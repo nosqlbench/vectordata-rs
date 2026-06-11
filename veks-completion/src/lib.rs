@@ -155,7 +155,7 @@ impl ClosedValues {
     /// Membership check — `true` iff `value` is in the set.
     pub fn validate(&self, value: &str) -> bool {
         match self {
-            ClosedValues::Static(s) => s.iter().any(|v| *v == value),
+            ClosedValues::Static(s) => s.contains(&value),
             ClosedValues::Owned(v) => v.iter().any(|val| val == value),
         }
     }
@@ -375,6 +375,7 @@ fn split_stability_prefix(prior: Vec<String>, default: Stability) -> (Stability,
 /// any node — calling them just adds the child, regardless of
 /// whether the node was previously leaf-shaped or not.
 #[derive(Clone)]
+#[derive(Default)]
 pub struct Node {
     // ---- discovery / display ----
     /// Display group tag — see [`CategoryTag`] for usage.
@@ -742,26 +743,6 @@ impl std::fmt::Debug for Node {
     }
 }
 
-impl Default for Node {
-    fn default() -> Self {
-        Node {
-            category: None,
-            stability: Stability::default(),
-            level: None,
-            help: None,
-            children: BTreeMap::new(),
-            flags: Vec::new(),
-            boolean_flags: std::collections::HashSet::new(),
-            flag_help: BTreeMap::new(),
-            flag_long_help: BTreeMap::new(),
-            value_providers: BTreeMap::new(),
-            positional_provider: None,
-            dynamic_options: None,
-            subtree_provider: None,
-            extras: None,
-        }
-    }
-}
 
 impl Node {
     /// Empty node — no flags, no children, no metadata. Build up
@@ -1640,7 +1621,7 @@ pub fn complete_rotating_with_raw(
     cursor_offset: usize,
 ) -> Vec<String> {
     let completed: &[&str] = if words.len() > 1 { &words[1..words.len() - 1] } else { &[] };
-    let partial: &str = if words.len() > 1 { *words.last().unwrap_or(&"") } else { "" };
+    let partial: &str = if words.len() > 1 { words.last().unwrap_or(&"") } else { "" };
     let mut node = &tree.root;
     for &word in completed {
         match node.child(word) {
@@ -1896,13 +1877,12 @@ pub fn complete_at_tap_with_raw(
     // positional, none has been entered yet, and the cursor is on a bare word
     // (not after a flag), offer the positional's dynamic candidates.
     let mut positional_candidates: Vec<String> = Vec::new();
-    if let Some(provider) = node.positional_provider() {
-        if !partial.starts_with('-')
+    if let Some(provider) = node.positional_provider()
+        && !partial.starts_with('-')
             && positionals_entered(remaining, &node.flags, &node.boolean_flags) == 0
         {
             positional_candidates = provider(partial, remaining);
         }
-    }
 
     // Children, then positional values, then flags.
     let mut out: Vec<String> = child_candidates.into_iter().map(|(_, k)| k).collect();
@@ -2002,18 +1982,15 @@ pub fn detect_shell() -> Option<Shell> {
     {
         // Read PPid from /proc/self/status — avoids a libc dep on
         // getppid(2). Format line: `PPid:\t<pid>\n`.
-        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            if let Some(ppid_line) = status.lines().find(|l| l.starts_with("PPid:")) {
-                if let Some(ppid) = ppid_line.split_whitespace().nth(1) {
-                    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", ppid)) {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status")
+            && let Some(ppid_line) = status.lines().find(|l| l.starts_with("PPid:"))
+                && let Some(ppid) = ppid_line.split_whitespace().nth(1)
+                    && let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", ppid)) {
                         let name = comm.trim();
                         if let Some(s) = Shell::from_name(name) {
                             return Some(s);
                         }
                     }
-                }
-            }
-        }
     }
     None
 }
@@ -2669,9 +2646,7 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     // emits the help line.
     let at_value_position = words
         .iter()
-        .rev()
-        .skip(1) // skip the partial under the cursor
-        .next()
+        .rev().nth(1)
         .map(|w| {
             w.starts_with("--")
                 && !w.contains('=')
@@ -2794,13 +2769,12 @@ pub fn next_tap_state(
 ) -> (u32, TapState) {
     let max = max_level.max(1);
     let mut tap_count = 1u32;
-    if let Some((prev_state, prev_key)) = prev {
-        if prev_key == cur_key
+    if let Some((prev_state, prev_key)) = prev
+        && prev_key == cur_key
             && now_ms.saturating_sub(prev_state.time_ms) < TAP_ADVANCE_MS
         {
             tap_count = prev_state.count.saturating_add(1).min(max);
         }
-    }
     let to_persist = if tap_count >= max { 0 } else { tap_count };
     let next = TapState {
         time_ms: now_ms,
@@ -2865,12 +2839,12 @@ fn tap_detect(app_name: &str, input_key: &str, max_level: u32) -> u32 {
 
     let prev_owned: Option<(TapState, String)> = std::fs::read_to_string(&tap_file)
         .ok()
-        .and_then(|content| {
+        .map(|content| {
             let mut parts = content.splitn(3, ' ');
             let time_ms: u128 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             let count: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             let key = parts.next().unwrap_or("").trim_end().to_string();
-            Some((TapState { time_ms, count }, key))
+            (TapState { time_ms, count }, key)
         });
     let prev = prev_owned.as_ref().map(|(s, k)| (*s, k.as_str()));
 
@@ -2996,8 +2970,8 @@ pub fn apply_directives(mut node: Node, directives: &[Directive]) -> Node {
 
     // Add the flags via the unified builders (idempotent: skip
     // duplicates).
-    let value_refs: Vec<&str> = value_flags.iter().copied().collect();
-    let bool_refs: Vec<&str> = bool_flags.iter().copied().collect();
+    let value_refs: Vec<&str> = value_flags.to_vec();
+    let bool_refs: Vec<&str> = bool_flags.to_vec();
     node = node.with_flags(&value_refs).with_boolean_flags(&bool_refs);
 
     // Help + value providers via the existing builder methods.
@@ -3277,11 +3251,10 @@ mod tests {
     fn dynamic_workload_params(_partial: &str, context: &[&str]) -> Vec<String> {
         // Find workload= on the context
         for word in context {
-            if let Some(path) = word.strip_prefix("workload=") {
-                if path == "test_keyvalue.yaml" {
+            if let Some(path) = word.strip_prefix("workload=")
+                && path == "test_keyvalue.yaml" {
                     return vec!["keyspace=".into(), "table=".into(), "keycount=".into()];
                 }
-            }
         }
         Vec::new()
     }
@@ -3699,9 +3672,8 @@ mod tests {
     fn cadence_key_change_resets_to_layer1() {
         // Two rapid taps but the input key changed — second tap is
         // a fresh start.
-        let mut state: Option<TapState> = None;
         let (t1, st1) = next_tap_state(None, 1_000, "veks", 3);
-        state = Some(st1);
+        let state = Some(st1);
         assert_eq!(t1, 1);
 
         let prev = state.map(|s| (s, "veks"));
@@ -3935,8 +3907,8 @@ mod tests {
         ])
         .with_flags(&["--workload"])
         .with_boolean_flags(&["--dry-run"]);
-        assert!(group.options().iter().any(|o| *o == "--workload"));
-        assert!(group.options().iter().any(|o| *o == "--dry-run"));
+        assert!(group.options().contains(&"--workload"));
+        assert!(group.options().contains(&"--dry-run"));
         // Hybrid node — has both children and flags. is_group()
         // returns true; is_leaf() returns false.
         assert!(group.is_group());

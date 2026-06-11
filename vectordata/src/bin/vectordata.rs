@@ -477,7 +477,7 @@ fn main() {
         println!("vectordata {LONG_VERSION}");
         return;
     }
-    if argv.first().is_none() || argv.iter().any(|a| a == "--help" || a == "-h") {
+    if argv.is_empty() || argv.iter().any(|a| a == "--help" || a == "-h") {
         // Help for the deepest subcommand named on the line (group → leaf).
         print!("{}", vcli::render_help_for(&spec, &argv));
         return;

@@ -151,21 +151,21 @@ data.
             "byte[]" | "u8" => "bvecs",
             _ => "",
         };
-        if !expected_ext.is_empty() {
-            if let Some(ext) = output_path.extension().and_then(|e| e.to_str()) {
-                let actual_fmt = veks_core::formats::VecFormat::from_extension(ext);
-                let expected_fmt =
-                    veks_core::formats::VecFormat::from_extension(expected_ext);
-                if actual_fmt != expected_fmt {
-                    return error_result(
-                        format!(
-                            "output extension '.{}' does not match element type '{}' (expected '.{}'). \
-                             Use --type {} or rename to .{}",
-                            ext, elem_type, expected_ext, elem_type, expected_ext,
-                        ),
-                        start,
-                    );
-                }
+        if !expected_ext.is_empty()
+            && let Some(ext) = output_path.extension().and_then(|e| e.to_str())
+        {
+            let actual_fmt = veks_core::formats::VecFormat::from_extension(ext);
+            let expected_fmt =
+                veks_core::formats::VecFormat::from_extension(expected_ext);
+            if actual_fmt != expected_fmt {
+                return error_result(
+                    format!(
+                        "output extension '.{}' does not match element type '{}' (expected '.{}'). \
+                         Use --type {} or rename to .{}",
+                        ext, elem_type, expected_ext, elem_type, expected_ext,
+                    ),
+                    start,
+                );
             }
         }
 
@@ -229,12 +229,11 @@ data.
         let actual_output = if let Some(ref ap) = append_path {
             ap.clone()
         } else {
-            if let Some(parent) = output_path.parent() {
-                if !parent.exists() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        return error_result(format!("failed to create directory: {}", e), start);
-                    }
-                }
+            if let Some(parent) = output_path.parent()
+                && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                return error_result(format!("failed to create directory: {}", e), start);
             }
             output_path.clone()
         };
@@ -526,8 +525,8 @@ fn generate_xvec_with_injection(
     // sequentially. Progress is reported per sub-batch within each chunk
     // for smooth status updates.
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let chunk_size = ((count as usize + threads - 1) / threads).max(1);
-    let num_chunks = (count as usize + chunk_size - 1) / chunk_size;
+    let chunk_size = (count as usize).div_ceil(threads).max(1);
+    let num_chunks = (count as usize).div_ceil(chunk_size);
 
     let chunk_seeds: Vec<u64> = (0..num_chunks).map(|_| rng.random()).collect();
     let alias_table = AliasTable::new(normal_ratio.max(0.0), zero_ratio, dup_ratio);
@@ -544,17 +543,17 @@ fn generate_xvec_with_injection(
 
             let mut chunk_rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed);
             let mut buf = Vec::with_capacity(chunk_len * record_total_size);
-            let mut records_written = 0usize;
 
             for j in 0..chunk_len {
                 let disp = alias_table.sample(&mut chunk_rng);
                 buf.extend_from_slice(&dim_header);
                 match disp {
                     VecDisposition::Zero => buf.extend_from_slice(&zero_bytes),
-                    VecDisposition::Duplicate if records_written > 0 => {
-                        let src_idx = chunk_rng.random_range(0..records_written);
+                    // `j` records have been written when record `j` starts.
+                    VecDisposition::Duplicate if j > 0 => {
+                        let src_idx = chunk_rng.random_range(0..j);
                         let src_offset = src_idx * record_total_size + 4;
-                        buf.extend_from_slice(&buf[src_offset..src_offset + record_data_size].to_vec());
+                        buf.extend_from_within(src_offset..src_offset + record_data_size);
                     }
                     VecDisposition::Normal | VecDisposition::Duplicate => {
                         for _ in 0..dim {
@@ -587,7 +586,6 @@ fn generate_xvec_with_injection(
                         }
                     }
                 }
-                records_written += 1;
                 // Report progress every ~10K vectors for smooth updates
                 if (j + 1) % progress_interval == 0 {
                     pb.inc(progress_interval as u64);

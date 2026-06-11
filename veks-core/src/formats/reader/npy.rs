@@ -151,8 +151,8 @@ impl NpyArrayData {
             Self::F32(a) => {
                 // On LE platforms with standard layout, the f32 slice is
                 // already in wire format — cast to &[u8] and copy once.
-                if cfg!(target_endian = "little") {
-                    if let Some(slice) = a.as_slice() {
+                if cfg!(target_endian = "little")
+                    && let Some(slice) = a.as_slice() {
                         let cols = a.ncols();
                         let start = row * cols;
                         let end = start + cols;
@@ -165,13 +165,12 @@ impl NpyArrayData {
                         };
                         return byte_slice.to_vec();
                     }
-                }
                 // Fallback: non-LE or non-contiguous layout
                 a.row(row).iter().flat_map(|f| f.to_le_bytes()).collect()
             }
             Self::F64(a) => {
-                if cfg!(target_endian = "little") {
-                    if let Some(slice) = a.as_slice() {
+                if cfg!(target_endian = "little")
+                    && let Some(slice) = a.as_slice() {
                         let cols = a.ncols();
                         let start = row * cols;
                         let end = start + cols;
@@ -184,7 +183,6 @@ impl NpyArrayData {
                         };
                         return byte_slice.to_vec();
                     }
-                }
                 a.row(row).iter().flat_map(|f| f.to_le_bytes()).collect()
             }
         }
@@ -258,7 +256,7 @@ pub fn scan_npy_headers(path: &Path, max_count: Option<u64>) -> Result<NpyScanRe
 
     // When max_count is set, only scan enough shards to cover the limit
     let mut scanned_files = 1usize; // first file already scanned
-    let have_enough = max_count.map_or(false, |mc| total_rows >= mc);
+    let have_enough = max_count.is_some_and(|mc| total_rows >= mc);
 
     if !have_enough {
         for f in &files[1..] {
@@ -281,11 +279,10 @@ pub fn scan_npy_headers(path: &Path, max_count: Option<u64>) -> Result<NpyScanRe
             }
             total_rows += header.rows as u64;
             scanned_files += 1;
-            if let Some(mc) = max_count {
-                if total_rows >= mc {
+            if let Some(mc) = max_count
+                && total_rows >= mc {
                     break;
                 }
-            }
         }
     }
 
@@ -378,7 +375,7 @@ impl NpyDirReader {
             let hw = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            hw.max(1).min(64)
+            hw.clamp(1, 64)
         };
         let num_workers = if threads == 0 { default_threads } else { threads }
             .min(total_files);
@@ -573,13 +570,12 @@ impl VecSource for NpyDirReader {
 
     fn next_record(&mut self) -> Option<Vec<u8>> {
         loop {
-            if let Some(ref array) = self.current_array {
-                if self.current_row < array.nrows() {
+            if let Some(ref array) = self.current_array
+                && self.current_row < array.nrows() {
                     let bytes = array.row_bytes(self.current_row);
                     self.current_row += 1;
                     return Some(bytes);
                 }
-            }
 
             // Need next file in sorted order
             if !self.advance_to_next_file() {

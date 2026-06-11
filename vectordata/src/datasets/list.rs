@@ -264,8 +264,8 @@ pub fn run(
         return 0;
     }
 
-    if select.is_some() {
-        output_select(&filtered, profile_view, select.unwrap());
+    if let Some(select) = select {
+        output_select(&filtered, profile_view, select);
         return 0;
     }
 
@@ -407,8 +407,8 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
     let name_col = max_name_len + 2; // padding
 
     // Header
-    println!("{:<width$}  {:<width2$}  {}",
-        "DATASET", "PROFILES", "METRIC",
+    println!("{:<width$}  {:<width2$}  METRIC",
+        "DATASET", "PROFILES",
         width = name_col.saturating_sub(2),
         width2 = 30);
 
@@ -554,11 +554,10 @@ fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: 
                 // Find the entry to show details
                 if let Some(entry) = entries.iter().find(|e| e.name == **name) {
                     println!("    url: {}", entry.path);
-                    if let Some(ref attrs) = entry.layout.attributes {
-                        if let Some(ref df) = attrs.distance_function {
+                    if let Some(ref attrs) = entry.layout.attributes
+                        && let Some(ref df) = attrs.distance_function {
                             println!("    metric: {}", df);
                         }
-                    }
                 }
             }
         }

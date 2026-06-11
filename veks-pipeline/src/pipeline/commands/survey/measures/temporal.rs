@@ -250,7 +250,7 @@ mod tests {
     fn temporal_range_ignores_non_temporal() {
         let mut m = TemporalRangeMeasure::new();
         m.observe(&MValue::Text("hi".into()), &ctx());
-        m.observe(&MValue::Float(3.14), &ctx());
+        m.observe(&MValue::Float(3.25), &ctx());
         let r = match Box::new(m).finalize() {
             MeasureReport::TemporalRange(r) => r,
             _ => panic!("wrong report kind"),

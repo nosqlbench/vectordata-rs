@@ -400,8 +400,8 @@ fn run_help(args: HelpArgs) {
     // (e.g., `veks help run` shows the root `run` command).
     // When they DID say "pipeline", skip root commands so
     // `veks help pipeline analyze` shows the pipeline group, not root analyze.
-    if !had_pipeline_prefix {
-        if let Some(help_text) = root_command_help(&query) {
+    if !had_pipeline_prefix
+        && let Some(help_text) = root_command_help(&query) {
             if args.markdown {
                 println!("{}", help_text);
             } else {
@@ -409,7 +409,6 @@ fn run_help(args: HelpArgs) {
             }
             return;
         }
-    }
 
     // Check if query matches a pipeline group name (DOC-07)
     if groups.contains_key(&query) {
@@ -431,8 +430,8 @@ fn run_help(args: HelpArgs) {
 
     // Fall through: when user didn't say "pipeline" and it's not a pipeline
     // group/command either, try root commands as a last resort.
-    if had_pipeline_prefix {
-        if let Some(help_text) = root_command_help(&query) {
+    if had_pipeline_prefix
+        && let Some(help_text) = root_command_help(&query) {
             if args.markdown {
                 println!("{}", help_text);
             } else {
@@ -440,7 +439,6 @@ fn run_help(args: HelpArgs) {
             }
             return;
         }
-    }
 
     eprintln!("Unknown command or group: '{}'", query);
     eprintln!("Use 'veks help --list' to see all available commands.");
@@ -496,7 +494,7 @@ fn print_command_list(
     for (group, commands) in pipeline_groups {
         let entries: Vec<(String, String)> = commands.iter()
             .map(|(path, summary)| {
-                let subname = path.splitn(2, ' ').nth(1).unwrap_or(path).to_string();
+                let subname = path.split_once(' ').map(|x| x.1).unwrap_or(path).to_string();
                 (subname, summary.clone())
             })
             .collect();
@@ -561,18 +559,18 @@ fn print_group_help(
         println!("| Command | Summary |");
         println!("|---------|---------|");
         for (path, summary) in commands {
-            let subname = path.splitn(2, ' ').nth(1).unwrap_or(path);
+            let subname = path.split_once(' ').map(|x| x.1).unwrap_or(path);
             println!("| `{}` | {} |", subname, summary);
         }
         println!("\nUse `veks help {} <command>` for detailed documentation.", group);
     } else {
         println!("{} — pipeline command group\n", group);
         let max_len = commands.iter()
-            .map(|(p, _)| p.splitn(2, ' ').nth(1).unwrap_or(p).len())
+            .map(|(p, _)| p.split_once(' ').map(|x| x.1).unwrap_or(p).len())
             .max()
             .unwrap_or(0);
         for (path, summary) in commands {
-            let subname = path.splitn(2, ' ').nth(1).unwrap_or(path);
+            let subname = path.split_once(' ').map(|x| x.1).unwrap_or(path);
             println!("  {:<width$}  {}", subname, summary, width = max_len);
         }
         println!("\nUse 'veks help {} <command>' for detailed documentation.", group);
@@ -677,9 +675,9 @@ mod tests {
         assert!(!config.subcommands.is_empty(), "config has nested subcommands");
     }
 
-    /// The hand-assembled top-level spec: canonical subcommands + pipeline graft
-    /// + shorthands, all reachable — the clap-free replacement for
-    /// `build_augmented_cli`.
+    /// The hand-assembled top-level spec: canonical subcommands plus
+    /// pipeline graft and shorthands, all reachable — the clap-free
+    /// replacement for `build_augmented_cli`.
     #[test]
     fn veks_spec_assembles_full_tree() {
         let spec = build_veks_spec();

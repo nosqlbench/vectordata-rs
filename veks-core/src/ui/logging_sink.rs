@@ -152,8 +152,8 @@ impl log::Log for PipelineLogger {
         let message = format!("{}", record.args());
 
         // Write all levels to the persistent plain text log file.
-        if let Some(ref fw) = self.file_writer {
-            if let Ok(mut w) = fw.lock() {
+        if let Some(ref fw) = self.file_writer
+            && let Ok(mut w) = fw.lock() {
                 let _ = writeln!(w, "[{}] {:5} {} — {}",
                     ts.format("%H:%M:%S"),
                     record.level(),
@@ -162,11 +162,10 @@ impl log::Log for PipelineLogger {
                 );
                 let _ = w.flush();
             }
-        }
 
         // Write all levels to the JSONL log file.
-        if let Some(ref jw) = self.jsonl_writer {
-            if let Ok(mut w) = jw.lock() {
+        if let Some(ref jw) = self.jsonl_writer
+            && let Ok(mut w) = jw.lock() {
                 let escaped = message.replace('\\', "\\\\")
                     .replace('"', "\\\"")
                     .replace('\n', "\\n")
@@ -180,7 +179,6 @@ impl log::Log for PipelineLogger {
                 );
                 let _ = w.flush();
             }
-        }
 
         // Forward Info+ to the TUI sink, unless the message came from
         // UiHandle::log() (target "ui") — those are already sent directly.
@@ -190,11 +188,9 @@ impl log::Log for PipelineLogger {
     }
 
     fn flush(&self) {
-        if let Some(ref fw) = self.file_writer {
-            if let Ok(mut w) = fw.lock() { let _ = w.flush(); }
-        }
-        if let Some(ref jw) = self.jsonl_writer {
-            if let Ok(mut w) = jw.lock() { let _ = w.flush(); }
-        }
+        if let Some(ref fw) = self.file_writer
+            && let Ok(mut w) = fw.lock() { let _ = w.flush(); }
+        if let Some(ref jw) = self.jsonl_writer
+            && let Ok(mut w) = jw.lock() { let _ = w.flush(); }
     }
 }

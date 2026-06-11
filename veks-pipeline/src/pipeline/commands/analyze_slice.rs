@@ -226,7 +226,7 @@ impl CommandOp for AnalyzeSliceOp {
                 };
                 let fc = VectorReader::<f64>::count(&r);
                 let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().to_vec()))
             }
         };
 

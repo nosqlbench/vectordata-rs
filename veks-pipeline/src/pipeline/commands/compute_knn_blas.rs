@@ -447,7 +447,7 @@ pub(super) fn scan_range_sgemm(
 
     let vecs_per_chunk = buffers.vecs_per_chunk;
     let qb_size = buffers.qb_size;
-    let n_chunks = (range_len + vecs_per_chunk - 1) / vecs_per_chunk;
+    let n_chunks = range_len.div_ceil(vecs_per_chunk);
 
     let need_base_norms = !use_ip || proper_cosine;
     if need_base_norms {
@@ -700,7 +700,7 @@ Reuses the shared segment-cache infrastructure:
             Err(e) => return error_result(e, start),
         };
         let metric_str = options.get("metric").unwrap_or("L2");
-        let metric = match Metric::from_str(metric_str) {
+        let metric = match Metric::parse(metric_str) {
             Some(m) => m,
             None => return error_result(format!("unsupported metric: '{}'", metric_str), start),
         };
@@ -739,11 +739,10 @@ Reuses the shared segment-cache infrastructure:
             .map(|s| resolve_path(s, &ctx.workspace));
 
         for path in std::iter::once(&indices_path).chain(distances_path.iter()) {
-            if let Some(parent) = path.parent() {
-                if !parent.exists() {
+            if let Some(parent) = path.parent()
+                && !parent.exists() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-            }
         }
 
         // Metadata via mmap; compute uses pread (no base bytes in RSS).
@@ -831,7 +830,7 @@ Reuses the shared segment-cache infrastructure:
                 auto.min(base_n)
             }
         };
-        let nominal_segments = (base_n + segment_size - 1) / segment_size;
+        let nominal_segments = base_n.div_ceil(segment_size);
         ctx.ui.log(&format!(
             "  {} base-vector segments @ {} vectors each (nominal, before cache reuse)",
             nominal_segments, segment_size,
@@ -986,7 +985,7 @@ Reuses the shared segment-cache infrastructure:
         let vecs_per_chunk = scan_buffers.vecs_per_chunk();
         let qb_size = scan_buffers.qb_size();
         let proper_cosine = matches!(cosine_mode, Some(CosineMode::ProperMetric));
-        let n_query_subbatches = (query_count + qb_size - 1) / qb_size;
+        let n_query_subbatches = query_count.div_ceil(qb_size);
         ctx.ui.log(&format!(
             "  chunk plan: {} base/chunk × {} queries/sub-batch ({} sub-batches), \
              raw={} MiB, packed={} MiB, score={} MiB",
@@ -1004,7 +1003,7 @@ Reuses the shared segment-cache infrastructure:
             let seg_start = p.start;
             let seg_end = p.end;
             let seg_len = seg_end - seg_start;
-            let n_chunks = (seg_len + vecs_per_chunk - 1) / vecs_per_chunk;
+            let n_chunks = seg_len.div_ceil(vecs_per_chunk);
             let seg_compute_start = Instant::now();
             ctx.ui.log(&format!(
                 "  ▶ [seg {:>3}/{}] COMPUTE range [{}..{}) ({} base × {} queries, {} chunk(s) ≤ {} vecs)",
@@ -1447,9 +1446,9 @@ mod tests {
             opts.set("query", "q.fvec");
             opts.set("indices", "a.ivec");
             opts.set("distances", "a-d.fvec");
-            opts.set("neighbors", &k.to_string());
+            opts.set("neighbors", k.to_string());
             opts.set("metric", "L2");
-            opts.set("partition_size", &partition_size.to_string());
+            opts.set("partition_size", partition_size.to_string());
             let mut op = ComputeKnnBlasOp;
             let r = op.execute(&opts, &mut ctx);
             assert_eq!(r.status, Status::Ok, "profile A failed: {}", r.message);
@@ -1482,9 +1481,9 @@ mod tests {
             opts.set("query", "q.fvec");
             opts.set("indices", "b.ivec");
             opts.set("distances", "b-d.fvec");
-            opts.set("neighbors", &k.to_string());
+            opts.set("neighbors", k.to_string());
             opts.set("metric", "L2");
-            opts.set("partition_size", &partition_size.to_string());
+            opts.set("partition_size", partition_size.to_string());
             let mut op = ComputeKnnBlasOp;
             let r = op.execute(&opts, &mut ctx);
             assert_eq!(r.status, Status::Ok, "profile B failed: {}", r.message);
@@ -1520,9 +1519,9 @@ mod tests {
         bopts.set("query", "q.fvec");
         bopts.set("indices", "baseline.ivec");
         bopts.set("distances", "baseline-d.fvec");
-        bopts.set("neighbors", &k.to_string());
+        bopts.set("neighbors", k.to_string());
         bopts.set("metric", "L2");
-        bopts.set("partition_size", &partition_size.to_string());
+        bopts.set("partition_size", partition_size.to_string());
         let mut bop = ComputeKnnBlasOp;
         let br = bop.execute(&bopts, &mut bctx);
         assert_eq!(br.status, Status::Ok);

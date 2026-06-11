@@ -251,11 +251,12 @@ fn write_npy_dir(dir: &Path) {
     // header length (padded to 64 bytes)
     let hdr_bytes = descr.as_bytes();
     let total = 10 + hdr_bytes.len() + 1; // magic + len + descr + newline
-    let pad = ((total + 63) / 64) * 64 - total;
+    let pad = total.div_ceil(64) * 64 - total;
     let hdr_len = (hdr_bytes.len() + pad + 1) as u16;
     header.extend_from_slice(&hdr_len.to_le_bytes());
     header.extend_from_slice(hdr_bytes);
-    for _ in 0..pad { header.push(b' '); }
+    let new_len = header.len() + pad;
+    header.resize(new_len, b' ');
     header.push(b'\n');
     // 10 vectors × 4 dims × 4 bytes = 160 bytes of data
     let mut data = Vec::with_capacity(160);

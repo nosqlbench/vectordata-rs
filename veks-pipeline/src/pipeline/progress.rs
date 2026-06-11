@@ -30,9 +30,9 @@ use super::provenance::{BinaryVersion, ProvenanceFlags, ProvenanceMap};
 /// History:
 /// - v3: fingerprint chains for DAG-based staleness
 /// - v4: build_version in StepRecord, mtime-based staleness removed,
-///        fingerprint now includes command build version
+///   fingerprint now includes command build version
 /// - v5: structured `ProvenanceMap` replaces opaque fingerprint string;
-///        staleness check is selector-driven (see `ProvenanceFlags`)
+///   staleness check is selector-driven (see `ProvenanceFlags`)
 const PROGRESS_SCHEMA_VERSION: u32 = 5;
 
 /// Persistent progress log for a pipeline execution.
@@ -261,15 +261,14 @@ impl ProgressLog {
         if old_path.exists() {
             if !new_path.exists() {
                 let cache_dir = dir.join(".cache");
-                if std::fs::create_dir_all(&cache_dir).is_ok() {
-                    if std::fs::rename(&old_path, &new_path).is_ok() {
+                if std::fs::create_dir_all(&cache_dir).is_ok()
+                    && std::fs::rename(&old_path, &new_path).is_ok() {
                         log::info!(
                             "Migrated progress log: {} → {}",
                             old_path.display(),
                             new_path.display(),
                         );
                     }
-                }
             } else {
                 let _ = std::fs::remove_file(&old_path);
             }
@@ -372,11 +371,10 @@ impl ProgressLog {
             return Some("previous run was a bound-check skip, re-validating".to_string());
         }
 
-        if let Some(current) = current_options {
-            if !record.resolved_options.is_empty() && &record.resolved_options != current {
+        if let Some(current) = current_options
+            && !record.resolved_options.is_empty() && &record.resolved_options != current {
                 return Some("options changed".to_string());
             }
-        }
 
         for output in &record.outputs {
             let path = resolve_path(&output.path, workspace);
@@ -425,6 +423,12 @@ impl ProgressLog {
 /// hashes. No external dependency.
 pub struct FnvHasher {
     state: u64,
+}
+
+impl Default for FnvHasher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FnvHasher {

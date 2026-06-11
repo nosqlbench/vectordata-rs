@@ -79,9 +79,9 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
                 let mut endpoints: Vec<(PathBuf, String)> = Vec::new();
                 loop {
                     let candidate = walk.join(PUBLISH_FILE);
-                    if candidate.is_file() {
-                        if let Ok(content) = std::fs::read_to_string(&candidate) {
-                            if let Ok(p) = parse_publish_url(&content) {
+                    if candidate.is_file()
+                        && let Ok(content) = std::fs::read_to_string(&candidate)
+                            && let Ok(p) = parse_publish_url(&content) {
                                 let rel_from_this_root = abs_ds.strip_prefix(&walk)
                                     .map(|r| r.to_string_lossy().to_string())
                                     .unwrap_or_default();
@@ -94,8 +94,6 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
                                 };
                                 endpoints.push((walk.clone(), endpoint));
                             }
-                        }
-                    }
                     if !walk.pop() { break; }
                 }
                 if endpoints.len() > 1 {

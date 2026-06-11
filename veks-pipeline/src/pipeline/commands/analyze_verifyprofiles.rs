@@ -123,7 +123,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
             .get("sample")
             .and_then(|s| s.parse().ok())
             .unwrap_or(10000);
-        let verbose = options.get("verbose").map_or(false, |s| s == "true");
+        let verbose = options.get("verbose") == Some("true");
 
         // Load model
         let content = match std::fs::read_to_string(&model_path) {
@@ -354,9 +354,9 @@ fn log_beta(a: f64, b: f64) -> f64 {
 fn log_gamma(x: f64) -> f64 {
     if x <= 0.0 { return 0.0; }
     let c = [
-        0.99999999999980993, 676.5203681218851, -1259.1392167224028,
-        771.32342877765313, -176.61502916214059, 12.507343278686905,
-        -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+        0.999_999_999_999_809_9, 676.5203681218851, -1259.1392167224028,
+        771.323_428_777_653_1, -176.615_029_162_140_6, 12.507343278686905,
+        -0.13857109526572012, 9.984_369_578_019_572e-6, 1.5056327351493116e-7,
     ];
     let x = x - 1.0;
     let mut sum = c[0];

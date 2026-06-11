@@ -224,11 +224,10 @@ fn print_access(url: &str, view: &serde_json::Value) {
             println!("  {path:<28} {who:<10} {}", actions.join(","));
         }
     }
-    if let Some(hidden) = view.get("hidden").and_then(|v| v.as_u64()) {
-        if hidden > 0 {
+    if let Some(hidden) = view.get("hidden").and_then(|v| v.as_u64())
+        && hidden > 0 {
             println!("hidden from you:  {hidden} namespace(s)");
         }
-    }
 }
 
 /// `vectordata token issue <url> --description … [--profile …] [--expires …]`

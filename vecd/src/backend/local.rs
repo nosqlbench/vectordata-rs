@@ -118,7 +118,7 @@ impl Backend for LocalBackend {
         // Open-or-create, then seek to the offset. Seeking past the current
         // end leaves a hole that reads back as zeros (a sparse file) — the
         // gap a later out-of-order chunk will fill.
-        let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
         f.seek(SeekFrom::Start(offset))?;
         f.write_all(chunk)?;
         Ok(())

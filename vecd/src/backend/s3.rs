@@ -140,7 +140,7 @@ impl Backend for S3Backend {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
         f.seek(SeekFrom::Start(offset))?;
         f.write_all(chunk)?;
         Ok(())

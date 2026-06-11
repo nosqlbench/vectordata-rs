@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_f32_f64_roundtrip() {
-        let values: Vec<f32> = vec![0.0, 1.0, -3.14, 1e10];
+        let values: Vec<f32> = vec![0.0, 1.0, -3.25, 1e10];
         let mut f32_bytes = Vec::new();
         for &v in &values {
             f32_bytes.extend_from_slice(&v.to_le_bytes());

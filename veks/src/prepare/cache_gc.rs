@@ -77,23 +77,21 @@ pub fn run(path: &Path, dry_run: bool) {
 
     // Read progress log to find recorded output files
     let progress_path = cache_dir.join(".upstream.progress.yaml");
-    if progress_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&progress_path) {
+    if progress_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&progress_path) {
             // Parse output paths from the YAML
             for line in content.lines() {
                 let trimmed = line.trim();
                 if trimmed.starts_with("path:") {
                     let path_val = trimmed.strip_prefix("path:").unwrap().trim().trim_matches('\'').trim_matches('"');
                     // Extract just the filename if it's a cache-relative path
-                    if path_val.starts_with(".cache/") {
-                        if let Some(name) = path_val.strip_prefix(".cache/") {
+                    if path_val.starts_with(".cache/")
+                        && let Some(name) = path_val.strip_prefix(".cache/") {
                             live.insert(name.to_string());
                         }
-                    }
                 }
             }
         }
-    }
 
     // Scan .cache/ for all files and directories
     let mut orphaned: Vec<(String, u64, bool)> = Vec::new(); // (name, size, is_dir)

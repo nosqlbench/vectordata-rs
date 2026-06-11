@@ -185,11 +185,10 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
             }
             Some(path) => {
                 checked += 1;
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if let Ok(mtime) = meta.modified() {
+                if let Ok(meta) = std::fs::metadata(&path)
+                    && let Ok(mtime) = meta.modified() {
                         catalog_mtimes.push((dir.clone(), mtime));
                     }
-                }
             }
         }
     }
@@ -217,14 +216,13 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
             if !file.starts_with(catalog_dir) { continue; }
             let fname = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             if crate::filters::is_catalog_staleness_exempt(&fname) { continue; }
-            if let Ok(file_mtime) = std::fs::metadata(file).and_then(|m| m.modified()) {
-                if file_mtime > *catalog_mtime {
+            if let Ok(file_mtime) = std::fs::metadata(file).and_then(|m| m.modified())
+                && file_mtime > *catalog_mtime {
                     let msg = format!("{}: catalog is older than {}", rel(catalog_dir), rel(file));
                     if is_local(catalog_dir) { local_failures.push(msg); }
                     else { outer_warnings.push(msg); }
                     break;
                 }
-            }
         }
     }
     for i in 0..catalog_mtimes.len() {
@@ -232,13 +230,12 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
         for j in 0..catalog_mtimes.len() {
             if i == j { continue; }
             let (ref child_dir, child_mtime) = catalog_mtimes[j];
-            if child_dir.starts_with(parent_dir) && child_dir != parent_dir {
-                if parent_mtime < child_mtime {
+            if child_dir.starts_with(parent_dir) && child_dir != parent_dir
+                && parent_mtime < child_mtime {
                     let msg = format!("{}: catalog is older than child {}", rel(parent_dir), rel(child_dir));
                     if is_local(parent_dir) { local_failures.push(msg); }
                     else { outer_warnings.push(msg); }
                 }
-            }
         }
     }
 
@@ -269,12 +266,11 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
         msgs.push(String::new());
         msgs.push("To regenerate catalogs:".to_string());
         msgs.push(format!("  veks prepare catalog generate {}", super::rel_display(root)));
-        if !outer_warnings.is_empty() {
-            if let Some(cr) = find_catalog_root(root) {
+        if !outer_warnings.is_empty()
+            && let Some(cr) = find_catalog_root(root) {
                 msgs.push(format!("  veks prepare catalog generate {}  (includes outer tree)",
                     super::rel_display(&cr)));
             }
-        }
         CheckResult::fail("catalogs", msgs)
     }
 }

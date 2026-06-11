@@ -104,12 +104,11 @@ Other formats (ivec metadata, Parquet, NPY) are not supported.
             Ok(s) => s,
             Err(e) => return err(format!("JSON serialization failed: {}", e), start),
         };
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    return err(format!("failed to create directory {}: {}", parent.display(), e), start);
-                }
-            }
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return err(format!("failed to create directory {}: {}", parent.display(), e), start);
         }
         if let Err(e) = std::fs::write(&output_path, json) {
             return err(format!("failed to write {}: {}", output_path.display(), e), start);

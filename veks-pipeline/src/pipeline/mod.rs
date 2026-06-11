@@ -363,7 +363,7 @@ pub fn run_script(args: ScriptArgs) {
         println!(
             "No pipeline steps found for profile '{}' in {}",
             profile_name,
-            veks_core::paths::rel_display(&dataset_path)
+            veks_core::paths::rel_display(dataset_path)
         );
         std::process::exit(1);
     }
@@ -376,15 +376,12 @@ pub fn run_script(args: ScriptArgs) {
     // Build defaults from upstream config + variables.yaml (no CLI overrides
     // for script mode — the script itself is the reproducible artifact).
     let mut defaults = IndexMap::new();
-    if let Some(ref pipe) = config.upstream {
-        if let Some(ref defs) = pipe.defaults {
-            defaults.extend(defs.clone());
-        }
+    if let Some(ref pipe) = config.upstream
+        && let Some(ref defs) = pipe.defaults
+    {
+        defaults.extend(defs.clone());
     }
-    match variables::load(&workspace) {
-        Ok(vars) => defaults.extend(vars),
-        Err(_) => {}
-    }
+    if let Ok(vars) = variables::load(&workspace) { defaults.extend(vars) }
 
     // Optionally load progress log for --show-progress
     let progress = if args.show_progress {
@@ -576,7 +573,7 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         println!(
             "No pipeline steps found for profile '{}' in {}",
             profile_name,
-            veks_core::paths::rel_display(&dataset_path)
+            veks_core::paths::rel_display(dataset_path)
         );
         println!("Add an 'upstream' section with 'steps' to define a pipeline.");
         std::process::exit(1);
@@ -598,10 +595,10 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
 
     // Build defaults from pipeline config + dataset variables + variables.yaml + CLI overrides
     let mut defaults = IndexMap::new();
-    if let Some(ref pipe) = config.upstream {
-        if let Some(ref defs) = pipe.defaults {
-            defaults.extend(defs.clone());
-        }
+    if let Some(ref pipe) = config.upstream
+        && let Some(ref defs) = pipe.defaults
+    {
+        defaults.extend(defs.clone());
     }
     // Layer in dataset.yaml variables: section
     defaults.extend(config.variables.clone());
@@ -916,7 +913,7 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
                 "Re-expanding pipeline for {} partition profiles...", partition_count));
 
             // Reload dataset.yaml to pick up the new profile entries
-            match vectordata::dataset::DatasetConfig::load(&dataset_path) {
+            match vectordata::dataset::DatasetConfig::load(dataset_path) {
                 Ok(mut updated_config) => {
                     // Derive views for partition profiles so compute-knn
                     // outputs are registered as profile views.
@@ -944,10 +941,10 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
                             // After partition compute steps complete, save the
                             // updated config with derived views (neighbor_indices,
                             // neighbor_distances) so finalization and consumers see them.
-                            if result.is_ok() {
-                                if let Err(e) = updated_config.save(&dataset_path) {
-                                    ctx.ui.log(&format!("  warning: failed to save updated views: {}", e));
-                                }
+                            if result.is_ok()
+                                && let Err(e) = updated_config.save(dataset_path)
+                            {
+                                ctx.ui.log(&format!("  warning: failed to save updated views: {}", e));
                             }
                             result
                         }
@@ -978,7 +975,7 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         update_dataset_attributes(dataset_path, dataset_path.parent().unwrap_or(Path::new(".")));
 
         // partition profiles added during Phase 3).
-        let finalize_config = vectordata::dataset::DatasetConfig::load(&dataset_path)
+        let finalize_config = vectordata::dataset::DatasetConfig::load(dataset_path)
             .unwrap_or_else(|_| config.clone());
         let raw_steps = vectordata::dataset::collect_all_steps(&finalize_config);
         let all_expanded = vectordata::dataset::expand_per_profile_steps_scoped(
@@ -1232,10 +1229,10 @@ fn explain_staleness(
         for up in &upstream_ids {
             if let Some(p) = current_provenances.get(*up) {
                 upstream_maps.insert((*up).to_string(), p.clone());
-            } else if let Some(rec) = ctx.progress.get_step(up) {
-                if let Some(p) = rec.provenance.clone() {
-                    upstream_maps.insert((*up).to_string(), p);
-                }
+            } else if let Some(rec) = ctx.progress.get_step(up)
+                && let Some(p) = rec.provenance.clone()
+            {
+                upstream_maps.insert((*up).to_string(), p);
             }
         }
         let binary = provenance::BinaryVersion::parse(&cmd_build_version);
@@ -1397,13 +1394,13 @@ fn format_bytes(bytes: u64) -> String {
 
 // The following local function was part of the old expand_per_profile_steps.
 // It has been moved to vectordata::dataset::expansion.
-/// Auto-derive profile views from per_profile step outputs.
-///
-/// For each profile that has per_profile template expansions (including default
-/// when no explicit default-gated steps exist), scans templates for `output`
-/// options and creates profile view entries using the filename stem as the view
-/// key and `profiles/{name}/{filename}` as the path. Existing explicit views
-/// are not overridden.
+// Auto-derive profile views from per_profile step outputs.
+//
+// For each profile that has per_profile template expansions (including default
+// when no explicit default-gated steps exist), scans templates for `output`
+// options and creates profile view entries using the filename stem as the view
+// key and `profiles/{name}/{filename}` as the path. Existing explicit views
+// are not overridden.
 // `derive_sized_profile_views` logic is now in
 // `DSProfileGroup::derive_views_from_templates` in the dataset crate.
 
@@ -1541,7 +1538,7 @@ fn rewrite_var_refs(input: &str, var_names: &std::collections::HashSet<String>) 
             chars.next(); // consume '{'
             let mut var_expr = String::new();
             let mut depth = 1;
-            while let Some(c) = chars.next() {
+            for c in chars.by_ref() {
                 if c == '}' {
                     depth -= 1;
                     if depth == 0 {
@@ -1719,16 +1716,16 @@ fn clean_last_step(_workspace: &Path, dataset_path: &Path) {
         match std::fs::metadata(p) {
             Ok(_) => match std::fs::remove_file(p) {
                 Ok(()) => {
-                    println!("  removed {}", veks_core::paths::rel_display(&p.to_path_buf()));
+                    println!("  removed {}", veks_core::paths::rel_display(p));
                     removed += 1;
                 }
                 Err(e) => {
-                    println!("  failed to remove {}: {}", veks_core::paths::rel_display(&p.to_path_buf()), e);
+                    println!("  failed to remove {}: {}", veks_core::paths::rel_display(p), e);
                     failed += 1;
                 }
             },
             Err(_) => {
-                println!("  skipped {} (already gone)", veks_core::paths::rel_display(&p.to_path_buf()));
+                println!("  skipped {} (already gone)", veks_core::paths::rel_display(p));
                 missing += 1;
             }
         }
@@ -1767,7 +1764,7 @@ fn clean_pipeline(workspace: &Path, dataset_path: &Path) {
     println!("Clean complete. Cache and output files are preserved.");
     println!(
         "To remove outputs, delete them manually from {}",
-        veks_core::paths::rel_display(&workspace.to_path_buf())
+        veks_core::paths::rel_display(workspace)
     );
 }
 
@@ -1842,16 +1839,14 @@ pub fn reset_pipeline(workspace: &Path, dataset_path: &Path, config: &DatasetCon
         if preserved.is_empty() {
             let _ = std::fs::remove_file(&vars_path);
             println!("  removed {}", veks_core::paths::rel_display(&vars_path));
-        } else {
-            if let Ok(content) = serde_yaml::to_string(&preserved) {
-                if std::fs::write(&vars_path, content).is_ok() {
-                    println!(
-                        "  pruned {} (kept: {})",
-                        veks_core::paths::rel_display(&vars_path),
-                        preserved.keys().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
-                    );
-                }
-            }
+        } else if let Ok(content) = serde_yaml::to_string(&preserved)
+            && std::fs::write(&vars_path, content).is_ok()
+        {
+            println!(
+                "  pruned {} (kept: {})",
+                veks_core::paths::rel_display(&vars_path),
+                preserved.keys().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+            );
         }
     }
     for name in &["dataset.json", "dataset.jsonl", "dataset.log",

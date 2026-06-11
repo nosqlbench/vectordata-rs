@@ -80,13 +80,12 @@ impl ReceivedRanges {
         // start strictly below `lo`.
         let mut to_remove: Vec<u64> = Vec::new();
         // The interval immediately at or before `lo` may reach into [lo, ..).
-        if let Some((&s, &e)) = self.intervals.range(..=lo).next_back() {
-            if e >= lo {
+        if let Some((&s, &e)) = self.intervals.range(..=lo).next_back()
+            && e >= lo {
                 lo = lo.min(s);
                 hi = hi.max(e);
                 to_remove.push(s);
             }
-        }
         // Intervals starting within [lo, hi] are adjacent/overlapping.
         for (&s, &e) in self.intervals.range(lo..=hi) {
             hi = hi.max(e);

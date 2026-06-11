@@ -439,8 +439,8 @@ fn quality_findings(report: &SurveyReport, cfg: &FindingsConfig, out: &mut Vec<F
                 json_path: Some(format!("fields.{}.presence", name)),
             });
         }
-        if let Some(MeasureReport::TypeStability(t)) = profile.measures.get("TypeStability") {
-            if t.surprise_count > 0 {
+        if let Some(MeasureReport::TypeStability(t)) = profile.measures.get("TypeStability")
+            && t.surprise_count > 0 {
                 out.push(Finding {
                     section: "Pass 1 vs Pass 2 surprises".into(),
                     severity: Severity::Warning,
@@ -451,7 +451,6 @@ fn quality_findings(report: &SurveyReport, cfg: &FindingsConfig, out: &mut Vec<F
                     json_path: Some(format!("fields.{}.measures.TypeStability", name)),
                 });
             }
-        }
     }
 }
 
@@ -660,8 +659,7 @@ mod tests {
         let mut r = empty_report();
         let (name, profile) = integer_profile("flag", 100);
         r.fields.insert(name, profile);
-        let mut cfg = FindingsConfig::default();
-        cfg.min_severity = Severity::Warning;
+        let cfg = FindingsConfig { min_severity: Severity::Warning, ..Default::default() };
         let (_, json) = render_findings(&r, &cfg);
         // Partition candidate is Notable; should be filtered.
         assert!(json.findings.iter().all(|f| f.severity >= Severity::Warning));

@@ -333,7 +333,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         loop {
             let input = prompt_with_default(
                 "Facets to include in dataset (* for all, +X to add)",
-                &implied_facets,
+                implied_facets,
             );
             let trimmed = input.trim();
 
@@ -417,8 +417,9 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     // ── Base vectors (B is always required) ───────────────────────────
     println!();
     println!("--- Vector source ---");
-    let base_vectors = if roles_accepted && detected.base_vectors.is_some() {
-        let bv = detected.base_vectors.as_ref().unwrap();
+    let base_vectors = if roles_accepted
+        && let Some(bv) = detected.base_vectors.as_ref()
+    {
         println!("  Using detected: {}", bv.display());
         Some(bv.clone())
     } else {
@@ -769,7 +770,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     let base_vec_count = base_vectors.as_ref().and_then(|p| probe_vector_count(p)).unwrap_or(0);
     let query_vec_count = query_vectors.as_ref()
         .and_then(|p| probe_vector_count(p))
-        .or_else(|| if self_search { Some(query_count as u64) } else { None })
+        .or(if self_search { Some(query_count as u64) } else { None })
         .unwrap_or(0);
     let dim = base_vectors.as_ref().and_then(|p| probe_vector_dim(p)).unwrap_or(128) as u64;
     let verify_knn_sample = if query_vec_count > 0 && base_vec_count > 0 {
@@ -1038,8 +1039,6 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                     let start = (effective_max / 10).max(1000);
                     let start_label = format_count_label(start);
                     format!("mul:{}/2", start_label)
-                } else if effective_max >= 10_000 {
-                    format_count_label(effective_max / 2)
                 } else {
                     format_count_label(effective_max / 2)
                 }
@@ -1216,15 +1215,14 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         // HDF5 dataset paths
         if path_str.contains('#') {
             let fmt = VecFormat::detect(p);
-            if let Some(f) = fmt {
-                if let Ok(meta) = veks_core::formats::reader::probe_source(p, f) {
+            if let Some(f) = fmt
+                && let Ok(meta) = veks_core::formats::reader::probe_source(p, f) {
                     let prec = match meta.element_size {
                         1 => "u8", 2 => "f16", 4 => "f32", 8 => "f64",
                         n => return format!("hdf5 {}B", n),
                     };
                     return format!("hdf5#{} dim={}", prec, meta.dimension);
                 }
-            }
             return "hdf5".into();
         }
         if p.is_dir() {
@@ -1442,7 +1440,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
 /// have a `_` prefix. Updates the paths in `detected` in place.
 fn rename_detected_sources(detected: &mut DetectedRoles) {
     fn needs_prefix(path: &Option<PathBuf>) -> bool {
-        path.as_ref().map_or(false, |p| {
+        path.as_ref().is_some_and(|p| {
             let fname = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             !fname.starts_with('_') && !fname.is_empty()
         })
@@ -1587,11 +1585,10 @@ fn prompt_source_location(source: &Path, output_dir: &Path, label: &str) -> Path
         let dataset_part = &source_str[hash_pos..]; // includes #
 
         // Check if this container was already renamed
-        if let Ok(renames) = HDF5_RENAMES.lock() {
-            if let Some((_, new_file)) = renames.iter().find(|(old, _)| old == file_part) {
+        if let Ok(renames) = HDF5_RENAMES.lock()
+            && let Some((_, new_file)) = renames.iter().find(|(old, _)| old == file_part) {
                 return PathBuf::from(format!("{}{}", new_file, dataset_part));
             }
-        }
 
         let file_path = Path::new(file_part);
         let filename = file_path.file_name()
@@ -1741,11 +1738,11 @@ fn probe_vector_dim(path: &Path) -> Option<u32> {
 
 /// Format a count as a clean suffix label (e.g., 407000000 → "407m").
 fn format_count_label(n: u64) -> String {
-    if n >= 1_000_000_000 && n % 1_000_000_000 == 0 {
+    if n >= 1_000_000_000 && n.is_multiple_of(1_000_000_000) {
         format!("{}b", n / 1_000_000_000)
-    } else if n >= 1_000_000 && n % 1_000_000 == 0 {
+    } else if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
         format!("{}m", n / 1_000_000)
-    } else if n >= 1_000 && n % 1_000 == 0 {
+    } else if n >= 1_000 && n.is_multiple_of(1_000) {
         format!("{}k", n / 1_000)
     } else {
         format!("{}", n)
@@ -1779,10 +1776,7 @@ const FLOAT_XVEC_FORMATS: &[(VecFormat, usize, &str)] = &[
 /// Returns the target format name (e.g., `"mvec"`) if conversion is needed,
 /// or `None` if the file should be used as-is.
 fn check_vector_precision(label: &str, path: &Path) -> Option<String> {
-    let format = match VecFormat::detect(path) {
-        Some(f) => f,
-        None => return None, // not a recognized format — nothing to confirm
-    };
+    let format = VecFormat::detect(path)?;
 
     // Only relevant for floating-point xvec formats
     let current = match format {
@@ -2049,10 +2043,10 @@ pub(crate) fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRol
         // Split on common delimiters for word-boundary matching.
         // This avoids false positives like "test" matching "base_test"
         // or "gt" matching "lighgt".
-        let tokens: Vec<&str> = stem.split(|c: char| c == '_' || c == '-' || c == '.')
+        let tokens: Vec<&str> = stem.split(['_', '-', '.'])
             .filter(|s| !s.is_empty())
             .collect();
-        let has_token = |keyword: &str| tokens.iter().any(|t| *t == keyword);
+        let has_token = |keyword: &str| tokens.contains(&keyword);
         let has_token_or_substring = |keyword: &str| stem.contains(keyword);
 
         // Some keywords are safe as substrings (long, unambiguous);
@@ -2121,11 +2115,14 @@ pub(crate) fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRol
     let mut seen: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
     for (i, (role, _)) in assignments.iter().enumerate() {
         let key = *role as u8;
-        if seen.contains_key(&key) {
-            // Mark as ambiguous — we'll push both to unassigned
-            seen.insert(key, usize::MAX);
-        } else {
-            seen.insert(key, i);
+        match seen.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                // Mark as ambiguous — we'll push both to unassigned
+                e.insert(usize::MAX);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(i);
+            }
         }
     }
 
@@ -2319,37 +2316,34 @@ fn prompt_with_prefill(label: &str, default: &str) -> String {
     }
 
     loop {
-        match event::read() {
-            Ok(Event::Key(key)) => match key.code {
-                KeyCode::Enter => break,
-                KeyCode::Backspace => {
-                    if !buf.is_empty() {
-                        buf.pop();
-                        eprint!("\x08 \x08"); // erase char
-                        io::stderr().flush().unwrap_or(());
-                    }
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let _ = terminal::disable_raw_mode();
-                    eprintln!();
-                    std::process::exit(130);
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Clear line
-                    let clear = "\x08 \x08".repeat(buf.len());
-                    eprint!("{}", clear);
-                    io::stderr().flush().unwrap_or(());
-                    buf.clear();
-                }
-                KeyCode::Char(c) => {
-                    buf.push(c);
-                    eprint!("{}", c);
+        if let Ok(Event::Key(key)) = event::read() { match key.code {
+            KeyCode::Enter => break,
+            KeyCode::Backspace => {
+                if !buf.is_empty() {
+                    buf.pop();
+                    eprint!("\x08 \x08"); // erase char
                     io::stderr().flush().unwrap_or(());
                 }
-                _ => {}
-            },
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let _ = terminal::disable_raw_mode();
+                eprintln!();
+                std::process::exit(130);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Clear line
+                let clear = "\x08 \x08".repeat(buf.len());
+                eprint!("{}", clear);
+                io::stderr().flush().unwrap_or(());
+                buf.clear();
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                eprint!("{}", c);
+                io::stderr().flush().unwrap_or(());
+            }
             _ => {}
-        }
+        } }
     }
 
     let _ = terminal::disable_raw_mode();

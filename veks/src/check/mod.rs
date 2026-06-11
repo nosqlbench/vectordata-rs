@@ -357,11 +357,10 @@ pub fn run(args: CheckArgs) {
         let pub_count = ds_entries.iter().filter(|(_, p, _)| *p).count();
         let local_count = ds_entries.iter().filter(|(_, p, _)| !*p).count();
         println!();
-        println!("  {} total: {} {} {}",
+        println!("  {} total: {} {} (legend: publish=has .publish file, local=no .publish file)",
             ds_entries.len(),
             crate::term::green(&format!("{} publishable", pub_count)),
             crate::term::dim(&format!("{} local", local_count)),
-            "(legend: publish=has .publish file, local=no .publish file)",
         );
     }
 

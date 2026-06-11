@@ -84,7 +84,7 @@ impl TestDataGroup {
         // Explicit catalog file: dispatch by content shape, no
         // sibling probing.
         if path.is_file()
-            && path.extension().map_or(false, |ext| ext == "yaml" || ext == "yml")
+            && path.extension().is_some_and(|ext| ext == "yaml" || ext == "yml")
         {
             let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
             let yaml_content = fs::read_to_string(path).map_err(Error::ConfigIo)?;
@@ -124,7 +124,7 @@ impl TestDataGroup {
         let knn_path = dir.join("knn_entries.yaml");
         if knn_path.exists() {
             let entries = crate::knn_entries::KnnEntries::load(&knn_path)
-                .map_err(|e| Error::Other(e))?;
+                .map_err(Error::Other)?;
             let dir_name = dir
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -226,7 +226,7 @@ impl TestDataGroup {
         let resp = client.get(knn_url).send()?.error_for_status()?;
         let yaml_content = resp.text()?;
         let entries = crate::knn_entries::KnnEntries::parse(&yaml_content)
-            .map_err(|e| Error::Other(e))?;
+            .map_err(Error::Other)?;
         let url_dir_name = base_url
             .path_segments()
             .and_then(|s| s.collect::<Vec<_>>().iter().rev().find(|seg| !seg.is_empty()).cloned())

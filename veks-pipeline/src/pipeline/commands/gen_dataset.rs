@@ -131,7 +131,7 @@ generation, or half-precision storage.
             .and_then(|s| s.parse().ok())
             .unwrap_or(100);
         let distance = options.get("distance").unwrap_or("L2");
-        let force = options.get("force").map_or(false, |s| s == "true");
+        let force = options.get("force") == Some("true");
         let seed = rng::parse_seed(options.get("seed"));
         let min_val: f32 = options
             .get("min")
@@ -433,7 +433,7 @@ fn compute_ground_truth(
     k: usize,
     distance_name: &str,
 ) -> Result<(), String> {
-    let metric = simd_distance::Metric::from_str(distance_name)
+    let metric = simd_distance::Metric::parse(distance_name)
         .ok_or_else(|| format!("unknown distance metric: {}", distance_name))?;
     let dist_fn = simd_distance::select_distance_fn(metric);
 
@@ -468,12 +468,11 @@ fn compute_ground_truth(
 
             if heap.len() < k {
                 heap.push(DistEntry { dist: d, idx: bi });
-            } else if let Some(top) = heap.peek() {
-                if d < top.dist {
+            } else if let Some(top) = heap.peek()
+                && d < top.dist {
                     heap.pop();
                     heap.push(DistEntry { dist: d, idx: bi });
                 }
-            }
         }
 
         // Sort by distance ascending

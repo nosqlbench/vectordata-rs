@@ -89,8 +89,8 @@ impl HttpTransport {
         // header and no `Location`. Rewrite the URL and retry
         // exactly once. We don't loop — if the second probe also
         // misbehaves we surface the error.
-        if resp.status().as_u16() == 301 {
-            if let Some(region) = resp
+        if resp.status().as_u16() == 301
+            && let Some(region) = resp
                 .headers()
                 .get("x-amz-bucket-region")
                 .and_then(|v| v.to_str().ok())
@@ -102,10 +102,9 @@ impl HttpTransport {
                     .send()
                     .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?
                     .error_for_status()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    .map_err(io::Error::other)?;
                 return read_probe_headers(&retry);
             }
-        }
 
         // Any other unfollowed 3xx is a misconfiguration — reqwest
         // follows up to 10 redirects when there's a `Location`
@@ -114,8 +113,7 @@ impl HttpTransport {
         // it as a clear error rather than letting the "missing
         // Content-Length" read further down hide the real cause.
         if resp.status().is_redirection() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!(
                     "unfollowed {} from {} (no Location header — \
                      bucket may be in a different region; set AWS_REGION \
@@ -127,7 +125,7 @@ impl HttpTransport {
         }
         let resp = resp
             .error_for_status()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         read_probe_headers(&resp)
     }
 
@@ -206,7 +204,7 @@ impl ChunkedTransport for HttpTransport {
             .send()
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?
             .error_for_status()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         let bytes = resp
             .bytes()

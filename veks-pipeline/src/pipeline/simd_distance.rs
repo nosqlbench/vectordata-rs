@@ -22,8 +22,10 @@ pub enum Metric {
 }
 
 impl Metric {
-    /// Parse from string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse from a metric-name string (case-insensitive). Named
+    /// `parse` rather than `from_str` so it can't be confused with
+    /// `std::str::FromStr::from_str`, which returns `Result`.
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "L2" | "EUCLIDEAN" => Some(Metric::L2),
             "COSINE" => Some(Metric::Cosine),
@@ -493,7 +495,7 @@ impl PackedBatches {
     /// Pack f32 query slices into the contiguous interleaved layout.
     pub fn from_f32(queries: &[&[f32]], dim: usize) -> Self {
         let n_queries = queries.len();
-        let n_batches = (n_queries + SIMD_BATCH_WIDTH - 1) / SIMD_BATCH_WIDTH;
+        let n_batches = n_queries.div_ceil(SIMD_BATCH_WIDTH);
         let stride = n_batches * SIMD_BATCH_WIDTH; // elements per dimension
         let mut data = vec![0.0f32; dim * stride];
         let mut counts = Vec::with_capacity(n_batches);
@@ -523,7 +525,7 @@ impl PackedBatches {
     /// Pack f16 query slices into the contiguous interleaved layout (f32).
     pub fn from_f16(queries: &[&[half::f16]], dim: usize) -> Self {
         let n_queries = queries.len();
-        let n_batches = (n_queries + SIMD_BATCH_WIDTH - 1) / SIMD_BATCH_WIDTH;
+        let n_batches = n_queries.div_ceil(SIMD_BATCH_WIDTH);
         let stride = n_batches * SIMD_BATCH_WIDTH;
         let mut data = vec![0.0f32; dim * stride];
         let mut counts = Vec::with_capacity(n_batches);
@@ -840,7 +842,9 @@ fn batched_cosine_f16(batch: &TransposedBatch, base: &[half::f16], out: &mut [f3
             dot += bv * batch.data[d * SIMD_BATCH_WIDTH + qi];
             if qi == 0 { base_norm_sq += bv * bv; }
         }
-        let base_norm = if qi == 0 { base_norm_sq.sqrt().max(f32::EPSILON) } else { base_norm_sq.sqrt().max(f32::EPSILON) };
+        // base_norm_sq is fully accumulated during the qi == 0 pass
+        // and loop-invariant afterwards.
+        let base_norm = base_norm_sq.sqrt().max(f32::EPSILON);
         out[qi] = 1.0 - dot / (batch.query_norms[qi] * base_norm);
     }
 }

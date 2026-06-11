@@ -737,7 +737,7 @@ mod tests {
     fn scalar_invalid_file_size_rejected() {
         let tmp = make_tmp();
         let path = tmp.path().join("bad.i32");
-        std::fs::write(&path, &[0u8; 5]).unwrap(); // 5 bytes, not divisible by 4
+        std::fs::write(&path, [0u8; 5]).unwrap(); // 5 bytes, not divisible by 4
         assert!(open(&path).is_err());
         assert!(probe(&path).is_err());
     }

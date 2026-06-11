@@ -102,7 +102,7 @@ impl Store {
         set_mode(&dir, 0o700);
         let path = credentials_path();
         let text = toml::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(&path, text)?;
         set_mode(&path, 0o600);
         Ok(())
@@ -240,6 +240,7 @@ pub struct ResolvedToken {
 ///     (e.g. `~/.config/vecd/credentials.json`) — the entry for `for_url`'s
 ///     origin is used (or the sole entry when there's just one);
 ///   * a bare token string on its own.
+///
 /// A value that isn't an existing file is taken verbatim.
 pub fn resolve_token_arg(value: &str, for_url: Option<&str>) -> Result<ResolvedToken, String> {
     let path = std::path::Path::new(value);

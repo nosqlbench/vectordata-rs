@@ -238,23 +238,21 @@ pub fn extract_xvec_dir_to_xvec_threaded(
     let total_records = probe.total_records();
     let total_files = probe.file_count();
 
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty() && !parent.exists() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("create dir {}: {}", parent.display(), e))?;
         }
-    }
 
     // Idempotent fast-exit: with the atomic-rename pattern, the existence
     // of `output` at the right size is the contract of a completed run.
-    if let Ok(meta) = fs::metadata(output) {
-        if meta.len() == total_bytes {
+    if let Ok(meta) = fs::metadata(output)
+        && meta.len() == total_bytes {
             if let Some(cb) = progress {
                 cb(total_files, total_files as u64, total_records);
             }
             return Ok(total_records);
         }
-    }
 
     // Pre-compute the per-file output offset by cumulative-sum of shard
     // sizes. Workers can then write to disjoint regions of the output
@@ -361,11 +359,10 @@ pub fn extract_xvec_dir_to_xvec_threaded(
                 if ticker_done.load(Ordering::Relaxed) {
                     let cur = ticker_total.load(Ordering::Relaxed);
                     let recs = ticker_records.load(Ordering::Relaxed);
-                    if cur > last_seen {
-                        if let Some(cb) = ticker_progress {
+                    if cur > last_seen
+                        && let Some(cb) = ticker_progress {
                             cb((cur - last_seen) as usize, cur, recs);
                         }
-                    }
                     break;
                 }
                 thread::sleep(PROGRESS_TICK);

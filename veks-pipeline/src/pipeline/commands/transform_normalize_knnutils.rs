@@ -91,11 +91,10 @@ Requires `python3` with `numpy` installed.
         let source_path = resolve_path(source_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
 
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists() {
                 let _ = std::fs::create_dir_all(parent);
             }
-        }
 
         ctx.ui.log(&format!(
             "  normalize-knnutils: {} -> {} (via numpy)",
@@ -134,7 +133,7 @@ print(f'{{n}} {{zero_count}}')
                     return error_result(format!("numpy normalization failed: {}", stderr), start);
                 }
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                let parts: Vec<&str> = stdout.trim().split_whitespace().collect();
+                let parts: Vec<&str> = stdout.split_whitespace().collect();
                 let count: usize = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
                 let zero_count: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 

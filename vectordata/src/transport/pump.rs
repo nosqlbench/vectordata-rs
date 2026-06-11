@@ -164,7 +164,7 @@ mod tests {
                 if i == 0 {
                     // Item 0 is dispatched first (ascending order), so the
                     // abort takes effect early.
-                    Err(io::Error::new(io::ErrorKind::Other, "boom"))
+                    Err(io::Error::other("boom"))
                 } else {
                     Ok(())
                 }

@@ -737,12 +737,11 @@ pub fn extract_parquet_to_xvec_threaded(
     }
 
     // Create output directory if needed.
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty() && !parent.exists() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("create dir {}: {}", parent.display(), e))?;
         }
-    }
 
     // Single-thread path keeps the existing veks-io sink for simplicity.
     if threads <= 1 {
@@ -788,8 +787,8 @@ pub fn extract_parquet_to_xvec_threaded(
     // shards dir is always around afterwards (we keep it as the
     // resumable intermediate for stage-1 → stage-2), so we deliberately
     // do NOT consult its presence here.
-    if let Ok(meta) = fs::metadata(output) {
-        if meta.len() == total_bytes {
+    if let Ok(meta) = fs::metadata(output)
+        && meta.len() == total_bytes {
             if let Some(cb) = progress {
                 cb(&ExtractProgressTick {
                     shards_delta: files.len(),
@@ -803,7 +802,6 @@ pub fn extract_parquet_to_xvec_threaded(
             }
             return Ok(total_rows);
         }
-    }
 
     // No trustworthy output. Wipe any prior in-progress artifacts so the
     // phases below start from a known-clean slate (besides resumable
@@ -1198,8 +1196,8 @@ fn shard_worker_loop(
         // The shard's content is fully determined by the source's
         // record contents and our pure-data extraction — same source
         // file → same shard bytes — so size congruence is sufficient.
-        if let Ok(meta) = fs::metadata(&shard_path) {
-            if meta.len() == expected_shard_size {
+        if let Ok(meta) = fs::metadata(&shard_path)
+            && meta.len() == expected_shard_size {
                 shards_done.fetch_add(1, Ordering::Relaxed);
                 records_done.fetch_add(expected_rows, Ordering::Relaxed);
                 writer_advance.fetch_max(idx + 1, Ordering::Relaxed);
@@ -1213,7 +1211,6 @@ fn shard_worker_loop(
                 }
                 continue;
             }
-        }
 
         // Acquire in-flight slot only when we actually have work to do
         // (skipped shards don't consume a slot — they're zero-cost).
@@ -1424,9 +1421,8 @@ fn parquet_prefetch_loop(
 
         // Don't prefetch if the shard is already cached — the decoder
         // will skip it anyway.
-        if let Ok(meta) = fs::metadata(&shard_path) {
-            if meta.len() == expected_shard_size { continue; }
-        }
+        if let Ok(meta) = fs::metadata(&shard_path)
+            && meta.len() == expected_shard_size { continue; }
 
         // Force the file's pages into the page cache. Errors here are
         // non-fatal — the decoder will hit a cache miss and pay the

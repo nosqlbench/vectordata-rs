@@ -60,3 +60,6 @@ tempfile = "3"
 [[bench]]
 name = "simd_distance"
 harness = false
+
+[lints]
+workspace = true

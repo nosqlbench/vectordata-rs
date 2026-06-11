@@ -143,7 +143,7 @@ statistics.
 
         let source_path = resolve_path(source_str, &ctx.workspace);
         let target_path = resolve_path(target_str, &ctx.workspace);
-        let force = options.get("force").map_or(false, |s| s == "true");
+        let force = options.get("force") == Some("true");
         let sample: usize = options
             .get("sample")
             .and_then(|s| s.parse().ok())

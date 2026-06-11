@@ -161,7 +161,7 @@ impl GenPredicatesOp {
                 start,
             );
         }
-        let input_path = source_resolved.clone().unwrap_or_else(PathBuf::new);
+        let input_path = source_resolved.clone().unwrap_or_default();
 
         // Resolve `--output`: CLI > proto > error. Captured in
         // the proto by the wizard, so a fresh `--proto-file`
@@ -644,9 +644,8 @@ fn parse_csv_field_list(s: &str) -> Vec<String> {
 /// unconditionally. Both filters compare case-sensitive exact
 /// names — the metadata schema is authoritative.
 fn field_passes_name_filter(name: &str, whitelist: Option<&[String]>, blacklist: &[String]) -> bool {
-    if let Some(allowed) = whitelist {
-        if !allowed.iter().any(|n| n == name) { return false; }
-    }
+    if let Some(allowed) = whitelist
+        && !allowed.iter().any(|n| n == name) { return false; }
     if blacklist.iter().any(|n| n == name) { return false; }
     true
 }
@@ -871,11 +870,10 @@ fn build_predicate_for_field(
             Some(boolean_predicate(field, rng))
         }
         SemanticType::Number(kind) => {
-            if op_mask.allows_numeric_inequality() {
-                if let Some(p) = numeric_predicate(field.clone(), profile, *kind, target_sel, op_mask, rng) {
+            if op_mask.allows_numeric_inequality()
+                && let Some(p) = numeric_predicate(field.clone(), profile, *kind, target_sel, op_mask, rng) {
                     return Some(p);
                 }
-            }
             if op_mask.allows_eq() {
                 if let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
                     return Some(p);
@@ -885,11 +883,10 @@ fn build_predicate_for_field(
             None
         }
         SemanticType::Temporal(_) => {
-            if op_mask.allows_numeric_inequality() {
-                if let Some(p) = numeric_predicate(field.clone(), profile, NumberKind::Floating, target_sel, op_mask, rng) {
+            if op_mask.allows_numeric_inequality()
+                && let Some(p) = numeric_predicate(field.clone(), profile, NumberKind::Floating, target_sel, op_mask, rng) {
                     return Some(p);
                 }
-            }
             if op_mask.allows_eq() {
                 return reservoir_predicate(field, profile, false);
             }
@@ -910,21 +907,18 @@ fn build_predicate_for_field(
             let try_eq = op_mask.allows_eq();
             let prefer_matches = if try_matches && try_eq { rng.random_bool(0.5) }
                 else { try_matches };
-            if prefer_matches && try_matches {
-                if let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng) {
+            if prefer_matches && try_matches
+                && let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng) {
                     return Some(p);
                 }
-            }
-            if try_eq {
-                if let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
+            if try_eq
+                && let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
                     return Some(p);
                 }
-            }
-            if !prefer_matches && try_matches {
-                if let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng) {
+            if !prefer_matches && try_matches
+                && let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng) {
                     return Some(p);
                 }
-            }
             if try_eq {
                 return reservoir_predicate(field, profile, true);
             }
@@ -1207,8 +1201,8 @@ fn trigram_matches_predicate(
 ///
 /// Weight = `1 / (|count - target| + 1)`. Returns `None` for an
 /// empty candidate slice.
-fn sample_by_target_proximity<'a, T: Copy>(
-    candidates: &'a [(T, f64)],
+fn sample_by_target_proximity<T: Copy>(
+    candidates: &[(T, f64)],
     target_count: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> Option<T> {
@@ -1602,16 +1596,13 @@ mod tests {
         for ord in 0..total {
             let bytes = preds_reader.get(ord as i64).unwrap();
             let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
-            if let FmtPNode::Predicate(p) = &pnode {
-                if p.op == OpType::Matches {
-                    if let Some(Comparand::Text(pat)) = p.comparands.first() {
-                        if pat.starts_with("(^|, ") && pat.ends_with("(,|$)") {
+            if let FmtPNode::Predicate(p) = &pnode
+                && p.op == OpType::Matches
+                    && let Some(Comparand::Text(pat)) = p.comparands.first()
+                        && pat.starts_with("(^|, ") && pat.ends_with("(,|$)") {
                             saw_anchored = true;
                             break;
                         }
-                    }
-                }
-            }
         }
         assert!(
             saw_anchored,
@@ -1878,9 +1869,8 @@ mod tests {
         for i in 0..reader.total_records() {
             let bytes = reader.get(i as i64).unwrap();
             let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
-            if let FmtPNode::Predicate(p) = pnode {
-                if let FieldRef::Named(n) = p.field { names.push(n); }
-            }
+            if let FmtPNode::Predicate(p) = pnode
+                && let FieldRef::Named(n) = p.field { names.push(n); }
         }
         names
     }

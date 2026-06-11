@@ -34,8 +34,8 @@ use ratatui::{
 use simsimd::SpatialSimilarity;
 
 use super::shared::{
-    UnifiedReader, SampleMode, sample_indices, clump_size_for_dim,
-    install_abort_handler, normalize,
+    UnifiedReader, SampleMode, sample_indices, clump_size_for,
+    spawn_chunk_prefetch, install_abort_handler, normalize,
 };
 use crate::CacheStats;
 
@@ -342,8 +342,11 @@ pub(super) fn run_interactive_explore(
     };
 
     let mut current_sample = sample_size.min(total);
-    let is_remote = reader.is_remote();
-    let clump = clump_size_for_dim(dim, is_remote);
+    // Chunk geometry of the remote store (None for local files):
+    // drives whole-chunk clump sizing, chunk-aligned clump placement,
+    // and the parallel readahead in the read thread.
+    let geometry = reader.chunk_geometry();
+    let clump = clump_size_for(geometry);
 
     let abort_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     install_abort_handler(abort_flag.clone());
@@ -420,7 +423,12 @@ pub(super) fn run_interactive_explore(
     // Outer loop: restarts computation when sample size changes.
     // Old data stays visible until new data arrives.
     loop {
-    let indices = sample_indices(total, current_sample, seed, sample_mode, clump);
+    let indices = sample_indices(total, current_sample, seed, sample_mode, clump, geometry);
+    // Cancellation for this iteration's read + prefetch threads:
+    // set when the inner loop exits (restart or quit) so abandoned
+    // workers stop fetching instead of downloading the rest of a
+    // sample nobody will consume.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // ── Phase 1: Read vectors + compute norms on background thread ──
     let (read_tx, new_read_rx) = mpsc::channel::<ReadBatch>();
@@ -429,32 +437,27 @@ pub(super) fn run_interactive_explore(
         let source_owned = source.to_string();
         let indices_clone = indices.clone();
         let dim_copy = dim;
+        let cancel = cancel.clone();
         std::thread::spawn(move || {
-            let bg_reader = UnifiedReader::open(&source_owned);
+            let bg_reader = std::sync::Arc::new(UnifiedReader::open(&source_owned));
+            // Parallel readahead: warm the chunks covering this
+            // sample with the download worker pool while the serial
+            // loop below consumes them in order. In-flight dedup in
+            // the storage layer means the consumer waits on chunks
+            // the prefetcher already started instead of re-fetching.
+            spawn_chunk_prefetch(bg_reader.clone(), &indices_clone, cancel.clone());
             let batch_size = 500;
             let mut batch_vecs: Vec<f32> = Vec::with_capacity(batch_size * dim_copy);
             let mut batch_norms: Vec<f64> = Vec::with_capacity(batch_size);
             let mut batch_count = 0;
 
-            // Group indices into contiguous runs and serve each run with
-            // a single range read. For Streaming (one big run) and
-            // Clumped (many small runs) sample modes this collapses
-            // O(N) per-vector channel reads into O(runs) — which on a
-            // remote-backed view is the difference between O(N) HTTP
-            // round trips and O(runs) parallel chunk fetches.
-            //
-            // Sparse mode produces no contiguous runs, so each "run" is
-            // length 1 and behaviour matches the old per-index loop.
-            let mut i = 0usize;
-            while i < indices_clone.len() {
-                let run_start = indices_clone[i];
-                let mut run_end = i + 1;
-                while run_end < indices_clone.len()
-                    && indices_clone[run_end] == indices_clone[run_end - 1] + 1 {
-                    run_end += 1;
-                }
-                let run_len = run_end - i;
-
+            // Serve the sample as contiguous runs capped at
+            // `batch_size` — see `contiguous_runs` for why the cap is
+            // load-bearing for UI liveness on remote sources.
+            for (run_start, run_len) in
+                super::shared::contiguous_runs(&indices_clone, batch_size)
+            {
+                if cancel.load(Ordering::Relaxed) { return; }
                 let vecs = if run_len > 1 {
                     bg_reader.get_f32_range(run_start, run_len)
                 } else {
@@ -464,25 +467,27 @@ pub(super) fn run_interactive_explore(
                 for opt in vecs {
                     if let Some(v) = opt {
                         let norm_sq = <f32 as SpatialSimilarity>::dot(&v, &v).unwrap_or(0.0);
-                        batch_norms.push((norm_sq as f64).sqrt());
+                        batch_norms.push(norm_sq.sqrt());
                         batch_vecs.extend_from_slice(&v);
                         batch_count += 1;
                     }
                     if batch_count >= batch_size {
                         let stats = bg_reader.cache_stats();
-                        let _ = read_tx.send(ReadBatch {
+                        let send = read_tx.send(ReadBatch {
                             vectors: std::mem::take(&mut batch_vecs),
                             norms: std::mem::take(&mut batch_norms),
                             count: batch_count,
                             cache_stats: stats,
                         });
+                        // Receiver dropped (restart/quit) — stop
+                        // reading rather than fetching the rest of
+                        // the sample for nobody.
+                        if send.is_err() { return; }
                         batch_vecs = Vec::with_capacity(batch_size * dim_copy);
                         batch_norms = Vec::with_capacity(batch_size);
                         batch_count = 0;
                     }
                 }
-
-                i = run_end;
             }
 
             if batch_count > 0 {
@@ -634,7 +639,7 @@ pub(super) fn run_interactive_explore(
                                         for vi in 0..actual_n {
                                             let off = vi * dim_c;
                                             let c = &centered_buf[off..off + dim_c];
-                                            let dot = <f32 as SpatialSimilarity>::dot(c, &v_f32).unwrap_or(0.0) as f64;
+                                            let dot = <f32 as SpatialSimilarity>::dot(c, &v_f32).unwrap_or(0.0);
                                             for d in 0..dim_c { new_v[d] += c[d] as f64 * dot; }
                                         }
                                         for d in 0..dim_c { new_v[d] /= actual_n as f64; }
@@ -651,7 +656,7 @@ pub(super) fn run_interactive_explore(
                                     for vi in 0..actual_n {
                                         let off = vi * dim_c;
                                         let c = &centered_buf[off..off + dim_c];
-                                        let dot = <f32 as SpatialSimilarity>::dot(c, &v_f32).unwrap_or(0.0) as f64;
+                                        let dot = <f32 as SpatialSimilarity>::dot(c, &v_f32).unwrap_or(0.0);
                                         ev_sum += dot * dot;
                                     }
                                     let eigenvalue = ev_sum / actual_n as f64;
@@ -675,8 +680,8 @@ pub(super) fn run_interactive_explore(
         }
 
         // ── Drain Phase 2 (distances) ──
-        if phase1_done && !phase2_done {
-            if let Some(ref rx) = dist_rx {
+        if phase1_done && !phase2_done
+            && let Some(ref rx) = dist_rx {
                 let mut batches = 0usize;
                 loop {
                     if batches >= 4 { break; }
@@ -691,11 +696,10 @@ pub(super) fn run_interactive_explore(
                     }
                 }
             }
-        }
 
         // ── Drain Phase 3 (eigenvalues) ──
-        if phase1_done && !phase3_done {
-            if let Some(ref rx) = eigen_rx {
+        if phase1_done && !phase3_done
+            && let Some(ref rx) = eigen_rx {
                 loop {
                     match rx.try_recv() {
                         Ok(msg) => {
@@ -757,7 +761,6 @@ pub(super) fn run_interactive_explore(
                     }
                 }
             }
-        }
 
         // Auto-deepen eigenvalues when loadings view is active and we have < 30 PCs.
         // The eigen thread checks the target atomically, so bumping it while
@@ -777,15 +780,14 @@ pub(super) fn run_interactive_explore(
         }
 
         // ── Drain Phase 4 (projection) ──
-        if phase3_done && !phase4_done {
-            if let Some(ref rx) = proj_rx {
+        if phase3_done && !phase4_done
+            && let Some(ref rx) = proj_rx {
                 match rx.try_recv() {
                     Ok(msg) => { projected = msg.points; phase4_done = true; }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => { phase4_done = true; }
                 }
             }
-        }
 
         let elapsed = compute_start.elapsed().as_secs_f64();
 
@@ -810,9 +812,28 @@ pub(super) fn run_interactive_explore(
         };
         status_msg = if !phase1_done {
             let rate = if elapsed > 0.0 { vectors_loaded as f64 / elapsed } else { 0.0 };
+            // Chunk-fill suffix: present for every remote-backed open
+            // (merkle-cached and chunked-HTTP alike). Deliberately
+            // pedantic about what is being measured: locally-resident
+            // bytes of the WHOLE underlying file (not of this
+            // sample), with the exact chunk tally alongside — so a
+            // sample that only touches a slice of a huge file reads
+            // as the partial whole-file fill it is, not as a stalled
+            // download.
             let ci = last_cache_stats.as_ref().map(|cs| {
-                let pct = if cs.total_chunks > 0 { 100.0 * cs.valid_chunks as f64 / cs.total_chunks as f64 } else { 0.0 };
-                format!(" | cache {:.0}%", pct)
+                // Every chunk except the last is exactly chunk_size
+                // bytes; clamp to content_size so a valid final
+                // (short) chunk can't overcount.
+                let bytes = (cs.valid_chunks as u64 * cs.chunk_size).min(cs.content_size);
+                let pct = if cs.total_chunks > 0 {
+                    100.0 * cs.valid_chunks as f64 / cs.total_chunks as f64
+                } else { 0.0 };
+                format!(
+                    " | file cache: {} of {} ({}/{} chunks, {:.1}%)",
+                    super::format_bytes_short(bytes),
+                    super::format_bytes_short(cs.content_size),
+                    cs.valid_chunks, cs.total_chunks, pct,
+                )
             }).unwrap_or_default();
             format!("{} Reading: {}/{} ({:.0}/s){}", spinner, vectors_loaded, current_sample, rate, ci)
         } else if !phase2_done || !phase3_done {
@@ -840,7 +861,7 @@ pub(super) fn run_interactive_explore(
                     let total_ev: f64 = eigenvalues.iter().sum();
                     let pcts: Vec<f64> = eigenvalues.iter().take(5).map(|v| 100.0 * v / total_ev).collect();
                     format!("PC1:{:.1}% PC2:{:.1}% PC3:{:.1}% PC4:{:.1}% PC5:{:.1}%",
-                        pcts.get(0).unwrap_or(&0.0), pcts.get(1).unwrap_or(&0.0),
+                        pcts.first().unwrap_or(&0.0), pcts.get(1).unwrap_or(&0.0),
                         pcts.get(2).unwrap_or(&0.0), pcts.get(3).unwrap_or(&0.0),
                         pcts.get(4).unwrap_or(&0.0))
                 } else { String::new() }
@@ -1242,6 +1263,11 @@ pub(super) fn run_interactive_explore(
         }
     } // end inner loop
 
+    // Tell this iteration's read + prefetch threads to stop fetching
+    // — whether we're restarting with a new sample size or leaving
+    // the explorer entirely.
+    cancel.store(true, Ordering::Relaxed);
+
     if !restart { break; }
 
     } // end 'compute loop
@@ -1433,7 +1459,7 @@ fn render_loadings(
         // Auto-fit: exactly fill the available vertical space
         (dim as f64 / data_rows as f64).ceil() as usize
     }.max(1);
-    let num_bands = (dim + band_size - 1) / band_size;
+    let num_bands = dim.div_ceil(band_size);
 
     let total_ev: f64 = eigenvalues.iter().sum();
 
@@ -1498,7 +1524,7 @@ fn render_loadings(
                 if bar_fill >= 6 {
                     let val_str = format!("{:.2}", intensity);
                     let val_len = val_str.len();
-                    if filled >= val_len + 1 {
+                    if filled > val_len {
                         let bar = format!("{}{}{} ",
                             "█".repeat(filled - val_len),
                             val_str,
@@ -1553,7 +1579,7 @@ fn render_loadings(
                 let intensity = band_loading(pc, d_start, d_end) / global_max;
                 let color = loading_color(intensity);
                 let block = loading_char(intensity);
-                let fill: String = std::iter::repeat(block).take(pc_col_w).collect();
+                let fill: String = std::iter::repeat_n(block, pc_col_w).collect();
                 spans.push(Span::styled(fill, Style::default().fg(color)));
             }
             lines.push(Line::from(spans));

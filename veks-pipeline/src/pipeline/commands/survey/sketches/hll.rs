@@ -131,11 +131,10 @@ impl HyperLogLog {
         // empty, linear counting is more accurate. The exact
         // threshold from Heule et al is 2.5 · m; the linear-counting
         // result is `m · ln(m / zeros)`.
-        if raw <= 2.5 * m {
-            if zeros > 0 {
+        if raw <= 2.5 * m
+            && zeros > 0 {
                 return m * (m / zeros as f64).ln();
             }
-        }
         raw
     }
 

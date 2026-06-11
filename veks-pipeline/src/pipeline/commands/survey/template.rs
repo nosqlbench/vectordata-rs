@@ -242,12 +242,11 @@ impl ExplorationProbe {
         let reservoir_samples: Vec<MValue> = self.reservoir.items().to_vec();
         let (probe_tallies, best_probe) =
             run_probes(&default_probes(), &reservoir_samples, self.cfg.semantic_confidence);
-        if !mixed_kinds {
-            if let Some((_kind_label, verdict, rate)) = best_probe {
+        if !mixed_kinds
+            && let Some((_kind_label, verdict, rate)) = best_probe {
                 semantic = Some(verdict);
                 semantic_confidence = rate;
             }
-        }
 
         let cardinality = classify_cardinality(
             semantic.as_ref(),

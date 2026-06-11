@@ -141,7 +141,7 @@ impl CommandOp for VerifyPredicatesOp {
         };
         let total_meta = meta_reader.total_records() as usize;
         let meta_count = match range_end {
-            Some(e) => (e as usize).min(total_meta),
+            Some(e) => e.min(total_meta),
             None => total_meta,
         };
         if range_end.is_some() {
@@ -213,7 +213,7 @@ impl CommandOp for VerifyPredicatesOp {
         let mut false_negatives = 0usize;
         let mut failures: Vec<serde_json::Value> = Vec::new();
 
-        for (_si, pred_idx) in sampled_indices.iter().enumerate() {
+        for pred_idx in sampled_indices.iter() {
             // Read PNode predicate
             let pred_data = match pred_reader.get(pred_idx as i64) {
                 Ok(d) => d,
@@ -496,7 +496,7 @@ fn pnode_to_sql(pnode: &PNode) -> Result<String, String> {
                 OpType::Le => Ok(format!("{} <= {}", field, comparand_to_sql(&pred.comparands[0])?)),
                 OpType::In => {
                     let vals: Result<Vec<String>, String> = pred.comparands.iter()
-                        .map(|c| comparand_to_sql(c))
+                        .map(comparand_to_sql)
                         .collect();
                     Ok(format!("{} IN ({})", field, vals?.join(", ")))
                 }
@@ -514,7 +514,7 @@ fn pnode_to_sql(pnode: &PNode) -> Result<String, String> {
                 _ => return Err("unsupported conjugate type".into()),
             };
             let parts: Result<Vec<String>, String> = conj.children.iter()
-                .map(|c| pnode_to_sql(c))
+                .map(pnode_to_sql)
                 .collect();
             let joined = parts?.join(&format!(" {} ", op_str));
             Ok(format!("({})", joined))

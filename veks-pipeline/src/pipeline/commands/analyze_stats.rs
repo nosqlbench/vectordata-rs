@@ -200,7 +200,7 @@ impl CommandOp for AnalyzeStatsOp {
         };
 
         let dimension: Option<usize> = options.get("dimension").and_then(|s| s.parse().ok());
-        let all_dimensions = options.get("all-dimensions").map_or(false, |s| s == "true");
+        let all_dimensions = options.get("all-dimensions") == Some("true");
         let sample: Option<usize> = options.get("sample").and_then(|s| s.parse().ok());
 
         let source = match resolve_source(source_str, &ctx.workspace) {
@@ -310,7 +310,7 @@ impl CommandOp for AnalyzeStatsOp {
                 };
                 let fc = VectorReader::<f64>::count(&r);
                 let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().to_vec()))
             }
         };
 
@@ -429,7 +429,7 @@ impl CommandOp for AnalyzeStatsOp {
                 "{:>5} {:>12} {:>12} {:>12} {:>12} {:>10} {:>10}",
                 "Dim", "Mean", "StdDev", "Min", "Max", "Skewness", "Kurtosis"
             ));
-            ctx.ui.log(&format!("{}", "-".repeat(83)));
+            ctx.ui.log(&"-".repeat(83).to_string());
 
             for (d, stats) in &dim_stats {
                 ctx.ui.log(&format!(

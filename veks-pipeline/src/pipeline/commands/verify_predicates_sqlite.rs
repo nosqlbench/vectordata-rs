@@ -165,7 +165,7 @@ impl CommandOp for VerifyPredicatesSqliteOp {
         let exemplar_count = std::sync::atomic::AtomicU64::new(0);
         let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-        let chunk_size = (actual_check + verify_threads - 1) / verify_threads;
+        let chunk_size = actual_check.div_ceil(verify_threads);
 
         std::thread::scope(|scope| {
             for chunk_start in (0..actual_check).step_by(chunk_size) {
@@ -231,12 +231,12 @@ impl CommandOp for VerifyPredicatesSqliteOp {
                                 ui_ref.log(&format!("    stored R:   {} ordinals", stored.len()));
                                 ui_ref.log(&format!("    SQL ordinals (first 5):    {}", fmt_ords(&expected, 5)));
                                 ui_ref.log(&format!("    stored ordinals (first 5): {}", fmt_ords(stored, 5)));
-                                ui_ref.log(&format!("    exact match ✓"));
+                                ui_ref.log("    exact match ✓");
                             }
                         } else {
                             fail_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if let Ok(mut errs) = errors_ref.lock() {
-                                if errs.len() < 10 {
+                            if let Ok(mut errs) = errors_ref.lock()
+                                && errs.len() < 10 {
                                     errs.push(format!(
                                         "pred {} ({}): SQL={} stored={} Δ={}",
                                         idx, where_clauses.join(" AND "),
@@ -244,11 +244,10 @@ impl CommandOp for VerifyPredicatesSqliteOp {
                                         (expected.len() as i64 - stored.len() as i64).abs(),
                                     ));
                                 }
-                            }
                         }
 
                         let done = progress_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        if done % 100 == 0 { pb_ref.set_position(done); }
+                        if done.is_multiple_of(100) { pb_ref.set_position(done); }
                     }
                 });
             }

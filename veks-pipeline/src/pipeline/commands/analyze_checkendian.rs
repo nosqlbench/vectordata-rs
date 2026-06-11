@@ -104,7 +104,7 @@ fn check_interpretation(dim: usize, element_width: usize, file_size: u64, path: 
     }
 
     let record_size = 4 + dim * element_width;
-    if file_size as usize % record_size != 0 {
+    if !(file_size as usize).is_multiple_of(record_size) {
         return invalid;
     }
 
@@ -350,7 +350,7 @@ mod tests {
         let mut ctx = test_ctx(ws);
 
         let input = ws.join("test.fvec");
-        std::fs::write(&input, &[0u8; 2]).unwrap();
+        std::fs::write(&input, [0u8; 2]).unwrap();
 
         let mut opts = Options::new();
         opts.set("source", input.to_string_lossy().to_string());

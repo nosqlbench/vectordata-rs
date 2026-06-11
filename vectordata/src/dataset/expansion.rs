@@ -19,11 +19,10 @@ use super::profile::DSProfileGroup;
 /// Collect all raw steps from a `DatasetConfig`.
 pub fn collect_all_steps(config: &DatasetConfig) -> Vec<StepDef> {
     let mut steps = Vec::new();
-    if let Some(ref pipeline) = config.upstream {
-        if let Some(ref shared_steps) = pipeline.steps {
+    if let Some(ref pipeline) = config.upstream
+        && let Some(ref shared_steps) = pipeline.steps {
             steps.extend(shared_steps.clone());
         }
-    }
     steps
 }
 
@@ -208,15 +207,12 @@ pub fn expand_per_profile_steps_scoped(
             // For partition profiles, skip templates outside the oracle scope.
             // E.g., with oracle scope "BQG", skip evaluate-predicates (R),
             // compute-filtered-knn (F), etc.
-            if is_partition {
-                if let Some(scope) = oracle_sub_facets {
-                    if let Some(facet) = command_facet(&template.run) {
-                        if !scope.contains(facet) {
+            if is_partition
+                && let Some(scope) = oracle_sub_facets
+                    && let Some(facet) = command_facet(&template.run)
+                        && !scope.contains(facet) {
                             continue;
                         }
-                    }
-                }
-            }
 
             let expanded_id = if suffix.is_empty() {
                 template_id.clone()
@@ -374,18 +370,15 @@ pub fn expand_per_profile_steps_scoped(
         .collect();
 
     for phase in 1..=max_phase {
-        let prev_phase_last = result.iter()
-            .filter(|s| s.phase == phase - 1 && !s.finalize && expanded_ids.contains(&s.effective_id()))
-            .last()
+        let prev_phase_last = result.iter().rfind(|s| s.phase == phase - 1 && !s.finalize && expanded_ids.contains(&s.effective_id()))
             .map(|s| s.effective_id());
         let this_phase_first_idx = result.iter()
             .position(|s| s.phase == phase && !s.finalize && expanded_ids.contains(&s.effective_id()));
 
-        if let (Some(prev_id), Some(idx)) = (prev_phase_last, this_phase_first_idx) {
-            if !result[idx].after.contains(&prev_id) {
+        if let (Some(prev_id), Some(idx)) = (prev_phase_last, this_phase_first_idx)
+            && !result[idx].after.contains(&prev_id) {
                 result[idx].after.push(prev_id);
             }
-        }
     }
 
     result

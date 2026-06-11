@@ -419,9 +419,9 @@ pub struct StreamContext {
     pub provenance_selector: super::provenance::ProvenanceFlags,
 }
 
-/// Describes a single accepted option for a `CommandOp`.
-///
-/// Used for dry-run validation and help output.
+// `CommandOption` (a single accepted option of a `CommandOp`, used
+// for dry-run validation and help output) lived here; the doc block
+// outlived the struct.
 
 /// The role of a pipeline option — whether it's an input file, output file,
 /// or a configuration parameter. Used for TUI display and manifest generation.

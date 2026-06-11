@@ -98,11 +98,10 @@ impl Drop for Server {
 fn wait_for_endpoint(addr_file: &Path) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
     let addr = loop {
-        if let Ok(s) = std::fs::read_to_string(addr_file) {
-            if !s.trim().is_empty() {
+        if let Ok(s) = std::fs::read_to_string(addr_file)
+            && !s.trim().is_empty() {
                 break s.trim().to_string();
             }
-        }
         if Instant::now() > deadline {
             panic!("vecd serve never published its address");
         }
@@ -111,11 +110,10 @@ fn wait_for_endpoint(addr_file: &Path) -> String {
     let base = format!("http://{addr}");
     let client = reqwest::blocking::Client::new();
     loop {
-        if let Ok(r) = client.get(format!("{base}/healthz")).send() {
-            if r.status().is_success() {
+        if let Ok(r) = client.get(format!("{base}/healthz")).send()
+            && r.status().is_success() {
                 break;
             }
-        }
         if Instant::now() > deadline {
             panic!("vecd /healthz never became ready");
         }

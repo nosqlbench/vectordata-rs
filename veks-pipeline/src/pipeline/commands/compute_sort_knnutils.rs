@@ -113,11 +113,10 @@ byte-identical shuffle results.
 
         // Create output directories
         for p in [&output_path, &duplicates_path] {
-            if let Some(parent) = p.parent() {
-                if !parent.exists() {
+            if let Some(parent) = p.parent()
+                && !parent.exists() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-            }
         }
 
         // Open source vectors
@@ -142,7 +141,7 @@ byte-identical shuffle results.
         // x[0] is the float tuple — Python tuple comparison is lexicographic
         // on all components.
         let sort_start = Instant::now();
-        let sort_pb = ctx.ui.spinner(&format!("sorting {} vectors (full lexicographic)", count));
+        let sort_pb = ctx.ui.spinner(format!("sorting {} vectors (full lexicographic)", count));
 
         let mut ordinals: Vec<u32> = (0..count as u32).collect();
 

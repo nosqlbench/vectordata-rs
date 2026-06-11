@@ -476,7 +476,7 @@ const STREAM_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 /// extracts, so the inner loop stays in safe code.
 fn alloc_chunk_buf(chunk_capacity_bytes: usize) -> Vec<f32> {
     // Round up so the byte capacity can hold any entry-sized chunk.
-    let n_f32 = (chunk_capacity_bytes + 3) / 4;
+    let n_f32 = chunk_capacity_bytes.div_ceil(4);
     vec![0.0f32; n_f32]
 }
 
@@ -621,7 +621,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             Err(e) => return error_result(e, start),
         };
         let metric_str = options.get("metric").unwrap_or("L2");
-        let metric = match Metric::from_str(metric_str) {
+        let metric = match Metric::parse(metric_str) {
             Some(m) => m,
             None => return error_result(format!("unknown metric: '{}'", metric_str), start),
         };
@@ -763,11 +763,11 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
         // fewer/differently-sized segments when scan_cached_segments
         // greedy-matches cached ranges that don't align with this
         // value. This log is just the "fresh-compute baseline."
-        let nominal_segments = (base_n + segment_size - 1) / segment_size;
+        let nominal_segments = base_n.div_ceil(segment_size);
         ctx.ui.log(&format!("  {} base-vector segments @ {} vectors each (nominal, before cache reuse)",
             nominal_segments, segment_size));
 
-        let chunk_size = (query_count + threads - 1) / threads;
+        let chunk_size = query_count.div_ceil(threads);
 
         // Per-query heaps persist across segments. Sized at internal_k
         // so the post-rerank stage has margin candidates to choose from.
@@ -952,7 +952,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             let seg_start = p.start;
             let seg_end = p.end;
             let seg_len = seg_end - seg_start;
-            let n_chunks = (seg_len + vecs_per_chunk - 1) / vecs_per_chunk;
+            let n_chunks = seg_len.div_ceil(vecs_per_chunk);
             let seg_compute_start = Instant::now();
             ctx.ui.log(&format!(
                 "  ▶ [seg {:>3}/{}] COMPUTE range [{}..{}) ({} base × {} queries, {} chunk(s) ≤ {} vecs)",
@@ -1505,9 +1505,9 @@ mod tests {
         opts.set("base", "b.fvec"); opts.set("query", "q.fvec");
         opts.set("indices", &indices_name);
         opts.set("distances", &distances_name);
-        opts.set("neighbors", &k.to_string());
+        opts.set("neighbors", k.to_string());
         opts.set("metric", metric);
-        opts.set("partition_size", &partition_size.to_string());
+        opts.set("partition_size", partition_size.to_string());
         let mut op = ComputeKnnStdarchOp;
         let r = op.execute(&opts, &mut ctx);
         (r, tmp.join(&indices_name), tmp.join(&distances_name))
@@ -1614,11 +1614,10 @@ mod tests {
         let cache_dir = tmp.path().join(".cache");
         for entry in std::fs::read_dir(&cache_dir).unwrap() {
             let p = entry.unwrap().path();
-            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                if name.contains("range_000000000030_000000000060") {
+            if let Some(name) = p.file_name().and_then(|s| s.to_str())
+                && name.contains("range_000000000030_000000000060") {
                     std::fs::remove_file(&p).unwrap();
                 }
-            }
         }
 
         // Second run produces same result, but the missing segment
@@ -1756,9 +1755,9 @@ mod tests {
             let mut opts = Options::new();
             opts.set("base", "b.fvec[0..30)"); opts.set("query", "q.fvec");
             opts.set("indices", "a.ivec"); opts.set("distances", "a-d.fvec");
-            opts.set("neighbors", &k.to_string());
+            opts.set("neighbors", k.to_string());
             opts.set("metric", "L2");
-            opts.set("partition_size", &partition_size.to_string());
+            opts.set("partition_size", partition_size.to_string());
             let mut op = ComputeKnnStdarchOp;
             let r = op.execute(&opts, &mut ctx);
             assert_eq!(r.status, Status::Ok, "profile A failed: {}", r.message);
@@ -1788,9 +1787,9 @@ mod tests {
         let mut opts = Options::new();
         opts.set("base", "b.fvec[0..60)"); opts.set("query", "q.fvec");
         opts.set("indices", "b.ivec"); opts.set("distances", "b-d.fvec");
-        opts.set("neighbors", &k.to_string());
+        opts.set("neighbors", k.to_string());
         opts.set("metric", "L2");
-        opts.set("partition_size", &partition_size.to_string());
+        opts.set("partition_size", partition_size.to_string());
         let mut op = ComputeKnnStdarchOp;
         let r = op.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok, "profile B failed: {}", r.message);
@@ -1824,9 +1823,9 @@ mod tests {
         let mut bopts = Options::new();
         bopts.set("base", "b.fvec[0..60)"); bopts.set("query", "q.fvec");
         bopts.set("indices", "baseline.ivec"); bopts.set("distances", "baseline-d.fvec");
-        bopts.set("neighbors", &k.to_string());
+        bopts.set("neighbors", k.to_string());
         bopts.set("metric", "L2");
-        bopts.set("partition_size", &partition_size.to_string());
+        bopts.set("partition_size", partition_size.to_string());
         let mut bop = ComputeKnnStdarchOp;
         let br = bop.execute(&bopts, &mut bctx);
         assert_eq!(br.status, Status::Ok);
@@ -1882,6 +1881,6 @@ mod tests {
         assert!((dot - (-70.0)).abs() < 1e-6, "neg_dot should be -70, got {}", dot);
 
         let cos = cosine_scalar(&a, &b);
-        assert!(cos >= 0.0 && cos < 0.05, "cosine dist should be near 0, got {}", cos);
+        assert!((0.0..0.05).contains(&cos), "cosine dist should be near 0, got {}", cos);
     }
 }

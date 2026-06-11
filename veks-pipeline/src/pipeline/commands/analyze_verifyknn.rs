@@ -42,7 +42,9 @@ enum DistanceMetric {
 }
 
 impl DistanceMetric {
-    fn from_str(s: &str) -> Option<Self> {
+    /// Named `parse` (not `from_str`) to avoid confusion with
+    /// `std::str::FromStr::from_str`, which returns `Result`.
+    fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "L2" | "EUCLIDEAN" => Some(DistanceMetric::L2),
             "COSINE" => Some(DistanceMetric::Cosine),
@@ -156,15 +158,14 @@ fn find_true_top_k(
                 index: window_idx,
                 distance: dist,
             });
-        } else if let Some(worst) = heap.peek() {
-            if dist < worst.distance {
+        } else if let Some(worst) = heap.peek()
+            && dist < worst.distance {
                 heap.pop();
                 heap.push(Neighbor {
                     index: window_idx,
                     distance: dist,
                 });
             }
-        }
 
         since_tick += 1;
         if since_tick >= TICK_EVERY {
@@ -174,9 +175,8 @@ fn find_true_top_k(
             since_tick = 0;
         }
     }
-    if let Some(bar) = inner_bar {
-        if since_tick > 0 { bar.inc(since_tick as u64); }
-    }
+    if let Some(bar) = inner_bar
+        && since_tick > 0 { bar.inc(since_tick as u64); }
 
     let mut result: Vec<Neighbor> = heap.into_vec();
     result.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
@@ -262,7 +262,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
         };
 
         let metric_str = options.get("metric").unwrap_or("L2");
-        let metric = match DistanceMetric::from_str(metric_str) {
+        let metric = match DistanceMetric::parse(metric_str) {
             Some(m) => m,
             None => {
                 return error_result(
@@ -400,11 +400,10 @@ impl CommandOp for AnalyzeVerifyKnnOp {
 
         for qi in range_start..range_end {
             // Periodic governor checkpoint every 1000 queries
-            if (qi - range_start) % 1000 == 0 {
-                if ctx.governor.checkpoint() {
+            if (qi - range_start) % 1000 == 0
+                && ctx.governor.checkpoint() {
                     ctx.ui.log("  governor: throttle active");
                 }
-            }
 
             let query_vec = match query_reader.get(qi) {
                 Ok(v) => v,

@@ -129,7 +129,7 @@ mod tests {
         let mut m = ByteEntropyMeasure::new();
         // Construct a uniform byte stream by emitting every byte
         // value the same number of times.
-        let payload: Vec<u8> = (0..256u16).flat_map(|b| std::iter::repeat(b as u8).take(16)).collect();
+        let payload: Vec<u8> = (0..256u16).flat_map(|b| std::iter::repeat_n(b as u8, 16)).collect();
         m.observe(&MValue::Bytes(payload), &ctx());
         let r = match Box::new(m).finalize() {
             MeasureReport::ByteEntropy(r) => r,

@@ -269,14 +269,13 @@ veks pipeline clear variables --workspace=/path/to/dataset
         let existing = variables::load(&ctx.workspace).unwrap_or_default();
 
         // Remove the file
-        if vars_path.exists() {
-            if let Err(e) = std::fs::remove_file(&vars_path) {
+        if vars_path.exists()
+            && let Err(e) = std::fs::remove_file(&vars_path) {
                 return error_result(
                     format!("failed to remove {}: {}", vars_path.display(), e),
                     start,
                 );
             }
-        }
 
         // Remove any variables.yaml keys from the current defaults
         let removed = existing.len();

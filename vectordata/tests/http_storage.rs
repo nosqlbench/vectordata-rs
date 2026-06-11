@@ -347,7 +347,7 @@ fn vvec_cached_falls_back_to_walk_without_idxfor() {
     let remote = IndexedVvecReader::<i32>::open(&url).unwrap();
     assert_eq!(remote.count(), 12);
     let r5 = <IndexedVvecReader<i32> as VvecReader<i32>>::get(&remote, 5).unwrap();
-    assert_eq!(r5.len(), (5 % 5) + 1);
+    assert_eq!(r5.len(), 1);
     assert_eq!(r5[0], 500);
 }
 
@@ -713,6 +713,8 @@ fn cache_stats_reports_partial_and_full_fill() {
     assert_eq!(pre.valid_chunks, 0, "no chunks should be downloaded yet");
     assert!(pre.total_chunks > 0);
     assert!(pre.content_size > 0);
+    assert_eq!(pre.chunk_size, TEST_CHUNK,
+        "merkle path must report the .mref's declared chunk size");
 
     storage.precache().unwrap();
 
@@ -743,7 +745,7 @@ fn cache_stats_returns_none_for_local_storage() {
 }
 
 #[test]
-fn cache_stats_returns_none_for_direct_http() {
+fn cache_stats_reports_fill_for_chunked_http_without_mref() {
     let tmp = make_tmp();
     write_fvec(&tmp.path().join("base.fvec"), 20, 4);
     write_fvec(&tmp.path().join("query.fvec"), 5, 4);
@@ -754,17 +756,24 @@ profiles:
     base_vectors: base.fvec
     query_vectors: query.fvec
 "#).unwrap();
-    // No .mref files at all → every facet falls back to direct HTTP.
+    // No .mref files at all → every facet opens through the
+    // merkle-less chunked-HTTP store. Fill progress must still be
+    // observable — the explore TUI's status line watches
+    // cache_stats no matter which transport the open resolved to.
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
     let storage = view.open_facet_storage("base_vectors").unwrap();
-    // Pre-precache state for direct-HTTP: never reports merkle
-    // cache stats, not local, not complete.
-    assert!(storage.cache_stats().is_none(),
-        "direct-HTTP storage has no merkle cache; cache_stats must be None");
+    let pre: CacheStats = storage.cache_stats()
+        .expect("chunked-HTTP storage must report cache_stats");
+    assert!(!pre.is_complete, "fresh chunked-HTTP facet must not be complete");
+    assert_eq!(pre.valid_chunks, 0, "no chunks should be downloaded yet");
+    assert!(pre.total_chunks > 0);
+    assert!(pre.content_size > 0);
+    assert_eq!(pre.chunk_size, 8 * 1024 * 1024,
+        "no-mref path must report the chunked-HTTP store's chunk size");
     assert!(!storage.is_local());
     assert!(!storage.is_complete());
 
@@ -775,10 +784,11 @@ profiles:
         "direct-HTTP storage MUST be complete after precache (strict contract)");
     assert!(storage.is_local(),
         "direct-HTTP storage MUST be local after precache");
-    // cache_stats stays None — merkle isn't part of the
-    // direct-HTTP path.
-    assert!(storage.cache_stats().is_none(),
-        "direct-HTTP storage has no merkle cache; cache_stats stays None even after precache");
+    let post = storage.cache_stats()
+        .expect("chunked-HTTP storage still reports cache_stats after precache");
+    assert!(post.is_complete);
+    assert_eq!(post.valid_chunks, post.total_chunks);
+    assert_eq!(post.content_size, pre.content_size);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

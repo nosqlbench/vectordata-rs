@@ -771,9 +771,9 @@ mod tests {
 
     #[test]
     fn test_raw_eq_float() {
-        let data = build_record(&[("x", MValue::Float(3.14))]);
+        let data = build_record(&[("x", MValue::Float(3.25))]);
         let (vpos, tag) = find_field_value(&data, 0);
-        assert!(check_condition_raw(&data, vpos, tag, &OpType::Eq, &[Comparand::Float(3.14)]));
+        assert!(check_condition_raw(&data, vpos, tag, &OpType::Eq, &[Comparand::Float(3.25)]));
         assert!(!check_condition_raw(&data, vpos, tag, &OpType::Eq, &[Comparand::Float(2.0)]));
     }
 

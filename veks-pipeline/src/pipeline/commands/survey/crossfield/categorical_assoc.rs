@@ -69,7 +69,7 @@ impl PairAnalyzer for CategoricalAssociationAnalyzer {
         // borrow checker can't see that `self.table.entry` only
         // touches the row corresponding to `ka`.
         let current_cells = self.cell_count();
-        let row = self.table.entry(ka).or_insert_with(IndexMap::new);
+        let row = self.table.entry(ka).or_default();
         if let Some(c) = row.get_mut(&kb) {
             *c += 1;
         } else if current_cells < self.cell_cap {

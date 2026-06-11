@@ -257,7 +257,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         };
 
         let metric_str = options.get("metric").unwrap_or("L2");
-        let metric = match Metric::from_str(metric_str) {
+        let metric = match Metric::parse(metric_str) {
             Some(m) => m,
             None => return error_result(format!("unknown metric: '{}'", metric_str), start),
         };
@@ -367,8 +367,8 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // Also discover profiles from the profiles/ directory that may
         // not be in the config (e.g., sized profiles with deferred expansion).
         let profiles_dir = ctx.workspace.join("profiles");
-        if profiles_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
+        if profiles_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&profiles_dir) {
                 for entry in entries.flatten() {
                     if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
                     let pname = entry.file_name().to_string_lossy().to_string();
@@ -383,7 +383,6 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                     }
                 }
             }
-        }
         profiles.sort_by(|(a_name, _, _, _), (b_name, _, _, _)| {
             let a_bc = config.profiles.profile(a_name).and_then(|p| p.base_count);
             let b_bc = config.profiles.profile(b_name).and_then(|p| p.base_count);
@@ -641,7 +640,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         let _ = (threads, &base_keepalive);
         let scan_pb = ctx.ui.bar_with_unit(
             base_count as u64,
-            &format!("scanning {} base ({}q × {}d)", base_count, num_samples, dim),
+            format!("scanning {} base ({}q × {}d)", base_count, num_samples, dim),
             "vectors",
         );
         let boundary_pb = ctx.ui.bar_with_unit(
@@ -825,15 +824,14 @@ fn verify_heaps_against_gt(
 
             if result.is_acceptable() {
                 pass += 1;
-                if let knn_compare::QueryResult::BoundaryMismatch(n) = &result {
-                    if pass <= 3 {
+                if let knn_compare::QueryResult::BoundaryMismatch(n) = &result
+                    && pass <= 3 {
                         let query_idx = if si < sample_indices.len() { sample_indices[si] } else { si };
                         ui.log(&format!(
                             "    tie-break query {} (sample #{}): {} boundary swaps (acceptable)",
                             query_idx, si, n,
                         ));
                     }
-                }
             } else {
                 fail += 1;
                 let query_idx = if si < sample_indices.len() { sample_indices[si] } else { si };
@@ -1001,7 +999,7 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
         let query_path = resolve_path(&query_str, &ctx.workspace);
 
         let metric_str = options.get("metric").unwrap_or("L2");
-        let metric = crate::pipeline::simd_distance::Metric::from_str(metric_str)
+        let metric = crate::pipeline::simd_distance::Metric::parse(metric_str)
             .unwrap_or(crate::pipeline::simd_distance::Metric::L2);
         let dist_fn = crate::pipeline::simd_distance::select_distance_fn(metric);
 
@@ -1096,7 +1094,7 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
             let mut pass = 0usize;
             let mut fail = 0usize;
 
-            let pb = ctx.ui.bar(actual_sample as u64, &format!("verify filtered-knn '{}'", name));
+            let pb = ctx.ui.bar(actual_sample as u64, format!("verify filtered-knn '{}'", name));
             for (si, &qi) in sample_indices.iter().enumerate() {
                 if qi >= gt_records.len() || qi >= pred_indices.count() { continue; }
 
@@ -1334,7 +1332,7 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
         let mut all_results = Vec::new();
         let pb = ctx.ui.bar_with_unit(profiles.len() as u64, "verifying profiles", "profiles");
 
-        for (_pi, (name, bc)) in profiles.iter().enumerate() {
+        for (name, bc) in profiles.iter() {
             // R-facet candidates: canonical `metadata_results.*` then legacy
             // `metadata_indices.*` (from the facet spec), falling back to the
             // canonical slab path when none exist yet.

@@ -194,9 +194,8 @@ templates (compute-knn, verify-knn) for the new partition profiles.
         // Build partitions: label → [ordinals]
         let mut partitions: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (i, &label) in labels.iter().enumerate() {
-            if let Some(ref filter) = labels_filter {
-                if !filter.contains(&label) { continue; }
-            }
+            if let Some(ref filter) = labels_filter
+                && !filter.contains(&label) { continue; }
             partitions.entry(label).or_default().push(i);
         }
 

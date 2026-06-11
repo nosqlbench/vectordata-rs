@@ -89,11 +89,10 @@ impl PairAnalyzer for FunctionalDependencyAnalyzer {
                 }
             }
             consistent_records += best_count;
-            if let Some(set) = b_set {
-                if set.len() == 1 {
+            if let Some(set) = b_set
+                && set.len() == 1 {
                     deterministic_a += 1;
                 }
-            }
         }
         let support = if n == 0 { 0.0 } else { consistent_records as f64 / n as f64 };
         PairReport::FunctionalDependency(FunctionalDependencyReport {

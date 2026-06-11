@@ -175,7 +175,7 @@ impl CommandOp for AnalyzeCompareOp {
             .get("sample")
             .and_then(|s| s.parse().ok())
             .unwrap_or(10_000);
-        let verbose = options.get("verbose").map_or(false, |s| s == "true");
+        let verbose = options.get("verbose") == Some("true");
         let single_dim: Option<usize> = options.get("dimension").and_then(|s| s.parse().ok());
 
         let orig_path = resolve_path(original_str, &ctx.workspace);
@@ -257,7 +257,7 @@ impl CommandOp for AnalyzeCompareOp {
                 };
                 let fc = VectorReader::<f64>::count(&r);
                 let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().to_vec()))
             }
         };
 
@@ -337,7 +337,7 @@ impl CommandOp for AnalyzeCompareOp {
                 };
                 let fc = VectorReader::<f64>::count(&r);
                 let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().to_vec()))
             }
         };
 
@@ -368,10 +368,10 @@ impl CommandOp for AnalyzeCompareOp {
 
         // Pre-read sampled vectors as f64
         let orig_vecs: Vec<Vec<f64>> = (0..orig_sample)
-            .map(|i| orig_get(i))
+            .map(orig_get)
             .collect();
         let synth_vecs: Vec<Vec<f64>> = (0..synth_sample)
-            .map(|i| synth_get(i))
+            .map(synth_get)
             .collect();
 
         // Query governor for thread count and build rayon pool
@@ -397,7 +397,7 @@ impl CommandOp for AnalyzeCompareOp {
                     let passed = p_val >= alpha;
 
                     let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 100 == 0 || done == dims.len() as u64 {
+                    if done.is_multiple_of(100) || done == dims.len() as u64 {
                         pb_ref.set_position(done);
                     }
 
@@ -426,7 +426,7 @@ impl CommandOp for AnalyzeCompareOp {
             alpha, orig_sample, synth_sample
         ));
         ctx.ui.log(&format!("{:>8}  {:>10}  {:>10}  {:>6}", "Dim", "D-stat", "P-value", "Result"));
-        ctx.ui.log(&format!("{}", "-".repeat(42)));
+        ctx.ui.log(&"-".repeat(42).to_string());
 
         let show_count = if verbose { results.len() } else { 10.min(results.len()) };
         let mut shown = 0;

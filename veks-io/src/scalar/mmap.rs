@@ -51,7 +51,7 @@ impl<T: Copy + 'static> ScalarMmapReader<T> {
             return Err(MmapError::EmptyFile);
         }
         let elem_size = std::mem::size_of::<T>();
-        if file_size as usize % elem_size != 0 {
+        if !(file_size as usize).is_multiple_of(elem_size) {
             return Err(MmapError::InvalidSize { file_size, element_size: elem_size });
         }
         let count = file_size as usize / elem_size;
@@ -198,7 +198,7 @@ mod tests {
         let tmp = make_tmp();
         let path = tmp.path().join("bad.i32");
         // 5 bytes is not divisible by 4
-        std::fs::write(&path, &[0u8; 5]).unwrap();
+        std::fs::write(&path, [0u8; 5]).unwrap();
         assert!(ScalarMmapReader::<i32>::open_i32(&path).is_err());
     }
 
@@ -206,7 +206,7 @@ mod tests {
     fn test_empty_file_rejected() {
         let tmp = make_tmp();
         let path = tmp.path().join("empty.u8");
-        std::fs::write(&path, &[]).unwrap();
+        std::fs::write(&path, []).unwrap();
         assert!(ScalarMmapReader::<u8>::open_u8(&path).is_err());
     }
 

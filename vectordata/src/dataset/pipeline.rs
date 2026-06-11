@@ -121,9 +121,9 @@ impl StepDef {
 
     /// Extract the `output` option value if present.
     pub fn output_path(&self) -> Option<String> {
-        self.options.get("output").and_then(|v| match v {
-            serde_yaml::Value::String(s) => Some(s.clone()),
-            _ => Some(format!("{:?}", v)),
+        self.options.get("output").map(|v| match v {
+            serde_yaml::Value::String(s) => s.clone(),
+            _ => format!("{:?}", v),
         })
     }
 

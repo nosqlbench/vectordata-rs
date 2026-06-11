@@ -150,7 +150,7 @@ pub fn format_count_with_suffix(n: u64) -> String {
             let mut rem_str = String::new();
             for &(rd, rs) in remainder_scales {
                 if rd >= divisor { continue; }
-                if remainder >= rd && remainder % rd == 0 {
+                if remainder >= rd && remainder.is_multiple_of(rd) {
                     rem_str = format!("{}{}", remainder / rd, rs);
                     break;
                 }
@@ -159,7 +159,7 @@ pub fn format_count_with_suffix(n: u64) -> String {
             format!("{}{}{}", quotient, suffix, rem_str)
         };
 
-        if best.as_ref().map_or(true, |b| candidate.len() < b.len()) {
+        if best.as_ref().is_none_or(|b| candidate.len() < b.len()) {
             best = Some(candidate);
         }
     }

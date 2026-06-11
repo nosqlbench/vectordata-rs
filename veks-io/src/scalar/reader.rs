@@ -20,7 +20,7 @@ pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String
     let file_len = file.metadata()
         .map_err(|e| format!("stat {}: {}", path.display(), e))?
         .len() as usize;
-    if file_len % elem_size != 0 {
+    if !file_len.is_multiple_of(elem_size) {
         return Err(format!(
             "{}: file size {} not divisible by element size {}",
             path.display(), file_len, elem_size
@@ -44,7 +44,7 @@ pub fn probe(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
     let meta = std::fs::metadata(path)
         .map_err(|e| format!("stat {}: {}", path.display(), e))?;
     let file_len = meta.len() as usize;
-    if file_len % elem_size != 0 {
+    if !file_len.is_multiple_of(elem_size) {
         return Err(format!(
             "{}: file size {} not divisible by element size {}",
             path.display(), file_len, elem_size

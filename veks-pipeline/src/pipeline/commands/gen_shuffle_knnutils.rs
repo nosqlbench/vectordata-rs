@@ -149,13 +149,11 @@ vector ordering exactly.
         let output_path = resolve_path(output_str, &ctx.workspace);
 
         // Create output directory
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(format!("create directory: {}", e), start);
                 }
-            }
-        }
 
         // Build value sequence to shuffle
         let mut values: Vec<i32> = if let Some(ref ord_path) = ordinals_path {

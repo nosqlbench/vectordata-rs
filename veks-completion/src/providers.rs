@@ -303,15 +303,15 @@ const LABEL_MATCH_OPERATORS: &[&str] = &["=", "!=", "=~", "!~"];
 ///   - Always emits: `metric` (APPEND — bare).
 ///   - Continuations (`{`, `[`, `)`, wrapper-close TERMINAL) are
 ///     gated behind one of:
-///       a. `ident == metric` — the user has fully typed the
-///          metric name; their next decision IS the continuation.
-///       b. `is_unique_match` — only one metric matched the
-///          typed prefix; the user has effectively pinned it
-///          down even mid-typing. Emitting continuations also
-///          gives bash a longest-common-prefix that is the full
-///          metric name, so single-tab advancement still works.
-///       c. `pp.tap_count >= 2` — rapid follow-up tap, "show me
-///          everything".
+///     1. `ident == metric` — the user has fully typed the
+///        metric name; their next decision IS the continuation.
+///     2. `is_unique_match` — only one metric matched the
+///        typed prefix; the user has effectively pinned it
+///        down even mid-typing. Emitting continuations also
+///        gives bash a longest-common-prefix that is the full
+///        metric name, so single-tab advancement still works.
+///     3. `pp.tap_count >= 2` — rapid follow-up tap, "show me
+///        everything".
 ///   - Otherwise (multiple matches with a partial prefix), keep
 ///     the names-only view so the candidate list isn't
 ///     N_metrics × 5 entries while the user is still narrowing.
@@ -353,9 +353,9 @@ fn expand_metric_continuations(
 ///   - `)` — close the enclosing function call (when `bs.paren > 0`)
 ///   - `,` — next varargs/argument (when `bs.paren > 0`)
 ///   - `<wrapper>` — TERMINAL when all outer scopes closed and
-///                   wrapper open
+///     wrapper open
 ///   - `)<wrapper>` — close enclosing call + TERMINAL (when
-///                    `bs.paren == 1` and wrapper open)
+///     `bs.paren == 1` and wrapper open)
 ///
 /// Only fires when `ident` is empty (the user is at a clean
 /// post-expression boundary, not mid-typing some identifier).
@@ -449,8 +449,8 @@ fn enforce_multi_candidate(
         return;
     }
     // Tier 1: smart ghost from the real candidate.
-    if let Some(real) = out.first() {
-        if real.starts_with(typed) && real.len() > typed.len() {
+    if let Some(real) = out.first()
+        && real.starts_with(typed) && real.len() > typed.len() {
             // Largest split < real.len() that's > typed.len() and
             // sits on a char boundary.
             let mut split = real.len() - 1;
@@ -465,7 +465,6 @@ fn enforce_multi_candidate(
                 }
             }
         }
-    }
     // Tier 2: typed-prefix ghost.
     if !out.iter().any(|c| c == typed) {
         out.push(typed.to_string());
@@ -1128,9 +1127,9 @@ fn complete_metricsql_inner(
     // scalar-first-arg functions (histogram_quantile, quantile,
     // topk, …), arg 0 is a number (no completion offered);
     // subsequent args are vector expressions (top-of-expression).
-    if bs.paren > 0 {
-        if let Some((fn_name, arg_idx)) = enclosing_function_call(before) {
-            if METRICSQL_SCALAR_FIRST_ARG.contains(&fn_name) && arg_idx == 0 {
+    if bs.paren > 0
+        && let Some((fn_name, arg_idx)) = enclosing_function_call(before)
+            && METRICSQL_SCALAR_FIRST_ARG.contains(&fn_name) && arg_idx == 0 {
                 // Inside the scalar arg — no useful suggestions
                 // for an arbitrary number, but don't fall through
                 // to top-of-expression either since that'd offer
@@ -1139,8 +1138,6 @@ fn complete_metricsql_inner(
             }
             // For all other arg positions (and non-typed
             // functions), fall through to top-of-expression.
-        }
-    }
 
     // (6) Top-of-expression. Layered:
     //
@@ -1290,7 +1287,7 @@ fn brace_between_matchers(before: &str) -> bool {
         }
     }
     let segment = before[i..].trim();
-    let segment = segment.trim_start_matches(|c| c == '{' || c == ',').trim();
+    let segment = segment.trim_start_matches(['{', ',']).trim();
     if segment.is_empty() {
         return false;
     }
@@ -1303,7 +1300,7 @@ fn brace_between_matchers(before: &str) -> bool {
     //   `job="x")`    → broken (stray `)`) but still past the
     //                   key+op — between-matchers (safe append)
     //   `job!=`       → op-end, value-start (empty after op)
-    let last_op = segment.rfind(|c: char| c == '=' || c == '~');
+    let last_op = segment.rfind(['=', '~']);
     match last_op {
         Some(pos) => !segment[pos + 1..].trim().is_empty(),
         None => false,
@@ -2346,7 +2343,7 @@ mod tests {
 
     #[test]
     fn after_close_range_bracket_offers_binops_and_modifiers() {
-        let cands = run("rate(up[5m]) ");
+        let _cands = run("rate(up[5m]) ");
         // The cursor lands after the outer `)`, not `]` directly.
         // Test the `]` case by constructing a line that ends with
         // a closing `]` outside any function.

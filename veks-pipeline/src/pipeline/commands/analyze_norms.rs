@@ -296,7 +296,7 @@ fn compute_norms_f32(
                 norm_sq += v * v;
             }
             let done = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if done % 100_000 == 0 { pb.set_position(done); }
+            if done.is_multiple_of(100_000) { pb.set_position(done); }
             norm_sq.sqrt()
         }).collect::<Vec<f64>>()
     };
@@ -335,7 +335,7 @@ fn compute_norms_f16(
                 norm_sq += v * v;
             }
             let done = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if done % 100_000 == 0 { pb.set_position(done); }
+            if done.is_multiple_of(100_000) { pb.set_position(done); }
             norm_sq.sqrt()
         }).collect::<Vec<f64>>()
     };

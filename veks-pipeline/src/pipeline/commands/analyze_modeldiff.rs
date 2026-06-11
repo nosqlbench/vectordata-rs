@@ -171,7 +171,7 @@ impl CommandOp for AnalyzeModelDiffOp {
             .get("max-drift-threshold")
             .and_then(|s| s.parse().ok())
             .unwrap_or(2.0);
-        let verbose = options.get("verbose").map_or(false, |s| s == "true");
+        let verbose = options.get("verbose") == Some("true");
 
         let orig = match load_model(&orig_path) {
             Ok(m) => m,
@@ -225,7 +225,7 @@ impl CommandOp for AnalyzeModelDiffOp {
                     let drift = o.drift(c).unwrap_or(100.0);
 
                     let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 100 == 0 || done == dim_count as u64 {
+                    if done.is_multiple_of(100) || done == dim_count as u64 {
                         pb_ref.set_position(done);
                     }
 
@@ -260,7 +260,7 @@ impl CommandOp for AnalyzeModelDiffOp {
             "{:<6} {:<10} {:<10} {:>10}  {}",
             "Dim", "Original", "Compare", "Drift%", "Status"
         ));
-        ctx.ui.log(&format!("{}", "-".repeat(52)));
+        ctx.ui.log(&"-".repeat(52).to_string());
 
         for r in &dim_results {
             if r.types_match {

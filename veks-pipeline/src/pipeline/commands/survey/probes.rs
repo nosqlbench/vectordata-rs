@@ -344,7 +344,7 @@ impl SemanticProbe for UuidStringProbe {
             return None;
         }
         if bytes.iter().enumerate().any(|(i, &b)| {
-            matches!(i, 8 | 13 | 18 | 23) == false && !b.is_ascii_hexdigit()
+            !matches!(i, 8 | 13 | 18 | 23) && !b.is_ascii_hexdigit()
         }) {
             return None;
         }
@@ -542,7 +542,7 @@ impl SemanticProbe for CompositeIdentifierProbe {
         // Pattern: leading ASCII alpha prefix, an underscore or dash,
         // then a numeric or alphanumeric body.
         // Example matches: "USR_00123", "ORD-A12345".
-        let (prefix, body) = s.split_once(|c: char| c == '_' || c == '-')?;
+        let (prefix, body) = s.split_once(['_', '-'])?;
         if prefix.len() < 2 || body.is_empty() { return None; }
         if !prefix.bytes().all(|b| b.is_ascii_alphabetic()) { return None; }
         if !body.bytes().all(|b| b.is_ascii_alphanumeric()) { return None; }

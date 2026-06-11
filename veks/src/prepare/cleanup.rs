@@ -114,11 +114,10 @@ fn parse_manifest(text: &str) -> Result<IndexMap<String, ManifestEntry>, String>
         if SECTION_KEYS.contains(&name.as_str()) {
             if let serde_yaml::Value::Mapping(section) = value {
                 for (k, v) in section {
-                    if let Some(group_name) = k.as_str() {
-                        if let Some(entry) = parse_group_value(v) {
+                    if let Some(group_name) = k.as_str()
+                        && let Some(entry) = parse_group_value(v) {
                             result.insert(group_name.to_string(), entry);
                         }
-                    }
                 }
             }
             continue;

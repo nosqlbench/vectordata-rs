@@ -44,6 +44,7 @@ use super::compute_knn::Neighbor;
 ///   - `L2`         → `+L2sq`     (positive, smaller = better)
 ///   - `DotProduct` → `+dot`      (positive, larger  = better)
 ///   - `Cosine`     → `+cos_sim`  (`[-1, 1]`, larger = better)
+///
 /// The kernel still operates on monotonic-distance values internally
 /// (smaller = better), but conversion to/from publication convention
 /// happens at every disk boundary via [`kernel_to_published`] and
@@ -105,7 +106,9 @@ pub enum Metric {
 }
 
 impl Metric {
-    pub(super) fn from_str(s: &str) -> Option<Self> {
+    /// Named `parse` (not `from_str`) to avoid confusion with
+    /// `std::str::FromStr::from_str`, which returns `Result`.
+    pub(super) fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "L2" => Some(Metric::L2),
             "DOT_PRODUCT" | "IP" | "DOT" => Some(Metric::DotProduct),
@@ -240,11 +243,9 @@ pub(super) fn resolve_cosine_mode_for(
                 // set the new flags explicitly going forward.
                 Ok(Some(CosineMode::AssumeNormalized))
             } else {
-                Err(format!(
-                    "metric=COSINE requires one of:\n  \
+                Err("metric=COSINE requires one of:\n  \
                       assume_normalized_like_faiss=true  (FAISS/numpy convention — vectors are pre-normalized, use inner product)\n  \
-                      use_proper_cosine_metric=true      (compute cosine in-kernel from raw vectors)"
-                ))
+                      use_proper_cosine_metric=true      (compute cosine in-kernel from raw vectors)".to_string())
             }
         }
     }
@@ -531,8 +532,8 @@ pub(super) fn scan_cached_segments(
 
     // ── Path 2: scan <workspace>/profiles/ for smaller-profile outputs
     let profiles_dir = workspace.join("profiles");
-    if profiles_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
+    if profiles_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&profiles_dir) {
             for entry in entries.flatten() {
                 if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     continue;
@@ -567,7 +568,6 @@ pub(super) fn scan_cached_segments(
                 }
             }
         }
-    }
 
     // Sort by start, then by size descending — the greedy matcher
     // picks the largest segment starting at a given position.
@@ -844,7 +844,7 @@ pub(super) fn rerank_output_post_pass(
                 |idx| Some(base_reader.get_slice(base_offset + idx as usize)),
             );
             let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if done % progress_tick == 0 || done == n_rows {
+            if done.is_multiple_of(progress_tick) || done == n_rows {
                 pb.set_position(done as u64);
             }
             result

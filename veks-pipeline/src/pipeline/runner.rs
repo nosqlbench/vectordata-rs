@@ -37,7 +37,7 @@ impl DatasetLog {
             .open(&path)
             .ok();
         DatasetLog {
-            writer: file.map(|f| std::io::BufWriter::new(f)),
+            writer: file.map(std::io::BufWriter::new),
         }
     }
 
@@ -202,9 +202,8 @@ pub fn run_steps(
         //    The provenance check subsumes the v4 fingerprint cascade —
         //    if an upstream's recorded provenance differs (under the
         //    same selector), this step's hash differs.
-        let progress_fresh;
         let provenance_reason = ctx.progress.check_provenance(&step.id, &provenance, selector);
-        match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
+        let progress_fresh = match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
             None if provenance_reason.is_none() => {
                 skipped_count += 1;
                 step_outcomes.push((step.id.clone(), false, "fresh".into()));
@@ -217,15 +216,15 @@ pub fn run_steps(
                 // Outputs/options match but provenance changed — upstream config or build changed
                 ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id,
                     provenance_reason.as_deref().unwrap_or("provenance changed")));
-                progress_fresh = false;
+                false
             }
             Some(reason) => {
                 if !reason.starts_with("not recorded") {
                     ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id, reason));
                 }
-                progress_fresh = false;
+                false
             }
-        }
+        };
 
         let mut options = Options::new();
         for (k, v) in &resolved_opts {
@@ -236,7 +235,7 @@ pub fn run_steps(
         //    succeeded previously. Without provenance, artifact existence alone
         //    is not trustworthy (could be stale from a different configuration).
         let resolved_output = resolved_opts.get("output").cloned();
-        if progress_fresh { if let Some(ref output_path) = resolved_output {
+        if progress_fresh && let Some(ref output_path) = resolved_output {
             let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
                 PathBuf::from(output_path)
             } else {
@@ -251,7 +250,7 @@ pub fn run_steps(
                     let output_mtime = std::fs::metadata(&full_path)
                         .ok()
                         .and_then(|m| m.modified().ok());
-                    let input_newer = output_mtime.map_or(false, |out_t| {
+                    let input_newer = output_mtime.is_some_and(|out_t| {
                         let descs = cmd.describe_options();
                         resolved_opts.iter().any(|(key, val)| {
                             // Check if this option is an Input-role path
@@ -263,7 +262,7 @@ pub fn run_steps(
                             std::fs::metadata(&check_path)
                                 .ok()
                                 .and_then(|m| m.modified().ok())
-                                .map_or(false, |in_t| in_t > out_t)
+                                .is_some_and(|in_t| in_t > out_t)
                         })
                     });
 
@@ -332,11 +331,10 @@ pub fn run_steps(
                     ));
                 }
                 ArtifactState::Absent => {
-                    if let Some(parent) = full_path.parent() {
-                        if !parent.exists() && !ctx.dry_run {
+                    if let Some(parent) = full_path.parent()
+                        && !parent.exists() && !ctx.dry_run {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                    }
                 }
                 ArtifactState::Unknown(ref reason) => {
                     let msg = format!(
@@ -350,7 +348,7 @@ pub fn run_steps(
                     }
                 }
             }
-        } } // close if !upstream_ran + if let Some(output_path)
+        } // close if !upstream_ran + if let Some(output_path)
 
         // Ensure output directory exists even when skipping artifact check
         if let Some(ref output_path) = resolved_output {
@@ -359,11 +357,10 @@ pub fn run_steps(
             } else {
                 ctx.workspace.join(output_path)
             };
-            if let Some(parent) = full_path.parent() {
-                if !parent.exists() && !ctx.dry_run {
+            if let Some(parent) = full_path.parent()
+                && !parent.exists() && !ctx.dry_run {
                     let _ = std::fs::create_dir_all(parent);
                 }
-            }
         }
 
         // 6. Validate required options from describe_options
@@ -421,9 +418,9 @@ pub fn run_steps(
                     } else {
                         ctx.workspace.join(v)
                     };
-                    if path.is_file() {
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            if meta.len() > 1_073_741_824 {
+                    if path.is_file()
+                        && let Ok(meta) = std::fs::metadata(&path)
+                            && meta.len() > 1_073_741_824 {
                                 // > 1 GiB
                                 ctx.ui.log(&format!(
                                     "{} {} — WARNING: option '{}' references {} ({:.1} GB) \
@@ -437,8 +434,6 @@ pub fn run_steps(
                                 ));
                                 break;
                             }
-                        }
-                    }
                 }
             }
 
@@ -747,14 +742,13 @@ pub fn run_steps(
         // with no zero vectors, find-duplicates with no duplicates).
         // The command returned Ok, so it knows whether empty is valid.
         for produced_path in &result.produced {
-            if let Ok(meta) = std::fs::metadata(produced_path) {
-                if meta.len() == 0 {
+            if let Ok(meta) = std::fs::metadata(produced_path)
+                && meta.len() == 0 {
                     ctx.ui.log(&format!(
                         "{} {} — warning: produced file '{}' is empty (zero bytes)",
                         prefix, step.id, produced_path.display(),
                     ));
                 }
-            }
         }
 
         // 10. Save progress incrementally
@@ -776,8 +770,8 @@ pub fn run_steps(
         executed_count, total_elapsed.as_secs_f64(), skipped_count, total));
 
     // Write data flow accounting from variables.yaml
-    if let Ok(vars) = super::variables::load(&ctx.workspace) {
-        if !vars.is_empty() {
+    if let Ok(vars) = super::variables::load(&ctx.workspace)
+        && !vars.is_empty() {
             dlog.log("\ndata flow:");
             let get = |k: &str| vars.get(k).and_then(|v| v.parse::<u64>().ok());
             if let Some(vc) = get("vector_count") {
@@ -813,7 +807,6 @@ pub fn run_steps(
                 }
             }
         }
-    }
 
     dlog.flush();
 

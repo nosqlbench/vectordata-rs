@@ -106,7 +106,7 @@ metadata records with vector ordinals.
 
         let from_path = resolve_path(from_str, &ctx.workspace);
         let to_path = resolve_path(to_str, &ctx.workspace);
-        let force = options.get("force").map_or(false, |s| s == "true");
+        let force = options.get("force") == Some("true");
         let page_size: u32 = options
             .get("page-size")
             .and_then(|s| s.parse().ok())
@@ -594,7 +594,7 @@ production queries where page I/O efficiency matters.
 
         let source_path = resolve_path(source_str, &ctx.workspace);
         let dest_path = resolve_path(dest_str, &ctx.workspace);
-        let force = options.get("force").map_or(false, |s| s == "true");
+        let force = options.get("force") == Some("true");
         let page_size: u32 = options
             .get("page-size")
             .and_then(|s| s.parse().ok())
@@ -739,7 +739,7 @@ attempt to read from a corrupted file.
             Err(e) => return error_result(e, start),
         };
         let input_path = resolve_path(input_str, &ctx.workspace);
-        let verbose = options.get("verbose").map_or(false, |s| s == "true");
+        let verbose = options.get("verbose") == Some("true");
 
         let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
@@ -1116,16 +1116,15 @@ produced the expected number of records and ordinal range.
             ctx.ui.log(&format!("  Record sizes: min={}, max={}, avg={:.1}, median={}", min_rs, max_rs, avg_rs, median_rs));
 
             // Content type detection from first page
-            if let Some(first_entry) = page_entries.first() {
-                if let Ok(first_page) = reader.read_data_page(first_entry) {
+            if let Some(first_entry) = page_entries.first()
+                && let Ok(first_page) = reader.read_data_page(first_entry) {
                     let sample_count = first_page.record_count().min(10);
                     let mut text_count = 0;
                     for i in 0..sample_count {
-                        if let Some(data) = first_page.get_record(i) {
-                            if data.iter().all(|&b| b.is_ascii()) {
+                        if let Some(data) = first_page.get_record(i)
+                            && data.iter().all(|&b| b.is_ascii()) {
                                 text_count += 1;
                             }
-                        }
                     }
                     let content_type = if text_count == sample_count {
                         "text/ascii"
@@ -1136,7 +1135,6 @@ produced the expected number of records and ordinal range.
                     };
                     ctx.ui.log(&format!("  Content type: {} (sampled {} records)", content_type, sample_count));
                 }
-            }
         }
 
         if !page_sizes.is_empty() {
@@ -1266,11 +1264,10 @@ changes to the slabtastic writer.
         let page_entries = reader.page_entries();
 
         for (i, entry) in page_entries.iter().enumerate() {
-            if let Some(ref filter) = pages_filter {
-                if !filter.contains(&i) {
+            if let Some(ref filter) = pages_filter
+                && !filter.contains(&i) {
                     continue;
                 }
-            }
 
             match reader.read_data_page(entry) {
                 Ok(page) => {
@@ -1487,7 +1484,8 @@ fn render_schema_sidecar(input_path: &std::path::Path, ctx: &StreamContext) {
             }
             Err(e) => ctx.ui.log(&format!("  :schema parse error (kind=predicate): {e}")),
         },
-        SCHEMA_KIND_METADATA | _ => match MetadataSchema::from_json_bytes(&bytes) {
+        // Metadata is the default interpretation for unknown kinds.
+        _ => match MetadataSchema::from_json_bytes(&bytes) {
             Ok(s) => {
                 let mut rows = vec![
                     format!("kind: metadata"),
@@ -1539,7 +1537,7 @@ fn render_survey_sidecar(input_path: &std::path::Path, ctx: &StreamContext) {
     // pretty-printer.
     let summary = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
-        .and_then(|v| {
+        .map(|v| {
             let fields = v.get("fields")
                 .and_then(|f| f.as_object())
                 .map(|m| m.len())
@@ -1557,7 +1555,7 @@ fn render_survey_sidecar(input_path: &std::path::Path, ctx: &StreamContext) {
                 .and_then(|s| s.get("sampled_records"))
                 .and_then(|n| n.as_u64())
                 .unwrap_or(0);
-            Some((fields, source, total, sampled))
+            (fields, source, total, sampled)
         });
     let rows = match summary {
         Some((fields, source, total, sampled)) => vec![
@@ -1658,7 +1656,7 @@ useful for orienting yourself when working with an unfamiliar slab file.
         };
 
         ctx.ui.log(&format!("{:<6} {:<30} {:>14}", "Index", "Name", "PagesOffset"));
-        ctx.ui.log(&format!("{}", "-".repeat(54)));
+        ctx.ui.log(&"-".repeat(54).to_string());
 
         for ns in &namespaces {
             ctx.ui.log(&format!(
@@ -2010,7 +2008,7 @@ mod tests {
         assert_eq!(result.status, Status::Ok, "import failed: {}", result.message);
 
         // Verify
-        let reader = SlabReader::open(&ws.join("output.slab")).unwrap();
+        let reader = SlabReader::open(ws.join("output.slab")).unwrap();
         let data = reader.get(0).unwrap();
         assert_eq!(&data, b"hello");
         let data = reader.get(3).unwrap();

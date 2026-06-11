@@ -49,8 +49,8 @@ pub fn check(_root: &Path, publishable: &[PathBuf], threshold: u64) -> CheckResu
         let data_mtime = std::fs::metadata(file).ok().and_then(|m| m.modified().ok());
         let mref_mtime = std::fs::metadata(&mref_path).ok().and_then(|m| m.modified().ok());
 
-        if let (Some(dm), Some(mm)) = (data_mtime, mref_mtime) {
-            if dm > mm {
+        if let (Some(dm), Some(mm)) = (data_mtime, mref_mtime)
+            && dm > mm {
                 stale.push(format!(
                     "{} ({}) — .mref stale (data newer)",
                     super::rel_display(file),
@@ -58,7 +58,6 @@ pub fn check(_root: &Path, publishable: &[PathBuf], threshold: u64) -> CheckResu
                 ));
                 continue;
             }
-        }
 
         covered += 1;
     }
@@ -117,11 +116,10 @@ pub fn missing_mref_files(publishable: &[PathBuf], threshold: u64) -> Vec<PathBu
         }
         let data_mtime = std::fs::metadata(file).ok().and_then(|m| m.modified().ok());
         let mref_mtime = std::fs::metadata(&mref_path).ok().and_then(|m| m.modified().ok());
-        if let (Some(dm), Some(mm)) = (data_mtime, mref_mtime) {
-            if dm > mm {
+        if let (Some(dm), Some(mm)) = (data_mtime, mref_mtime)
+            && dm > mm {
                 result.push(file.clone());
             }
-        }
     }
     result
 }

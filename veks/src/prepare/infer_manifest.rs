@@ -90,8 +90,8 @@ fn load_dataset_metadata(root: &Path) -> IndexMap<String, String> {
     while let Some(d) = dir {
         for name in &names {
             let path = d.join(name);
-            if path.is_file() {
-                if let Ok(text) = std::fs::read_to_string(&path) {
+            if path.is_file()
+                && let Ok(text) = std::fs::read_to_string(&path) {
                     match serde_yaml::from_str::<IndexMap<String, DatasetMeta>>(&text) {
                         Ok(parsed) => {
                             println!("Loaded metadata from {}", path.display());
@@ -105,7 +105,6 @@ fn load_dataset_metadata(root: &Path) -> IndexMap<String, String> {
                         }
                     }
                 }
-            }
         }
         dir = d.parent();
     }
@@ -143,7 +142,7 @@ fn lookup_similarity(name: &str, metadata: &IndexMap<String, String>) -> Option<
 /// "emb-english-v3-100k" → "embenglishv3"
 fn normalize_for_match(name: &str) -> String {
     name.to_lowercase()
-        .split(|c: char| c == '-' || c == '_' || c == '.')
+        .split(['-', '_', '.'])
         .filter(|t| !t.is_empty() && !is_size_token(t))
         .collect::<Vec<_>>()
         .join("")
@@ -356,11 +355,10 @@ fn split_by_size(
                 .collect();
             let mut combined = size_files;
             for (sp, sf) in &shared {
-                if let Some(dir) = sp.parent() {
-                    if size_dirs.contains(dir) {
+                if let Some(dir) = sp.parent()
+                    && size_dirs.contains(dir) {
                         combined.push((sp.clone(), *sf));
                     }
-                }
             }
             let sub_name = format!("{}-{}", name, size);
             (sub_name, combined)
@@ -383,7 +381,7 @@ fn extract_size_token(path: &Path) -> Option<String> {
     let stem = path.file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    let tokens: Vec<&str> = stem.split(|c: char| c == '_' || c == '-' || c == '.')
+    let tokens: Vec<&str> = stem.split(['_', '-', '.'])
         .filter(|s| !s.is_empty())
         .collect();
 
@@ -421,13 +419,11 @@ fn extract_size_token(path: &Path) -> Option<String> {
     });
     if has_indices_or_distances {
         for t in &tokens {
-            if t.len() >= 2 && t.starts_with('b') {
-                if let Ok(n) = t[1..].parse::<u64>() {
-                    if n >= 1000 {
+            if t.len() >= 2 && t.starts_with('b')
+                && let Ok(n) = t[1..].parse::<u64>()
+                    && n >= 1000 {
                         return Some(n.to_string());
                     }
-                }
-            }
         }
     }
 
@@ -538,7 +534,7 @@ fn extract_size_token_from_group(group: &RawGroup) -> Option<String> {
         let stem = path.file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        for token in stem.split(|c: char| c == '_' || c == '-' || c == '.') {
+        for token in stem.split(['_', '-', '.']) {
             if is_size_token(token) {
                 return Some(token.to_string());
             }
@@ -600,11 +596,10 @@ fn collect_files(dir: &Path, out: &mut Vec<(PathBuf, VecFormat)>) {
                 continue;
             }
 
-            if let Some(fmt) = VecFormat::detect_from_path(&path) {
-                if fmt.is_xvec() || fmt == VecFormat::Slab {
+            if let Some(fmt) = VecFormat::detect_from_path(&path)
+                && (fmt.is_xvec() || fmt == VecFormat::Slab) {
                     out.push((path, fmt));
                 }
-            }
         }
     }
 }
@@ -652,13 +647,11 @@ fn is_count_or_noise_token(token: &str) -> bool {
     }
 
     // Prefixed count: "b100000", "q10000", "k100"
-    if token.len() >= 2 && matches!(token.as_bytes()[0], b'b' | b'q' | b'k') {
-        if let Ok(n) = token[1..].parse::<u64>() {
-            if n >= 10 {
+    if token.len() >= 2 && matches!(token.as_bytes()[0], b'b' | b'q' | b'k')
+        && let Ok(n) = token[1..].parse::<u64>()
+            && n >= 10 {
                 return true;
             }
-        }
-    }
 
     // File fragment tokens: "files0", "files1", etc.
     if token.starts_with("files") {
@@ -698,7 +691,7 @@ fn infer_dataset_name(path: &Path) -> String {
     let stem = stem.strip_prefix('_').unwrap_or(&stem);
 
     // Tokenize on delimiters
-    let tokens: Vec<&str> = stem.split(|c: char| c == '_' || c == '-' || c == '.')
+    let tokens: Vec<&str> = stem.split(['_', '-', '.'])
         .filter(|s| !s.is_empty())
         .collect();
 

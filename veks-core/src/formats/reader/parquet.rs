@@ -266,7 +266,7 @@ impl ParquetDirReader {
             let hw = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            hw.max(1).min(64)
+            hw.clamp(1, 64)
         };
         let num_workers = if threads == 0 { default_threads } else { threads }
             .min(total_files);
@@ -578,17 +578,15 @@ fn format_schema(schema: &Arc<arrow::datatypes::Schema>) -> String {
 fn find_vector_column(schema: &Arc<arrow::datatypes::Schema>) -> Option<usize> {
     use arrow::datatypes::DataType;
     for (i, field) in schema.fields().iter().enumerate() {
-        if let DataType::List(inner) = field.data_type() {
-            if matches!(inner.data_type(), DataType::Float32) {
+        if let DataType::List(inner) = field.data_type()
+            && matches!(inner.data_type(), DataType::Float32) {
                 return Some(i);
             }
-        }
         // Also check FixedSizeList
-        if let DataType::FixedSizeList(inner, _) = field.data_type() {
-            if matches!(inner.data_type(), DataType::Float32) {
+        if let DataType::FixedSizeList(inner, _) = field.data_type()
+            && matches!(inner.data_type(), DataType::Float32) {
                 return Some(i);
             }
-        }
     }
     None
 }

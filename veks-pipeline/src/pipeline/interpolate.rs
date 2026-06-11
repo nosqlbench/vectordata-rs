@@ -49,7 +49,7 @@ pub fn interpolate(
             chars.next(); // consume '{'
             let mut var_expr = String::new();
             let mut depth = 1;
-            while let Some(c) = chars.next() {
+            for c in chars.by_ref() {
                 if c == '}' {
                     depth -= 1;
                     if depth == 0 {

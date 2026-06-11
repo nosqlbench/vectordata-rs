@@ -11,10 +11,9 @@ use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use veks_pipeline::pipeline::simd_distance::{
-    self, Metric, TransposedBatch,
-    SIMD_BATCH_WIDTH,
+    Metric, TransposedBatch,
     select_distance_fn, select_distance_fn_f16,
-    select_batched_fn_f32, select_batched_fn_f16,
+    select_batched_fn_f32,
     convert_f16_to_f32_bulk,
 };
 
@@ -23,7 +22,14 @@ use veks_pipeline::pipeline::simd_distance::{
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Copy, Debug)]
-struct Neighbor { index: u32, distance: f32 }
+struct Neighbor {
+    /// Never read by the benchmark bodies — kept so the struct has
+    /// the same size/layout as the production neighbor type, which
+    /// is what the top-k structure benchmarks are measuring.
+    #[allow(dead_code)]
+    index: u32,
+    distance: f32,
+}
 
 impl PartialEq for Neighbor {
     fn eq(&self, other: &Self) -> bool { self.distance == other.distance }
@@ -31,12 +37,12 @@ impl PartialEq for Neighbor {
 impl Eq for Neighbor {}
 impl PartialOrd for Neighbor {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.distance.partial_cmp(&other.distance)
+        Some(self.cmp(other))
     }
 }
 impl Ord for Neighbor {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        self.distance.partial_cmp(&other.distance).unwrap_or(Ordering::Equal)
     }
 }
 
@@ -197,7 +203,6 @@ impl SortedTopK {
         }
     }
 
-    fn into_sorted(self) -> Vec<Neighbor> { self.items }
     fn threshold(&self) -> f32 { self.threshold }
 }
 
@@ -425,7 +430,7 @@ impl DualBatch {
     fn from_f32(queries: &[&[f32]], dim: usize) -> Self {
         assert!(queries.len() <= 32);
         let count_a = std::cmp::min(queries.len(), 16);
-        let count_b = queries.len().saturating_sub(16);
+        let _count_b = queries.len().saturating_sub(16);
         let mut data_a = vec![0.0f32; dim * 16];
         let mut data_b = vec![0.0f32; dim * 16];
         for (qi, q) in queries[..count_a].iter().enumerate() {
@@ -443,7 +448,7 @@ impl DualBatch {
 #[target_feature(enable = "avx512f")]
 unsafe fn dual_neg_dot_f32_avx512(
     batch: &DualBatch, base: &[f32], out: &mut [f32; 32],
-) {
+) { unsafe {
     use std::arch::x86_64::*;
     let dim = batch.dim;
     let a_ptr = batch.data_a.as_ptr();
@@ -465,7 +470,7 @@ unsafe fn dual_neg_dot_f32_avx512(
     let zero = _mm512_setzero_ps();
     _mm512_storeu_ps(out.as_mut_ptr(), _mm512_sub_ps(zero, acc_a));
     _mm512_storeu_ps(out.as_mut_ptr().add(16), _mm512_sub_ps(zero, acc_b));
-}
+}}
 
 fn bench_dual_accumulator(c: &mut Criterion) {
     let dim = 512;

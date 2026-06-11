@@ -218,8 +218,8 @@ fn write_header(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
     if let Some(v) = config.variable("partition_count") {
         doc.push_str(&format!("| Oracle partitions | {} |\n", v));
     }
-    if let Some(v) = config.variable("duplicate_count") {
-        if let Ok(n) = v.parse::<u64>() {
+    if let Some(v) = config.variable("duplicate_count")
+        && let Ok(n) = v.parse::<u64>() {
             let base = config.variable("vector_count").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             if base > 0 {
                 doc.push_str(&format!("| Duplicate vectors | {} ({:.2}% of {}) |\n",
@@ -228,7 +228,6 @@ fn write_header(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
                 doc.push_str(&format!("| Duplicate vectors | {} |\n", format_count(n as usize)));
             }
         }
-    }
     if let Some(v) = config.variable("zero_count") {
         doc.push_str(&format!("| Zero vectors | {} |\n", v));
     }
@@ -260,7 +259,7 @@ fn write_header(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
         }
     }
 
-    doc.push_str("\n");
+    doc.push('\n');
 }
 
 fn write_provenance(_config: &DatasetConfig, workspace: &Path, doc: &mut String) {
@@ -296,7 +295,7 @@ fn write_provenance(_config: &DatasetConfig, workspace: &Path, doc: &mut String)
             else { format!("symlink → `{}`", target) };
         doc.push_str(&format!("| `{}` | {} | {} |\n", name, format_size(*size), origin));
     }
-    doc.push_str("\n");
+    doc.push('\n');
 }
 
 fn write_facet_legend(config: &DatasetConfig, doc: &mut String) {
@@ -338,7 +337,7 @@ fn write_facet_legend(config: &DatasetConfig, doc: &mut String) {
     if has_partitions {
         doc.push_str("| O | oracle partition profiles | Per-label subsets with independent KNN | per-partition directory |\n");
     }
-    doc.push_str("\n");
+    doc.push('\n');
 
     doc.push_str("**File formats:** ");
     doc.push_str("`fvec`/`ivec` = dimension-prefixed vectors (`[dim:i32, v0, v1, ..., v_dim-1]` per record). ");
@@ -423,7 +422,7 @@ fn write_profiles(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
                 doc.push_str(&format!("| {} | `{}` | {} | {} |\n",
                     facet_name, view.path(), size, note));
             }
-            doc.push_str("\n");
+            doc.push('\n');
         }
     }
 
@@ -481,7 +480,7 @@ fn write_pipeline(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
         doc.push_str(&format!("| {} | `{}` | `{}`{} | {} |\n",
             i + 1, id, step.run, tag_str, desc));
     }
-    doc.push_str("\n");
+    doc.push('\n');
 
     // Show key step parameters for important processing steps
     let key_steps = ["generate-metadata", "generate-predicates", "partition-profiles"];
@@ -506,20 +505,18 @@ fn write_pipeline(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
             doc.push_str(&format!("- **{}**: {}\n", id, params.join(", ")));
         }
     }
-    if shown_params { doc.push_str("\n"); }
+    if shown_params { doc.push('\n'); }
 
     // Defaults
-    if let Some(ref pipeline) = config.upstream {
-        if let Some(ref defaults) = pipeline.defaults {
-            if !defaults.is_empty() {
+    if let Some(ref pipeline) = config.upstream
+        && let Some(ref defaults) = pipeline.defaults
+            && !defaults.is_empty() {
                 doc.push_str("### Pipeline Defaults\n\n");
                 for (k, v) in defaults {
                     doc.push_str(&format!("- `{}` = `{}`\n", k, v));
                 }
-                doc.push_str("\n");
+                doc.push('\n');
             }
-        }
-    }
 
     // Data flow — derived from actual pipeline steps and source files.
     doc.push_str("### Data Flow\n\n");
@@ -766,7 +763,7 @@ fn write_partitions(config: &DatasetConfig, workspace: &Path, doc: &mut String) 
         doc.push_str(&format!("| `{}` | {} | {} | {} |\n", name, bc, qc_str, source));
     }
 
-    doc.push_str("\n");
+    doc.push('\n');
 
     if total_partition_queries > 0 && total_queries > 0 {
         doc.push_str(&format!(
@@ -815,7 +812,7 @@ fn write_verification(config: &DatasetConfig, doc: &mut String) {
             tied_q, tied_n));
     }
 
-    doc.push_str("\n");
+    doc.push('\n');
 }
 
 fn write_inventory(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
@@ -868,7 +865,7 @@ fn write_inventory(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
         let sz = if *size > 0 { format_size(*size) } else { "missing".to_string() };
         doc.push_str(&format!("| `{}` | {} | {} |\n", rel, sz, note));
     }
-    doc.push_str("\n");
+    doc.push('\n');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -903,27 +900,24 @@ fn generate_exemplars(
     if config.default_profile()
         .and_then(|p| p.view("filtered_neighbor_indices"))
         .is_some()
-    {
-        if let Some(factory) = registry.get("analyze explain-filtered-knn") {
+        && let Some(factory) = registry.get("analyze explain-filtered-knn") {
             doc.push_str("## Filtered KNN Explanation (query 0)\n\n");
             doc.push_str("```\n");
             let output = run_explain_command(*factory, workspace, exemplar_ordinal, ctx);
             doc.push_str(&output);
             doc.push_str("```\n\n");
         }
-    }
 
     // explain-partitions (if partitions exist)
     let has_partitions = config.profiles.profiles.values().any(|p| p.partition);
-    if has_partitions {
-        if let Some(factory) = registry.get("analyze explain-partitions") {
+    if has_partitions
+        && let Some(factory) = registry.get("analyze explain-partitions") {
             doc.push_str("## Partition Explanation (query 0)\n\n");
             doc.push_str("```\n");
             let output = run_explain_command(*factory, workspace, exemplar_ordinal, ctx);
             doc.push_str(&output);
             doc.push_str("```\n\n");
         }
-    }
 
     doc
 }
@@ -937,7 +931,7 @@ fn run_explain_command(
 ) -> String {
     let mut cmd = factory();
     let mut opts = Options::new();
-    opts.set("ordinal", &ordinal.to_string());
+    opts.set("ordinal", ordinal.to_string());
 
     // Capture log output via a collecting sink
     let collector = std::sync::Arc::new(LogCollector::new());

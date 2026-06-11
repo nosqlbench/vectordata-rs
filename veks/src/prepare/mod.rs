@@ -431,7 +431,7 @@ fn parse_fraction(s: &str) -> f64 {
                 std::process::exit(1);
             }
         };
-        if pct_val < 0.0 || pct_val > 100.0 {
+        if !(0.0..=100.0).contains(&pct_val) {
             eprintln!("Error: --base-fraction '{}' — percentage must be between 0% and 100%", s);
             std::process::exit(1);
         }
@@ -449,8 +449,8 @@ fn parse_fraction(s: &str) -> f64 {
                 // Bare "1" is ambiguous — could mean 1% or 100%.
                 // Require "1%" or "0.01" instead.
                 eprintln!(
-                    "Error: --base-fraction '{}' is ambiguous. Use '{}%' for {}% or '{}' for a decimal fraction.",
-                    s, s, s, format!("0.{:02}", v as u32)
+                    "Error: --base-fraction '{}' is ambiguous. Use '{}%' for {}% or '0.{:02}' for a decimal fraction.",
+                    s, s, s, v as u32
                 );
                 std::process::exit(1);
             }
@@ -682,12 +682,11 @@ pub fn run(args: PrepareArgs) {
             if let Some(ref o) = output {
                 // output directory is allowed to not exist yet (we'll create it),
                 // but its parent must exist
-                if let Some(parent) = o.parent() {
-                    if !parent.as_os_str().is_empty() && !parent.exists() {
+                if let Some(parent) = o.parent()
+                    && !parent.as_os_str().is_empty() && !parent.exists() {
                         eprintln!("Error: --output parent directory '{}' does not exist", parent.display());
                         std::process::exit(1);
                     }
-                }
             }
 
             if reset {
@@ -719,8 +718,8 @@ pub fn run(args: PrepareArgs) {
                 // After regeneration, check if dataset.yaml changed.
                 // If identical, restore progress log AND variables.yaml.
                 let check_and_restore = move |dir: &std::path::Path| {
-                    if let Some(ref old) = old_yaml {
-                        if let Ok(new) = std::fs::read_to_string(dir.join("dataset.yaml")) {
+                    if let Some(ref old) = old_yaml
+                        && let Ok(new) = std::fs::read_to_string(dir.join("dataset.yaml")) {
                             if *old == new {
                                 // Only restore if BOTH progress and variables were captured.
                                 // If either is missing, the state is inconsistent — don't
@@ -743,7 +742,6 @@ pub fn run(args: PrepareArgs) {
                                 eprintln!("Config changed — steps will re-execute");
                             }
                         }
-                    }
                 };
 
                 if interactive {
@@ -905,7 +903,7 @@ pub fn run(args: PrepareArgs) {
         PrepareCommand::Run(args) => {
             if args.recursive {
                 run_recursive(args);
-            } else if let Err(_) = crate::pipeline::run_pipeline(args) {
+            } else if crate::pipeline::run_pipeline(args).is_err() {
                 std::process::exit(1);
             }
         }

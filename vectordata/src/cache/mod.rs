@@ -691,6 +691,12 @@ impl CachedChannel {
         self.reference.shape().total_content_size
     }
 
+    /// Transfer-chunk size declared by the merkle reference. Every
+    /// chunk except the last is exactly this many bytes.
+    pub fn chunk_size(&self) -> u64 {
+        self.reference.shape().chunk_size
+    }
+
     /// The merkle reference tree.
     pub fn reference(&self) -> &MerkleRef {
         &self.reference
@@ -955,7 +961,7 @@ mod tests {
         // 200 chunks × 1 MiB = 200 MiB. Big enough that
         // overheads matter; small enough that the test finishes
         // in tens of seconds.
-        let chunk_size: u64 = 1 * 1024 * 1024;
+        let chunk_size: u64 = 1024 * 1024;
         let n_chunks: usize = 200;
         let data_size = chunk_size as usize * n_chunks;
         let data: Vec<u8> = (0..data_size).map(|i| (i % 251) as u8).collect();

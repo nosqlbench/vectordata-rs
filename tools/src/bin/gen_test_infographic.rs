@@ -447,9 +447,8 @@ fn render(tests: &[TestEntry]) -> String {
     out.push_str("</g>\n");
 
     // ── Footer ───────────────────────────────────────────────────
-    let _ = write!(out,
-        r##"<text x="60" y="{y}" fill="#475569" font-size="11">scan: walk &lt;crate&gt;/src &amp; &lt;crate&gt;/tests for #[test] · purpose inferred from file prefix · regenerate with `cargo run -p tools --bin gen_test_infographic`</text>
-"##,
+    let _ = writeln!(out,
+        r##"<text x="60" y="{y}" fill="#475569" font-size="11">scan: walk &lt;crate&gt;/src &amp; &lt;crate&gt;/tests for #[test] · purpose inferred from file prefix · regenerate with `cargo run -p tools --bin gen_test_infographic`</text>"##,
         y = H - 30,
     );
 

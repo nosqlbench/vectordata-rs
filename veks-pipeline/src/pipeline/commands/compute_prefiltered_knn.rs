@@ -551,7 +551,7 @@ fn compute_partition_filtered_f64(
 
     if threads > 1 && query_count > 1 {
         let effective_threads = std::cmp::min(threads, query_count);
-        let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+        let chunk_size = query_count.div_ceil(effective_threads);
         let result_chunks: Vec<&mut [Vec<Neighbor>]> = results.chunks_mut(chunk_size).collect();
 
         std::thread::scope(|scope| {
@@ -563,10 +563,7 @@ fn compute_partition_filtered_f64(
                 scope.spawn(move || {
                     for qi in 0..chunk_len {
                         let global_qi = chunk_start + qi;
-                        let ordinals = match keys_reader.get_ordinals(global_qi as usize) {
-                            Ok(ords) => ords,
-                            Err(_) => Vec::new(),
-                        };
+                        let ordinals = keys_reader.get_ordinals(global_qi as usize).unwrap_or_default();
                         let filtered: Vec<i32> = ordinals.into_iter()
                             .filter(|&o| (o as usize) >= start && (o as usize) < end)
                             .collect();
@@ -581,10 +578,7 @@ fn compute_partition_filtered_f64(
         });
     } else {
         for qi in 0..query_count {
-            let ordinals = match keys_reader.get_ordinals(qi as usize) {
-                Ok(ords) => ords,
-                Err(_) => Vec::new(),
-            };
+            let ordinals = keys_reader.get_ordinals(qi).unwrap_or_default();
             let filtered: Vec<i32> = ordinals.into_iter()
                 .filter(|&o| (o as usize) >= start && (o as usize) < end)
                 .collect();
@@ -621,7 +615,7 @@ fn compute_partition_filtered_f32(
 
     if threads > 1 && query_count > 1 {
         let effective_threads = std::cmp::min(threads, query_count);
-        let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+        let chunk_size = query_count.div_ceil(effective_threads);
 
         let result_chunks: Vec<&mut [Vec<Neighbor>]> =
             results.chunks_mut(chunk_size).collect();
@@ -635,10 +629,7 @@ fn compute_partition_filtered_f32(
                 scope.spawn(move || {
                     for qi in 0..chunk_len {
                         let global_qi = chunk_start + qi;
-                        let ordinals = match keys_reader.get_ordinals(global_qi as usize) {
-                            Ok(ords) => ords,
-                            Err(_) => Vec::new(),
-                        };
+                        let ordinals = keys_reader.get_ordinals(global_qi as usize).unwrap_or_default();
                         let filtered: Vec<i32> = ordinals.into_iter()
                             .filter(|&o| (o as usize) >= start && (o as usize) < end)
                             .collect();
@@ -656,10 +647,7 @@ fn compute_partition_filtered_f32(
         });
     } else {
         for qi in 0..query_count {
-            let ordinals = match keys_reader.get_ordinals(qi as usize) {
-                Ok(ords) => ords,
-                Err(_) => Vec::new(),
-            };
+            let ordinals = keys_reader.get_ordinals(qi).unwrap_or_default();
             let filtered: Vec<i32> = ordinals.into_iter()
                 .filter(|&o| (o as usize) >= start && (o as usize) < end)
                 .collect();
@@ -694,7 +682,7 @@ fn compute_partition_filtered_f16(
 
     if threads > 1 && query_count > 1 {
         let effective_threads = std::cmp::min(threads, query_count);
-        let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+        let chunk_size = query_count.div_ceil(effective_threads);
 
         let result_chunks: Vec<&mut [Vec<Neighbor>]> =
             results.chunks_mut(chunk_size).collect();
@@ -708,10 +696,7 @@ fn compute_partition_filtered_f16(
                 scope.spawn(move || {
                     for qi in 0..chunk_len {
                         let global_qi = chunk_start + qi;
-                        let ordinals = match keys_reader.get_ordinals(global_qi as usize) {
-                            Ok(ords) => ords,
-                            Err(_) => Vec::new(),
-                        };
+                        let ordinals = keys_reader.get_ordinals(global_qi as usize).unwrap_or_default();
                         let filtered: Vec<i32> = ordinals.into_iter()
                             .filter(|&o| (o as usize) >= start && (o as usize) < end)
                             .collect();
@@ -729,10 +714,7 @@ fn compute_partition_filtered_f16(
         });
     } else {
         for qi in 0..query_count {
-            let ordinals = match keys_reader.get_ordinals(qi as usize) {
-                Ok(ords) => ords,
-                Err(_) => Vec::new(),
-            };
+            let ordinals = keys_reader.get_ordinals(qi).unwrap_or_default();
             let filtered: Vec<i32> = ordinals.into_iter()
                 .filter(|&o| (o as usize) >= start && (o as usize) < end)
                 .collect();
@@ -877,7 +859,7 @@ use the E facet produced by `compute postfiltered-knn`.
         };
 
         let metric_str = options.get("metric").unwrap_or("L2");
-        let metric = match Metric::from_str(metric_str) {
+        let metric = match Metric::parse(metric_str) {
             Some(m) => m,
             None => return error_result(
                 format!("unknown metric: '{}'. Use L2, COSINE, DOT_PRODUCT, or L1", metric_str),
@@ -928,13 +910,11 @@ use the E facet produced by `compute postfiltered-knn`.
 
         // Create output directories
         for path in std::iter::once(&indices_path).chain(distances_path.iter()) {
-            if let Some(parent) = path.parent() {
-                if !parent.exists() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
+            if let Some(parent) = path.parent()
+                && !parent.exists()
+                    && let Err(e) = std::fs::create_dir_all(parent) {
                         return error_result(format!("failed to create directory: {}", e), start);
                     }
-                }
-            }
         }
 
         // Load metadata-indices (slab or ivec)
@@ -955,7 +935,9 @@ use the E facet produced by `compute postfiltered-knn`.
             Err(e) => return error_result(e, start),
         };
         match etype {
-            ElementType::F32 | _ if !etype.supports_simd_distance() || etype == ElementType::I8 => {
+            // F32 — and anything without SIMD support (or i8) —
+            // takes the generic f32 kernel.
+            _ if !etype.supports_simd_distance() || etype == ElementType::I8 => {
                 let dist_fn = simd_distance::select_distance_fn(metric);
                 execute_f32(
                     &base_path, &query_path, &keys_reader, &indices_path,
@@ -1215,6 +1197,15 @@ fn execute_f64(
 /// processed sequentially: a prefetch thread warms the page cache, compute
 /// threads process all queries against matching ordinals in the partition,
 /// and a background writer flushes results to cache.
+/// Per-element-type prefiltered-KNN kernel invoked once per base
+/// partition: `(query_reader, query_count, base_reader, keys_reader,
+/// base_offset, base_count, k, dist_fn, threads, progress) ->
+/// per-query neighbors`.
+type PartitionComputeFn<T> = fn(
+    &XvecReader<T>, usize, &Arc<XvecReader<T>>, &PredicateIndices,
+    usize, usize, usize, fn(&[T], &[T]) -> f32, usize, &ProgressHandle,
+) -> Vec<Vec<Neighbor>>;
+
 #[allow(clippy::too_many_arguments)]
 fn execute_with_partitions<T: Send + Sync + 'static>(
     query_reader: &XvecReader<T>,
@@ -1234,10 +1225,7 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     compress_cache: bool,
     ctx: &mut StreamContext,
     start: Instant,
-    compute_fn: fn(
-        &XvecReader<T>, usize, &Arc<XvecReader<T>>, &PredicateIndices,
-        usize, usize, usize, fn(&[T], &[T]) -> f32, usize, &ProgressHandle,
-    ) -> Vec<Vec<Neighbor>>,
+    compute_fn: PartitionComputeFn<T>,
 ) -> CommandResult {
     // Single-partition fast path
     if base_count <= partition_size {
@@ -1325,17 +1313,16 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     };
 
     // Create cache directory
-    if !ctx.cache.exists() {
-        if let Err(e) = std::fs::create_dir_all(&ctx.cache) {
+    if !ctx.cache.exists()
+        && let Err(e) = std::fs::create_dir_all(&ctx.cache) {
             return error_result(format!("create cache dir: {}", e), start);
         }
-    }
 
     // Phase 1: Plan partitions and validate cache
     // Use base_count in the cache key so partitions are invalidated when
     // the base vector file changes (e.g., different fraction).
     let base_file_size = base_count as u64;
-    let estimated_partitions = (base_count + partition_size - 1) / partition_size;
+    let estimated_partitions = base_count.div_ceil(partition_size);
     ctx.ui.log(&format!(
         "  planning ~{} partitions (partition_size={})...",
         estimated_partitions, format_count(partition_size),
@@ -1504,11 +1491,10 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
         if !full_neighbors.exists() {
             let _ = std::fs::copy(indices_path, &full_neighbors);
         }
-        if let Some(dp) = distances_path {
-            if !full_distances.exists() {
+        if let Some(dp) = distances_path
+            && !full_distances.exists() {
                 let _ = std::fs::copy(dp, &full_distances);
             }
-        }
         ctx.ui.log(&format!(
             "  cached merged result as partition [{}, {}) for reuse by larger profiles",
             format_count(base_offset), format_count(base_end),

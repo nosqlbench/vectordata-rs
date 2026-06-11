@@ -198,7 +198,7 @@ _defaults:
     let yaml = yaml.replace("REPLACED_AT_RUNTIME", &dataset_url);
     std::fs::write(dataset_dir.join("knn_entries.yaml"), yaml).unwrap();
 
-    let sources = CatalogSources::new().add_catalogs(&[dataset_url.clone()]);
+    let sources = CatalogSources::new().add_catalogs(std::slice::from_ref(&dataset_url));
     let catalog = Catalog::of(&sources);
 
     let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
@@ -294,8 +294,7 @@ fn catalog_open_synthesizes_group_for_knn_entries_entry() {
     let tmp = tempfile::tempdir().unwrap();
     let server = TestServer::start(tmp.path()).unwrap();
     let base = server.base_url();
-    let yaml = format!(
-        r#"
+    let yaml = r#"
 _defaults:
   base_url: s3://example-bucket/some-prefix/
 
@@ -303,8 +302,7 @@ ds-x:
   base: x/base.fvecs
   query: x/query.fvecs
   gt: x/gt.ivecs
-"#
-    );
+"#.to_string();
     std::fs::write(tmp.path().join("entries.yaml"), &yaml).unwrap();
     let sources = CatalogSources::new()
         .add_catalogs(&[format!("{base}/entries.yaml")]);
@@ -401,7 +399,7 @@ _defaults:
     std::fs::write(tmp.path().join("protected-catalog.yaml"), &yaml).unwrap();
 
     let catalog_url = format!("{base}/protected-catalog.yaml");
-    let sources = CatalogSources::new().add_catalogs(&[catalog_url.clone()]);
+    let sources = CatalogSources::new().add_catalogs(std::slice::from_ref(&catalog_url));
     let catalog = Catalog::of(&sources);
 
     let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();

@@ -83,7 +83,7 @@ beginning of a pipeline to log the execution environment.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let short = options.get("short").map_or(false, |s| s == "true");
+        let short = options.get("short") == Some("true");
 
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -175,30 +175,19 @@ beginning of a pipeline to log the execution environment.
 
 /// Detect available SIMD features at compile time.
 fn detect_simd_features() -> Vec<&'static str> {
-    let mut features = Vec::new();
-
-    #[cfg(target_feature = "avx512f")]
-    features.push("AVX-512F");
-
-    #[cfg(target_feature = "avx2")]
-    features.push("AVX2");
-
-    #[cfg(target_feature = "avx")]
-    features.push("AVX");
-
-    #[cfg(target_feature = "sse4.2")]
-    features.push("SSE4.2");
-
-    #[cfg(target_feature = "sse4.1")]
-    features.push("SSE4.1");
-
-    #[cfg(target_feature = "sse2")]
-    features.push("SSE2");
-
-    #[cfg(target_feature = "neon")]
-    features.push("NEON");
-
-    features
+    let candidates = [
+        (cfg!(target_feature = "avx512f"), "AVX-512F"),
+        (cfg!(target_feature = "avx2"), "AVX2"),
+        (cfg!(target_feature = "avx"), "AVX"),
+        (cfg!(target_feature = "sse4.2"), "SSE4.2"),
+        (cfg!(target_feature = "sse4.1"), "SSE4.1"),
+        (cfg!(target_feature = "sse2"), "SSE2"),
+        (cfg!(target_feature = "neon"), "NEON"),
+    ];
+    candidates.iter()
+        .filter(|(enabled, _)| *enabled)
+        .map(|&(_, name)| name)
+        .collect()
 }
 
 #[cfg(test)]

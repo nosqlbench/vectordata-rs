@@ -278,11 +278,10 @@ fn ivec_record_count(path: &Path) -> Result<usize, String> {
 }
 
 fn ensure_parent(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
+    if let Some(parent) = path.parent()
+        && !parent.exists() {
             let _ = std::fs::create_dir_all(parent);
         }
-    }
 }
 
 fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {

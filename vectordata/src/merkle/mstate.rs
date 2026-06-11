@@ -70,7 +70,7 @@ impl MerkleState {
 
     /// Number of u64 words needed for a given leaf count.
     fn word_count_for_leaves(leaf_count: u32) -> usize {
-        ((leaf_count as usize) + 63) / 64
+        (leaf_count as usize).div_ceil(64)
     }
 
     /// Bitset size in bytes (for serialization).
@@ -441,7 +441,7 @@ mod tests {
         let path = dir.path().join("corrupt_trunc.mrkl");
 
         // Write a file that is too short to contain even a footer
-        fs::write(&path, &[0u8; 10]).unwrap();
+        fs::write(&path, [0u8; 10]).unwrap();
         let result = MerkleState::load(&path);
         assert!(result.is_err());
     }

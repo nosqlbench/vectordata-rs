@@ -62,9 +62,9 @@ const CBLAS_NO_TRANS: i32 = 111;
 #[cfg(all(feature = "knnutils", unix))]
 const CBLAS_TRANS: i32 = 112;
 
-/// Set env vars that BLAS libraries read at init time. This only
-/// has an effect if called before the BLAS is first invoked — for
-/// our parity demo the process hasn't touched BLAS yet when this
+// Set env vars that BLAS libraries read at init time. This only
+// has an effect if called before the BLAS is first invoked — for
+// our parity demo the process hasn't touched BLAS yet when this
 // blas_set_single_threaded() was a private helper here; the logic is
 // now inlined at the top of execute() above. See pipeline::blas_abi
 // for the production-grade variant gated on the `faiss` feature.

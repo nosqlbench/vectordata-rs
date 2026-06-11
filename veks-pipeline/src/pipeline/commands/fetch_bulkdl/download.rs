@@ -197,14 +197,13 @@ pub fn download_signed_file(
             url, expected_size, actual,
         ));
     }
-    if let Some(cl) = content_length {
-        if cl != expected_size {
+    if let Some(cl) = content_length
+        && cl != expected_size {
             return Err(format!(
                 "Content-Length {} does not match listed size {} for {}",
                 cl, expected_size, url,
             ));
         }
-    }
 
     Ok(())
 }

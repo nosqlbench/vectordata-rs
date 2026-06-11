@@ -133,11 +133,10 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
         };
 
         let output_path = resolve_path(output_str, &ctx.workspace);
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists() {
                 let _ = std::fs::create_dir_all(parent);
             }
-        }
 
         let format = options.get("format").unwrap_or("slab");
 
@@ -268,11 +267,10 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
         let mut produced = vec![output_path.clone()];
         if let Some(layout_str) = options.get("layout-output") {
             let layout_path = resolve_path(layout_str, &ctx.workspace);
-            if let Some(parent) = layout_path.parent() {
-                if !parent.exists() {
+            if let Some(parent) = layout_path.parent()
+                && !parent.exists() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-            }
             let cfg = match slabtastic::WriterConfig::new(512, 4096, u32::MAX, false) {
                 Ok(c) => c,
                 Err(e) => return error_result(format!("layout slab config: {}", e), start),

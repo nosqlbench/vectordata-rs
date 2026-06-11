@@ -1138,8 +1138,8 @@ mod cli {
         // A bare `--to <namespace>` (or `--to root`) is shorthand for a full URL
         // on the endpoint you're logged in to — expand it before anything reads
         // the destination (token resolution, the engine, .publish_url).
-        if let Some(to) = args.to.clone() {
-            if !to.contains("://") {
+        if let Some(to) = args.to.clone()
+            && !to.contains("://") {
                 match super::resolve_to(&to, &args.path) {
                     Ok(url) => args.to = Some(url),
                     Err(e) => {
@@ -1148,7 +1148,6 @@ mod cli {
                     }
                 }
             }
-        }
 
         // No destination at all (no --to, no .publish_url)? If the user is
         // logged in, offer to push to that endpoint — prompting for the path

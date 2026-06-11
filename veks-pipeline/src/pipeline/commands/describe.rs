@@ -202,7 +202,7 @@ element type does this dataset use?"
             format!("~{} (estimated)", format_count(est.rows))
         } else {
             meta.record_count
-                .map_or("unknown".to_string(), |n| format_count(n))
+                .map_or("unknown".to_string(), format_count)
         };
         let record_bytes = 4 + meta.dimension as usize * meta.element_size;
 
@@ -229,7 +229,7 @@ element type does this dataset use?"
             message.push_str(&format!("\nFiles:      {}", a.file_count));
         }
         if record_bytes > 0 {
-            message.push_str(&format!("\nRecord size:{} bytes", format!(" {}", record_bytes)));
+            message.push_str(&format!("\nRecord size: {} bytes", record_bytes));
         }
         if let Some(size) = file_size {
             message.push_str(&format!("\n{}{}", size_label, format_bytes(size)));
@@ -251,8 +251,8 @@ element type does this dataset use?"
         }
 
         // For xvec formats, report whether records are uniform or variable length
-        if format.is_xvec() && dir_agg.is_none() {
-            if let Some(size) = file_size {
+        if format.is_xvec() && dir_agg.is_none()
+            && let Some(size) = file_size {
                 let stride = record_bytes as u64;
                 if stride > 0 && size % stride == 0 {
                     let count = size / stride;
@@ -262,7 +262,6 @@ element type does this dataset use?"
                     message.push_str("\nStructure:   variable-length (records have different dimensions)");
                 }
             }
-        }
 
         // Hint on directories: tell the caller about the alternative scan
         // modes available (sparse for speed, full-scan for per-record verify).
@@ -280,8 +279,8 @@ element type does this dataset use?"
         }
 
         // --full-scan: walk all records and build a histogram of record lengths
-        if full_scan && format.is_xvec() && dir_agg.is_none() {
-            if let Some(size) = file_size {
+        if full_scan && format.is_xvec() && dir_agg.is_none()
+            && let Some(size) = file_size {
                 match scan_xvec_records(&source_path, format, size, ctx) {
                     Ok(scan) => {
                         message.push_str(&format!("\n\n── Record length scan ({} records) ──", scan.total_records));
@@ -306,7 +305,6 @@ element type does this dataset use?"
                     }
                 }
             }
-        }
 
         CommandResult {
             status: Status::Ok,
@@ -542,7 +540,7 @@ fn scan_xvec_records(
         offset += record_size;
         record_idx += 1;
 
-        if record_idx % 10_000 == 0 {
+        if record_idx.is_multiple_of(10_000) {
             pb.set_position(offset);
         }
     }

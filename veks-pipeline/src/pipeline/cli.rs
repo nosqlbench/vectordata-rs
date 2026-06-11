@@ -790,7 +790,7 @@ mod tests {
     fn test_all_commands_have_documentation() {
         let registry = CommandRegistry::with_builtins();
         for path in registry.command_paths() {
-            let factory = registry.get(&path).unwrap();
+            let factory = registry.get(path).unwrap();
             let cmd = factory();
             let doc = cmd.command_doc();
 

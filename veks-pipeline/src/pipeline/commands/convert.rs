@@ -336,16 +336,14 @@ Convert with explicit source format override:
         };
 
         // Create output directory
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(
                         format!("failed to create directory: {}", e),
                         start,
                     );
                 }
-            }
-        }
 
         // ── Fast path: parallel mmap conversion for npy→xvec ──
         //
@@ -710,9 +708,8 @@ Convert with explicit source format override:
                 count += 1;
             };
             pb.inc(1);
-            if let Some(lim) = limit {
-                if count >= lim { break; }
-            }
+            if let Some(lim) = limit
+                && count >= lim { break; }
         }
 
         reader_handle.join().expect("reader thread panicked");
@@ -1056,8 +1053,8 @@ fn try_fast_parquet_to_xvec(
     if !to_format.is_uniform_xvec() { return None; }
     if let Some(f) = options.get("facet") {
         use veks_core::formats::facet::Facet;
-        if let Some(facet) = Facet::from_key(f).or_else(|| Facet::from_alias(f)) {
-            if matches!(
+        if let Some(facet) = Facet::from_key(f).or_else(|| Facet::from_alias(f))
+            && matches!(
                 facet,
                 Facet::MetadataContent
                     | Facet::MetadataPredicates
@@ -1066,7 +1063,6 @@ fn try_fast_parquet_to_xvec(
             ) {
                 return None;
             }
-        }
     }
 
     // From here on, source IS parquet and target IS uniform xvec, so the
@@ -1269,8 +1265,8 @@ fn try_fast_xvec_dir_to_xvec(
     // are exactly what this fast path is built to gather.
     if let Some(f) = options.get("facet") {
         use veks_core::formats::facet::Facet;
-        if let Some(facet) = Facet::from_key(f).or_else(|| Facet::from_alias(f)) {
-            if matches!(
+        if let Some(facet) = Facet::from_key(f).or_else(|| Facet::from_alias(f))
+            && matches!(
                 facet,
                 Facet::MetadataContent
                     | Facet::MetadataPredicates
@@ -1279,7 +1275,6 @@ fn try_fast_xvec_dir_to_xvec(
             ) {
                 return None;
             }
-        }
     }
 
     // ── Tier 2: applicable but BLOCKED by user-requested behavior.

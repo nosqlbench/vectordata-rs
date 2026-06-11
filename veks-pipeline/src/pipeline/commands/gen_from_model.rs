@@ -274,13 +274,11 @@ is proprietary or too large to distribute.
         };
 
         // Create output directory
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(format!("failed to create directory: {}", e), start);
                 }
-            }
-        }
 
         // Generate vectors
         let mut data_rng = rng::seeded_rng(seed);

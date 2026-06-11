@@ -179,28 +179,24 @@ pub(crate) fn create_backup(path: &Path) -> Result<PathBuf, String> {
 
 /// Check if a dataset.yaml has a `merkle create` step (by command name).
 fn has_merkle_create_step(dataset_path: &Path) -> bool {
-    if let Ok(config) = DatasetConfig::load(dataset_path) {
-        if let Some(ref pipeline) = config.upstream {
-            if let Some(ref steps) = pipeline.steps {
+    if let Ok(config) = DatasetConfig::load(dataset_path)
+        && let Some(ref pipeline) = config.upstream
+            && let Some(ref steps) = pipeline.steps {
                 return steps.iter().any(|s| s.run == "merkle create");
             }
-        }
-    }
     false
 }
 
 /// Load the set of existing step IDs from a dataset.yaml.
 fn load_existing_step_ids(dataset_path: &Path) -> std::collections::HashSet<String> {
     let mut ids = std::collections::HashSet::new();
-    if let Ok(config) = DatasetConfig::load(dataset_path) {
-        if let Some(ref pipeline) = config.upstream {
-            if let Some(ref steps) = pipeline.steps {
+    if let Ok(config) = DatasetConfig::load(dataset_path)
+        && let Some(ref pipeline) = config.upstream
+            && let Some(ref steps) = pipeline.steps {
                 for step in steps {
                     ids.insert(step.effective_id());
                 }
             }
-        }
-    }
     ids
 }
 
@@ -212,22 +208,18 @@ fn find_producing_step(dataset_path: &Path, output_rel: &str) -> Option<String> 
 
     for step in steps {
         // Check if this step's output matches
-        if let Some(output) = step.options.get("output") {
-            if let Some(s) = output.as_str() {
-                if s == output_rel {
+        if let Some(output) = step.options.get("output")
+            && let Some(s) = output.as_str()
+                && s == output_rel {
                     return Some(step.effective_id());
                 }
-            }
-        }
         // Also check multi-output steps (indices, distances, etc.)
         for key in &["indices", "distances", "source"] {
-            if let Some(val) = step.options.get(*key) {
-                if let Some(s) = val.as_str() {
-                    if s == output_rel {
+            if let Some(val) = step.options.get(*key)
+                && let Some(s) = val.as_str()
+                    && s == output_rel {
                         return Some(step.effective_id());
                     }
-                }
-            }
         }
     }
     None

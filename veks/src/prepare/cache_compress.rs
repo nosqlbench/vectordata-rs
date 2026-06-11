@@ -42,14 +42,13 @@ const SKIP_EXTENSIONS: &[&str] = &["json", "gz"];
 /// Returns `true` if the file name matches an eligible compression pattern.
 fn is_eligible(file_name: &str) -> bool {
     // Never compress files that are explicitly skipped.
-    if SKIP_NAMES.iter().any(|s| file_name == *s) {
+    if SKIP_NAMES.contains(&file_name) {
         return false;
     }
-    if let Some(ext) = Path::new(file_name).extension().and_then(|e| e.to_str()) {
-        if SKIP_EXTENSIONS.iter().any(|s| *s == ext) {
+    if let Some(ext) = Path::new(file_name).extension().and_then(|e| e.to_str())
+        && SKIP_EXTENSIONS.contains(&ext) {
             return false;
         }
-    }
 
     ELIGIBLE_PATTERNS.iter().any(|pat| file_name.contains(pat))
 }
@@ -80,7 +79,7 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// modifying any files.
 pub fn run(cache_dir: &Path, dry_run: bool) {
     if !cache_dir.exists() {
-        eprintln!("Cache directory does not exist: {}", crate::check::rel_display(&cache_dir.to_path_buf()));
+        eprintln!("Cache directory does not exist: {}", crate::check::rel_display(cache_dir));
         std::process::exit(1);
     }
 
@@ -99,14 +98,14 @@ pub fn run(cache_dir: &Path, dry_run: bool) {
         .collect();
 
     if eligible.is_empty() {
-        println!("No eligible files found in {}", crate::check::rel_display(&cache_dir.to_path_buf()));
+        println!("No eligible files found in {}", crate::check::rel_display(cache_dir));
         return;
     }
 
     println!(
         "{} eligible file(s) in {}",
         eligible.len(),
-        crate::check::rel_display(&cache_dir.to_path_buf())
+        crate::check::rel_display(cache_dir)
     );
     if dry_run {
         println!("(dry run — no files will be modified)");
@@ -173,7 +172,7 @@ pub fn run(cache_dir: &Path, dry_run: bool) {
         a_total_compressed.fetch_add(compressed_size, Ordering::Relaxed);
         compressed_count.fetch_add(1, Ordering::Relaxed);
         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 10 == 0 || n as usize == total {
+        if n.is_multiple_of(10) || n as usize == total {
             eprint!("\r[{}/{}] compressed...       ", n, total);
         }
     });
@@ -202,7 +201,7 @@ pub fn run(cache_dir: &Path, dry_run: bool) {
 /// and preserves the mtime.
 pub fn run_uncompress(cache_dir: &Path, dry_run: bool) {
     if !cache_dir.exists() {
-        eprintln!("Cache directory does not exist: {}", crate::check::rel_display(&cache_dir.to_path_buf()));
+        eprintln!("Cache directory does not exist: {}", crate::check::rel_display(cache_dir));
         std::process::exit(1);
     }
 
@@ -222,11 +221,11 @@ pub fn run_uncompress(cache_dir: &Path, dry_run: bool) {
         .collect();
 
     if gz_files.is_empty() {
-        println!("No compressed cache files found in {}", crate::check::rel_display(&cache_dir.to_path_buf()));
+        println!("No compressed cache files found in {}", crate::check::rel_display(cache_dir));
         return;
     }
 
-    println!("{} compressed file(s) in {}", gz_files.len(), crate::check::rel_display(&cache_dir.to_path_buf()));
+    println!("{} compressed file(s) in {}", gz_files.len(), crate::check::rel_display(cache_dir));
     if dry_run { println!("(dry run — no files will be modified)"); }
     println!();
 
@@ -296,7 +295,7 @@ pub fn run_uncompress(cache_dir: &Path, dry_run: bool) {
         a_total_uncompressed.fetch_add(data.len() as u64, Ordering::Relaxed);
         uncompressed_count.fetch_add(1, Ordering::Relaxed);
         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 10 == 0 || n as usize == total {
+        if n.is_multiple_of(10) || n as usize == total {
             eprint!("\r[{}/{}] uncompressed...       ", n, total);
         }
     });

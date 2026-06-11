@@ -144,35 +144,6 @@ pub(crate) fn writable_namespaces_from(view: &serde_json::Value) -> Vec<String> 
         .unwrap_or_default()
 }
 
-#[cfg(test)]
-mod namespace_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn active_namespaces_filters_inactive_and_backendless() {
-        let v = json!({"namespaces": [
-            {"path": "datasets", "active": true,  "backend_config": "store"},
-            {"path": "archive",  "active": false, "backend_config": "store"}, // inactive
-            {"path": "general",  "active": true,  "backend_config": null},     // no backend → unwritable
-            {"path": "scratch",  "backend_config": "store"},                   // no `active` ⇒ assume active
-        ]});
-        assert_eq!(active_namespaces_from(&v), vec!["datasets".to_string(), "scratch".to_string()]);
-        assert!(active_namespaces_from(&json!({})).is_empty());
-    }
-
-    #[test]
-    fn writable_namespaces_from_whoami() {
-        let v = json!({"namespaces": [
-            {"path": "datasets", "actions": ["read", "write"]},
-            {"path": "pub",      "actions": ["publish"]},
-            {"path": "ro",       "actions": ["read"]},
-        ]});
-        assert_eq!(writable_namespaces_from(&v), vec!["datasets".to_string(), "pub".to_string()]);
-        assert!(writable_namespaces_from(&json!({})).is_empty());
-    }
-}
-
 /// `POST /tokens` — mint a delegated key for the authenticated caller,
 /// optionally narrowed by a profile spec.
 pub fn issue_token(
@@ -267,4 +238,33 @@ fn parse_token(resp: reqwest::blocking::Response, what: &str) -> Result<TokenRes
         return Err(format!("{what} failed (HTTP {status}): {}", body.trim()));
     }
     resp.json::<TokenResp>().map_err(|e| format!("parsing {what} response: {e}"))
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn active_namespaces_filters_inactive_and_backendless() {
+        let v = json!({"namespaces": [
+            {"path": "datasets", "active": true,  "backend_config": "store"},
+            {"path": "archive",  "active": false, "backend_config": "store"}, // inactive
+            {"path": "general",  "active": true,  "backend_config": null},     // no backend → unwritable
+            {"path": "scratch",  "backend_config": "store"},                   // no `active` ⇒ assume active
+        ]});
+        assert_eq!(active_namespaces_from(&v), vec!["datasets".to_string(), "scratch".to_string()]);
+        assert!(active_namespaces_from(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn writable_namespaces_from_whoami() {
+        let v = json!({"namespaces": [
+            {"path": "datasets", "actions": ["read", "write"]},
+            {"path": "pub",      "actions": ["publish"]},
+            {"path": "ro",       "actions": ["read"]},
+        ]});
+        assert_eq!(writable_namespaces_from(&v), vec!["datasets".to_string(), "pub".to_string()]);
+        assert!(writable_namespaces_from(&json!({})).is_empty());
+    }
 }

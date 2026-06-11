@@ -118,8 +118,8 @@ pub fn run(args: PublishArgs) {
             loop {
                 let candidate = walk.join(".publish_url");
                 if candidate.is_file() {
-                    if let Ok(outer_content) = std::fs::read_to_string(&candidate) {
-                        if let Ok(outer) = crate::check::publish_url::parse_publish_url(&outer_content) {
+                    if let Ok(outer_content) = std::fs::read_to_string(&candidate)
+                        && let Ok(outer) = crate::check::publish_url::parse_publish_url(&outer_content) {
                             println!("{}", crate::term::warn("Note: this publish root is interior to another:"));
                             println!("  {} {} → {}",
                                 crate::term::info("outer:"),
@@ -133,7 +133,6 @@ pub fn run(args: PublishArgs) {
                                 crate::term::bold("local"));
                             println!();
                         }
-                    }
                     break; // only report the nearest outer root
                 }
                 if !walk.pop() { break; }
@@ -322,7 +321,7 @@ fn run_preflight_checks(directory: &Path) -> bool {
         if !result.passed {
             eprintln!("{} {}",
                 veks_core::term::fail("Pre-flight check failed:"),
-                veks_core::term::bold(&result.name));
+                veks_core::term::bold(result.name));
             for msg in &result.messages {
                 eprintln!("  {}", veks_core::term::red(msg));
             }
@@ -353,7 +352,7 @@ pub fn enumerate_publishable_files(root: &Path) -> Vec<PathBuf> {
 
     // Step 3: enumerate files within on-path directories and dataset subtrees
     let mut files = Vec::new();
-    enumerate_recursive(root, root, &mut files, &on_path_dirs, &dataset_dirs);
+    enumerate_recursive(root, &mut files, &on_path_dirs, &dataset_dirs);
     files.sort();
     files
 }
@@ -386,7 +385,7 @@ fn find_dataset_dirs(dir: &Path, result: &mut Vec<PathBuf>) {
 }
 
 fn enumerate_recursive(
-    root: &Path, dir: &Path, files: &mut Vec<PathBuf>,
+    dir: &Path, files: &mut Vec<PathBuf>,
     on_path_dirs: &std::collections::HashSet<PathBuf>,
     dataset_dirs: &[PathBuf],
 ) {
@@ -410,10 +409,10 @@ fn enumerate_recursive(
             }
             if inside_dataset {
                 // Inside a dataset — descend into all non-excluded subdirs
-                enumerate_recursive(root, &path, files, on_path_dirs, dataset_dirs);
+                enumerate_recursive(&path, files, on_path_dirs, dataset_dirs);
             } else if on_path_dirs.contains(&path) || dataset_dirs.iter().any(|ds| ds.starts_with(&path)) {
                 // On the path to a dataset — descend
-                enumerate_recursive(root, &path, files, on_path_dirs, dataset_dirs);
+                enumerate_recursive(&path, files, on_path_dirs, dataset_dirs);
             }
             // else: not on any dataset path — skip silently
         } else if !filters::is_excluded_file(&name_str) {

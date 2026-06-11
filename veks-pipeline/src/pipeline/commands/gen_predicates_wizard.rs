@@ -263,11 +263,10 @@ fn autodetect_metadata_source(root: &std::path::Path) -> Result<Option<PathBuf>,
             }
             loop {
                 let raw = prompt("Pick metadata source", "1")?;
-                if let Ok(n) = raw.trim().parse::<usize>() {
-                    if n >= 1 && n <= candidates.len() {
+                if let Ok(n) = raw.trim().parse::<usize>()
+                    && n >= 1 && n <= candidates.len() {
                         return Ok(Some(candidates.remove(n - 1)));
                     }
-                }
                 println!("  pick a number in 1..={}", candidates.len());
             }
         }
@@ -330,10 +329,7 @@ fn walk_for_metadata_slabs(
 /// the file; that's correct for predicate slabs, vector slabs,
 /// and anything else that isn't a metadata source.
 fn is_metadata_slab(path: &std::path::Path) -> bool {
-    match classify_slab(path) {
-        SlabKind::Metadata => true,
-        _ => false,
-    }
+    matches!(classify_slab(path), SlabKind::Metadata)
 }
 
 enum SlabKind { Metadata, Predicate, Other }
@@ -343,10 +339,10 @@ fn classify_slab(path: &std::path::Path) -> SlabKind {
         SCHEMA_KIND_METADATA, SCHEMA_KIND_PREDICATE, SCHEMA_NAMESPACE,
     };
     // Layer 1: schema sidecar (authoritative when present).
-    if let Ok(r) = slabtastic::SlabReader::open_namespace(path, Some(SCHEMA_NAMESPACE)) {
-        if r.total_records() > 0 {
-            if let Ok(bytes) = r.get(0) {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+    if let Ok(r) = slabtastic::SlabReader::open_namespace(path, Some(SCHEMA_NAMESPACE))
+        && r.total_records() > 0
+            && let Ok(bytes) = r.get(0)
+                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     // Default to metadata when the descriptor is
                     // present but pre-dates the `kind` discriminator.
                     let kind = v.get("kind").and_then(|k| k.as_str())
@@ -357,9 +353,6 @@ fn classify_slab(path: &std::path::Path) -> SlabKind {
                         _ => SlabKind::Other,
                     };
                 }
-            }
-        }
-    }
     // Layer 2: filename convention. Mirrors the bootstrap wizard's
     // `detect_roles` for the MetadataContent / MetadataPredicates /
     // MetadataResults split.
@@ -368,16 +361,16 @@ fn classify_slab(path: &std::path::Path) -> SlabKind {
 
 fn classify_by_filename(path: &std::path::Path) -> SlabKind {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-    let tokens: Vec<&str> = stem.split(|c: char| c == '_' || c == '-' || c == '.')
+    let tokens: Vec<&str> = stem.split(['_', '-', '.'])
         .filter(|s| !s.is_empty())
         .collect();
     let has_token_or_substring = |k: &str| stem.contains(k);
     let has_predicates = has_token_or_substring("predicate") || has_token_or_substring("predkey");
-    let has_indices = tokens.iter().any(|t| *t == "indices")
+    let has_indices = tokens.contains(&"indices")
         || has_token_or_substring("neighbors")
         || has_token_or_substring("groundtruth");
     let has_results = has_token_or_substring("result");
-    let has_metadata = has_token_or_substring("metadata") || tokens.iter().any(|t| *t == "content");
+    let has_metadata = has_token_or_substring("metadata") || tokens.contains(&"content");
     if has_predicates { return SlabKind::Predicate; }
     if has_results || has_indices { return SlabKind::Other; }
     if has_metadata { return SlabKind::Metadata; }
@@ -418,7 +411,7 @@ fn load_survey(inputs: &WizardInputs) -> Result<SurveyReport, String> {
 // Field eligibility + display
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn list_eligible_fields<'a>(report: &'a SurveyReport) -> Vec<(String, &'a FieldProfile)> {
+fn list_eligible_fields(report: &SurveyReport) -> Vec<(String, &FieldProfile)> {
     let mut out = Vec::new();
     for (name, profile) in &report.fields {
         if profile.presence.present == 0 { continue; }
@@ -493,8 +486,8 @@ fn print_field_table(eligible: &[(String, &FieldProfile)]) {
         }
     };
     println!("  Available fields:");
-    println!("    {:>3}  {:<28}  {:<12}  {:<10}  {}",
-        "#", "field", "type", "cardinality", "capable ops");
+    println!("    {:>3}  {:<28}  {:<12}  {:<10}  capable ops",
+        "#", "field", "type", "cardinality");
     println!("    {:>3}  {:<28}  {:<12}  {:<10}  {}",
         "—", "—".repeat(28), "—".repeat(12), "—".repeat(10), "—".repeat(20));
     for (i, (name, profile)) in eligible.iter().enumerate() {

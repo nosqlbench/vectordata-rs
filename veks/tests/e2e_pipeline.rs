@@ -233,11 +233,12 @@ fn write_npy_dir(dir: &Path, count: usize, dim: usize) {
     header.extend_from_slice(magic);
     let hdr_bytes = descr.as_bytes();
     let total = 10 + hdr_bytes.len() + 1;
-    let pad = ((total + 63) / 64) * 64 - total;
+    let pad = total.div_ceil(64) * 64 - total;
     let hdr_len = (hdr_bytes.len() + pad + 1) as u16;
     header.extend_from_slice(&hdr_len.to_le_bytes());
     header.extend_from_slice(hdr_bytes);
-    for _ in 0..pad { header.push(b' '); }
+    let new_len = header.len() + pad;
+    header.resize(new_len, b' ');
     header.push(b'\n');
     for i in 0..(count * dim) {
         header.extend_from_slice(&(i as f32).to_le_bytes());
@@ -873,7 +874,7 @@ fn e2e_base_fraction_10_percent_cli() {
     assert_eq!(query_dim, 4);
     // Query count may be 9 or 10: zero detection during extraction removes
     // the zero vector, which may end up in the query set depending on shuffle.
-    assert!(actual_query_count >= 9 && actual_query_count <= 10,
+    assert!((9..=10).contains(&actual_query_count),
         "expected 9-10 query vectors (zero may be removed), got {}", actual_query_count);
     assert_eq!(actual_base_count, base_count as usize,
         "base_vectors record count ({}) should match base_count variable ({})",
@@ -916,24 +917,22 @@ fn e2e_base_fraction_10_percent_cli() {
                 // Look for patterns like "407314954 records" or "N vectors"
                 // that would indicate the full dataset leaked through
                 for word in line.split_whitespace() {
-                    if let Ok(n) = word.parse::<u64>() {
-                        if n > 200 {
+                    if let Ok(n) = word.parse::<u64>()
+                        && n > 200 {
                             // Allow counts up to 200 in log messages
                             // (variable values, file sizes, etc. are fine)
                             // but flag anything that looks like a vector count
                             // Only flag raw counts, not rates (vec/s, rec/s)
                             let is_rate = line.contains("vec/s") || line.contains("rec/s")
                                 || line.contains("MB/s");
-                            if !is_rate && (line.contains("vectors") || line.contains("records")) {
-                                if n > 500 {
+                            if !is_rate && (line.contains("vectors") || line.contains("records"))
+                                && n > 500 {
                                     panic!(
                                         "run.log shows {} in a processing line after convert: {}",
                                         n, line.trim()
                                     );
                                 }
-                            }
                         }
-                    }
                 }
             }
         }
@@ -1501,10 +1500,8 @@ fn e2e_source_zero_count_through_duplicates() {
             for d in 0..dim {
                 let val = if (2..=6).contains(&i) {
                     0.0f32 // 5 zero vectors
-                } else if i == 1 {
-                    (d + 1) as f32 // dup of vector 0
-                } else if i == 0 {
-                    (d + 1) as f32
+                } else if i <= 1 {
+                    (d + 1) as f32 // vector 0 and its duplicate (i == 1)
                 } else {
                     (i * dim + d + 1) as f32
                 };

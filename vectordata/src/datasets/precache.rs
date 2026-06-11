@@ -204,13 +204,12 @@ fn resolve_spec(
             return None;
         }
     };
-    if let ProfileSelection::Named(ref p) = profile_sel {
-        if entry.layout.profiles.profile(p).is_none() {
+    if let ProfileSelection::Named(ref p) = profile_sel
+        && entry.layout.profiles.profile(p).is_none() {
             eprintln!("Profile '{p}' not found in dataset '{}'. Available: {}",
                 entry.name, entry.profile_names().join(", "));
             return None;
         }
-    }
     let name = entry.name.clone();
     Some((Resolved::CatalogEntry { catalog, name }, profile_sel))
 }
@@ -410,7 +409,7 @@ impl LiveCtx {
             String::new()
         };
         use std::io::Write;
-        let _ = eprint!(
+        eprint!(
             "\r  [{}/{}] {}: {} \u{2022} total {}% ({}/{}){}\u{1b}[K",
             self.facet_index, self.facet_count, facet,
             facet_state,

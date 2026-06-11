@@ -188,6 +188,7 @@ impl ChunkStore {
     pub(crate) fn cache_path(&self) -> &Path { &self.cache_path }
     pub(crate) fn total_size(&self) -> u64 { self.total_size }
     pub(crate) fn total_chunks(&self) -> u32 { self.total_chunks }
+    pub(crate) fn chunk_size(&self) -> u64 { self.chunk_size }
 
     /// Whether every chunk has been downloaded. Lock-free —
     /// `Acquire` ordering ensures we observe the data-file

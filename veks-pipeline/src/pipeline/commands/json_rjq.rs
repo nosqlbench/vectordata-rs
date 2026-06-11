@@ -178,10 +178,10 @@ environments.
         let output_path = output_str.map(|s| resolve_path(s, &ctx.workspace));
         let mut writer: Box<dyn IoWrite> = match &output_path {
             Some(p) if p.to_string_lossy() != "stdout" && p.to_string_lossy() != "null" => {
-                if let Some(parent) = p.parent() {
-                    if !parent.exists() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
+                if let Some(parent) = p.parent()
+                    && !parent.exists()
+                {
+                    let _ = std::fs::create_dir_all(parent);
                 }
                 match safe_create_file(p) {
                     Ok(f) => Box::new(std::io::BufWriter::new(f)),
@@ -228,9 +228,9 @@ environments.
 
             // Run filter
             let val = json_to_val(json_val);
-            let mut out = filter.run((Ctx::new([], &inputs), val));
+            let out = filter.run((Ctx::new([], &inputs), val));
 
-            while let Some(result) = out.next() {
+            for result in out {
                 match result {
                     Ok(v) => {
                         let json = val_to_json(v);

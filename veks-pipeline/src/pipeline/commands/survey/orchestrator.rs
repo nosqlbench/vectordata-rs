@@ -518,11 +518,8 @@ pub fn survey(
         for m in measures {
             let kind = m.kind();
             let report = m.finalize();
-            match (kind, &report) {
-                (MeasureKind::Presence, MeasureReport::Presence(p)) => {
-                    presence = Some(p.clone());
-                }
-                _ => {}
+            if let (MeasureKind::Presence, MeasureReport::Presence(p)) = (kind, &report) {
+                presence = Some(p.clone());
             }
             measure_reports.insert(kind.as_str().to_string(), report);
         }
@@ -737,8 +734,7 @@ fn collect_pair_reports(
     pair_analyzers: Vec<(PairPlanEntry, Box<dyn PairAnalyzer>)>,
     planned: u32,
 ) -> CrossFieldReport {
-    let mut out = CrossFieldReport::default();
-    out.planned = planned;
+    let mut out = CrossFieldReport { planned, ..Default::default() };
     for (plan, analyzer) in pair_analyzers {
         let report = analyzer.finalize();
         out.executed += 1;

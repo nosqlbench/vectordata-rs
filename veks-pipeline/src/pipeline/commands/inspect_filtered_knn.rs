@@ -862,7 +862,7 @@ fn push_intersection_histogram(rows: &mut Vec<String>, sizes: &[usize], bin_widt
     // Bins: a dedicated `[0..=0]` bin, then equal-width bins up
     // to `max_val`.
     let nonzero_max = max_val.max(1);
-    let nonzero_bins = ((nonzero_max + bin_width - 1) / bin_width).max(1);
+    let nonzero_bins = nonzero_max.div_ceil(bin_width).max(1);
 
     // Build (lo, hi) closed-closed ranges. Bin 0 is always [0,0].
     let mut bins: Vec<(usize, usize)> = vec![(0, 0)];
@@ -913,7 +913,7 @@ fn push_intersection_histogram(rows: &mut Vec<String>, sizes: &[usize], bin_widt
             let raw = (c as f64 / max_count as f64) * bar_max as f64;
             (raw.round() as usize).max(1)
         };
-        let bar: String = std::iter::repeat('█').take(bar_len).collect();
+        let bar: String = std::iter::repeat_n('█', bar_len).collect();
         rows.push(format!(
             "  {label:>label_w$}  {c:>count_w$} ({pct:5.1}%)  {bar}",
             label = label, label_w = label_w,

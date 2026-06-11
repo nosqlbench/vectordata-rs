@@ -314,11 +314,10 @@ from the knn\_utils project.
         );
 
         let mut produced = Vec::new();
-        if let Some(parent) = report_path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = report_path.parent()
+            && !parent.exists() {
                 let _ = std::fs::create_dir_all(parent);
             }
-        }
         match std::fs::File::create(&report_path) {
             Ok(mut f) => {
                 if let Err(e) = f.write_all(report_content.as_bytes()) {

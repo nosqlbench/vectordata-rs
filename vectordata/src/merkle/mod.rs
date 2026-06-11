@@ -69,7 +69,7 @@ impl MerkleShape {
         let total_chunks = if total_content_size == 0 {
             0
         } else {
-            ((total_content_size + chunk_size - 1) / chunk_size) as u32
+            total_content_size.div_ceil(chunk_size) as u32
         };
 
         let cap_leaf = if total_chunks <= 1 {

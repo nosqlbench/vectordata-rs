@@ -68,6 +68,25 @@ pub(crate) fn error_result(message: String, start: Instant) -> CommandResult {
     }
 }
 
+pub(crate) fn opt(
+    name: &str,
+    type_name: &str,
+    required: bool,
+    default: Option<&str>,
+    desc: &str,
+    role: OptionRole,
+) -> OptionDesc {
+    OptionDesc {
+        name: name.to_string(),
+        type_name: type_name.to_string(),
+        required,
+        default: default.map(|s| s.to_string()),
+        description: desc.to_string(),
+        extended_description: None,
+        role,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,24 +121,5 @@ mod tests {
     fn resolve_path_keeps_parent_components() {
         let p = resolve_path("../sibling/x.slab", Path::new("./profiles/base"));
         assert_eq!(p, Path::new("./profiles/base/../sibling/x.slab"));
-    }
-}
-
-pub(crate) fn opt(
-    name: &str,
-    type_name: &str,
-    required: bool,
-    default: Option<&str>,
-    desc: &str,
-    role: OptionRole,
-) -> OptionDesc {
-    OptionDesc {
-        name: name.to_string(),
-        type_name: type_name.to_string(),
-        required,
-        default: default.map(|s| s.to_string()),
-        description: desc.to_string(),
-        extended_description: None,
-        role,
     }
 }

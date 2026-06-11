@@ -58,7 +58,7 @@ impl RetryPolicy {
         }
 
         Err(last_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "retry policy exhausted")
+            io::Error::other("retry policy exhausted")
         }))
     }
 

@@ -95,8 +95,8 @@ pub fn check(
             if name == "default" { continue; }
             let profile_dir = format!("profiles/{}", name);
             let profile_path = workspace.join(&profile_dir);
-            if profile_path.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&profile_path) {
+            if profile_path.is_dir()
+                && let Ok(entries) = std::fs::read_dir(&profile_path) {
                     for entry in entries.flatten() {
                         let fname = entry.file_name().to_string_lossy().to_string();
                         // Skip IDXFOR files (handled separately below)
@@ -104,7 +104,6 @@ pub fn check(
                         accounted.insert(format!("{}/{}", profile_dir, fname));
                     }
                 }
-            }
         }
 
         // knn_entries.yaml is produced by catalog generate
@@ -113,8 +112,8 @@ pub fn check(
         // docs/ directory is a standard dataset artifact directory —
         // all files within it are part of the dataset.
         let docs_dir = workspace.join("docs");
-        if docs_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&docs_dir) {
+        if docs_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&docs_dir) {
                 for entry in entries.flatten() {
                     if entry.path().is_file() {
                         let name = entry.file_name().to_string_lossy().to_string();
@@ -122,7 +121,6 @@ pub fn check(
                     }
                 }
             }
-        }
 
         // Check each publishable file under this workspace
         for file in publishable {
@@ -228,11 +226,10 @@ pub fn find_extraneous(
                 return rel.to_string_lossy().to_string();
             }
             // Try canonicalizing the path and stripping
-            if let Ok(canon) = path.canonicalize() {
-                if let Ok(rel) = canon.strip_prefix(&workspace_canonical) {
+            if let Ok(canon) = path.canonicalize()
+                && let Ok(rel) = canon.strip_prefix(&workspace_canonical) {
                     return rel.to_string_lossy().to_string();
                 }
-            }
         }
         p.to_string()
     };

@@ -611,7 +611,7 @@ fn parse_literal_comparand(s: &str) -> Result<Comparand, String> {
     if s == "false" { return Ok(Comparand::Bool(false)); }
     if s.starts_with("X'") && s.ends_with('\'') {
         let hex = &s[2..s.len()-1];
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             return Err("odd-length hex literal".into());
         }
         let mut out = Vec::with_capacity(hex.len()/2);

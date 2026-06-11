@@ -176,7 +176,7 @@ impl ParquetMnodeReader {
             let hw = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            hw.max(1).min(64)
+            hw.clamp(1, 64)
         };
         let num_workers = if threads == 0 { default_threads } else { threads }
             .min(total_files);
@@ -460,7 +460,7 @@ fn count_total_rows(files: &[PathBuf]) -> Result<u64, String> {
     let mut total = 0u64;
     let n = files.len();
     // Report every ~10% but at least every 20 files, and always for >10 files
-    let report_interval = if n > 10 { (n / 10).max(1).min(20) } else { n + 1 };
+    let report_interval = if n > 10 { (n / 10).clamp(1, 20) } else { n + 1 };
     if n > 10 {
         log::info!("    counting rows across {} parquet files...", n);
     }

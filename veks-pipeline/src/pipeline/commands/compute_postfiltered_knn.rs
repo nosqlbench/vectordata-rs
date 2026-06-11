@@ -161,8 +161,8 @@ sign convention (FAISS publication convention for KNN outputs from
         };
 
         let gt_path = resolve_path(&gt_str, &ctx.workspace);
-        let keys_path = resolve_path(&keys_str, &ctx.workspace);
-        let indices_path = resolve_path(&indices_str, &ctx.workspace);
+        let keys_path = resolve_path(keys_str, &ctx.workspace);
+        let indices_path = resolve_path(indices_str, &ctx.workspace);
 
         let distances_path = options.get("distances")
             .map(|s| resolve_path(s, &ctx.workspace));

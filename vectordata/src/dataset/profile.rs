@@ -813,6 +813,7 @@ fn take_number(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) -> u64 {
 ///   - `mul:start/factor`        — no `..end`
 ///   - `fib:start`               — no `..end` (just the start scalar)
 ///   - `linear:start/step`       — no `..end` in the range portion
+///
 /// All three are resolved at runtime once the base count is materialized.
 pub fn needs_base_count(entry: &str) -> bool {
     let entry = entry.trim();
@@ -1006,7 +1007,7 @@ fn parse_fib_range(range_str: &str, max_count: u64) -> Result<Vec<(String, u64)>
     let mut result = Vec::new();
     let (mut a, mut b): (u64, u64) = (1, 1);
     loop {
-        let val = a.checked_mul(start).unwrap_or(u64::MAX);
+        let val = a.saturating_mul(start);
         if val > end {
             break;
         }
@@ -1068,7 +1069,7 @@ fn parse_mul_range(spec: &str, max_count: u64) -> Result<Vec<(String, u64)>, Str
             break;
         }
         // Deduplicate: skip if same as previous
-        if result.last().map_or(true, |&(_, prev): &(String, u64)| prev != val) {
+        if result.last().is_none_or(|&(_, prev): &(String, u64)| prev != val) {
             result.push((format_count_with_suffix(val), val));
         }
         val_f *= factor;
@@ -1448,8 +1449,8 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                 let mut merged_views: IndexMap<String, DSView> = dp.views.iter()
                     .filter(|(k, _)| !is_per_profile_output_view(k))
                     .map(|(k, v)| {
-                        if let Some(bc) = child_bc {
-                            if is_windowed_shared_view(k) && v.source.window.is_empty() {
+                        if let Some(bc) = child_bc
+                            && is_windowed_shared_view(k) && v.source.window.is_empty() {
                                 let mut windowed = v.clone();
                                 windowed.source.window = DSWindow(vec![DSInterval {
                                     min_incl: 0,
@@ -1457,7 +1458,6 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                                 }]);
                                 return (k.clone(), windowed);
                             }
-                        }
                         (k.clone(), v.clone())
                     })
                     .collect();

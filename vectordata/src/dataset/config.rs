@@ -202,15 +202,13 @@ impl DatasetConfig {
             let mut vars: indexmap::IndexMap<String, String> = config.variables.clone();
 
             let vars_path = workspace.join("variables.yaml");
-            if vars_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&vars_path) {
-                    if let Ok(file_vars) = serde_yaml::from_str::<indexmap::IndexMap<String, String>>(&content) {
+            if vars_path.exists()
+                && let Ok(content) = std::fs::read_to_string(&vars_path)
+                    && let Ok(file_vars) = serde_yaml::from_str::<indexmap::IndexMap<String, String>>(&content) {
                         for (k, v) in file_vars {
                             vars.insert(k, v);
                         }
                     }
-                }
-            }
 
             // Fall through several count variables in priority order.
             // Different stages of the pipeline produce different ones:
@@ -513,17 +511,15 @@ impl DatasetConfig {
                     // deserializer will re-derive by inheritance from
                     // default. Without this, expanded-save bloats the
                     // file with N copies of every shared view.
-                    if name != "default" {
-                        if let Some(dv) = default_views.and_then(|m| m.get(key)) {
-                            if dv.source.path == view.source.path
+                    if name != "default"
+                        && let Some(dv) = default_views.and_then(|m| m.get(key))
+                            && dv.source.path == view.source.path
                                 && dv.source.window == view.source.window
                                 && dv.source.namespace == view.source.namespace
                                 && dv.window == view.window
                             {
                                 continue;
                             }
-                        }
-                    }
                     if view.window.is_none()
                         && view.source.namespace.is_none()
                         && view.source.window.is_empty()

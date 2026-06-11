@@ -269,7 +269,7 @@ fn scan_zeros_f32(
     let progress = AtomicUsize::new(0);
     let all_zeros: Mutex<Vec<ZeroHit>> = Mutex::new(Vec::new());
 
-    let threads = threads.max(1).min((count + vecs_per_chunk - 1) / vecs_per_chunk);
+    let threads = threads.max(1).min(count.div_ceil(vecs_per_chunk));
     let file_ref = &file;
     let found_ref = &found;
     let limit_reached_ref = &limit_reached;
@@ -284,7 +284,7 @@ fn scan_zeros_f32(
         // sequential prefetch inside each worker's range is worth
         // more than even load balance at the chunk level — scan work
         // per vector is roughly constant.
-        let stride_vecs = (count + threads - 1) / threads;
+        let stride_vecs = count.div_ceil(threads);
         for w in 0..threads {
             let start_vec = w * stride_vecs;
             if start_vec >= count { break; }
@@ -294,7 +294,7 @@ fn scan_zeros_f32(
                 // One reusable per-worker buffer. `Vec<f32>` for alignment;
                 // the pread path reinterprets it as bytes.
                 let chunk_cap_bytes = vecs_per_chunk * entry_size;
-                let mut buf: Vec<f32> = vec![0.0; (chunk_cap_bytes + 3) / 4];
+                let mut buf: Vec<f32> = vec![0.0; chunk_cap_bytes.div_ceil(4)];
 
                 let mut v = start_vec;
                 while v < end_vec {
@@ -310,7 +310,7 @@ fn scan_zeros_f32(
                             buf.len() * 4,
                         )
                     };
-                    if let Err(e) = pread_exact(&file_ref, &mut bytes_mut[..chunk_bytes], byte_off) {
+                    if let Err(e) = pread_exact(file_ref, &mut bytes_mut[..chunk_bytes], byte_off) {
                         log::error!("pread at vec {}: {}", v, e);
                         return;
                     }
@@ -333,11 +333,10 @@ fn scan_zeros_f32(
                         if norm_sq < threshold_sq {
                             let norm = norm_sq.sqrt();
                             let total = found_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                            if let Some(lim) = limit {
-                                if total >= lim {
+                            if let Some(lim) = limit
+                                && total >= lim {
                                     limit_reached_ref.store(true, Ordering::Relaxed);
                                 }
-                            }
                             local_hits.push(ZeroHit { ordinal: v + local_i, norm });
                         }
                     }
@@ -413,7 +412,7 @@ fn scan_zeros_f16(
     let entry_size = 4 + dim * 2;
     let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
     let chunk_capacity_bytes = vecs_per_chunk * entry_size;
-    let chunk_capacity_u16 = (chunk_capacity_bytes + 1) / 2;
+    let chunk_capacity_u16 = chunk_capacity_bytes.div_ceil(2);
 
     let mut chunk_buf: Vec<u16> = vec![0u16; chunk_capacity_u16];
 
@@ -474,11 +473,10 @@ fn scan_zeros_f16(
                     if norm_sq < threshold_sq {
                         let norm = norm_sq.sqrt();
                         let total = found.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        if let Some(lim) = limit {
-                            if total >= lim {
+                        if let Some(lim) = limit
+                            && total >= lim {
                                 limit_reached.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
-                        }
                         Some(ZeroHit { ordinal: base_vec_idx + local_i, norm })
                     } else {
                         None
@@ -849,7 +847,7 @@ fn scan_file_concise_f32(
     }
     let entry_size = 4 + dim * 4;
     let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
-    let chunk_capacity_f32 = (vecs_per_chunk * entry_size + 3) / 4;
+    let chunk_capacity_f32 = (vecs_per_chunk * entry_size).div_ceil(4);
     let mut chunk_buf: Vec<f32> = vec![0.0; chunk_capacity_f32];
 
     let file = File::open(path).map_err(|e| format!("{}", e))?;
@@ -865,9 +863,8 @@ fn scan_file_concise_f32(
     let mut offset_vec = 0usize;
 
     while offset_vec < count {
-        if let Some(lim) = limit {
-            if total_zeros >= lim { break; }
-        }
+        if let Some(lim) = limit
+            && total_zeros >= lim { break; }
         let n_vecs = vecs_per_chunk.min(count - offset_vec);
         let chunk_bytes_now = n_vecs * entry_size;
         let byte_off = (offset_vec as u64) * (entry_size as u64);
@@ -933,7 +930,7 @@ fn scan_file_concise_f16(
     }
     let entry_size = 4 + dim * 2;
     let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
-    let chunk_capacity_u16 = (vecs_per_chunk * entry_size + 1) / 2;
+    let chunk_capacity_u16 = (vecs_per_chunk * entry_size).div_ceil(2);
     let mut chunk_buf: Vec<u16> = vec![0u16; chunk_capacity_u16];
 
     let file = File::open(path).map_err(|e| format!("{}", e))?;
@@ -948,9 +945,8 @@ fn scan_file_concise_f16(
     let mut offset_vec = 0usize;
 
     while offset_vec < count {
-        if let Some(lim) = limit {
-            if total_zeros >= lim { break; }
-        }
+        if let Some(lim) = limit
+            && total_zeros >= lim { break; }
         let n_vecs = vecs_per_chunk.min(count - offset_vec);
         let chunk_bytes_now = n_vecs * entry_size;
         let byte_off = (offset_vec as u64) * (entry_size as u64);

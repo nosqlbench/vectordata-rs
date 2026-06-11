@@ -234,34 +234,30 @@ fn load_step_outputs(dataset_path: &Path) -> Vec<(String, String)> {
         Err(_) => return results,
     };
 
-    if let Some(ref pipeline) = config.upstream {
-        if let Some(ref steps) = pipeline.steps {
+    if let Some(ref pipeline) = config.upstream
+        && let Some(ref steps) = pipeline.steps {
             for step in steps {
                 let cmd = step.run.clone();
                 // Collect the "source" option for merkle create (that's the input file)
-                if let Some(source) = step.options.get("source") {
-                    if let Some(s) = source.as_str() {
+                if let Some(source) = step.options.get("source")
+                    && let Some(s) = source.as_str() {
                         results.push((cmd.clone(), s.to_string()));
                     }
-                }
-                if let Some(output) = step.options.get("output") {
-                    if let Some(s) = output.as_str() {
+                if let Some(output) = step.options.get("output")
+                    && let Some(s) = output.as_str() {
                         results.push((cmd.clone(), s.to_string()));
                     }
-                }
             }
         }
-    }
     results
 }
 
 /// Collect pipeline steps from a DatasetConfig (shared steps only).
 fn collect_steps(config: &DatasetConfig) -> Vec<StepDef> {
     let mut steps = Vec::new();
-    if let Some(ref pipeline) = config.upstream {
-        if let Some(ref shared_steps) = pipeline.steps {
+    if let Some(ref pipeline) = config.upstream
+        && let Some(ref shared_steps) = pipeline.steps {
             steps.extend(shared_steps.clone());
         }
-    }
     steps
 }

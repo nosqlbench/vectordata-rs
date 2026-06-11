@@ -284,11 +284,10 @@ impl Snapshot {
         match caller {
             Caller::Anonymous => false,
             Caller::User { name, level, .. } => {
-                if let Some(set) = self.system_privileges.get(name) {
-                    if set.contains(privilege) {
+                if let Some(set) = self.system_privileges.get(name)
+                    && set.contains(privilege) {
                         return true;
                     }
-                }
                 // Superusers implicitly hold all system privileges.
                 *level >= Level::Superuser
             }
@@ -420,11 +419,10 @@ impl Snapshot {
 fn profile_actions(profile: &Profile, key: &str) -> ActionSet {
     let mut acc = ActionSet::EMPTY;
     for e in profile {
-        if covers(&normalize(&e.scope), key) {
-            if let Ok(class) = e.class.parse::<Class>() {
+        if covers(&normalize(&e.scope), key)
+            && let Ok(class) = e.class.parse::<Class>() {
                 acc = acc.union(class.actions());
             }
-        }
     }
     acc
 }

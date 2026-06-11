@@ -128,7 +128,7 @@ pub(crate) fn facet_window_byte_range(
         match crate::dataset::source::parse_source_string(raw_source) {
             Ok(parsed) if !parsed.window.is_empty() => {
                 let iv = &parsed.window.0[0];
-                (parsed.path, iv.min_incl as u64, iv.max_excl as u64)
+                (parsed.path, iv.min_incl, iv.max_excl)
             }
             _ => return None,
         };
@@ -236,10 +236,15 @@ impl<T: Send + Sync> VectorReader<T> for WindowedVectorReader<T> {
 pub struct FacetDescriptor {
     /// Facet name as declared in dataset.yaml (canonical key).
     pub name: String,
-    /// Source file path or filename.
+    /// Source file path or filename. Retains any `[start..end)`
+    /// sub-ordinal suffix the catalog declared inline.
     pub source_path: Option<String>,
     /// Inferred source format type (e.g., "fvec", "ivec", "mvec", "slab").
     pub source_type: Option<String>,
+    /// Explicit `window:` field from a `Detailed` facet config, when
+    /// present. The suffix form stays embedded in `source_path`;
+    /// consumers that need the effective window must consult both.
+    pub window: Option<String>,
     /// Matching StandardFacet if this is a recognized standard facet.
     pub standard_kind: Option<StandardFacet>,
 }
@@ -544,6 +549,10 @@ pub struct CacheStats {
     pub valid_chunks: u32,
     /// Total chunks in the file.
     pub total_chunks: u32,
+    /// Transfer-chunk size in bytes. Every chunk except the last is
+    /// exactly this size, so consumers can map byte offsets to chunk
+    /// ordinals (e.g. for chunk-aligned sampling or prefetch).
+    pub chunk_size: u64,
     /// Total content size in bytes.
     pub content_size: u64,
     /// Whether every chunk is verified.
@@ -608,15 +617,21 @@ impl FacetStorage {
         self.storage.local_path()
     }
 
-    /// Live cache-fill statistics. Returns `None` when the storage is
-    /// not cache-backed (local mmap or direct HTTP).
+    /// Live cache-fill statistics. Reports chunk fill for both the
+    /// merkle-verified (`.mref`) and merkle-less chunked-HTTP remote
+    /// paths, so progress UIs work no matter which transport the
+    /// open resolved to. Returns `None` only for local mmap storage,
+    /// which is always fully resident.
     pub fn cache_stats(&self) -> Option<CacheStats> {
-        self.storage.cached_channel().map(|c| CacheStats {
-            valid_chunks: c.valid_count(),
-            total_chunks: c.total_chunks(),
-            content_size: c.content_size(),
-            is_complete: c.is_complete(),
-        })
+        self.storage.fill_stats().map(
+            |(valid_chunks, total_chunks, chunk_size, content_size, is_complete)| CacheStats {
+                valid_chunks,
+                total_chunks,
+                chunk_size,
+                content_size,
+                is_complete,
+            },
+        )
     }
 }
 
@@ -865,6 +880,7 @@ impl GenericTestDataView {
                         name: name.to_string(),
                         source_type: FacetDescriptor::infer_type(&source),
                         source_path: Some(source),
+                        window: facet.window().map(|w| w.to_string()),
                         standard_kind: Some(*kind),
                     },
                 );
@@ -929,7 +945,7 @@ impl GenericTestDataView {
             }
             ResourceLocation::Http(url) => {
                 let native_type = crate::typed_access::ElementType::from_url(&url)
-                    .map_err(|e| crate::typed_access::TypedAccessError::Io(e))?;
+                    .map_err(crate::typed_access::TypedAccessError::Io)?;
                 crate::typed_access::TypedReader::<T>::open_url(url, native_type)
             }
         }

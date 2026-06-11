@@ -243,9 +243,9 @@ mod tests {
 
     #[test]
     fn test_eq_float() {
-        let p = pred("x", OpType::Eq, vec![Comparand::Float(3.14)]);
-        assert!(evaluate(&p, &mnode_one("x", MValue::Float(3.14))));
-        assert!(!evaluate(&p, &mnode_one("x", MValue::Float(2.71))));
+        let p = pred("x", OpType::Eq, vec![Comparand::Float(3.25)]);
+        assert!(evaluate(&p, &mnode_one("x", MValue::Float(3.25))));
+        assert!(!evaluate(&p, &mnode_one("x", MValue::Float(2.5))));
     }
 
     #[test]
@@ -322,7 +322,7 @@ mod tests {
     fn test_matches_on_non_text_is_false() {
         let p = pred("x", OpType::Matches, vec![Comparand::Text("foo".into())]);
         assert!(!evaluate(&p, &mnode_one("x", MValue::Int(42))));
-        assert!(!evaluate(&p, &mnode_one("x", MValue::Float(3.14))));
+        assert!(!evaluate(&p, &mnode_one("x", MValue::Float(3.25))));
     }
 
     #[test]

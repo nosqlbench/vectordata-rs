@@ -274,7 +274,7 @@ fn resolve_dataset_path(path: &Path) -> (PathBuf, PathBuf) {
     } else {
         let yaml = path.join("dataset.yaml");
         if !yaml.exists() {
-            eprintln!("Error: no dataset.yaml found in {}", crate::check::rel_display(&path.to_path_buf()));
+            eprintln!("Error: no dataset.yaml found in {}", crate::check::rel_display(path));
             std::process::exit(1);
         }
         (path.to_path_buf(), yaml)
@@ -286,11 +286,10 @@ fn determine_base_count(dataset_dir: &Path, config: &DatasetConfig) -> u64 {
     // Try variables.yaml first
     if let Ok(vars) = crate::pipeline::variables::load(dataset_dir) {
         // Prefer clean_count (post-dedup), then vector_count (pre-dedup)
-        if let Some(v) = vars.get("clean_count").or_else(|| vars.get("vector_count")) {
-            if let Ok(n) = v.parse::<u64>() {
+        if let Some(v) = vars.get("clean_count").or_else(|| vars.get("vector_count"))
+            && let Ok(n) = v.parse::<u64>() {
                 return n;
             }
-        }
     }
 
     // Fallback: probe the base_vectors file
@@ -322,8 +321,8 @@ fn probe_vector_count(path: &Path) -> Option<u64> {
 
 /// Detect if the dataset uses self-search mode.
 fn detect_self_search(config: &DatasetConfig) -> bool {
-    if let Some(ref upstream) = config.upstream {
-        if let Some(ref steps) = upstream.steps {
+    if let Some(ref upstream) = config.upstream
+        && let Some(ref steps) = upstream.steps {
             for step in steps {
                 let id = step.effective_id();
                 if id.contains("shuffle") || id.contains("extract-query") || id.contains("extract-base") {
@@ -331,7 +330,6 @@ fn detect_self_search(config: &DatasetConfig) -> bool {
                 }
             }
         }
-    }
     false
 }
 
@@ -365,9 +363,6 @@ pub(crate) fn standard_spec(effective_max: u64) -> String {
     } else if effective_max >= 100_000 {
         let start = format_count_label((effective_max / 10).max(1000));
         format!("mul:{}/2", start)
-    } else if effective_max >= 10_000 {
-        let half = format_count_label(effective_max / 2);
-        half
     } else {
         format_count_label(effective_max / 2)
     }
@@ -502,11 +497,11 @@ fn prompt_with_default(prompt: &str, default: &str) -> String {
 }
 
 fn format_count_label(n: u64) -> String {
-    if n >= 1_000_000_000 && n % 1_000_000_000 == 0 {
+    if n >= 1_000_000_000 && n.is_multiple_of(1_000_000_000) {
         format!("{}b", n / 1_000_000_000)
-    } else if n >= 1_000_000 && n % 1_000_000 == 0 {
+    } else if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
         format!("{}m", n / 1_000_000)
-    } else if n >= 1_000 && n % 1_000 == 0 {
+    } else if n >= 1_000 && n.is_multiple_of(1_000) {
         format!("{}k", n / 1_000)
     } else {
         format!("{}", n)

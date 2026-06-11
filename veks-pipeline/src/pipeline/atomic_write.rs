@@ -47,11 +47,10 @@ impl AtomicWriter {
     /// Create with a specific buffer capacity.
     pub fn with_capacity(capacity: usize, final_path: &Path) -> io::Result<Self> {
         // Ensure parent directory exists
-        if let Some(parent) = final_path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = final_path.parent()
+            && !parent.exists() {
                 std::fs::create_dir_all(parent)?;
             }
-        }
 
         let temp_path = temp_path_for(final_path);
         let file = File::create(&temp_path)?;

@@ -299,7 +299,7 @@ subtle errors in later pipeline steps.
             let samples = read_samples(&data, &info, sample_count, 8);
             ctx.ui.log("  Sample vectors:");
             for s in &samples {
-                ctx.ui.log(&format!("{}", s));
+                ctx.ui.log(&s.to_string());
             }
         }
 
@@ -424,10 +424,10 @@ mod tests {
         {
             use std::io::Write;
             let mut f = std::fs::File::create(&source).unwrap();
-            for i in 0..5 {
+            for i in 0..5i32 {
                 f.write_all(&3i32.to_le_bytes()).unwrap();
-                for j in 0..3 {
-                    f.write_all(&(i * 3 + j as i32).to_le_bytes()).unwrap();
+                for j in 0..3i32 {
+                    f.write_all(&(i * 3 + j).to_le_bytes()).unwrap();
                 }
             }
         }

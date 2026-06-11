@@ -65,8 +65,13 @@ pub struct ExploreArgs {
     /// Random seed
     #[arg(long, default_value = "42")]
     pub seed: u64,
-    /// Sampling mode [streaming, clumped, sparse]
-    #[arg(long, default_value = "streaming", value_parser = ["streaming", "clumped", "sparse"])]
+    /// Sampling mode [clumped, streaming, sparse]. Clumped is the
+    /// default: whole transfer chunks, evenly spaced across the file,
+    /// so a remote sample covers the full distribution while wasting
+    /// none of the downloaded blocks. Streaming reads the head of the
+    /// file (fastest, distribution-biased); sparse is fully random
+    /// (best coverage, one chunk download per vector when remote).
+    #[arg(long, default_value = "clumped", value_parser = ["streaming", "clumped", "sparse"])]
     pub sample_mode: SampleMode,
 }
 

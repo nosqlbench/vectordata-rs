@@ -106,11 +106,10 @@ impl DatasetFilter {
 
     /// Test whether a catalog entry passes all filter predicates.
     pub fn matches(&self, entry: &CatalogEntry) -> bool {
-        if let Some(ref name) = self.name {
-            if !smart_match(name, &entry.name) {
+        if let Some(ref name) = self.name
+            && !smart_match(name, &entry.name) {
                 return false;
             }
-        }
 
         if !self.facet.is_empty() {
             let all_views = collect_all_view_names(entry);
@@ -134,11 +133,10 @@ impl DatasetFilter {
             }
         }
 
-        if let Some(ref desc) = self.desc {
-            if !matches_description_smart(entry, desc) {
+        if let Some(ref desc) = self.desc
+            && !matches_description_smart(entry, desc) {
                 return false;
             }
-        }
 
         // Size filters: check base_count across all profiles
         if self.min_size.is_some() || self.max_size.is_some() || self.size.is_some() {
@@ -297,14 +295,12 @@ pub fn max_base_count(entry: &CatalogEntry) -> Option<u64> {
 pub fn infer_dimension(entry: &CatalogEntry) -> Option<u32> {
     if let Some(ref attrs) = entry.layout.attributes {
         for (k, v) in &attrs.tags {
-            if k.eq_ignore_ascii_case("dimension")
+            if (k.eq_ignore_ascii_case("dimension")
                 || k.eq_ignore_ascii_case("dim")
-                || k.eq_ignore_ascii_case("dimensions")
-            {
-                if let Ok(d) = v.parse::<u32>() {
+                || k.eq_ignore_ascii_case("dimensions"))
+                && let Ok(d) = v.parse::<u32>() {
                     return Some(d);
                 }
-            }
         }
     }
     extract_dim_from_name(&entry.name)
@@ -313,15 +309,12 @@ pub fn infer_dimension(entry: &CatalogEntry) -> Option<u32> {
 /// Extract dimension from a dataset name using the `_dNNN` convention.
 fn extract_dim_from_name(name: &str) -> Option<u32> {
     for part in name.split('_') {
-        if let Some(num_str) = part.strip_prefix('d') {
-            if !num_str.is_empty() && num_str.chars().all(|c| c.is_ascii_digit()) {
-                if let Ok(d) = num_str.parse::<u32>() {
-                    if d > 0 && d < 100_000 {
+        if let Some(num_str) = part.strip_prefix('d')
+            && !num_str.is_empty() && num_str.chars().all(|c| c.is_ascii_digit())
+                && let Ok(d) = num_str.parse::<u32>()
+                    && d > 0 && d < 100_000 {
                         return Some(d);
                     }
-                }
-            }
-        }
     }
     None
 }
@@ -623,8 +616,7 @@ fn select_already_specified() -> bool {
 fn select_has_value() -> bool {
     let args: Vec<String> = std::env::args().collect();
     for (i, arg) in args.iter().enumerate() {
-        if arg.starts_with("--select=") {
-            let val = &arg["--select=".len()..];
+        if let Some(val) = arg.strip_prefix("--select=") {
             return !val.is_empty();
         }
         if arg == "--select" {

@@ -14,6 +14,15 @@ members = [
 ]
 resolver = "3"
 
+# Workspace lint policy. Member crates opt in via `[lints] workspace = true`.
+[workspace.lints.clippy]
+# This codebase is dense with SIMD/BLAS-style numeric kernels that
+# index several parallel arrays by one loop ordinal (query x segment x
+# accumulator). Rewriting those as zipped iterators obscures the
+# kernel structure without changing codegen, so the lint is policy-
+# allowed; prefer iterators in new non-kernel code regardless.
+needless_range_loop = "allow"
+
 [profile.bench]
 debug = true
 

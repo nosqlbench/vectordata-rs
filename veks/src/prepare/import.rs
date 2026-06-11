@@ -214,6 +214,7 @@ pub const FACET_CODES: &[(&str, char, &str)] = &[
 /// - `"B,Q,G,D"` or `"base,query,gt,dist"` — comma-separated
 /// - `"base query gt dist"` — space-separated names
 /// - Full facet names like `"base_vectors,query_vectors"`
+///
 /// All recognized single-letter facet codes.
 const ALL_FACET_CHARS: &str = "BQGDMPRFObqgdmprfo";
 
@@ -293,27 +294,26 @@ pub fn parse_facet_spec(spec: &str) -> String {
 pub fn resolve_facets(args: &ImportArgs) -> String {
     // '+' prefix means additive: infer first, then add the extra codes.
     // Without '+', the spec replaces inference entirely.
-    if let Some(ref spec) = args.required_facets {
-        if !spec.trim().starts_with('+') {
+    if let Some(ref spec) = args.required_facets
+        && !spec.trim().starts_with('+') {
             return parse_facet_spec(spec);
         }
         // Fall through to inference, then merge below
-    }
 
     // When provided_facets is set, only consider inputs matching those codes
     let provided = args.provided_facets.as_ref().map(|s| parse_facet_spec(s));
 
     let has_base = args.base_vectors.is_some()
-        && provided.as_ref().map_or(true, |p| p.contains('B'));
+        && provided.as_ref().is_none_or(|p| p.contains('B'));
     let _has_query = args.query_vectors.is_some()
-        && provided.as_ref().map_or(true, |p| p.contains('Q'));
+        && provided.as_ref().is_none_or(|p| p.contains('Q'));
     let has_gt = args.ground_truth.is_some()
-        && provided.as_ref().map_or(true, |p| p.contains('G'));
+        && provided.as_ref().is_none_or(|p| p.contains('G'));
     let has_meta = args.metadata.is_some()
-        && provided.as_ref().map_or(true, |p| p.contains('M'));
+        && provided.as_ref().is_none_or(|p| p.contains('M'));
 
     let has_gt_dist = args.ground_truth_distances.is_some()
-        && provided.as_ref().map_or(true, |p| p.contains('D'));
+        && provided.as_ref().is_none_or(|p| p.contains('D'));
 
     // Inference from available inputs (SRD 2.8 implication rules)
     let mut facets = String::new();
@@ -339,8 +339,8 @@ pub fn resolve_facets(args: &ImportArgs) -> String {
     }
 
     // Merge additive extras from '+' prefix (e.g., "+O" → add O to inferred)
-    if let Some(ref spec) = args.required_facets {
-        if spec.trim().starts_with('+') {
+    if let Some(ref spec) = args.required_facets
+        && spec.trim().starts_with('+') {
             let extras = parse_facet_spec(spec);
             for c in extras.chars() {
                 if !facets.contains(c) {
@@ -348,7 +348,6 @@ pub fn resolve_facets(args: &ImportArgs) -> String {
                 }
             }
         }
-    }
 
     facets
 }
@@ -838,6 +837,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
 // ---------------------------------------------------------------------------
 
 /// A step to emit in the YAML.
+#[derive(Default)]
 struct Step {
     id: String,
     run: String,
@@ -854,20 +854,6 @@ struct Step {
     options: Vec<(String, String)>,
 }
 
-impl Default for Step {
-    fn default() -> Self {
-        Step {
-            id: String::new(),
-            run: String::new(),
-            description: None,
-            after: Vec::new(),
-            per_profile: false,
-            phase: 0,
-            finalize: false,
-            options: Vec::new(),
-        }
-    }
-}
 
 /// Command name mapping for the knn_utils personality.
 ///
@@ -1199,7 +1185,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     }
 
     // Dataset metadata flags — persisted to variables.yaml for stats
-    let is_shuffled = slots.shuffle.as_ref().map_or(false, |s| s.is_materialized());
+    let is_shuffled = slots.shuffle.as_ref().is_some_and(|s| s.is_materialized());
     for (name, value) in [
         ("is_shuffled", is_shuffled.to_string()),
         ("is_self_search", slots.self_search.to_string()),
@@ -1327,8 +1313,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     // (Strategies 1 & 3) AND HDF5 with separate queries (Strategy 2).
     // For self-search, the shuffle also provides the train/test split.
     // For HDF5, the shuffle randomizes base vector order after dedup.
-    if let Some(ref shuffle) = slots.shuffle {
-        if shuffle.is_materialized() {
+    if let Some(ref shuffle) = slots.shuffle
+        && shuffle.is_materialized() {
             let shuffle_after = if slots.prepare.is_materialized() {
                 vec!["prepare-vectors".into()]
             } else {
@@ -1358,12 +1344,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 options: shuffle_opts,
             });
         }
-    }
 
     // ── Query chain (self-search) ────────────────────────────────────
     if slots.self_search {
-        if let Some(ref qv) = slots.query_vectors {
-            if qv.is_materialized() {
+        if let Some(ref qv) = slots.query_vectors
+            && qv.is_materialized() {
                 let vec_deps = if last_vector_step.is_empty() {
                     vec!["generate-shuffle".into()]
                 } else {
@@ -1473,7 +1458,6 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 // Normalization stats are computed by prepare-vectors (SRD §20).
                 // No separate measure-normals step needed.
             }
-        }
     } else if let Some(ref qv) = slots.query_vectors {
         // Separate query import
         if qv.is_materialized() {
@@ -1516,7 +1500,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // - Native xvec with dedup: extract clean subset via clean_ordinals
         if slots.base_vectors.is_materialized() {
             let working = slots.all_vectors.path();
-            let has_shuffle = slots.shuffle.as_ref().map_or(false, |s| s.is_materialized());
+            let has_shuffle = slots.shuffle.as_ref().is_some_and(|s| s.is_materialized());
             let after = if has_shuffle {
                 vec!["generate-shuffle".into()]
             } else if slots.prepare.is_materialized() {
@@ -1822,11 +1806,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             if slots.all_vectors.is_materialized() {
                 after.push("convert-vectors".into());
             }
-            if let Some(ref qv) = slots.query_vectors {
-                if qv.is_materialized() {
+            if let Some(ref qv) = slots.query_vectors
+                && qv.is_materialized() {
                     after.push(qv.step_id().into());
                 }
-            }
 
             // No separate overlap removal step (SRD §20):
             // - Strategy 1 (combined B+Q): combined before dedup, shuffle guarantees disjointness
@@ -1910,14 +1893,14 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     //   • no partition oracles (their per-partition `compute-knn-partition`
     //     already writes distances for partition profiles)
     let knn_is_identity = slots.knn.as_ref()
-        .map_or(false, |a| !a.is_materialized());
+        .is_some_and(|a| !a.is_materialized());
     let wants_distances = facets_check.contains('D');
     if knn_is_identity
         && wants_distances
         && args.ground_truth_distances.is_none()
         && !needs_computed_knn
         && !wants_partition_verify
-        && slots.query_vectors.is_some()
+        && let Some(ref query_vectors) = slots.query_vectors
     {
         let knn_path = slots.knn.as_ref().unwrap().path().to_string();
         let mut after = vec![];
@@ -1926,10 +1909,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         } else if slots.base_vectors.is_materialized() {
             after.push(slots.base_vectors.step_id().into());
         }
-        if let Some(ref qv) = slots.query_vectors {
-            if qv.is_materialized() {
-                after.push(qv.step_id().into());
-            }
+        if query_vectors.is_materialized() {
+            after.push(query_vectors.step_id().into());
         }
         steps.push(Step {
             id: "compute-knn-distances".into(),
@@ -1943,7 +1924,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             finalize: false,
             options: vec![
                 ("base".into(), compute_knn_base_arg(slots, &working_vectors, subset_applied)),
-                ("query".into(), slots.query_vectors.as_ref().unwrap().path().to_string()),
+                ("query".into(), query_vectors.path().to_string()),
                 ("indices".into(), knn_path),
                 ("output".into(), "neighbor_distances.fvecs".into()),
                 ("metric".into(), args.metric.clone()),
@@ -1951,8 +1932,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         });
     }
 
-    if let Some(ref fknn) = slots.filtered_knn {
-        if fknn.is_materialized() {
+    if let Some(ref fknn) = slots.filtered_knn
+        && fknn.is_materialized() {
             let simple = args.synthesis_mode == "simple-int-eq" && args.synthesize_metadata;
             let mut after = if simple {
                 vec!["verify-predicates-sqlite".into()]
@@ -1962,11 +1943,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             if slots.base_count.is_some() {
                 after.push("count-base".into());
             }
-            if let Some(ref qv) = slots.query_vectors {
-                if qv.is_materialized() {
+            if let Some(ref qv) = slots.query_vectors
+                && qv.is_materialized() {
                     after.push(qv.step_id().into());
                 }
-            }
             steps.push(Step {
                 id: "compute-prefiltered-knn".into(),
                 run: "compute prefiltered-knn".into(),
@@ -2000,16 +1980,14 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             // `docs/design/prefilter-postfilter-facets.md` for the
             // F/E split rationale.
             let mut e_after: Vec<String> = Vec::new();
-            if let Some(ref knn) = slots.knn {
-                if knn.is_materialized() {
+            if let Some(ref knn) = slots.knn
+                && knn.is_materialized() {
                     e_after.push(knn.step_id().into());
                 }
-            }
-            if let Some(ref meta) = slots.metadata {
-                if meta.predicate_indices.is_materialized() {
+            if let Some(ref meta) = slots.metadata
+                && meta.predicate_indices.is_materialized() {
                     e_after.push(meta.predicate_indices.step_id().into());
                 }
-            }
             // G (ground-truth) and D (ground-truth-distances) are resolved
             // by the command from the profile's facets — the correct
             // per-profile path with `.ivecs`/`.ivec` tolerance — so they
@@ -2037,7 +2015,6 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 options: e_opts,
             });
         }
-    }
 
     // ── Consolidated verification ─────────────────────────────────
     // Single-pass verifiers that scan base vectors once and verify all
@@ -2051,11 +2028,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             if slots.all_vectors.is_materialized() {
                 verify_after.push("convert-vectors".into());
             }
-            if let Some(ref qv) = slots.query_vectors {
-                if qv.is_materialized() {
+            if let Some(ref qv) = slots.query_vectors
+                && qv.is_materialized() {
                     verify_after.push(qv.step_id().into());
                 }
-            }
         }
         // When ground truth is pre-provided (Identity), use the source
         // base vectors for verification — the GT ordinals reference the
@@ -2072,7 +2048,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         let verify_query = if !needs_computed_knn && args.query_vectors.is_some() {
             // Use original query source when GT is pre-provided
             slots.query_vectors.as_ref()
-                .map(|q| if q.is_materialized() { q.path().to_string() } else { q.path().to_string() })
+                .map(|q| q.path().to_string())
                 .unwrap_or_else(|| "query_vectors.fvecs".to_string())
         } else {
             slots.query_vectors.as_ref().unwrap().path().to_string()
@@ -2148,8 +2124,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     // verify-predicates-sqlite: SQLite oracle verification of R
     // Runs after evaluate-predicates, before compute-prefiltered-knn
     if is_simple_synth {
-        if let Some(ref meta) = slots.metadata {
-            if meta.predicate_indices.is_materialized() {
+        if let Some(ref meta) = slots.metadata
+            && meta.predicate_indices.is_materialized() {
                 steps.push(Step {
                     id: "verify-predicates-sqlite".into(),
                     run: "verify predicates-sqlite".into(),
@@ -2167,7 +2143,6 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ],
                 });
             }
-        }
     } else if let Some(ref meta) = slots.metadata {
         // Slab mode: consolidated predicate verification
         if meta.predicate_indices.is_materialized() {
@@ -2192,8 +2167,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     }
 
     // ── Filtered KNN + verification ─────────────────────────────────
-    if let Some(ref fknn) = slots.filtered_knn {
-        if fknn.is_materialized() {
+    if let Some(ref fknn) = slots.filtered_knn
+        && fknn.is_materialized() {
             let meta = slots.metadata.as_ref().unwrap();
             // verify-prefiltered-knn: brute-force re-computation of F (pre-filter) ground truth
             steps.push(Step {
@@ -2236,19 +2211,17 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 ],
             });
         }
-    }
 
     // ── dataset.json ──────────────────────────────────────────────
     // Generate a JSON copy of dataset.yaml for clients that prefer JSON.
     // Runs before merkle so the JSON file gets merkle coverage.
     let mut json_after = Vec::new();
-    if let Some(ref knn) = slots.knn {
-        if knn.is_materialized() || needs_computed_knn {
+    if let Some(ref knn) = slots.knn
+        && (knn.is_materialized() || needs_computed_knn) {
             json_after.push("verify-knn".into());
         }
-    }
-    if let Some(ref fknn) = slots.filtered_knn {
-        if fknn.is_materialized() {
+    if let Some(ref fknn) = slots.filtered_knn
+        && fknn.is_materialized() {
             json_after.push("verify-prefiltered-knn".into());
             // E facet's verifier rides the same materialization gate
             // because the postfilter step is emitted alongside the
@@ -2256,7 +2229,6 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             // `slots.filtered_knn`).
             json_after.push("verify-postfiltered-knn".into());
         }
-    }
     if is_simple_synth && slots.metadata.is_some() {
         json_after.push("verify-predicates-sqlite".into());
     }
@@ -2266,18 +2238,14 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     let facets = resolve_facets(args);
     let (_, oracle_scope) = parse_oracle_scope(&facets);
     let wants_oracles = args.partition_oracles || oracle_scope.is_some();
-    if wants_oracles && slots.metadata.is_some() {
+    if wants_oracles && let Some(ref metadata) = slots.metadata {
         // Partition-profiles depends on whatever produced the metadata labels.
         // If filtered KNN was computed, wait for its verification first.
         // Otherwise, just wait for metadata to be ready.
         let partition_after = if slots.filtered_knn.as_ref().map(|f| f.is_materialized()).unwrap_or(false) {
             vec!["verify-prefiltered-knn".into()]
-        } else if let Some(ref meta) = slots.metadata {
-            if meta.metadata_content.is_materialized() {
-                vec![meta.metadata_content.step_id().into()]
-            } else {
-                vec![]
-            }
+        } else if metadata.metadata_content.is_materialized() {
+            vec![metadata.metadata_content.step_id().into()]
         } else {
             vec![]
         };
@@ -2292,8 +2260,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             options: vec![
                 ("base".into(), slots.base_vectors.path().into()),
                 ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
-                ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
-                ("predicates".into(), slots.metadata.as_ref().unwrap().predicates.path().into()),
+                ("metadata".into(), metadata.metadata_content.path().into()),
+                ("predicates".into(), metadata.predicates.path().into()),
                 ("neighbors".into(), args.neighbors.to_string()),
                 ("metric".into(), args.metric.clone()),
                 ("allowed-partitions".into(), args.max_partitions.to_string()),
@@ -2303,11 +2271,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         json_after.push("partition-profiles".into());
     }
 
-    if json_after.is_empty() {
-        if let Some(last) = steps.last() {
+    if json_after.is_empty()
+        && let Some(last) = steps.last() {
             json_after.push(last.id.clone());
         }
-    }
     steps.push(Step {
         id: "generate-dataset-json".into(),
         run: "generate dataset-json".into(),
@@ -2483,8 +2450,8 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
             format!("{}{}", args.default_prefix(), meta.predicate_indices.path())));
     }
 
-    if let Some(ref fknn) = slots.filtered_knn {
-        if fknn.is_materialized() {
+    if let Some(ref fknn) = slots.filtered_knn
+        && fknn.is_materialized() {
             // F facet — pre-filter ground truth, canonical key
             views.push(("prefiltered_neighbor_indices".into(),  format!("{}prefiltered_neighbor_indices.ivec",  args.default_prefix())));
             views.push(("prefiltered_neighbor_distances".into(), format!("{}prefiltered_neighbor_distances.fvec", args.default_prefix())));
@@ -2492,7 +2459,6 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
             views.push(("postfiltered_neighbor_indices".into(),  format!("{}postfiltered_neighbor_indices.ivec",  args.default_prefix())));
             views.push(("postfiltered_neighbor_distances".into(), format!("{}postfiltered_neighbor_distances.fvec", args.default_prefix())));
         }
-    }
 
     views
 }
@@ -2631,7 +2597,7 @@ fn generate_yaml(
                     out.push_str(&format!("      {}: {}\n", k, v));
                 }
             }
-            out.push_str("\n");
+            out.push('\n');
         }
     }
 
@@ -2646,7 +2612,7 @@ fn generate_yaml(
         let specs: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
         // Human-readable header comments explaining each expression,
         // then the flat sequence `serde` expects for `Vec<String>`.
-        out.push_str("\n");
+        out.push('\n');
         for s in &specs {
             let desc = describe_sized_spec(s);
             out.push_str(&format!("# strata \"{}\": {}\n", s, desc));
@@ -2707,15 +2673,14 @@ pub fn run(mut args: ImportArgs) {
 
     let output_dir = &args.output;
 
-    if output_dir.exists() && !args.force {
-        if output_dir.join("dataset.yaml").exists() {
+    if output_dir.exists() && !args.force
+        && output_dir.join("dataset.yaml").exists() {
             eprintln!(
                 "Error: {} already contains a dataset.yaml. Use --force to overwrite.",
                 crate::check::rel_display(output_dir)
             );
             std::process::exit(1);
         }
-    }
 
     if let Err(e) = std::fs::create_dir_all(output_dir) {
         eprintln!("Error: failed to create directory {}: {}", crate::check::rel_display(output_dir), e);
@@ -2723,8 +2688,8 @@ pub fn run(mut args: ImportArgs) {
     }
 
     // Detect normalization status of base vectors
-    if let Some(ref base_path) = args.base_vectors {
-        if let Some((is_normalized, sample_count, mean_norm)) = detect_normalized(base_path) {
+    if let Some(ref base_path) = args.base_vectors
+        && let Some((is_normalized, sample_count, mean_norm)) = detect_normalized(base_path) {
             if is_normalized {
                 println!("Vectors detected as L2-normalized (mean norm={:.4}, n={})", mean_norm, sample_count);
                 println!("  Normalization during extraction will be a no-op for these vectors.");
@@ -2734,7 +2699,6 @@ pub fn run(mut args: ImportArgs) {
             }
             println!();
         }
-    }
 
     // Resolve all slots
     let slots = resolve_slots(&args);
@@ -2843,11 +2807,10 @@ pub fn run(mut args: ImportArgs) {
         // Sorted for deterministic output (matches the runtime writer).
         let sorted: std::collections::BTreeMap<_, _> =
             vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        if let Ok(content) = serde_yaml::to_string(&sorted) {
-            if let Err(e) = std::fs::write(&vars_path, content) {
+        if let Ok(content) = serde_yaml::to_string(&sorted)
+            && let Err(e) = std::fs::write(&vars_path, content) {
                 eprintln!("Warning: failed to seed {}: {}", vars_path.display(), e);
             }
-        }
     }
 
     // Create .gitignore
@@ -2919,9 +2882,9 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
 
     // Base vectors: symlink ONLY when Identity (not Materialized).
     // When Materialized, the extract-base step will create the file.
-    if !self_search && !slots.base_vectors.is_materialized() {
-        if let Some(ref base_path) = args.base_vectors {
-            if is_native_xvec_file(base_path) {
+    if !self_search && !slots.base_vectors.is_materialized()
+        && let Some(ref base_path) = args.base_vectors
+            && is_native_xvec_file(base_path) {
                 let ext = base_path.extension()
                     .and_then(|e| e.to_str())
                     .and_then(VecFormat::canonical_extension)
@@ -2929,15 +2892,13 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
                 let link = base_dir.join(format!("base_vectors.{}", ext));
                 create_symlink(base_path, &link);
             }
-        }
-    }
 
     // Query vectors: when Identity (used as-is), create a query_vectors symlink.
     // When Materialized, the processing step creates the final file and a
     // query_vectors_raw symlink is created for the overlap step's input.
-    if let Some(ref qv) = slots.query_vectors {
-        if let Some(ref query_path) = args.query_vectors {
-            if !slots.self_search && is_native_xvec_file(query_path) {
+    if let Some(ref qv) = slots.query_vectors
+        && let Some(ref query_path) = args.query_vectors
+            && !slots.self_search && is_native_xvec_file(query_path) {
                 let ext = query_path.extension()
                     .and_then(|e| e.to_str())
                     .and_then(VecFormat::canonical_extension)
@@ -2952,14 +2913,12 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
                     create_symlink(query_path, &link);
                 }
             }
-        }
-    }
 
     // Ground truth: symlink when Identity and native xvec
-    if let Some(ref knn) = slots.knn {
-        if !knn.is_materialized() {
-            if let Some(ref gt_path) = args.ground_truth {
-                if is_native_xvec_file(gt_path) {
+    if let Some(ref knn) = slots.knn
+        && !knn.is_materialized() {
+            if let Some(ref gt_path) = args.ground_truth
+                && is_native_xvec_file(gt_path) {
                     let ext = gt_path.extension()
                         .and_then(|e| e.to_str())
                         .and_then(VecFormat::canonical_extension)
@@ -2967,9 +2926,8 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
                     let link = base_dir.join(format!("neighbor_indices.{}", ext));
                     create_symlink(gt_path, &link);
                 }
-            }
-            if let Some(ref gt_dist) = args.ground_truth_distances {
-                if is_native_xvec_file(gt_dist) {
+            if let Some(ref gt_dist) = args.ground_truth_distances
+                && is_native_xvec_file(gt_dist) {
                     let ext = gt_dist.extension()
                         .and_then(|e| e.to_str())
                         .and_then(VecFormat::canonical_extension)
@@ -2977,19 +2935,15 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
                     let link = base_dir.join(format!("neighbor_distances.{}", ext));
                     create_symlink(gt_dist, &link);
                 }
-            }
         }
-    }
 
     // Metadata content: symlink when native slab and not self-search
-    if !self_search {
-        if let Some(ref meta_path) = args.metadata {
-            if is_native_slab_file(meta_path) {
+    if !self_search
+        && let Some(ref meta_path) = args.metadata
+            && is_native_slab_file(meta_path) {
                 let link = base_dir.join("metadata_content.slab");
                 create_symlink(meta_path, &link);
             }
-        }
-    }
 }
 
 /// Create a symlink with a relative target, removing any existing one first.
@@ -3347,7 +3301,7 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
         let _ = std::io::stderr().flush();
     };
 
-    let actual_windows = WINDOWS.min((count + WINDOW_RECORDS - 1) / WINDOW_RECORDS).max(1);
+    let actual_windows = WINDOWS.min(count.div_ceil(WINDOW_RECORDS)).max(1);
     let window_stride = if actual_windows == 1 {
         0
     } else {
@@ -3589,12 +3543,12 @@ fn count_identity(slots: &PipelineSlots) -> usize {
     if !slots.all_vectors.is_materialized() { n += 1; }
     if !slots.prepare.is_materialized() { n += 1; }
     if !slots.base_vectors.is_materialized() { n += 1; }
-    if let Some(ref qv) = slots.query_vectors { if !qv.is_materialized() { n += 1; } }
+    if let Some(ref qv) = slots.query_vectors && !qv.is_materialized() { n += 1; }
     if let Some(ref meta) = slots.metadata {
         if !meta.metadata_all.is_materialized() { n += 1; }
         if !meta.metadata_content.is_materialized() { n += 1; }
     }
-    if let Some(ref knn) = slots.knn { if !knn.is_materialized() { n += 1; } }
+    if let Some(ref knn) = slots.knn && !knn.is_materialized() { n += 1; }
     n
 }
 

@@ -88,7 +88,7 @@ impl PlainSink {
         let total_str = format_count(bar.total);
 
         // \r moves to column 0; trailing spaces overwrite stale text
-        let _ = eprint!(
+        eprint!(
             "\r{} [{}/{}] {}%{}{}    ",
             bar.label, pos_str, total_str, pct, rate_str, eta_str,
         );
@@ -100,7 +100,7 @@ impl PlainSink {
     fn clear_bar_line(&self) {
         if self.bar_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
             // Move to a new line so the next output doesn't overwrite the bar
-            let _ = eprintln!();
+            eprintln!();
         }
     }
 }
@@ -169,7 +169,7 @@ impl UiSink for PlainSink {
                 if let Some(mut bar) = bars.remove(&id) {
                     bar.position = bar.total;
                     Self::render_bar(&mut bar);
-                    let _ = eprintln!(); // newline after final render
+                    eprintln!(); // newline after final render
                     self.bar_dirty.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }

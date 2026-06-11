@@ -290,31 +290,27 @@ pub fn fetch_if_modified(url: &str, local_path: &std::path::Path) -> io::Result<
             .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-        if let Ok(resp) = apply_read_auth(client.head(url), parsed.as_ref()).send() {
-            if resp.status().is_success() {
-                if let Some(remote_mtime) = parse_last_modified(&resp) {
-                    if remote_mtime <= local_mtime {
+        if let Ok(resp) = apply_read_auth(client.head(url), parsed.as_ref()).send()
+            && resp.status().is_success()
+                && let Some(remote_mtime) = parse_last_modified(&resp)
+                    && remote_mtime <= local_mtime {
                         return Ok(false); // local is current
                     }
-                }
-            }
-        }
         // HEAD failed or no Last-Modified — fall through to re-download
     }
 
     // Download the file
     let resp = apply_read_auth(client.get(url), parsed.as_ref()).send()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     if !resp.status().is_success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("HTTP {} fetching {}", resp.status(), url),
         ));
     }
 
     let remote_mtime = parse_last_modified(&resp);
     let bytes = resp.bytes()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
 
     std::fs::write(local_path, &bytes)?;
 
@@ -335,7 +331,7 @@ pub(crate) fn apply_read_auth(
     rb: reqwest::blocking::RequestBuilder,
     url: Option<&url::Url>,
 ) -> reqwest::blocking::RequestBuilder {
-    match url.and_then(|u| crate::credentials::resolve_read_token(u)) {
+    match url.and_then(crate::credentials::resolve_read_token) {
         Some(token) => rb.bearer_auth(token),
         None => rb,
     }
@@ -430,7 +426,7 @@ pub fn fetch_chunks_parallel(
         handles
             .into_iter()
             .map(|h| h.join().unwrap_or_else(|_| {
-                Err(io::Error::new(io::ErrorKind::Other, "thread panicked"))
+                Err(io::Error::other("thread panicked"))
             }))
             .collect()
     })

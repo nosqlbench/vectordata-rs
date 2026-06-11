@@ -256,11 +256,10 @@ impl QuantileSketchMeasure {
 
 impl Measure for QuantileSketchMeasure {
     fn observe(&mut self, value: &MValue, _ctx: &MeasureCtx) {
-        if let Some(x) = mvalue_as_f64(value) {
-            if !x.is_nan() {
+        if let Some(x) = mvalue_as_f64(value)
+            && !x.is_nan() {
                 self.sketch.add(x);
             }
-        }
     }
 
     fn finalize(self: Box<Self>) -> MeasureReport {
@@ -363,7 +362,7 @@ impl Measure for BitWidthMeasure {
         let range = (self.max as i128) - (self.min as i128);
         let range_u = range.max(0) as u128;
         // Bits needed to enumerate the observed range.
-        let bits_used = if range_u == 0 { 0 } else { 128 - range_u.leading_zeros() as u32 };
+        let bits_used = if range_u == 0 { 0 } else { 128 - range_u.leading_zeros() };
         let density = self.n as f64 / (range_u.max(1) as f64);
         let avg_pop = self.popcount_sum as f64 / self.n as f64;
         // Heuristic classification.
@@ -445,13 +444,12 @@ impl HistogramFromQuantilesMeasure {
 
 impl Measure for HistogramFromQuantilesMeasure {
     fn observe(&mut self, value: &MValue, _ctx: &MeasureCtx) {
-        if let Some(x) = mvalue_as_f64(value) {
-            if !x.is_nan() {
+        if let Some(x) = mvalue_as_f64(value)
+            && !x.is_nan() {
                 if x < self.min { self.min = x; }
                 if x > self.max { self.max = x; }
                 self.values.push(x);
             }
-        }
     }
 
     fn finalize(self: Box<Self>) -> MeasureReport {

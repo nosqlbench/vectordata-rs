@@ -120,8 +120,20 @@ impl UnifiedReader {
             UnifiedReader::Remote(r) => r.cache_stats(),
         }
     }
-    pub(super) fn is_remote(&self) -> bool {
-        matches!(self, UnifiedReader::Remote(_))
+    /// Chunk geometry of the underlying remote storage, when the
+    /// source is chunk-backed. `None` for local files.
+    pub(super) fn chunk_geometry(&self) -> Option<ChunkGeometry> {
+        match self {
+            UnifiedReader::Local(_) => None,
+            UnifiedReader::Remote(r) => r.chunk_geometry(),
+        }
+    }
+    /// See [`AnyDatasetReader::prefetch_byte_range`]. No-op for local.
+    pub(super) fn prefetch_byte_range(&self, byte_start: u64, byte_end: u64) -> std::io::Result<()> {
+        match self {
+            UnifiedReader::Local(_) => Ok(()),
+            UnifiedReader::Remote(r) => r.prefetch_byte_range(byte_start, byte_end),
+        }
     }
 }
 
@@ -215,6 +227,44 @@ impl AnyVectorReader {
 
 }
 
+/// Byte-level geometry of a remote facet, resolved once at open time.
+/// Lets sampling and prefetch reason in transfer-chunk units: which
+/// chunk a record lands in, and how many records one chunk holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ChunkGeometry {
+    /// Bytes per record: 4-byte dim header + `dim × element size`.
+    pub entry_bytes: u64,
+    /// Transfer-chunk size of the backing store (8 MiB for the
+    /// merkle-less chunked-HTTP path, whatever the published `.mref`
+    /// declares for the merkle path).
+    pub chunk_bytes: u64,
+    /// Ordinal of the window's first record in the underlying file —
+    /// 0 for unwindowed facets. Chunk boundaries are file-global, so
+    /// windowed profiles must offset before mapping records to chunks.
+    pub window_start: u64,
+}
+
+impl ChunkGeometry {
+    /// Records per chunk, floored (a record straddling the boundary
+    /// counts toward neither side). Never zero.
+    pub(super) fn records_per_chunk(&self) -> usize {
+        ((self.chunk_bytes / self.entry_bytes.max(1)) as usize).max(1)
+    }
+
+    /// File-global chunk ordinal containing the FIRST byte of the
+    /// window-local record `i`.
+    fn chunk_of(&self, i: usize) -> u64 {
+        ((self.window_start + i as u64) * self.entry_bytes) / self.chunk_bytes
+    }
+
+    /// File-global chunk ordinal containing the LAST byte of the
+    /// window-local record `i` — differs from [`Self::chunk_of`] when
+    /// the record straddles a chunk boundary.
+    fn chunk_of_end(&self, i: usize) -> u64 {
+        ((self.window_start + i as u64 + 1) * self.entry_bytes - 1) / self.chunk_bytes
+    }
+}
+
 /// Wrapper that opens `base_vectors` (and exposes a cache-stats view)
 /// through the canonical [`crate::TestDataView`] path.
 pub(super) struct AnyDatasetReader {
@@ -223,6 +273,11 @@ pub(super) struct AnyDatasetReader {
     facet_storage: Option<crate::FacetStorage>,
     dim: usize,
     count: usize,
+    /// Bytes per record in the underlying file (dim header + payload).
+    entry_bytes: u64,
+    /// Window offset of this profile's base facet into the underlying
+    /// file, in records. 0 when the facet is unwindowed.
+    window_start: u64,
 }
 
 impl AnyDatasetReader {
@@ -239,7 +294,8 @@ impl AnyDatasetReader {
         //
         // `open_facet_storage` is still called so the resulting
         // `AnyDatasetReader::facet_storage` handle can serve
-        // cache_stats() to the TUI's status line.
+        // cache_stats() to the TUI's status line and the chunk
+        // geometry to the sampler/prefetcher.
         let facet_storage = view.open_facet_storage("base_vectors").ok();
         let base = view.base_vectors().unwrap_or_else(|e| {
             eprintln!("error: failed to open base_vectors: {e}");
@@ -247,7 +303,38 @@ impl AnyDatasetReader {
         });
         let dim = base.dim();
         let count = base.count();
-        AnyDatasetReader { view, base, facet_storage, dim, count }
+        let elem = crate::io::infer_elem_size(crate::io::ext_of(
+            view.facet_source("base_vectors").as_deref().unwrap_or(""),
+        ));
+        // Unknown extension: assume f32, the only element type the
+        // remote f32 reader path can have opened anyway.
+        let elem = if elem == 0 { 4 } else { elem };
+        let entry_bytes = 4 + (dim as u64) * (elem as u64);
+        let window_start = base_window_start(&*view);
+        AnyDatasetReader { view, base, facet_storage, dim, count, entry_bytes, window_start }
+    }
+
+    /// Chunk geometry of the base facet, when it is chunk-backed
+    /// remote storage. `None` for local mmap (no transfer chunks)
+    /// and when the facet storage handle could not be opened.
+    pub(super) fn chunk_geometry(&self) -> Option<ChunkGeometry> {
+        let stats = self.facet_storage.as_ref()?.cache_stats()?;
+        if stats.chunk_size == 0 { return None; }
+        Some(ChunkGeometry {
+            entry_bytes: self.entry_bytes,
+            chunk_bytes: stats.chunk_size,
+            window_start: self.window_start,
+        })
+    }
+
+    /// Drive the chunks covering `[byte_start, byte_end)` of the base
+    /// facet to locally-resident state. Blocking; parallel within the
+    /// range. No-op when there is no storage handle.
+    pub(super) fn prefetch_byte_range(&self, byte_start: u64, byte_end: u64) -> std::io::Result<()> {
+        match &self.facet_storage {
+            Some(fs) => fs.prebuffer_range_with_progress(byte_start, byte_end, |_| {}),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn count(&self) -> usize { self.count }
@@ -270,38 +357,66 @@ impl AnyDatasetReader {
     pub(super) fn view(&self) -> &dyn crate::TestDataView { &*self.view }
 }
 
-/// Default number of consecutive vectors per clump.
-///
-/// For remote data, the effective clump size should ideally match the number
-/// of vectors that fit in one merkle chunk (~1MB). With 1024-dim f16 vectors
-/// (2KB each), that's ~512 vectors per chunk. A larger clump means each
-/// downloaded chunk is more fully utilized, reducing total HTTP requests.
-///
-/// This default is a conservative floor for local data. The `clump_size_for`
-/// helper scales it up based on vector size and chunk geometry.
+/// Resolve the base facet's window offset (in records) into the
+/// underlying file. Sized profiles express their window either as a
+/// `[start..end)` suffix on the source string (the canonical sugar)
+/// or as an explicit `window:` field on a `Detailed` facet config —
+/// the facet manifest carries both forms, so consult both. 0 when
+/// the facet is unwindowed or the window is unparseable (reads stay
+/// correct either way; only chunk alignment degrades).
+fn base_window_start(view: &dyn crate::TestDataView) -> u64 {
+    let manifest = view.facet_manifest();
+    let Some(desc) = manifest.get("base_vectors") else { return 0 };
+    if let Some(raw) = &desc.source_path
+        && let Ok(parsed) = crate::dataset::source::parse_source_string(raw)
+        && let Some(iv) = parsed.window.0.first()
+    {
+        return iv.min_incl;
+    }
+    if let Some(w) = &desc.window
+        && let Ok(parsed) = crate::dataset::source::parse_window(w)
+        && let Some(iv) = parsed.0.first()
+    {
+        return iv.min_incl;
+    }
+    0
+}
+
+/// Default number of consecutive vectors per clump, used when the
+/// source has no chunk geometry to align with (local mmap). Pure
+/// access-locality clumping — large enough to amortize per-record
+/// overhead, small enough that clumps stay well spread.
 pub(super) const DEFAULT_CLUMP_SIZE: usize = 32;
 
-/// Compute an effective clump size based on vector entry size.
-///
-/// For remote access, aligns clumps to merkle chunk boundaries so each
-/// downloaded chunk is maximally utilized. Falls back to DEFAULT_CLUMP_SIZE
-/// for very small vectors or local access.
-pub(super) fn clump_size_for_dim(dim: usize, is_remote: bool) -> usize {
-    if !is_remote {
-        return DEFAULT_CLUMP_SIZE;
+/// Effective clump size for the given source geometry: exactly the
+/// number of records one transfer chunk holds, so a clump consumes
+/// whole downloaded blocks. Falls back to [`DEFAULT_CLUMP_SIZE`]
+/// when there is no chunk geometry (local files) or for very small
+/// records where a single chunk would make clumps absurdly small.
+pub(super) fn clump_size_for(geometry: Option<ChunkGeometry>) -> usize {
+    match geometry {
+        Some(g) => g.records_per_chunk().max(DEFAULT_CLUMP_SIZE),
+        None => DEFAULT_CLUMP_SIZE,
     }
-    // Estimate bytes per vector entry: dim * element_size + 4 (dimension header)
-    // Use 2 bytes/element (f16) as conservative estimate; f32 would be 4.
-    let entry_size = dim * 2 + 4;
-    // Merkle default chunk size is 1MB
-    let chunk_size = 1024 * 1024;
-    let vecs_per_chunk = chunk_size / entry_size.max(1);
-    // Use the full chunk capacity, with a floor of DEFAULT_CLUMP_SIZE
-    vecs_per_chunk.max(DEFAULT_CLUMP_SIZE)
 }
 
 /// Generate sample indices according to the sampling mode.
-pub(super) fn sample_indices(total: usize, effective: usize, seed: u64, mode: SampleMode, clump_size: usize) -> Vec<usize> {
+///
+/// When `geometry` is known (chunk-backed remote source), `Clumped`
+/// mode produces *chunk-aligned* clumps: evenly-spaced whole transfer
+/// chunks, each contributing every record fully contained in it. This
+/// is the intended remote trade-off — pay for whole blocks, spread
+/// them across the distribution, and waste none of the downloaded
+/// bytes. Without geometry, `Clumped` falls back to evenly-spaced
+/// fixed-size clumps (access locality only).
+pub(super) fn sample_indices(
+    total: usize,
+    effective: usize,
+    seed: u64,
+    mode: SampleMode,
+    clump_size: usize,
+    geometry: Option<ChunkGeometry>,
+) -> Vec<usize> {
     if effective >= total {
         return (0..total).collect();
     }
@@ -310,10 +425,12 @@ pub(super) fn sample_indices(total: usize, effective: usize, seed: u64, mode: Sa
             (0..effective).collect()
         }
         SampleMode::Clumped => {
-            // Evenly-spaced clumps of consecutive vectors.
-            // num_clumps × clump_size ≈ effective
-            let clump_size = clump_size;
-            let num_clumps = (effective + clump_size - 1) / clump_size;
+            if let Some(g) = geometry {
+                return chunk_aligned_clumps(total, effective, g);
+            }
+            // No chunk geometry — evenly-spaced clumps of consecutive
+            // vectors. num_clumps × clump_size ≈ effective.
+            let num_clumps = effective.div_ceil(clump_size);
             let stride = total / num_clumps.max(1);
 
             let mut indices = Vec::with_capacity(effective);
@@ -340,6 +457,156 @@ pub(super) fn sample_indices(total: usize, effective: usize, seed: u64, mode: Sa
             idx
         }
     }
+}
+
+/// Chunk-aligned clumped sampling: pick `ceil(effective /
+/// records_per_chunk)` whole transfer chunks, evenly spaced across
+/// the chunks the window covers, and take every record *fully
+/// contained* in each picked chunk (a record straddling a chunk
+/// boundary would force a second chunk download, defeating the
+/// whole-block trade-off). If edge clipping leaves the sample short,
+/// additional unpicked chunks are appended (in ascending order) until
+/// `effective` is met or the window is exhausted.
+pub(super) fn chunk_aligned_clumps(total: usize, effective: usize, g: ChunkGeometry) -> Vec<usize> {
+    let (e, c) = (g.entry_bytes, g.chunk_bytes);
+    if e == 0 || c == 0 {
+        return (0..effective.min(total)).collect();
+    }
+    let first_chunk = g.chunk_of(0);
+    let last_chunk = g.chunk_of_end(total.saturating_sub(1));
+    let span_chunks = last_chunk - first_chunk + 1;
+
+    // Window-local ordinals of the records fully inside chunk `q`.
+    let recs_in = |q: u64| -> std::ops::Range<usize> {
+        let lo_global = (q * c).div_ceil(e);
+        let hi_global = ((q + 1) * c) / e;
+        let lo = lo_global.saturating_sub(g.window_start).min(total as u64) as usize;
+        let hi = hi_global.saturating_sub(g.window_start).min(total as u64) as usize;
+        lo..hi.max(lo)
+    };
+
+    let needed = (effective.div_ceil(g.records_per_chunk()) as u64)
+        .clamp(1, span_chunks);
+    let stride = (span_chunks / needed).max(1);
+    let mut picked: Vec<u64> = (0..needed).map(|k| first_chunk + k * stride).collect();
+    let mut chosen: std::collections::HashSet<u64> = picked.iter().copied().collect();
+
+    let mut indices = Vec::with_capacity(effective);
+    let mut cursor = 0usize;
+    while indices.len() < effective && cursor < picked.len() {
+        for r in recs_in(picked[cursor]) {
+            if indices.len() >= effective { break; }
+            indices.push(r);
+        }
+        cursor += 1;
+        // Top-up: boundary clipping can leave each chunk a few records
+        // short of records_per_chunk. Pull in the next unpicked chunk
+        // until the target is met or the window has no chunks left.
+        if cursor == picked.len() && indices.len() < effective
+            && let Some(q) = (first_chunk..=last_chunk).find(|q| !chosen.contains(q)) {
+                chosen.insert(q);
+                picked.push(q);
+            }
+    }
+    indices
+}
+
+/// Map sample indices to the distinct file-global transfer chunks
+/// they touch, in first-touch order. A record straddling a chunk
+/// boundary contributes both chunks. This is the prefetcher's work
+/// list: warming exactly these chunks (in this order) keeps the
+/// parallel readahead aligned with the serial read order.
+pub(super) fn chunks_for_indices(indices: &[usize], g: ChunkGeometry) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::new();
+    let mut chunks = Vec::new();
+    for &i in indices {
+        for q in [g.chunk_of(i), g.chunk_of_end(i)] {
+            if seen.insert(q) {
+                chunks.push(q);
+            }
+        }
+    }
+    chunks
+}
+
+/// Spawn parallel readahead for a sample over a chunk-backed remote
+/// source. Maps `indices` to their covering chunks and warms them
+/// with [`crate::cache::download_concurrency`] worker threads, each
+/// driving one chunk at a time through the storage layer's
+/// prebuffer path. The storage layer dedups in-flight chunk fetches,
+/// so the serial read thread consuming the same sample blocks on
+/// chunks already being fetched here instead of downloading them
+/// itself — turning the read path's one-connection serial fetch into
+/// a pool-wide parallel one without restructuring the reader.
+///
+/// `cancel` is checked between chunks; setting it abandons the
+/// remaining work list (bounded overshoot: at most one in-flight
+/// chunk per worker). No-op for local sources.
+pub(super) fn spawn_chunk_prefetch(
+    reader: std::sync::Arc<UnifiedReader>,
+    indices: &[usize],
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let Some(g) = reader.chunk_geometry() else { return };
+    let chunks = chunks_for_indices(indices, g);
+    if chunks.is_empty() { return; }
+    let queue = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::VecDeque::from(chunks),
+    ));
+    let workers = crate::cache::download_concurrency()
+        .min(queue.lock().unwrap().len())
+        .max(1);
+    for _ in 0..workers {
+        let reader = reader.clone();
+        let queue = queue.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                let q = queue.lock().unwrap().pop_front();
+                let Some(q) = q else { break };
+                // Errors are not surfaced here — the serial read path
+                // hits the same chunk next and reports the failure
+                // with full context.
+                if reader.prefetch_byte_range(q * g.chunk_bytes, (q + 1) * g.chunk_bytes).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// Split sample indices into contiguous runs of at most `cap`
+/// indices each, returned as `(start_index, run_length)` pairs.
+///
+/// Used by the explore read thread to drive `get_f32_range`: a run
+/// is served with one range read, and the cap bounds how many
+/// vectors that read collects before control returns to the caller.
+/// Without the cap, Streaming mode (one contiguous block spanning
+/// the whole sample) would gather every vector — and on a remote
+/// source, download every covering chunk — inside a single call,
+/// so no progress batch could reach the UI until the entire sample
+/// was resident. With the cap, each segment completes after at most
+/// a chunk fetch or two and the vectors-loaded counter advances as
+/// data arrives.
+///
+/// Sparse mode produces no contiguous neighbors, so every run has
+/// length 1 and behaviour matches a per-index loop.
+pub(super) fn contiguous_runs(indices: &[usize], cap: usize) -> Vec<(usize, usize)> {
+    let cap = cap.max(1);
+    let mut runs = Vec::new();
+    let mut i = 0usize;
+    while i < indices.len() {
+        let mut end = i + 1;
+        while end < indices.len()
+            && end - i < cap
+            && indices[end] == indices[end - 1] + 1 {
+            end += 1;
+        }
+        runs.push((indices[i], end - i));
+        i = end;
+    }
+    runs
 }
 
 /// Install a SIGINT (Ctrl-C) handler.
@@ -379,5 +646,132 @@ pub(super) fn normalize(v: &mut [f64]) {
         for x in v.iter_mut() {
             *x /= norm;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A streaming-mode sample (one fully contiguous block) must be
+    /// split into cap-sized segments — an uncapped single run is the
+    /// regression where the whole remote sample downloaded before
+    /// the first progress batch reached the UI.
+    #[test]
+    fn streaming_block_splits_at_cap() {
+        let indices: Vec<usize> = (0..1250).collect();
+        let runs = contiguous_runs(&indices, 500);
+        assert_eq!(runs, vec![(0, 500), (500, 500), (1000, 250)]);
+    }
+
+    /// Sparse (non-adjacent) indices each form a length-1 run.
+    #[test]
+    fn sparse_indices_yield_unit_runs() {
+        let indices = vec![7, 3, 100, 42];
+        let runs = contiguous_runs(&indices, 500);
+        assert_eq!(runs, vec![(7, 1), (3, 1), (100, 1), (42, 1)]);
+    }
+
+    /// Clumped samples keep clump boundaries; clumps longer than the
+    /// cap split, shorter ones pass through intact.
+    #[test]
+    fn clumps_split_only_when_longer_than_cap() {
+        let mut indices: Vec<usize> = (0..8).collect();      // clump of 8
+        indices.extend(1000..1003);                           // clump of 3
+        let runs = contiguous_runs(&indices, 4);
+        assert_eq!(runs, vec![(0, 4), (4, 4), (1000, 3)]);
+    }
+
+    #[test]
+    fn empty_and_degenerate_cap() {
+        assert!(contiguous_runs(&[], 500).is_empty());
+        // cap 0 is clamped to 1 instead of looping forever
+        assert_eq!(contiguous_runs(&[5, 6], 0), vec![(5, 1), (6, 1)]);
+    }
+
+    fn geo(entry: u64, chunk: u64, window: u64) -> ChunkGeometry {
+        ChunkGeometry { entry_bytes: entry, chunk_bytes: chunk, window_start: window }
+    }
+
+    /// Clump size equals whole-chunk capacity when geometry is known;
+    /// falls back to the locality floor for local files.
+    #[test]
+    fn clump_size_tracks_chunk_capacity() {
+        // dim=256 f32: entry 1028 B; 8 MiB chunk → 8160 records.
+        assert_eq!(clump_size_for(Some(geo(1028, 8 << 20, 0))), 8160);
+        // Tiny chunks never shrink the clump below the floor.
+        assert_eq!(clump_size_for(Some(geo(1028, 4096, 0))), DEFAULT_CLUMP_SIZE);
+        assert_eq!(clump_size_for(None), DEFAULT_CLUMP_SIZE);
+    }
+
+    /// Whole-block invariant: every index a chunk-aligned clump
+    /// produces maps to a record fully contained in one of the
+    /// evenly-spaced picked chunks — no byte of any other chunk is
+    /// needed to serve the sample.
+    #[test]
+    fn aligned_clumps_stay_within_whole_chunks() {
+        // entry 300 B, chunk 1000 B → records straddle boundaries.
+        let g = geo(300, 1000, 0);
+        let total = 100;       // 30 000 bytes → chunks 0..=29
+        // 3 recs/chunk → 3 picked chunks (stride 10), which after
+        // boundary clipping yield exactly 3 + 2 + 3 = 8 records —
+        // ask for all 8 so no top-up chunk is pulled in.
+        let effective = 8;
+        let indices = chunk_aligned_clumps(total, effective, g);
+        assert_eq!(indices.len(), effective);
+        for &r in &indices {
+            let (lo, hi) = (r as u64 * 300, (r as u64 + 1) * 300);
+            let q = lo / 1000;
+            assert_eq!(hi.div_ceil(1000) - 1, q,
+                "record {r} ({lo}..{hi}) must not straddle a chunk boundary");
+        }
+        // Even spread: picked chunks are 0, 10, 20.
+        let chunks = chunks_for_indices(&indices, g);
+        assert_eq!(chunks, vec![0, 10, 20]);
+    }
+
+    /// Boundary clipping makes each chunk yield fewer records than
+    /// `records_per_chunk`; the top-up pass appends more chunks until
+    /// the requested sample size is met.
+    #[test]
+    fn aligned_clumps_top_up_after_clipping() {
+        let g = geo(300, 1000, 0);
+        let total = 100;
+        // 3 fully-contained records per 1000-byte chunk (floor of
+        // 3.33), so 33 records cannot come from ceil(33/3)=11 chunks
+        // alone if any clip — request a size that forces top-up.
+        let effective = 34;
+        let indices = chunk_aligned_clumps(total, effective, g);
+        assert_eq!(indices.len(), effective);
+        // No duplicates.
+        let unique: std::collections::HashSet<_> = indices.iter().collect();
+        assert_eq!(unique.len(), indices.len());
+    }
+
+    /// Windowed profiles map records to file-global chunks: window
+    /// start 5 at entry 100 puts local record 0 at byte 500, inside
+    /// chunk 0, and local record 5 at byte 1000 — chunk 1.
+    #[test]
+    fn window_offsets_shift_chunk_mapping() {
+        let g = geo(100, 1000, 5);
+        assert_eq!(chunks_for_indices(&[0], g), vec![0]);
+        assert_eq!(chunks_for_indices(&[5], g), vec![1]);
+        // Aligned clumps express results in window-local ordinals.
+        let indices = chunk_aligned_clumps(20, 5, g);
+        assert_eq!(indices.len(), 5);
+        for &r in &indices {
+            assert!(r < 20, "window-local ordinal expected, got {r}");
+        }
+    }
+
+    /// A record straddling a chunk boundary contributes both covering
+    /// chunks to the prefetch work list, in first-touch order.
+    #[test]
+    fn straddling_records_prefetch_both_chunks() {
+        let g = geo(300, 1000, 0);
+        // record 3 spans bytes 900..1200 → chunks 0 and 1.
+        assert_eq!(chunks_for_indices(&[3], g), vec![0, 1]);
+        // Dedup across indices: records 0..=3 touch chunks 0 and 1 once.
+        assert_eq!(chunks_for_indices(&[0, 1, 2, 3], g), vec![0, 1]);
     }
 }

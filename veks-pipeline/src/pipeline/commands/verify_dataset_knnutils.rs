@@ -965,7 +965,7 @@ checks, in a single pipeline step.
             if recomputed_neighbors == gt_neighbors {
                 let recomputed_ordered: Vec<i32> = batch_result.labels[si * k..(si + 1) * k]
                     .to_vec();
-                let gt_ordered: Vec<i32> = gt_row.iter().cloned().collect();
+                let gt_ordered: Vec<i32> = gt_row.to_vec();
                 if recomputed_ordered == gt_ordered {
                     exact_match += 1;
                 } else {

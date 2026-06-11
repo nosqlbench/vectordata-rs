@@ -78,11 +78,10 @@ pub fn project_workspace(
 
     // Build defaults from upstream config
     let mut defaults = IndexMap::new();
-    if let Some(ref pipe) = config.upstream {
-        if let Some(ref defs) = pipe.defaults {
+    if let Some(ref pipe) = config.upstream
+        && let Some(ref defs) = pipe.defaults {
             defaults.extend(defs.clone());
         }
-    }
 
     let mut all_final: HashSet<String> = HashSet::new();
     let mut all_intermediate: HashSet<String> = HashSet::new();

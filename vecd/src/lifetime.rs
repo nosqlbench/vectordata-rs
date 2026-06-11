@@ -7,9 +7,9 @@
 //! `expires_at = committed_at + ns.ttl`). A background sweep moves expired
 //! committed versions to `stasis` (records `stasis_at`): they become
 //! invisible to clients (`GET`/`HEAD` → `410 Gone`) while every byte and
-//! manifest row is retained. An admin then either **extends** (re-lifecycle
-//! + restore) or **purges** (the only path that physically removes bytes,
-//! always explicit) from the cleanup queue.
+//! manifest row is retained. An admin then either **extends**
+//! (re-lifecycle + restore) or **purges** (the only path that
+//! physically removes bytes, always explicit) from the cleanup queue.
 //!
 //! When a namespace's current (latest) version moves to stasis, the live
 //! manifest (`objects`) is rebuilt from the next non-stasis committed

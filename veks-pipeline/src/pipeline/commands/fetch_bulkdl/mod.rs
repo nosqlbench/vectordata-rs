@@ -144,13 +144,12 @@ impl FetchJob {
 
     fn perform(&self, dest: &Path, on_bytes: &dyn Fn(u64)) -> Result<(), String> {
         // Ensure parent directory exists (COS keys may contain subpaths).
-        if let Some(parent) = dest.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| {
                     format!("failed to create directory {}: {}", parent.display(), e)
                 })?;
             }
-        }
 
         match self {
             FetchJob::Http { url, .. } => download_file(url, dest, on_bytes),
@@ -432,10 +431,10 @@ size check verifies any pre-existing local file before re-downloading.
                     // Re-verify in worker too (covers the race where the file
                     // was finished by another process between pre-verify and
                     // the worker pickup).
-                    if dest.exists() {
-                        if let Ok(meta) = fs::metadata(&dest) {
-                            if meta.len() > 0 {
-                                if let Ok(true) = job.check_existing_size(meta.len()) {
+                    if dest.exists()
+                        && let Ok(meta) = fs::metadata(&dest)
+                            && meta.len() > 0
+                                && let Ok(true) = job.check_existing_size(meta.len()) {
                                     ui.log(&format!(
                                         "[w{}] skip {} ({})",
                                         worker_id, filename, format_size(meta.len())
@@ -443,9 +442,6 @@ size check verifies any pre-existing local file before re-downloading.
                                     let _ = result_tx.send(DownloadResult::Ok(filename, 0));
                                     continue;
                                 }
-                            }
-                        }
-                    }
 
                     // Mark this file as in-flight. The ticker thread picks
                     // up the change on its next 250ms tick.

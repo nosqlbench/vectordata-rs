@@ -104,11 +104,10 @@ Norm is computed via BLAS `cblas_snrm2` (matching knn\_utils which uses
         let source_path = resolve_path(source_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
 
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists() {
                 let _ = std::fs::create_dir_all(parent);
             }
-        }
 
         let reader = match XvecReader::<f32>::open_path(&source_path) {
             Ok(r) => r,

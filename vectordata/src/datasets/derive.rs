@@ -180,7 +180,7 @@ fn local_dataset_yaml(dataset: &str) -> Option<std::path::PathBuf> {
         if yaml.is_file() { return Some(yaml); }
         return None;
     }
-    if p.extension().map_or(false, |e| e == "yaml" || e == "yml") {
+    if p.extension().is_some_and(|e| e == "yaml" || e == "yml") {
         return Some(p.to_path_buf());
     }
     None
@@ -460,15 +460,14 @@ fn run_plan(
         // `dest_filename` is `profiles/base/<facet>.<ext>` — ensure
         // the containing directory exists before any sink opens it
         // for writing. Idempotent across facets.
-        if let Some(parent) = dest_path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
+        if let Some(parent) = dest_path.parent()
+            && let Err(e) = fs::create_dir_all(parent) {
                 meter.fail(
                     &row.facet,
                     &format!("create dir {}: {e}", parent.display()),
                 );
                 return 1;
             }
-        }
         meter.begin_facet(&row.facet, row.expected_bytes);
 
         let mut written: u64 = 0;
@@ -666,7 +665,7 @@ impl DeriveMeter {
                 }
             }
         };
-        let _ = eprint!(
+        eprint!(
             "\r  [{}/{}] {}: {} \u{2022} total {}% ({}/{})\u{1b}[K",
             self.facet_index, self.facet_count, self.current_facet,
             facet_state,
@@ -1084,7 +1083,7 @@ fn load_rich_config(group_path: &str) -> Result<RichDatasetConfig, String> {
         let p = Path::new(group_path);
         let yaml_path = if p.is_dir() {
             p.join("dataset.yaml")
-        } else if p.extension().map_or(false, |e| e == "yaml" || e == "yml") {
+        } else if p.extension().is_some_and(|e| e == "yaml" || e == "yml") {
             p.to_path_buf()
         } else {
             p.join("dataset.yaml")
@@ -1118,8 +1117,8 @@ fn fetch_yaml_url(url: &str) -> io::Result<String> {
     }
     let resp = shared_client_for(u.as_str()).get(u).send()
         .and_then(|r| r.error_for_status())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    resp.text().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    resp.text().map_err(|e| io::Error::other(e.to_string()))
 }
 
 #[cfg(test)]

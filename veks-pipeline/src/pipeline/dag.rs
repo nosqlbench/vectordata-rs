@@ -114,8 +114,8 @@ pub fn build_dag(steps: &[StepDef]) -> Result<PipelineDag, String> {
                 serde_yaml::Value::String(s) => s.as_str(),
                 _ => continue,
             };
-            if let Some(&producer_idx) = output_to_idx.get(val_str) {
-                if producer_idx != i {
+            if let Some(&producer_idx) = output_to_idx.get(val_str)
+                && producer_idx != i {
                     // Avoid duplicate edges
                     let from = node_indices[producer_idx];
                     let to = node_indices[i];
@@ -123,7 +123,6 @@ pub fn build_dag(steps: &[StepDef]) -> Result<PipelineDag, String> {
                         graph.add_edge(from, to, ());
                     }
                 }
-            }
         }
     }
 

@@ -60,7 +60,7 @@ impl MerkleTree {
         let leaf_count = if data.is_empty() {
             1
         } else {
-            (data.len() + chunk_size - 1) / chunk_size
+            data.len().div_ceil(chunk_size)
         };
 
         let mut leaf_hashes: Vec<[u8; HASH_SIZE]> = Vec::with_capacity(leaf_count);
@@ -109,11 +109,11 @@ impl MerkleTree {
         let leaf_count = if file_size == 0 {
             1
         } else {
-            ((file_size as usize) + chunk_size - 1) / chunk_size
+            (file_size as usize).div_ceil(chunk_size)
         };
 
         if file_size == 0 {
-            let empty: [u8; HASH_SIZE] = Sha256::digest(&[]).into();
+            let empty: [u8; HASH_SIZE] = Sha256::digest([]).into();
             progress_fn(1);
             return Ok(Self::from_leaf_hashes(vec![empty], 1, chunk_size, file_size));
         }
@@ -206,8 +206,8 @@ impl MerkleTree {
                 handles.push(handle);
             }
             for h in handles {
-                h.join().map_err(|_| std::io::Error::new(
-                    std::io::ErrorKind::Other, "merkle worker panicked"))??;
+                h.join().map_err(|_| std::io::Error::other(
+                    "merkle worker panicked"))??;
             }
             Ok(())
         })?;
@@ -239,7 +239,7 @@ impl MerkleTree {
         let leaf_count = if file_size == 0 {
             1
         } else {
-            ((file_size as usize) + chunk_size - 1) / chunk_size
+            (file_size as usize).div_ceil(chunk_size)
         };
 
         // Channel: reader → hash workers (bounded to limit memory)
@@ -281,7 +281,7 @@ impl MerkleTree {
                 }
                 // chunk_tx drops here, closing the channel
             })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         // Hash worker threads: pull chunks, compute SHA-256, send results
         let mut workers = Vec::with_capacity(hash_threads);
@@ -327,7 +327,7 @@ impl MerkleTree {
 
         if leaf_hashes.is_empty() {
             return Ok(Self::from_leaf_hashes(
-                vec![Sha256::digest(&[]).into()], 1, chunk_size, file_size,
+                vec![Sha256::digest([]).into()], 1, chunk_size, file_size,
             ));
         }
 
@@ -344,7 +344,7 @@ impl MerkleTree {
     ) -> Self {
         // Pad to next power of 2 for balanced tree
         let padded_leaves = leaf_count.next_power_of_two().max(1);
-        let empty_hash: [u8; HASH_SIZE] = Sha256::digest(&[]).into();
+        let empty_hash: [u8; HASH_SIZE] = Sha256::digest([]).into();
         while leaf_hashes.len() < padded_leaves {
             leaf_hashes.push(empty_hash);
         }
@@ -362,8 +362,8 @@ impl MerkleTree {
             let left = 2 * i + 1;
             let right = 2 * i + 2;
             let mut hasher = Sha256::new();
-            hasher.update(&hashes[left]);
-            hasher.update(&hashes[right]);
+            hasher.update(hashes[left]);
+            hasher.update(hashes[right]);
             hashes[i] = hasher.finalize().into();
         }
 
@@ -554,9 +554,9 @@ byte ranges rather than requiring a full file re-download.
             );
         }
 
-        let force = options.get("force").map_or(false, |s| s == "true");
+        let force = options.get("force") == Some("true");
         let min_size: u64 = options.get("min-size")
-            .and_then(|s| veks_core::paths::parse_size(s))
+            .and_then(veks_core::paths::parse_size)
             .unwrap_or(100_000_000);
 
         let source_path = resolve_path(source_str, &ctx.workspace);
@@ -625,19 +625,18 @@ byte ranges rather than requiring a full file re-download.
             if mref.exists() && !force {
                 let src_t = std::fs::metadata(file).ok().and_then(|m| m.modified().ok());
                 let mref_t = std::fs::metadata(&mref).ok().and_then(|m| m.modified().ok());
-                if let (Some(st), Some(mt)) = (src_t, mref_t) {
-                    if mt > st {
+                if let (Some(st), Some(mt)) = (src_t, mref_t)
+                    && mt > st {
                         skipped_fresh += 1;
                         produced.push(mref);
                         files_done += 1;
                         files_pb.set_position(files_done);
                         continue;
                     }
-                }
             }
 
             let total_chunks = if file_size == 0 { 1 } else {
-                ((file_size as usize) + chunk_size - 1) / chunk_size
+                (file_size as usize).div_ceil(chunk_size)
             };
 
             ctx.ui.log(&format!(
@@ -676,7 +675,7 @@ byte ranges rather than requiring a full file re-download.
             };
             chunk_pb.finish();
 
-            if let Err(e) = std::fs::write(&mref, &tree.to_bytes()) {
+            if let Err(e) = std::fs::write(&mref, tree.to_bytes()) {
                 ctx.ui.log(&format!("    ERROR writing mref: {}", e));
                 files_done += 1;
                 files_pb.set_position(files_done);
@@ -757,7 +756,7 @@ byte ranges rather than requiring a full file re-download.
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
         let source_str = options.get("source").unwrap_or(".");
         let min_size: u64 = options.get("min-size")
-            .and_then(|s| veks_core::paths::parse_size(s))
+            .and_then(veks_core::paths::parse_size)
             .unwrap_or(100_000_000);
 
         let source_path = PathBuf::from(source_str);
@@ -1797,7 +1796,7 @@ fn render_braille_bitset(set_positions: &[usize], total: usize) -> String {
 
     // Each braille character represents 2 columns × 4 rows = 8 dots
     // We map positions to a single row, so each char covers 2 positions
-    let char_count = (total + 1) / 2;
+    let char_count = total.div_ceil(2);
     let mut result = String::with_capacity(char_count * 3);
 
     // Build a bitset
@@ -1981,7 +1980,7 @@ and integration testing rather than in production dataset preparation.
             .get("seed")
             .and_then(|s| s.parse().ok())
             .unwrap_or(42);
-        let dryrun = options.get("dryrun").map_or(false, |s| s == "true");
+        let dryrun = options.get("dryrun") == Some("true");
 
         let mref_path = resolve_mref_path(input_str, &ctx.workspace);
         let tree = match load_mref(&mref_path) {
@@ -2172,11 +2171,11 @@ corruption scenarios such as disk bit-rot or truncated downloads.
             .get("seed")
             .and_then(|s| s.parse().ok())
             .unwrap_or(42);
-        let dryrun = options.get("dryrun").map_or(false, |s| s == "true");
+        let dryrun = options.get("dryrun") == Some("true");
 
         // Resolve the source file and mref
         let input_path = resolve_path_ws(input_str, &ctx.workspace);
-        let source_path = if input_path.extension().map_or(false, |e| e == MREF_EXT) {
+        let source_path = if input_path.extension().is_some_and(|e| e == MREF_EXT) {
             input_path.with_extension("")
         } else {
             input_path.clone()
@@ -2333,10 +2332,10 @@ fn recompute_internal_nodes(tree: &mut MerkleTree) {
         let right = 2 * i + 2;
         let mut hasher = Sha256::new();
         if left < total {
-            hasher.update(&tree.hashes[left]);
+            hasher.update(tree.hashes[left]);
         }
         if right < total {
-            hasher.update(&tree.hashes[right]);
+            hasher.update(tree.hashes[right]);
         }
         let result = hasher.finalize();
         tree.hashes[i].copy_from_slice(&result);

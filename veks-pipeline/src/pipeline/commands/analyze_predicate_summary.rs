@@ -157,7 +157,7 @@ this is a read-only summary of a pre-computed answer key.
         // schema record count, then the max ordinal observed +1
         // (rough estimate; suitable for the summary row).
         let metadata_total: u64 = if let Some(p) = metadata_path.as_ref() {
-            SlabReader::open(p).map(|r| r.total_records() as u64).unwrap_or(0)
+            SlabReader::open(p).map(|r| r.total_records()).unwrap_or(0)
         } else if let Some(s) = schema.as_ref().and_then(|s| s.count.into()) {
             // PredicateSchema.count is the predicate count, not
             // the metadata count — but if the schema doesn't
@@ -362,7 +362,7 @@ fn render_summary(
     }
     rows.push(format!("total matches:     {total_matches}"));
     rows.push("─".repeat(8));
-    rows.push(format!("match distribution (per predicate)"));
+    rows.push("match distribution (per predicate)".to_string());
     rows.push(format!("  min:    {:>10}    sel = {}", min, sel(min)));
     rows.push(format!("  median: {:>10}    sel = {}", median, sel(median)));
     rows.push(format!("  p95:    {:>10}    sel = {}", p95, sel(p95)));

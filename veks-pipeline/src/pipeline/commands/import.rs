@@ -183,16 +183,14 @@ work with.
             && source_path.is_file()
         {
             // Ensure output directory exists
-            if let Some(parent) = output_path.parent() {
-                if !parent.exists() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
+            if let Some(parent) = output_path.parent()
+                && !parent.exists()
+                    && let Err(e) = std::fs::create_dir_all(parent) {
                         return error_result(
                             format!("failed to create directory {}: {}", parent.display(), e),
                             start,
                         );
                     }
-                }
-            }
 
             // Remove existing output if present (could be a stale symlink or file)
             if output_path.exists() || output_path.symlink_metadata().is_ok() {
@@ -243,16 +241,14 @@ work with.
         let target_format = facet.preferred_format(element_size);
 
         // Create output directory
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(
                         format!("failed to create directory {}: {}", parent.display(), e),
                         start,
                     );
                 }
-            }
-        }
 
         // Open sink
         let sink_config = SinkConfig {
@@ -303,11 +299,10 @@ work with.
         let demand_threshold: u32 = 3; // 3 × 5s = 15s sustained before demand
 
         while let Some(data) = source.next_record() {
-            if let Some(mc) = max_count {
-                if count >= mc {
+            if let Some(mc) = max_count
+                && count >= mc {
                     break;
                 }
-            }
             interval_bytes += data.len() as u64;
             interval_records += 1;
             sink.write_record(count as i64, &data);
@@ -332,7 +327,7 @@ work with.
                 }
 
                 if consecutive_low >= demand_threshold {
-                    let could_use = (current_threads * 2).max(8).min(64);
+                    let could_use = (current_threads * 2).clamp(8, 64);
                     ctx.governor.offer_demand("threads", current_threads, could_use);
                 }
 

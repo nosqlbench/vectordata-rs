@@ -333,25 +333,25 @@ fn write_value_bytes(writer: &ValueWriter, col: &Arc<dyn Array>, row: usize, buf
         }
         ValueWriter::DictInt8(inner) => {
             let dict = col.as_any().downcast_ref::<DictionaryArray<Int8Type>>().unwrap();
-            let key = dict.key(row).unwrap() as usize;
+            let key = dict.key(row).unwrap();
             let values = dict.values();
             write_value_bytes(inner, values, key, buf);
         }
         ValueWriter::DictInt16(inner) => {
             let dict = col.as_any().downcast_ref::<DictionaryArray<Int16Type>>().unwrap();
-            let key = dict.key(row).unwrap() as usize;
+            let key = dict.key(row).unwrap();
             let values = dict.values();
             write_value_bytes(inner, values, key, buf);
         }
         ValueWriter::DictInt32(inner) => {
             let dict = col.as_any().downcast_ref::<DictionaryArray<Int32Type>>().unwrap();
-            let key = dict.key(row).unwrap() as usize;
+            let key = dict.key(row).unwrap();
             let values = dict.values();
             write_value_bytes(inner, values, key, buf);
         }
         ValueWriter::DictInt64(inner) => {
             let dict = col.as_any().downcast_ref::<DictionaryArray<Int64Type>>().unwrap();
-            let key = dict.key(row).unwrap() as usize;
+            let key = dict.key(row).unwrap();
             let values = dict.values();
             write_value_bytes(inner, values, key, buf);
         }
@@ -401,8 +401,8 @@ mod tests {
             Arc::new(UInt32Array::from(vec![3_000_000_000u32])),
             Arc::new(UInt64Array::from(vec![12_345_678_901u64])),
             Arc::new(Float16Array::from(vec![f16::from_f32(1.5)])),
-            Arc::new(Float32Array::from(vec![3.14f32])),
-            Arc::new(Float64Array::from(vec![2.718281828f64])),
+            Arc::new(Float32Array::from(vec![3.25f32])),
+            Arc::new(Float64Array::from(vec![2.5f64])),
         ]).unwrap();
 
         let node = roundtrip_row(&batch, 0);
@@ -416,8 +416,8 @@ mod tests {
         assert_eq!(node.fields["u32_col"], MValue::Int(3_000_000_000));
         assert_eq!(node.fields["u64_col"], MValue::Int(12_345_678_901));
         assert_eq!(node.fields["f16_col"], MValue::Half(f16::from_f32(1.5).to_bits()));
-        assert_eq!(node.fields["f32_col"], MValue::Float32(3.14));
-        assert_eq!(node.fields["f64_col"], MValue::Float(2.718281828));
+        assert_eq!(node.fields["f32_col"], MValue::Float32(3.25));
+        assert_eq!(node.fields["f64_col"], MValue::Float(2.5));
     }
 
     #[test]

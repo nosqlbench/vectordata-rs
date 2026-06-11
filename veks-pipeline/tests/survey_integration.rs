@@ -23,7 +23,7 @@ use indexmap::IndexMap;
 use slabtastic::{SlabWriter, WriterConfig};
 
 use veks_pipeline::pipeline::commands::survey::{
-    self, findings, BinaryKind, CardinalityRegime, IdentifierKind, MeasureReport, NumberKind,
+    self, findings, BinaryKind, CardinalityRegime, IdentifierKind, NumberKind,
     SemanticType, StructuredKind, SurveyConfig, TemporalKind,
 };
 

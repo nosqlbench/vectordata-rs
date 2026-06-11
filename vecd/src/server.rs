@@ -514,11 +514,10 @@ fn method_action(method: &Method) -> Option<Action> {
 /// exactly what `vectordata push`'s `HttpsTransport` sends:
 /// `If-None-Match: *` (must-not-exist) and `If-Match: "<etag>"`.
 fn precondition(headers: &HeaderMap) -> Precondition {
-    if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
-        if inm.trim() == "*" {
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+        && inm.trim() == "*" {
             return Precondition::IfNoneMatchStar;
         }
-    }
     if let Some(im) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
         return Precondition::IfMatch(im.trim().trim_matches('"').to_string());
     }
@@ -601,12 +600,11 @@ async fn object_handler(
     if method == Method::PUT {
         let snap = state.snapshot();
         let parsed = parse_path(uri.path());
-        if let Ok(resolved) = namespace::resolve(&snap, &parsed.logical) {
-            if resolved.rel_key != PUSHLOG_FILE {
+        if let Ok(resolved) = namespace::resolve(&snap, &parsed.logical)
+            && resolved.rel_key != PUSHLOG_FILE {
                 return stream_put(state, snap, parsed.logical, headers, bearer, remote, addr, resolved, body)
                     .await;
             }
-        }
     }
 
     // Buffered path: GET/HEAD/DELETE (empty bodies) and the small pushlog
@@ -682,11 +680,10 @@ fn gate(
     }
 
     // Stamp last_used for a real token (best-effort, no reload).
-    if let Caller::User { token_id, .. } = &caller {
-        if let Ok(db) = state.db.lock() {
+    if let Caller::User { token_id, .. } = &caller
+        && let Ok(db) = state.db.lock() {
             db.touch_token(*token_id);
         }
-    }
 
     // ── authorize ───────────────────────────────────────────────────
     let Some(action) = method_action(method) else {
@@ -1200,11 +1197,10 @@ async fn upload_delete(
         Ok(v) => v,
         Err(r) => return r,
     };
-    if !upload.complete {
-        if let Ok(resolved) = namespace::resolve(&snap, &upload.path()) {
+    if !upload.complete
+        && let Ok(resolved) = namespace::resolve(&snap, &upload.path()) {
             let _ = resolved.backend.discard_staged(&upload.staging_key);
         }
-    }
     {
         let db = state.db.lock().unwrap();
         let _ = upload::delete(&db, &upload_id);
@@ -1318,11 +1314,10 @@ fn handle_object(
                     // namespace, so a freshly-pushed dataset is discoverable
                     // without anyone publishing a catalog by hand. (READ is
                     // already authorized above, so this respects access.)
-                    if is_catalog_key(&resolved.rel_key) {
-                        if let Some(out) = dynamic_catalog(&db, &resolved)? {
+                    if is_catalog_key(&resolved.rel_key)
+                        && let Some(out) = dynamic_catalog(&db, &resolved)? {
                             return Ok(out);
                         }
-                    }
                     Ok(absent_or_gone(&db, &resolved.storage_ns)?)
                 }
             }
@@ -1411,7 +1406,7 @@ fn dataset_layout(
     if let Some(p) = doc.get("profiles") {
         layout.insert("profiles".to_string(), p.clone());
     }
-    (!layout.is_empty()).then(|| serde_json::Value::Object(layout))
+    (!layout.is_empty()).then_some(serde_json::Value::Object(layout))
 }
 
 /// A request path split around an optional `@<selector>` version segment.
@@ -1634,8 +1629,8 @@ fn handle_put(
     // evaluated against the *committed* pushlog (the live manifest), so the
     // single-provenance CAS guarantee holds while the new version stages
     // invisibly.
-    if r.rel_key == PUSHLOG_FILE {
-        if let Ok(log) = Log::parse(&String::from_utf8_lossy(body)) {
+    if r.rel_key == PUSHLOG_FILE
+        && let Ok(log) = Log::parse(&String::from_utf8_lossy(body)) {
             match log.events.last() {
                 Some(Event::Begin { deletes, actor, .. }) => {
                     if !committed_precondition_ok(&db, r, &cond)? {
@@ -1674,7 +1669,6 @@ fn handle_put(
                 None => {} // empty log → fall through to a lone write
             }
         }
-    }
 
     // Inside an open session, any object PUT stages (invisible to readers).
     if session::is_open(&db, &ns)? {

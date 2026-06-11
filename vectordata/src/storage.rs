@@ -343,7 +343,7 @@ impl Storage {
             }
             return match result.as_ref().unwrap() {
                 Ok(arc) => Ok(Arc::clone(arc)),
-                Err(msg) => Err(io::Error::new(io::ErrorKind::Other, msg.clone())),
+                Err(msg) => Err(io::Error::other(msg.clone())),
             };
         }
 
@@ -440,7 +440,7 @@ impl Storage {
             .error_for_status()
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("no .mref for {url}: {e}")))?;
         let mref_bytes = resp.bytes()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mref read: {e}")))?;
+            .map_err(|e| io::Error::other(format!("mref read: {e}")))?;
         let reference = MerkleRef::from_bytes(&mref_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("mref parse: {e}")))?;
 
@@ -455,13 +455,12 @@ impl Storage {
         )?;
 
         let mmap = OnceLock::new();
-        if channel.is_complete() {
-            if let Ok(file) = std::fs::File::open(channel.cache_path())
+        if channel.is_complete()
+            && let Ok(file) = std::fs::File::open(channel.cache_path())
                 && let Ok(m) = unsafe { Mmap::map(&file) }
             {
                 let _ = mmap.set(m);
             }
-        }
 
         Ok(Storage::Cached { channel, mmap })
     }
@@ -551,13 +550,12 @@ impl Storage {
                     return Ok(m[offset as usize..end].to_vec());
                 }
                 let bytes = channel.read(offset, len)?;
-                if mmap.get().is_none() && channel.is_complete() {
-                    if let Ok(file) = std::fs::File::open(channel.cache_path())
+                if mmap.get().is_none() && channel.is_complete()
+                    && let Ok(file) = std::fs::File::open(channel.cache_path())
                         && let Ok(m) = unsafe { Mmap::map(&file) }
                     {
                         let _ = mmap.set(m);
                     }
-                }
                 Ok(bytes)
             }
         }
@@ -731,8 +729,7 @@ impl Storage {
                 if mmap.get().is_some() { return Ok(()); }
                 chunks.prebuffer_with_progress(cb)?;
                 if !chunks.is_complete() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         format!(
                             "HTTP precache did not complete: {}/{} chunks downloaded",
                             chunks.valid_count(), chunks.total_chunks(),
@@ -755,8 +752,7 @@ impl Storage {
                 if !channel.is_complete() {
                     let valid = channel.valid_count();
                     let total = channel.total_chunks();
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         format!(
                             "precache did not complete: {valid}/{total} chunks verified"
                         ),
@@ -868,12 +864,13 @@ impl Storage {
         }
     }
 
-    /// Force the byte range into the page cache via `madvise(WILLNEED)`
-    /// + sequential volatile read. Blocks until the pages are
-    /// resident. Caller increments `bytes_paged` per page touched.
-    /// The `madvise` portion is Unix-only; the volatile-read fallback
-    /// still executes on all platforms (it's the load-bearing part of
-    /// the prefetch — `madvise` is just a hint).
+    /// Force the byte range into the page cache via
+    /// `madvise(WILLNEED)` + sequential volatile read. Blocks until
+    /// the pages are resident. Caller increments `bytes_paged` per
+    /// page touched. The `madvise` portion is Unix-only; the
+    /// volatile-read fallback still executes on all platforms (it's
+    /// the load-bearing part of the prefetch — `madvise` is just a
+    /// hint).
     pub(crate) fn prefetch_pages_bytes(
         &self,
         byte_start: u64,
@@ -928,14 +925,30 @@ impl Storage {
         }
     }
 
-    /// Borrow the underlying [`CachedChannel`] when this storage is
-    /// `Cached`. Used by [`crate::view::FacetStorage::cache_stats`]
-    /// to report fill state. **Crate-internal**: the channel itself
-    /// is not part of the public API.
-    pub(crate) fn cached_channel(&self) -> Option<&CachedChannel> {
+    /// Live cache-fill statistics for chunk-backed remote storage:
+    /// `(valid_chunks, total_chunks, chunk_size, content_size,
+    /// is_complete)`. Covers both the merkle-verified (`Cached`) and
+    /// merkle-less (`Http`) chunk stores — a status UI watching a
+    /// no-`.mref` download must see the same fill progress as a
+    /// `.mref` one. `None` for local mmap, which is always fully
+    /// resident and has no fill state to report.
+    pub(crate) fn fill_stats(&self) -> Option<(u32, u32, u64, u64, bool)> {
         match self {
-            Storage::Cached { channel, .. } => Some(channel),
-            _ => None,
+            Storage::Mmap(_) => None,
+            Storage::Http { chunks, .. } => Some((
+                chunks.valid_count(),
+                chunks.total_chunks(),
+                chunks.chunk_size(),
+                chunks.total_size(),
+                chunks.is_complete(),
+            )),
+            Storage::Cached { channel, .. } => Some((
+                channel.valid_count(),
+                channel.total_chunks(),
+                channel.chunk_size(),
+                channel.content_size(),
+                channel.is_complete(),
+            )),
         }
     }
 }

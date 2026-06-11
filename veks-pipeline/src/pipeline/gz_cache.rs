@@ -156,7 +156,7 @@ impl GzStats {
 pub fn save_gz_with_stats(path: &Path, data: &[u8]) -> Result<GzStats, String> {
     let original_size = data.len() as u64;
     save_gz(path, data)?;
-    let compressed_size = std::fs::metadata(&gz_path(path))
+    let compressed_size = std::fs::metadata(gz_path(path))
         .map(|m| m.len())
         .unwrap_or(0);
     Ok(GzStats { original_size, compressed_size })

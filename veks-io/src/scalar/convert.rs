@@ -117,7 +117,7 @@ pub fn convert_scalars(
     let from_size = from.size();
     let to_size = to.size();
 
-    if data.len() % from_size != 0 {
+    if !data.len().is_multiple_of(from_size) {
         return Err(ConvertError {
             ordinal: 0, value: 0, from_type: from, to_type: to,
         });

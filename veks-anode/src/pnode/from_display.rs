@@ -314,7 +314,7 @@ impl<'a> Parser<'a> {
         }
         let hex = &self.input[start..self.cursor];
         self.consume_char('\'')?;
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             return Err(ParseError { msg: "odd-length hex literal".into(), pos: start });
         }
         let mut bytes = Vec::with_capacity(hex.len() / 2);
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn round_trip_float() {
-        assert_round_trip(&pred("ratio", OpType::Lt, Comparand::Float(3.14)));
+        assert_round_trip(&pred("ratio", OpType::Lt, Comparand::Float(3.25)));
         assert_round_trip(&pred("zero", OpType::Eq, Comparand::Float(0.0)));
         assert_round_trip(&pred("whole", OpType::Eq, Comparand::Float(1.0)));
     }

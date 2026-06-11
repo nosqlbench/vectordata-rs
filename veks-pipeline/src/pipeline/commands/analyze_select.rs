@@ -216,16 +216,15 @@ impl CommandOp for AnalyzeSelectOp {
                 };
                 let fc = VectorReader::<f64>::count(&r);
                 let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().to_vec()))
             }
         } }; // close match etype + else
 
         // Parse ordinal spec: single number, comma-separated, or range [start,end)
-        let ordinals = parse_ordinal_spec(&ordinal_str, count);
-        if ordinals.is_err() {
-            return error_result(ordinals.unwrap_err(), start);
-        }
-        let ordinals = ordinals.unwrap();
+        let ordinals = match parse_ordinal_spec(&ordinal_str, count) {
+            Ok(o) => o,
+            Err(e) => return error_result(e, start),
+        };
 
         if ordinals.is_empty() {
             return error_result("no ordinals in range".into(), start);
@@ -324,13 +323,12 @@ fn parse_ordinal_spec(spec: &str, count: usize) -> Result<Vec<usize>, String> {
     // Range: start-end (only if both parts are numeric)
     if spec.contains('-') && !spec.starts_with('-') {
         let parts: Vec<&str> = spec.splitn(2, '-').collect();
-        if parts.len() == 2 {
-            if let (Ok(start), Ok(end)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+        if parts.len() == 2
+            && let (Ok(start), Ok(end)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
                 let end = (end + 1).min(count);
                 if start >= end { return Err(format!("empty range {}-{}", start, end - 1)); }
                 return Ok((start..end).collect());
             }
-        }
     }
 
     // Comma-separated

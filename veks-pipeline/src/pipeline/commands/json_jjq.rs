@@ -313,11 +313,10 @@ the need for an external `jq` binary on the system.
         let output_path = output_str.map(|s| resolve_file_path(s, &ctx.workspace));
         let mut writer: Box<dyn IoWrite> = match &output_path {
             Some(p) if p.to_string_lossy() != "stdout" && p.to_string_lossy() != "null" => {
-                if let Some(parent) = p.parent() {
-                    if !parent.exists() {
+                if let Some(parent) = p.parent()
+                    && !parent.exists() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                }
                 match safe_create_file(p) {
                     Ok(f) => Box::new(std::io::BufWriter::new(f)),
                     Err(e) => {

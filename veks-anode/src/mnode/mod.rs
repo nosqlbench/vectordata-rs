@@ -616,7 +616,7 @@ mod tests {
     fn test_mnode_framed_roundtrip() {
         let mut node = MNode::new();
         node.insert("x".into(), MValue::Int32(42));
-        node.insert("y".into(), MValue::Float32(3.14));
+        node.insert("y".into(), MValue::Float32(3.25));
 
         let encoded = node.encode();
         let mut cursor = Cursor::new(encoded.as_slice());
@@ -655,7 +655,7 @@ mod tests {
     fn test_mvalue_fingerprint() {
         assert_eq!(MValue::Text("hello".into()).fingerprint(), MValue::Text(String::new()));
         assert_eq!(MValue::Int(42).fingerprint(), MValue::Int(0));
-        assert_eq!(MValue::Float(3.14).fingerprint(), MValue::Float(0.0));
+        assert_eq!(MValue::Float(3.25).fingerprint(), MValue::Float(0.0));
         assert_eq!(MValue::Bool(true).fingerprint(), MValue::Bool(false));
         assert_eq!(MValue::Null.fingerprint(), MValue::Null);
     }

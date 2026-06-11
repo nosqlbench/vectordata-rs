@@ -1,0 +1,24 @@
+# Workspace clippy calibration.
+#
+# These thresholds keep the corresponding lints ACTIVE but tuned to
+# this codebase's realities, instead of blanket-allowing them. Each
+# value sits just above the current worst case, so any new code that
+# regresses past today's high-water mark still gets flagged.
+
+# Pipeline command entry points thread per-run knobs (readers, ranges,
+# output paths, UI context) as parameters; the widest is 16. Param
+# structs are tracked as a refactor, not enforced by lint today.
+too-many-arguments-threshold = 16
+
+# KNN/segment plumbing carries tuple-rich types (reader + range +
+# profile triples). Worst offenders score ~500 under clippy's metric.
+type-complexity-threshold = 550
+
+# CLI argument enums (derive-based) and the Storage enum carry large
+# inline variants (~490 bytes). Boxing CLI variants buys nothing, and
+# boxing Storage would add a pointer chase to hot read paths.
+enum-variant-size-threshold = 512
+
+# Error enums carry rich context strings; worst Err variant is 184
+# bytes on cold error paths only.
+large-error-threshold = 192

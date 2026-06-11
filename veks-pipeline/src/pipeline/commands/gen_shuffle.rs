@@ -111,16 +111,14 @@ The same shuffle ivec is also applied to metadata slabs (via
         let output_path = resolve_path(output_str, &ctx.workspace);
 
         // Create output directory
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(
                         format!("failed to create directory: {}", e),
                         start,
                     );
                 }
-            }
-        }
 
         // Build the value sequence to shuffle.
         // When an ordinals file is provided (e.g., clean_ordinals.ivec),

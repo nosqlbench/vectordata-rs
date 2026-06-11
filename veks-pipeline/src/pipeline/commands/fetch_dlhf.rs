@@ -155,9 +155,9 @@ import, and vector file assembly.
             let dest = output_dir.join(&entry.rfilename);
 
             // Skip if already exists with matching size
-            if dest.exists() {
-                if let Ok(meta) = std::fs::metadata(&dest) {
-                    if meta.len() == entry.size {
+            if dest.exists()
+                && let Ok(meta) = std::fs::metadata(&dest)
+                    && meta.len() == entry.size {
                         ctx.ui.log(&format!(
                             "  {} — already downloaded ({} bytes)",
                             entry.rfilename, entry.size
@@ -165,8 +165,6 @@ import, and vector file assembly.
                         skipped += 1;
                         continue;
                     }
-                }
-            }
 
             let download_url = format!(
                 "https://huggingface.co/{}s/{}/resolve/{}/{}",

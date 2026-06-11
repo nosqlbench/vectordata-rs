@@ -1556,9 +1556,9 @@ fn step_ids_from_yaml(yaml: &str) -> Vec<String> {
 fn after_for_step(yaml: &str, step_id: &str) -> Option<String> {
     let lines: Vec<&str> = yaml.lines().collect();
     let mut in_step = false;
-    for (_i, line) in lines.iter().enumerate() {
+    for line in lines.iter() {
         let trimmed = line.trim();
-        if trimmed == &format!("- id: {}", step_id) {
+        if trimmed == format!("- id: {}", step_id) {
             in_step = true;
             continue;
         }

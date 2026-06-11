@@ -292,8 +292,8 @@ impl VecReader {
         // I/O size (>= 1 MiB) but small enough that we get real
         // parallelism across rayon threads.
         const CHUNK_BYTES: usize = 16 * 1024 * 1024;
-        let n_chunks = ((byte_len + CHUNK_BYTES - 1) / CHUNK_BYTES).max(1);
-        let chunk_size = (byte_len + n_chunks - 1) / n_chunks;
+        let n_chunks = byte_len.div_ceil(CHUNK_BYTES).max(1);
+        let chunk_size = byte_len.div_ceil(n_chunks);
         let file = self.pread_file();
 
         buf.par_chunks_mut(chunk_size)
@@ -779,7 +779,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                     };
                     // Throttled progress flush.
                     let done = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if done % flush_every == 0 {
+                    if done.is_multiple_of(flush_every) {
                         ctx.ui.inc_by_id(pb_id, flush_every);
                     }
                     // norm² == 0 ⇔ all components exactly zero in f32;
@@ -1131,7 +1131,7 @@ fn create_sorted_runs(
         .build()
         .ok();
 
-    let expected_runs = ((count + batch_size - 1) / batch_size) as u32;
+    let expected_runs = count.div_ceil(batch_size) as u32;
 
     // Check for existing runs from a previous attempt
     let meta_path = run_dir.join("meta.json");
@@ -1155,7 +1155,7 @@ fn create_sorted_runs(
     // Record size: 4 bytes ordinal + prefix_width * 4 bytes
     let record_bytes = 4 + prefix_width * 4;
 
-    let num_runs = ((count + batch_size - 1) / batch_size).max(1);
+    let num_runs = count.div_ceil(batch_size).max(1);
     let mut run_files: Vec<PathBuf> = Vec::new();
     let mut skipped = 0u32;
     // The prefix-read pass touches only ~4–40 bytes per vector but
@@ -1252,7 +1252,7 @@ fn create_sorted_runs(
                         let key = build_sort_key(&prefix_buf[..pw]);
                         let record = RunRecord::new(i as u32, &prefix_buf[..pw]);
                         let done = progress.fetch_add(1, AtomicOrd::Relaxed) + 1;
-                        if done % update_interval == 0 {
+                        if done.is_multiple_of(update_interval) {
                             pb.set_position(batch_start as u64 + done);
                         }
                         Ok::<_, String>((key, record))
@@ -1266,10 +1266,7 @@ fn create_sorted_runs(
                 build_fn()
             };
 
-            entries = match entries_result {
-                Ok(e) => e,
-                Err(e) => return Err(e),
-            };
+            entries = entries_result?;
         }
         // batch_buf is owned by the loop scope — it'll be reused
         // for the next batch (committed pages, no faults).
@@ -1463,7 +1460,7 @@ fn merge_runs(
     // ── Sub-phase B: Parallel sort ───────────────────────────────────
     set_phase_msg!("phase 2/3: sorting all records by prefix");
     let sort_start = Instant::now();
-    let sort_pb = ctx.ui.spinner(&format!("sorting {} records ({} threads)", all_records.len(), threads));
+    let sort_pb = ctx.ui.spinner(format!("sorting {} records ({} threads)", all_records.len(), threads));
 
     let sort_fn = |records: &mut Vec<RunRecord>| {
         records.par_sort_unstable_by(|a, b| a.cmp_prefix(b));
@@ -1832,24 +1829,23 @@ fn write_report(
 }
 
 fn ensure_parent(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
+    if let Some(parent) = path.parent()
+        && !parent.exists() {
             let _ = std::fs::create_dir_all(parent);
         }
-    }
 }
 
 /// Format a count with thousands separators.
 fn format_count(n: usize) -> String {
-    if n >= 1_000_000_000 && n % 1_000_000_000 == 0 {
+    if n >= 1_000_000_000 && n.is_multiple_of(1_000_000_000) {
         format!("{}B", n / 1_000_000_000)
     } else if n >= 1_000_000_000 {
         format!("{:.1}B", n as f64 / 1_000_000_000.0)
-    } else if n >= 1_000_000 && n % 1_000_000 == 0 {
+    } else if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
         format!("{}M", n / 1_000_000)
     } else if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 && n % 1_000 == 0 {
+    } else if n >= 1_000 && n.is_multiple_of(1_000) {
         format!("{}K", n / 1_000)
     } else if n >= 10_000 {
         format!("{:.1}K", n as f64 / 1_000.0)

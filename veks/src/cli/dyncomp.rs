@@ -139,9 +139,8 @@ fn complete_profile_names(partial: &str, _context: &[&str]) -> Vec<String> {
 
     let mut profiles = std::collections::BTreeSet::new();
     for entry in catalog.datasets() {
-        if let Some(ref ds) = dataset_name {
-            if !entry.name.eq_ignore_ascii_case(ds) { continue; }
-        }
+        if let Some(ref ds) = dataset_name
+            && !entry.name.eq_ignore_ascii_case(ds) { continue; }
         for name in entry.profile_names() {
             if prefix.is_empty() || name.to_lowercase().starts_with(&prefix) {
                 profiles.insert(name.to_string());

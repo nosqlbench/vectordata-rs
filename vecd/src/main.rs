@@ -34,7 +34,7 @@ fn main() {
         println!("vecd {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    if args.first().is_none() || args.iter().any(|a| a == "--help" || a == "-h") {
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         // Render help for the deepest subcommand named on the line (group →
         // leaf), falling back to the top-level overview.
         print!("{}", vcli::render_help_for(&spec, &args));

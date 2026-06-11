@@ -238,7 +238,7 @@ fn find_top_k_batch_transposed_f32(
             sub_offsets.push(offset);
             offset = sub_end;
         }
-        if sub_batches.len() % 2 != 0 {
+        if !sub_batches.len().is_multiple_of(2) {
             let empty: &[&[f32]] = &[];
             sub_batches.push(TransposedBatch::from_f32(empty, dim));
             sub_offsets.push(batch_size); // past end — count=0, no results consumed
@@ -258,7 +258,7 @@ fn find_top_k_batch_transposed_f32(
     // saturating the prefetch queue (max ~10 outstanding on Skylake+).
     const PREFETCH_AHEAD: usize = 4;
     let base_bytes = dim * std::mem::size_of::<f32>();
-    let cache_lines = (base_bytes + 63) / 64;
+    let cache_lines = base_bytes.div_ceil(64);
 
     let mut i = start;
     while i < end {
@@ -457,17 +457,17 @@ fn compute_partition(
     // also be DotProduct (neg-dot, no norm division).
     let batched_fn = simd_distance::select_batched_fn_f32(metric);
     let base_count = end - start;
-    let stride = (base_count + STRIDES_PER_THREAD - 1) / STRIDES_PER_THREAD;
+    let stride = base_count.div_ceil(STRIDES_PER_THREAD);
     let base_progress = Arc::new(AtomicU64::new(0));
     let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
 
     if threads > 1 && query_count > 1 {
         let effective_threads = std::cmp::min(threads, query_count);
-        let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+        let chunk_size = query_count.div_ceil(effective_threads);
         let num_batches: u64 = (0..effective_threads)
             .map(|t| {
                 let clen = std::cmp::min(chunk_size, query_count.saturating_sub(t * chunk_size));
-                ((clen + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64
+                clen.div_ceil(QUERY_BATCH_SIZE) as u64
             })
             .sum();
         let total_base_scans = num_batches * (base_count as u64);
@@ -522,7 +522,7 @@ fn compute_partition(
             });
         });
     } else {
-        let num_batches = ((query_count + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64;
+        let num_batches = query_count.div_ceil(QUERY_BATCH_SIZE) as u64;
         let mut offset = 0;
         while offset < query_count {
             let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, query_count);
@@ -711,7 +711,7 @@ fn find_top_k_batch_transposed_f16(
     // but the per-base latency-hiding window is identical.
     const PREFETCH_AHEAD: usize = 4;
     let base_bytes_f16 = dim * std::mem::size_of::<half::f16>();
-    let cache_lines_f16 = (base_bytes_f16 + 63) / 64;
+    let cache_lines_f16 = base_bytes_f16.div_ceil(64);
 
     let mut i = start;
     while i < end {
@@ -838,17 +838,17 @@ fn compute_partition_f16(
     // also be DotProduct (neg-dot, no norm division).
     let batched_fn = simd_distance::select_batched_fn_f32(metric);
     let base_count = end - start;
-    let stride = (base_count + STRIDES_PER_THREAD - 1) / STRIDES_PER_THREAD;
+    let stride = base_count.div_ceil(STRIDES_PER_THREAD);
     let base_progress = Arc::new(AtomicU64::new(0));
     let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
 
     if threads > 1 && query_count > 1 {
         let effective_threads = std::cmp::min(threads, query_count);
-        let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+        let chunk_size = query_count.div_ceil(effective_threads);
         let num_batches: u64 = (0..effective_threads)
             .map(|t| {
                 let clen = std::cmp::min(chunk_size, query_count.saturating_sub(t * chunk_size));
-                ((clen + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64
+                clen.div_ceil(QUERY_BATCH_SIZE) as u64
             })
             .sum();
         let total_base_scans = num_batches * (base_count as u64);
@@ -900,7 +900,7 @@ fn compute_partition_f16(
             });
         });
     } else {
-        let num_batches = ((query_count + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64;
+        let num_batches = query_count.div_ceil(QUERY_BATCH_SIZE) as u64;
         let mut offset = 0;
         while offset < query_count {
             let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, query_count);
@@ -939,7 +939,7 @@ fn compute_partition_f64(
     pb: &ProgressHandle,
 ) -> Vec<Vec<Neighbor>> {
     let base_count = end - start;
-    let stride = (base_count + STRIDES_PER_THREAD - 1) / STRIDES_PER_THREAD;
+    let stride = base_count.div_ceil(STRIDES_PER_THREAD);
     let base_progress = Arc::new(AtomicU64::new(0));
     let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
 
@@ -947,11 +947,11 @@ fn compute_partition_f64(
         // Cap threads so each gets at least QUERY_BATCH_SIZE queries.
         // More threads = more redundant base-vector memory reads.
         let effective_threads = std::cmp::min(threads, query_count);
-        let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+        let chunk_size = query_count.div_ceil(effective_threads);
         let num_batches: u64 = (0..effective_threads)
             .map(|t| {
                 let clen = std::cmp::min(chunk_size, query_count.saturating_sub(t * chunk_size));
-                ((clen + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64
+                clen.div_ceil(QUERY_BATCH_SIZE) as u64
             })
             .sum();
         let total_base_scans = num_batches * (base_count as u64);
@@ -1003,7 +1003,7 @@ fn compute_partition_f64(
             });
         });
     } else {
-        let num_batches = ((query_count + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64;
+        let num_batches = query_count.div_ceil(QUERY_BATCH_SIZE) as u64;
         let mut offset = 0;
         while offset < query_count {
             let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, query_count);
@@ -1102,6 +1102,7 @@ fn write_partition_cache(
 ///   neighbor have the same distance (boundary tie)
 /// - `total_tied_neighbors`: total count of extra neighbors beyond k that
 ///   share the boundary distance across all queries
+///
 /// Result of merging partitions, including tie diagnostics.
 struct MergeResult {
     tie_count: usize,
@@ -1462,7 +1463,7 @@ compare an ANN index's approximate results against this exact ground truth.
         };
 
         let metric_str = options.get("metric").unwrap_or("L2");
-        let metric = match Metric::from_str(metric_str) {
+        let metric = match Metric::parse(metric_str) {
             Some(m) => m,
             None => {
                 return error_result(
@@ -1549,16 +1550,14 @@ compare an ANN index's approximate results against this exact ground truth.
 
         // Create output directories
         for path in std::iter::once(&indices_path).chain(distances_path.iter()) {
-            if let Some(parent) = path.parent() {
-                if !parent.exists() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
+            if let Some(parent) = path.parent()
+                && !parent.exists()
+                    && let Err(e) = std::fs::create_dir_all(parent) {
                         return error_result(
                             format!("failed to create directory: {}", e),
                             start,
                         );
                     }
-                }
-            }
         }
 
         // Window comes from inline notation (`base=file.fvec[0,1M)`) OR
@@ -1614,7 +1613,9 @@ compare an ANN index's approximate results against this exact ground truth.
                     start,
                 )
             }
-            ElementType::F32 | _ => {
+            // F32 — and any element type without a specialized arm —
+            // takes the generic f32 kernel.
+            _ => {
                 let dist_fn = simd_distance::select_distance_fn(kernel_metric);
                 // Margin is opt-in: default 0 ⇒ original heap sizes
                 // and pruning aggressiveness, no slowdown.
@@ -1906,8 +1907,8 @@ fn execute_f32(
             Metric::DotProduct => Some(super::knn_segment::Metric::DotProduct),
             Metric::L1 => None,
         };
-        if let Some(m) = canonical_metric {
-            if let Err(e) = super::knn_segment::rerank_output_post_pass(
+        if let Some(m) = canonical_metric
+            && let Err(e) = super::knn_segment::rerank_output_post_pass(
                 indices_path, distances_path,
                 &base_reader, &query_reader,
                 m, k, base_offset,
@@ -1915,7 +1916,6 @@ fn execute_f32(
             ) {
                 ctx.ui.log(&format!("  rerank post-pass skipped: {}", e));
             }
-        }
     }
     result
 }
@@ -2136,6 +2136,14 @@ fn execute_f64(
 /// Query vectors are accessed via mmap random access on demand — no bulk
 /// loading. Each base-vector partition's results are cached independently,
 /// then merged into the final output.
+/// Per-element-type KNN kernel invoked once per base partition:
+/// `(query_reader, query_count, base_reader, base_offset, base_count,
+/// dim, dist_fn, metric, k, threads, progress) -> per-query neighbors`.
+type PartitionComputeFn<T> = fn(
+    &XvecReader<T>, usize, &Arc<XvecReader<T>>, usize, usize, usize,
+    fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressHandle,
+) -> Vec<Vec<Neighbor>>;
+
 #[allow(clippy::too_many_arguments)]
 fn execute_with_partitions<T>(
     query_reader: &XvecReader<T>,
@@ -2158,7 +2166,7 @@ fn execute_with_partitions<T>(
     elem_label: &str,
     ctx: &mut StreamContext,
     start: Instant,
-    compute_fn: fn(&XvecReader<T>, usize, &Arc<XvecReader<T>>, usize, usize, usize, fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressHandle) -> Vec<Vec<Neighbor>>,
+    compute_fn: PartitionComputeFn<T>,
 ) -> CommandResult
 where
     T: Send + Sync + 'static,
@@ -2268,17 +2276,16 @@ where
         partition_size
     };
 
-    if !ctx.cache.exists() {
-        if let Err(e) = std::fs::create_dir_all(&ctx.cache) {
+    if !ctx.cache.exists()
+        && let Err(e) = std::fs::create_dir_all(&ctx.cache) {
             return error_result(
                 format!("failed to create cache directory: {}", e),
                 start,
             );
         }
-    }
 
     // Phase 1: Plan partitions and validate cache
-    let estimated_partitions = (base_count + partition_size - 1) / partition_size;
+    let estimated_partitions = base_count.div_ceil(partition_size);
     ctx.ui.log(&format!(
         "  planning ~{} partitions (partition_size={})...",
         estimated_partitions, format_count(partition_size)
@@ -2349,9 +2356,9 @@ where
                 let after_prefix = &name_str[prefix_pat.len()..];
                 let range_end = after_prefix.find('.').unwrap_or(after_prefix.len());
                 let range_str = &after_prefix[..range_end];
-                if let Some((s_str, e_str)) = range_str.split_once('_') {
-                    if let (Ok(s), Ok(e)) = (s_str.parse::<usize>(), e_str.parse::<usize>()) {
-                        if e > s && check_cache_pair(s, e) {
+                if let Some((s_str, e_str)) = range_str.split_once('_')
+                    && let (Ok(s), Ok(e)) = (s_str.parse::<usize>(), e_str.parse::<usize>())
+                        && e > s && check_cache_pair(s, e) {
                             segments.push(CachedSegment {
                                 start: s,
                                 end: e,
@@ -2359,8 +2366,6 @@ where
                                 distances_path: build_cache_path(&ctx.cache, &cache_prefix, s, e, k, metric, "distances", "fvec"),
                             });
                         }
-                    }
-                }
             }
         }
 
@@ -2370,8 +2375,8 @@ where
         // contains neighbor_indices.ivecs with the right size, it covers
         // [0, profile_base_count) and can be reused as a cached segment.
         let profiles_dir = ctx.workspace.join("profiles");
-        if profiles_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
+        if profiles_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&profiles_dir) {
                 for entry in entries.flatten() {
                     if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         continue;
@@ -2407,7 +2412,6 @@ where
                     }
                 }
             }
-        }
 
         // Sort by start, then by size descending (prefer larger segments)
         segments.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
@@ -2466,8 +2470,8 @@ where
             // Find chain entries this segment spans
             let first = partitions.iter().position(|p| p.start == seg.start);
             let last = partitions.iter().position(|p| p.end == seg.end);
-            if let (Some(fi), Some(li)) = (first, last) {
-                if li > fi {
+            if let (Some(fi), Some(li)) = (first, last)
+                && li > fi {
                     let replaced_count = li - fi + 1;
                     ctx.ui.log(&format!(
                         "  consolidate: [{}, {}) replaces {} partitions with 1 cached segment",
@@ -2485,7 +2489,6 @@ where
                     consolidation_rounds += 1;
                     break;
                 }
-            }
         }
         if !did_consolidate { break; }
     }
@@ -2567,7 +2570,7 @@ where
         None
     };
 
-    for (_ui_idx, &pi) in uncached_indices.iter().enumerate() {
+    for &pi in uncached_indices.iter() {
         let part = &partitions[pi];
 
         // Governor checkpoint at partition boundary
@@ -2609,7 +2612,7 @@ where
         let part_base_count = (part.end - part.start) as u64;
         let pb = ctx.ui.bar_with_unit(
             part_base_count,
-            &format!("KNN {:?} (kernel {:?}) {}x{} {} base x {} queries [{},{})",
+            format!("KNN {:?} (kernel {:?}) {}x{} {} base x {} queries [{},{})",
                 display_metric, metric, dim, elem_label,
                 format_count(part_size), format_count(query_count),
                 format_count(part.start), format_count(part.end)),
@@ -2839,11 +2842,10 @@ where
             if !full_neighbors.exists() {
                 let _ = std::fs::copy(indices_path, &full_neighbors);
             }
-            if let Some(dp) = distances_path {
-                if !full_distances.exists() {
+            if let Some(dp) = distances_path
+                && !full_distances.exists() {
                     let _ = std::fs::copy(dp, &full_distances);
                 }
-            }
             cache_sp.finish();
             ctx.ui.log(&format!(
                 "  cached result [{}, {}) for reuse by larger profiles",
@@ -3007,15 +3009,15 @@ fn make_query_progress_bar(total: u64, ui: &veks_core::ui::UiHandle) -> Progress
 
 /// Format a count with thousands separators.
 fn format_count(n: usize) -> String {
-    if n >= 1_000_000_000 && n % 1_000_000_000 == 0 {
+    if n >= 1_000_000_000 && n.is_multiple_of(1_000_000_000) {
         format!("{}B", n / 1_000_000_000)
     } else if n >= 1_000_000_000 {
         format!("{:.1}B", n as f64 / 1_000_000_000.0)
-    } else if n >= 1_000_000 && n % 1_000_000 == 0 {
+    } else if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
         format!("{}M", n / 1_000_000)
     } else if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 && n % 1_000 == 0 {
+    } else if n >= 1_000 && n.is_multiple_of(1_000) {
         format!("{}K", n / 1_000)
     } else if n >= 10_000 {
         format!("{:.1}K", n as f64 / 1_000.0)
@@ -3060,7 +3062,7 @@ fn join_writer_with_spinner(
     ui: &veks_core::ui::UiHandle,
 ) -> Result<(), String> {
     if !handle.is_finished() {
-        let sp = ui.spinner(&format!("flushing {} cache write...", label));
+        let sp = ui.spinner(format!("flushing {} cache write...", label));
         let result = handle.join();
         sp.finish();
         match result {
@@ -3268,12 +3270,12 @@ mod tests {
 
     #[test]
     fn test_metric_parsing() {
-        assert_eq!(Metric::from_str("L2"), Some(Metric::L2));
-        assert_eq!(Metric::from_str("EUCLIDEAN"), Some(Metric::L2));
-        assert_eq!(Metric::from_str("cosine"), Some(Metric::Cosine));
-        assert_eq!(Metric::from_str("DOT_PRODUCT"), Some(Metric::DotProduct));
-        assert_eq!(Metric::from_str("L1"), Some(Metric::L1));
-        assert_eq!(Metric::from_str("invalid"), None);
+        assert_eq!(Metric::parse("L2"), Some(Metric::L2));
+        assert_eq!(Metric::parse("EUCLIDEAN"), Some(Metric::L2));
+        assert_eq!(Metric::parse("cosine"), Some(Metric::Cosine));
+        assert_eq!(Metric::parse("DOT_PRODUCT"), Some(Metric::DotProduct));
+        assert_eq!(Metric::parse("L1"), Some(Metric::L1));
+        assert_eq!(Metric::parse("invalid"), None);
     }
 
     #[test]

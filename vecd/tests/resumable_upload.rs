@@ -300,7 +300,7 @@ fn finalize_honors_if_none_match_star() {
         .unwrap();
     assert_eq!(resp.status(), 201);
     let upload = server.url(resp.headers().get("location").unwrap().to_str().unwrap().trim_start_matches('/'));
-    let done = patch(&client, &upload, 0, &vec![2u8; 50], &token);
+    let done = patch(&client, &upload, 0, &[2u8; 50], &token);
     assert_eq!(done.status(), 412, "If-None-Match:* must reject an overwrite at finalize");
 
     // The original bytes are untouched.
@@ -333,6 +333,6 @@ fn oversized_chunk_is_rejected() {
 
     let upload = create_upload(&client, &server, "datasets/glove/big.bin", 100, &token);
     // A chunk that would write past the declared Upload-Length is a 400.
-    let r = patch(&client, &upload, 50, &vec![7u8; 100], &token);
+    let r = patch(&client, &upload, 50, &[7u8; 100], &token);
     assert_eq!(r.status(), 400);
 }

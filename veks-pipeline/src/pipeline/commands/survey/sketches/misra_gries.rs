@@ -183,7 +183,7 @@ mod tests {
         }
         assert_eq!(mg.seen(), 12);
         assert!(mg.distinct_tracked() <= 4, "must respect capacity");
-        for (_, count) in mg.counters() {
+        for count in mg.counters().values() {
             assert!(*count <= 1, "estimated count never exceeds true count");
         }
     }

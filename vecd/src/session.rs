@@ -251,8 +251,8 @@ pub fn find_version(db: &Db, ns: &str, selector: &str) -> Result<Option<VersionR
         return Ok(Some(v));
     }
     // `v<seq>` numeric form.
-    if let Some(seq) = selector.strip_prefix('v').and_then(|s| s.parse::<i64>().ok()) {
-        if let Some(v) = db
+    if let Some(seq) = selector.strip_prefix('v').and_then(|s| s.parse::<i64>().ok())
+        && let Some(v) = db
             .conn()
             .query_row(
                 &format!("SELECT {VERSION_COLS} FROM versions WHERE namespace_path=?1 AND seq=?2"),
@@ -263,7 +263,6 @@ pub fn find_version(db: &Db, ns: &str, selector: &str) -> Result<Option<VersionR
         {
             return Ok(Some(v));
         }
-    }
     // manifest-hash prefix.
     Ok(db
         .conn()

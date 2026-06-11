@@ -180,13 +180,11 @@ facets of the dataset.
         let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&fvec_reader) as u32;
 
         // Create output directory
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(format!("failed to create directory: {}", e), start);
                 }
-            }
-        }
 
         let normalize = options.get("normalize").map(|s| s == "true").unwrap_or(false);
         if normalize {
@@ -359,6 +357,7 @@ facets of the dataset.
 ///   index-file entries to use.
 /// - **Range-based**: omit `index-file`; `range` selects a contiguous range
 ///   of ivec records directly.
+///
 /// Internal delegate for `transform extract` when source is `.ivec`.
 pub(super) struct GenerateIvecExtractOp;
 
@@ -465,13 +464,11 @@ ordinal.
         let dim = <XvecReader<i32> as VectorReader<i32>>::dim(&ivec_reader) as u32;
 
         // Create output directory
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(format!("failed to create directory: {}", e), start);
                 }
-            }
-        }
 
         use std::io::Write;
         let file = match safe_create_file(&output_path) {
@@ -549,7 +546,7 @@ ordinal.
                     writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
                 }
                 count += 1;
-                if count % 10_000 == 0 { pb.set_position(count); }
+                if count.is_multiple_of(10_000) { pb.set_position(count); }
             }
             pb.finish();
 
@@ -608,7 +605,7 @@ ordinal.
                     writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
                 }
                 count += 1;
-                if count % 10_000 == 0 { pb.set_position(count); }
+                if count.is_multiple_of(10_000) { pb.set_position(count); }
             }
             pb.finish();
 
@@ -694,6 +691,7 @@ ordinal.
 ///   a vector from the mvec source. `range` selects which ivec entries to use.
 /// - **Range-based**: omit `ivec-file`; `range` selects a contiguous range of
 ///   mvec records directly.
+///
 /// Internal delegate for `transform extract` when source is `.mvec`.
 pub(super) struct GenerateMvecExtractOp;
 
@@ -828,13 +826,11 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
         ));
 
         // Create output directory
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(format!("failed to create directory: {}", e), start);
                 }
-            }
-        }
 
         let normalize = options.get("normalize").map(|s| s == "true").unwrap_or(false);
         if normalize {
@@ -944,7 +940,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                     writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
                 }
                 count += 1;
-                if count % 10_000 == 0 { pb.set_position(count); }
+                if count.is_multiple_of(10_000) { pb.set_position(count); }
             }
             pb.finish();
 
@@ -1102,13 +1098,11 @@ impl CommandOp for GenerateSlabExtractOp {
         let slab_count = reader.total_records() as usize;
 
         // Create output directory
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(format!("failed to create directory: {}", e), start);
                 }
-            }
-        }
 
         let page_size: u32 = options
             .get("page-size")
@@ -1195,7 +1189,7 @@ impl CommandOp for GenerateSlabExtractOp {
                     return error_result(format!("write error at record {}: {}", count, e), start);
                 }
                 count += 1;
-                if count % 10_000 == 0 { pb.set_position(count); }
+                if count.is_multiple_of(10_000) { pb.set_position(count); }
             }
             pb.finish();
 
@@ -1352,11 +1346,10 @@ fn parse_range(s: &str) -> Result<Range, String> {
         start = start.checked_add(1).ok_or("start overflow")?;
     }
     // Inclusive end ']' → include the boundary element
-    if right_inclusive {
-        if let Some(e) = end {
+    if right_inclusive
+        && let Some(e) = end {
             end = Some(e.checked_add(1).ok_or("end overflow")?);
         }
-    }
 
     Ok(Range { start, end })
 }
@@ -1413,6 +1406,25 @@ fn half_system_ram() -> u64 {
 /// chunk. Equivalent in cost to `slice.fill(0)` but produces visible
 /// throughput in the TUI for hundred-GiB buffers that would otherwise
 /// block silently for tens of seconds.
+/// Allocate a `total`-byte zeroed buffer in chunked `resize` steps so
+/// a progress bar can tick during the memset. `vec![0u8; N]` blocks
+/// silently for tens of seconds at tens-of-GiB sizes; growing with
+/// `resize` keeps every byte initialized before it becomes visible
+/// (no `set_len` over reserved-but-uninitialized capacity), at the
+/// same memset speed per chunk.
+fn grow_zeroed_in_chunks(total: usize, ctx: &mut StreamContext, label: &str) -> Vec<u8> {
+    const CHUNK: usize = 256 * 1024 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(total);
+    let pb = ctx.ui.bar_with_unit(total as u64, label, "B");
+    while buf.len() < total {
+        let next = (buf.len() + CHUNK).min(total);
+        buf.resize(next, 0);
+        pb.set_position(buf.len() as u64);
+    }
+    pb.finish();
+    buf
+}
+
 fn zero_in_chunks(slice: &mut [u8], ctx: &mut StreamContext, label: &str) {
     const CHUNK: usize = 256 * 1024 * 1024;
     let total = slice.len();
@@ -1457,9 +1469,9 @@ fn sorted_index_extract_mvec(
     let default_mem = half_system_ram();
     let mem_budget = ctx.governor.offer_demand("mem", 0, default_mem);
     let records_per_partition = (mem_budget as usize / record_bytes).max(1);
-    let raw_partitions = (extract_count + records_per_partition - 1) / records_per_partition;
+    let raw_partitions = extract_count.div_ceil(records_per_partition);
     let num_partitions = raw_partitions.max(2);
-    let partition_size = (extract_count + num_partitions - 1) / num_partitions;
+    let partition_size = extract_count.div_ceil(num_partitions);
 
     ctx.ui.log(&format!(
         "mvec-extract: {} vectors, {} bytes/record, {} passes (budget: {:.1} GiB, {:.0} MB/partition)",
@@ -1513,12 +1525,8 @@ fn sorted_index_extract_mvec(
         "mvec-extract: allocating partition buffer ({:.1} GiB)",
         part_buf_total as f64 / (1024.0 * 1024.0 * 1024.0),
     ));
-    let mut part_buf: Vec<u8> = Vec::with_capacity(part_buf_total);
-    // SAFETY: capacity == part_buf_total; we zero every byte below
-    // before any reader touches the buffer.
-    unsafe { part_buf.set_len(part_buf_total); }
-    zero_in_chunks(
-        &mut part_buf[..part_buf_total],
+    let mut part_buf = grow_zeroed_in_chunks(
+        part_buf_total,
         ctx,
         "allocating partition buffer",
     );
@@ -1545,7 +1553,7 @@ fn sorted_index_extract_mvec(
         let global_start = range_start + part_start;
         let global_end = range_start + part_end;
         let phase_t = Instant::now();
-        let scan_pb = ctx.ui.bar_with_unit(part_len as u64, &format!("scanning indices{}", pass_label(pass)), "vectors");
+        let scan_pb = ctx.ui.bar_with_unit(part_len as u64, format!("scanning indices{}", pass_label(pass)), "vectors");
         read_plan.clear();
         for (local_pos, i) in (global_start..global_end).enumerate() {
             let index_vec = ivec_reader.get(i)
@@ -1570,7 +1578,7 @@ fn sorted_index_extract_mvec(
         let bucket_range = (mvec_count / num_buckets).max(1);
 
         let phase_t = Instant::now();
-        let dist_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)), "vectors");
+        let dist_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)), "vectors");
         let thread_buckets: Vec<Vec<Vec<(usize, usize)>>>;
         {
             use rayon::prelude::*;
@@ -1621,7 +1629,7 @@ fn sorted_index_extract_mvec(
         ));
 
         let phase_t = Instant::now();
-        let sort_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("sorting {} entries by source position{}", read_plan.len(), pass_label(pass)), "vectors");
+        let sort_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, format!("sorting {} entries by source position{}", read_plan.len(), pass_label(pass)), "vectors");
         {
             use rayon::prelude::*;
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -1695,7 +1703,7 @@ fn sorted_index_extract_mvec(
             &format!("zeroing partition buffer{}", pass_label(pass)),
         );
         let phase_t = Instant::now();
-        let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("reading+transposing mvec{}", pass_label(pass)), "vectors");
+        let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, format!("reading+transposing mvec{}", pass_label(pass)), "vectors");
         mvec_reader.advise_sequential();
 
         {
@@ -1720,7 +1728,7 @@ fn sorted_index_extract_mvec(
                     dest[4..].copy_from_slice(src_bytes);
 
                     let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 100_000 == 0 {
+                    if done.is_multiple_of(100_000) {
                         read_pb.set_position(done);
                     }
                     Ok(())
@@ -1778,7 +1786,7 @@ fn sorted_index_extract_mvec(
         let write_mb = total_write_bytes as f64 / (1024.0 * 1024.0);
         // Progress covers writes + sync; reserve 5% of bar for the sync phase
         let sync_reserve = total_write_bytes as u64 / 20;
-        let write_pb = ctx.ui.bar_with_unit(total_write_bytes as u64 + sync_reserve, &format!("writing+syncing {:.0} MB{}", write_mb, pass_label(pass)), "bytes");
+        let write_pb = ctx.ui.bar_with_unit(total_write_bytes as u64 + sync_reserve, format!("writing+syncing {:.0} MB{}", write_mb, pass_label(pass)), "bytes");
         let file_offset = (part_start as u64) * (record_bytes as u64);
         use std::io::Seek;
         out_file.seek(std::io::SeekFrom::Start(file_offset))
@@ -1951,9 +1959,9 @@ fn sorted_index_extract_fvec(
     let mem_budget = governor_offer.min(safe_budget);
 
     let records_per_partition = (mem_budget / record_bytes).max(1);
-    let raw_partitions = (extract_count + records_per_partition - 1) / records_per_partition;
+    let raw_partitions = extract_count.div_ceil(records_per_partition);
     let num_partitions = raw_partitions.max(2);
-    let partition_size = (extract_count + num_partitions - 1) / num_partitions;
+    let partition_size = extract_count.div_ceil(num_partitions);
 
     ctx.ui.log(&format!(
         "fvec-extract: {} vectors, {} bytes/record, {} passes (budget: {:.1} GiB, {:.0} MB/partition)",
@@ -2016,7 +2024,7 @@ fn sorted_index_extract_fvec(
         // Step 1: Scan ivec for this partition's entries only.
         let global_start = range_start + part_start;
         let global_end = range_start + part_end;
-        let scan_pb = ctx.ui.bar_with_unit(part_len as u64, &format!("scanning indices{}", pass_label(pass)), "vectors");
+        let scan_pb = ctx.ui.bar_with_unit(part_len as u64, format!("scanning indices{}", pass_label(pass)), "vectors");
         read_plan.clear();
         for (local_pos, i) in (global_start..global_end).enumerate() {
             let index_vec = ivec_reader.get(i)
@@ -2062,7 +2070,7 @@ fn sorted_index_extract_fvec(
         // buffers into part_buf sequentially (skipping zero-vector gaps).
         let extract_threads = ctx.governor.current_or("threads", ctx.threads as u64)
             .max(1) as usize;
-        let chunk_size = (read_plan.len() + extract_threads - 1) / extract_threads;
+        let chunk_size = read_plan.len().div_ceil(extract_threads);
         let progress = std::sync::atomic::AtomicU64::new(0);
 
         struct ChunkOutput {
@@ -2162,7 +2170,7 @@ fn sorted_index_extract_fvec(
                                 local.zeros.push(source_idx);
                                 let done = progress_counter
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                if done % 100_000 == 0 { extract_pb.set_position(done); }
+                                if done.is_multiple_of(100_000) { extract_pb.set_position(done); }
                                 continue;
                             }
 
@@ -2172,7 +2180,7 @@ fn sorted_index_extract_fvec(
                             local.src_sum_sq += src_epsilon * src_epsilon;
                             if src_epsilon < local.src_min { local.src_min = src_epsilon; }
                             if src_epsilon > local.src_max { local.src_max = src_epsilon; }
-                            if local.src_count % sample_every == 0 {
+                            if local.src_count.is_multiple_of(sample_every) {
                                 local.src_samples.push(src_epsilon);
                             }
                             local.src_count += 1;
@@ -2211,7 +2219,7 @@ fn sorted_index_extract_fvec(
                             local.out_sum_sq += out_epsilon * out_epsilon;
                             if out_epsilon < local.out_min { local.out_min = out_epsilon; }
                             if out_epsilon > local.out_max { local.out_max = out_epsilon; }
-                            if local.out_count % sample_every == 0 {
+                            if local.out_count.is_multiple_of(sample_every) {
                                 local.out_samples.push(out_epsilon);
                             }
                             local.out_count += 1;
@@ -2231,7 +2239,7 @@ fn sorted_index_extract_fvec(
 
                         let done = progress_counter
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        if done % 100_000 == 0 { extract_pb.set_position(done); }
+                        if done.is_multiple_of(100_000) { extract_pb.set_position(done); }
                     }
                     local
                 }).collect()
@@ -2356,7 +2364,7 @@ fn sorted_index_extract_fvec(
                             if norm_sq < zero_threshold_sq {
                                 zeros.push(source_idx);
                                 let done = progress_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                if done % 100_000 == 0 { extract_pb.set_position(done); }
+                                if done.is_multiple_of(100_000) { extract_pb.set_position(done); }
                                 continue;
                             }
 
@@ -2366,7 +2374,7 @@ fn sorted_index_extract_fvec(
                             src_norm_sum_sq += src_epsilon * src_epsilon;
                             if src_epsilon < src_norm_min { src_norm_min = src_epsilon; }
                             if src_epsilon > src_norm_max { src_norm_max = src_epsilon; }
-                            if src_norm_count % sample_every == 0 {
+                            if src_norm_count.is_multiple_of(sample_every) {
                                 src_norm_samples.push(src_epsilon);
                             }
                             src_norm_count += 1;
@@ -2406,7 +2414,7 @@ fn sorted_index_extract_fvec(
                                 out_norm_sum_sq += out_epsilon * out_epsilon;
                                 if out_epsilon < out_norm_min { out_norm_min = out_epsilon; }
                                 if out_epsilon > out_norm_max { out_norm_max = out_epsilon; }
-                                if out_norm_count % sample_every == 0 {
+                                if out_norm_count.is_multiple_of(sample_every) {
                                     out_norm_samples.push(out_epsilon);
                                 }
                                 out_norm_count += 1;
@@ -2426,7 +2434,7 @@ fn sorted_index_extract_fvec(
                         written += 1;
 
                         let done = progress_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        if done % 100_000 == 0 { extract_pb.set_position(done); }
+                        if done.is_multiple_of(100_000) { extract_pb.set_position(done); }
                     }
 
                     ChunkOutput {
@@ -2459,7 +2467,7 @@ fn sorted_index_extract_fvec(
         let write_mb = total_write_bytes as f64 / (1024.0 * 1024.0);
         let write_pb = ctx.ui.bar_with_unit(
             total_write_bytes as u64,
-            &format!("writing {:.0} MB{}", write_mb, pass_label(pass)),
+            format!("writing {:.0} MB{}", write_mb, pass_label(pass)),
             "bytes",
         );
         let file_offset = (total_written as u64) * (record_bytes as u64);
@@ -2769,9 +2777,9 @@ fn sorted_index_extract_slab(
     let default_mem = half_system_ram();
     let mem_budget = ctx.governor.offer_demand("mem", 0, default_mem);
     let records_per_partition = (mem_budget as usize / avg_record_bytes).max(1);
-    let raw_partitions = (extract_count + records_per_partition - 1) / records_per_partition;
+    let raw_partitions = extract_count.div_ceil(records_per_partition);
     let num_partitions = raw_partitions.max(2);
-    let partition_size = (extract_count + num_partitions - 1) / num_partitions;
+    let partition_size = extract_count.div_ceil(num_partitions);
 
     ctx.ui.log(&format!(
         "slab-extract: {} records, ~{} bytes/record avg, {} passes (budget: {:.1} GiB)",
@@ -2876,7 +2884,7 @@ fn sorted_index_extract_slab(
                 let cached_count = cache_reader.total_records() as usize;
                 let replay_pb = ctx.ui.bar_with_unit(
                     cached_count as u64,
-                    &format!("resuming from cache{}", pass_label(pass)),
+                    format!("resuming from cache{}", pass_label(pass)),
                     "records",
                 );
                 for i in 0..cached_count {
@@ -2908,7 +2916,7 @@ fn sorted_index_extract_slab(
         // Step 1: Scan ivec for this partition's entries
         let global_start = range_start + part_start;
         let global_end = range_start + part_end;
-        let scan_pb = ctx.ui.bar(part_len as u64, &format!("scanning indices{}", pass_label(pass)));
+        let scan_pb = ctx.ui.bar(part_len as u64, format!("scanning indices{}", pass_label(pass)));
         read_plan.clear();
         for (local_pos, i) in (global_start..global_end).enumerate() {
             let index_vec = ivec_reader.get(i)
@@ -2926,7 +2934,7 @@ fn sorted_index_extract_slab(
         let num_buckets = 256usize;
         let bucket_range = (slab_count / num_buckets).max(1);
 
-        let dist_pb = ctx.ui.bar(read_plan.len() as u64, &format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)));
+        let dist_pb = ctx.ui.bar(read_plan.len() as u64, format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)));
         let thread_buckets: Vec<Vec<Vec<(usize, usize)>>>;
         {
             use rayon::prelude::*;
@@ -2957,7 +2965,7 @@ fn sorted_index_extract_slab(
             }
         }
 
-        let sort_pb = ctx.ui.bar(read_plan.len() as u64, &format!("sorting {} entries{}", read_plan.len(), pass_label(pass)));
+        let sort_pb = ctx.ui.bar(read_plan.len() as u64, format!("sorting {} entries{}", read_plan.len(), pass_label(pass)));
         {
             use rayon::prelude::*;
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -2971,7 +2979,7 @@ fn sorted_index_extract_slab(
         sort_pb.finish();
 
         let total_entries = buckets.iter().map(|b| b.len()).sum::<usize>();
-        let merge_sp = ctx.ui.spinner(&format!("merging {} entries into read plan{}", total_entries, pass_label(pass)));
+        let merge_sp = ctx.ui.spinner(format!("merging {} entries into read plan{}", total_entries, pass_label(pass)));
         read_plan.clear();
         read_plan.resize(total_entries, (0, 0));
         let mut offsets: Vec<usize> = Vec::with_capacity(num_buckets);
@@ -2996,7 +3004,7 @@ fn sorted_index_extract_slab(
         merge_sp.finish();
 
         // Step 3: Read slab records in source order, collecting (local_pos, data)
-        let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("reading slab records{}", pass_label(pass)), "records");
+        let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, format!("reading slab records{}", pass_label(pass)), "records");
         let mut records: Vec<(usize, Vec<u8>)> = Vec::with_capacity(part_len);
         for (i, &(source_idx, local_pos)) in read_plan.iter().enumerate() {
             let data = reader.get_ref(source_idx as i64)
@@ -3007,11 +3015,11 @@ fn sorted_index_extract_slab(
         read_pb.finish();
 
         // Step 4: Sort by output position and write sequentially
-        let sort_out_sp = ctx.ui.spinner(&format!("sorting by output position{}", pass_label(pass)));
+        let sort_out_sp = ctx.ui.spinner(format!("sorting by output position{}", pass_label(pass)));
         records.sort_unstable_by_key(|(pos, _)| *pos);
         sort_out_sp.finish();
 
-        let write_pb = ctx.ui.bar_with_unit(records.len() as u64, &format!("writing slab records{}", pass_label(pass)), "records");
+        let write_pb = ctx.ui.bar_with_unit(records.len() as u64, format!("writing slab records{}", pass_label(pass)), "records");
         for (i, (_, data)) in records.iter().enumerate() {
             writer.add_record(data)
                 .map_err(|e| format!("write error at record {}: {}", part_start + i, e))?;
@@ -3081,8 +3089,13 @@ impl SharedBuf {
 
     /// Get a mutable slice at the given byte offset.
     ///
-    /// SAFETY: caller must ensure no other thread is writing to the same range.
-    unsafe fn slice_mut(&self, offset: usize, len: usize) -> &mut [u8] {
+    /// SAFETY: caller must ensure no other thread is writing to the
+    /// same range, and that the returned slice does not outlive the
+    /// buffer `SharedBuf::new` borrowed from. The receiver is
+    /// by-value (the handle is `Copy`), so the returned lifetime is
+    /// the caller's assertion — nothing ties it to the handle, which
+    /// is the honest shape for a raw-pointer-derived slice.
+    unsafe fn slice_mut<'a>(self, offset: usize, len: usize) -> &'a mut [u8] {
         unsafe { std::slice::from_raw_parts_mut((self.addr + offset) as *mut u8, len) }
     }
 }

@@ -286,11 +286,10 @@ pub fn run(
         update_ordinal_bounds(start_ord, record_count, &mut min_ordinal, &mut max_ordinal);
 
         if reading_all {
-            if let Some(prev_end) = prev_end_ordinal {
-                if start_ord > prev_end + 1 {
+            if let Some(prev_end) = prev_end_ordinal
+                && start_ord > prev_end + 1 {
                     has_gaps = true;
                 }
-            }
             if record_count > 0 {
                 prev_end_ordinal = Some(end_ord);
             }

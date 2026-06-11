@@ -265,11 +265,10 @@ impl OptionRegistry {
                 occs.iter().map(|(_, d)| d.parse_sig()).collect();
             // Fold in the registered canonical definition so an observed flag
             // that disagrees with the shared definition is flagged too.
-            if let Some(reg) = self.defs.get(&name) {
-                if sigs.insert(reg.parse_sig()) {
+            if let Some(reg) = self.defs.get(&name)
+                && sigs.insert(reg.parse_sig()) {
                     occs.push(("<registered>".to_string(), reg.clone()));
                 }
-            }
             if sigs.len() > 1 {
                 occs.sort_by(|a, b| a.0.cmp(&b.0));
                 mismatches.push(ParseMismatch { name, occurrences: occs });

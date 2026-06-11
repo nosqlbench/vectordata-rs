@@ -248,19 +248,17 @@ fn eval_record_fallback(
 
     for i in 0..pred_len {
         let required = memo.condition_counts[i];
-        if required > 0 && pass_counts[i] == required {
-            if limit == 0 || local_matches[i].len() < limit {
+        if required > 0 && pass_counts[i] == required
+            && (limit == 0 || local_matches[i].len() < limit) {
                 local_matches[i].push(ordinal);
             }
-        }
     }
 
     for (idx, pnode) in compiled_scan.fallback() {
-        if evaluate(pnode, mnode) {
-            if limit == 0 || local_matches[*idx].len() < limit {
+        if evaluate(pnode, mnode)
+            && (limit == 0 || local_matches[*idx].len() < limit) {
                 local_matches[*idx].push(ordinal);
             }
-        }
     }
 }
 
@@ -1421,8 +1419,7 @@ sweep.
                 (matches_per_pred, total_indices, data_bytes)
             };
 
-            if selectivity.is_some() {
-                let sel_min = selectivity.unwrap();
+            if let Some(sel_min) = selectivity {
                 let sel_max = selectivity_max.unwrap_or(sel_min);
                 if (sel_min - sel_max).abs() < f64::EPSILON {
                     ctx.ui.log(&format!("    selectivity:            {:.4}%  (from predicate generation)",
@@ -1609,15 +1606,13 @@ sweep.
                                                         compiled_scan.required_count(i);
                                                     if required != u32::MAX
                                                         && pass_counts[i] == required
-                                                    {
-                                                        if limit == 0
+                                                        && (limit == 0
                                                             || local_matches[i].len()
-                                                                < limit
+                                                                < limit)
                                                         {
                                                             local_matches[i]
                                                                 .push(ordinal);
                                                         }
-                                                    }
                                                 }
 
                                                 if !compiled_scan
@@ -1631,12 +1626,12 @@ sweep.
                                                             {
                                                                 if evaluate(
                                                                     pnode, &mnode,
-                                                                ) {
-                                                                    if limit == 0
+                                                                )
+                                                                    && (limit == 0
                                                                         || local_matches
                                                                             [*idx]
                                                                             .len()
-                                                                            < limit
+                                                                            < limit)
                                                                     {
                                                                         local_matches
                                                                             [*idx]
@@ -1644,7 +1639,6 @@ sweep.
                                                                                 ordinal,
                                                                             );
                                                                     }
-                                                                }
                                                             }
                                                         }
                                                         Err(_) => {
@@ -1678,7 +1672,7 @@ sweep.
                                             }
 
                                             local_rec_count += 1;
-                                            if local_rec_count % 100 == 0 {
+                                            if local_rec_count.is_multiple_of(100) {
                                                 let total = records_done
                                                     .fetch_add(100, Ordering::Relaxed)
                                                     + 100;
@@ -2578,9 +2572,9 @@ mod tests {
 
     /// Binary git-hash bump invalidates caches. When eval
     /// semantics change (e.g. MATCHES going from always-false to
-    /// substring) the binary git_hash changes; the same predicate
-    /// + same source must NOT hit a cached result from the
-    /// previous binary.
+    /// substring) the binary git_hash changes; the same
+    /// predicate + same source must NOT hit a cached result
+    /// from the previous binary.
     #[test]
     fn cache_invalidates_on_binary_version_bump() {
         let tmp = tempfile::tempdir().unwrap();

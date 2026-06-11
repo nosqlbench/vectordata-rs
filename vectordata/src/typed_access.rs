@@ -460,7 +460,7 @@ mod tests {
     fn scalar_u8_native() {
         let tmp = make_tmp();
         let path = tmp.path().join("data.u8");
-        std::fs::write(&path, &[0u8, 42, 127, 255]).unwrap();
+        std::fs::write(&path, [0u8, 42, 127, 255]).unwrap();
         let r = TypedReader::<u8>::open(&path).unwrap();
         assert_eq!(r.count(), 4);
         assert_eq!(r.dim(), 1);
@@ -473,7 +473,7 @@ mod tests {
     fn scalar_u8_as_i32_widening() {
         let tmp = make_tmp();
         let path = tmp.path().join("data.u8");
-        std::fs::write(&path, &[0u8, 42, 255]).unwrap();
+        std::fs::write(&path, [0u8, 42, 255]).unwrap();
         let r = TypedReader::<i32>::open(&path).unwrap();
         assert!(!r.is_native());
         assert_eq!(r.get_value(0).unwrap(), 0i32);
@@ -484,7 +484,7 @@ mod tests {
     fn scalar_u8_as_i8_overflow() {
         let tmp = make_tmp();
         let path = tmp.path().join("data.u8");
-        std::fs::write(&path, &[128u8]).unwrap();
+        std::fs::write(&path, [128u8]).unwrap();
         let r = TypedReader::<i8>::open(&path).unwrap();
         assert!(r.get_value(0).is_err());
     }
@@ -520,7 +520,7 @@ mod tests {
     fn out_of_bounds() {
         let tmp = make_tmp();
         let path = tmp.path().join("data.u8");
-        std::fs::write(&path, &[1u8, 2, 3]).unwrap();
+        std::fs::write(&path, [1u8, 2, 3]).unwrap();
         let r = TypedReader::<u8>::open(&path).unwrap();
         assert!(r.get_value(3).is_err());
     }
@@ -529,7 +529,7 @@ mod tests {
     fn empty_scalar() {
         let tmp = make_tmp();
         let path = tmp.path().join("data.u8");
-        std::fs::write(&path, &[]).unwrap();
+        std::fs::write(&path, []).unwrap();
         let r = TypedReader::<u8>::open(&path).unwrap();
         assert_eq!(r.count(), 0);
     }

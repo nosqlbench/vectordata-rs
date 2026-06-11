@@ -791,11 +791,10 @@ fn validate_profile_template(spec: &str) -> Result<(), VecdError> {
 
 /// Map a UNIQUE-constraint violation to a friendly usage error.
 fn dup(e: rusqlite::Error, msg: String) -> VecdError {
-    if let rusqlite::Error::SqliteFailure(err, _) = &e {
-        if err.code == rusqlite::ErrorCode::ConstraintViolation {
+    if let rusqlite::Error::SqliteFailure(err, _) = &e
+        && err.code == rusqlite::ErrorCode::ConstraintViolation {
             return VecdError::usage(msg);
         }
-    }
     VecdError::Db(e)
 }
 

@@ -266,13 +266,11 @@ recover them this way.
             );
         }
 
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(format!("create output dir: {}", e), start);
                 }
-            }
-        }
 
         // For COSINE+AssumeNormalized, we evaluate cosine as the inner
         // product (vectors are pre-normalized, so dot = cos_sim). The

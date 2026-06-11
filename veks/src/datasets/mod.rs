@@ -461,7 +461,7 @@ pub fn run(args: DatasetsArgs) {
         }
         DatasetsCommand::PruneLegacyCache { dry_run, cache_dir } => {
             let cache_dir = cache_dir
-                .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir_or_exit());
+                .unwrap_or_else(crate::pipeline::commands::config::configured_cache_dir_or_exit);
             if dry_run {
                 println!("Scanning {} for pre-cutover cache directories \
                     (blobs/, http/, <host>[:<port>]/)...",

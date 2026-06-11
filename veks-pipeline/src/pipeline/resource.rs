@@ -305,32 +305,26 @@ fn resolve_block_device(path: &Path) -> Option<String> {
                 continue;
             }
             let dev_path = entry.path().join("dev");
-            if let Some(dev_str) = read_sysfs_string(&dev_path) {
-                if let Some((maj_s, min_s)) = dev_str.split_once(':') {
-                    if let (Ok(maj), Ok(min)) = (maj_s.parse::<u64>(), min_s.parse::<u64>()) {
-                        if maj == target_major && min == target_minor {
+            if let Some(dev_str) = read_sysfs_string(&dev_path)
+                && let Some((maj_s, min_s)) = dev_str.split_once(':')
+                    && let (Ok(maj), Ok(min)) = (maj_s.parse::<u64>(), min_s.parse::<u64>())
+                        && maj == target_major && min == target_minor {
                             return Some(name_str.to_string());
                         }
-                    }
-                }
-            }
             // Check partitions under this block device
             if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
                 for sub in sub_entries.flatten() {
                     let sub_name = sub.file_name();
                     let sub_name_str = sub_name.to_string_lossy();
                     let sub_dev = sub.path().join("dev");
-                    if let Some(dev_str) = read_sysfs_string(&sub_dev) {
-                        if let Some((maj_s, min_s)) = dev_str.split_once(':') {
-                            if let (Ok(maj), Ok(min)) = (maj_s.parse::<u64>(), min_s.parse::<u64>()) {
-                                if maj == target_major && min == target_minor {
+                    if let Some(dev_str) = read_sysfs_string(&sub_dev)
+                        && let Some((maj_s, min_s)) = dev_str.split_once(':')
+                            && let (Ok(maj), Ok(min)) = (maj_s.parse::<u64>(), min_s.parse::<u64>())
+                                && maj == target_major && min == target_minor {
                                     // Return the parent block device, not the partition
                                     let _ = sub_name_str;
                                     return Some(name_str.to_string());
                                 }
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -407,7 +401,7 @@ fn classify_storage(
             StorageType::LocalNvme
         }
         Some(t) if t == "sata" || t == "ata" => StorageType::SataSsd,
-        Some(t) if t == "virtio" => {
+        Some("virtio") => {
             // virtio is typically network-backed (cloud VMs)
             StorageType::NetworkBlock
         }
@@ -681,11 +675,10 @@ fn get_system_ram() -> Option<u64> {
             for line in content.lines() {
                 if let Some(rest) = line.strip_prefix("MemTotal:") {
                     let rest = rest.trim();
-                    if let Some(kb_str) = rest.strip_suffix("kB").or_else(|| rest.strip_suffix("KB")) {
-                        if let Ok(kb) = kb_str.trim().parse::<u64>() {
+                    if let Some(kb_str) = rest.strip_suffix("kB").or_else(|| rest.strip_suffix("KB"))
+                        && let Ok(kb) = kb_str.trim().parse::<u64>() {
                             return Some(kb * 1024);
                         }
-                    }
                 }
             }
         }
@@ -995,12 +988,11 @@ fn read_diskstats_inflight() -> (u64, u64) {
                 let path = entry.path().join("inflight");
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     let parts: Vec<&str> = content.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        if let (Ok(r), Ok(w)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                    if parts.len() >= 2
+                        && let (Ok(r), Ok(w)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
                             total_read += r;
                             total_write += w;
                         }
-                    }
                 }
             }
             return (total_read, total_write);
@@ -1050,11 +1042,10 @@ fn read_diskstats_inflight() -> (u64, u64) {
 fn read_proc_uptime() -> f64 {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(content) = std::fs::read_to_string("/proc/uptime") {
-            if let Some(first) = content.split_whitespace().next() {
+        if let Ok(content) = std::fs::read_to_string("/proc/uptime")
+            && let Some(first) = content.split_whitespace().next() {
                 return first.parse().unwrap_or(0.0);
             }
-        }
         0.0
     }
     #[cfg(not(target_os = "linux"))]
@@ -1240,15 +1231,11 @@ fn apply_scale_up(
 }
 
 /// Conservative strategy: starts at floor, only increases after sustained stability.
+#[derive(Default)]
 pub struct ConservativeStrategy {
     stable_count: u32,
 }
 
-impl Default for ConservativeStrategy {
-    fn default() -> Self {
-        Self { stable_count: 0 }
-    }
-}
 
 impl GovernorStrategy for ConservativeStrategy {
     fn name(&self) -> &str {
@@ -1385,11 +1372,10 @@ impl GovernorLog {
     }
 
     fn write_entry(&mut self, entry: &GovernorLogEntry) {
-        if let Some(ref mut file) = self.file {
-            if let Ok(json) = serde_json::to_string(entry) {
+        if let Some(ref mut file) = self.file
+            && let Ok(json) = serde_json::to_string(entry) {
                 let _ = writeln!(file, "{}", json);
             }
-        }
     }
 }
 
@@ -1453,19 +1439,19 @@ impl ResourceGovernor {
     ///      hosts (e.g. an EBS-backed dataset volume's cache).
     ///   3. **Burst allocations during merge / sort phases** that
     ///      briefly spike beyond the steady-state working set.
+    ///
     /// Users who need more can opt in with `--mem 80%` or similar;
     /// the safer default here errs on the side of avoiding the
     /// "RSS over ceiling — aborting to prevent system lockup" path.
     pub fn new(mut budget: ResourceBudget, workspace: Option<&Path>) -> Self {
         // Backfill defaults for unspecified resources
-        if !budget.resources.contains_key("mem") {
-            if let Some(ram) = get_system_ram() {
+        if !budget.resources.contains_key("mem")
+            && let Some(ram) = get_system_ram() {
                 budget.resources.insert(
                     "mem".to_string(),
                     ResourceValue::Fixed((ram as f64 * 0.65) as u64),
                 );
             }
-        }
         if !budget.resources.contains_key("threads") {
             let cpus = std::thread::available_parallelism()
                 .map(|n| n.get() as u64)
@@ -1901,7 +1887,7 @@ impl ResourceGovernor {
                             current: *current,
                             desired: *desired,
                             granted,
-                            reason: format!("demand granted; system not throttled"),
+                            reason: "demand granted; system not throttled".to_string(),
                         });
                     }
                 }
@@ -2010,10 +1996,10 @@ impl ResourceStatusSource {
         let snapshot = SystemSnapshot::sample();
         let effective = self.effective.read().unwrap();
         let mut parts: Vec<String> = Vec::new();
-        let mut metrics = ResourceMetrics::default();
-
-        // RSS
-        metrics.rss_bytes = snapshot.rss_bytes;
+        let mut metrics = ResourceMetrics {
+            rss_bytes: snapshot.rss_bytes,
+            ..Default::default()
+        };
         if let Some(mem_budget) = self.budget.get("mem") {
             let ceiling = mem_budget.ceiling();
             metrics.rss_ceiling_bytes = ceiling;

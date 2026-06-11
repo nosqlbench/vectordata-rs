@@ -313,7 +313,7 @@ impl<T: VvecElement> XvecReader<T> {
         }
         let dim = dim_i32 as usize;
         let entry_size = 4 + dim * T::ELEM_SIZE;
-        if total_size % entry_size as u64 != 0 {
+        if !total_size.is_multiple_of(entry_size as u64) {
             return Err(IoError::VariableLengthRecords(format!(
                 "file size {total_size} is not a multiple of stride {entry_size} (dim={dim}). \
                  Use IndexedVvecReader for variable-length files.",
@@ -401,7 +401,7 @@ impl<T: VvecElement> VectorReader<T> for XvecReader<T> {
         // aligned — so we conservatively bail out on 8-byte types.
         if T::ELEM_SIZE > 4 { return None; }
         let ptr = bytes.as_ptr() as *const T;
-        if (ptr as usize) % core::mem::align_of::<T>() != 0 { return None; }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) { return None; }
         Some(unsafe { core::slice::from_raw_parts(ptr, self.dim) })
     }
 

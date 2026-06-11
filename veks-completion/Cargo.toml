@@ -12,3 +12,6 @@ categories = ["command-line-utilities"]
 [dev-dependencies]
 tempfile = "3.8"
 veks-completion-derive = { path = "../veks-completion-derive" }
+
+[lints]
+workspace = true

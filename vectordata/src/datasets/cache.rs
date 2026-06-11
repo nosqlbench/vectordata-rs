@@ -8,7 +8,7 @@ use std::path::Path;
 pub fn run(cache_dir: Option<&Path>, verbose: bool) {
     let cache_dir = cache_dir
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| configured_cache_dir_or_exit());
+        .unwrap_or_else(configured_cache_dir_or_exit);
 
     if !cache_dir.exists() {
         println!("Cache directory does not exist: {}", rel_display(&cache_dir));
@@ -61,8 +61,8 @@ pub fn run(cache_dir: Option<&Path>, verbose: bool) {
                 format_size(total_size)
             );
 
-            if verbose {
-                if let Ok(files) = std::fs::read_dir(ds_dir) {
+            if verbose
+                && let Ok(files) = std::fs::read_dir(ds_dir) {
                     for f in files.flatten() {
                         let fp = f.path();
                         // Skip the natural-layout origin sidecar in
@@ -80,7 +80,6 @@ pub fn run(cache_dir: Option<&Path>, verbose: bool) {
                         }
                     }
                 }
-            }
         }
     }
 
@@ -258,7 +257,7 @@ pub fn run_cache_status(
                 for (_facet, view) in &profile.views {
                     let source = &view.source.path;
                     if source.is_empty() { continue; }
-                    let clean = if let Some(b) = source.find(|c: char| c == '[' || c == '(') {
+                    let clean = if let Some(b) = source.find(['[', '(']) {
                         &source[..b]
                     } else { source.as_str() };
                     let mrkl = ds_cache.join(format!("{}.mrkl", clean));
@@ -370,8 +369,8 @@ fn scan_mrkl_status(
         let path = entry.path();
         if path.is_dir() {
             scan_mrkl_status(base, &path, rows);
-        } else if path.extension().is_some_and(|e| e == "mrkl") {
-            if let Ok(state) = MerkleState::load(&path) {
+        } else if path.extension().is_some_and(|e| e == "mrkl")
+            && let Ok(state) = MerkleState::load(&path) {
                 let valid = state.valid_count();
                 let total = state.shape().total_chunks;
                 let content_size = state.shape().total_content_size;
@@ -384,7 +383,6 @@ fn scan_mrkl_status(
                     .unwrap_or_else(|_| path.to_string_lossy().to_string());
                 rows.push((rel, valid, total, cached_bytes, content_size, complete, rle));
             }
-        }
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 }
@@ -552,26 +550,6 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_size_values() {
-        assert_eq!(format_size(512), "512 B");
-        assert_eq!(format_size(1536), "1.5 KB");
-        assert_eq!(format_size(1048576), "1.0 MB");
-    }
-
-    #[test]
-    fn scan_empty_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (count, size) = scan_directory(tmp.path());
-        assert_eq!(count, 0);
-        assert_eq!(size, 0);
-    }
-}
-
 /// CLI-style wrapper around [`crate::settings::cache_dir`]:
 /// prints the configuration error to stderr and exits with code 2
 /// when `cache_dir:` is unset. Mirrors the helper that used to
@@ -599,5 +577,25 @@ fn rel_display(path: &std::path::Path) -> String {
             .unwrap_or_else(|_| path.to_string_lossy().to_string())
     } else {
         path.to_string_lossy().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_size_values() {
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1536), "1.5 KB");
+        assert_eq!(format_size(1048576), "1.0 MB");
+    }
+
+    #[test]
+    fn scan_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (count, size) = scan_directory(tmp.path());
+        assert_eq!(count, 0);
+        assert_eq!(size, 0);
     }
 }

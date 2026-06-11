@@ -389,8 +389,8 @@ fn find_publish_url(dir: &Path) -> Option<String> {
     let mut current = dir.to_path_buf();
     loop {
         let candidate = current.join(PUBLISH_URL_FILE);
-        if candidate.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&candidate) {
+        if candidate.is_file()
+            && let Ok(content) = std::fs::read_to_string(&candidate) {
                 let url = content.lines()
                     .map(|l| l.trim())
                     .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -399,7 +399,6 @@ fn find_publish_url(dir: &Path) -> Option<String> {
                     return Some(url);
                 }
             }
-        }
         if !current.pop() {
             return None;
         }

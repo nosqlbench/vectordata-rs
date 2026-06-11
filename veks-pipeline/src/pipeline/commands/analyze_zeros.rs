@@ -169,7 +169,7 @@ impl CommandOp for AnalyzeZerosOp {
                     Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
                 };
                 let fc = VectorReader::<f64>::count(&r);
-                (fc, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                (fc, Box::new(move |i| r.get(i).unwrap_or_default().to_vec()))
             }
         };
 
@@ -198,7 +198,7 @@ impl CommandOp for AnalyzeZerosOp {
                         let norm_sq: f64 = components.iter().map(|&v| v * v).sum();
                         let is_near_zero = norm_sq < threshold_sq;
                         let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done % 100_000 == 0 {
+                        if done.is_multiple_of(100_000) {
                             pb_ref.set_position(done);
                         }
                         if is_near_zero { Some(i) } else { None }
@@ -213,7 +213,7 @@ impl CommandOp for AnalyzeZerosOp {
                         let norm_sq: f64 = components.iter().map(|&v| v * v).sum();
                         let is_near_zero = norm_sq < threshold_sq;
                         let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done % 100_000 == 0 {
+                        if done.is_multiple_of(100_000) {
                             pb_ref.set_position(done);
                         }
                         if is_near_zero { 1usize } else { 0usize }
@@ -362,11 +362,10 @@ fn finish_result(
 
 /// Ensure the parent directory of a path exists.
 fn ensure_parent(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
+    if let Some(parent) = path.parent()
+        && !parent.exists() {
             let _ = std::fs::create_dir_all(parent);
         }
-    }
 }
 
 fn resolve_path(s: &str, workspace: &Path) -> PathBuf {

@@ -134,7 +134,7 @@ struct DedupResult {
 /// Run compute sort on a single file using a temp directory, collect results.
 fn run_dedup(source_path: &Path, ctx: &mut StreamContext) -> Result<DedupResult, String> {
     let file_start = Instant::now();
-    let spinner = ctx.ui.spinner(&format!("dedup: {}", source_path.file_name().unwrap_or_default().to_string_lossy()));
+    let spinner = ctx.ui.spinner(format!("dedup: {}", source_path.file_name().unwrap_or_default().to_string_lossy()));
 
     // Create a temp directory for all artifacts
     let tmp = tempfile::tempdir()

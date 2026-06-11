@@ -676,7 +676,7 @@ fn kv(key: &str, value: &str, key_style: Style, val_style: Style) -> Line<'stati
 /// stripped paths to detect when a profile is a window into the
 /// dataset's default base data rather than its own download.
 fn strip_window_suffix(source_path: &str) -> &str {
-    if let Some(bracket) = source_path.find(|c: char| c == '[' || c == '(') {
+    if let Some(bracket) = source_path.find(['[', '(']) {
         &source_path[..bracket]
     } else {
         source_path
@@ -1204,9 +1204,9 @@ fn format_count(n: u64) -> String {
     ];
     for (threshold, iec, iec_label, si, si_label) in tiers {
         if n >= threshold {
-            if n % iec == 0 {
+            if n.is_multiple_of(iec) {
                 return format!("{}{}", n / iec, iec_label);
-            } else if n % si == 0 {
+            } else if n.is_multiple_of(si) {
                 return format!("{}{}", n / si, si_label);
             } else {
                 return format!("{:.1}{}", n as f64 / si as f64, si_label);
@@ -1841,10 +1841,10 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
             // list area, anchored to the bottom of the screen and
             // covering roughly the lower 60% horizontally centred,
             // so the filter line and footer stay visible.
-            if show_details {
-                if let Some(row) = visible.get(cursor) {
+            if show_details
+                && let Some(row) = visible.get(cursor) {
                     let outer = frame.area();
-                    let popup_h = outer.height.saturating_sub(6).max(6).min(20);
+                    let popup_h = outer.height.saturating_sub(6).clamp(6, 20);
                     let popup_w = outer.width.saturating_sub(8).max(40);
                     let popup_x = (outer.width.saturating_sub(popup_w)) / 2;
                     let popup_y = outer.height.saturating_sub(popup_h + 1);
@@ -1868,7 +1868,6 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                         area,
                     );
                 }
-            }
 
             // Descriptor overlay (Describe action). Larger than the
             // Ctrl-D details popup so the full facet list, windows,
@@ -2033,8 +2032,8 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
         }
 
         // Events
-        if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
-            if let Ok(Event::Key(key)) = event::read() {
+        if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false)
+            && let Ok(Event::Key(key)) = event::read() {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     result = PickerOutcome::Done;
                     break;
@@ -2102,7 +2101,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                             disambig_open = false;
                         }
                         KeyCode::Up => {
-                            if disambig_cursor > 0 { disambig_cursor -= 1; }
+                            disambig_cursor = disambig_cursor.saturating_sub(1);
                         }
                         KeyCode::Down => {
                             if disambig_cursor + 1 < 3 { disambig_cursor += 1; }
@@ -2143,7 +2142,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     match key.code {
                         KeyCode::Esc => { menu_open = false; }
                         KeyCode::Up => {
-                            if menu_cursor > 0 { menu_cursor -= 1; }
+                            menu_cursor = menu_cursor.saturating_sub(1);
                         }
                         KeyCode::Down => {
                             let menu_len = if menu_is_batch {
@@ -2367,8 +2366,8 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
                             .filter(|r| matches_filter(r, &filter))
                             .collect();
-                        if let Some(row) = vis.get(cursor) {
-                            if expanded.remove(&row.dataset) {
+                        if let Some(row) = vis.get(cursor)
+                            && expanded.remove(&row.dataset) {
                                 // Move cursor to the default row of this dataset
                                 let new_vis: Vec<&PickerRow> = all_rows.iter()
                                     .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
@@ -2376,7 +2375,6 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                     .collect();
                                 cursor = new_vis.iter().position(|r| r.dataset == row.dataset).unwrap_or(0);
                             }
-                        }
                     }
                     KeyCode::Right => {
                         // Expand: same as Enter for collapsed datasets
@@ -2384,11 +2382,10 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
                             .filter(|r| matches_filter(r, &filter))
                             .collect();
-                        if let Some(row) = vis.get(cursor) {
-                            if !expanded.contains(&row.dataset) {
+                        if let Some(row) = vis.get(cursor)
+                            && !expanded.contains(&row.dataset) {
                                 expanded.insert(row.dataset.clone());
                             }
-                        }
                     }
                     KeyCode::Up => {
                         // Shift+↑ enters range mode (or extends it):
@@ -2489,7 +2486,6 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     _ => {}
                 }
             }
-        }
     }
 
     let _ = disable_raw_mode();

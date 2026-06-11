@@ -454,7 +454,7 @@ fn verify_f32(
 
     if threads > 1 && sample_count > 1 {
         let effective_threads = std::cmp::min(threads, sample_count);
-        let chunk_size = (sample_count + effective_threads - 1) / effective_threads;
+        let chunk_size = sample_count.div_ceil(effective_threads);
 
         let result_chunks: Vec<&mut [Vec<Neighbor>]> =
             recomputed.chunks_mut(chunk_size).collect();
@@ -568,7 +568,7 @@ fn verify_f16(
 
     if threads > 1 && sample_count > 1 {
         let effective_threads = std::cmp::min(threads, sample_count);
-        let chunk_size = (sample_count + effective_threads - 1) / effective_threads;
+        let chunk_size = sample_count.div_ceil(effective_threads);
 
         let result_chunks: Vec<&mut [Vec<Neighbor>]> =
             recomputed.chunks_mut(chunk_size).collect();
@@ -677,7 +677,7 @@ fn verify_f64(
 
     if threads > 1 && sample_count > 1 {
         let effective_threads = std::cmp::min(threads, sample_count);
-        let chunk_size = (sample_count + effective_threads - 1) / effective_threads;
+        let chunk_size = sample_count.div_ceil(effective_threads);
 
         let result_chunks: Vec<&mut [Vec<Neighbor>]> =
             recomputed.chunks_mut(chunk_size).collect();
@@ -944,7 +944,7 @@ impl CommandOp for VerifyKnnOp {
         // -- Parse optional options -------------------------------------------
 
         let metric_str = options.get("metric").unwrap_or("L2");
-        let metric = match Metric::from_str(metric_str) {
+        let metric = match Metric::parse(metric_str) {
             Some(m) => m,
             None => {
                 return error_result(
@@ -1007,16 +1007,14 @@ impl CommandOp for VerifyKnnOp {
         let output_path = resolve_path(&output_str, &ctx.workspace);
 
         // Create output directory if needed
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = output_path.parent()
+            && !parent.exists()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     return error_result(
                         format!("failed to create output directory: {}", e),
                         start,
                     );
                 }
-            }
-        }
 
         // -- Open indices reader (type-independent) ---------------------------
 

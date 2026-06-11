@@ -2770,7 +2770,7 @@ fn fuzz_corrupt_file_no_panic() {
     // Create files with garbage data (wrong format, truncated headers)
     std::fs::write(ws.join("corrupt.fvecs"), b"\x04\x00\x00\x00\x01").unwrap(); // dim=4 but only 1 data byte
     std::fs::write(ws.join("corrupt.ivecs"), b"\xff\xff\xff\xff").unwrap(); // dim=-1
-    std::fs::write(ws.join("corrupt.u8"), &[42, 43, 44]).unwrap(); // valid u8 but tiny
+    std::fs::write(ws.join("corrupt.u8"), [42, 43, 44]).unwrap(); // valid u8 but tiny
     std::fs::write(ws.join("corrupt.slab"), b"NOT_A_SLAB").unwrap(); // invalid slab header
 
     let corrupt_files = ["corrupt.fvecs", "corrupt.ivecs", "corrupt.u8", "corrupt.slab"];
@@ -2859,7 +2859,7 @@ fn run_engine(
     opts.set("base", base_path.to_string_lossy().to_string());
     opts.set("query", query_path.to_string_lossy().to_string());
     opts.set("indices", indices_path.to_string_lossy().to_string());
-    opts.set("neighbors", &k.to_string());
+    opts.set("neighbors", k.to_string());
     opts.set("metric", metric);
     // COSINE metric requires an explicit cosine-mode flag. Parity
     // test inputs are random (not unit-normalized), so metal and

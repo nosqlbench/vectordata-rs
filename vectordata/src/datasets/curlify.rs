@@ -140,12 +140,30 @@ fn extract_view_path(entry: &serde_yaml::Value) -> Option<String> {
         let s = s.split('(').next().unwrap_or(s);
         Some(s.to_string())
     } else if let Some(m) = entry.as_mapping() {
-        m.get(&serde_yaml::Value::String("source".to_string()))
-            .or_else(|| m.get(&serde_yaml::Value::String("path".to_string())))
+        m.get(serde_yaml::Value::String("source".to_string()))
+            .or_else(|| m.get(serde_yaml::Value::String("path".to_string())))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     } else {
         None
+    }
+}
+
+/// Display a path relative to the current working directory.
+/// Falls back to the full path if stripping fails. Inlined here
+/// instead of imported because the canonical home for this
+/// helper lives in the veks `check` module — a vectordata-side
+/// import would create a circular dep.
+fn rel_display(path: &std::path::Path) -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        path.strip_prefix(&cwd)
+            .map(|r| {
+                let s = r.to_string_lossy().to_string();
+                if s.is_empty() { ".".to_string() } else { s }
+            })
+            .unwrap_or_else(|_| path.to_string_lossy().to_string())
+    } else {
+        path.to_string_lossy().to_string()
     }
 }
 
@@ -173,23 +191,5 @@ profiles:
         assert!(script.contains("curl"));
         assert!(script.contains("base.fvec"));
         assert!(script.contains("query.fvec"));
-    }
-}
-
-/// Display a path relative to the current working directory.
-/// Falls back to the full path if stripping fails. Inlined here
-/// instead of imported because the canonical home for this
-/// helper lives in the veks `check` module — a vectordata-side
-/// import would create a circular dep.
-fn rel_display(path: &std::path::Path) -> String {
-    if let Ok(cwd) = std::env::current_dir() {
-        path.strip_prefix(&cwd)
-            .map(|r| {
-                let s = r.to_string_lossy().to_string();
-                if s.is_empty() { ".".to_string() } else { s }
-            })
-            .unwrap_or_else(|_| path.to_string_lossy().to_string())
-    } else {
-        path.to_string_lossy().to_string()
     }
 }

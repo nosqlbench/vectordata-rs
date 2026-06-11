@@ -106,7 +106,7 @@ impl RatatuiSink {
                     eprintln!("ratatui render error: {}", e);
                 }
             })
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         Ok(RatatuiSink {
             tx,
@@ -605,8 +605,8 @@ fn render_loop(
 
     loop {
         // Poll for keyboard events (Ctrl-C, Ctrl-Z, Esc×2) without blocking.
-        if ct_event::poll(poll_timeout)? {
-            if let CtEvent::Key(key) = ct_event::read()? {
+        if ct_event::poll(poll_timeout)?
+            && let CtEvent::Key(key) = ct_event::read()? {
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
                         KeyCode::Char('c') => {
@@ -642,8 +642,8 @@ fn render_loop(
                     } else {
                         // Double-Escape within 1 second: terminate like Ctrl-C.
                         let now = Instant::now();
-                        if let Some(prev) = last_escape {
-                            if now.duration_since(prev) < Duration::from_millis(250) {
+                        if let Some(prev) = last_escape
+                            && now.duration_since(prev) < Duration::from_millis(250) {
                                 restore_terminal(&mut terminal);
                                 #[cfg(unix)]
                                 unsafe {
@@ -651,7 +651,6 @@ fn render_loop(
                                 }
                                 std::process::exit(130);
                             }
-                        }
                         last_escape = Some(now);
                     }
                 } else if key.code == KeyCode::Char('?') {
@@ -687,7 +686,6 @@ fn render_loop(
                     state.dirty = true;
                 }
             }
-        }
 
         // Drain all queued render messages without blocking.
         let mut pending_logs: Vec<String> = Vec::new();
@@ -696,11 +694,10 @@ fn render_loop(
 
         while let Ok(msg) = rx.try_recv() {
             // Buffer log messages for post-TUI console output
-            if let RenderMsg::Event(UiEvent::Log { ref message }) = msg {
-                if let Ok(mut buf) = console_log.lock() {
+            if let RenderMsg::Event(UiEvent::Log { ref message }) = msg
+                && let Ok(mut buf) = console_log.lock() {
                     buf.push(message.clone());
                 }
-            }
             if matches!(msg, RenderMsg::Shutdown) {
                 // Flush any pending output before shutdown.
                 flush_logs(&mut terminal, &pending_logs)?;
@@ -733,8 +730,8 @@ fn render_loop(
                 .map(|b| b.unit.clone());
             let mut total_delta: u64 = 0;
             for id in &state.bar_order {
-                if let Some(bar) = state.bars.get(id) {
-                    if bar.kind == ProgressKind::Bar {
+                if let Some(bar) = state.bars.get(id)
+                    && bar.kind == ProgressKind::Bar {
                         let prev = state.prev_positions.get(id).copied().unwrap_or(0);
                         let delta = bar.position.saturating_sub(prev);
                         state.prev_positions.insert(*id, bar.position);
@@ -742,7 +739,6 @@ fn render_loop(
                             total_delta += delta;
                         }
                     }
-                }
             }
             let rps = total_delta as f64 / rps_dt;
             state.rps_history.push(rps);
@@ -998,7 +994,7 @@ fn colorize_log<'a>(s: &'a str) -> Line<'a> {
         let rest = &s[dash_pos + " — ".len()..];
 
         let (status_word, after_status) = rest
-            .find(|c: char| c == ' ' || c == ':' || c == '(')
+            .find([' ', ':', '('])
             .map(|i| (&rest[..i], &rest[i..]))
             .unwrap_or((rest, ""));
 
@@ -1053,7 +1049,7 @@ fn flush_logs(
     let lines: Vec<Line> = logs.iter().map(|s| colorize_log(s)).collect();
     terminal.insert_before(lines.len() as u16, |buf| {
         let area = buf.area;
-        let text: Vec<Line> = lines.iter().cloned().collect();
+        let text: Vec<Line> = lines.to_vec();
         let paragraph = Paragraph::new(text);
         paragraph.render(area, buf);
     })?;
@@ -1921,8 +1917,6 @@ fn format_rate(rps: f64, unit: &str) -> String {
             return format!("{:.1} KB/s", rps / 1024.0);
         } else if rps >= 1.0 {
             return format!("{:.0} B/s", rps);
-        } else if rps > 0.0 {
-            return String::new();
         } else {
             return String::new();
         }
@@ -1949,8 +1943,8 @@ fn format_rate(rps: f64, unit: &str) -> String {
             // queries → query, entries → entry
             singular_owned = format!("{}y", &unit[..unit.len() - 3]);
             &singular_owned
-        } else if unit.ends_with('s') {
-            &unit[..unit.len() - 1]
+        } else if let Some(stripped) = unit.strip_suffix('s') {
+            stripped
         } else {
             unit
         };
@@ -1998,15 +1992,15 @@ fn format_bytes(bytes: u64) -> String {
 /// Format a count with thousands separators.
 fn format_count(n: u64) -> String {
     let n = n as usize;
-    if n >= 1_000_000_000 && n % 1_000_000_000 == 0 {
+    if n >= 1_000_000_000 && n.is_multiple_of(1_000_000_000) {
         format!("{}B", n / 1_000_000_000)
     } else if n >= 1_000_000_000 {
         format!("{:.1}B", n as f64 / 1_000_000_000.0)
-    } else if n >= 1_000_000 && n % 1_000_000 == 0 {
+    } else if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
         format!("{}M", n / 1_000_000)
     } else if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 && n % 1_000 == 0 {
+    } else if n >= 1_000 && n.is_multiple_of(1_000) {
         format!("{}K", n / 1_000)
     } else if n >= 10_000 {
         format!("{:.1}K", n as f64 / 1_000.0)
@@ -2529,7 +2523,7 @@ mod tests {
         (0..buf.area.width)
             .any(|x| {
                 let ch = buf.cell((x, row)).unwrap().symbol();
-                ch != " " && ch != ""
+                ch != " " && !ch.is_empty()
             })
     }
 

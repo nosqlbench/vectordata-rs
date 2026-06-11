@@ -197,16 +197,15 @@ pub fn check_xvec_alignment(path: &Path) -> ArtifactState {
     // be in .cache/ (1 level), profiles/name/ (2 levels), or deeper.
     let var_name = format!("verified_count:{}",
         path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
-    if let Some(workspace) = find_workspace_with_variables(path) {
-        if let Ok(vars) = crate::pipeline::variables::load(&workspace) {
-            if let Some(expected_str) = vars.get(&var_name) {
-                if let Ok(expected) = expected_str.parse::<u64>() {
+    if let Some(workspace) = find_workspace_with_variables(path)
+        && let Ok(vars) = crate::pipeline::variables::load(&workspace) {
+            if let Some(expected_str) = vars.get(&var_name)
+                && let Ok(expected) = expected_str.parse::<u64>() {
                     if actual_records != expected {
                         return ArtifactState::Partial;
                     }
                     return ArtifactState::Complete;
                 }
-            }
             // variables.yaml exists but has no entry for this file.
             // The command either didn't write one (older code) or was
             // interrupted after creating the file but before writing
@@ -214,7 +213,6 @@ pub fn check_xvec_alignment(path: &Path) -> ArtifactState {
             // record-boundary truncations.
             return ArtifactState::Partial;
         }
-    }
 
     // No variables.yaml found at all (e.g., after --restart, or first
     // run). Fall back to record-alignment check only — a record-aligned

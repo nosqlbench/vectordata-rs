@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn test_comparand_display() {
         assert_eq!(format!("{}", Comparand::Int(42)), "42");
-        assert_eq!(format!("{}", Comparand::Float(3.14)), "3.14");
+        assert_eq!(format!("{}", Comparand::Float(3.25)), "3.25");
         assert_eq!(format!("{}", Comparand::Text("hello".into())), "'hello'");
         assert_eq!(format!("{}", Comparand::Bool(true)), "true");
         assert_eq!(format!("{}", Comparand::Bytes(vec![0xCA, 0xFE])), "X'cafe'");

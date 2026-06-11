@@ -633,11 +633,10 @@ fn spec_to_node(
         // First-positional completion: a resolver registered under this command's
         // full path (e.g. "backends remove"), applied only when the command
         // actually takes a positional.
-        if !spec.positionals.is_empty() {
-            if let Some(p) = resolvers.get(path).cloned() {
+        if !spec.positionals.is_empty()
+            && let Some(p) = resolvers.get(path).cloned() {
                 node = node.with_positional_provider(p);
             }
-        }
         node.with_stability(spec.stability)
     } else {
         let mut node = crate::Node::empty_group();
@@ -870,10 +869,14 @@ mod derive_tests {
         },
     }
 
+    // Derive-macro fixtures: the fields exist to shape the generated
+    // completion spec (field name → flag name); nothing reads their
+    // values at runtime.
     #[derive(VeksCli)]
     #[command(stability = "preview")]
     struct PreviewArgs {
         #[arg(long)]
+        #[allow(dead_code)]
         x: bool,
     }
 
@@ -882,11 +885,13 @@ mod derive_tests {
         /// Stable by default (no attribute).
         Steady {
             #[arg(long)]
+            #[allow(dead_code)]
             a: bool,
         },
         #[command(stability = "experimental")]
         Risky {
             #[arg(long)]
+            #[allow(dead_code)]
             b: bool,
         },
     }

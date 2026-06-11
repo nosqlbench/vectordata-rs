@@ -69,13 +69,11 @@ struct FieldAttrs {
 fn collect_docs(attrs: &[Attribute]) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     for a in attrs {
-        if a.path().is_ident("doc") {
-            if let Meta::NameValue(nv) = &a.meta {
-                if let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = &nv.value {
+        if a.path().is_ident("doc")
+            && let Meta::NameValue(nv) = &a.meta
+                && let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = &nv.value {
                     lines.push(s.value().trim().to_string());
                 }
-            }
-        }
     }
     if lines.is_empty() {
         None
@@ -92,21 +90,19 @@ fn collect_aliases(attrs: &[Attribute]) -> Vec<String> {
         if a.path().is_ident("command") {
             let _ = a.parse_nested_meta(|meta| {
                 if meta.path.is_ident("alias") {
-                    if let Ok(v) = meta.value() {
-                        if let Ok(s) = v.parse::<syn::LitStr>() {
+                    if let Ok(v) = meta.value()
+                        && let Ok(s) = v.parse::<syn::LitStr>() {
                             out.push(s.value());
                         }
-                    }
                 } else if meta.path.is_ident("aliases") {
-                    if let Ok(v) = meta.value() {
-                        if let Ok(arr) = v.parse::<syn::ExprArray>() {
+                    if let Ok(v) = meta.value()
+                        && let Ok(arr) = v.parse::<syn::ExprArray>() {
                             for elem in arr.elems {
                                 if let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = elem {
                                     out.push(s.value());
                                 }
                             }
                         }
-                    }
                 } else {
                     let _ = meta.value().and_then(|v| v.parse::<Expr>());
                 }
@@ -148,11 +144,10 @@ fn parse_field_attrs(field: &Field) -> syn::Result<FieldAttrs> {
                 } else if meta.path.is_ident("default_value_t") {
                     // A computed default expression (e.g. a function call). Kept
                     // verbatim and used as the fallback in `veks_from_parsed`.
-                    if let Ok(v) = meta.value() {
-                        if let Ok(e) = v.parse::<Expr>() {
+                    if let Ok(v) = meta.value()
+                        && let Ok(e) = v.parse::<Expr>() {
                             fa.default_expr = Some(quote! { #e });
                         }
-                    }
                 } else if meta.path.is_ident("value_parser") {
                     // `value_parser = ["a", "b", …]` declares a closed set of
                     // valid values → capture the literals for a completion
@@ -199,11 +194,10 @@ fn command_str_attr(attrs: &[Attribute], key: &str) -> Option<String> {
             let mut out = None;
             let _ = attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident(key) {
-                    if let Ok(v) = meta.value() {
-                        if let Ok(s) = v.parse::<syn::LitStr>() {
+                    if let Ok(v) = meta.value()
+                        && let Ok(s) = v.parse::<syn::LitStr>() {
                             out = Some(s.value());
                         }
-                    }
                 } else {
                     let _ = meta.value().and_then(|v| v.parse::<Expr>());
                 }
@@ -234,11 +228,10 @@ fn type_about(di: &DeriveInput) -> Option<String> {
             let mut about = None;
             let _ = attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("about") {
-                    if let Ok(v) = meta.value() {
-                        if let Ok(s) = v.parse::<syn::LitStr>() {
+                    if let Ok(v) = meta.value()
+                        && let Ok(s) = v.parse::<syn::LitStr>() {
                             about = Some(s.value());
                         }
-                    }
                 } else {
                     // Tolerate clap-only type-level keys (disable_help_subcommand,
                     // arg_required_else_help, …) — consume any `= value`.
@@ -262,11 +255,10 @@ fn after_help_from_attrs(attrs: &[Attribute]) -> Option<String> {
             let mut out = None;
             let _ = attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("after_long_help") || meta.path.is_ident("after_help") {
-                    if let Ok(v) = meta.value() {
-                        if let Ok(s) = v.parse::<syn::LitStr>() {
+                    if let Ok(v) = meta.value()
+                        && let Ok(s) = v.parse::<syn::LitStr>() {
                             out = Some(s.value());
                         }
-                    }
                 } else {
                     let _ = meta.value().and_then(|v| v.parse::<Expr>());
                 }
@@ -310,13 +302,11 @@ fn type_is_bool(ty: &Type) -> bool {
 fn generic_inner<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type> {
     if let Type::Path(p) = ty {
         let seg = p.path.segments.last()?;
-        if seg.ident == wrapper {
-            if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+        if seg.ident == wrapper
+            && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+                && let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
                     return Some(inner);
                 }
-            }
-        }
     }
     None
 }
