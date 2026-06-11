@@ -570,12 +570,23 @@ mod tests {
     fn xdg_cache_home_resolution() {
         let home = Path::new("/home/u");
         assert_eq!(xdg_cache_home_from(None, home), PathBuf::from("/home/u/.cache"));
+        // "Absolute" is platform-defined: a Unix-style path has no
+        // drive letter, so on Windows it is NOT absolute and must be
+        // ignored like any other relative value.
+        #[cfg(unix)]
+        let abs = "/fast/cache";
+        #[cfg(windows)]
+        let abs = r"C:\fast\cache";
         assert_eq!(
-            xdg_cache_home_from(Some("/fast/cache".into()), home),
-            PathBuf::from("/fast/cache"));
+            xdg_cache_home_from(Some(abs.into()), home),
+            PathBuf::from(abs));
         // Relative XDG_CACHE_HOME must be ignored per the XDG spec.
         assert_eq!(
             xdg_cache_home_from(Some("relative".into()), home),
+            PathBuf::from("/home/u/.cache"));
+        #[cfg(windows)]
+        assert_eq!(
+            xdg_cache_home_from(Some("/unix/style/not/absolute/here".into()), home),
             PathBuf::from("/home/u/.cache"));
     }
 
