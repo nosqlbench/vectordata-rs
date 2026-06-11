@@ -281,7 +281,15 @@ fn load_from_explicit_catalog_file(location: &str, entries: &mut Vec<CatalogEntr
             // jvector's per-entry resolution against the entry's
             // cache directory, with `_defaults.base_url` overriding).
             match parse_knn_entries_yaml(&content, &parent) {
-                Ok(parsed) => {
+                Ok(mut parsed) => {
+                    // The parser only sees the parent directory; the
+                    // resolver knows which document these entries came
+                    // from. Without this, "show me the catalog source"
+                    // surfaces a fabricated `<base_url>/knn_entries.yaml`
+                    // that may name the wrong host AND the wrong file.
+                    for e in &mut parsed {
+                        e.catalog_file = Some(location.to_string());
+                    }
                     entries.extend(parsed);
                     true
                 }
@@ -412,7 +420,10 @@ fn try_load_knn_entries(location: &str, entries: &mut Vec<CatalogEntry>) -> bool
     };
 
     match parse_knn_entries_yaml(&content, location) {
-        Ok(parsed) => {
+        Ok(mut parsed) => {
+            for e in &mut parsed {
+                e.catalog_file = Some(url.clone());
+            }
             entries.extend(parsed);
             true
         }
@@ -475,6 +486,7 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
             path: full_path,
             dataset_type,
             layout,
+            catalog_file: None,
         })
     } else {
         // Direct entry — attributes and profiles at top level (e.g. HDF5 datasets)
@@ -514,6 +526,7 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
                 attributes,
                 profiles,
             },
+            catalog_file: None,
         })
     }
 }
@@ -655,6 +668,7 @@ mod tests {
             name: name.to_string(),
             path: format!("{}/dataset.yaml", name),
             dataset_type: "dataset.yaml".to_string(),
+            catalog_file: None,
             layout: CatalogLayout {
                 attributes: None,
                 profiles: crate::dataset::DSProfileGroup::from_profiles(profile_group),

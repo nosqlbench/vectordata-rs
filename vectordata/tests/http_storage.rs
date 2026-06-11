@@ -233,6 +233,35 @@ fn fvec_no_mref_falls_back_to_direct_http() {
     }
 }
 
+/// A server that ignores `Range` (no `Accept-Ranges`, whole body on
+/// every GET) must still serve reads — via the documented
+/// FullTransfer semantic: the first read streams the entire file
+/// into the local cache once, and everything after that is local.
+/// Before this path existed, such servers produced hard
+/// "expected N bytes, got M" read errors.
+#[test]
+fn no_range_server_full_transfers_on_first_read() {
+    let tmp = make_tmp();
+    write_fvec(&tmp.path().join("base.fvec"), 300, 16);
+    let server = TestServer::start_no_range(tmp.path()).unwrap();
+    init_test_cache();
+    let url = format!("{}base.fvec", server.base_url());
+
+    let reader = XvecReader::<f32>::open(&url).unwrap();
+    assert_eq!(reader.count(), 300);
+    assert_eq!(reader.dim(), 16);
+    // The dim-header probe at open already forced the full transfer
+    // (chunk 0 was needed; the server can't serve chunks).
+    assert!(reader.is_complete(),
+        "no-range source must be fully resident after the first read");
+
+    // Bytes must match a normal ranged open of the same fixture.
+    let local = XvecReader::<f32>::open_path(&tmp.path().join("base.fvec")).unwrap();
+    for i in [0usize, 1, 150, 299] {
+        assert_eq!(local.get(i).unwrap(), reader.get(i).unwrap(), "record {i}");
+    }
+}
+
 #[test]
 fn open_vec_dispatches_through_http() {
     // No .mref — test contract is purely value equality between
@@ -348,6 +377,34 @@ fn vvec_cached_falls_back_to_walk_without_idxfor() {
     assert_eq!(remote.count(), 12);
     let r5 = <IndexedVvecReader<i32> as VvecReader<i32>>::get(&remote, 5).unwrap();
     assert_eq!(r5.len(), 1);
+    assert_eq!(r5[0], 500);
+
+    // The walk persists the rebuilt index next to the local cache
+    // file so reopening doesn't re-pay the whole-file walk. Find the
+    // sidecar by name anywhere under the test cache root (the cache
+    // layout is the storage layer's business, not this test's).
+    fn find_named(root: &Path, prefix: &str) -> Option<std::path::PathBuf> {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).ok()?.flatten() {
+                let p = e.path();
+                if p.is_dir() { stack.push(p); }
+                else if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(prefix)) {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+    let idx = find_named(TEST_CACHE_DIR.path(), "IDXFOR__predicates.ivvec");
+    assert!(idx.is_some(),
+        "walk must persist the rebuilt offset index next to the cache file");
+
+    // Reopen: must load the persisted index (and still read correctly).
+    drop(remote);
+    let reopened = IndexedVvecReader::<i32>::open(&url).unwrap();
+    assert_eq!(reopened.count(), 12);
+    let r5 = <IndexedVvecReader<i32> as VvecReader<i32>>::get(&reopened, 5).unwrap();
     assert_eq!(r5[0], 500);
 }
 

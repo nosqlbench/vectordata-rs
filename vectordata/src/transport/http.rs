@@ -137,6 +137,25 @@ impl HttpTransport {
         }
         Ok(())
     }
+
+    /// Stream the entire resource body — one plain GET, no `Range`
+    /// header — into `out`. Returns the byte count written.
+    ///
+    /// This is the FullTransfer path for servers that don't support
+    /// byte ranges: chunked access is impossible, so the documented
+    /// fallback downloads the whole file once into the local cache
+    /// and serves every read from there.
+    pub(crate) fn fetch_full_to(&self, out: &mut dyn io::Write) -> io::Result<u64> {
+        self.ensure_probed()?;
+        let target = self.effective_url().clone();
+        let client = super::shared_client_for(target.as_str());
+        let mut resp = super::apply_read_auth(client.get(target.clone()), Some(&target))
+            .send()
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?
+            .error_for_status()
+            .map_err(io::Error::other)?;
+        std::io::copy(&mut resp, out)
+    }
 }
 
 /// Read `Content-Length` and `Accept-Ranges` from a successful

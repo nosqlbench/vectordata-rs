@@ -435,7 +435,11 @@ impl Storage {
         let mref_url_str = format!("{}.mref", url.as_str());
         let mref_url = Url::parse(&mref_url_str)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid mref URL: {e}")))?;
-        let resp = client.get(mref_url).send()
+        // Same read-side auth as every data fetch — without it, a
+        // token-protected server 401s the `.mref` probe and every
+        // open silently falls back to the unverified chunked-HTTP
+        // path even though a merkle reference is published.
+        let resp = crate::transport::apply_read_auth(client.get(mref_url.clone()), Some(&mref_url)).send()
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("mref fetch: {e}")))?
             .error_for_status()
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("no .mref for {url}: {e}")))?;

@@ -75,7 +75,9 @@ pub fn run(cache_dir: Option<&Path>, verbose: bool) {
                             let fname =
                                 fp.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                             let fsize =
-                                std::fs::metadata(&fp).map(|m| m.len()).unwrap_or(0);
+                                std::fs::metadata(&fp)
+                                    .map(|m| crate::cache::reader::allocated_size(&m))
+                                    .unwrap_or(0);
                             println!("  {:<28} {:>12}", fname, format_size(fsize));
                         }
                     }
@@ -454,7 +456,7 @@ fn collect_files_recursive(base: &Path, dir: &Path, files: &mut Vec<(String, u64
             let rel = path.strip_prefix(base)
                 .map(|r| r.to_string_lossy().to_string())
                 .unwrap_or_else(|_| path.to_string_lossy().to_string());
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let size = std::fs::metadata(&path).map(|m| crate::cache::reader::allocated_size(&m)).unwrap_or(0);
             files.push((rel, size));
         }
     }
@@ -468,7 +470,7 @@ fn scan_directory_recursive(dir: &Path) -> (usize, u64) {
             let path = entry.path();
             if path.is_file() {
                 count += 1;
-                size += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                size += std::fs::metadata(&path).map(|m| crate::cache::reader::allocated_size(&m)).unwrap_or(0);
             } else if path.is_dir() {
                 let (c, s) = scan_directory_recursive(&path);
                 count += c;
@@ -516,7 +518,7 @@ fn print_tree_recursive(dir: &Path, prefix: &str, is_root: bool) {
                 prefix, connector, name, fc, format_size(sz));
             print_tree_recursive(&path, &child_prefix, false);
         } else {
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let size = std::fs::metadata(&path).map(|m| crate::cache::reader::allocated_size(&m)).unwrap_or(0);
             println!("{}{}{}  {}", prefix, connector, name, format_size(size));
         }
     }
@@ -530,7 +532,7 @@ fn scan_directory(dir: &Path) -> (usize, u64) {
             if entry.path().is_file() {
                 count += 1;
                 size += std::fs::metadata(entry.path())
-                    .map(|m| m.len())
+                    .map(|m| crate::cache::reader::allocated_size(&m))
                     .unwrap_or(0);
             }
         }

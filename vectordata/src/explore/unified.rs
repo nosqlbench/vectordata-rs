@@ -326,7 +326,7 @@ pub(super) fn run_interactive_explore(
     if total == 0 || dim == 0 {
         eprintln!("error: no vector data found in '{}' (count={}, dim={})", source, total, dim);
         eprintln!("  This may mean the profile doesn't have base_vectors, or the data isn't cached yet.");
-        eprintln!("  Try: veks datasets precache --dataset {} --profile {}",
+        eprintln!("  Try: vectordata datasets precache {}:{}",
             source.split(':').next().unwrap_or(source),
             source.split(':').nth(1).unwrap_or("default"));
         // Brief pause so user can read the message before TUI takes over

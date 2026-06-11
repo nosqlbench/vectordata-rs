@@ -65,7 +65,7 @@ pub(crate) fn download_concurrency() -> usize {
 ///
 /// The public surface is identical on both platforms so the rest
 /// of the cache code is cfg-agnostic.
-struct CacheFile {
+pub(crate) struct CacheFile {
     #[cfg(unix)]
     file: File,
     #[cfg(not(unix))]
@@ -73,13 +73,13 @@ struct CacheFile {
 }
 
 impl CacheFile {
-    fn new(file: File) -> Self {
+    pub(crate) fn new(file: File) -> Self {
         #[cfg(unix)]      { CacheFile { file } }
         #[cfg(not(unix))] { CacheFile { file: Mutex::new(file) } }
     }
 
     /// Read exactly `buf.len()` bytes from `offset`.
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    pub(crate) fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         #[cfg(unix)] {
             use std::os::unix::fs::FileExt;
             self.file.read_exact_at(buf, offset)
@@ -93,7 +93,7 @@ impl CacheFile {
     }
 
     /// Write exactly `buf.len()` bytes at `offset`.
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+    pub(crate) fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
         #[cfg(unix)] {
             use std::os::unix::fs::FileExt;
             self.file.write_all_at(buf, offset)
@@ -104,6 +104,12 @@ impl CacheFile {
             f.seek(SeekFrom::Start(offset))?;
             f.write_all(buf)
         }
+    }
+
+    /// Flush data bytes (not metadata) to disk — `fdatasync` semantics.
+    pub(crate) fn sync_data(&self) -> io::Result<()> {
+        #[cfg(unix)]      { self.file.sync_data() }
+        #[cfg(not(unix))] { self.file.lock().unwrap().sync_data() }
     }
 }
 

@@ -38,7 +38,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -65,6 +65,11 @@ pub(crate) struct ChunkStore {
     chunk_size: u64,
     total_chunks: u32,
     cache_path: PathBuf,
+    /// Persistent handle to the sparse cache file. Reads are
+    /// positional (`pread` on Unix) so the hot read path doesn't
+    /// re-open the file per call; chunk writes go through the same
+    /// handle followed by an explicit `sync_data`.
+    cache_file: crate::cache::CacheFile,
     /// Sidecar bitmap path (`<cache_path>.chunks`). Persists
     /// validity across process runs.
     chunks_path: PathBuf,
@@ -89,6 +94,11 @@ pub(crate) struct ChunkStore {
     /// `.mref` [`crate::cache::CachedChannel`] path. A flaky connection on
     /// one chunk of a concurrent prebuffer must not fail the whole download.
     retry_policy: crate::transport::RetryPolicy,
+    /// Serializes the whole-file FullTransfer download used when the
+    /// server doesn't support byte ranges: the first chunk request
+    /// streams the entire body; concurrent requesters block here and
+    /// then observe every chunk valid.
+    full_transfer: Mutex<()>,
 }
 
 impl ChunkStore {
@@ -129,17 +139,17 @@ impl ChunkStore {
         let file_existed = cache_path.exists();
         let file_size_matches = file_existed
             && std::fs::metadata(&cache_path).map(|m| m.len() == total_size).unwrap_or(false);
-        let mut reset_bitmap = false;
-        if !file_existed || !file_size_matches {
-            let f = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .read(true)
-                .truncate(false)
-                .open(&cache_path)?;
+        let reset_bitmap = !file_existed || !file_size_matches;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(false)
+            .open(&cache_path)?;
+        if reset_bitmap {
             f.set_len(total_size)?;
-            reset_bitmap = true;
         }
+        let cache_file = crate::cache::CacheFile::new(f);
 
         // Load the bitmap. The `.chunks` sidecar is the *sole*
         // source of truth for which chunks are valid — a data
@@ -178,10 +188,12 @@ impl ChunkStore {
             chunk_size,
             total_chunks,
             cache_path,
+            cache_file,
             chunks_path,
             chunk_state: Arc::new(chunk_state),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             retry_policy: crate::transport::RetryPolicy::default(),
+            full_transfer: Mutex::new(()),
         })
     }
 
@@ -229,7 +241,7 @@ impl ChunkStore {
         let last = ((end - 1) / self.chunk_size) as u32;
         self.ensure_chunks_valid(first, last)?;
         let mut buf = vec![0u8; len as usize];
-        read_exact_at(&self.cache_path, &mut buf, offset)?;
+        self.cache_file.read_exact_at(&mut buf, offset)?;
         Ok(buf)
     }
 
@@ -449,6 +461,46 @@ impl ChunkStore {
         }
     }
 
+    /// FullTransfer fallback: stream the entire body into the cache
+    /// file with one plain GET, then mark every chunk valid. Used
+    /// when the server doesn't advertise byte-range support (the
+    /// probe's `Accept-Ranges` check). A server that supports ranges
+    /// without advertising them costs one whole-file download here —
+    /// correct bytes, suboptimal transfer; the advertisement is the
+    /// only offline-safe signal we have.
+    fn fetch_full_transfer(&self) -> io::Result<()> {
+        let _guard = self.full_transfer.lock().unwrap();
+        if self.is_complete() {
+            return Ok(());
+        }
+        log::warn!(
+            "{} does not advertise byte-range support; downloading the entire file \
+             ({} bytes) before the first read can be served (FullTransfer)",
+            self.transport.url(), self.total_size,
+        );
+        self.retry_policy.execute(|| {
+            // Restart from offset 0 on every attempt — positional
+            // writes make partial previous attempts harmless.
+            let mut w = PositionalWriter { file: &self.cache_file, pos: 0 };
+            let n = self.transport.fetch_full_to(&mut w)?;
+            if n != self.total_size {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                    format!("full transfer short read: expected {} bytes, got {n}", self.total_size)));
+            }
+            Ok(())
+        })?;
+        self.cache_file.sync_data()?;
+        for slot in self.chunk_state.iter() {
+            slot.store(1, Ordering::Release);
+        }
+        let snapshot = self.snapshot_bitmap();
+        {
+            let _guard = self.in_flight.lock().unwrap();
+            let _ = save_bitmap(&self.chunks_path, &snapshot);
+        }
+        Ok(())
+    }
+
     fn chunk_start(&self, i: u32) -> u64 { i as u64 * self.chunk_size }
     fn chunk_len(&self, i: u32) -> u64 {
         let start = self.chunk_start(i);
@@ -456,6 +508,18 @@ impl ChunkStore {
     }
 
     fn fetch_and_write_chunk(&self, i: u32) -> io::Result<()> {
+        // Range-less servers can't serve chunks: the documented
+        // FullTransfer semantic applies — the whole file downloads
+        // once (streamed to the cache file) before any read returns.
+        // Per-chunk callers converge here naturally: the first one
+        // streams, the rest block on the full-transfer lock and then
+        // find their chunk already valid.
+        {
+            use crate::transport::ChunkedTransport;
+            if !self.transport.supports_range() {
+                return self.fetch_full_transfer();
+            }
+        }
         let start = self.chunk_start(i);
         let len = self.chunk_len(i);
         // Retry transient fetch failures with backoff — a flaky connection on
@@ -480,7 +544,11 @@ impl ChunkStore {
         // bitmap behind the in-memory state; the next session
         // refetches a redundant chunk and re-saves. Either way
         // the data is correct.
-        write_chunk_and_sync(&self.cache_path, &bytes, start)?;
+        self.cache_file.write_all_at(&bytes, start)?;
+        // `sync_data` rather than `sync_all` — we only care about the
+        // data bytes, not metadata. Cheaper, same crash-safety
+        // guarantee for the byte content.
+        self.cache_file.sync_data()?;
         if let Some(slot) = self.chunk_state.get(i as usize) {
             slot.store(1, Ordering::Release);
         }
@@ -497,6 +565,23 @@ impl ChunkStore {
         }
         Ok(())
     }
+}
+
+/// `io::Write` adapter over [`crate::cache::CacheFile`]'s positional
+/// writes, for streaming a sequential body into the sparse cache file
+/// without touching a shared cursor.
+struct PositionalWriter<'a> {
+    file: &'a crate::cache::CacheFile,
+    pos: u64,
+}
+
+impl std::io::Write for PositionalWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write_all_at(buf, self.pos)?;
+        self.pos += buf.len() as u64;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
 fn chunks_sidecar_path(cache_path: &Path) -> PathBuf {
@@ -532,23 +617,6 @@ fn save_bitmap(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    Ok(())
-}
-
-fn read_exact_at(path: &Path, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    let mut f = std::fs::File::open(path)?;
-    f.seek(SeekFrom::Start(offset))?;
-    f.read_exact(buf)
-}
-
-fn write_chunk_and_sync(path: &Path, buf: &[u8], offset: u64) -> io::Result<()> {
-    let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
-    f.seek(SeekFrom::Start(offset))?;
-    f.write_all(buf)?;
-    // `sync_data` rather than `sync_all` — we only care about
-    // the data bytes, not metadata. Cheaper, same crash-safety
-    // guarantee for the byte content.
-    f.sync_data()?;
     Ok(())
 }
 

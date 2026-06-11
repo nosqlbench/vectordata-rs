@@ -958,6 +958,52 @@ enum ResourceLocation {
     Http(Url),
 }
 
+/// Cache-relative path for a facet inside its dataset's cache
+/// directory (`<cache_root>/<dataset>/<relpath>`): the home-relative
+/// path when the facet lives under the dataset's home URL, otherwise
+/// the URL basename — flat under the dataset directory, per the
+/// mandated dataset-keyed layout.
+fn facet_cache_relpath<'a>(resolved: &'a str, home_norm: &str) -> &'a str {
+    if let Some(rel) = resolved.strip_prefix(home_norm) {
+        return rel;
+    }
+    resolved.rsplit('/').next().unwrap_or(resolved)
+}
+
+impl GenericTestDataView {
+    /// Hard-stop guard for cache-file collisions: two facets of this
+    /// profile must never map to the same `<dataset>/<relpath>` from
+    /// different source URLs — chunk sidecars are keyed to the file,
+    /// so a shared path with divergent bytes is silent corruption.
+    /// Realistically reachable only via basename collisions between
+    /// out-of-home facets; cheap to check (≤ a dozen facets).
+    fn reject_relpath_collisions(
+        &self,
+        facet_name: &str,
+        resolved: &str,
+        relpath: &str,
+        home_norm: &str,
+    ) -> Result<()> {
+        for (other_name, desc) in self.facet_manifest() {
+            if other_name == facet_name { continue; }
+            let Some(raw) = desc.source_path.as_deref() else { continue; };
+            let other_path = match crate::dataset::source::parse_source_string(raw) {
+                Ok(parsed) => parsed.path,
+                Err(_) => raw.to_string(),
+            };
+            let Ok(other_resolved) = self.resolve_path_str(&other_path) else { continue; };
+            if other_resolved == resolved { continue; }
+            if facet_cache_relpath(&other_resolved, home_norm) == relpath {
+                return Err(Error::Other(format!(
+                    "cache filename collision in dataset '{}': facets '{facet_name}'                      ({resolved}) and '{other_name}' ({other_resolved}) both cache as                      '{relpath}'. Rename one of the source files (or move it under the                      dataset's home URL) so each facet has a distinct filename.",
+                    self.dataset_name.as_deref().unwrap_or("?"),
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl TestDataView for GenericTestDataView {
     fn base_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>> {
         self.open_uniform(self.config.base_vectors.as_ref(), "base_vectors")
@@ -1101,15 +1147,25 @@ impl TestDataView for GenericTestDataView {
             Err(_) => raw.to_string(),
         };
         let resolved = self.resolve_path_str(&path_str)?;
-        // Catalog-anchored open: cache lands at
-        // `<cache_root>/<dataset>/<file_relpath>` where
-        // `file_relpath` is the facet URL's path *relative to the
-        // dataset's home URL* (`catalog_source`). This matters for
-        // knn_entries-shape catalogs where `path_str` is already an
-        // absolute URL: joining `<cache>/<dataset>/` with that URL
-        // produced a nested-URL-shaped path on disk and the colon
-        // broke Windows outright. Strip-by-prefix recovers the
-        // logical relpath ("base.fvec", "profiles/1m/base.fvec").
+        // Catalog-anchored open. The cache layout is fixed by design:
+        //
+        //   <cache_root>/<dataset_name>/<dataset files>
+        //
+        // For facets under the dataset's home URL (`catalog_source`)
+        // the file keeps its home-relative path ("base.fvec",
+        // "profiles/1m/base.fvec") so the cache mirrors the published
+        // layout. A facet living OUTSIDE the home URL (legal in
+        // knn_entries catalogs — several sized datasets sharing one
+        // remote directory of files) still caches under THIS
+        // dataset's directory, flat, by URL basename. Datasets that
+        // share a remote file each hold their own copy — the layout
+        // is dataset-keyed, never URL-keyed. (The previous fallback
+        // used the absolute URL as a "relative path", producing
+        // `<dataset>/s3:/...` trees whose colon broke Windows.)
+        //
+        // `facet_cache_relpath` collisions (two facets of this
+        // profile mapping to one cache file from different URLs) are
+        // rejected before any byte lands — see the guard below.
         let storage = match (&self.dataset_name, &self.catalog_source) {
             (Some(ds_name), Some(home)) => {
                 let home_norm = if home.ends_with('/') {
@@ -1117,12 +1173,10 @@ impl TestDataView for GenericTestDataView {
                 } else {
                     format!("{home}/")
                 };
-                let file_relpath = resolved
-                    .strip_prefix(&home_norm)
-                    .unwrap_or(path_str.as_str())
-                    .to_string();
+                let file_relpath = facet_cache_relpath(&resolved, &home_norm);
+                self.reject_relpath_collisions(name, &resolved, file_relpath, &home_norm)?;
                 crate::storage::Storage::open_layered(
-                    &resolved, ds_name, &file_relpath, home,
+                    &resolved, ds_name, file_relpath, home,
                 )
             }
             _ => crate::storage::Storage::open(&resolved),

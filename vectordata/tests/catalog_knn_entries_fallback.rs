@@ -11,9 +11,26 @@
 
 mod support;
 
+use std::sync::LazyLock;
+
 use vectordata::catalog::{Catalog, CatalogSources};
 
 use support::testserver::TestServer;
+
+/// Test-wide cache root under `target/tmp` (reaped by `cargo clean`),
+/// mirroring the `http_storage.rs` convention. Installed lazily by
+/// tests that actually open facet storage.
+static TEST_CACHE_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::tempdir_in(&base).expect("create test cache root")
+});
+
+fn init_test_cache() {
+    vectordata::settings::override_cache_dir_for_process(
+        TEST_CACHE_DIR.path().to_path_buf(),
+    );
+}
 
 const KNN_ENTRIES_YAML: &str = r#"
 _defaults:
@@ -682,4 +699,211 @@ fn local_knn_entries_via_catalog_open_reads_correctly() {
     assert_eq!(base.count(), 8);
     let v = base.get(3).unwrap();
     assert_eq!(v, vec![3.0f32, 4.0]);
+}
+
+/// Facets that live OUTSIDE a dataset's home URL (legal in
+/// knn_entries catalogs — several sized datasets sharing one remote
+/// directory of files) must still cache under the dataset-keyed
+/// layout: `<cache_root>/<dataset>/<basename>`, flat, with a
+/// `.publish_url` binding alongside. Never URL-keyed, never the old
+/// `<dataset>/s3:/...` nested-URL shape (whose colon broke Windows).
+#[test]
+fn out_of_home_facets_cache_flat_under_dataset_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Files live in a `shared/` directory that is a *sibling* of the
+    // per-dataset home URLs (`<base>/root/ds-a-1m/`, `.../ds-a-6m/`).
+    let shared = tmp.path().join("root/shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    // Minimal valid fvecs: one record, dim 2.
+    let mut rec: Vec<u8> = Vec::new();
+    rec.extend_from_slice(&2i32.to_le_bytes());
+    rec.extend_from_slice(&1.0f32.to_le_bytes());
+    rec.extend_from_slice(&2.0f32.to_le_bytes());
+    std::fs::write(shared.join("base_1m.fvecs"), &rec).unwrap();
+    std::fs::write(shared.join("base_6m.fvecs"), &rec).unwrap();
+    std::fs::write(shared.join("query_10k.fvecs"), &rec).unwrap();
+
+    let server = TestServer::start(tmp.path()).unwrap();
+    let base = server.base_url();
+    let yaml = format!(
+        r#"
+_defaults:
+  base_url: {base}/root/
+
+ds-a-1m:
+  base: shared/base_1m.fvecs
+  query: shared/query_10k.fvecs
+  gt: shared/gt.ivecs
+
+ds-a-6m:
+  base: shared/base_6m.fvecs
+  query: shared/query_10k.fvecs
+  gt: shared/gt.ivecs
+"#
+    );
+    std::fs::write(tmp.path().join("root/knn_entries.yaml"), &yaml).unwrap();
+    init_test_cache();
+
+    let sources = CatalogSources::new()
+        .add_catalogs(&[format!("{base}/root/knn_entries.yaml")]);
+    let catalog = Catalog::of(&sources);
+
+    let open_query_path = |name: &str| {
+        let group = catalog.open(name).expect("dataset opens");
+        let view = group.profile("default").expect("default profile");
+        let storage = view.open_facet_storage("query_vectors").expect("storage opens");
+        storage.cache_path().expect("chunk store pre-sizes the cache file")
+    };
+    // The resolver records which document each entry came from —
+    // this is what the picker's Source action displays. It must be
+    // the actual catalog file, not a name fabricated from base_url.
+    for e in catalog.datasets() {
+        assert_eq!(e.catalog_file.as_deref(),
+            Some(format!("{base}/root/knn_entries.yaml").as_str()),
+            "entry '{}' must record its source document", e.name);
+    }
+
+    let q_1m = open_query_path("ds-a-1m");
+    let q_6m = open_query_path("ds-a-6m");
+
+    let cache_root = TEST_CACHE_DIR.path();
+    // Dataset-keyed layout: each dataset holds its own flat copy.
+    assert_eq!(q_1m, cache_root.join("ds-a-1m/query_10k.fvecs"),
+        "out-of-home facet must cache flat under its dataset directory");
+    assert_eq!(q_6m, cache_root.join("ds-a-6m/query_10k.fvecs"));
+
+    // No URL-shaped path components anywhere under the dataset dirs.
+    for q in [&q_1m, &q_6m] {
+        let rel = q.strip_prefix(cache_root).unwrap();
+        for comp in rel.components() {
+            let c = comp.as_os_str().to_string_lossy();
+            assert!(!c.contains(':'),
+                "URL-shaped path component '{c}' in cache path {rel:?}");
+        }
+    }
+
+    // Single binding: `.publish_url` recorded at download time names
+    // the dataset's home URL, so a later `vectordata push` of the
+    // cached directory is already bound.
+    for ds in ["ds-a-1m", "ds-a-6m"] {
+        let marker = cache_root.join(ds).join(".publish_url");
+        let content = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("missing {}: {e}", marker.display()));
+        let parsed = vectordata::push::binding::parse_publish_url(&content)
+            .expect("binding parses");
+        assert_eq!(parsed.url, format!("{base}/root/{ds}/"),
+            "binding must name the dataset home URL");
+    }
+}
+
+/// Two facets of one profile mapping to the same cache file from
+/// different URLs (basename collision between out-of-home facets)
+/// must be rejected before any byte lands — a shared cache path with
+/// divergent source bytes would be silent corruption.
+#[test]
+fn out_of_home_basename_collision_is_a_hard_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("root/dir-a");
+    let b = tmp.path().join("root/dir-b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let mut rec: Vec<u8> = Vec::new();
+    rec.extend_from_slice(&2i32.to_le_bytes());
+    rec.extend_from_slice(&1.0f32.to_le_bytes());
+    rec.extend_from_slice(&2.0f32.to_le_bytes());
+    std::fs::write(a.join("vectors.fvecs"), &rec).unwrap();
+    std::fs::write(b.join("vectors.fvecs"), &rec).unwrap();
+
+    let server = TestServer::start(tmp.path()).unwrap();
+    let base = server.base_url();
+    let yaml = format!(
+        r#"
+_defaults:
+  base_url: {base}/root/
+
+ds-x:
+  base: dir-a/vectors.fvecs
+  query: dir-b/vectors.fvecs
+  gt: dir-a/gt.ivecs
+"#
+    );
+    std::fs::write(tmp.path().join("root/knn_entries.yaml"), &yaml).unwrap();
+    init_test_cache();
+
+    let sources = CatalogSources::new()
+        .add_catalogs(&[format!("{base}/root/knn_entries.yaml")]);
+    let catalog = Catalog::of(&sources);
+    let group = catalog.open("ds-x").expect("dataset opens");
+    let view = group.profile("default").expect("default profile");
+
+    let msg = match view.open_facet_storage("base_vectors") {
+        Ok(_) => panic!("colliding basenames must refuse to open"),
+        Err(e) => e.to_string(),
+    };
+    assert!(msg.contains("collision"), "unexpected error: {msg}");
+}
+
+/// `config catalog add` verification contract: a source is accepted
+/// only when it parses AND its data endpoint answers a catalog ping.
+/// A catalog whose YAML is fine but whose facet files are absent
+/// (dead base_url, wrong prefix, decommissioned bucket) must be
+/// refused before it is recorded.
+#[test]
+fn catalog_source_verification_requires_live_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = tmp.path().join("live");
+    std::fs::create_dir_all(live.join("ds")).unwrap();
+    let mut rec: Vec<u8> = Vec::new();
+    rec.extend_from_slice(&2i32.to_le_bytes());
+    rec.extend_from_slice(&1.0f32.to_le_bytes());
+    rec.extend_from_slice(&2.0f32.to_le_bytes());
+    std::fs::write(live.join("ds/base.fvecs"), &rec).unwrap();
+    std::fs::write(live.join("ds/query.fvecs"), &rec).unwrap();
+    let mut gt: Vec<u8> = Vec::new();
+    gt.extend_from_slice(&1i32.to_le_bytes());
+    gt.extend_from_slice(&0i32.to_le_bytes());
+    std::fs::write(live.join("ds/gt.ivecs"), &gt).unwrap();
+
+    let server = TestServer::start(tmp.path()).unwrap();
+    let base = server.base_url();
+    init_test_cache();
+
+    // Healthy: document parses, facets answer.
+    std::fs::write(live.join("knn_entries.yaml"), format!(
+        r#"
+_defaults:
+  base_url: {base}/live/
+
+good-ds:
+  base: ds/base.fvecs
+  query: ds/query.fvecs
+  gt: ds/gt.ivecs
+"#
+    )).unwrap();
+    let n = vectordata::config::verify_catalog_source(&format!("{base}/live/knn_entries.yaml"))
+        .expect("live endpoint must verify");
+    assert_eq!(n, 1);
+
+    // Parses fine, but every facet 404s: must be refused.
+    let dead = tmp.path().join("dead");
+    std::fs::create_dir_all(&dead).unwrap();
+    std::fs::write(dead.join("knn_entries.yaml"), format!(
+        r#"
+_defaults:
+  base_url: {base}/nowhere/
+
+ghost-ds:
+  base: ds/base.fvecs
+  query: ds/query.fvecs
+  gt: ds/gt.ivecs
+"#
+    )).unwrap();
+    let err = vectordata::config::verify_catalog_source(&format!("{base}/dead/knn_entries.yaml"))
+        .expect_err("dead data endpoint must be refused");
+    assert!(err.contains("catalog ping failed"), "unexpected refusal: {err}");
+
+    // Unreachable / empty location: refused at the parse stage.
+    let err = vectordata::config::verify_catalog_source(&format!("{base}/absent/"))
+        .expect_err("missing catalog must be refused");
+    assert!(err.contains("no datasets"), "unexpected refusal: {err}");
 }

@@ -501,14 +501,24 @@ fn build_source_lines(
     let body_style = tint(TEXT_PRIMARY);
     let error_style = tint(ACCENT_CORAL);
 
-    // Source location: canonical entries point at the dataset.yaml
-    // URL directly; knn_entries-shape entries point at the catalog
-    // base, so we append the file name.
-    let (source_url, title_suffix) = if entry.dataset_type == "knn_entries.yaml" {
-        let url = format!("{}/knn_entries.yaml", entry.path.trim_end_matches('/'));
-        (url, "knn_entries.yaml")
-    } else {
-        (entry.path.clone(), "dataset.yaml")
+    // Source location. `entry.catalog_file` is the document the
+    // resolver actually parsed this entry from — authoritative when
+    // present. For knn_entries-shape catalogs it is the ONLY correct
+    // answer: `entry.path` holds `_defaults.base_url` (where the DATA
+    // lives, possibly another host and scheme), so the old
+    // `<path>/knn_entries.yaml` reconstruction pointed at a file that
+    // never existed. Canonical entries fall back to `entry.path`,
+    // which IS their dataset.yaml location.
+    let (source_url, title_suffix) = match &entry.catalog_file {
+        Some(file) => {
+            let basename = file.rsplit('/').next().unwrap_or("catalog").to_string();
+            (file.clone(), basename)
+        }
+        None if entry.dataset_type == "knn_entries.yaml" => (
+            format!("{}/knn_entries.yaml", entry.path.trim_end_matches('/')),
+            "knn_entries.yaml".to_string(),
+        ),
+        None => (entry.path.clone(), "dataset.yaml".to_string()),
     };
 
     let raw = match fetch_yaml_text(&source_url) {
@@ -552,9 +562,14 @@ fn build_source_lines(
 /// 32-way runtime fanout as the rest of the runtime); everything
 /// else is treated as a filesystem path.
 fn fetch_yaml_text(location: &str) -> Result<String, String> {
-    if location.starts_with("http://") || location.starts_with("https://") {
+    // `s3://` catalogs fetch over their virtual-hosted HTTPS form,
+    // same as every data read.
+    if crate::transport::is_remote_url(location) {
+        let location = crate::transport::normalize_remote_url(location);
+        let location = location.as_ref();
         let client = crate::transport::shared_client_for(location);
-        return client.get(location).send()
+        let parsed = url::Url::parse(location).ok();
+        return crate::transport::apply_read_auth(client.get(location), parsed.as_ref()).send()
             .map_err(|e| format!("HTTP fetch: {e}"))?
             .error_for_status()
             .map_err(|e| format!("HTTP status: {e}"))?
@@ -1074,7 +1089,9 @@ fn leaf_size_bytes(dir: &std::path::Path) -> u64 {
             match e.file_type() {
                 Ok(ft) if ft.is_dir() => stack.push(p),
                 Ok(_) => {
-                    if let Ok(meta) = e.metadata() { total += meta.len(); }
+                    if let Ok(meta) = e.metadata() {
+                        total += crate::cache::reader::allocated_size(&meta);
+                    }
                 }
                 Err(_) => {}
             }

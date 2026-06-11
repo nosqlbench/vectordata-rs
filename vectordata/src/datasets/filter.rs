@@ -752,6 +752,7 @@ mod tests {
             name: name.to_string(),
             path: format!("{}/dataset.yaml", name),
             dataset_type: "dataset.yaml".to_string(),
+            catalog_file: None,
             layout: CatalogLayout {
                 attributes: None,
                 profiles: DSProfileGroup::from_profiles(profiles),
@@ -897,6 +898,7 @@ mod tests {
             name: "test".to_string(),
             path: "test/dataset.yaml".to_string(),
             dataset_type: "dataset.yaml".to_string(),
+            catalog_file: None,
             layout: CatalogLayout {
                 attributes: None,
                 profiles: DSProfileGroup::from_profiles(profiles),
@@ -933,6 +935,7 @@ mod tests {
             name: "test".to_string(),
             path: "test/dataset.yaml".to_string(),
             dataset_type: "dataset.yaml".to_string(),
+            catalog_file: None,
             layout: CatalogLayout {
                 attributes: None,
                 profiles: DSProfileGroup::from_profiles(profiles),

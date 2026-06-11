@@ -38,9 +38,9 @@ impl RetryPolicy {
     ///
     /// Returns the first successful result, or the last error after all
     /// retries are exhausted.
-    pub fn execute<F>(&self, mut op: F) -> io::Result<Vec<u8>>
+    pub fn execute<T, F>(&self, mut op: F) -> io::Result<T>
     where
-        F: FnMut() -> io::Result<Vec<u8>>,
+        F: FnMut() -> io::Result<T>,
     {
         let mut last_err = None;
 
@@ -127,7 +127,7 @@ mod tests {
         };
 
         let attempts = AtomicU32::new(0);
-        let result = policy.execute(|| {
+        let result = policy.execute(|| -> io::Result<Vec<u8>> {
             attempts.fetch_add(1, Ordering::Relaxed);
             Err(io::Error::new(io::ErrorKind::ConnectionReset, "always fail"))
         });

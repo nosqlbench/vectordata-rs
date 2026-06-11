@@ -76,6 +76,7 @@ impl DiscoveredDataset {
             name: self.config.name.clone(),
             path: cleaned.to_string_lossy().to_string(),
             dataset_type: "dataset.yaml".to_string(),
+            catalog_file: None,
             layout: CatalogLayout {
                 attributes: self.config.attributes.clone(),
                 profiles: self.config.profiles.clone(),

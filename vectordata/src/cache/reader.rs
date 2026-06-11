@@ -94,6 +94,37 @@ pub fn is_legacy_layout_dir(name: &str) -> bool {
     true
 }
 
+/// True when a directory tree contains a natural-layout
+/// `origin.json` marker anywhere beneath it (bounded depth).
+///
+/// Authority-shaped top-level names are NOT sufficient evidence of
+/// pre-cutover detritus: the URL-derived natural layout
+/// (`crate::storage::layout_for_url`) also creates
+/// `<cache>/<host>/<path…>/` trees — for direct URL opens that have
+/// no catalog identity to anchor a dataset directory on — and
+/// those carry `origin.json` at each dataset directory inside.
+/// Classifying (and pruning!) by name alone would delete live
+/// caches. Name shape narrows the candidates; this marker decides.
+pub(crate) fn contains_origin_json(root: &Path) -> bool {
+    fn walk(dir: &Path, depth: usize) -> bool {
+        if depth == 0 { return false; }
+        let Ok(entries) = fs::read_dir(dir) else { return false; };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_file()
+                && p.file_name().is_some_and(|n| n == crate::cache::layout::DATASET_ORIGIN_FILE)
+            {
+                return true;
+            }
+            if p.is_dir() && walk(&p, depth - 1) {
+                return true;
+            }
+        }
+        false
+    }
+    walk(root, 8)
+}
+
 // ─── Targeted prune ─────────────────────────────────────────────────
 
 /// Filter for [`prune_by_filter`]: dataset directory names matching
@@ -192,7 +223,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 pub struct CacheEntry {
     /// Absolute on-disk path of the entry's top-level cache directory.
     pub path: PathBuf,
-    /// Sum of all file sizes under `path` (bytes).
+    /// Bytes actually allocated on disk under `path` (`du`
+    /// semantics). Sparse cache files report only their downloaded
+    /// chunks, not the pre-sized apparent length.
     pub size_bytes: u64,
     /// Number of regular files under `path`.
     pub file_count: usize,
@@ -212,6 +245,12 @@ pub struct CacheListing {
     /// Natural-layout datasets — one entry per top-level directory
     /// containing an `origin.json` recorded by the cache write side.
     pub datasets: Vec<CacheEntry>,
+    /// URL-derived natural caches — authority-named top-level trees
+    /// holding per-dataset `origin.json` markers deeper inside.
+    /// Produced only by direct URL opens that carry no catalog
+    /// identity (catalog-anchored opens always use the dataset-keyed
+    /// layout). Live data — never pruned by [`prune_legacy_layout`].
+    pub url_derived: Vec<CacheEntry>,
     /// Pre-cutover detritus — `blobs/`, `http/`, and the older
     /// `<host>[:<port>]/` shape. Cleaned up by
     /// [`prune_legacy_layout`].
@@ -225,7 +264,7 @@ impl CacheListing {
     /// Total bytes across every category.
     pub fn total_bytes(&self) -> u64 {
         let s = |v: &[CacheEntry]| v.iter().map(|e| e.size_bytes).sum::<u64>();
-        s(&self.datasets) + s(&self.legacy) + s(&self.other)
+        s(&self.datasets) + s(&self.url_derived) + s(&self.legacy) + s(&self.other)
     }
 }
 
@@ -265,6 +304,8 @@ pub fn list_entries(cache_root: &Path) -> io::Result<CacheListing> {
         };
         if origin.is_some() {
             listing.datasets.push(cache_entry);
+        } else if contains_origin_json(&path) {
+            listing.url_derived.push(cache_entry);
         } else if is_legacy_layout_dir(&name) {
             listing.legacy.push(cache_entry);
         } else {
@@ -272,6 +313,7 @@ pub fn list_entries(cache_root: &Path) -> io::Result<CacheListing> {
         }
     }
     sort_by_size_desc(&mut listing.datasets);
+    sort_by_size_desc(&mut listing.url_derived);
     sort_by_size_desc(&mut listing.legacy);
     sort_by_size_desc(&mut listing.other);
     Ok(listing)
@@ -286,6 +328,24 @@ fn origin_host(url: &str) -> Option<String> {
 
 fn sort_by_size_desc(v: &mut [CacheEntry]) {
     v.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+}
+
+/// Bytes a file actually occupies on disk (`du` semantics): allocated
+/// blocks, not apparent length. The distinction is load-bearing for
+/// every cache-size surface — chunk stores pre-size sparse cache
+/// files to the full remote size at open, so `metadata().len()`
+/// reports a one-chunk download as the whole dataset. On non-Unix
+/// targets (no block count in std) this falls back to apparent size.
+pub(crate) fn allocated_size(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks() * 512
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
 }
 
 fn dir_size_and_count(path: &Path) -> (u64, usize) {
@@ -303,7 +363,7 @@ fn dir_size_and_count(path: &Path) -> (u64, usize) {
                 Ok(ft) if ft.is_dir() => stack.push(p),
                 Ok(_) => {
                     if let Ok(meta) = e.metadata() {
-                        size += meta.len();
+                        size += allocated_size(&meta);
                         count += 1;
                     }
                 }
@@ -340,6 +400,12 @@ pub fn prune_legacy_layout(cache_root: &Path) -> io::Result<Vec<String>> {
         if !path.is_dir() {
             continue;
         }
+        // Authority-shaped name is necessary but not sufficient: a
+        // URL-derived natural cache has the same top-level shape and
+        // must survive. The origin.json marker is the discriminator.
+        if contains_origin_json(&path) {
+            continue;
+        }
         fs::remove_dir_all(&path)?;
         removed.push(name);
     }
@@ -371,6 +437,33 @@ mod tests {
         assert!(!is_legacy_layout_dir("vecs1m"));
         assert!(!is_legacy_layout_dir("example-1b"));
         assert!(!is_legacy_layout_dir(""));
+    }
+
+    /// A sparse pre-sized cache file (the shape every chunk store
+    /// leaves behind at open) must report only its written bytes,
+    /// not the apparent length — this is the regression that made
+    /// one downloaded chunk list as a fully-cached dataset.
+    #[cfg(unix)]
+    #[test]
+    fn allocated_size_ignores_sparse_holes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sparse.bin");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(64 * 1024 * 1024).unwrap(); // 64 MiB apparent
+        drop(f);
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&vec![7u8; 1024 * 1024]).unwrap(); // 1 MiB real
+            f.sync_all().unwrap();
+        }
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 64 * 1024 * 1024);
+        let alloc = allocated_size(&meta);
+        assert!(alloc >= 1024 * 1024, "written bytes must be counted, got {alloc}");
+        assert!(alloc < 8 * 1024 * 1024,
+            "sparse holes must not be counted (apparent 64 MiB, got {alloc})");
     }
 
     #[test]
@@ -509,6 +602,16 @@ mod tests {
         // A natural-layout dataset that must NOT be touched.
         seed_dataset(root, "vecs1m", "https://example.com/vecs1m/");
 
+        // A URL-derived natural cache: authority-shaped TOP-LEVEL name
+        // but with a nested per-dataset origin.json — the layout that
+        // direct URL opens and out-of-home catalog facets produce.
+        // Must NOT be classified or pruned as legacy.
+        let url_derived = root.join("example.s3.amazonaws.com/data/vecs");
+        fs::create_dir_all(&url_derived).unwrap();
+        fs::write(url_derived.join("origin.json"),
+            r#"{"source":"https://example.s3.amazonaws.com/data/vecs/","fetched_at":"x"}"#).unwrap();
+        fs::write(url_derived.join("base.fvec"), b"data").unwrap();
+
         let mut removed = prune_legacy_layout(root).unwrap();
         removed.sort();
         assert_eq!(removed, vec![
@@ -520,5 +623,14 @@ mod tests {
         ]);
         assert!(root.join("vecs1m/origin.json").exists(),
             "natural-layout datasets must survive legacy purge");
+        assert!(url_derived.join("base.fvec").exists(),
+            "URL-derived natural caches must survive legacy purge");
+
+        let listing = list_entries(root).unwrap();
+        assert!(listing.legacy.is_empty(),
+            "nothing legacy-shaped remains after prune");
+        assert!(listing.url_derived.iter().any(|e|
+            e.path.file_name().is_some_and(|n| n == "example.s3.amazonaws.com")),
+            "URL-derived cache must list in its own live group, not as detritus");
     }
 }

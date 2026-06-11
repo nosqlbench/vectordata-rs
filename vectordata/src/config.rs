@@ -257,11 +257,48 @@ fn save_catalog_entries(entries: &[String]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Append a catalog source. Probes the source first to confirm it
-/// resolves to at least one dataset — refusing to record an
-/// unreachable or empty source is the single biggest paper-cut this
-/// command has. Returns 1 if the source is unreachable or already
-/// present.
+/// Verify a catalog source end-to-end before it is accepted:
+///
+/// 1. The location must parse into at least one dataset entry.
+/// 2. The first dataset must pass a **catalog ping** — every facet
+///    of its default (or first) profile reachable through the same
+///    access layer the runtime uses for real reads. A catalog whose
+///    document parses but whose data endpoints are dead or
+///    mis-based is refused here instead of failing later at first
+///    use.
+///
+/// Returns the dataset count on success, a human-readable refusal
+/// otherwise. Pure with respect to configuration — nothing is read
+/// from or written to `catalogs.yaml` — so it is directly testable
+/// against a fixture server.
+pub fn verify_catalog_source(source: &str) -> Result<usize, String> {
+    let sources = CatalogSources::new().add_catalogs(&[source.to_string()]);
+    let catalog = Catalog::of(&sources);
+    let count = catalog.datasets().len();
+    if count == 0 {
+        return Err("no datasets found at this location".to_string());
+    }
+    let first = &catalog.datasets()[0];
+    let name = first.name.clone();
+    let profiles = first.profile_names();
+    let profile = if profiles.contains(&"default") {
+        "default".to_string()
+    } else {
+        profiles.first().map(|p| p.to_string()).unwrap_or_else(|| "default".to_string())
+    };
+    println!("Verifying endpoint with a catalog ping — dataset '{name}', profile '{profile}':");
+    let code = crate::datasets::ping::run_via_catalog(&catalog, &name, &profile);
+    if code != 0 {
+        return Err(format!(
+            "catalog ping failed for dataset '{name}' (profile '{profile}') —              the catalog parses but its data endpoint is not serving"));
+    }
+    Ok(count)
+}
+
+/// Append a catalog source. The source must pass
+/// [`verify_catalog_source`] — parse to at least one dataset AND
+/// answer a catalog ping — before anything is recorded. Returns 1
+/// if verification fails; nothing is saved in that case.
 pub fn add_catalog(source: &str) -> i32 {
     let mut entries = load_catalog_entries();
     if entries.iter().any(|e| e == source) {
@@ -269,13 +306,14 @@ pub fn add_catalog(source: &str) -> i32 {
         return 0;
     }
 
-    let sources = CatalogSources::new().add_catalogs(&[source.to_string()]);
-    let catalog = Catalog::of(&sources);
-    let count = catalog.datasets().len();
-    if count == 0 {
-        eprintln!("FAIL {source} — no datasets found at this location");
-        return 1;
-    }
+    let count = match verify_catalog_source(source) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("FAIL {source} — {e}");
+            eprintln!("Not saved.");
+            return 1;
+        }
+    };
     println!("OK   {source} ({count} dataset(s))");
 
     entries.push(source.to_string());

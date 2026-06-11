@@ -29,6 +29,18 @@ pub struct TestServer {
 impl TestServer {
     /// Start serving files from the given directory.
     pub fn start(root: &Path) -> Result<Self, String> {
+        Self::start_with_ranges(root, true)
+    }
+
+    /// Start a server that IGNORES `Range` headers: every GET returns
+    /// the whole body with `200 OK` and no `Accept-Ranges` header.
+    /// Models servers without byte-range support so tests can prove
+    /// the storage layer's FullTransfer fallback.
+    pub fn start_no_range(root: &Path) -> Result<Self, String> {
+        Self::start_with_ranges(root, false)
+    }
+
+    fn start_with_ranges(root: &Path, ranges: bool) -> Result<Self, String> {
         let root = root.to_path_buf();
         let (port_tx, port_rx) = std::sync::mpsc::channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -42,9 +54,41 @@ impl TestServer {
                 .unwrap();
 
             rt.block_on(async {
-                let service = tower_http::services::ServeDir::new(&root);
-                let app = axum::Router::new()
-                    .fallback_service(service);
+                let app = if ranges {
+                    let service = tower_http::services::ServeDir::new(&root);
+                    axum::Router::new().fallback_service(service)
+                } else {
+                    // Whole-body-only handler: no Accept-Ranges, no
+                    // 206 — a Range header on the request is ignored.
+                    let root = root.clone();
+                    axum::Router::new().fallback(move |
+                        method: axum::http::Method,
+                        uri: axum::http::Uri,
+                    | {
+                        let root = root.clone();
+                        async move {
+                            let rel = uri.path().trim_start_matches('/');
+                            let path = root.join(rel);
+                            let Ok(bytes) = tokio::fs::read(&path).await else {
+                                return axum::http::Response::builder()
+                                    .status(404)
+                                    .body(axum::body::Body::empty())
+                                    .unwrap();
+                            };
+                            let len = bytes.len();
+                            let body = if method == axum::http::Method::HEAD {
+                                axum::body::Body::empty()
+                            } else {
+                                axum::body::Body::from(bytes)
+                            };
+                            axum::http::Response::builder()
+                                .status(200)
+                                .header(axum::http::header::CONTENT_LENGTH, len)
+                                .body(body)
+                                .unwrap()
+                        }
+                    })
+                };
 
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                     .await

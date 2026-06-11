@@ -715,9 +715,32 @@ fn load_or_fetch_remote_offsets(
             return Ok(parse_index_bytes(&bytes, ext));
         }
     }
-    // Fallback: walk the file via Storage::read_bytes (slow for direct
-    // HTTP; for cached storage this prebuffers chunks as it walks).
-    walk_offsets_via_storage(storage, elem_size)
+    // Second chance before the expensive walk: a prior open of this
+    // URL already walked the file and persisted the rebuilt index
+    // next to the local cache file. Without this, every open of a
+    // remote vvec with no published sidecar re-paid the full walk.
+    let cache_path = storage.local_path();
+    if let Some(cp) = &cache_path {
+        let index_path = index_path_for(cp, storage.total_size());
+        if let Some(cached) = load_local_index(&index_path, cp)? {
+            return Ok(cached);
+        }
+    }
+    // Fallback: walk the file via Storage::read_bytes. For remote
+    // storage this downloads EVERY chunk of the file before the
+    // reader exists — say so out loud instead of looking like a
+    // hang, and point at the durable fix (publish the sidecar).
+    log::warn!(
+        "no IDXFOR__ offset index published for {data_url}; rebuilding it requires          downloading the entire file ({} bytes). Publish the IDXFOR__ sidecar next to          the data file (or precache the dataset) to avoid this.",
+        storage.total_size(),
+    );
+    let offsets = walk_offsets_via_storage(storage, elem_size)?;
+    // Persist so the walk is paid once per cache lifetime. Best-
+    // effort: a read-only cache directory only costs us the rebuild.
+    if let Some(cp) = &cache_path {
+        let _ = write_index(&index_path_for(cp, storage.total_size()), &offsets, storage.total_size());
+    }
+    Ok(offsets)
 }
 
 fn walk_offsets(mmap: &[u8], elem_size: usize) -> Result<Vec<u64>, IoError> {

@@ -201,6 +201,12 @@ pub(crate) fn verify_or_record_origin(
                 requested: source_url.to_string(),
             });
         }
+        // The `.publish_url` binding rides along with the origin
+        // check so cache downloads and publishes share one binding.
+        // Ordered AFTER the origin comparison: an origin mismatch
+        // must error with origin semantics and must not record a
+        // binding for the rejected source.
+        verify_or_record_publish_url(dataset_dir, source_url)?;
         return Ok(());
     }
     // First open against a fresh (or origin-less) dataset dir.
@@ -208,6 +214,52 @@ pub(crate) fn verify_or_record_origin(
     // under us — bubble that up as InvalidInput so the caller can
     // surface it, but don't synthesise a mismatch.
     let _ = write_dataset_origin(dataset_dir, source_url);
+    verify_or_record_publish_url(dataset_dir, source_url)?;
+    Ok(())
+}
+
+/// Record (or verify) the `.publish_url` binding in the dataset's
+/// cache directory — the same single-binding contract `vectordata
+/// push` enforces (`crate::push::binding::PUBLISH_FILE`). Writing it
+/// at cache-download time closes the happy-path loop: a dataset
+/// pulled into the cache is already bound to the location it came
+/// from, so publishing the directory needs no extra wiring and can't
+/// silently target somewhere else.
+///
+/// - No file yet → write `source_url` (only when it is a URL the
+///   push transports speak; a local catalog path is not a publish
+///   binding and is skipped).
+/// - File present and (normalized) equal → `Ok`.
+/// - File present and different → [`OriginMismatch`]-style hard
+///   error: single binding means exactly one URL per directory.
+pub(crate) fn verify_or_record_publish_url(
+    dataset_dir: &Path,
+    source_url: &str,
+) -> Result<(), OriginMismatch> {
+    let Ok(requested) = crate::push::binding::parse_publish_url(source_url) else {
+        // Not a publishable URL (e.g. a local catalog directory) —
+        // nothing to bind.
+        return Ok(());
+    };
+    let path = dataset_dir.join(crate::push::binding::PUBLISH_FILE);
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        return match crate::push::binding::parse_publish_url(&content) {
+            Ok(existing) if existing.url == requested.url => Ok(()),
+            // Malformed existing content is the push command's
+            // domain to surface; don't overwrite user-managed state.
+            Err(_) => Ok(()),
+            Ok(existing) => Err(OriginMismatch {
+                dataset_dir: dataset_dir.to_path_buf(),
+                recorded: existing.url,
+                requested: requested.url,
+            }),
+        };
+    }
+    // Fresh directory — best-effort write, same posture as
+    // `write_dataset_origin` above.
+    if std::fs::create_dir_all(dataset_dir).is_ok() {
+        let _ = std::fs::write(&path, format!("{}\n", requested.url));
+    }
     Ok(())
 }
 

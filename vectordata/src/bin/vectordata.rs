@@ -781,6 +781,12 @@ fn print_listing(root: &std::path::Path, l: &CacheListing, verbose: bool) {
         println!();
     }
 
+    if !l.url_derived.is_empty() {
+        println!("URL-derived caches (from direct URL opens, no catalog identity):");
+        print_simple_rows(&l.url_derived, root);
+        println!();
+    }
+
     if !l.legacy.is_empty() {
         println!("Legacy detritus (pre-cutover layout):");
         print_simple_rows(&l.legacy, root);
@@ -794,7 +800,9 @@ fn print_listing(root: &std::path::Path, l: &CacheListing, verbose: bool) {
         println!();
     }
 
-    if l.datasets.is_empty() && l.legacy.is_empty() && l.other.is_empty() {
+    if l.datasets.is_empty() && l.url_derived.is_empty()
+        && l.legacy.is_empty() && l.other.is_empty()
+    {
         println!("(empty)");
     }
 }

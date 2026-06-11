@@ -66,6 +66,17 @@ pub struct CatalogEntry {
     /// Entry type discriminator — always `"dataset.yaml"` for layout entries.
     #[serde(default = "default_dataset_type")]
     pub dataset_type: String,
+    /// Location of the catalog document this entry was parsed from
+    /// (URL or path), when the resolver knows it. For
+    /// `knn_entries.yaml`-shape catalogs this is the only record of
+    /// where the catalog file actually lives — `path` holds the
+    /// `_defaults.base_url` data location, which may be a different
+    /// host (and a different filename) entirely. `None` for entries
+    /// built without resolver context (embedded layouts, tests).
+    /// Never serialized into published catalogs — it is resolver-side
+    /// provenance, not catalog content.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub catalog_file: Option<String>,
     /// Embedded dataset configuration (attributes + profiles).
     pub layout: CatalogLayout,
 }
