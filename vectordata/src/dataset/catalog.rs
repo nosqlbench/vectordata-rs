@@ -86,6 +86,25 @@ fn default_dataset_type() -> String {
 }
 
 impl CatalogEntry {
+    /// The dataset's *home URL* — the location the cache mirrors
+    /// under `<cache_root>/<dataset_name>/`, always with a trailing
+    /// slash. For `knn_entries.yaml`-shape entries `path` is the
+    /// catalog base (no dataset segment), so the dataset name is
+    /// appended; for canonical entries `path` is the `dataset.yaml`
+    /// URL whose parent directory IS the home. Single authority for
+    /// this derivation — the group loader and every cache-path
+    /// computation must agree on it byte-for-byte.
+    pub fn dataset_home_url(&self) -> String {
+        if self.dataset_type == "knn_entries.yaml" {
+            format!("{}/{}/", self.path.trim_end_matches('/'), self.name)
+        } else {
+            match self.path.rsplit_once('/') {
+                Some((parent, _)) => format!("{parent}/"),
+                None => self.path.clone(),
+            }
+        }
+    }
+
     /// Returns view names from the default profile (convenience accessor).
     pub fn view_names(&self) -> Vec<&str> {
         self.layout.profiles.view_names()

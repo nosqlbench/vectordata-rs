@@ -399,6 +399,13 @@ pub struct Node {
     flags: Vec<String>,
     /// Subset of `flags` that don't take a value.
     boolean_flags: std::collections::HashSet<String>,
+    /// Short-flag aliases: `-c` → `--config`. Every flag-shaped
+    /// lookup resolves through [`Node::resolve_flag_token`] so a
+    /// short previous word value-completes exactly like its long
+    /// form. Registration-keyed on purpose: an unregistered
+    /// single-dash word (a negative number argument, say `-5`)
+    /// resolves to nothing and is never mistaken for a flag.
+    short_aliases: BTreeMap<String, String>,
     /// Per-flag help text. Used by [`render_usage`].
     flag_help: BTreeMap<String, String>,
     /// Extended help text for flags — shown on triple-tap at a
@@ -844,6 +851,26 @@ impl Node {
             self.boolean_flags.insert((*f).to_string());
         }
         self
+    }
+
+    /// Register a short alias (`-c`) for a long flag (`--config`).
+    /// The alias participates in value-position detection and value
+    /// completion exactly like the long form.
+    pub fn with_short_alias(mut self, short: &str, long: &str) -> Self {
+        self.short_aliases.insert(short.to_string(), long.to_string());
+        self
+    }
+
+    /// Resolve a previous-word token to the canonical long-flag form
+    /// used as the key for `boolean_flags`, `value_providers`, and
+    /// flag help. `--long` passes through verbatim; a registered
+    /// short alias maps to its long flag; everything else — including
+    /// single-dash words that are values, not flags (`-5`) — is
+    /// `None` for shorts and pass-through-by-shape for longs.
+    pub(crate) fn resolve_flag_token<'a>(&'a self, word: &'a str) -> Option<&'a str> {
+        if word.contains('=') { return None; }
+        if word.starts_with("--") { return Some(word); }
+        self.short_aliases.get(word).map(|s| s.as_str())
     }
 
     /// All flag names this node accepts (value-taking + boolean), in
@@ -1662,10 +1689,9 @@ pub fn complete_rotating_with_raw(
     // [`complete_at_tap_with_raw`]) never fires.
     let prev_word_opt = completed.last().copied();
     let at_value_position = prev_word_opt
+        .and_then(|w| node.resolve_flag_token(w))
         .map(|w| {
-            w.starts_with("--")
-                && !w.contains('=')
-                && !node.boolean_flags.contains(w)
+            !node.boolean_flags.contains(w)
                 && (node.value_providers.contains_key(w)
                     || node.flag_help_for(w).is_some())
         })
@@ -1794,10 +1820,12 @@ pub fn complete_at_tap_with_raw(
     //      root with empty partial) + flags (static + dynamic) +
     //      global flag tokens, prefix-filtered.
 
-    // (1) Value-completion for the previous flag.
-    if let Some(&prev_word) = remaining.last()
-        && prev_word.starts_with("--")
-        && !prev_word.contains('=')
+    // (1) Value-completion for the previous flag. Short aliases
+    // (`-c`) resolve to their long form first — value completion
+    // must work identically for `attach --config <TAB>` and
+    // `attach -c <TAB>`.
+    if let Some(&prev_raw) = remaining.last()
+        && let Some(prev_word) = node.resolve_flag_token(prev_raw)
         && !node.boolean_flags.contains(prev_word)
     {
         // Rapid double-tab at a value position prints the flag's
@@ -2647,10 +2675,9 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     let at_value_position = words
         .iter()
         .rev().nth(1)
+        .and_then(|w| max_node.resolve_flag_token(w))
         .map(|w| {
-            w.starts_with("--")
-                && !w.contains('=')
-                && !max_node.boolean_flags.contains(*w)
+            !max_node.boolean_flags.contains(w)
                 && max_node.flag_help_for(w).is_some()
         })
         .unwrap_or(false);

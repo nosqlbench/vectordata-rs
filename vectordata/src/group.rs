@@ -421,14 +421,7 @@ impl TestDataGroup {
         // URL. View facet URLs strip this prefix to derive the
         // relative path that the cache mirrors under the dataset
         // directory.
-        let dataset_home_url = if entry.dataset_type == "knn_entries.yaml" {
-            format!("{}/{}/", entry.path.trim_end_matches('/'), entry.name)
-        } else {
-            match entry.path.rsplit_once('/') {
-                Some((parent, _)) => format!("{parent}/"),
-                None => entry.path.clone(),
-            }
-        };
+        let dataset_home_url = entry.dataset_home_url();
         Ok(Self {
             source,
             config,

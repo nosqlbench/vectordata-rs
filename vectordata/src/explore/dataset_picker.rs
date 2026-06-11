@@ -109,7 +109,7 @@ impl PickerRow {
 
 fn build_rows(
     entries: &[CatalogEntry],
-    cache_survey: &std::collections::HashMap<String, FacetCacheView>,
+    cache_survey: &std::collections::HashMap<std::path::PathBuf, FacetCacheView>,
 ) -> Vec<PickerRow> {
     use crate::dataset::StandardFacet;
 
@@ -240,8 +240,15 @@ fn profile_cache_coverage(
     entry: &CatalogEntry,
     profile: &crate::dataset::profile::DSProfile,
     ds_workspace: &std::path::Path,
-    survey: &std::collections::HashMap<String, FacetCacheView>,
+    survey: &std::collections::HashMap<std::path::PathBuf, FacetCacheView>,
 ) -> (u32, u32) {
+    // Same home URL the storage open anchors the cache layout on —
+    // single authority, so the picker's expectation of where a facet
+    // caches cannot drift from where the runtime actually puts it.
+    let home = {
+        let h = entry.dataset_home_url();
+        if h.ends_with('/') { h } else { format!("{h}/") }
+    };
     let mut valid = 0u32;
     let mut total = 0u32;
     for (_facet, view) in &profile.views {
@@ -260,18 +267,21 @@ fn profile_cache_coverage(
         if elem_size == 0 { continue; }
 
         // Prefer the survey (which reads the `.mrkl` / `.chunks`
-        // sidecar for true chunk-level coverage). Post-cutover the
-        // natural-layout cache path is *exactly* `<cache>/<dataset>/
-        // <facet>` — the same place a `derive`-style flat file
-        // would live, but Storage pre-allocates the file as sparse
-        // before downloading any chunks. A `file.exists()` check
-        // therefore lights up as `100% (1/1)` from the moment
-        // precache opens the facet, masking the real chunk progress.
-        // Survey first, file-existence second (as the `derive`-style
-        // flat-file fallback when there is no sidecar to consult).
+        // sidecar for true chunk-level coverage). The expected cache
+        // path is derived FORWARD — facet URL + home →
+        // `facet_cache_relpath`, the same function the storage open
+        // uses — and looked up by path. (The previous version
+        // reconstructed a URL from the on-disk relpath and matched
+        // URLs; that guess broke for any facet whose cache relpath
+        // isn't home-relative, e.g. out-of-home facets cached flat
+        // by basename.) A bare `file.exists()` check can't replace
+        // the survey: Storage pre-allocates sparse files before any
+        // chunk lands, so existence alone would show `100% (1/1)`
+        // the moment a facet is first opened.
         if let Some(url) = resolve_facet_url(entry, view) {
-            let canonical = canonicalize_cache_url(&url);
-            if let Some(cv) = survey.get(&canonical) {
+            let relpath = crate::view::facet_cache_relpath(&url, &home);
+            let expected = ds_workspace.join(relpath);
+            if let Some(cv) = survey.get(&expected) {
                 let (v, t) = window_bounded_coverage(cv, view, source_path, ext, elem_size);
                 valid += v;
                 total += t;
@@ -735,14 +745,18 @@ fn strip_window_suffix(source_path: &str) -> &str {
 ///   └── query.fvec.chunks
 /// ```
 fn survey_cache_state(cache_dir: &std::path::Path)
-    -> std::collections::HashMap<String, FacetCacheView>
+    -> std::collections::HashMap<std::path::PathBuf, FacetCacheView>
 {
-    let mut map: std::collections::HashMap<String, FacetCacheView> =
+    let mut map: std::collections::HashMap<std::path::PathBuf, FacetCacheView> =
         std::collections::HashMap::new();
     walk_dataset_dirs(cache_dir, &mut |dataset_dir| {
-        let Some(origin) = crate::cache::layout::read_dataset_origin(dataset_dir) else { return; };
-        let base_url = origin.source;
-        walk_sidecars(dataset_dir, dataset_dir, &base_url, &mut map);
+        // origin.json marks a real dataset directory; the survey is
+        // keyed by cache-file path, so the origin's URL itself isn't
+        // needed here — the coverage lookup derives each facet's
+        // expected cache path forward, with the same function the
+        // storage open uses, and matches on the path.
+        if crate::cache::layout::read_dataset_origin(dataset_dir).is_none() { return; }
+        walk_sidecars(dataset_dir, &mut map);
     });
     map
 }
@@ -916,21 +930,22 @@ fn walk_dataset_dirs<F: FnMut(&std::path::Path)>(root: &std::path::Path, visit: 
 }
 
 /// Within a single dataset directory (where origin.json lives), walk
-/// every file and record per-chunk cache state. The URL recorded in
-/// the map is `<base_url><relpath>` where `relpath` is the sidecar's
-/// logical filename (`.mrkl` / `.chunks` trimmed) relative to the
-/// dataset directory.
+/// every file and record per-chunk cache state, keyed by the data
+/// file's absolute cache path (the sidecar path with `.mrkl` /
+/// `.chunks` trimmed). Path-keyed on purpose: reconstructing the
+/// facet URL from `<origin><relpath>` breaks the moment the relpath
+/// isn't home-relative (out-of-home facets cache flat by basename),
+/// whereas the forward derivation used by the coverage lookup is the
+/// same one the storage open uses — they can't disagree.
 fn walk_sidecars(
-    dataset_dir: &std::path::Path,
     current: &std::path::Path,
-    base_url: &str,
-    map: &mut std::collections::HashMap<String, FacetCacheView>,
+    map: &mut std::collections::HashMap<std::path::PathBuf, FacetCacheView>,
 ) {
     let Ok(entries) = std::fs::read_dir(current) else { return; };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            walk_sidecars(dataset_dir, &path, base_url, map);
+            walk_sidecars(&path, map);
             continue;
         }
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue; };
@@ -977,19 +992,7 @@ fn walk_sidecars(
             _ => None,
         };
         let Some(view) = view else { continue; };
-        let Ok(relpath) = cache_file_path.strip_prefix(dataset_dir) else { continue; };
-        let relpath_str = relpath.to_string_lossy().replace('\\', "/");
-        let facet_url = format!("{}{}", base_url.trim_end_matches('/'), {
-            // base_url already ends with `/` (recorded as the parent
-            // URL). If it doesn't, add one. Use `.starts_with('/')`
-            // on the relpath to avoid a double slash either way.
-            if relpath_str.starts_with('/') {
-                relpath_str.clone()
-            } else {
-                format!("/{relpath_str}")
-            }
-        });
-        map.insert(canonicalize_cache_url(&facet_url), view);
+        map.insert(cache_file_path, view);
     }
 }
 
@@ -2513,6 +2516,71 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
 #[cfg(test)]
 mod tests {
     use super::format_count;
+
+    /// The CACHED column's coverage must agree with where the storage
+    /// layer actually puts cache files — for home-relative facets AND
+    /// for out-of-home facets (cached flat by basename under the
+    /// dataset directory). The previous survey reconstructed facet
+    /// URLs from on-disk relpaths, which silently missed any facet
+    /// whose cache relpath isn't home-relative, reporting fully
+    /// cached datasets as missing.
+    #[test]
+    fn cache_coverage_matches_storage_layout_for_all_facet_shapes() {
+        use crate::dataset::profile::{DSProfile, DSView};
+        use crate::dataset::source::DSSource;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let ds = cache.join("ds-a");
+        std::fs::create_dir_all(ds.join("profiles")).unwrap();
+        std::fs::write(ds.join("origin.json"),
+            r#"{"source":"https://h/cat/ds-a/","fetched_at":"x"}"#).unwrap();
+        // Home-relative facet: profiles/base.fvecs, fully chunk-valid.
+        std::fs::write(ds.join("profiles/base.fvecs"), b"data").unwrap();
+        std::fs::write(ds.join("profiles/base.fvecs.chunks"), [1u8]).unwrap();
+        // Out-of-home facet: cached flat by basename.
+        std::fs::write(ds.join("query.fvecs"), b"data").unwrap();
+        std::fs::write(ds.join("query.fvecs.chunks"), [1u8]).unwrap();
+
+        let entry = crate::dataset::CatalogEntry {
+            name: "ds-a".to_string(),
+            path: "https://h/cat".to_string(),
+            dataset_type: "knn_entries.yaml".to_string(),
+            catalog_file: None,
+            layout: crate::dataset::CatalogLayout {
+                attributes: None,
+                profiles: Default::default(),
+            },
+        };
+        let view_for = |path: &str| DSView {
+            source: DSSource {
+                path: path.to_string(),
+                namespace: None,
+                window: Default::default(),
+            },
+            window: None,
+        };
+        let mut profile = DSProfile {
+            maxk: None,
+            base_count: None,
+            partition: false,
+            views: indexmap::IndexMap::new(),
+        };
+        profile.views.insert("base_vectors".into(),
+            view_for("https://h/cat/ds-a/profiles/base.fvecs"));
+        profile.views.insert("query_vectors".into(),
+            view_for("https://h/cat/shared/query.fvecs"));
+        profile.views.insert("neighbor_indices".into(),
+            view_for("https://h/cat/shared/missing.ivecs"));
+
+        let survey = super::survey_cache_state(cache);
+        let (valid, total) = super::profile_cache_coverage(
+            &entry, &profile, &ds, &survey);
+        // base (1 chunk) + query (1 chunk) cached; missing.ivecs
+        // contributes 1 uncached unit.
+        assert_eq!((valid, total), (2, 3),
+            "home-relative and flat-basename facets must both be found");
+    }
 
     #[test]
     fn format_count_iec_vs_si() {

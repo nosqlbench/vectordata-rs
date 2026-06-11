@@ -963,7 +963,7 @@ enum ResourceLocation {
 /// path when the facet lives under the dataset's home URL, otherwise
 /// the URL basename — flat under the dataset directory, per the
 /// mandated dataset-keyed layout.
-fn facet_cache_relpath<'a>(resolved: &'a str, home_norm: &str) -> &'a str {
+pub(crate) fn facet_cache_relpath<'a>(resolved: &'a str, home_norm: &str) -> &'a str {
     if let Some(rel) = resolved.strip_prefix(home_norm) {
         return rel;
     }

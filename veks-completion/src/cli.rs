@@ -618,6 +618,13 @@ fn spec_to_node(
             if let Some(h) = &o.def.help {
                 node = node.with_flag_help(&o.def.name, h);
             }
+            // Short aliases participate in value-position detection
+            // and value completion exactly like the long form —
+            // `attach -c <TAB>` must complete the same values as
+            // `attach --config <TAB>`.
+            if let Some(c) = o.def.short {
+                node = node.with_short_alias(&format!("-{c}"), &o.def.name);
+            }
             if o.def.takes_value {
                 // The option's own completer wins; otherwise fall back to a
                 // shared resolver registered for that flag name.
@@ -787,6 +794,54 @@ mod tests {
         // Value completion: the --at resolver fires on ping.
         let at_vals = crate::complete(&tree, &["veks", "datasets", "ping", "--at", ""]);
         assert_eq!(at_vals, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    /// A short flag at the previous-word position must value-complete
+    /// exactly like its long form. The value-position branch used to
+    /// require a `--` prefix on the previous word, so `attach -c
+    /// <TAB>` silently fell through to flag/subcommand candidates.
+    #[test]
+    fn short_flag_value_completes_like_long_form() {
+        let spec = CommandSpec::new("veks").subcommand(
+            CommandSpec::new("attach")
+                .option(OptionSpec::new(OptionDef::value("--config").short('c')))
+                .option(OptionSpec::new(OptionDef::flag("--verbose").short('v'))),
+        );
+        let mut resolvers: std::collections::BTreeMap<String, crate::ValueProvider> =
+            std::collections::BTreeMap::new();
+        resolvers.insert(
+            "--config".to_string(),
+            crate::fn_provider(|p, _c| {
+                ["dev.yaml", "prod.yaml"].iter()
+                    .filter(|v| v.starts_with(p))
+                    .map(|v| v.to_string())
+                    .collect()
+            }),
+        );
+        let tree = build_completion_tree(&spec, &resolvers);
+
+        // Long and short forms produce identical value candidates.
+        let long_vals = crate::complete(&tree, &["veks", "attach", "--config", ""]);
+        let short_vals = crate::complete(&tree, &["veks", "attach", "-c", ""]);
+        assert_eq!(long_vals, vec!["dev.yaml".to_string(), "prod.yaml".to_string()]);
+        assert_eq!(short_vals, long_vals,
+            "short flag must value-complete like its long form");
+
+        // Prefix filtering flows through the short form too.
+        let filtered = crate::complete(&tree, &["veks", "attach", "-c", "pro"]);
+        assert_eq!(filtered, vec!["prod.yaml".to_string()]);
+
+        // A short BOOLEAN flag is not a value position — candidates
+        // are the node's flags, not values.
+        let after_bool = crate::complete(&tree, &["veks", "attach", "-v", "--"]);
+        assert!(after_bool.contains(&"--config".to_string()),
+            "boolean short must not open a value position: {after_bool:?}");
+
+        // An unregistered single-dash word (negative number value)
+        // is not mistaken for a flag.
+        let after_number = crate::complete(&tree, &["veks", "attach", "-5", "--"]);
+        assert!(after_number.contains(&"--config".to_string()),
+            "unregistered -word must not open a value position: {after_number:?}");
     }
 }
 
