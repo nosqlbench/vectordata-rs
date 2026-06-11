@@ -5015,7 +5015,7 @@ dependencies = [
 
 [[package]]
 name = "vectordata"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5059,7 +5059,7 @@ dependencies = [
 
 [[package]]
 name = "veks"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "arrow",
  "atty",
@@ -5170,7 +5170,7 @@ dependencies = [
 
 [[package]]
 name = "veks-pipeline"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "atty",
  "byteorder",
