@@ -128,7 +128,7 @@ pub fn offer_endpoint_catalogs(url: &str) {
         return;
     }
     for u in urls {
-        crate::config::add_catalog(&u);
+        crate::config::add_catalog(&u, None);
     }
 }
 

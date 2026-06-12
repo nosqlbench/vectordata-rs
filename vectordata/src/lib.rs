@@ -99,6 +99,10 @@ pub mod mounts;
 /// commands. Both the `vectordata` binary and the `veks` CLI dispatch
 /// here — there is no parallel implementation in either consumer.
 pub mod config;
+/// Throttled, opt-out update-availability notice backed by the
+/// GitHub Releases redirect (no API quota). Never blocks, never
+/// fails a command, never prints mid-run — see the module docs.
+pub mod update_check;
 /// Canonical implementation of `<binary> datasets …` subcommands.
 /// Both binaries dispatch into this module — there is exactly one
 /// implementation of each command.

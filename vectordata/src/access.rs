@@ -38,8 +38,10 @@ use std::path::Path;
 /// cache, subsequent classifications upgrade to `MerkleHashed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
-    /// Source is a local file. Reads are mmap-backed from the first
-    /// call; no download takes place.
+    /// Every byte is already on disk: a local source file
+    /// (mmap-backed reads), or a remote facet whose cache copy is
+    /// complete — a finished download, or a chunk-store file with a
+    /// fully valid bitmap. Either way, no download takes place.
     Local,
 
     /// Remote source with a published `.mref`. Chunks download on
@@ -127,17 +129,20 @@ impl AccessMode {
         }
     }
 
-    /// Long human-readable description suitable for the detail panel.
+    /// Human-readable description for the detail panel. Kept under
+    /// ~55 display columns so the picker's bottom panel line
+    /// (`" access: "` prefix included) fits an 80-column terminal
+    /// without truncating or wrapping.
     pub fn description(self) -> &'static str {
         match self {
             AccessMode::Local =>
-                "local — mmap-backed; no download",
+                "local — fully on disk; no download",
             AccessMode::MerkleHashed =>
-                "merkle-hashed — sparse remote access, chunks verified against published .mref",
+                "hashed — sparse chunks, merkle-verified",
             AccessMode::MerkleChunked =>
-                "merkle-chunked — sparse remote access, local chunk sidecar, no per-chunk verification",
+                "chunked — sparse chunks, TLS trust only",
             AccessMode::FullTransfer =>
-                "full-transfer — entire file must download before first use",
+                "full-transfer — whole file downloads first",
         }
     }
 }

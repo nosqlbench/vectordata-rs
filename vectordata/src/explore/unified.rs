@@ -317,6 +317,7 @@ pub(super) enum ExploreExit {
 
 pub(super) fn run_interactive_explore(
     source: &str, sample_size: usize, seed: u64, sample_mode: SampleMode,
+    start_palette: super::palette::Palette, start_curve: super::palette::Curve,
 ) -> ExploreExit {
     eprintln!("Opening {}...", source);
     let reader = UnifiedReader::open(source);
@@ -377,14 +378,13 @@ pub(super) fn run_interactive_explore(
     let mut loadings_band_size: usize = 0;   // 0 = auto-fit to terminal height
     let mut loadings_scroll: usize = 0;      // vertical scroll offset (band index)
     let mut eigen_sub_mode: usize = 0;       // 0=scree, 1=cumvar, 2=log decay
-    // Color palette + intensity curve for the 4D/5D PCA scatter, where
-    // PC4 drives point hue. Default to Turbo — its 9-stop perceptual
-    // ramp keeps every bin sharply distinct, which is exactly what the
-    // 4D scatter needs to make the PC4 dimension read clearly. Press
-    // `p` to cycle to other palettes (BlueOrange etc) when sign-aware
+    // Color palette + intensity curve for the 4D/5D PCA scatter,
+    // where PC4 drives point hue. Starts from the session's resolved
+    // pair (settings/flags; standard Turbo/Square); press `p` to
+    // cycle to other palettes (BlueOrange etc) when sign-aware
     // diverging is more useful.
-    let mut palette = super::palette::Palette::Turbo;
-    let mut curve = super::palette::Curve::Linear;
+    let mut palette = start_palette;
+    let mut curve = start_curve;
 
     // ── Computation state (persists across restarts — old data stays visible) ──
     let mut compute_start;
@@ -417,6 +417,8 @@ pub(super) fn run_interactive_explore(
     let mut frame_count: usize = 0;
     let mut restart;
     let mut exit_reason = ExploreExit::Quit;
+    // Theme-save confirmation, appended to the status line briefly.
+    let mut save_flash: Option<(String, Instant)> = None;
     // read_rx lives across restarts — reassigned each iteration
     let mut read_rx: mpsc::Receiver<ReadBatch>;
 
@@ -853,6 +855,13 @@ pub(super) fn run_interactive_explore(
             let t = *final_elapsed.get_or_insert(elapsed);
             format!("  Ready — {} vectors, {:.1}s total", vectors_loaded, t)
         };
+        if let Some((msg, at)) = &save_flash {
+            if at.elapsed() < std::time::Duration::from_secs(4) {
+                status_msg.push_str(&format!("  [{msg}]"));
+            } else {
+                save_flash = None;
+            }
+        }
 
         // ── Stats line for current view ──
         let stats_line = match view_mode {
@@ -957,6 +966,7 @@ pub(super) fn run_interactive_explore(
                     Line::from("   Esc (while loading)             Stop in-flight processing"),
                     Line::from("   Esc (when idle)                 Return to the dataset picker"),
                     Line::from("   q / Ctrl-C                      Quit immediately (no picker)"),
+                    Line::from("   Ctrl-S                          Save palette/curve to settings as default theme"),
                 ];
                 // View-specific keys
                 let view_keys: Vec<Line> = match view_mode {
@@ -1081,6 +1091,19 @@ pub(super) fn run_interactive_explore(
             match event::read().unwrap() {
                 Event::Key(key) => {
                     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { break; }
+                    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                        // Save the active palette/curve as the user's
+                        // default theme. Cycling keys ('p'/'f') write
+                        // through to the session theme; this persists
+                        // it.
+                        super::set_theme(palette, curve);
+                        save_flash = Some((match super::save_theme_to_settings() {
+                            Ok(path) => format!("saved theme ({}/{}) to {}",
+                                palette.name(), curve.name(), path.display()),
+                            Err(e) => format!("theme save failed: {e}"),
+                        }, Instant::now()));
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') => {
                             exit_reason = ExploreExit::Quit;
@@ -1220,9 +1243,13 @@ pub(super) fn run_interactive_explore(
                         // continuous quantity (PC4) to color.
                         KeyCode::Char('p') if view_mode == V_PCA => {
                             palette = palette.next();
+                            // Write through: the chrome theme and the
+                            // data colors track the same pair.
+                            super::set_theme(palette, curve);
                         }
                         KeyCode::Char('f') if view_mode == V_PCA => {
                             curve = curve.next();
+                            super::set_theme(palette, curve);
                         }
                         KeyCode::Char('X') if view_mode == V_PCA => {
                             let tmp = pc_axes[3];

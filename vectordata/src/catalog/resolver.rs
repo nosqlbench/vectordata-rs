@@ -29,12 +29,26 @@ impl Catalog {
     pub fn of(sources: &CatalogSources) -> Self {
         let mut entries = Vec::new();
 
-        for location in sources.required() {
-            load_catalog_entries(location, &mut entries, true);
+        let load_named = |src: &super::sources::NamedCatalogSource,
+                              entries: &mut Vec<CatalogEntry>,
+                              required: bool| {
+            let before = entries.len();
+            load_catalog_entries(&src.location, entries, required);
+            // Stamp every entry this source contributed with the
+            // catalog's symbolic name so downstream surfaces (the
+            // picker's catalog toggle screen, listings) can group
+            // and filter by catalog.
+            for e in entries[before..].iter_mut() {
+                e.catalog_name = Some(src.name.clone());
+            }
+        };
+
+        for src in sources.required() {
+            load_named(src, &mut entries, true);
         }
 
-        for location in sources.optional() {
-            load_catalog_entries(location, &mut entries, false);
+        for src in sources.optional() {
+            load_named(src, &mut entries, false);
         }
 
         Catalog { entries }
@@ -487,6 +501,7 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
             dataset_type,
             layout,
             catalog_file: None,
+            catalog_name: None,
         })
     } else {
         // Direct entry — attributes and profiles at top level (e.g. HDF5 datasets)
@@ -527,6 +542,7 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
                 profiles,
             },
             catalog_file: None,
+            catalog_name: None,
         })
     }
 }
@@ -669,6 +685,7 @@ mod tests {
             path: format!("{}/dataset.yaml", name),
             dataset_type: "dataset.yaml".to_string(),
             catalog_file: None,
+            catalog_name: None,
             layout: CatalogLayout {
                 attributes: None,
                 profiles: crate::dataset::DSProfileGroup::from_profiles(profile_group),

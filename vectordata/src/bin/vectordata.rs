@@ -50,9 +50,8 @@ const LONG_VERSION: &str = concat!(
     long_about = "vectordata — the user-facing entry point for working with \
                   published vector-search benchmark datasets.\n\n\
                   Common starting points:\n  \
-                  • `vectordata datasets`          — TUI browser of every reachable dataset\n  \
+                  • `vectordata explore`           — interactive dataset picker + visualizer\n  \
                   • `vectordata datasets list`     — text catalog listing\n  \
-                  • `vectordata explore`           — interactive value/distance explorer\n  \
                   • `vectordata config get`        — review the active configuration\n  \
                   • `vectordata cache list`        — see what's on disk\n\n\
                   First-time users typically start by configuring a catalog source \
@@ -76,20 +75,27 @@ enum Cmd {
         #[command(subcommand)]
         command: ConfigCmd,
     },
-    /// Operations on catalog-published datasets. With no
-    /// subcommand, launches an interactive TUI browser of every
-    /// dataset reachable through the configured catalogs.
+    /// Operations on catalog-published datasets. Run bare to see
+    /// the available subcommands; for interactive browsing and
+    /// visualization use `vectordata explore`.
     Datasets {
         #[command(subcommand)]
         command: Option<DatasetsCmd>,
+        // The three globals below are declared here so the flags
+        // are accepted between `datasets` and its subcommand; the
+        // values the dispatch arms read come from each subcommand's
+        // own fields.
+        #[allow(dead_code)]
         /// (TUI-mode only) Configuration directory containing catalogs.yaml.
         #[arg(long, default_value_t = vectordata::catalog::sources::config_dir(), global = true)]
         configdir: String,
         /// (TUI-mode only) Additional catalog directories, file paths, or HTTP URLs.
         #[arg(long, global = true)]
+        #[allow(dead_code)]
         catalog: Vec<String>,
         /// (TUI-mode only) Catalog URLs or paths to use *instead* of configured catalogs.
         #[arg(long = "at", global = true)]
+        #[allow(dead_code)]
         at: Vec<String>,
     },
     /// Unified vector space explorer — norms, distances, eigenvalues,
@@ -421,6 +427,10 @@ enum CatalogCmd {
     Add {
         /// Catalog URL or path (e.g. https://host/path/ or /local/path).
         source: String,
+        /// Symbolic name for the catalog (map key in catalogs.yaml).
+        /// Derived from the location when omitted.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Remove a catalog source (by URL/path or `--at <index>`).
     #[command(alias = "rm")]
@@ -461,7 +471,13 @@ fn complete_config_set(partial: &str, ctx: &[&str]) -> Vec<String> {
     let positionals: Vec<&str> =
         ctx.iter().copied().filter(|w| !w.starts_with('-')).collect();
     let mut out: Vec<String> = match positionals.first() {
-        None => vec!["cache".to_string()],
+        None => vec!["cache".to_string(), "palette".to_string(), "curve".to_string(),
+                     "update_check".to_string()],
+        Some(&"palette") =>
+            vectordata::config::ui_palette_names().iter().map(|s| s.to_string()).collect(),
+        Some(&"curve") =>
+            vectordata::config::ui_curve_names().iter().map(|s| s.to_string()).collect(),
+        Some(&"update_check") => vec!["on".to_string(), "off".to_string()],
         Some(&"cache") => {
             let mut vals = vec!["auto".to_string()];
             if let Some(home) = std::env::var_os("HOME") {
@@ -485,13 +501,20 @@ fn complete_config_set(partial: &str, ctx: &[&str]) -> Vec<String> {
 /// Tab-completion for `config get <key>` — the same key set as
 /// `config set`.
 fn complete_config_get(partial: &str, _ctx: &[&str]) -> Vec<String> {
-    ["cache"].iter()
+    ["cache", "palette", "curve", "update_check"].iter()
         .filter(|k| partial.is_empty() || k.starts_with(partial))
         .map(|k| k.to_string())
         .collect()
 }
 
 fn main() {
+    // Detached update-probe child (see update_check module docs):
+    // marked by an internal env var, does one fetch + state write,
+    // and exits before any CLI machinery runs.
+    if vectordata::update_check::run_probe_child_if_marked() {
+        return;
+    }
+
     let spec = Cli::veks_command_spec("vectordata");
 
     // Dynamic-completion entry: when invoked with `COMPLETE=<shell>` (or
@@ -533,6 +556,13 @@ fn main() {
         eprintln!("vectordata: {e}");
         std::process::exit(2);
     });
+    // After parsing only — completion, --help, --version, and
+    // malformed invocations never reach the update check. Prints a
+    // cached notice instantly (if any) and refreshes in a detached
+    // background thread at most once a day; `config set
+    // update_check off`, VECTORDATA_NO_UPDATE_CHECK, CI, or a
+    // non-terminal stderr each disable it entirely.
+    vectordata::update_check::startup(env!("CARGO_PKG_VERSION"));
     match cli.command {
         Cmd::Cache { command } => match command {
             CacheCmd::List { cache_dir, verbose } => cmd_cache_list(cache_dir, verbose),
@@ -543,11 +573,16 @@ fn main() {
                 cmd_cache_prune(cache_dir, dataset, dry_run)
             }
         },
-        Cmd::Datasets { command, configdir, catalog, at } => {
-            // No subcommand → TUI browser. The `Option<DatasetsCmd>`
-            // shape makes `vectordata datasets` valid on its own.
+        Cmd::Datasets { command, configdir: _, catalog: _, at: _ } => {
+            // No subcommand → describe the subcommands, nothing
+            // else. The interactive surface is `vectordata explore`;
+            // launching a TUI from a bare noun command was a
+            // surprise, not a feature.
             let Some(command) = command else {
-                std::process::exit(vectordata::datasets::browser::run(&configdir, &catalog, &at));
+                print!("{}", vcli::render_help_for(&spec, &["datasets".to_string()]));
+                println!();
+                println!("For interactive browsing and visualization, use: vectordata explore");
+                std::process::exit(0);
             };
             let code = match command {
                 DatasetsCmd::List(args) =>
@@ -577,21 +612,26 @@ fn main() {
                 ConfigCmd::Get { key } => match key.as_deref() {
                     None => vectordata::config::show(),
                     Some("cache") => vectordata::config::get_cache(),
+                    Some(k @ ("palette" | "curve")) => vectordata::config::get_ui_setting(k),
+                    Some("update_check") => vectordata::config::get_update_check(),
                     Some(other) => {
-                        eprintln!("unknown config key '{other}' (try `config get cache`, or `config get` for all)");
+                        eprintln!("unknown config key '{other}' (keys: cache, palette, curve, update_check; or `config get` for all)");
                         2
                     }
                 },
                 ConfigCmd::Set { key, value, force } => match key.as_str() {
                     "cache" => vectordata::config::set_cache(std::path::Path::new(&value), force),
+                    k @ ("palette" | "curve") => vectordata::config::set_ui_setting(k, &value),
+                    "update_check" => vectordata::config::set_update_check(&value),
                     other => {
-                        eprintln!("unknown config key '{other}' (settable keys: cache)");
+                        eprintln!("unknown config key '{other}' (settable keys: cache, palette, curve, update_check)");
                         2
                     }
                 },
                 ConfigCmd::Mounts { all } => vectordata::config::list_mounts(all),
                 ConfigCmd::Catalog { command } => match command {
-                    CatalogCmd::Add { source } => vectordata::config::add_catalog(&source),
+                    CatalogCmd::Add { source, name } =>
+                        vectordata::config::add_catalog(&source, name.as_deref()),
                     CatalogCmd::Remove { source, at } => match (source, at) {
                         (Some(s), _) => vectordata::config::remove_catalog(
                             vectordata::config::RemoveCatalogSpec::Source(&s)),

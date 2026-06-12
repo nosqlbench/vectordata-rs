@@ -144,7 +144,34 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, profile_name: &str
             Ok(storage) => {
                 let size = storage.total_size();
                 let locality = if storage.is_local() { " local" } else { " remote" };
-                println!("OK{} ({})", locality, format_size(size));
+                // Read the first record's header — proving the bytes
+                // are actually servable (an open alone only proves
+                // metadata), and reporting basic shape for uniform
+                // facets. Side effect on remote storage: the covering
+                // chunk lands in the cache, so the picker's survey
+                // can show this dataset's size from now on.
+                let shape = match storage.read_prefix(4) {
+                    Ok(hdr) if hdr.len() == 4 => {
+                        let dim = i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+                        let ext = source.rsplit('.').next().unwrap_or("");
+                        let elem = crate::io::infer_elem_size(ext);
+                        if dim > 0 && dim <= 1_000_000 && elem > 0 && !crate::io::is_vvec_ext(ext) {
+                            let bpr = 4 + dim as u64 * elem as u64;
+                            format!(", dim={dim}, ~{} records", size / bpr)
+                        } else if dim > 0 && dim <= 1_000_000 {
+                            format!(", dim={dim}")
+                        } else {
+                            String::new()
+                        }
+                    }
+                    Ok(_) => String::new(),
+                    Err(e) => {
+                        println!("FAILED reading first record: {e}");
+                        fail += 1;
+                        continue;
+                    }
+                };
+                println!("OK{} ({}{})", locality, format_size(size), shape);
                 pass += 1;
             }
             Err(e) => {

@@ -77,6 +77,12 @@ pub struct CatalogEntry {
     /// provenance, not catalog content.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub catalog_file: Option<String>,
+    /// Symbolic name of the configured catalog this entry came from
+    /// (`catalogs.yaml` map key, or the synthesized `catalog-N`).
+    /// Resolver-side provenance like `catalog_file`; never
+    /// serialized.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub catalog_name: Option<String>,
     /// Embedded dataset configuration (attributes + profiles).
     pub layout: CatalogLayout,
 }

@@ -573,6 +573,16 @@ impl FacetStorage {
     pub(crate) fn new(storage: std::sync::Arc<crate::storage::Storage>) -> Self {
         Self { storage }
     }
+
+    /// Read the first `len` bytes of the facet (clamped to its size).
+    /// Crate-internal shape probe: pulls the covering chunk on remote
+    /// storage, which is exactly what `datasets ping` wants — after a
+    /// ping, the cache survey can derive record counts from the now-
+    /// resident header.
+    pub(crate) fn read_prefix(&self, len: u64) -> std::io::Result<Vec<u8>> {
+        let len = len.min(self.total_size());
+        self.storage.read_bytes(0, len)
+    }
     /// Drive this facet to fully-resident, zero-copy state.
     /// **Strict**: returns `Err` on any failure — never silently
     /// leaves the facet in a partially-resident state. After

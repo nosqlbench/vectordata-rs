@@ -675,7 +675,7 @@ mod tests {
             &["https://example.com/catalog".to_string()],
         );
         // --at should take precedence, required should contain the at URL
-        assert!(sources.required().iter().any(|s| s.contains("example.com")));
+        assert!(sources.required().iter().any(|s| s.location.contains("example.com")));
     }
 
     #[test]

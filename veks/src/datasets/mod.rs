@@ -545,7 +545,7 @@ fn run_config_command(command: ConfigSubcommand) {
         },
         ConfigSubcommand::Mounts { all } => vectordata::config::list_mounts(all),
         ConfigSubcommand::Catalog { command } => match command {
-            ConfigCatalogSubcommand::Add { source } => vectordata::config::add_catalog(&source),
+            ConfigCatalogSubcommand::Add { source } => vectordata::config::add_catalog(&source, None),
             ConfigCatalogSubcommand::Remove { source, index } => match (source, index) {
                 (Some(s), _) => vectordata::config::remove_catalog(
                     vectordata::config::RemoveCatalogSpec::Source(&s)),

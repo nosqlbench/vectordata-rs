@@ -515,6 +515,7 @@ mod tests {
             path: "https://example.com/datasets/vecs1m/dataset.yaml".to_string(),
             dataset_type: "dataset.yaml".to_string(),
             catalog_file: None,
+            catalog_name: None,
             layout,
         };
         let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
@@ -541,6 +542,7 @@ mod tests {
             path: "s3://vector-datasets-public/datasets-clean".to_string(),
             dataset_type: "knn_entries.yaml".to_string(),
             catalog_file: None,
+            catalog_name: None,
             layout,
         };
         let group = TestDataGroup::from_catalog_entry(&entry).unwrap();

@@ -185,6 +185,7 @@ pub fn parse_knn_entries_yaml(
             // Set by the resolver, which knows which document this
             // catalog came from; the parser only sees its content.
             catalog_file: None,
+            catalog_name: None,
             // For knn_entries-shaped catalogs there's no per-dataset
             // dataset.yaml — the synthesized layout *is* the
             // dataset description. Point the path at the catalog

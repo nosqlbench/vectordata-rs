@@ -14,7 +14,7 @@
 
 pub mod shared;
 mod dataset_picker;
-mod palette;
+pub(crate) mod palette;
 mod unified;
 
 /// Resolve the configured cache directory or exit the process with a
@@ -46,6 +46,95 @@ pub(crate) fn seeded_rng(seed: u64) -> rand_xoshiro::Xoshiro256PlusPlus {
 
 pub use shared::SampleMode;
 
+/// Session UI theme, derived from the active (palette, curve) pair.
+/// Initialized from settings/flags by [`run`] and mutable at runtime
+/// — the picker's settings screen (Ctrl-G) and the explorer's
+/// `p`/`f` cycles write through here so one pair themes everything
+/// live. Consumers that render before initialization get the
+/// resolution chain (settings → project standard).
+#[allow(clippy::type_complexity)]
+static THEME_STATE: std::sync::RwLock<Option<(palette::Palette, palette::Curve, palette::Theme)>> =
+    std::sync::RwLock::new(None);
+
+pub(crate) fn theme() -> palette::Theme {
+    if let Some((_, _, t)) = *THEME_STATE.read().unwrap() {
+        return t;
+    }
+    let (p, c) = resolve_palette_curve(None, None);
+    set_theme(p, c);
+    palette::Theme::derive(p, c)
+}
+
+/// Replace the session theme. The derived chrome is cached alongside
+/// the pair so `theme()` is a lock-read + copy.
+pub(crate) fn set_theme(p: palette::Palette, c: palette::Curve) {
+    *THEME_STATE.write().unwrap() = Some((p, c, palette::Theme::derive(p, c)));
+}
+
+/// The active (palette, curve) pair, initializing on first use.
+pub(crate) fn theme_palette_curve() -> (palette::Palette, palette::Curve) {
+    if let Some((p, c, _)) = *THEME_STATE.read().unwrap() {
+        return (p, c);
+    }
+    let (p, c) = resolve_palette_curve(None, None);
+    set_theme(p, c);
+    (p, c)
+}
+
+/// Persist the active (palette, curve) pair to `settings.yaml` as the
+/// user's default theme — the "save theme" action on the picker's
+/// settings screen (Ctrl-G) and behind Ctrl-S in the explorer.
+/// Comment-preserving line edits.
+pub(crate) fn save_theme_to_settings() -> Result<std::path::PathBuf, String> {
+    let (p, c) = theme_palette_curve();
+    crate::settings::write_setting("palette", p.name())?;
+    crate::settings::write_setting("curve", c.name())
+}
+
+/// "Reset Display Options": remove the display-related settings keys
+/// (`palette`, `curve`, `disabled_columns`) so the project standard
+/// applies again, and reset the session theme to match. Catalog
+/// enablement is data scope, not display — deliberately untouched.
+pub(crate) fn reset_display_options() -> Result<(), String> {
+    crate::settings::remove_setting("palette")?;
+    crate::settings::remove_setting("curve")?;
+    crate::settings::remove_setting("disabled_columns")?;
+    set_theme(palette::Palette::default(), palette::Curve::default());
+    Ok(())
+}
+
+/// Resolve the (palette, curve) pair: CLI flag > settings.yaml key >
+/// project standard. Unknown names warn and fall through so a typo'd
+/// setting degrades to the standard instead of breaking the UI.
+pub(crate) fn resolve_palette_curve(
+    flag_palette: Option<&str>,
+    flag_curve: Option<&str>,
+) -> (palette::Palette, palette::Curve) {
+    let parse_p = |s: &str, origin: &str| {
+        palette::Palette::parse(s).or_else(|| {
+            eprintln!("warning: unknown palette '{s}' ({origin}); valid: {}. Using standard.",
+                palette::ALL_PALETTES.iter().map(|p| p.name()).collect::<Vec<_>>().join(", "));
+            None
+        })
+    };
+    let parse_c = |s: &str, origin: &str| {
+        palette::Curve::parse(s).or_else(|| {
+            eprintln!("warning: unknown curve '{s}' ({origin}); valid: {}. Using standard.",
+                palette::ALL_CURVES.iter().map(|c| c.name()).collect::<Vec<_>>().join(", "));
+            None
+        })
+    };
+    let p = flag_palette.and_then(|s| parse_p(s, "--palette"))
+        .or_else(|| crate::settings::setting_value("palette")
+            .and_then(|s| parse_p(&s, "settings.yaml")))
+        .unwrap_or_default();
+    let c = flag_curve.and_then(|s| parse_c(s, "--curve"))
+        .or_else(|| crate::settings::setting_value("curve")
+            .and_then(|s| parse_c(&s, "settings.yaml")))
+        .unwrap_or_default();
+    (p, c)
+}
+
 /// Unified vector space explorer — norms, distances, eigenvalues, PCA
 /// in one TUI. Run without any source flag to pop the catalog picker.
 #[derive(veks_completion_derive::VeksCli)]
@@ -73,6 +162,14 @@ pub struct ExploreArgs {
     /// (best coverage, one chunk download per vector when remote).
     #[arg(long, default_value = "clumped", value_parser = ["streaming", "clumped", "sparse"])]
     pub sample_mode: SampleMode,
+    /// Color palette for visualization AND the UI theme (overrides
+    /// the `palette:` settings key; standard: turbo).
+    #[arg(long)]
+    pub palette: Option<String>,
+    /// Intensity curve for visualization AND the UI theme (overrides
+    /// the `curve:` settings key; standard: square).
+    #[arg(long)]
+    pub curve: Option<String>,
 }
 
 /// Resolve the data source from mutually exclusive --dataset / --source options.
@@ -125,51 +222,44 @@ pub fn run(args: ExploreArgs) -> i32 {
         original_hook(info);
     }));
 
-    let ExploreArgs { dataset, source, profile, sample, seed, sample_mode } = args;
+    let ExploreArgs { dataset, source, profile, sample, seed, sample_mode, palette: palette_flag, curve: curve_flag } = args;
+    // Resolve the theme once for the whole session — the picker's
+    // chrome and the explorer's data colors derive from the same
+    // (palette, curve) pair.
+    let (resolved_palette, resolved_curve) =
+        resolve_palette_curve(palette_flag.as_deref(), curve_flag.as_deref());
+    set_theme(resolved_palette, resolved_curve);
 
     // Non-interactive path: explicit source or dataset → straight to
     // the explorer, no picker, no menu.
     if dataset.is_some() || source.is_some() {
         let src = resolve_input(dataset, source, profile)
             .expect("guarded above: at least one of --dataset/--source is set here");
-        return match unified::run_interactive_explore(&src, sample, seed, sample_mode) {
+        return match unified::run_interactive_explore(&src, sample, seed, sample_mode, resolved_palette, resolved_curve) {
             unified::ExploreExit::Quit | unified::ExploreExit::Back => 0,
         };
     }
 
     // Interactive path: picker owns the loop and dispatches actions
     // inline. Visualize → Quit exits the picker too; Visualize → Back
-    // keeps the picker open. precache/purge/ping always return to the
-    // picker so the user can chain operations. Locate buffers one
-    // line per dataset and exits the picker after the last selected
-    // item — the lines print to stdout only after the picker's
-    // alternate screen is gone, so they survive on the terminal (and
-    // pipe cleanly into `cd $(...)`-style use).
-    let mut located: Vec<String> = Vec::new();
+    // keeps the picker open. locate/download/purge/ping always return
+    // to the picker so the user can chain operations.
     let dispatch = |specifier: &str, action: PickerAction, pause: bool| -> ActionFlow {
         match action {
             PickerAction::Visualize => {
                 // Interactive viewer — `pause` is irrelevant; the
                 // viewer owns the terminal until the user exits it.
                 let _ = pause;
-                match unified::run_interactive_explore(specifier, sample, seed, sample_mode) {
+                match unified::run_interactive_explore(specifier, sample, seed, sample_mode, resolved_palette, resolved_curve) {
                     unified::ExploreExit::Quit => ActionFlow::Exit,
                     unified::ExploreExit::Back => ActionFlow::Stay,
                 }
             }
             PickerAction::Locate => {
-                let line = locate_line(specifier, &cache_dir_or_exit());
-                if !located.contains(&line) {
-                    located.push(line);
-                }
-                // `pause` doubles as "this is the last item of the
-                // batch" (always true for single dispatch): exit so
-                // the buffered lines print beneath the restored
-                // terminal instead of being swallowed by the
-                // picker's alternate screen.
-                if pause { ActionFlow::Exit } else { ActionFlow::Stay }
+                run_locate(specifier, pause);
+                ActionFlow::Stay
             }
-            PickerAction::Precache => {
+            PickerAction::Download => {
                 run_precache(specifier, pause);
                 ActionFlow::Stay
             }
@@ -191,27 +281,37 @@ pub fn run(args: ExploreArgs) -> i32 {
             }
         }
     };
-    let outcome = dataset_picker::run_picker(dispatch);
-    for line in &located {
-        println!("{line}");
-    }
-    match outcome {
+    match dataset_picker::run_picker(dispatch) {
         PickerOutcome::Done => 0,
         PickerOutcome::Failed => 1,
     }
 }
 
-/// One stdout line for the Locate action: the dataset's cache
-/// directory when it exists, otherwise a `#`-commented note so
-/// shell consumers can filter real paths with `grep -v '^#'`.
-fn locate_line(specifier: &str, cache_root: &std::path::Path) -> String {
+/// The Locate action: print the dataset's cache location with the
+/// picker's chrome suspended, then return to the picker (pausing
+/// after the last item like every other action). Output is
+/// shell-friendly — a `#`-commented header per dataset and either
+/// the bare path or a commented not-cached note, so real paths
+/// filter out with `grep -v '^#'`.
+fn run_locate(specifier: &str, pause: bool) {
+    for line in locate_lines(specifier, &cache_dir_or_exit()) {
+        println!("{line}");
+    }
+    if pause { pause_for_keypress(); }
+}
+
+/// Pure body of [`run_locate`].
+fn locate_lines(specifier: &str, cache_root: &std::path::Path) -> Vec<String> {
     let (dataset, _profile) = split_specifier(specifier);
     let dir = cache_root.join(dataset);
-    if dir.is_dir() {
-        dir.display().to_string()
-    } else {
-        format!("# {dataset}: not cached")
-    }
+    vec![
+        format!("# location of {dataset} on local system:"),
+        if dir.is_dir() {
+            dir.display().to_string()
+        } else {
+            format!("# {dataset}: not cached")
+        },
+    ]
 }
 
 /// Split a `dataset:profile` specifier. Profile defaults to `default`.
@@ -304,7 +404,7 @@ fn run_purge(specifier: &str, pause: bool) {
     if pause { pause_for_keypress(); }
 }
 
-fn format_bytes_short(n: u64) -> String {
+pub(crate) fn format_bytes_short(n: u64) -> String {
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
     const KIB: u64 = 1 << 10;
@@ -340,20 +440,26 @@ fn run_ping(specifier: &str, pause: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::locate_line;
+    use super::locate_lines;
 
-    /// Locate prints the dataset's cache directory when present, and
-    /// a `#`-commented note when not — so shell consumers can filter
-    /// real paths with `grep -v '^#'`.
+    /// Locate prints a commented per-dataset header, then the cache
+    /// directory when present or a `#`-commented note when not — so
+    /// shell consumers can filter real paths with `grep -v '^#'`.
     #[test]
-    fn locate_line_path_or_commented_note() {
+    fn locate_lines_header_then_path_or_note() {
         let tmp = tempfile::tempdir().unwrap();
         let cached = tmp.path().join("ds-a");
         std::fs::create_dir_all(&cached).unwrap();
 
-        assert_eq!(locate_line("ds-a:default", tmp.path()), cached.display().to_string());
+        assert_eq!(locate_lines("ds-a:default", tmp.path()), vec![
+            "# location of ds-a on local system:".to_string(),
+            cached.display().to_string(),
+        ]);
         // Profile suffix is irrelevant — the cache is dataset-keyed.
-        assert_eq!(locate_line("ds-a:100k", tmp.path()), cached.display().to_string());
-        assert_eq!(locate_line("ds-b:default", tmp.path()), "# ds-b: not cached");
+        assert_eq!(locate_lines("ds-a:100k", tmp.path())[1], cached.display().to_string());
+        assert_eq!(locate_lines("ds-b:default", tmp.path()), vec![
+            "# location of ds-b on local system:".to_string(),
+            "# ds-b: not cached".to_string(),
+        ]);
     }
 }

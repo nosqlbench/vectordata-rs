@@ -8,7 +8,7 @@
 //! offer the same set of palettes — including color-blind-safe options.
 
 /// 24-bit RGB triple. Sized to match `ratatui::style::Color::Rgb`.
-pub(super) type Rgb = (u8, u8, u8);
+pub(crate) type Rgb = (u8, u8, u8);
 
 /// Diverging-vs-sequential color palettes, including options chosen
 /// for accessibility under the three common forms of color-vision
@@ -18,8 +18,14 @@ pub(super) type Rgb = (u8, u8, u8);
 /// their own gradient table so the eye reads many distinct hues
 /// across the range — the right shape for scatter plots where
 /// every bin should be unambiguous.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Palette {
+// Project standard for color-mapped visualization: **Turbo /
+// Square** (see also `Curve`). Turbo's 9-stop perceptual ramp keeps
+// every bin sharply distinct; the Square curve suppresses the noisy
+// low end so structure stands out. Every visualization that takes a
+// palette + curve starts from these defaults — cycle away
+// interactively, but the standard is the default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Palette {
     /// Classic blue ↔ red diverging. High contrast, but red↔green
     /// confusion is the most common form of color blindness — avoid
     /// for accessibility-critical displays.
@@ -41,6 +47,7 @@ pub(super) enum Palette {
     /// jet/HSV scatter palettes. Walks dark-purple → blue → teal →
     /// green → yellow → orange → dark-red, so every bin is sharply
     /// distinct. Default for the PCA scatter.
+    #[default]
     Turbo,
     /// Saturated spectrum / hue ramp (red → orange → yellow → green →
     /// cyan → blue → violet). Maximum hue separation between bins;
@@ -49,7 +56,7 @@ pub(super) enum Palette {
 }
 
 impl Palette {
-    pub(super) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Palette::BlueRed    => "blue-red",
             Palette::BlueOrange => "blue-orange (cb-safe)",
@@ -61,7 +68,7 @@ impl Palette {
         }
     }
 
-    pub(super) fn next(self) -> Self {
+    pub(crate) fn next(self) -> Self {
         match self {
             Palette::BlueOrange => Palette::BlueYellow,
             Palette::BlueYellow => Palette::Cividis,
@@ -77,7 +84,7 @@ impl Palette {
     /// Multi-stop palettes (Turbo, Spectrum) override `sample()`, so the
     /// triple returned here is only used for `is_sequential` callers
     /// that still want a coarse "extreme" color (e.g. a legend swatch).
-    pub(super) fn anchors(self) -> (Rgb, Rgb, Rgb) {
+    pub(crate) fn anchors(self) -> (Rgb, Rgb, Rgb) {
         match self {
             Palette::BlueRed    => ((60, 130, 255), (160, 160, 160), (235, 80,  60)),
             Palette::BlueOrange => ((45, 110, 220), (200, 200, 200), (240, 145, 30)),
@@ -97,14 +104,14 @@ impl Palette {
     /// decide whether to flip the cold/hot anchor for sign. Turbo and
     /// Spectrum are sequential — they're scatter palettes where the
     /// whole range is one continuous hue progression.
-    pub(super) fn is_sequential(self) -> bool {
+    pub(crate) fn is_sequential(self) -> bool {
         matches!(self, Palette::Cividis | Palette::Turbo | Palette::Spectrum)
     }
 
     /// Sample this palette at `t ∈ [0,1]`. Diverging palettes bend
     /// through neutral at `t = 0.5`; multi-stop palettes interpolate
     /// across their full gradient table.
-    pub(super) fn sample(self, t: f64) -> Rgb {
+    pub(crate) fn sample(self, t: f64) -> Rgb {
         let t = t.clamp(0.0, 1.0);
         match self {
             Palette::Turbo    => sample_stops(t, &TURBO_STOPS),
@@ -167,20 +174,21 @@ fn sample_stops(t: f64, stops: &[(f64, Rgb)]) -> Rgb {
 }
 
 /// Reshapes a normalized magnitude `t ∈ [0,1]` before palette lookup.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Curve {
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Curve {
     /// Identity.
     Linear,
     /// `sqrt(t)`. Boosts the low end.
     Sqrt,
     /// `t²`. Suppresses the low end.
+    #[default]
     Square,
     /// Logistic centered on `t = 0.5`.
     Sigmoid,
 }
 
 impl Curve {
-    pub(super) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Curve::Linear  => "linear",
             Curve::Sqrt    => "sqrt",
@@ -188,7 +196,7 @@ impl Curve {
             Curve::Sigmoid => "sigmoid",
         }
     }
-    pub(super) fn next(self) -> Self {
+    pub(crate) fn next(self) -> Self {
         match self {
             Curve::Linear  => Curve::Sqrt,
             Curve::Sqrt    => Curve::Square,
@@ -196,7 +204,7 @@ impl Curve {
             Curve::Sigmoid => Curve::Linear,
         }
     }
-    pub(super) fn apply(self, t: f64) -> f64 {
+    pub(crate) fn apply(self, t: f64) -> f64 {
         let t = t.clamp(0.0, 1.0);
         match self {
             Curve::Linear  => t,
@@ -222,8 +230,138 @@ fn lerp_rgb(a: Rgb, b: Rgb, t: f64) -> Rgb {
     (blend(a.0, b.0), blend(a.1, b.1), blend(a.2, b.2))
 }
 
+impl Palette {
+    /// Canonical short name — the config/CLI token (`palette: turbo`).
+    /// Unlike `label()` (a display string with annotations), this is
+    /// stable, lowercase, and round-trips through [`Palette::parse`].
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Palette::BlueRed    => "blue-red",
+            Palette::BlueOrange => "blue-orange",
+            Palette::BlueYellow => "blue-yellow",
+            Palette::Cividis    => "cividis",
+            Palette::Mono       => "mono",
+            Palette::Turbo      => "turbo",
+            Palette::Spectrum   => "spectrum",
+        }
+    }
+
+    /// Parse a canonical palette name (case-insensitive). `None` for
+    /// unknown names — callers surface the valid set via
+    /// [`ALL_PALETTES`].
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        ALL_PALETTES.iter().copied().find(|p| p.name().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// Every palette, in cycle order. Single authority for parse and
+/// completion candidates.
+pub(crate) const ALL_PALETTES: &[Palette] = &[
+    Palette::BlueRed, Palette::BlueOrange, Palette::BlueYellow,
+    Palette::Cividis, Palette::Mono, Palette::Turbo, Palette::Spectrum,
+];
+
+impl Curve {
+    /// Canonical short name — the config/CLI token (`curve: square`).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Curve::Linear  => "linear",
+            Curve::Sqrt    => "sqrt",
+            Curve::Square  => "square",
+            Curve::Sigmoid => "sigmoid",
+        }
+    }
+
+    /// Parse a canonical curve name (case-insensitive).
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        ALL_CURVES.iter().copied().find(|c| c.name().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// Every curve, in cycle order.
+pub(crate) const ALL_CURVES: &[Curve] = &[
+    Curve::Linear, Curve::Sqrt, Curve::Square, Curve::Sigmoid,
+];
+
+/// The explore UI's chrome colors, derived from a (palette, curve)
+/// pair — the same settings that drive data visualization, so one
+/// knob themes everything. Text levels stay neutral grays for
+/// readability; the six accent roles sample the palette at spread
+/// positions pushed through the curve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Theme {
+    pub primary: ratatui::style::Color,   // primary highlight / local
+    pub success: ratatui::style::Color,   // success / merkle-hashed
+    pub info: ratatui::style::Color,      // info / merkle-chunked
+    pub warning: ratatui::style::Color,   // warning / GT-style
+    pub meta: ratatui::style::Color,      // metadata family
+    pub error: ratatui::style::Color,     // error / full-transfer
+    pub text_primary: ratatui::style::Color,
+    pub text_muted: ratatui::style::Color,
+    pub text_dim: ratatui::style::Color,
+}
+
+impl Theme {
+    /// Derive the chrome from a palette + curve. Accent roles sample
+    /// the palette high-to-low (primary at the hot end, error at the
+    /// cold end) with the curve shaping emphasis exactly as it does
+    /// for data; a brightness floor keeps every accent readable on
+    /// the dark background.
+    pub(crate) fn derive(palette: Palette, curve: Curve) -> Self {
+        let at = |t: f64| {
+            let (r, g, b) = palette.sample(curve.apply(t));
+            // Readability floor: lift very dark samples toward a
+            // pastel of themselves so chrome text never vanishes.
+            let lift = |c: u8| -> u8 { (c as u16 * 3 / 4 + 64) as u8 };
+            ratatui::style::Color::Rgb(lift(r), lift(g), lift(b))
+        };
+        Theme {
+            primary: at(0.95),
+            success: at(0.78),
+            info:    at(0.60),
+            warning: at(0.42),
+            meta:    at(0.24),
+            error:   at(0.06),
+            text_primary: ratatui::style::Color::Rgb(225, 230, 245),
+            text_muted:   ratatui::style::Color::Rgb(135, 145, 175),
+            text_dim:     ratatui::style::Color::Rgb( 90, 100, 130),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Canonical names round-trip through parse, case-insensitively.
+    #[test]
+    fn names_round_trip_through_parse() {
+        for p in super::ALL_PALETTES {
+            assert_eq!(super::Palette::parse(p.name()), Some(*p));
+            assert_eq!(super::Palette::parse(&p.name().to_uppercase()), Some(*p));
+        }
+        for c in super::ALL_CURVES {
+            assert_eq!(super::Curve::parse(c.name()), Some(*c));
+        }
+        assert_eq!(super::Palette::parse("nope"), None);
+        assert_eq!(super::Curve::parse(""), None);
+    }
+
+    /// The derived theme is deterministic and its six accent roles
+    /// are pairwise distinct under the project standard — chrome
+    /// roles must stay tellable-apart.
+    #[test]
+    fn standard_theme_accents_are_distinct() {
+        let t = super::Theme::derive(super::Palette::default(), super::Curve::default());
+        let t2 = super::Theme::derive(super::Palette::default(), super::Curve::default());
+        assert_eq!(t, t2, "derivation must be deterministic");
+        let accents = [t.primary, t.success, t.info, t.warning, t.meta, t.error];
+        for i in 0..accents.len() {
+            for j in (i + 1)..accents.len() {
+                assert_ne!(accents[i], accents[j],
+                    "accent roles {i} and {j} must differ");
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

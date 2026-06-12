@@ -237,11 +237,11 @@ fn catalogs_path() -> PathBuf {
     PathBuf::from(crate::catalog::sources::config_dir()).join("catalogs.yaml")
 }
 
-fn load_catalog_entries() -> Vec<String> {
+fn load_catalog_entries() -> Vec<crate::catalog::sources::NamedCatalogSource> {
     let path = catalogs_path();
     if !path.is_file() { return Vec::new(); }
     let content = std::fs::read_to_string(&path).unwrap_or_default();
-    serde_yaml::from_str(&content).unwrap_or_default()
+    crate::catalog::sources::parse_named_catalogs(&content).unwrap_or_default()
 }
 
 // ── Comment-preserving textual edits ────────────────────────────────
@@ -253,50 +253,77 @@ fn load_catalog_entries() -> Vec<String> {
 // and `remove` deletes exactly the matching entry line; every other
 // byte of the file is preserved.
 
-/// True when a line is a block-sequence entry (`- value`), as opposed
-/// to a comment, blank line, or something structurally different.
-fn is_entry_line(line: &str) -> bool {
+/// True when a line is a block-sequence entry (`- value`) — the
+/// legacy list form.
+fn is_list_entry_line(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with("- ") || t == "-"
 }
 
-/// Parse the scalar value of an entry line, unquoting via the YAML
-/// scalar parser so `- "url"` and `- url` compare equal.
+/// `(name, location)` of a top-level map entry line (`name: url`),
+/// the default form going forward. Comments and list lines are not
+/// map entries.
+fn map_entry_line(line: &str) -> Option<(String, String)> {
+    let t = line.trim_start();
+    if t.starts_with('#') || is_list_entry_line(line) { return None; }
+    let (key, value) = t.split_once(':')?;
+    let key = key.trim();
+    let value = value.trim().trim_matches('"').trim_matches('\'');
+    if key.is_empty() || value.is_empty() { return None; }
+    Some((key.to_string(), value.to_string()))
+}
+
+/// Parse the scalar value of a legacy list entry line, unquoting via
+/// the YAML scalar parser so `- "url"` and `- url` compare equal.
 fn entry_line_value(line: &str) -> Option<String> {
     let t = line.trim_start().strip_prefix('-')?.trim();
     if t.is_empty() { return None; }
     serde_yaml::from_str::<String>(t).ok()
 }
 
-/// Append `source` as a new entry line, preserving the rest of the
-/// file byte-for-byte. Refuses when the existing content isn't a
-/// simple block list (flow style, mappings) — rewriting such a file
-/// without a serializer isn't safe, and rewriting WITH one would
-/// destroy comments.
-fn append_entry_text(content: &str, source: &str) -> Result<String, String> {
+/// Append a catalog entry, preserving the rest of the file
+/// byte-for-byte. New entries use the map form (`name: url`) — the
+/// default going forward — unless the existing file is a legacy list,
+/// where a list line keeps the document a valid sequence. Refuses
+/// structures it can't edit line-wise.
+fn append_entry_text(content: &str, name: &str, source: &str) -> Result<String, String> {
+    let mut has_list = false;
+    let mut has_map = false;
     for line in content.lines() {
         let t = line.trim();
-        if t.is_empty() || t.starts_with('#') || is_entry_line(line) { continue; }
+        if t.is_empty() || t.starts_with('#') { continue; }
+        if is_list_entry_line(line) { has_list = true; continue; }
+        if map_entry_line(line).is_some() { has_map = true; continue; }
         return Err(format!(
-            "catalogs.yaml contains a non-list line ({t:?}); \
-             refusing to edit it automatically — add the entry manually"));
+            "catalogs.yaml contains a line that is neither a list entry nor a \
+             name: url mapping ({t:?}); refusing to edit it automatically"));
+    }
+    if has_list && has_map {
+        return Err("catalogs.yaml mixes list and map entries; fix it manually".to_string());
     }
     let mut out = content.to_string();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str(&format!("- {source}\n"));
+    if has_list {
+        out.push_str(&format!("- {source}\n"));
+    } else {
+        out.push_str(&format!("{name}: {source}\n"));
+    }
     Ok(out)
 }
 
-/// Remove the entry line(s) whose value equals `source`, preserving
-/// every other byte (comments and commented-out entries included).
+/// Remove the entry line(s) matching `target` — a legacy list value,
+/// a map entry's location, or a map entry's NAME — preserving every
+/// other byte (comments and commented-out entries included).
 /// Returns `(new_content, removed_any)`.
-fn remove_entry_text(content: &str, source: &str) -> (String, bool) {
+fn remove_entry_text(content: &str, target: &str) -> (String, bool) {
     let mut removed = false;
     let kept: Vec<&str> = content.lines()
         .filter(|line| {
-            let is_match = entry_line_value(line).as_deref() == Some(source);
+            let is_match = entry_line_value(line).as_deref() == Some(target)
+                || map_entry_line(line)
+                    .is_some_and(|(k, v)| k == target || v == target);
             if is_match { removed = true; }
             !is_match
         })
@@ -308,7 +335,44 @@ fn remove_entry_text(content: &str, source: &str) -> (String, bool) {
     (out, removed)
 }
 
-fn append_catalog_entry(source: &str) -> Result<PathBuf, String> {
+/// Derive a symbolic catalog name from its location: the last path
+/// segment's stem, lowercased and sanitized to `[a-z0-9-]`. Empty
+/// when nothing usable remains — the caller falls back to the
+/// made-up enumeration.
+fn derive_catalog_name(location: &str, taken: &[String]) -> String {
+    let stem = location
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or_else(|| location.trim_end_matches('/').rsplit('/').next().unwrap_or(""));
+    let slug: String = stem.to_lowercase().chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let base = if slug.is_empty() {
+        // Same promotion rule as legacy list files: stringified index.
+        taken.len().to_string()
+    } else {
+        slug
+    };
+    if !taken.iter().any(|t| t == &base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !taken.iter().any(|t| t == &candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+fn append_catalog_entry(name: &str, source: &str) -> Result<PathBuf, String> {
     let path = catalogs_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -320,7 +384,7 @@ fn append_catalog_entry(source: &str) -> Result<PathBuf, String> {
     } else {
         String::new()
     };
-    let new_content = append_entry_text(&content, source)?;
+    let new_content = append_entry_text(&content, name, source)?;
     std::fs::write(&path, new_content)
         .map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(path)
@@ -337,6 +401,80 @@ fn remove_catalog_entry(source: &str) -> Result<bool, String> {
             .map_err(|e| format!("writing {}: {e}", path.display()))?;
     }
     Ok(removed)
+}
+
+/// Canonical palette names for `config set palette` validation and
+/// tab-completion. Delegates to the palette module's single
+/// authority so the lists can't drift.
+pub fn ui_palette_names() -> Vec<&'static str> {
+    crate::explore::palette::ALL_PALETTES.iter().map(|p| p.name()).collect()
+}
+
+/// Canonical curve names; see [`ui_palette_names`].
+pub fn ui_curve_names() -> Vec<&'static str> {
+    crate::explore::palette::ALL_CURVES.iter().map(|c| c.name()).collect()
+}
+
+/// Print one UI setting (`palette` / `curve`): the configured value
+/// or the project standard when unset.
+pub fn get_ui_setting(key: &str) -> i32 {
+    let standard = match key {
+        "palette" => crate::explore::palette::Palette::default().name(),
+        "curve" => crate::explore::palette::Curve::default().name(),
+        _ => { eprintln!("unknown UI setting '{key}'"); return 2; }
+    };
+    match crate::settings::setting_value(key) {
+        Some(v) => println!("{v}"),
+        None => println!("{standard}"),
+    }
+    0
+}
+
+/// Validate and persist a UI setting (`palette` / `curve`) to
+/// `settings.yaml` via the comment-preserving line editor.
+pub fn set_ui_setting(key: &str, value: &str) -> i32 {
+    let valid = match key {
+        "palette" => ui_palette_names(),
+        "curve" => ui_curve_names(),
+        _ => { eprintln!("unknown UI setting '{key}'"); return 2; }
+    };
+    let value = value.trim().to_lowercase();
+    if !valid.contains(&value.as_str()) {
+        eprintln!("unknown {key} '{value}' (valid: {})", valid.join(", "));
+        return 1;
+    }
+    match crate::settings::write_setting(key, &value) {
+        Ok(path) => { println!("{key} = {value}\nSaved to {}", path.display()); 0 }
+        Err(e) => { eprintln!("error: {e}"); 1 }
+    }
+}
+
+/// Print the update-check switch: `on` / `off` (standard: on).
+pub fn get_update_check() -> i32 {
+    let enabled = crate::update_check::enabled_setting(
+        crate::settings::setting_value(crate::update_check::SETTING_KEY).as_deref());
+    println!("{}", if enabled { "on" } else { "off" });
+    0
+}
+
+/// Validate and persist the update-check switch to `settings.yaml`
+/// via the comment-preserving line editor.
+pub fn set_update_check(value: &str) -> i32 {
+    let norm = match value.trim().to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" | "enabled" => "on",
+        "off" | "false" | "no" | "0" | "disabled" => "off",
+        other => {
+            eprintln!("invalid update_check value '{other}' (use on or off)");
+            return 1;
+        }
+    };
+    match crate::settings::write_setting(crate::update_check::SETTING_KEY, norm) {
+        Ok(path) => {
+            println!("update_check = {norm}\nSaved to {}", path.display());
+            0
+        }
+        Err(e) => { eprintln!("error: {e}"); 1 }
+    }
 }
 
 /// Verify a catalog source end-to-end before it is accepted:
@@ -381,12 +519,24 @@ pub fn verify_catalog_source(source: &str) -> Result<usize, String> {
 /// [`verify_catalog_source`] — parse to at least one dataset AND
 /// answer a catalog ping — before anything is recorded. Returns 1
 /// if verification fails; nothing is saved in that case.
-pub fn add_catalog(source: &str) -> i32 {
+pub fn add_catalog(source: &str, name: Option<&str>) -> i32 {
     let entries = load_catalog_entries();
-    if entries.iter().any(|e| e == source) {
+    if entries.iter().any(|e| e.location == source) {
         println!("Already configured: {source}");
         return 0;
     }
+    let taken: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+    let name = match name {
+        Some(n) => {
+            let n = n.trim();
+            if n.is_empty() || taken.iter().any(|t| t == n) {
+                eprintln!("error: catalog name '{n}' is empty or already in use");
+                return 1;
+            }
+            n.to_string()
+        }
+        None => derive_catalog_name(source, &taken),
+    };
 
     let count = match verify_catalog_source(source) {
         Ok(n) => n,
@@ -398,49 +548,50 @@ pub fn add_catalog(source: &str) -> i32 {
     };
     println!("OK   {source} ({count} dataset(s))");
 
-    match append_catalog_entry(source) {
-        Ok(path) => { println!("Saved to {}", path.display()); 0 }
+    match append_catalog_entry(&name, source) {
+        Ok(path) => { println!("Saved as '{name}' to {}", path.display()); 0 }
         Err(e) => { eprintln!("error: {e}"); 1 }
     }
 }
 
-/// Remove a catalog source by URL/path or 1-based index. Returns 1
-/// if the spec doesn't match anything.
+/// Remove a catalog source by name, URL/path, or 1-based index.
+/// Returns 1 if the spec doesn't match anything.
 pub fn remove_catalog(spec: RemoveCatalogSpec<'_>) -> i32 {
     let entries = load_catalog_entries();
-    let source = match spec {
+    let target = match spec {
         RemoveCatalogSpec::Source(s) => s.to_string(),
         RemoveCatalogSpec::Index(n) => {
             if n == 0 || n > entries.len() {
                 eprintln!("error: index {n} out of range (1..{})", entries.len());
                 return 1;
             }
-            let s = entries[n - 1].clone();
-            println!("Removing catalog #{n}: {s}");
-            s
+            let e = &entries[n - 1];
+            println!("Removing catalog #{n}: {} ({})", e.name, e.location);
+            e.location.clone()
         }
     };
-    match remove_catalog_entry(&source) {
-        Ok(true) => { println!("Removed: {source}"); 0 }
-        Ok(false) => { eprintln!("Not found: {source}"); 1 }
+    match remove_catalog_entry(&target) {
+        Ok(true) => { println!("Removed: {target}"); 0 }
+        Ok(false) => { eprintln!("Not found: {target}"); 1 }
         Err(e) => { eprintln!("error: {e}"); 1 }
     }
 }
 
-/// List the configured catalog sources.
+/// List the configured catalog sources with their symbolic names.
 pub fn list_catalogs() -> i32 {
     let path = catalogs_path();
     let config_dir = crate::catalog::sources::config_dir();
-    let entries = raw_catalog_entries(&config_dir);
+    let entries = crate::catalog::sources::named_catalog_entries(&config_dir);
     if entries.is_empty() {
         println!("No catalog sources configured.");
         println!();
         println!("Add one with:");
-        println!("  vectordata config catalog add <URL-or-path>");
+        println!("  vectordata config catalog add <URL-or-path> [--name <name>]");
     } else {
         println!("Configured catalog sources ({}):", entries.len());
+        let name_w = entries.iter().map(|e| e.name.len()).max().unwrap_or(8);
         for (i, e) in entries.iter().enumerate() {
-            println!("  {:>3}. {}", i + 1, e);
+            println!("  {:>3}. {:<name_w$}  {}", i + 1, e.name, e.location);
         }
         println!();
         println!("Catalogs file: {}", path.display());
@@ -499,25 +650,55 @@ mod tests {
     /// workflow and were previously destroyed by a serde round-trip.
     #[test]
     fn append_preserves_comments_and_formatting() {
-        let out = append_entry_text(HAND_EDITED, "https://d.example/cat/").unwrap();
+        // Legacy list file → stays a list (a map line would break the
+        // YAML document); comments untouched.
+        let out = append_entry_text(HAND_EDITED, "dx", "https://d.example/cat/").unwrap();
         assert!(out.starts_with(HAND_EDITED),
             "existing content must be byte-identical:\n{out}");
         assert!(out.ends_with("- https://d.example/cat/\n"));
     }
 
     #[test]
-    fn append_to_empty_or_missing_file() {
-        assert_eq!(append_entry_text("", "https://x/").unwrap(), "- https://x/\n");
-        // No trailing newline on the last line — one is inserted.
-        let out = append_entry_text("- https://a/", "https://x/").unwrap();
+    fn append_uses_map_form_going_forward() {
+        // Empty file → map form (the default going forward).
+        assert_eq!(append_entry_text("", "prot", "https://x/").unwrap(),
+            "prot: https://x/\n");
+        // Existing map file → map form, comments preserved.
+        let existing = "# main\nprot: https://a/\n";
+        let out = append_entry_text(existing, "lab", "https://b/").unwrap();
+        assert_eq!(out, "# main\nprot: https://a/\nlab: https://b/\n");
+        // Existing list file → list line for document validity.
+        let out = append_entry_text("- https://a/", "x", "https://x/").unwrap();
         assert_eq!(out, "- https://a/\n- https://x/\n");
     }
 
     #[test]
-    fn append_refuses_non_list_structure() {
-        let err = append_entry_text("catalogs:\n  - https://a/\n", "https://x/")
+    fn remove_matches_map_name_or_location() {
+        let content = "# keep\nprot: https://a/\nlab: https://b/\n";
+        let (out, removed) = remove_entry_text(content, "prot");
+        assert!(removed);
+        assert!(out.contains("# keep") && out.contains("lab:") && !out.contains("prot"));
+        let (out2, removed2) = remove_entry_text(content, "https://b/");
+        assert!(removed2);
+        assert!(out2.contains("prot:") && !out2.contains("lab"));
+    }
+
+    #[test]
+    fn derive_catalog_name_slugs_and_enumerates() {
+        assert_eq!(derive_catalog_name("https://h/x/protected-catalog.yaml", &[]),
+            "protected-catalog");
+        assert_eq!(derive_catalog_name("/data/catalogs/lab/", &[]), "lab");
+        // Collision → numbered suffix.
+        assert_eq!(derive_catalog_name("/x/lab", &["lab".to_string()]), "lab-2");
+        // Nothing usable → stringified index (the promotion rule).
+        assert_eq!(derive_catalog_name("///", &["a".to_string()]), "1");
+    }
+
+    #[test]
+    fn append_refuses_unrecognized_structure() {
+        let err = append_entry_text("catalogs:\n  - https://a/\n", "x", "https://x/")
             .unwrap_err();
-        assert!(err.contains("refusing"), "{err}");
+        assert!(err.contains("mixes") || err.contains("refusing"), "{err}");
     }
 
     /// Removal drops exactly the matching entry line; comments —

@@ -24,10 +24,10 @@ pub const DEFAULT_CONFIG_DIR: &str = "~/.config/vectordata";
 /// required (failure is fatal) and optional (failure is silently ignored).
 #[derive(Debug, Clone, Default)]
 pub struct CatalogSources {
-    /// Required catalog locations — loading failures are fatal.
-    required: Vec<String>,
-    /// Optional catalog locations — loading failures are silently ignored.
-    optional: Vec<String>,
+    /// Required catalog sources — loading failures are fatal.
+    required: Vec<NamedCatalogSource>,
+    /// Optional catalog sources — loading failures are silently ignored.
+    optional: Vec<NamedCatalogSource>,
 }
 
 impl CatalogSources {
@@ -76,27 +76,51 @@ impl CatalogSources {
     pub fn add_catalogs(mut self, paths: &[String]) -> Self {
         for path in paths {
             let expanded = expand_tilde(path);
-            self.required.extend(resolve_catalog_path(&expanded));
+            for resolved in resolve_catalog_path(&expanded) {
+                let name = self.synthesize_name();
+                self.required.push(NamedCatalogSource { name, location: resolved });
+            }
         }
         self
+    }
+
+    /// Next made-up name for a source whose name can't be determined
+    /// (ad-hoc CLI locations): the next free stringified index,
+    /// matching the promotion rule for legacy list files.
+    fn synthesize_name(&self) -> String {
+        let taken: std::collections::HashSet<&str> = self.required.iter()
+            .chain(self.optional.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        let mut n = self.required.len() + self.optional.len();
+        loop {
+            let candidate = n.to_string();
+            if !taken.contains(candidate.as_str()) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 
     /// Add optional catalog locations (failures are silently ignored).
     pub fn add_optional_catalogs(mut self, paths: &[String]) -> Self {
         for path in paths {
             let expanded = expand_tilde(path);
-            self.optional.extend(resolve_catalog_path(&expanded));
+            for resolved in resolve_catalog_path(&expanded) {
+                let name = self.synthesize_name();
+                self.optional.push(NamedCatalogSource { name, location: resolved });
+            }
         }
         self
     }
 
     /// Returns required catalog locations.
-    pub fn required(&self) -> &[String] {
+    pub fn required(&self) -> &[NamedCatalogSource] {
         &self.required
     }
 
-    /// Returns optional catalog locations.
-    pub fn optional(&self) -> &[String] {
+    /// Returns optional catalog sources.
+    pub fn optional(&self) -> &[NamedCatalogSource] {
         &self.optional
     }
 
@@ -110,20 +134,86 @@ impl CatalogSources {
 ///
 /// Returns the list of strings exactly as written in the file.
 pub fn raw_catalog_entries(config_dir: &str) -> Vec<String> {
-    let dir = std::path::Path::new(config_dir);
-    let catalogs_yaml = dir.join("catalogs.yaml");
+    named_catalog_entries(config_dir).into_iter().map(|n| n.location).collect()
+}
+
+/// A configured catalog source: symbolic name + location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedCatalogSource {
+    /// Symbolic name — the map key in the map form of
+    /// `catalogs.yaml`, or a synthesized `catalog-N` for the legacy
+    /// list form (and any other entry whose name can't be
+    /// determined).
+    pub name: String,
+    /// Catalog URL or path, verbatim from the file.
+    pub location: String,
+}
+
+/// Read `catalogs.yaml` from a config directory as named sources.
+/// Missing/unreadable/malformed files yield an empty list.
+pub fn named_catalog_entries(config_dir: &str) -> Vec<NamedCatalogSource> {
+    let catalogs_yaml = std::path::Path::new(config_dir).join("catalogs.yaml");
     if !catalogs_yaml.is_file() { return Vec::new(); }
     let content = match std::fs::read_to_string(&catalogs_yaml) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    serde_yaml::from_str(&content).unwrap_or_default()
+    parse_named_catalogs(&content).unwrap_or_default()
+}
+
+/// Parse `catalogs.yaml` content into named sources. Two supported
+/// shapes:
+///
+/// - **Map of names to locations** — the default going forward:
+///   ```yaml
+///   protected: https://host/path/protected-catalog.yaml
+///   local-lab: /data/catalogs/lab
+///   ```
+/// - **Legacy list of locations** — still accepted; entries promote
+///   to stringified 0-based indexes as their names (`0`, `1`, …) in
+///   file order:
+///   ```yaml
+///   - https://host/path/protected-catalog.yaml   # name: "0"
+///   ```
+///
+/// Map keys win as names; anything name-less gets the stringified
+/// index so every catalog is addressable.
+pub fn parse_named_catalogs(content: &str) -> Result<Vec<NamedCatalogSource>, String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(content)
+        .map_err(|e| format!("parse catalogs.yaml: {e}"))?;
+    let mut out = Vec::new();
+    match value {
+        serde_yaml::Value::Sequence(seq) => {
+            for (i, item) in seq.into_iter().enumerate() {
+                let Some(loc) = item.as_str() else { continue };
+                out.push(NamedCatalogSource {
+                    name: i.to_string(),
+                    location: loc.to_string(),
+                });
+            }
+        }
+        serde_yaml::Value::Mapping(map) => {
+            for (i, (k, v)) in map.into_iter().enumerate() {
+                let Some(loc) = v.as_str() else { continue };
+                let name = k.as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| i.to_string());
+                out.push(NamedCatalogSource { name, location: loc.to_string() });
+            }
+        }
+        serde_yaml::Value::Null => {}
+        other => {
+            return Err(format!(
+                "catalogs.yaml must be a list of locations or a map of name: location, got {other:?}"));
+        }
+    }
+    Ok(out)
 }
 
 /// Load `catalogs.yaml` from a config directory.
 ///
 /// The file contains a YAML list of strings, each a catalog location.
-fn load_config(config_dir: &str) -> Result<Vec<String>, String> {
+fn load_config(config_dir: &str) -> Result<Vec<NamedCatalogSource>, String> {
     let dir = Path::new(config_dir);
     let catalogs_yaml = dir.join("catalogs.yaml");
 
@@ -137,14 +227,16 @@ fn load_config(config_dir: &str) -> Result<Vec<String>, String> {
     let content = std::fs::read_to_string(&catalogs_yaml)
         .map_err(|e| format!("failed to read {}: {}", catalogs_yaml.display(), e))?;
 
-    let entries: Vec<String> = serde_yaml::from_str(&content)
-        .map_err(|e| format!("failed to parse {}: {}", catalogs_yaml.display(), e))?;
+    let entries = parse_named_catalogs(&content)
+        .map_err(|e| format!("failed to parse {}: {e}", catalogs_yaml.display()))?;
 
-    // Resolve each entry relative to the config directory
+    // Resolve each entry relative to the config directory.
     let mut locations = Vec::new();
     for entry in entries {
-        let expanded = expand_tilde(&entry);
-        locations.extend(resolve_catalog_path(&expanded));
+        let expanded = expand_tilde(&entry.location);
+        for resolved in resolve_catalog_path(&expanded) {
+            locations.push(NamedCatalogSource { name: entry.name.clone(), location: resolved });
+        }
     }
 
     Ok(locations)
@@ -173,8 +265,8 @@ fn resolve_catalog_path(path: &str) -> Vec<String> {
         // Directory with catalogs.yaml → load recursively
         let catalogs_yaml = p.join("catalogs.yaml");
         if catalogs_yaml.is_file()
-            && let Ok(locations) = load_config(path) {
-            return locations;
+            && let Ok(sources) = load_config(path) {
+            return sources.into_iter().map(|s| s.location).collect();
         }
 
         // Directory with catalog.json or catalog.yaml → use it
@@ -299,6 +391,27 @@ pub fn looks_like_catalog_file(location: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// catalogs.yaml accepts both shapes: a map of name → location
+    /// (the default going forward) and the legacy list, whose entries
+    /// promote to stringified 0-based indexes as names.
+    #[test]
+    fn named_catalogs_map_and_list_forms() {
+        let map_form = "\n# main\nprotected: https://h/p/protected-catalog.yaml\nlab: /data/lab\n";
+        let named = super::parse_named_catalogs(map_form).unwrap();
+        assert_eq!(named.len(), 2);
+        assert_eq!(named[0].name, "protected");
+        assert_eq!(named[0].location, "https://h/p/protected-catalog.yaml");
+        assert_eq!(named[1].name, "lab");
+
+        let list_form = "- https://h/a/\n- https://h/b/\n";
+        let named = super::parse_named_catalogs(list_form).unwrap();
+        assert_eq!(named[0].name, "0");
+        assert_eq!(named[1].name, "1");
+
+        assert!(super::parse_named_catalogs("just a string").is_err());
+        assert!(super::parse_named_catalogs("").unwrap().is_empty());
+    }
+
     use super::*;
 
     #[test]
@@ -345,7 +458,7 @@ mod tests {
         .unwrap();
         let s = CatalogSources::new().configure_optional(&empty.path().to_string_lossy());
         assert!(
-            s.optional().iter().any(|e| e.contains("example.invalid")),
+            s.optional().iter().any(|e| e.location.contains("example.invalid")),
             "expected the dir's catalogs.yaml entry, got {:?}",
             s.optional()
         );
@@ -392,10 +505,13 @@ mod tests {
         let yaml = "- /some/catalog\n- https://example.com/data\n";
         std::fs::write(tmp.path().join("catalogs.yaml"), yaml).unwrap();
 
-        let locations = load_config(tmp.path().to_str().unwrap()).unwrap();
+        let sources = load_config(tmp.path().to_str().unwrap()).unwrap();
         // /some/catalog doesn't exist so it still gets returned as-is
-        assert!(locations.iter().any(|l| l == "/some/catalog"));
-        assert!(locations.iter().any(|l| l == "https://example.com/data"));
+        assert!(sources.iter().any(|s| s.location == "/some/catalog"));
+        assert!(sources.iter().any(|s| s.location == "https://example.com/data"));
+        // Legacy list entries promote to stringified 0-based indexes.
+        assert!(sources.iter().any(|s| s.name == "0"));
+        assert!(sources.iter().any(|s| s.name == "1"));
     }
 
     #[test]

@@ -30,44 +30,26 @@ use crate::dataset::CatalogEntry;
 // `Color::Cyan` etc. would change meaning under Solarized, Dracula,
 // Nord, etc.). Truecolor-capable terminals render these verbatim;
 // older terminals downsample to the nearest 256-colour cube cell.
-const ACCENT_CYAN:    Color = Color::Rgb( 64, 230, 220); // primary highlight / local
-const ACCENT_MINT:    Color = Color::Rgb(135, 240, 195); // success / merkle-hashed
-const ACCENT_LAVENDR: Color = Color::Rgb(190, 160, 255); // info / merkle-chunked
-const ACCENT_AMBER:   Color = Color::Rgb(255, 195, 120); // warning / GT-style
-const ACCENT_PINK:    Color = Color::Rgb(255, 130, 200); // metadata family
-const ACCENT_CORAL:   Color = Color::Rgb(255, 115, 145); // error / full-transfer
-const TEXT_PRIMARY:   Color = Color::Rgb(225, 230, 245); // default row text
-const TEXT_MUTED:     Color = Color::Rgb(135, 145, 175); // column headers, footer
-const TEXT_DIM:       Color = Color::Rgb( 90, 100, 130); // tertiary text, "—" rows
+// Chrome colors come from the session theme — derived from the same
+// configured (palette, curve) pair that drives data visualization.
+// See `explore::theme()` / `palette::Theme::derive`. Role mapping:
+//   primary  — highlight / local        success — merkle-hashed
+//   info     — merkle-chunked           warning — GT-style
+//   meta     — metadata family          error   — full-transfer
+use super::theme;
 // Selection uses `Modifier::REVERSED` rather than explicit fg/bg
 // colours so the highlight bar is independent of palette state —
 // works under the neon theme, the mono toggle, and broken-ANSI
 // terminals alike.
 
-/// Pad a string to `target` DISPLAY columns (not bytes). Rust's built-in
-/// `format!("{:<w$}", ...)` pads by byte count, which under-reserves
-/// columns whenever the content contains multi-byte glyphs like the
-/// tree-drawing unicode (`▸`, `▾`, `└` — 3 bytes each, 1 column each).
-/// In the picker, that bug let the PROFILE column drift left and kiss
-/// the DATASET column on any row whose name had a tree prefix.
-fn pad_display(s: &str, target: usize) -> String {
-    let w = UnicodeWidthStr::width(s);
-    if w >= target {
-        s.to_string()
-    } else {
-        let mut out = String::with_capacity(s.len() + (target - w));
-        out.push_str(s);
-        for _ in 0..(target - w) {
-            out.push(' ');
-        }
-        out
-    }
-}
-
-/// Truncate a string to at most `target` DISPLAY columns, then pad to
-/// exactly `target`. Matches the behaviour the original code tried to
-/// get out of `format!("{:.w$}", ...)` — that formatter also counts
-/// bytes, not columns, so long UTF-8 strings would overflow the cell.
+/// Truncate a string to at most `target` DISPLAY columns (not
+/// bytes), then pad to exactly `target`. Byte-counting formatters
+/// (`format!("{:<w$}")` / `format!("{:.w$}")`) under-reserve columns
+/// whenever content contains multi-byte glyphs like the tree-drawing
+/// unicode (`▸`, `▾`, `└` — 3 bytes each, 1 column each) and let
+/// long values overflow their cell. Every picker cell renders
+/// through this, at exactly its column width — inter-column gaps
+/// come from explicit separator spans, never from width headroom.
 fn fit_display(s: &str, target: usize) -> String {
     let mut out = String::new();
     let mut used = 0usize;
@@ -88,13 +70,108 @@ use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::CatalogSources;
 
 /// A flattened row: one entry per dataset:profile pair.
+/// Optional picker columns, in display order. DATASET and PROFILE
+/// are row identity and always shown; everything else can be hidden
+/// via the settings screen (persisted as the `disabled_columns`
+/// settings key, by `name()`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PickerColumn {
+    Catalog,
+    Facets,
+    Metric,
+    /// Base-vector record count (cardinality).
+    Count,
+    /// Storage bytes across the profile's facet files.
+    Size,
+    Access,
+    Cached,
+}
+
+const ALL_COLUMNS: &[PickerColumn] = &[
+    PickerColumn::Catalog,
+    PickerColumn::Facets,
+    PickerColumn::Metric,
+    PickerColumn::Count,
+    PickerColumn::Size,
+    PickerColumn::Access,
+    PickerColumn::Cached,
+];
+
+impl PickerColumn {
+    /// Settings token (the `disabled_columns` entry).
+    fn name(self) -> &'static str {
+        match self {
+            PickerColumn::Catalog => "catalog",
+            PickerColumn::Facets  => "facets",
+            PickerColumn::Metric  => "metric",
+            PickerColumn::Count   => "count",
+            PickerColumn::Size    => "size",
+            PickerColumn::Access  => "access",
+            PickerColumn::Cached  => "cached",
+        }
+    }
+    /// Column header text. Catalog is deliberately terse — it sits
+    /// left of DATASET and usually holds short names/indexes.
+    fn header(self) -> &'static str {
+        match self {
+            PickerColumn::Catalog => "C",
+            PickerColumn::Facets  => "FACETS",
+            PickerColumn::Metric  => "METRIC",
+            PickerColumn::Count   => "COUNT",
+            PickerColumn::Size    => "SIZE",
+            PickerColumn::Access  => "ACCESS",
+            PickerColumn::Cached  => "CACHED",
+        }
+    }
+}
+
+/// One actionable row of the settings screen (Ctrl-G). Headers are
+/// rendered between sections but are not items — the cursor only
+/// lands on these.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum SettingsItem {
+    /// Toggle one configured catalog by name.
+    CatalogToggle(String),
+    /// Toggle one optional column.
+    ColumnToggle(PickerColumn),
+    /// Cycle the global palette.
+    PaletteCycle,
+    /// Cycle the global curve.
+    CurveCycle,
+    /// Persist palette/curve to settings.yaml.
+    SaveTheme,
+    /// Remove display-related settings keys; back to the standard.
+    ResetDisplay,
+}
+
+/// Build the settings screen's actionable items in display order.
+fn settings_items(catalog_list: &[(String, usize)]) -> Vec<SettingsItem> {
+    let mut items: Vec<SettingsItem> = catalog_list.iter()
+        .map(|(name, _)| SettingsItem::CatalogToggle(name.clone()))
+        .collect();
+    items.extend(ALL_COLUMNS.iter().map(|c| SettingsItem::ColumnToggle(*c)));
+    items.push(SettingsItem::PaletteCycle);
+    items.push(SettingsItem::CurveCycle);
+    items.push(SettingsItem::SaveTheme);
+    items.push(SettingsItem::ResetDisplay);
+    items
+}
+
 struct PickerRow {
     dataset: String,
+    /// Symbolic name of the configured catalog this row came from.
+    catalog: String,
     profile: String,
     /// Numeric base_count for sorting (0 for default profile).
     base_count: u64,
     metric: String,
     facets: String,
+    /// COUNT cell: base-vector cardinality ("1M", "983K", with `*`
+    /// marking profiles that share the default profile's base file).
+    count: String,
+    /// SIZE cell: storage bytes across the profile's facet files.
+    /// Both cells are filled by [`apply_size_cells`] from the
+    /// session's facet-knowledge map, not by `build_rows`.
     size: String,
     cache_status: String,
     /// Predicted access mode for this profile's `base_vectors` source.
@@ -111,47 +188,28 @@ fn build_rows(
     entries: &[CatalogEntry],
     cache_survey: &std::collections::HashMap<std::path::PathBuf, FacetCacheView>,
 ) -> Vec<PickerRow> {
-    use crate::dataset::StandardFacet;
-
     let cache_dir = crate::explore::cache_dir_or_exit();
     let mut rows = Vec::new();
     for entry in entries {
+        // Declared metric first (canonical dataset.yaml attributes);
+        // knn_entries-shape catalogs declare none, but the jvector
+        // SimpleMFD ecosystem encodes the metric in ground-truth
+        // filenames (`..._gt_..._ip_k100.ivecs`) — recover it from
+        // there rather than showing an empty column.
         let metric = entry.layout.attributes.as_ref()
             .and_then(|a| a.distance_function.as_deref())
-            .unwrap_or("")
-            .to_string();
+            .map(|s| s.to_string())
+            .or_else(|| infer_metric_from_entry(entry))
+            .unwrap_or_default();
 
         let ds_cache = cache_dir.join(&entry.name);
 
-        // The default profile's `base_vectors` file is the dataset's
-        // shared base. Non-default profiles whose base path resolves
-        // to the same file (after stripping window notation) are
-        // windows into that shared data — no extra download.
-        let default_base_path: Option<String> = entry.layout.profiles
-            .profile("default")
-            .and_then(|p| p.views.get(StandardFacet::BaseVectors.key()))
-            .map(|v| strip_window_suffix(&v.source.path).to_string());
-
+        let catalog_name = entry.catalog_name.clone()
+            .unwrap_or_else(|| "?".to_string());
         for profile_name in entry.profile_names() {
             let profile = entry.layout.profiles.profile(profile_name);
             let bc = crate::dataset::profile::profile_sort_key(
                 profile_name, profile.and_then(|p| p.base_count));
-            // Show count from profile's base_count (partition profiles, sized profiles)
-            let explicit_count = profile.and_then(|p| p.base_count);
-            let shares_default_base = profile_name != "default"
-                && profile.map(|p| !p.partition).unwrap_or(false)
-                && profile
-                    .and_then(|p| p.views.get(StandardFacet::BaseVectors.key()))
-                    .map(|v| strip_window_suffix(&v.source.path).to_string())
-                    == default_base_path
-                && default_base_path.is_some();
-            let size = match explicit_count {
-                Some(c) if c > 0 => {
-                    let s = format_count(c);
-                    if shares_default_base { format!("{}*", s) } else { s }
-                }
-                _ => String::new(),
-            };
 
             let facets = profile.map(|p| facet_indicators(&p.views)).unwrap_or_default();
 
@@ -176,15 +234,17 @@ fn build_rows(
                 format!("{:.0}% ({}/{})", pct, valid_chunks, total_chunks)
             };
 
-            let access = profile_access_mode(&ds_cache, profile);
+            let access = profile_access_mode(entry, &ds_cache, profile, cache_survey);
 
             rows.push(PickerRow {
                 dataset: entry.name.clone(),
+                catalog: catalog_name.clone(),
                 profile: profile_name.to_string(),
                 base_count: bc,
                 metric: metric.clone(),
                 facets,
-                size,
+                count: String::new(),
+                size: String::new(),
                 cache_status,
                 access,
             });
@@ -299,19 +359,47 @@ fn profile_cache_coverage(
     (valid, total)
 }
 
+/// One-line cardinality + byte summary for a facet, from the
+/// session's knowledge map: `"983K records, 1.5G"`. Windowed views
+/// that could only be costed whole-file say so. `None` when nothing
+/// is known (and no probe is in flight) — the line is omitted
+/// rather than shown empty.
+fn facet_stat_string(
+    entry: &CatalogEntry,
+    view: &crate::dataset::profile::DSView,
+    knowledge: &std::collections::HashMap<String, FacetKnowledge>,
+) -> Option<String> {
+    let shape = facet_shape(entry, view)?;
+    let res = resolve_facet(&shape, knowledge);
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(n) = res.records {
+        parts.push(format!("{} records", format_count(n)));
+    }
+    if let Some(b) = res.bytes {
+        let suffix = if res.whole_file_for_window { " (whole file)" } else { "" };
+        parts.push(format!("{}{suffix}", crate::explore::format_bytes_short(b)));
+    }
+    if parts.is_empty() {
+        return res.pending.then(|| "resolving…".to_string());
+    }
+    Some(parts.join(", "))
+}
+
 /// Compose stats lines for the Ctrl-D details overlay. Pulls
 /// dataset-level attributes (model / license / vendor / distance)
 /// from the catalog entry plus profile-level facets (each view's
-/// source path, with window notation kept inline for clarity).
+/// cardinality and size when known, then its source path with
+/// window notation kept inline for clarity).
 fn build_details_lines(
     row: &PickerRow,
     entry: Option<&CatalogEntry>,
+    knowledge: &std::collections::HashMap<String, FacetKnowledge>,
     colors_on: bool,
 ) -> Vec<Line<'static>> {
     let tint = |c: Color| if colors_on { Style::default().fg(c) } else { Style::default() };
-    let dim_gray = tint(TEXT_MUTED);
-    let val_white = tint(TEXT_PRIMARY);
-    let head_cyan = tint(ACCENT_CYAN);
+    let dim_gray = tint(theme().text_muted);
+    let val_white = tint(theme().text_primary);
+    let head_cyan = tint(theme().primary);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -354,17 +442,23 @@ fn build_details_lines(
             } else {
                 view.source.path.clone()
             };
-            lines.push(kv(facet, &path, dim_gray, val_white));
+            // Cardinality first — it's the question this panel
+            // answers at a glance; the path follows for context.
+            let value = match facet_stat_string(entry, view, knowledge) {
+                Some(stat) => format!("{stat} — {path}"),
+                None => path,
+            };
+            lines.push(kv(facet, &value, dim_gray, val_white));
         }
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(" Access ", head_cyan)));
     let access_color = match row.access {
-        AccessMode::Local         => ACCENT_CYAN,
-        AccessMode::MerkleHashed  => ACCENT_MINT,
-        AccessMode::MerkleChunked => ACCENT_LAVENDR,
-        AccessMode::FullTransfer  => ACCENT_CORAL,
+        AccessMode::Local         => theme().primary,
+        AccessMode::MerkleHashed  => theme().success,
+        AccessMode::MerkleChunked => theme().info,
+        AccessMode::FullTransfer  => theme().error,
     };
     lines.push(Line::from(Span::styled(
         format!(" {}", row.access.description()),
@@ -377,18 +471,19 @@ fn build_details_lines(
 
 /// Compose the full descriptor for the scrollable Describe overlay.
 /// Goes deeper than [`build_details_lines`]: every view's path,
-/// namespace (when set), and explicit window range; the origin URL
-/// pulled from the catalog entry; access mode rationale; per-row
-/// cache state.
+/// namespace (when set), explicit window range, and cardinality /
+/// byte size when known; the origin URL pulled from the catalog
+/// entry; access mode rationale; per-row cache state.
 fn build_descriptor_lines(
     row: &PickerRow,
     entry: Option<&CatalogEntry>,
+    knowledge: &std::collections::HashMap<String, FacetKnowledge>,
     colors_on: bool,
 ) -> Vec<Line<'static>> {
     let tint = |c: Color| if colors_on { Style::default().fg(c) } else { Style::default() };
-    let dim_gray = tint(TEXT_MUTED);
-    let val_white = tint(TEXT_PRIMARY);
-    let head_cyan = tint(ACCENT_CYAN);
+    let dim_gray = tint(theme().text_muted);
+    let val_white = tint(theme().text_primary);
+    let head_cyan = tint(theme().primary);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -449,6 +544,9 @@ fn build_descriptor_lines(
                 Span::styled(format!("{facet}:"), val_white),
             ]));
             lines.push(kv_indent(2, "source", &view.source.path, dim_gray, val_white));
+            if let Some(stat) = facet_stat_string(entry, view, knowledge) {
+                lines.push(kv_indent(2, "shape", &stat, dim_gray, val_white));
+            }
             if let Some(ns) = view.source.namespace.as_deref() {
                 lines.push(kv_indent(2, "namespace", ns, dim_gray, val_white));
             }
@@ -474,10 +572,10 @@ fn build_descriptor_lines(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(" Access & Cache ", head_cyan)));
     let access_color = match row.access {
-        AccessMode::Local         => ACCENT_CYAN,
-        AccessMode::MerkleHashed  => ACCENT_MINT,
-        AccessMode::MerkleChunked => ACCENT_LAVENDR,
-        AccessMode::FullTransfer  => ACCENT_CORAL,
+        AccessMode::Local         => theme().primary,
+        AccessMode::MerkleHashed  => theme().success,
+        AccessMode::MerkleChunked => theme().info,
+        AccessMode::FullTransfer  => theme().error,
     };
     lines.push(kv("access", row.access.short_label(), dim_gray, tint(access_color)));
     lines.push(Line::from(vec![
@@ -487,6 +585,7 @@ fn build_descriptor_lines(
         Span::styled(row.access.description().to_string(), dim_gray),
     ]));
     lines.push(kv("cache", &row.cache_status, dim_gray, val_white));
+    lines.push(kv("count", &row.count, dim_gray, val_white));
     lines.push(kv("size", &row.size, dim_gray, val_white));
     lines.push(kv("metric", &row.metric, dim_gray, val_white));
 
@@ -508,8 +607,8 @@ fn build_source_lines(
     colors_on: bool,
 ) -> (String, Vec<Line<'static>>) {
     let tint = |c: Color| if colors_on { Style::default().fg(c) } else { Style::default() };
-    let body_style = tint(TEXT_PRIMARY);
-    let error_style = tint(ACCENT_CORAL);
+    let body_style = tint(theme().text_primary);
+    let error_style = tint(theme().error);
 
     // Source location. `entry.catalog_file` is the document the
     // resolver actually parsed this entry from — authoritative when
@@ -537,7 +636,7 @@ fn build_source_lines(
             return (
                 format!("Source error — {title_suffix}"),
                 vec![
-                    Line::from(Span::styled(format!(" {source_url}"), tint(TEXT_MUTED))),
+                    Line::from(Span::styled(format!(" {source_url}"), tint(theme().text_muted))),
                     Line::from(""),
                     Line::from(Span::styled(format!(" error: {e}"), error_style)),
                 ],
@@ -555,7 +654,7 @@ fn build_source_lines(
     // span. The Paragraph widget already honours the line breaks;
     // the leading space keeps content from kissing the border.
     let lines: Vec<Line<'static>> = std::iter::once(
-        Line::from(Span::styled(format!(" {source_url}"), tint(TEXT_MUTED))),
+        Line::from(Span::styled(format!(" {source_url}"), tint(theme().text_muted))),
     )
     .chain(std::iter::once(Line::from("")))
     .chain(filtered.lines().map(|l| {
@@ -1159,14 +1258,22 @@ fn resolve_facet_url(
 ///
 /// Returns [`AccessMode::FullTransfer`] when the profile has no
 /// `base_vectors` declared — there's nothing to predict an access
-/// mode against. Returns [`AccessMode::Local`] when the source path
-/// resolves to a file already present under the cache root (the
-/// dataset has been precached or was locally prepared). Otherwise
-/// delegates to [`AccessMode::classify`], which handles the remote
-/// uniform-vs-vvec / `.mrkl`-or-not branches.
+/// mode against. Returns [`AccessMode::Local`] when the facet is
+/// already fully on disk: a complete sidecar-less copy at the
+/// forward-derived cache path (URL + home → `facet_cache_relpath`,
+/// the same single authority the storage open and the coverage
+/// survey use — joining the raw source path broke for knn_entries
+/// catalogs whose source paths are absolute URLs, leaving fully
+/// downloaded datasets labelled "chunked"), a chunk-store file whose
+/// survey bitmap is fully valid, or the legacy workspace layout's
+/// materialised file. Otherwise delegates to
+/// [`AccessMode::classify_remote`] for the remote uniform-vs-vvec /
+/// `.mrkl`-or-not branches.
 fn profile_access_mode(
+    entry: &CatalogEntry,
     ds_cache: &std::path::Path,
     profile: Option<&crate::dataset::profile::DSProfile>,
+    survey: &std::collections::HashMap<std::path::PathBuf, FacetCacheView>,
 ) -> AccessMode {
     use crate::dataset::StandardFacet;
 
@@ -1181,8 +1288,33 @@ fn profile_access_mode(
 
     let clean = strip_window_suffix(&view.source.path);
 
-    // Materialised locally already? Same check `profile_cache_coverage`
-    // uses for its "this file exists locally, count as cached" branch.
+    if let Some(url) = resolve_facet_url(entry, view) {
+        let home = {
+            let h = entry.dataset_home_url();
+            if h.ends_with('/') { h } else { format!("{h}/") }
+        };
+        let expected = ds_cache.join(crate::view::facet_cache_relpath(&url, &home));
+        match survey.get(&expected) {
+            // Chunk-store file: fully valid bitmap means every read
+            // is served from disk — no download left to do.
+            Some(cv) => {
+                if cv.total_chunks > 0 && cv.whole_file_valid() == cv.total_chunks {
+                    return AccessMode::Local;
+                }
+            }
+            // No sidecar: a plain file at the derived path is a
+            // complete copy (only sparse chunk-store files misreport
+            // completeness, and those always carry a sidecar).
+            None => {
+                if expected.is_file() {
+                    return AccessMode::Local;
+                }
+            }
+        }
+    }
+
+    // Legacy workspace layout (`derive` output): source-relative
+    // file materialised under the dataset directory.
     if ds_cache.join(clean).exists() {
         return AccessMode::Local;
     }
@@ -1193,6 +1325,404 @@ fn profile_access_mode(
 ///
 /// Letters: B(base) Q(query) G(ground-truth indices) D(distances)
 ///          M(metadata) P(predicates) R(results) F(filtered-knn)
+/// Recover the distance metric from facet filenames when the catalog
+/// declares none. The jvector SimpleMFD convention encodes it as an
+/// underscore-delimited token in the ground-truth (and sometimes
+/// base) filename: `_ip_`, `_l2_`, `_cos`/`_cosine`, `_angular`,
+/// `_dot`. Returns the canonical lowercase token.
+fn infer_metric_from_entry(entry: &CatalogEntry) -> Option<String> {
+    for (_pname, profile) in &entry.layout.profiles.profiles {
+        for (_facet, view) in &profile.views {
+            if let Some(m) = infer_metric_from_filename(&view.source.path) {
+                return Some(m);
+            }
+        }
+    }
+    None
+}
+
+/// Token scan of one filename. Pure; see [`infer_metric_from_entry`].
+fn infer_metric_from_filename(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    for t in name.split(['_', '.', '-']) {
+        match t {
+            "ip" | "dot" | "dotproduct" => return Some("ip".to_string()),
+            "l2" | "euclidean" => return Some("l2".to_string()),
+            "cos" | "cosine" | "angular" => return Some("cosine".to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Marker shown in a COUNT/SIZE cell while a background remote
+/// probe that could still improve it is in flight.
+const SIZE_PENDING: &str = "…";
+
+/// What the session knows about one facet file, keyed by its
+/// resolved source URL. Seeded from local sources (the cache
+/// survey, complete local copies) by [`collect_local_knowledge`]
+/// and completed by background remote probes. Lives across row
+/// rebuilds so an answer is never fetched twice.
+#[derive(Clone, Copy, Default)]
+struct FacetKnowledge {
+    /// Total file size in bytes.
+    bytes: Option<u64>,
+    /// Bytes per record (`4 + dim * elem_size`, uniform xvec only).
+    bpr: Option<u64>,
+    /// A remote probe is queued or in flight.
+    pending: bool,
+    /// A remote probe answered (even with nothing) — the facet is
+    /// settled; whatever is still `None` is unknowable this session.
+    probed: bool,
+}
+
+/// Static per-facet shape derived from the catalog entry alone:
+/// resolved URL, element size, uniformity, window. The bridge
+/// between a profile's views and the knowledge map.
+struct FacetShape {
+    url: String,
+    elem_size: usize,
+    /// Uniform-stride xvec — record counts derivable from byte math.
+    uniform: bool,
+    /// `[start..end)` record window, when the view declares one.
+    window: Option<(u64, u64)>,
+}
+
+/// Resolve one view to its [`FacetShape`]. `None` for facets that
+/// aren't vector data (sidecar YAMLs etc. — same skip rule as cache
+/// coverage) or whose URL can't be resolved.
+fn facet_shape(entry: &CatalogEntry, view: &crate::dataset::profile::DSView) -> Option<FacetShape> {
+    let clean = strip_window_suffix(&view.source.path);
+    let ext = clean.rsplit('.').next().unwrap_or("");
+    let elem_size = crate::io::infer_elem_size(ext);
+    if elem_size == 0 { return None; }
+    let url = resolve_facet_url(entry, view)?;
+    let window = view.effective_window().0.first()
+        .map(|iv| (iv.min_incl, iv.max_excl))
+        .or_else(|| parse_path_suffix_window(&view.source.path))
+        .filter(|(s, e)| e > s);
+    Some(FacetShape {
+        url,
+        elem_size,
+        uniform: !crate::io::is_vvec_ext(ext),
+        window,
+    })
+}
+
+/// Seed the knowledge map from everything answerable without the
+/// network, for every facet of every profile:
+///   - the cache survey: sparse chunk-store files carry the full
+///     remote size in their sidecar, and `bpr` when chunk 0 (the
+///     xvec dim header) is resident — a ping leaves it there;
+///   - a complete local copy with no chunk sidecar (a finished
+///     download, or a locally-derived workspace): a plain file's
+///     length IS the whole size — only sparse chunk-store files
+///     misreport it, and those always carry the sidecar above.
+///
+/// Re-run after cache re-surveys to pick up facts the cache didn't
+/// hold before (e.g. a download landing the dim header). Facets
+/// already fully answered are skipped — local and remote answers
+/// describe the same file, so there is nothing to upgrade.
+fn collect_local_knowledge(
+    entries: &[CatalogEntry],
+    cache_dir: &std::path::Path,
+    survey: &std::collections::HashMap<std::path::PathBuf, FacetCacheView>,
+    knowledge: &mut std::collections::HashMap<String, FacetKnowledge>,
+) {
+    for entry in entries {
+        let ds_workspace = cache_dir.join(&entry.name);
+        let home = {
+            let h = entry.dataset_home_url();
+            if h.ends_with('/') { h } else { format!("{h}/") }
+        };
+        for pname in entry.profile_names() {
+            let Some(profile) = entry.layout.profiles.profile(pname) else { continue };
+            for (_facet, view) in &profile.views {
+                let Some(shape) = facet_shape(entry, view) else { continue };
+                let known = knowledge.get(&shape.url).copied().unwrap_or_default();
+                if known.bytes.is_some() && (!shape.uniform || known.bpr.is_some()) {
+                    continue; // already fully answered
+                }
+                let relpath = crate::view::facet_cache_relpath(&shape.url, &home);
+                let (bytes, header_file) = if let Some(cv) = survey.get(&ds_workspace.join(relpath)) {
+                    (Some(cv.total_size), Some(cv.cache_file_path.clone()))
+                } else {
+                    let clean = strip_window_suffix(&view.source.path);
+                    [ds_workspace.join(relpath), ds_workspace.join(clean)].into_iter()
+                        .find_map(|p| std::fs::metadata(&p).ok()
+                            .filter(|m| m.is_file())
+                            .map(|m| (Some(m.len()), Some(p))))
+                        .unwrap_or((None, None))
+                };
+                if bytes.is_none() { continue; }
+                let bpr = header_file
+                    .filter(|_| shape.uniform)
+                    .and_then(|p| read_xvec_bpr(&p, shape.elem_size));
+                let slot = knowledge.entry(shape.url).or_default();
+                slot.bytes = bytes.filter(|&b| b > 0).or(slot.bytes);
+                slot.bpr = bpr.or(slot.bpr);
+            }
+        }
+    }
+}
+
+/// One remote lookup: a facet URL whose bytes (or bytes-per-record)
+/// the local pass couldn't answer.
+struct SizeProbeJob {
+    url: String,
+    elem_size: usize,
+    uniform: bool,
+}
+
+/// Answer for one [`SizeProbeJob`]; merged into the knowledge map.
+struct SizeProbeResult {
+    url: String,
+    bytes: Option<u64>,
+    bpr: Option<u64>,
+}
+
+/// Collect one probe job per distinct remote facet URL the local
+/// pass left incompletely answered, marking each as pending in the
+/// knowledge map. No jobs → no threads spawned.
+fn collect_size_probe_jobs(
+    entries: &[CatalogEntry],
+    knowledge: &mut std::collections::HashMap<String, FacetKnowledge>,
+) -> Vec<SizeProbeJob> {
+    let mut jobs: Vec<SizeProbeJob> = Vec::new();
+    for entry in entries {
+        for pname in entry.profile_names() {
+            let Some(profile) = entry.layout.profiles.profile(pname) else { continue };
+            for (_facet, view) in &profile.views {
+                let Some(shape) = facet_shape(entry, view) else { continue };
+                if !crate::transport::is_remote_url(&shape.url) { continue; }
+                let slot = knowledge.entry(shape.url.clone()).or_default();
+                if slot.pending || slot.probed { continue; }
+                if slot.bytes.is_some() && (!shape.uniform || slot.bpr.is_some()) { continue; }
+                slot.pending = true;
+                jobs.push(SizeProbeJob {
+                    url: shape.url,
+                    elem_size: shape.elem_size,
+                    uniform: shape.uniform,
+                });
+            }
+        }
+    }
+    jobs
+}
+
+/// Run `jobs` on a small worker pool, sending each answer over the
+/// returned channel as it lands. Workers are detached: they stop at
+/// the next job boundary once `cancel` is set or the receiver is
+/// dropped. Probes are read-only — an authenticated HEAD for the
+/// byte size plus (for uniform xvecs on range-capable servers) a
+/// 4-byte ranged GET for the dim header. Nothing touches the cache
+/// directory, so an untouched dataset stays untouched on disk.
+fn spawn_size_probes(
+    jobs: Vec<SizeProbeJob>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::sync::mpsc::Receiver<SizeProbeResult> {
+    use std::sync::atomic::Ordering;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let queue = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::VecDeque::from(jobs)));
+    let workers = crate::cache::download_concurrency()
+        .min(queue.lock().map(|q| q.len()).unwrap_or(0));
+    for _ in 0..workers {
+        let queue = queue.clone();
+        let tx = tx.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            while !cancel.load(Ordering::Relaxed) {
+                let job = match queue.lock() {
+                    Ok(mut q) => q.pop_front(),
+                    Err(_) => None,
+                };
+                let Some(job) = job else { break };
+                let (bytes, bpr) = probe_facet(&job);
+                let result = SizeProbeResult { url: job.url, bytes, bpr };
+                if tx.send(result).is_err() { break; }
+            }
+        });
+    }
+    rx
+}
+
+/// One remote probe: HEAD for `Content-Length` (with read auth and
+/// S3 wrong-region handling via `HttpTransport`), then — when the
+/// facet is a uniform xvec on a range-capable server — a 4-byte
+/// ranged GET of the dim header for bytes-per-record, the same
+/// `4 + dim * elem` math ping and the cache survey use.
+fn probe_facet(job: &SizeProbeJob) -> (Option<u64>, Option<u64>) {
+    use crate::transport::ChunkedTransport;
+    let normalized = crate::transport::normalize_remote_url(&job.url);
+    let Some(parsed) = url::Url::parse(normalized.as_ref()).ok() else {
+        return (None, None);
+    };
+    let transport = crate::transport::HttpTransport::new(parsed);
+    let Ok(total) = transport.content_length() else { return (None, None) };
+    let mut bpr = None;
+    if job.uniform && transport.supports_range()
+        && let Ok(hdr) = transport.fetch_range(0, 4)
+            && hdr.len() == 4 {
+                let dim = i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+                if dim > 0 && dim <= 1_000_000 {
+                    bpr = Some(4 + dim as u64 * job.elem_size as u64);
+                }
+            }
+    ((total > 0).then_some(total), bpr)
+}
+
+/// Resolved cardinality and byte weight for one facet, merged from
+/// its [`FacetShape`] and the knowledge map. Single authority for
+/// the window math — the COUNT/SIZE cells and the details overlays
+/// all read from here.
+struct FacetResolution {
+    /// Record count: the window length when windowed, else
+    /// `bytes / bpr` when both are known.
+    records: Option<u64>,
+    /// Bytes this facet contributes to its profile: the window's
+    /// byte span when it can be computed, else the whole file.
+    bytes: Option<u64>,
+    /// `bytes` covers the whole file although the view is a window
+    /// into it (bpr unknown, so the span couldn't be computed).
+    whole_file_for_window: bool,
+    /// A probe that could still improve this facet is in flight.
+    pending: bool,
+}
+
+/// Merge one facet's static shape with the session's knowledge.
+fn resolve_facet(
+    shape: &FacetShape,
+    knowledge: &std::collections::HashMap<String, FacetKnowledge>,
+) -> FacetResolution {
+    let known = knowledge.get(&shape.url).copied().unwrap_or_default();
+    let derived_records = match (known.bytes, known.bpr) {
+        (Some(bytes), Some(bpr)) if bpr > 0 => Some(bytes / bpr),
+        _ => None,
+    };
+    match shape.window {
+        Some((start, end)) => {
+            let span = known.bpr.map(|bpr| {
+                let span = (end - start).saturating_mul(bpr);
+                match known.bytes {
+                    Some(total) => span.min(total),
+                    None => span,
+                }
+            });
+            FacetResolution {
+                records: Some(end - start),
+                bytes: span.or(known.bytes),
+                whole_file_for_window: span.is_none() && known.bytes.is_some(),
+                pending: known.pending && span.is_none(),
+            }
+        }
+        None => FacetResolution {
+            records: derived_records,
+            bytes: known.bytes,
+            whole_file_for_window: false,
+            pending: known.pending
+                && (known.bytes.is_none() || (shape.uniform && known.bpr.is_none())),
+        },
+    }
+}
+
+/// Fill every row's COUNT and SIZE cells from the catalog entries
+/// and the knowledge map. Called after each row rebuild and after
+/// each batch of probe answers — cells are recomputed wholesale, so
+/// the function is the single authority on what the two columns
+/// mean:
+///   COUNT — base-vector cardinality: the declared `base_count`,
+///           else the base view's window length, else
+///           `bytes / bpr`; `*` marks profiles sharing the default
+///           profile's base file (no extra download).
+///   SIZE  — storage bytes summed over the profile's distinct facet
+///           files, window-scaled when the math is derivable; `…`
+///           while a probe is still in flight, a `+` suffix when
+///           some facet stayed unknowable (sum is a floor), `*`
+///           when a shared base file is counted whole.
+fn apply_size_cells(
+    rows: &mut [PickerRow],
+    entries: &[CatalogEntry],
+    knowledge: &std::collections::HashMap<String, FacetKnowledge>,
+) {
+    use crate::dataset::StandardFacet;
+    for row in rows.iter_mut() {
+        let Some(entry) = entries.iter().find(|e| e.name == row.dataset) else { continue };
+        let Some(profile) = entry.layout.profiles.profile(&row.profile) else { continue };
+
+        let default_base_path: Option<String> = entry.layout.profiles
+            .profile("default")
+            .and_then(|p| p.views.get(StandardFacet::BaseVectors.key()))
+            .map(|v| strip_window_suffix(&v.source.path).to_string());
+        let shares_default_base = row.profile != "default"
+            && !profile.partition
+            && default_base_path.is_some()
+            && profile.views.get(StandardFacet::BaseVectors.key())
+                .map(|v| strip_window_suffix(&v.source.path).to_string())
+                == default_base_path;
+
+        let base_shape = profile.views.get(StandardFacet::BaseVectors.key())
+            .and_then(|v| facet_shape(entry, v));
+        let base_res = base_shape.as_ref().map(|s| resolve_facet(s, knowledge));
+
+        row.count = match profile.base_count {
+            Some(c) if c > 0 => {
+                let s = format_count(c);
+                if shares_default_base { format!("{s}*") } else { s }
+            }
+            _ => match &base_res {
+                Some(r) => match r.records {
+                    Some(n) if n > 0 => {
+                        let s = format_count(n);
+                        if shares_default_base { format!("{s}*") } else { s }
+                    }
+                    _ if r.pending => SIZE_PENDING.to_string(),
+                    _ => String::new(),
+                },
+                None => String::new(),
+            },
+        };
+
+        // SIZE: sum each distinct facet FILE once (keyed by URL).
+        // Two views of the same file with different windows are
+        // still one download — count the larger contribution.
+        let mut urls: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        let mut pending = false;
+        let mut unknown = false;
+        for (_facet, view) in &profile.views {
+            let Some(shape) = facet_shape(entry, view) else { continue };
+            let res = resolve_facet(&shape, knowledge);
+            pending |= res.pending;
+            match res.bytes {
+                Some(b) => {
+                    let slot = urls.entry(shape.url).or_default();
+                    *slot = (*slot).max(b);
+                }
+                None => unknown = true,
+            }
+        }
+        // `*`: the sum counts the default profile's base file in
+        // full although this profile only shares (or windows into)
+        // it — downloading the default profile covers it.
+        let shared_whole_base = shares_default_base
+            && base_shape.as_ref().zip(base_res.as_ref()).is_some_and(|(s, r)|
+                r.bytes.is_some() && (s.window.is_none() || r.whole_file_for_window));
+        let total: u64 = urls.values().sum();
+        row.size = if pending {
+            SIZE_PENDING.to_string()
+        } else if total == 0 {
+            String::new()
+        } else {
+            let mut s = crate::explore::format_bytes_short(total);
+            if unknown { s.push('+'); }
+            if shared_whole_base { s.push('*'); }
+            s
+        };
+    }
+}
+
 fn facet_indicators(views: &indexmap::IndexMap<String, crate::dataset::DSView>) -> String {
     use crate::dataset::StandardFacet;
 
@@ -1257,6 +1787,17 @@ fn format_count(n: u64) -> String {
     n.to_string()
 }
 
+/// Row visibility: the text/facet filter AND the catalog toggle
+/// screen's enabled set. Single predicate so every visible-rows
+/// recomputation agrees.
+fn row_visible(
+    row: &PickerRow,
+    filter: &str,
+    disabled_catalogs: &std::collections::HashSet<String>,
+) -> bool {
+    !disabled_catalogs.contains(&row.catalog) && matches_filter(row, filter)
+}
+
 fn matches_filter(row: &PickerRow, filter: &str) -> bool {
     if filter.is_empty() { return true; }
 
@@ -1281,9 +1822,9 @@ fn matches_filter(row: &PickerRow, filter: &str) -> bool {
 pub enum PickerAction {
     /// Launch the unified vector-space explorer for this profile.
     Visualize,
-    /// Print the dataset's cache directory to stdout when the picker
-    /// exits — or a commented not-cached line when nothing is cached.
-    /// Batch-safe: selecting several datasets prints one line each.
+    /// Print the dataset's cache location (commented header + path,
+    /// or a commented not-cached note), then return to the picker.
+    /// Batch-safe: selecting several datasets prints one block each.
     Locate,
     /// Open a scrollable text view of the full catalog descriptor
     /// for this dataset+profile (attributes, facets with windows,
@@ -1296,7 +1837,9 @@ pub enum PickerAction {
     /// shape. Picker-local like Describe.
     Source,
     /// Download every facet's bytes into the local cache directory.
-    Precache,
+    /// (Drives the `datasets precache` machinery; the menu label is
+    /// "Download" because that's what the user experiences.)
+    Download,
     /// Delete the dataset's cached files from disk.
     Purge,
     /// Probe the dataset's catalog: verify reachability, list facets,
@@ -1311,7 +1854,7 @@ impl PickerAction {
             PickerAction::Locate    => "Locate",
             PickerAction::Describe  => "Describe",
             PickerAction::Source    => "Source",
-            PickerAction::Precache  => "Precache",
+            PickerAction::Download  => "Download",
             PickerAction::Purge     => "Purge",
             PickerAction::Ping      => "Ping",
         }
@@ -1322,12 +1865,12 @@ impl PickerAction {
             PickerAction::Visualize =>
                 "Open the interactive explorer: norms, distances, eigenvalues, PCA.",
             PickerAction::Locate =>
-                "Print the dataset's cache directory to stdout on exit (a commented line when not cached). Works on a multi-selection.",
+                "Print the dataset's cache directory (commented note when not cached), then return to the picker. Works on a multi-selection.",
             PickerAction::Describe =>
                 "Show full descriptor: attributes, facets (paths + windows), origin, cache state. Scrollable.",
             PickerAction::Source =>
                 "Show the raw catalog YAML — dataset.yaml verbatim, or the relevant entries from knn_entries.yaml. Scrollable.",
-            PickerAction::Precache =>
+            PickerAction::Download =>
                 "Download every facet of this profile into the cache directory.",
             PickerAction::Purge =>
                 "Delete this dataset's cached files from disk (does not affect the catalog).",
@@ -1347,7 +1890,7 @@ impl PickerAction {
             PickerAction::Describe,
             PickerAction::Source,
             PickerAction::Locate,
-            PickerAction::Precache,
+            PickerAction::Download,
             PickerAction::Ping,
             PickerAction::Purge,
         ]
@@ -1364,12 +1907,12 @@ impl PickerAction {
     /// selected rows in sequence. `Visualize` is excluded because
     /// it opens an interactive single-target viewer; `Describe` and
     /// `Source` are picker-local overlays that only have meaning
-    /// for one row at a time. The remaining three — precache,
-    /// ping, purge — chain naturally across a batch.
+    /// for one row at a time. The rest — locate, download, ping,
+    /// purge — chain naturally across a batch.
     fn batch_safe(self) -> bool {
         matches!(self,
             PickerAction::Locate
-            | PickerAction::Precache
+            | PickerAction::Download
             | PickerAction::Ping
             | PickerAction::Purge)
     }
@@ -1440,6 +1983,13 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     let cache_dir = crate::explore::cache_dir_or_exit();
     let mut cache_survey = survey_cache_state(&cache_dir);
     let mut all_rows = build_rows(entries, &cache_survey);
+    // Session-long facet knowledge (url → bytes/bpr): seeded from
+    // local sources now, completed by background remote probes once
+    // the terminal is up. Drives the COUNT and SIZE cells and the
+    // per-facet cardinality lines in the detail overlays.
+    let mut facet_knowledge: std::collections::HashMap<String, FacetKnowledge> =
+        std::collections::HashMap::new();
+    collect_local_knowledge(entries, &cache_dir, &cache_survey, &mut facet_knowledge);
     if all_rows.is_empty() {
         eprintln!("error: no dataset profiles available in the configured catalogs");
         return PickerOutcome::Failed;
@@ -1477,7 +2027,49 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
         }
     };
 
+    // Background remote-size probes for facets the local pass left
+    // incompletely answered (untouched remote datasets). Answers
+    // stream in over the channel, drained at the top of the event
+    // loop into `facet_knowledge`, which lives across row rebuilds
+    // so nothing is ever probed twice.
+    let size_probe_cancel = std::sync::Arc::new(
+        std::sync::atomic::AtomicBool::new(false));
+    let size_probe_rx = {
+        let jobs = collect_size_probe_jobs(entries, &mut facet_knowledge);
+        spawn_size_probes(jobs, size_probe_cancel.clone())
+    };
+    apply_size_cells(&mut all_rows, entries, &facet_knowledge);
+
     let mut filter = String::new();
+    // Last theme-knob outcome, shown on the footer's summary line
+    // until any other key clears it.
+    let mut flash: Option<String> = None;
+    // Catalog toggle screen (Ctrl-G): the ordered catalog names with
+    // dataset counts, the disabled set (session-scoped — comment the
+    // entry out in catalogs.yaml to disable persistently), and the
+    // screen's open/cursor state.
+    let catalog_list: Vec<(String, usize)> = {
+        let mut ordered: Vec<(String, usize)> = Vec::new();
+        for e in entries {
+            let name = e.catalog_name.clone().unwrap_or_else(|| "?".to_string());
+            match ordered.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, count)) => *count += 1,
+                None => ordered.push((name, 1)),
+            }
+        }
+        ordered
+    };
+    // Seed from the persisted `disabled_catalogs` setting; only
+    // names that actually exist in this session's catalog list count
+    // (a stale name in settings silently waits for its catalog to
+    // come back).
+    let mut disabled_catalogs: std::collections::HashSet<String> =
+        crate::settings::disabled_catalogs().into_iter().collect();
+    // Hidden columns, persisted as the `disabled_columns` key.
+    let mut disabled_columns: std::collections::HashSet<String> =
+        crate::settings::disabled_columns().into_iter().collect();
+    let mut catalog_screen = false;
+    let mut catalog_cursor: usize = 0;
     let mut cursor: usize = 0;
     let mut scroll: usize = 0;
     let mut show_all_profiles = false;
@@ -1534,12 +2126,28 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     let result: PickerOutcome;
 
     loop {
+        // Fold finished remote-size probes into the knowledge map,
+        // then recompute the COUNT/SIZE cells they could affect.
+        let mut probes_landed = false;
+        while let Ok(result) = size_probe_rx.try_recv() {
+            let slot = facet_knowledge.entry(result.url).or_default();
+            // Local knowledge wins — a probe never downgrades it.
+            slot.bytes = slot.bytes.or(result.bytes);
+            slot.bpr = slot.bpr.or(result.bpr);
+            slot.pending = false;
+            slot.probed = true;
+            probes_landed = true;
+        }
+        if probes_landed {
+            apply_size_cells(&mut all_rows, entries, &facet_knowledge);
+        }
+
         // Filter rows:
         // - show_all_profiles: show everything
         // - otherwise: show "default" profile + all profiles of expanded datasets
         let visible: Vec<&PickerRow> = all_rows.iter()
             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
-            .filter(|r| matches_filter(r, &filter))
+            .filter(|r| row_visible(r, &filter, &disabled_catalogs))
             .collect();
 
         if cursor >= visible.len() && !visible.is_empty() {
@@ -1579,19 +2187,19 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
             // panel instead of plain ASCII. In mono mode all tints
             // collapse to terminal default.
             let filter_line = Line::from(vec![
-                Span::styled(" Filter: ", tinted(TEXT_MUTED)),
-                Span::styled(filter.clone(), tinted(TEXT_PRIMARY)),
-                Span::styled("█", tinted(ACCENT_CYAN)),
+                Span::styled(" Filter: ", tinted(theme().text_muted)),
+                Span::styled(filter.clone(), tinted(theme().text_primary)),
+                Span::styled("█", tinted(theme().primary)),
             ]);
             frame.render_widget(
                 Paragraph::new(filter_line)
                     .block(Block::default().borders(Borders::ALL)
-                        .border_style(bordered(ACCENT_LAVENDR))
+                        .border_style(bordered(theme().info))
                         .title(Span::styled(
                             format!(" Select Dataset — {} shown ({}) ",
                                 visible.len(),
                                 if show_all_profiles { "all profiles" } else { "default only — Tab for all" }),
-                            tinted(ACCENT_CYAN),
+                            tinted(theme().primary),
                         ))),
                 chunks[0],
             );
@@ -1614,44 +2222,46 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
             }
 
             if show_help {
+                // Compact on purpose: every line ≤78 columns and the
+                // whole card ≤19 rows, so it renders complete on an
+                // 80×24 terminal (the Paragraph doesn't scroll —
+                // anything taller silently truncates). One group per
+                // label; the "Overlays" line documents the shared
+                // conventions of every sub-screen (settings,
+                // describe/source, menus) in one place.
+                let group = |label: &str, text: &str| {
+                    Line::from(vec![
+                        Span::styled(format!(" {label:<10}"), tinted(theme().primary)),
+                        Span::styled(text.to_string(), tinted(theme().text_primary)),
+                    ])
+                };
+                let cont = |text: &str| {
+                    Line::from(vec![
+                        Span::raw(" ".repeat(11)),
+                        Span::styled(text.to_string(), tinted(theme().text_primary)),
+                    ])
+                };
                 let help = vec![
-                    Line::from(Span::styled(" Dataset Picker — Keyboard Shortcuts", tinted(ACCENT_CYAN))),
+                    Line::from(Span::styled(" Dataset Picker — Keys", tinted(theme().primary))),
                     Line::from(""),
-                    Line::from(" Navigation"),
-                    Line::from("   ↑ / ↓                 Move cursor"),
-                    Line::from("   PgUp / PgDn           Jump by page"),
-                    Line::from("   Enter / →             Expand dataset / open action menu"),
-                    Line::from("   ←                     Collapse expanded dataset"),
-                    Line::from("   Tab                   Toggle: default profiles / all profiles"),
-                    Line::from(""),
-                    Line::from(" Multi-select"),
-                    Line::from("   Space                 Toggle the cursor row into / out of selection"),
-                    Line::from("   Shift+↑ / Shift+↓     Extend a temporary highlighted range"),
-                    Line::from("   Space (in range)      Toggle every row in the highlighted range"),
-                    Line::from("   Enter (with selection) Open batch action menu (Precache / Ping / Purge)"),
-                    Line::from(""),
-                    Line::from(" Filtering"),
-                    Line::from("   type letters          Filter by name, profile, or metric"),
-                    Line::from("   type BQGDMPRF         Filter by facet codes (all caps)"),
-                    Line::from("   Backspace             Delete last filter character"),
-                    Line::from(""),
-                    Line::from(" Facet Codes"),
-                    Line::from("   B=Base  Q=Query  G=GroundTruth  D=Distances"),
-                    Line::from("   M=Metadata  P=Predicates  R=Results  F=Filtered"),
-                    Line::from(""),
-                    Line::from(" Inspection"),
-                    Line::from("   Ctrl-D                Toggle dataset details overlay"),
-                    Line::from("   Ctrl-T                Toggle colour / mono theme"),
-                    Line::from(""),
-                    Line::from(" Exit"),
-                    Line::from("   Esc                   Drop range → clear selection → close details → collapse → clear filter → exit"),
-                    Line::from("   q / Ctrl-C            Quit immediately"),
-                    Line::from("   ?                     Toggle this help"),
+                    group("Navigate",  "↑↓ move · PgUp/PgDn page · Home/End ends · Tab all profiles"),
+                    cont("Enter/→ expand or open menu · ← collapse"),
+                    group("Filter",    "type to match name/profile/metric · Backspace edits"),
+                    cont("ALL-CAPS filters facets: B=Base Q=Query G=GroundTruth"),
+                    cont("D=Distances M=Meta P=Predicates R=Results F=Filtered"),
+                    group("Select",    "Space toggles row · Shift+↑↓ extends range, Space commits"),
+                    cont("Enter with a selection → batch menu (Download/Ping/Purge)"),
+                    group("Inspect",   "Ctrl-D details panel · Enter menu → Describe/Source/Locate"),
+                    group("Configure", "Ctrl-G settings: catalogs · columns · theme · reset"),
+                    cont("Ctrl-T mono/colour (terminals that mangle ANSI)"),
+                    group("Overlays",  "↑↓ or j/k scroll · g/G Home/End ends · Esc or q close"),
+                    group("Exit",      "Esc peels: help → range → selection → details →"),
+                    cont("expanded → filter → exit · Ctrl-C quits now · ? this help"),
                 ];
                 frame.render_widget(
                     Paragraph::new(help).block(Block::default().borders(Borders::ALL)
-                        .border_style(bordered(ACCENT_LAVENDR))
-                        .title(Span::styled(" Help ", tinted(ACCENT_CYAN)))),
+                        .border_style(bordered(theme().info))
+                        .title(Span::styled(" Help ", tinted(theme().primary)))),
                     chunks[1],
                 );
             } else {
@@ -1662,43 +2272,79 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
             //   col 0  cursor pip ('▶' or ' ')
             //   col 1  toggle mark ('●' or ' ')
             //   col 2-4 tree glyph (up to 3 cols: " └ ", "▸ ", etc.)
-            // Reserve 5 cols on top of the longest dataset name plus
-            // 2 trailing blanks so the PROFILE column has a visible
-            // gap even when the widest row fills its cell edge-to-edge.
+            // Reserve 5 cols on top of the longest dataset name.
+            // Inter-column gaps come from explicit one-space
+            // separator spans (see the header/row assembly below),
+            // never from width headroom — every cell is rendered at
+            // exactly its column width, so a value filling its cell
+            // edge-to-edge still gets a gap before the next column.
             let name_w = visible.iter()
-                .map(|r| UnicodeWidthStr::width(r.dataset.as_str()) + 5 + 2)
+                .map(|r| UnicodeWidthStr::width(r.dataset.as_str()) + 5)
                 .max()
                 .unwrap_or(20)
                 .max(12);
-            // PROFILE column sized to fit the longest profile name plus
-            // a trailing gap. Default of 14 is plenty for `default`,
-            // `1m`, `40mi` etc., but partition / user-named profiles
-            // can run longer.
+            // PROFILE column sized to fit the longest profile name.
+            // Default of 14 is plenty for `default`, `1m`, `40mi`
+            // etc., but partition / user-named profiles can run
+            // longer.
             let prof_w = visible.iter()
-                .map(|r| UnicodeWidthStr::width(r.profile.as_str()) + 2)
+                .map(|r| UnicodeWidthStr::width(r.profile.as_str()))
                 .max()
                 .unwrap_or(14)
                 .max(10);
-            let facet_w = 12;
-            let metric_w = 14;
-            let size_w = 11; // +1 vs metric/cache widths to leave room for the shared-base "*"
-            let access_w = 10;
-            let cache_w = 18;
+            // Per-column widths. CATALOG sizes to its content
+            // (catalog names are user-chosen); the rest are fixed.
+            let catalog_w = visible.iter()
+                .map(|r| UnicodeWidthStr::width(r.catalog.as_str()))
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let col_w = |c: PickerColumn| -> usize {
+                match c {
+                    PickerColumn::Catalog => catalog_w,
+                    PickerColumn::Facets  => 12,
+                    PickerColumn::Metric  => 14,
+                    // Room for the shared-base "*" after the value.
+                    PickerColumn::Count   => 8,
+                    // Room for the "+" (sum is a floor) / "*" marks.
+                    PickerColumn::Size    => 9,
+                    PickerColumn::Access  => 10,
+                    PickerColumn::Cached  => 18,
+                }
+            };
+            let enabled_cols: Vec<PickerColumn> = ALL_COLUMNS.iter().copied()
+                .filter(|c| !disabled_columns.contains(c.name()))
+                .collect();
+            // The catalog column sits LEFT of DATASET (provenance
+            // before identity); the rest follow PROFILE.
+            let catalog_enabled = enabled_cols.contains(&PickerColumn::Catalog);
+            let trailing_cols: Vec<PickerColumn> = enabled_cols.iter().copied()
+                .filter(|c| *c != PickerColumn::Catalog)
+                .collect();
 
             // Header and data rows share the same cell widths so columns
-            // line up edge-to-edge. Data rows get their leading whitespace
-            // from the tree prefix (3–4 display columns depending on
-            // shape); the header pads DATASET to the same `name_w` so
-            // the PROFILE column lands at identical offsets in both.
-            let mut lines = vec![Line::from(vec![
-                Span::styled(pad_display("DATASET", name_w), tinted(TEXT_MUTED)),
-                Span::styled(pad_display("PROFILE", prof_w), tinted(TEXT_MUTED)),
-                Span::styled(pad_display("FACETS", facet_w), tinted(TEXT_MUTED)),
-                Span::styled(pad_display("METRIC", metric_w), tinted(TEXT_MUTED)),
-                Span::styled(pad_display("SIZE", size_w), tinted(TEXT_MUTED)),
-                Span::styled(pad_display("ACCESS", access_w), tinted(TEXT_MUTED)),
-                Span::styled(pad_display("CACHED", cache_w), tinted(TEXT_MUTED)),
-            ])];
+            // line up edge-to-edge. Data rows prefix the dataset name
+            // with marker + tree glyph columns; the DATASET header is
+            // indented by the same width so it aligns with the names
+            // themselves (2 marker cols + 2 glyph cols in tree mode,
+            // markers only when every profile is flattened).
+            let name_indent = if show_all_profiles { 2 } else { 4 };
+            let dataset_header = format!("{}DATASET", " ".repeat(name_indent));
+            let mut header_spans = Vec::new();
+            if catalog_enabled {
+                header_spans.push(Span::styled(
+                    fit_display("C", catalog_w), tinted(theme().text_muted)));
+                header_spans.push(Span::raw(" "));
+            }
+            header_spans.push(Span::styled(fit_display(&dataset_header, name_w), tinted(theme().text_muted)));
+            header_spans.push(Span::raw(" "));
+            header_spans.push(Span::styled(fit_display("PROFILE", prof_w), tinted(theme().text_muted)));
+            for c in &trailing_cols {
+                header_spans.push(Span::raw(" "));
+                header_spans.push(Span::styled(
+                    fit_display(c.header(), col_w(*c)), tinted(theme().text_muted)));
+            }
+            let mut lines = vec![Line::from(header_spans)];
 
             // Compute the inclusive range of visible-row indices
             // that should render with the REVERSED bar. When
@@ -1725,18 +2371,18 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     // Persistent multi-select: tinted accent so a
                     // toggled-but-not-current row is visible without
                     // overwhelming the cursor's REVERSED bar.
-                    tinted(ACCENT_LAVENDR)
+                    tinted(theme().info)
                 } else if row.cache_status != "—" {
-                    tinted(ACCENT_MINT)
+                    tinted(theme().success)
                 } else {
-                    tinted(TEXT_PRIMARY)
+                    tinted(theme().text_primary)
                 };
                 let cache_style = if in_range {
                     style
                 } else if row.cache_status != "—" {
-                    tinted(ACCENT_MINT)
+                    tinted(theme().success)
                 } else {
-                    tinted(TEXT_DIM)
+                    tinted(theme().text_dim)
                 };
 
                 // Row prefix layout (display columns):
@@ -1772,10 +2418,10 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 let name_cell = fit_display(&name_field, name_w);
 
                 let access_color = match row.access {
-                    AccessMode::Local         => ACCENT_CYAN,
-                    AccessMode::MerkleHashed  => ACCENT_MINT,
-                    AccessMode::MerkleChunked => ACCENT_LAVENDR,
-                    AccessMode::FullTransfer  => ACCENT_CORAL,
+                    AccessMode::Local         => theme().primary,
+                    AccessMode::MerkleHashed  => theme().success,
+                    AccessMode::MerkleChunked => theme().info,
+                    AccessMode::FullTransfer  => theme().error,
                 };
                 let access_style = if in_range {
                     style
@@ -1783,21 +2429,46 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     tinted(access_color)
                 };
 
-                lines.push(Line::from(vec![
-                    Span::styled(name_cell, style),
-                    Span::styled(pad_display(&row.profile, prof_w), style),
-                    Span::styled(pad_display(&row.facets, facet_w), style),
-                    Span::styled(pad_display(&row.metric, metric_w), style),
-                    Span::styled(pad_display(&row.size, size_w), style),
-                    Span::styled(pad_display(row.access.short_label(), access_w), access_style),
-                    Span::styled(pad_display(&row.cache_status, cache_w), cache_style),
-                ]));
+                // Separator spans carry the row's base style so the
+                // REVERSED highlight bar stays continuous across
+                // column gaps on the cursor/range rows.
+                let mut row_spans = Vec::new();
+                if catalog_enabled {
+                    row_spans.push(Span::styled(
+                        fit_display(&row.catalog, catalog_w),
+                        if in_range { style } else { tinted(theme().text_muted) }));
+                    row_spans.push(Span::styled(" ", style));
+                }
+                row_spans.push(Span::styled(name_cell, style));
+                row_spans.push(Span::styled(" ", style));
+                row_spans.push(Span::styled(fit_display(&row.profile, prof_w), style));
+                for c in &trailing_cols {
+                    let w = col_w(*c);
+                    row_spans.push(Span::styled(" ", style));
+                    row_spans.push(match c {
+                        PickerColumn::Facets =>
+                            Span::styled(fit_display(&row.facets, w), style),
+                        PickerColumn::Metric =>
+                            Span::styled(fit_display(&row.metric, w), style),
+                        PickerColumn::Count =>
+                            Span::styled(fit_display(&row.count, w), style),
+                        PickerColumn::Size =>
+                            Span::styled(fit_display(&row.size, w), style),
+                        PickerColumn::Access =>
+                            Span::styled(fit_display(row.access.short_label(), w), access_style),
+                        PickerColumn::Cached =>
+                            Span::styled(fit_display(&row.cache_status, w), cache_style),
+                        // Catalog renders before DATASET, never here.
+                        PickerColumn::Catalog => unreachable!("catalog is filtered out of trailing_cols"),
+                    });
+                }
+                lines.push(Line::from(row_spans));
             }
 
             frame.render_widget(
                 Paragraph::new(lines)
                     .block(Block::default().borders(Borders::ALL)
-                        .border_style(bordered(ACCENT_LAVENDR))),
+                        .border_style(bordered(theme().info))),
                 chunks[1],
             );
 
@@ -1811,21 +2482,28 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
             // default otherwise).
             let (detail_line, access_line) = if let Some(row) = visible.get(cursor) {
                 let mut spans: Vec<Span<'_>> = vec![Span::raw(" ")];
+                // Name the legend so users know what the indicator
+                // letters describe.
+                if theme_on {
+                    spans.push(Span::styled("Facets: ", Style::default().fg(theme().text_muted)));
+                } else {
+                    spans.push(Span::raw("Facets: "));
+                }
                 let facet_details: &[(&str, char, Color)] = &[
-                    ("Base",     'B', ACCENT_MINT),
-                    ("Query",    'Q', ACCENT_MINT),
-                    ("GT",       'G', ACCENT_AMBER),
-                    ("Dist",     'D', ACCENT_AMBER),
-                    ("Meta",     'M', ACCENT_PINK),
-                    ("Pred",     'P', ACCENT_PINK),
-                    ("Results",  'R', ACCENT_PINK),
-                    ("Filtered", 'F', ACCENT_CORAL),
+                    ("Base",     'B', theme().success),
+                    ("Query",    'Q', theme().success),
+                    ("GT",       'G', theme().warning),
+                    ("Dist",     'D', theme().warning),
+                    ("Meta",     'M', theme().meta),
+                    ("Pred",     'P', theme().meta),
+                    ("Results",  'R', theme().meta),
+                    ("Filtered", 'F', theme().error),
                 ];
                 for (label, code, color) in facet_details {
                     let present = row.facets.contains(*code);
                     if theme_on {
                         let style = if present { Style::default().fg(*color) }
-                                    else { Style::default().fg(TEXT_DIM) };
+                                    else { Style::default().fg(theme().text_dim) };
                         spans.push(Span::styled(format!("{} ", label), style));
                     } else {
                         // Mono: bracket present facets, strike absent ones with
@@ -1836,10 +2514,10 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     }
                 }
                 let access_color = match row.access {
-                    AccessMode::Local         => ACCENT_CYAN,
-                    AccessMode::MerkleHashed  => ACCENT_MINT,
-                    AccessMode::MerkleChunked => ACCENT_LAVENDR,
-                    AccessMode::FullTransfer  => ACCENT_CORAL,
+                    AccessMode::Local         => theme().primary,
+                    AccessMode::MerkleHashed  => theme().success,
+                    AccessMode::MerkleChunked => theme().info,
+                    AccessMode::FullTransfer  => theme().error,
                 };
                 let access = Line::from(Span::styled(
                     format!(" access: {}", row.access.description()),
@@ -1854,7 +2532,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     detail_line,
                     access_line,
                 ]).block(Block::default().borders(Borders::TOP)
-                    .border_style(bordered(ACCENT_LAVENDR))),
+                    .border_style(bordered(theme().info))),
                 chunks[2],
             );
 
@@ -1876,13 +2554,26 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 (n, None)        => format!(" Selected: {n} · Space toggles cursor · Enter for batch menu"),
                 (n, Some(r))     => format!(" Selected: {n} · Range: {r} highlighted · Space toggles range"),
             };
-            let mono_hint = if theme_on { "Ctrl-T: mono" } else { "Ctrl-T: colour" };
+            // The flash slot shows the latest theme-knob action
+            // (cycle/save outcome) until the next keypress replaces
+            // the summary line's left edge.
+            let summary_line = match &flash {
+                Some(f) => format!(" {f}"),
+                None => summary,
+            };
+            // Essentials only — the full keymap lives in the `?`
+            // help overlay. One line, 78 display columns, so an
+            // 80-column terminal shows it whole instead of
+            // truncating a cheat sheet. `^G` (terminal notation, as
+            // in nano) keeps the config entry point discoverable
+            // without blowing the width budget — settings must be
+            // findable without first finding help.
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from(Span::styled(summary, tinted(ACCENT_CYAN))),
+                    Line::from(Span::styled(summary_line, tinted(theme().primary))),
                     Line::from(Span::styled(
-                        format!(" ↑↓: navigate | Shift+↑↓: range | Space: toggle | Enter/→: expand | ←: collapse | Tab: all profiles | Ctrl-D: details | {mono_hint} | Esc: back | q: quit"),
-                        tinted(TEXT_MUTED))),
+                        " type: filter · Space: select · Enter: menu · ^G: config · ?: help · Esc: quit",
+                        tinted(theme().text_muted))),
                 ]),
                 chunks[3],
             );
@@ -1905,15 +2596,15 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                         height: popup_h,
                     };
                     let entry = entries.iter().find(|e| e.name == row.dataset);
-                    let lines = build_details_lines(row, entry, theme_on);
+                    let lines = build_details_lines(row, entry, &facet_knowledge, theme_on);
                     frame.render_widget(ratatui::widgets::Clear, area);
                     frame.render_widget(
                         Paragraph::new(lines)
                             .block(Block::default().borders(Borders::ALL)
-                                .border_style(bordered(ACCENT_LAVENDR))
+                                .border_style(bordered(theme().info))
                                 .title(Span::styled(
                                     format!(" Dataset Details — {}:{} (Ctrl-D / Esc to close) ", row.dataset, row.profile),
-                                    tinted(ACCENT_CYAN),
+                                    tinted(theme().primary),
                                 ))),
                         area,
                     );
@@ -1953,13 +2644,13 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     Paragraph::new(descriptor_lines.clone())
                         .scroll((descriptor_scroll, 0))
                         .block(Block::default().borders(Borders::ALL)
-                            .border_style(bordered(ACCENT_LAVENDR))
+                            .border_style(bordered(theme().info))
                             .title(Span::styled(
-                                format!(" {} ({}/{} · ↑↓/PgUp/PgDn/Home/End · Esc to close) ",
+                                format!(" {} ({}/{} · ↑↓ j/k scroll · g/G ends · Esc/q close) ",
                                     descriptor_title,
                                     descriptor_scroll + 1,
                                     descriptor_lines.len().max(1)),
-                                tinted(ACCENT_CYAN),
+                                tinted(theme().primary),
                             ))),
                     area,
                 );
@@ -1994,7 +2685,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     let style = if i == disambig_cursor {
                         selected_style()
                     } else {
-                        tinted(TEXT_PRIMARY)
+                        tinted(theme().text_primary)
                     };
                     lines.push(Line::from(Span::styled(
                         format!("{marker}{opt}"),
@@ -2006,10 +2697,10 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 frame.render_widget(
                     Paragraph::new(lines)
                         .block(Block::default().borders(Borders::ALL)
-                            .border_style(bordered(ACCENT_LAVENDR))
+                            .border_style(bordered(theme().info))
                             .title(Span::styled(
                                 " Which target? (↑↓ · Enter · Esc) ",
-                                tinted(ACCENT_LAVENDR),
+                                tinted(theme().info),
                             ))),
                     area,
                 );
@@ -2052,7 +2743,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     let style = if i == menu_cursor {
                         selected_style()
                     } else {
-                        tinted(TEXT_PRIMARY)
+                        tinted(theme().text_primary)
                     };
                     lines.push(Line::from(Span::styled(
                         format!("{marker}{}", action.label()),
@@ -2062,14 +2753,101 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     format!(" {}", actions[menu_cursor].description()),
-                    tinted(TEXT_MUTED),
+                    tinted(theme().text_muted),
                 )));
                 frame.render_widget(ratatui::widgets::Clear, area);
                 frame.render_widget(
                     Paragraph::new(lines)
                         .block(Block::default().borders(Borders::ALL)
-                            .border_style(bordered(ACCENT_CYAN))
-                            .title(Span::styled(title_text, tinted(ACCENT_CYAN)))),
+                            .border_style(bordered(theme().primary))
+                            .title(Span::styled(title_text, tinted(theme().primary)))),
+                    area,
+                );
+            }
+
+            // Settings screen (Ctrl-G): catalogs, columns, theme,
+            // reset — one cursor over the actionable items, section
+            // headers rendered between them. Toggles persist
+            // immediately; theme cycles are session state with an
+            // explicit save item.
+            if catalog_screen {
+                let items = settings_items(&catalog_list);
+                let outer = frame.area();
+                // items + 4 section headers + frame + hint rows.
+                let h: u16 = (items.len() as u16) + 9;
+                let w: u16 = 76;
+                let area = ratatui::layout::Rect {
+                    x: outer.x + outer.width.saturating_sub(w) / 2,
+                    y: outer.y + outer.height.saturating_sub(h) / 2,
+                    width: w.min(outer.width),
+                    height: h.min(outer.height),
+                };
+                let (cur_palette, cur_curve) = super::theme_palette_curve();
+                let header = |t: &str| Line::from(Span::styled(
+                    format!(" {t}"), tinted(theme().info)));
+                let mut lines: Vec<Line> = Vec::new();
+                let mut last_section = "";
+                for (i, item) in items.iter().enumerate() {
+                    let section = match item {
+                        SettingsItem::CatalogToggle(_) => "Catalogs",
+                        SettingsItem::ColumnToggle(_) => "Columns",
+                        SettingsItem::PaletteCycle
+                        | SettingsItem::CurveCycle
+                        | SettingsItem::SaveTheme => "Theme",
+                        SettingsItem::ResetDisplay => "Maintenance",
+                    };
+                    if section != last_section {
+                        lines.push(header(section));
+                        last_section = section;
+                    }
+                    let marker = if i == catalog_cursor { " ▸ " } else { "   " };
+                    let (text, enabled) = match item {
+                        SettingsItem::CatalogToggle(name) => {
+                            let enabled = !disabled_catalogs.contains(name);
+                            let count = catalog_list.iter()
+                                .find(|(n, _)| n == name)
+                                .map(|(_, c)| *c)
+                                .unwrap_or(0);
+                            (format!("[{}] {name}  ({count} dataset{})",
+                                if enabled { "x" } else { " " },
+                                if count == 1 { "" } else { "s" }), enabled)
+                        }
+                        SettingsItem::ColumnToggle(col) => {
+                            let enabled = !disabled_columns.contains(col.name());
+                            (format!("[{}] {} column",
+                                if enabled { "x" } else { " " }, col.name()), enabled)
+                        }
+                        SettingsItem::PaletteCycle =>
+                            (format!("palette: {}  (Space cycles)", cur_palette.name()), true),
+                        SettingsItem::CurveCycle =>
+                            (format!("curve: {}  (Space cycles)", cur_curve.name()), true),
+                        SettingsItem::SaveTheme =>
+                            ("save theme to settings as default".to_string(), true),
+                        SettingsItem::ResetDisplay =>
+                            ("reset display options (palette, curve, columns)".to_string(), true),
+                    };
+                    let style = if i == catalog_cursor {
+                        selected_style()
+                    } else if enabled {
+                        tinted(theme().text_primary)
+                    } else {
+                        tinted(theme().text_dim)
+                    };
+                    lines.push(Line::from(Span::styled(format!("{marker}{text}"), style)));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    " Space/Enter: toggle/activate — toggles persist to settings.yaml",
+                    tinted(theme().text_muted),
+                )));
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .block(Block::default().borders(Borders::ALL)
+                            .border_style(bordered(theme().primary))
+                            .title(Span::styled(
+                                " Settings — ↑↓ j/k move · Space toggle · Esc/q close ",
+                                tinted(theme().primary)))),
                     area,
                 );
             }
@@ -2101,6 +2879,96 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     colors_enabled = !colors_enabled;
                     continue;
                 }
+                // Theme knobs (palette/curve cycle, save) live on the
+                // Ctrl-G settings screen only — global chords for
+                // them were dropped to keep the keymap small. Ctrl-T
+                // stays global: it is the accessibility escape hatch
+                // for terminals that mangle color, so it must work
+                // without navigating a (colored) settings screen.
+                if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    catalog_screen = !catalog_screen;
+                    catalog_cursor = 0;
+                    continue;
+                }
+                // Settings screen is modal: swallow everything except
+                // its own navigation/activate/close keys. Toggles
+                // persist immediately (checkbox semantics); theme
+                // cycles are session state with an explicit save item.
+                if catalog_screen {
+                    let items = settings_items(&catalog_list);
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => { catalog_screen = false; }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            catalog_cursor = catalog_cursor.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if catalog_cursor + 1 < items.len() {
+                                catalog_cursor += 1;
+                            }
+                        }
+                        KeyCode::Char(' ') | KeyCode::Enter => {
+                            match items.get(catalog_cursor) {
+                                Some(SettingsItem::CatalogToggle(name)) => {
+                                    if !disabled_catalogs.remove(name) {
+                                        disabled_catalogs.insert(name.clone());
+                                    }
+                                    if let Err(e) =
+                                        crate::settings::write_disabled_catalogs(&disabled_catalogs)
+                                    {
+                                        flash = Some(format!("could not persist disabled_catalogs: {e}"));
+                                    }
+                                    // The visible row set just changed
+                                    // out from under the main cursor —
+                                    // snap it back.
+                                    cursor = 0;
+                                    scroll = 0;
+                                }
+                                Some(SettingsItem::ColumnToggle(col)) => {
+                                    let name = col.name().to_string();
+                                    if !disabled_columns.remove(&name) {
+                                        disabled_columns.insert(name);
+                                    }
+                                    if let Err(e) =
+                                        crate::settings::write_disabled_columns(&disabled_columns)
+                                    {
+                                        flash = Some(format!("could not persist disabled_columns: {e}"));
+                                    }
+                                }
+                                Some(SettingsItem::PaletteCycle) => {
+                                    let (p, c) = super::theme_palette_curve();
+                                    super::set_theme(p.next(), c);
+                                }
+                                Some(SettingsItem::CurveCycle) => {
+                                    let (p, c) = super::theme_palette_curve();
+                                    super::set_theme(p, c.next());
+                                }
+                                Some(SettingsItem::SaveTheme) => {
+                                    let (p, c) = super::theme_palette_curve();
+                                    flash = Some(match super::save_theme_to_settings() {
+                                        Ok(path) => format!(
+                                            "saved theme ({}/{}) to {}",
+                                            p.name(), c.name(), path.display()),
+                                        Err(e) => format!("save failed: {e}"),
+                                    });
+                                }
+                                Some(SettingsItem::ResetDisplay) => {
+                                    flash = Some(match super::reset_display_options() {
+                                        Ok(()) => {
+                                            disabled_columns.clear();
+                                            "display options reset to the project standard".to_string()
+                                        }
+                                        Err(e) => format!("reset failed: {e}"),
+                                    });
+                                }
+                                None => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                // Any other key clears the theme-knob flash.
+                flash = None;
 
                 // Descriptor overlay is modal — when open, swallow
                 // everything but scroll/close keys so the underlying
@@ -2207,7 +3075,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                         KeyCode::Enter => {
                             let vis: Vec<&PickerRow> = all_rows.iter()
                                 .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
-                                .filter(|r| matches_filter(r, &filter))
+                                .filter(|r| row_visible(r, &filter, &disabled_catalogs))
                                 .collect();
                             // Batch path: loop the chosen action
                             // over every specifier in the persistent
@@ -2246,9 +3114,14 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                     break;
                                 }
                                 // Cache survey reflects every change
-                                // the batch made.
+                                // the batch made; fresh local facts
+                                // (finished downloads) refresh the
+                                // knowledge map before cells refill.
                                 cache_survey = survey_cache_state(&cache_dir);
                                 all_rows = build_rows(entries, &cache_survey);
+                                collect_local_knowledge(
+                                    entries, &cache_dir, &cache_survey, &mut facet_knowledge);
+                                apply_size_cells(&mut all_rows, entries, &facet_knowledge);
                                 // Selection stays toggled — user can
                                 // chain another batch action without
                                 // re-selecting. Press Esc to clear.
@@ -2265,7 +3138,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                     match action {
                                         PickerAction::Describe => {
                                             let entry = entries.iter().find(|e| e.name == row.dataset);
-                                            descriptor_lines = build_descriptor_lines(row, entry, theme_on);
+                                            descriptor_lines = build_descriptor_lines(row, entry, &facet_knowledge, theme_on);
                                             descriptor_title = format!(
                                                 "Descriptor — {}:{}", row.dataset, row.profile);
                                             descriptor_scroll = 0;
@@ -2279,7 +3152,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                                     "Source — error".to_string(),
                                                     vec![Line::from(
                                                         Span::styled(" no catalog entry found".to_string(),
-                                                            if theme_on { Style::default().fg(ACCENT_CORAL) }
+                                                            if theme_on { Style::default().fg(theme().error) }
                                                             else { Style::default() }),
                                                     )],
                                                 ),
@@ -2327,9 +3200,12 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                 // moved it.
                                 cache_survey = survey_cache_state(&cache_dir);
                                 all_rows = build_rows(entries, &cache_survey);
+                                collect_local_knowledge(
+                                    entries, &cache_dir, &cache_survey, &mut facet_knowledge);
+                                apply_size_cells(&mut all_rows, entries, &facet_knowledge);
                                 let new_visible_idx = all_rows.iter()
                                     .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
-                                    .filter(|r| matches_filter(r, &filter))
+                                    .filter(|r| row_visible(r, &filter, &disabled_catalogs))
                                     .position(|r| r.specifier() == specifier);
                                 if let Some(pos) = new_visible_idx {
                                     cursor = pos;
@@ -2346,19 +3222,24 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     continue;
                 }
                 match key.code {
-                    KeyCode::Char('q') => {
-                        result = PickerOutcome::Done;
-                        break;
-                    }
+                    // No `q`-quit on the main list: every printable
+                    // key belongs to the filter (datasets named
+                    // "quora"/"query" were unfilterable while `q`
+                    // quit). Exit is the Esc cascade or Ctrl-C;
+                    // sub-screens keep `q`-close since they have no
+                    // filter to collide with.
                     KeyCode::Esc => {
                         // Single-Esc cascade: whichever piece of state
                         // is "in the way" of leaving the picker gets
                         // peeled off first. No double-tap; the user can
                         // just keep tapping Esc until they're out.
-                        // Order matters — multi-select state peels off
-                        // first (most ephemeral), then UI overlays,
-                        // then list shape, then filter, then exit.
-                        if range_anchor.is_some() {
+                        // Order matters — the topmost overlay (help)
+                        // peels first, then multi-select state (most
+                        // ephemeral), then the details overlay, then
+                        // list shape, then filter, then exit.
+                        if show_help {
+                            show_help = false;
+                        } else if range_anchor.is_some() {
                             range_anchor = None;
                         } else if !selected.is_empty() {
                             selected.clear();
@@ -2378,7 +3259,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     KeyCode::Enter => {
                         let vis: Vec<&PickerRow> = all_rows.iter()
                             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
-                            .filter(|r| matches_filter(r, &filter))
+                            .filter(|r| row_visible(r, &filter, &disabled_catalogs))
                             .collect();
                         let cursor_in_selection = vis.get(cursor)
                             .map(|r| selected.contains(&r.specifier()))
@@ -2414,14 +3295,14 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                         // Collapse: if current row's dataset is expanded, collapse it
                         let vis: Vec<&PickerRow> = all_rows.iter()
                             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
-                            .filter(|r| matches_filter(r, &filter))
+                            .filter(|r| row_visible(r, &filter, &disabled_catalogs))
                             .collect();
                         if let Some(row) = vis.get(cursor)
                             && expanded.remove(&row.dataset) {
                                 // Move cursor to the default row of this dataset
                                 let new_vis: Vec<&PickerRow> = all_rows.iter()
                                     .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
-                                    .filter(|r| matches_filter(r, &filter))
+                                    .filter(|r| row_visible(r, &filter, &disabled_catalogs))
                                     .collect();
                                 cursor = new_vis.iter().position(|r| r.dataset == row.dataset).unwrap_or(0);
                             }
@@ -2430,7 +3311,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                         // Expand: same as Enter for collapsed datasets
                         let vis: Vec<&PickerRow> = all_rows.iter()
                             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
-                            .filter(|r| matches_filter(r, &filter))
+                            .filter(|r| row_visible(r, &filter, &disabled_catalogs))
                             .collect();
                         if let Some(row) = vis.get(cursor)
                             && !expanded.contains(&row.dataset) {
@@ -2458,7 +3339,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                         }
                         let visible_count = all_rows.iter()
                             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
-                            .filter(|r| matches_filter(r, &filter))
+                            .filter(|r| row_visible(r, &filter, &disabled_catalogs))
                             .count();
                         if cursor + 1 < visible_count {
                             cursor += 1;
@@ -2473,7 +3354,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                         // cursor row.
                         let vis: Vec<&PickerRow> = all_rows.iter()
                             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
-                            .filter(|r| matches_filter(r, &filter))
+                            .filter(|r| row_visible(r, &filter, &disabled_catalogs))
                             .collect();
                         match range_anchor {
                             Some(a) => {
@@ -2507,9 +3388,23 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                         let h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(20);
                         let visible_count = all_rows.iter()
                             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
-                            .filter(|r| matches_filter(r, &filter))
+                            .filter(|r| row_visible(r, &filter, &disabled_catalogs))
                             .count();
                         cursor = (cursor + h.saturating_sub(6)).min(visible_count.saturating_sub(1));
+                    }
+                    // Same ends-jumping the overlays offer (there via
+                    // g/G as well — letters here belong to the
+                    // filter, so only the dedicated keys apply).
+                    KeyCode::Home => {
+                        cursor = 0;
+                        scroll = 0;
+                    }
+                    KeyCode::End => {
+                        let visible_count = all_rows.iter()
+                            .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
+                            .filter(|r| row_visible(r, &filter, &disabled_catalogs))
+                            .count();
+                        cursor = visible_count.saturating_sub(1);
                     }
                     KeyCode::Tab => {
                         show_all_profiles = !show_all_profiles;
@@ -2538,6 +3433,10 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
             }
     }
 
+    // Stop the size-probe workers at their next job boundary; the
+    // receiver drops with this frame, so any in-flight send also
+    // ends its worker.
+    size_probe_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     result
@@ -2547,12 +3446,29 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
 mod tests {
     use super::format_count;
 
+    /// Metric recovery from jvector SimpleMFD filenames — fills the
+    /// picker's metric column for catalogs that declare no
+    /// attributes.
+    #[test]
+    fn metric_inferred_from_filename_tokens() {
+        use super::infer_metric_from_filename as infer;
+        assert_eq!(infer("cap/cap_1m_gt_norm_shuffle_ip_k100.ivecs"), Some("ip".into()));
+        assert_eq!(infer("x/some_gt_l2_k100.ivecs"), Some("l2".into()));
+        assert_eq!(infer("a_cosine_gt.ivecs"), Some("cosine".into()));
+        assert_eq!(infer("a_angular_gt.ivecs"), Some("cosine".into()));
+        assert_eq!(infer("dpr_gemma_gt_ip_100.ivecs"), Some("ip".into()));
+        // No token → no claim. ("ship.fvecs" must not match "ip".)
+        assert_eq!(infer("base_vectors.fvecs"), None);
+        assert_eq!(infer("ship.fvecs"), None);
+    }
+
     fn knn_entry(name: &str, base: &str) -> crate::dataset::CatalogEntry {
         crate::dataset::CatalogEntry {
             name: name.to_string(),
             path: base.to_string(),
             dataset_type: "knn_entries.yaml".to_string(),
             catalog_file: None,
+            catalog_name: None,
             layout: crate::dataset::CatalogLayout {
                 attributes: None,
                 profiles: Default::default(),
@@ -2632,6 +3548,7 @@ mod tests {
             path: "https://h/cat".to_string(),
             dataset_type: "knn_entries.yaml".to_string(),
             catalog_file: None,
+            catalog_name: None,
             layout: crate::dataset::CatalogLayout {
                 attributes: None,
                 profiles: Default::default(),
@@ -2665,6 +3582,235 @@ mod tests {
         // contributes 1 uncached unit.
         assert_eq!((valid, total), (2, 3),
             "home-relative and flat-basename facets must both be found");
+    }
+
+    fn test_row(dataset: &str, profile: &str) -> super::PickerRow {
+        super::PickerRow {
+            dataset: dataset.to_string(),
+            catalog: "0".to_string(),
+            profile: profile.to_string(),
+            base_count: 0,
+            metric: String::new(),
+            facets: String::new(),
+            count: String::new(),
+            size: String::new(),
+            cache_status: "—".to_string(),
+            access: crate::AccessMode::FullTransfer,
+        }
+    }
+
+    fn view_for(path: &str) -> crate::dataset::profile::DSView {
+        crate::dataset::profile::DSView {
+            source: crate::dataset::source::DSSource {
+                path: path.to_string(),
+                namespace: None,
+                window: Default::default(),
+            },
+            window: None,
+        }
+    }
+
+    fn profile_with_base(path: &str) -> crate::dataset::profile::DSProfile {
+        let mut profile = crate::dataset::profile::DSProfile {
+            maxk: None,
+            base_count: None,
+            partition: false,
+            views: indexmap::IndexMap::new(),
+        };
+        profile.views.insert("base_vectors".into(), view_for(path));
+        profile
+    }
+
+    /// COUNT and SIZE must answer from local knowledge wherever
+    /// possible: a window IS the record count (and window × bpr the
+    /// byte span), and a complete local copy with no chunk sidecar
+    /// (finished download) reports from its real file — no survey
+    /// entry, no network. vvec gets bytes but no record math.
+    #[test]
+    fn size_cells_from_local_knowledge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let ds = cache.join("ds-a");
+        std::fs::create_dir_all(&ds).unwrap();
+        // Complete sidecar-less local file: dim=2 f32 → 12 bytes per
+        // record, 24 bytes on disk → 2 records.
+        let mut bytes = Vec::new();
+        for _ in 0..2 {
+            bytes.extend_from_slice(&2i32.to_le_bytes());
+            bytes.extend_from_slice(&[0u8; 8]);
+        }
+        std::fs::write(ds.join("base.fvecs"), &bytes).unwrap();
+        std::fs::write(ds.join("base.ivvecs"), [0u8; 64]).unwrap();
+
+        let mut entry = knn_entry("ds-a", "https://h/cat");
+        entry.layout.profiles.profiles.insert(
+            "default".into(), profile_with_base("https://h/cat/ds-a/base.fvecs"));
+        entry.layout.profiles.profiles.insert(
+            "win".into(), profile_with_base("https://h/cat/ds-a/base.fvecs[0..1)"));
+        entry.layout.profiles.profiles.insert(
+            "vv".into(), profile_with_base("https://h/cat/ds-a/base.ivvecs"));
+        let entries = vec![entry];
+
+        let survey = std::collections::HashMap::new();
+        let mut knowledge = std::collections::HashMap::new();
+        super::collect_local_knowledge(&entries, cache, &survey, &mut knowledge);
+
+        let mut rows = vec![
+            test_row("ds-a", "default"),
+            test_row("ds-a", "win"),
+            test_row("ds-a", "vv"),
+        ];
+        super::apply_size_cells(&mut rows, &entries, &knowledge);
+
+        assert_eq!(rows[0].count, format_count(2));
+        assert_eq!(rows[0].size, crate::explore::format_bytes_short(24));
+        // Window: 1 record, shares the default base (`*` on count),
+        // and SIZE is the window's byte span — 1 × 12 — not the
+        // whole shared file.
+        assert_eq!(rows[1].count, format!("{}*", format_count(1)));
+        assert_eq!(rows[1].size, crate::explore::format_bytes_short(12));
+        // vvec: no record math, bytes still report.
+        assert_eq!(rows[2].count, "");
+        assert_eq!(rows[2].size, crate::explore::format_bytes_short(64));
+
+        // The details overlays read the same knowledge: cardinality
+        // and bytes for the uniform facet.
+        let stat = super::facet_stat_string(
+            &entries[0],
+            entries[0].layout.profiles.profile("default").unwrap()
+                .views.get("base_vectors").unwrap(),
+            &knowledge);
+        assert_eq!(stat.as_deref(), Some(format!(
+            "{} records, {}", format_count(2),
+            crate::explore::format_bytes_short(24)).as_str()));
+    }
+
+    /// Probe-job collection: one job per distinct remote facet URL,
+    /// non-remote and already-answered facets skipped, and pending
+    /// facets surface as `…` cells until their answer merges in.
+    #[test]
+    fn size_probe_jobs_dedupe_and_mark_pending() {
+        let mut a = knn_entry("ds-a", "https://h/cat");
+        a.layout.profiles.profiles.insert(
+            "default".into(), profile_with_base("https://h/cat/ds-a/base.fvecs"));
+        a.layout.profiles.profiles.insert(
+            "alt".into(), profile_with_base("https://h/cat/ds-a/base.fvecs"));
+        let mut b = knn_entry("ds-b", "https://h/cat");
+        b.layout.profiles.profiles.insert(
+            "default".into(), profile_with_base("/local/base.fvecs"));
+        let mut c = knn_entry("ds-c", "https://h/cat");
+        c.layout.profiles.profiles.insert(
+            "default".into(), profile_with_base("https://h/cat/ds-c/base.fvecs"));
+        let entries = vec![a, b, c];
+
+        // ds-c is already fully answered locally.
+        let mut knowledge = std::collections::HashMap::new();
+        knowledge.insert("https://h/cat/ds-c/base.fvecs".to_string(),
+            super::FacetKnowledge {
+                bytes: Some(1_200), bpr: Some(12), pending: false, probed: false,
+            });
+
+        let mut jobs = super::collect_size_probe_jobs(&entries, &mut knowledge);
+        assert_eq!(jobs.len(), 1, "one job for the one unanswered remote URL");
+        let job = jobs.pop().unwrap();
+        assert_eq!(job.url, "https://h/cat/ds-a/base.fvecs");
+        assert!(job.uniform);
+
+        let mut rows = vec![
+            test_row("ds-a", "default"),
+            test_row("ds-a", "alt"),
+            test_row("ds-b", "default"),
+            test_row("ds-c", "default"),
+        ];
+        super::apply_size_cells(&mut rows, &entries, &knowledge);
+        assert_eq!(rows[0].count, super::SIZE_PENDING);
+        assert_eq!(rows[0].size, super::SIZE_PENDING);
+        assert_eq!(rows[1].size, super::SIZE_PENDING);
+        assert_eq!(rows[2].count, "", "non-remote, unknowable: blank");
+        assert_eq!(rows[2].size, "");
+        assert_eq!(rows[3].count, format_count(100));
+        assert_eq!(rows[3].size, crate::explore::format_bytes_short(1_200));
+
+        // A probe answer merges in: both ds-a rows resolve, and the
+        // profile sharing the default base gets its `*` markers
+        // (whole shared file counted in SIZE).
+        let slot = knowledge.get_mut("https://h/cat/ds-a/base.fvecs").unwrap();
+        slot.bytes = Some(2_400);
+        slot.bpr = Some(12);
+        slot.pending = false;
+        slot.probed = true;
+        super::apply_size_cells(&mut rows, &entries, &knowledge);
+        assert_eq!(rows[0].count, format_count(200));
+        assert_eq!(rows[0].size, crate::explore::format_bytes_short(2_400));
+        assert_eq!(rows[1].count, format!("{}*", format_count(200)));
+        assert_eq!(rows[1].size,
+            format!("{}*", crate::explore::format_bytes_short(2_400)));
+    }
+
+    /// The ACCESS column must say "local" the moment a facet is
+    /// fully on disk — including knn_entries-style catalogs whose
+    /// source paths are absolute URLs. The previous check joined the
+    /// raw source path under the dataset dir (never exists for a
+    /// URL), so fully downloaded datasets stayed labelled "chunked".
+    #[test]
+    fn fully_cached_knn_dataset_classifies_local() {
+        use crate::AccessMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let ds = cache.join("ds-a");
+        std::fs::create_dir_all(&ds).unwrap();
+        std::fs::write(ds.join("origin.json"),
+            r#"{"source":"https://h/cat/ds-a/","fetched_at":"x"}"#).unwrap();
+        std::fs::write(ds.join("base.fvecs"), b"data").unwrap();
+
+        let entry = knn_entry("ds-a", "https://h/cat");
+        let profile = profile_with_base("https://h/cat/ds-a/base.fvecs");
+
+        // Chunk-store copy, every chunk valid → local.
+        std::fs::write(ds.join("base.fvecs.chunks"), [1u8, 1]).unwrap();
+        let survey = super::survey_cache_state(cache);
+        assert_eq!(
+            super::profile_access_mode(&entry, &ds, Some(&profile), &survey),
+            AccessMode::Local);
+
+        // One chunk missing → still sparse remote access.
+        std::fs::write(ds.join("base.fvecs.chunks"), [1u8, 0]).unwrap();
+        let survey = super::survey_cache_state(cache);
+        assert_eq!(
+            super::profile_access_mode(&entry, &ds, Some(&profile), &survey),
+            AccessMode::MerkleChunked);
+
+        // Sidecar-less complete copy (finished download) → local.
+        std::fs::remove_file(ds.join("base.fvecs.chunks")).unwrap();
+        let survey = super::survey_cache_state(cache);
+        assert_eq!(
+            super::profile_access_mode(&entry, &ds, Some(&profile), &survey),
+            AccessMode::Local);
+
+        // Untouched facet → the remote classification stands.
+        let absent = profile_with_base("https://h/cat/ds-a/missing.fvecs");
+        assert_eq!(
+            super::profile_access_mode(&entry, &ds, Some(&absent), &survey),
+            AccessMode::MerkleChunked);
+    }
+
+    /// A failed probe settles the facet: pending markers clear and
+    /// the cells go blank instead of showing `…` forever.
+    #[test]
+    fn failed_probe_clears_pending_cells() {
+        let mut a = knn_entry("ds-a", "https://h/cat");
+        a.layout.profiles.profiles.insert(
+            "default".into(), profile_with_base("https://h/cat/ds-a/base.fvecs"));
+        let entries = vec![a];
+        let mut knowledge = std::collections::HashMap::new();
+        knowledge.insert("https://h/cat/ds-a/base.fvecs".to_string(),
+            super::FacetKnowledge {
+                bytes: None, bpr: None, pending: false, probed: true,
+            });
+        let mut rows = vec![test_row("ds-a", "default")];
+        super::apply_size_cells(&mut rows, &entries, &knowledge);
+        assert_eq!(rows[0].count, "");
+        assert_eq!(rows[0].size, "");
     }
 
     #[test]

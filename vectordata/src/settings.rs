@@ -322,6 +322,106 @@ pub fn auto_resolved_cache_dir() -> Result<AutoResolved, String> {
     Ok(xdg_default())
 }
 
+/// Read one top-level scalar setting from `settings.yaml` content.
+/// Pure — the parsing twin of [`rewrite_setting_line`].
+pub(crate) fn setting_value_from(content: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') { continue; }
+        if let Some(val) = line.strip_prefix(&prefix) {
+            let val = val.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// One top-level scalar from the active `settings.yaml`, `None` when
+/// unset or the file is missing.
+pub fn setting_value(key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(settings_path()).ok()?;
+    setting_value_from(&content, key)
+}
+
+/// Read a comma-separated list setting (`key: a, b, c`). One scalar
+/// line so the comment-preserving single-line editor handles it like
+/// every other setting.
+pub fn csv_setting(key: &str) -> Vec<String> {
+    setting_value(key).map(|v| parse_csv_setting(&v)).unwrap_or_default()
+}
+
+/// Pure parser for comma-separated list settings.
+pub(crate) fn parse_csv_setting(value: &str) -> Vec<String> {
+    value.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Persist a comma-separated list setting (sorted for stable output).
+pub fn write_csv_setting(key: &str, names: &std::collections::HashSet<String>) -> Result<PathBuf, String> {
+    let mut sorted: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    write_setting(key, &sorted.join(", "))
+}
+
+/// Catalog names disabled by the user — the persisted form of the
+/// picker's settings-screen toggles.
+pub fn disabled_catalogs() -> Vec<String> {
+    csv_setting("disabled_catalogs")
+}
+
+/// Persist the disabled-catalog set.
+pub fn write_disabled_catalogs(names: &std::collections::HashSet<String>) -> Result<PathBuf, String> {
+    write_csv_setting("disabled_catalogs", names)
+}
+
+/// Picker columns hidden by the user; see the settings screen.
+pub fn disabled_columns() -> Vec<String> {
+    csv_setting("disabled_columns")
+}
+
+/// Persist the hidden-column set.
+pub fn write_disabled_columns(names: &std::collections::HashSet<String>) -> Result<PathBuf, String> {
+    write_csv_setting("disabled_columns", names)
+}
+
+/// Delete one top-level setting line from `settings.yaml`,
+/// preserving every other byte (comments included). Used by "Reset
+/// Display Options" — removing the key restores the project
+/// standard, instead of pinning a value that might change.
+pub fn remove_setting(key: &str) -> Result<(), String> {
+    let path = settings_path();
+    let Ok(existing) = std::fs::read_to_string(&path) else { return Ok(()); };
+    let prefix = format!("{key}:");
+    let kept: Vec<&str> = existing.lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            t.starts_with('#') || !t.starts_with(&prefix)
+        })
+        .collect();
+    let mut out = kept.join("\n");
+    if !out.is_empty() { out.push('\n'); }
+    std::fs::write(&path, out).map_err(|e| e.to_string())
+}
+
+/// Write (or replace) one top-level scalar in `settings.yaml`,
+/// preserving every other byte — comments included. Creates the file
+/// when absent.
+pub fn write_setting(key: &str, value: &str) -> Result<PathBuf, String> {
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let new_content = rewrite_setting_line(&existing, key, value);
+    std::fs::write(&path, new_content).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 /// The XDG cache base: `$XDG_CACHE_HOME` when set (absolute), else
 /// `<home>/.cache` per the XDG Base Directory spec.
 fn xdg_cache_home(home: &Path) -> PathBuf {
@@ -524,7 +624,7 @@ pub fn write_cache_dir_at(
         // `cache_dir:` line and keep every other byte — comments and
         // any additional keys are the user's, not ours to discard.
         let existing = std::fs::read_to_string(settings)?;
-        rewrite_cache_dir_line(&existing, cache_dir)
+        rewrite_setting_line(&existing, "cache_dir", &cache_dir.display().to_string())
     } else {
         format!(
             "cache_dir: {}\nprotect_settings: true\n",
@@ -535,25 +635,26 @@ pub fn write_cache_dir_at(
     Ok(WriteCacheOutcome::Wrote)
 }
 
-/// Replace the value of the top-level `cache_dir:` line in an existing
+/// Replace the value of one top-level `key:` line in an existing
 /// `settings.yaml`, preserving every other line byte-for-byte
 /// (comments, unknown keys, formatting). Appends the line when no
-/// uncommented `cache_dir:` exists.
-fn rewrite_cache_dir_line(existing: &str, cache_dir: &Path) -> String {
+/// uncommented `key:` exists.
+fn rewrite_setting_line(existing: &str, key: &str, value: &str) -> String {
+    let prefix = format!("{key}:");
     let mut replaced = false;
     let mut lines: Vec<String> = existing.lines()
         .map(|line| {
             let t = line.trim_start();
-            if !replaced && t.starts_with("cache_dir:") && !t.starts_with('#') {
+            if !replaced && t.starts_with(&prefix) && !t.starts_with('#') {
                 replaced = true;
-                format!("cache_dir: {}", cache_dir.display())
+                format!("{key}: {value}")
             } else {
                 line.to_string()
             }
         })
         .collect();
     if !replaced {
-        lines.push(format!("cache_dir: {}", cache_dir.display()));
+        lines.push(format!("{key}: {value}"));
     }
     let mut out = lines.join("\n");
     out.push('\n');
@@ -563,6 +664,35 @@ fn rewrite_cache_dir_line(existing: &str, cache_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `setting_value_from` reads top-level scalars, skipping
+    /// comments — including a commented-out copy of the same key.
+    #[test]
+    fn setting_value_from_reads_uncommented_scalar() {
+        let content = "\
+# palette: spectrum   (disabled experiment)
+palette: turbo
+curve: \"square\"
+cache_dir: /x
+";
+        assert_eq!(setting_value_from(content, "palette").as_deref(), Some("turbo"));
+        assert_eq!(setting_value_from(content, "curve").as_deref(), Some("square"));
+        assert_eq!(setting_value_from(content, "nope"), None);
+    }
+
+    /// `disabled_catalogs` round-trips through the comma-scalar form,
+    /// tolerating spacing and empty segments.
+    #[test]
+    fn csv_setting_scalar_round_trip() {
+        assert_eq!(parse_csv_setting("lab, old-mirror ,,1"),
+            vec!["lab", "old-mirror", "1"]);
+        assert!(parse_csv_setting("").is_empty());
+        let set: std::collections::HashSet<String> =
+            ["b".to_string(), "a".to_string()].into();
+        let mut sorted: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
+        sorted.sort_unstable();
+        assert_eq!(parse_csv_setting(&sorted.join(", ")), vec!["a", "b"]);
+    }
 
     /// Auto-resolution lands on the XDG default under $HOME — with
     /// `$XDG_CACHE_HOME` honored when absolute, ignored otherwise.
