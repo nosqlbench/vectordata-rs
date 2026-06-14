@@ -64,6 +64,12 @@ struct FieldAttrs {
     /// yields the field type directly and is used as the fallback when the flag
     /// is absent (the option is then optional rather than required).
     default_expr: Option<TS2>,
+    /// Mutual exclusions from `#[arg(conflicts_with = "field")]` /
+    /// `#[arg(conflicts_with_all = ["a", "b"])]`. Entries reference
+    /// sibling FIELD IDENTS (clap convention); codegen resolves them
+    /// to the siblings' long tokens. Declaring one side is enough —
+    /// the completion bridge and parser symmetrize.
+    conflicts_with: Vec<String>,
 }
 
 fn collect_docs(attrs: &[Attribute]) -> Option<String> {
@@ -161,8 +167,21 @@ fn parse_field_attrs(field: &Field) -> syn::Result<FieldAttrs> {
                             }
                         }
                     }
+                } else if meta.path.is_ident("conflicts_with") {
+                    let v = meta.value()?;
+                    let s: syn::LitStr = v.parse()?;
+                    fa.conflicts_with.push(s.value());
+                } else if meta.path.is_ident("conflicts_with_all") {
+                    let v = meta.value()?;
+                    if let Expr::Array(arr) = v.parse::<Expr>()? {
+                        for elem in arr.elems {
+                            if let Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = elem {
+                                fa.conflicts_with.push(s.value());
+                            }
+                        }
+                    }
                 } else {
-                    // Unknown arg keys (conflicts_with, value_hint, alias, …) are
+                    // Unknown arg keys (value_hint, alias, …) are
                     // tolerated and ignored — consume any `= value` so parsing
                     // continues.
                     let _ = meta.value().and_then(|v| v.parse::<Expr>());
@@ -342,6 +361,29 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
     let mut inits: Vec<TS2> = Vec::new();
     let mut positional_index: usize = 0;
 
+    // Pre-pass: sibling field ident → dashed long token, so
+    // `conflicts_with = "min_dim"` resolves to `--with-min-dim`.
+    let mut long_by_ident: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for field in fields {
+        let ident = field.ident.as_ref().unwrap();
+        let fa = parse_field_attrs(field)?;
+        if fa.flatten || fa.subcommand || fa.positional {
+            continue;
+        }
+        if type_is_bool(&field.ty) || fa.has_long || fa.short.is_some() {
+            let long = fa.long.clone().unwrap_or_else(|| ident_to_long(ident));
+            long_by_ident.insert(ident.to_string(), format!("--{long}"));
+        }
+    }
+    // Resolve a conflicts_with reference: a sibling field ident wins;
+    // otherwise treat it as a long token spelled directly.
+    let resolve_conflict = |r: &String| -> String {
+        long_by_ident.get(r).cloned().unwrap_or_else(|| {
+            if r.starts_with("--") { r.clone() } else { format!("--{}", r.replace('_', "-")) }
+        })
+    };
+
     for field in fields {
         let ident = field.ident.as_ref().unwrap();
         let ty = &field.ty;
@@ -390,6 +432,12 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
             Some(h) => quote! { .help(#h) },
             None => quote! {},
         };
+        let conflicts_call = if fa.conflicts_with.is_empty() {
+            quote! {}
+        } else {
+            let resolved: Vec<String> = fa.conflicts_with.iter().map(resolve_conflict).collect();
+            quote! { .conflicts_with(&[#(#resolved),*]) }
+        };
 
         // ---- boolean flag ----
         if type_is_bool(ty) {
@@ -398,7 +446,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
             let short_call = short_call(&fa, &long);
             spec_stmts.push(quote! {
                 __spec = __spec.option(::veks_completion::OptionSpec::new(
-                    ::veks_completion::OptionDef::flag(#dashed) #short_call #help_call
+                    ::veks_completion::OptionDef::flag(#dashed) #short_call #help_call #conflicts_call
                 ));
             });
             inits.push(quote! { #ident: __p.has_flag(#dashed) });
@@ -429,7 +477,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                 let parse = parse_expr(inner, &dashed);
                 spec_stmts.push(quote! {
                     __spec = __spec.option(::veks_completion::OptionSpec::new(
-                        ::veks_completion::OptionDef::value(#dashed).multiple(true) #short_call #value_name_call #help_call
+                        ::veks_completion::OptionDef::value(#dashed).multiple(true) #short_call #value_name_call #help_call #conflicts_call
                     ) #value_completion_call);
                 });
                 inits.push(quote! {
@@ -446,7 +494,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                 let parse = parse_expr(vec_inner, &dashed);
                 spec_stmts.push(quote! {
                     __spec = __spec.option(::veks_completion::OptionSpec::new(
-                        ::veks_completion::OptionDef::value(#dashed).multiple(true) #short_call #value_name_call #help_call
+                        ::veks_completion::OptionDef::value(#dashed).multiple(true) #short_call #value_name_call #help_call #conflicts_call
                     ) #value_completion_call);
                 });
                 inits.push(quote! {
@@ -464,7 +512,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                 let parse = parse_expr(inner, &dashed);
                 spec_stmts.push(quote! {
                     __spec = __spec.option(::veks_completion::OptionSpec::new(
-                        ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call
+                        ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call #conflicts_call
                     ) #value_completion_call);
                 });
                 inits.push(quote! {
@@ -479,7 +527,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                 let parse = parse_expr(ty, &dashed);
                 spec_stmts.push(quote! {
                     __spec = __spec.option(::veks_completion::OptionSpec::new(
-                        ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call
+                        ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call #conflicts_call
                     ) #value_completion_call);
                 });
                 inits.push(quote! {
@@ -495,7 +543,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                     Some(def) => {
                         spec_stmts.push(quote! {
                             __spec = __spec.option(::veks_completion::OptionSpec::new(
-                                ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call
+                                ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call #conflicts_call
                             ).default(#def) #value_completion_call);
                         });
                         inits.push(quote! {
@@ -505,7 +553,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                     None => {
                         spec_stmts.push(quote! {
                             __spec = __spec.option(::veks_completion::OptionSpec::new(
-                                ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call
+                                ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call #conflicts_call
                             ).required(true) #value_completion_call);
                         });
                         inits.push(quote! {

@@ -1,21 +1,18 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dataset filtering predicates for `vectordata datasets list`.
+//! Dataset filtering predicates for `<binary> datasets list`.
 //!
 //! Each filter option maps to a predicate applied against [`CatalogEntry`]
 //! fields. Filters compose conjunctively — all specified filters must match.
 //!
-//! Dynamic autocompletion is powered by [`catalog_completions`], which loads
-//! the real catalog from the user's default config and extracts the actual
-//! values present across all visible entries.
-
-use std::sync::OnceLock;
+//! Dynamic autocompletion of filter values is wired in
+//! [`crate::datasets::dyncomp`]; this module supplies the pure
+//! domain helpers it needs ([`parse_active_filters`], the
+//! `distinct_*` extractors).
 
 use regex::RegexBuilder;
 
-use crate::catalog::resolver::Catalog;
-use crate::catalog::sources::CatalogSources;
 use crate::dataset::source::parse_number_with_suffix;
 use crate::dataset::CatalogEntry;
 
@@ -75,15 +72,24 @@ pub struct DatasetFilter {
     pub facet: Vec<String>,
     pub metric: Option<String>,
     pub desc: Option<String>,
-    pub min_size: Option<u64>,
-    pub max_size: Option<u64>,
-    pub size: Option<u64>,
+    pub min_count: Option<u64>,
+    pub max_count: Option<u64>,
+    pub count: Option<u64>,
     pub min_dim: Option<u32>,
     pub max_dim: Option<u32>,
     pub dim: Option<u32>,
     pub vtype: Option<String>,
-    pub data_min: Option<u64>,
-    pub data_max: Option<u64>,
+    pub min_data: Option<u64>,
+    pub max_data: Option<u64>,
+    /// Exact data size as `(bytes, granularity)`: the granularity is
+    /// the multiplier of the unit the user spelled (`118MB` →
+    /// `(118_000_000, 1_000_000)`), and matching tolerates half a
+    /// unit either way. Data sizes are estimates/probes, so byte-for-
+    /// byte equality would make every displayed candidate a miss;
+    /// unit-granularity matching makes a picked candidate match the
+    /// dataset it was derived from. Bare digits carry granularity 1 —
+    /// exact equality.
+    pub data: Option<(u64, u64)>,
 }
 
 impl DatasetFilter {
@@ -93,19 +99,59 @@ impl DatasetFilter {
             && self.facet.is_empty()
             && self.metric.is_none()
             && self.desc.is_none()
-            && self.min_size.is_none()
-            && self.max_size.is_none()
-            && self.size.is_none()
+            && self.min_count.is_none()
+            && self.max_count.is_none()
+            && self.count.is_none()
             && self.min_dim.is_none()
             && self.max_dim.is_none()
             && self.dim.is_none()
             && self.vtype.is_none()
-            && self.data_min.is_none()
-            && self.data_max.is_none()
+            && self.min_data.is_none()
+            && self.max_data.is_none()
+            && self.data.is_none()
     }
 
-    /// Test whether a catalog entry passes all filter predicates.
+    /// True when any active predicate may need a facet probe to
+    /// decide — i.e. a count, dimension, or data-size filter is set.
+    /// Completion uses this to skip warming the probe cache entirely
+    /// for pure-offline filters (name/metric/vtype/facet/profile),
+    /// which never touch a facet file.
+    pub fn needs_probe(&self) -> bool {
+        self.min_count.is_some()
+            || self.max_count.is_some()
+            || self.count.is_some()
+            || self.min_dim.is_some()
+            || self.max_dim.is_some()
+            || self.dim.is_some()
+            || self.min_data.is_some()
+            || self.max_data.is_some()
+            || self.data.is_some()
+    }
+
+    /// Test whether a catalog entry passes all filter predicates,
+    /// probing the base-vector header / facet sizes live when the
+    /// catalog metadata can't answer a dimension/count/data predicate.
+    /// This is the command-run path (blocking reads are acceptable).
     pub fn matches(&self, entry: &CatalogEntry) -> bool {
+        self.matches_with(entry, ProbeMode::Live)
+    }
+
+    /// [`Self::matches`] with no probing: dimension/count/data
+    /// predicates see only metadata- and name-derived values, and
+    /// entries whose values are only knowable by probing fail those
+    /// predicates.
+    pub fn matches_offline(&self, entry: &CatalogEntry) -> bool {
+        self.matches_with(entry, ProbeMode::Off)
+    }
+
+    /// Test all predicates under an explicit [`ProbeMode`]. Completion
+    /// passes [`ProbeMode::Cached`] with a pre-warmed
+    /// [`FacetProbeCache`] so its narrowing is consistent with what a
+    /// real run ([`ProbeMode::Live`]) would match — without blocking
+    /// on the network. The cache holds whatever a bounded warm-up
+    /// managed to resolve; a facet missing from it reads as "unknown"
+    /// (same as offline), never a live fetch.
+    pub fn matches_with(&self, entry: &CatalogEntry, mode: ProbeMode) -> bool {
         if let Some(ref name) = self.name
             && !smart_match(name, &entry.name) {
                 return false;
@@ -122,14 +168,13 @@ impl DatasetFilter {
         }
 
         if let Some(ref metric) = self.metric {
-            let df = entry
-                .layout
-                .attributes
-                .as_ref()
-                .and_then(|a| a.distance_function.as_deref())
-                .unwrap_or("");
-            if !df.eq_ignore_ascii_case(metric) {
-                return false;
+            // Synonym-aware on both sides: `--with-metric angular`
+            // matches an entry whose name says `-cosine`, and vice
+            // versa — both canonicalize to COSINE.
+            let want = canonicalize_metric(metric);
+            match infer_metric(entry) {
+                Some(have) if have.eq_ignore_ascii_case(&want) => {}
+                _ => return false,
             }
         }
 
@@ -138,22 +183,26 @@ impl DatasetFilter {
                 return false;
             }
 
-        // Size filters: check base_count across all profiles
-        if self.min_size.is_some() || self.max_size.is_some() || self.size.is_some() {
-            let max_base_count = max_base_count(entry);
-            if let Some(min) = self.min_size {
+        // Size filters: base_count across all profiles, else (when
+        // `probe`) base-file bytes / bytes-per-record from the dim
+        // header — the same `4 + dim × elem` math ping and the
+        // picker's size probes use.
+        if self.min_count.is_some() || self.max_count.is_some() || self.count.is_some() {
+            let max_base_count =
+                max_base_count(entry).or_else(|| probed_base_records(entry, mode));
+            if let Some(min) = self.min_count {
                 match max_base_count {
                     Some(c) if c >= min => {}
                     _ => return false,
                 }
             }
-            if let Some(max) = self.max_size {
+            if let Some(max) = self.max_count {
                 match max_base_count {
                     Some(c) if c <= max => {}
                     _ => return false,
                 }
             }
-            if let Some(exact) = self.size {
+            if let Some(exact) = self.count {
                 match max_base_count {
                     Some(c) if c == exact => {}
                     _ => return false,
@@ -161,9 +210,10 @@ impl DatasetFilter {
             }
         }
 
-        // Dimension filters: infer from name pattern _dNNN_ or attributes/tags
+        // Dimension filters: attributes/tags, then name conventions,
+        // then (when `probe`) the base-vectors 4-byte dim header.
         if self.min_dim.is_some() || self.max_dim.is_some() || self.dim.is_some() {
-            let dim = infer_dimension(entry);
+            let dim = resolve_dimension(entry, mode);
             if let Some(min) = self.min_dim {
                 match dim {
                     Some(d) if d >= min => {}
@@ -194,17 +244,23 @@ impl DatasetFilter {
         }
 
         // Data size filters: estimate from base_count × element_size × facet_count
-        if self.data_min.is_some() || self.data_max.is_some() {
-            let est = estimate_data_bytes(entry);
-            if let Some(min) = self.data_min {
+        if self.min_data.is_some() || self.max_data.is_some() || self.data.is_some() {
+            let est = total_data_bytes(entry, mode);
+            if let Some(min) = self.min_data {
                 match est {
                     Some(b) if b >= min => {}
                     _ => return false,
                 }
             }
-            if let Some(max) = self.data_max {
+            if let Some(max) = self.max_data {
                 match est {
                     Some(b) if b <= max => {}
+                    _ => return false,
+                }
+            }
+            if let Some((target, unit)) = self.data {
+                match est {
+                    Some(b) if b.abs_diff(target) <= unit / 2 => {}
                     _ => return false,
                 }
             }
@@ -264,8 +320,18 @@ fn collect_all_view_names(entry: &CatalogEntry) -> Vec<String> {
     names
 }
 
-/// Resolve a user-provided facet name to its canonical form.
+/// Resolve a user-provided facet name to its canonical form. Filter
+/// vocabulary accepts capital facet codes (`B`, `Q`, `G`, …) in
+/// addition to keys and aliases; the code table is the facet spec's
+/// ([`StandardFacet::from_code`]), not duplicated here.
 fn resolve_facet_name(name: &str) -> String {
+    let mut chars = name.chars();
+    if let (Some(c), None) = (chars.next(), chars.next())
+        && c.is_ascii_uppercase()
+        && let Some(facet) = crate::dataset::facet::StandardFacet::from_code(c)
+    {
+        return facet.key().to_string();
+    }
     crate::dataset::facet::resolve_standard_key(name)
         .unwrap_or_else(|| name.to_string())
 }
@@ -291,7 +357,158 @@ pub fn max_base_count(entry: &CatalogEntry) -> Option<u64> {
     max
 }
 
-/// Infer dimensionality from the dataset name or attributes/tags.
+/// Canonicalize a metric token to the names the rest of the
+/// toolchain speaks (`COSINE` / `L2` / `DOT_PRODUCT` / `L1` /
+/// `HAMMING` / `JACCARD`). Unrecognized tokens pass through
+/// uppercased so declared-but-unknown metrics still display and
+/// match as themselves.
+pub fn canonicalize_metric(token: &str) -> String {
+    metric_synonym(token)
+        .map(str::to_string)
+        .unwrap_or_else(|| token.to_uppercase())
+}
+
+/// The synonym table behind [`canonicalize_metric`]. `None` for
+/// tokens that don't name a metric at all — which is what lets
+/// [`infer_metric`] scan name tokens without false positives.
+fn metric_synonym(token: &str) -> Option<&'static str> {
+    match token.to_ascii_lowercase().as_str() {
+        "cosine" | "angular" => Some("COSINE"),
+        "euclidean" | "l2" => Some("L2"),
+        "dot" | "dot_product" | "dotproduct" | "ip" | "inner_product" | "mips" => {
+            Some("DOT_PRODUCT")
+        }
+        "l1" | "manhattan" | "taxicab" => Some("L1"),
+        "hamming" => Some("HAMMING"),
+        "jaccard" => Some("JACCARD"),
+        _ => None,
+    }
+}
+
+/// Infer the distance metric of an entry, canonicalized via
+/// [`canonicalize_metric`]. Sources, in priority order:
+///
+/// 1. `attributes.distance_function` (the canonical catalog field);
+/// 2. attribute tags named `metric`, `distance_metric`, or
+///    `distance_function`;
+/// 3. the dataset-name convention used by the ann-benchmarks corpus
+///    (`glove-25-angular`, `sift-128-euclidean`, `lastfm-64-dot`).
+pub fn infer_metric(entry: &CatalogEntry) -> Option<String> {
+    if let Some(ref attrs) = entry.layout.attributes {
+        if let Some(ref df) = attrs.distance_function {
+            return Some(canonicalize_metric(df));
+        }
+        for (k, v) in &attrs.tags {
+            if k.eq_ignore_ascii_case("metric")
+                || k.eq_ignore_ascii_case("distance_metric")
+                || k.eq_ignore_ascii_case("distance_function")
+            {
+                return Some(canonicalize_metric(v));
+            }
+        }
+    }
+    entry
+        .name
+        .split(['-', '_'])
+        .find_map(metric_synonym)
+        .map(str::to_string)
+}
+
+/// A probed facet file: its byte length, and — for xvec files — the
+/// dimension from the 4-byte little-endian header. Either field is
+/// `None` when the probe couldn't determine it. Serializable so the
+/// completion layer can memoize a [`FacetProbeCache`] to disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FacetProbe {
+    pub bytes: Option<u64>,
+    pub dim: Option<u32>,
+}
+
+/// Pre-resolved facet probes keyed by facet file path/URL. Built by a
+/// bounded warm-up in the completion layer and consulted via
+/// [`ProbeMode::Cached`] so filter matching there is probe-consistent
+/// with a real run without blocking.
+pub type FacetProbeCache = std::collections::BTreeMap<String, FacetProbe>;
+
+/// How a filter predicate resolves a value the catalog metadata can't
+/// supply (base-vector dimension, record count, total bytes).
+#[derive(Clone, Copy)]
+pub enum ProbeMode<'a> {
+    /// Metadata + name inference only; never touch a file.
+    Off,
+    /// Read the file live (local stat/read or authed HEAD/range) —
+    /// blocking. The command-run path.
+    Live,
+    /// Read probe values from this pre-warmed cache only; a cache miss
+    /// reads as "unknown", never a live fetch. The completion path.
+    Cached(&'a FacetProbeCache),
+}
+
+/// Byte length of a facet file under `mode`: `None` when off or a
+/// cache miss; a live stat/HEAD under [`ProbeMode::Live`].
+fn facet_bytes(path: &str, mode: ProbeMode) -> Option<u64> {
+    match mode {
+        ProbeMode::Off => None,
+        ProbeMode::Live => facet_len(path),
+        ProbeMode::Cached(cache) => cache.get(path).and_then(|p| p.bytes),
+    }
+}
+
+/// Base-vector dimension from a facet's 4-byte header under `mode`:
+/// `None` when off or a cache miss; a live 4-byte read under
+/// [`ProbeMode::Live`].
+fn facet_dim(path: &str, mode: ProbeMode) -> Option<u32> {
+    match mode {
+        ProbeMode::Off => None,
+        ProbeMode::Live => probe_facet_live(path).dim,
+        ProbeMode::Cached(cache) => cache.get(path).and_then(|p| p.dim),
+    }
+}
+
+/// Live single-facet probe: byte length (local stat / authed HEAD)
+/// plus, for an xvec-extension file, the validated dim from its
+/// 4-byte little-endian header (local read / authed 4-byte range).
+/// This is the unit the completion warm-up runs per facet so that the
+/// resulting [`FacetProbeCache`] answers every probe predicate.
+pub fn probe_facet_live(path: &str) -> FacetProbe {
+    let bytes = facet_len(path);
+    let dim = probe_facet_dim_header(path);
+    FacetProbe { bytes, dim }
+}
+
+/// Read and validate the 4-byte dim header of an xvec file. `None`
+/// for non-xvec extensions (npy/hdf5/parquet carry no such header) or
+/// any read failure.
+fn probe_facet_dim_header(path: &str) -> Option<u32> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_lowercase();
+    if !ext.ends_with("vec") && !ext.ends_with("vecs") {
+        return None;
+    }
+    let header: [u8; 4] = if crate::transport::is_remote_url(path) {
+        use crate::transport::ChunkedTransport;
+        let normalized = crate::transport::normalize_remote_url(path);
+        let parsed = url::Url::parse(normalized.as_ref()).ok()?;
+        let transport = crate::transport::HttpTransport::new(parsed);
+        if !transport.supports_range() {
+            return None;
+        }
+        transport.fetch_range(0, 4).ok()?.as_slice().try_into().ok()?
+    } else {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut buf = [0u8; 4];
+        file.read_exact(&mut buf).ok()?;
+        buf
+    };
+    let dim = i32::from_le_bytes(header);
+    (dim > 0 && dim <= 1_000_000).then_some(dim as u32)
+}
+
+/// Infer dimensionality from attributes/tags or the dataset name.
+/// Offline-only — see [`resolve_dimension`] for the probing variant.
 pub fn infer_dimension(entry: &CatalogEntry) -> Option<u32> {
     if let Some(ref attrs) = entry.layout.attributes {
         for (k, v) in &attrs.tags {
@@ -306,7 +523,22 @@ pub fn infer_dimension(entry: &CatalogEntry) -> Option<u32> {
     extract_dim_from_name(&entry.name)
 }
 
-/// Extract dimension from a dataset name using the `_dNNN` convention.
+/// Dimensionality with a last-resort header probe: [`infer_dimension`]
+/// first; failing that, the base-vector facet's 4-byte dim header via
+/// `mode` (a live read under [`ProbeMode::Live`], the warm cache under
+/// [`ProbeMode::Cached`], nothing under [`ProbeMode::Off`]).
+pub fn resolve_dimension(entry: &CatalogEntry, mode: ProbeMode) -> Option<u32> {
+    infer_dimension(entry).or_else(|| {
+        let path = base_vectors_path(entry)?;
+        facet_dim(&path, mode)
+    })
+}
+
+/// Extract dimension from a dataset name. Two conventions:
+/// the pipeline's `_dNNN` token (`emb-base-v2_d768_b10000`) and the
+/// ann-benchmarks bare-number token (`glove-25-angular`,
+/// `openai-v3-large-3072-100k`). Count-ish tokens (`100k`, `1M`)
+/// carry a suffix and never match the bare-number rule.
 fn extract_dim_from_name(name: &str) -> Option<u32> {
     for part in name.split('_') {
         if let Some(num_str) = part.strip_prefix('d')
@@ -315,6 +547,36 @@ fn extract_dim_from_name(name: &str) -> Option<u32> {
                     && d > 0 && d < 100_000 {
                         return Some(d);
                     }
+    }
+    for part in name.split(['-', '_']) {
+        // Leading zeros mark version-ish tokens (`emb_002`), not dims.
+        if !part.is_empty()
+            && !part.starts_with('0')
+            && part.chars().all(|c| c.is_ascii_digit())
+            && let Ok(d) = part.parse::<u32>()
+            && (2..100_000).contains(&d)
+        {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// The absolute URL/path of the entry's base-vectors facet (first
+/// profile that declares one), canonical name first, legacy `base`
+/// alias second. Resolved through [`CatalogEntry::resolve_facet_url`]
+/// so a `dataset.yaml`-shaped catalog's relative source becomes the
+/// real URL the probe reads — not a bare relative string mistaken for
+/// a local file.
+pub(crate) fn base_vectors_path(entry: &CatalogEntry) -> Option<String> {
+    for (_, profile) in &entry.layout.profiles.profiles {
+        if let Some(view) = profile
+            .views
+            .get("base_vectors")
+            .or_else(|| profile.views.get("base"))
+        {
+            return entry.resolve_facet_url(view.path());
+        }
     }
     None
 }
@@ -364,20 +626,107 @@ fn vtype_from_extension(path: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Rough estimate of total data bytes from base_count × dimension × element_size.
-fn estimate_data_bytes(entry: &CatalogEntry) -> Option<u64> {
-    let dim = infer_dimension(entry).unwrap_or(0) as u64;
-    if dim == 0 {
-        return None;
+/// Total data bytes of an entry — the real on-disk/remote footprint.
+///
+/// Prefers the summed byte sizes of the entry's distinct facet files
+/// (via `mode`'s probe), which is what `--with-data` means: how much
+/// data the dataset actually weighs. Only when nothing can be probed
+/// (`ProbeMode::Off`, or every probe failed) does it fall back to the
+/// `base_count × dim × element_size` estimate — and that estimate
+/// covers BASE VECTORS ONLY and uses the (possibly windowed)
+/// `base_count`, so it badly under-reports a dataset with large
+/// query / ground-truth / metadata facets. The fallback exists so an
+/// offline caller still gets a rough number, never as the primary
+/// answer when real sizes are available.
+fn total_data_bytes(entry: &CatalogEntry, mode: ProbeMode) -> Option<u64> {
+    probed_data_bytes(entry, mode).or_else(|| {
+        let dim = resolve_dimension(entry, mode).unwrap_or(0) as u64;
+        if dim == 0 {
+            return None;
+        }
+        let elem_bytes = infer_vtype(entry)
+            .as_deref()
+            .and_then(vtype_elem_bytes)
+            .unwrap_or(4);
+        let base_count = max_base_count(entry)?;
+        Some(base_count * dim * elem_bytes)
+    })
+}
+
+/// Per-element byte width for an xvec-family vector type name.
+/// `None` for container formats (numpy/hdf5/parquet) whose record
+/// layout isn't dim-header-derivable.
+fn vtype_elem_bytes(vtype: &str) -> Option<u64> {
+    match vtype {
+        "uint8" | "int8" => Some(1),
+        "float16" | "int16" | "uint16" => Some(2),
+        "float32" | "int32" | "uint32" => Some(4),
+        "float64" | "int64" | "uint64" => Some(8),
+        _ => None,
     }
-    let elem_bytes: u64 = match infer_vtype(entry).as_deref() {
-        Some("float32") | Some("int32") => 4,
-        Some("float16") => 2,
-        Some("uint8") => 1,
-        _ => 4,
-    };
-    let base_count = max_base_count(entry)?;
-    Some(base_count * dim * elem_bytes)
+}
+
+/// Byte length of one facet file: a local stat, or an authed HEAD
+/// via the unified transport for remote URLs. Live read — predicate
+/// callers route through [`facet_bytes`] to honor a [`ProbeMode`];
+/// the completion warm-up calls this directly for bytes-only facets.
+pub(crate) fn facet_len(path: &str) -> Option<u64> {
+    if crate::transport::is_remote_url(path) {
+        use crate::transport::ChunkedTransport;
+        let normalized = crate::transport::normalize_remote_url(path);
+        let parsed = url::Url::parse(normalized.as_ref()).ok()?;
+        let transport = crate::transport::HttpTransport::new(parsed);
+        let len = transport.content_length().ok()?;
+        (len > 0).then_some(len)
+    } else {
+        std::fs::metadata(path).ok().map(|m| m.len()).filter(|l| *l > 0)
+    }
+}
+
+/// Record count of the base vectors derived from file bytes and the
+/// dim header: `bytes / (4 + dim × elem)`. Only sound for uniform
+/// xvec facets, which is what the element-size gate enforces. Probe
+/// values come from `mode`.
+fn probed_base_records(entry: &CatalogEntry, mode: ProbeMode) -> Option<u64> {
+    let path = base_vectors_path(entry)?;
+    let elem = infer_vtype(entry).as_deref().and_then(vtype_elem_bytes)?;
+    let dim = resolve_dimension(entry, mode)? as u64;
+    let total = facet_bytes(&path, mode)?;
+    let bytes_per_record = 4 + dim * elem;
+    Some(total / bytes_per_record)
+}
+
+/// The distinct absolute facet URLs/paths of an entry across all
+/// profiles, resolved through [`CatalogEntry::resolve_facet_url`].
+/// Distinct so profiles sharing a base file (or a window into it,
+/// which resolves to the same stripped path) don't double-count.
+pub(crate) fn entry_facet_paths(entry: &CatalogEntry) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for (_, profile) in &entry.layout.profiles.profiles {
+        for view in profile.views.values() {
+            if let Some(path) = entry.resolve_facet_url(view.path())
+                && seen.insert(path.clone())
+            {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Sum of the entry's distinct facet file sizes under `mode` — the
+/// ground-truth data weight when catalog metadata carries no counts.
+fn probed_data_bytes(entry: &CatalogEntry, mode: ProbeMode) -> Option<u64> {
+    let mut total = 0u64;
+    let mut any = false;
+    for path in entry_facet_paths(entry) {
+        if let Some(len) = facet_bytes(&path, mode) {
+            total += len;
+            any = true;
+        }
+    }
+    any.then_some(total)
 }
 
 /// Strip surrounding single or double quotes from a string.
@@ -449,154 +798,73 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
     parse_number_with_suffix(s)
 }
 
-// ---------------------------------------------------------------------------
-// Dynamic autocompletion — loads the real catalog
-// ---------------------------------------------------------------------------
-
-/// Lazily cached catalog entries for autocompletion.
-///
-/// Loads from the user's default `~/.config/vectordata/catalogs.yaml` once,
-/// then reuses the result for all completer calls within the same completion
-/// invocation.
-static COMPLETION_CATALOG: OnceLock<Vec<CatalogEntry>> = OnceLock::new();
-
-/// Load catalog entries for completion, caching on first call.
-pub(crate) fn completion_entries() -> &'static [CatalogEntry] {
-    COMPLETION_CATALOG.get_or_init(|| {
-        let sources = CatalogSources::new().configure_default();
-        if sources.is_empty() {
-            return Vec::new();
-        }
-        let catalog = Catalog::of(&sources);
-        catalog.datasets().to_vec()
-    })
+/// Parse a byte size value, also returning the granularity of the
+/// unit the user spelled (`118MB` → `(118_000_000, 1_000_000)`).
+/// Backs the tolerance semantics of the exact `--with-data` filter.
+pub fn parse_bytes_with_unit(s: &str) -> Result<(u64, u64), String> {
+    crate::dataset::source::parse_number_with_suffix_unit(s)
 }
 
-/// Returns catalog entries filtered by any `--with-*`, `--profile`, and
-/// `--profile-regex` args already present on the command line, so each
-/// completer only suggests values consistent with filters specified so far.
-fn filtered_completion_entries() -> Vec<&'static CatalogEntry> {
-    let all = completion_entries();
-    let (filter, pv) = parse_active_filters();
-    all.iter()
-        .filter(|e| filter.matches(e))
-        .filter(|e| !pv.is_active() || !pv.matching_profiles(e).is_empty())
-        .collect()
-}
+// ---------------------------------------------------------------------------
+// Completion support — pure helpers over context words + entries
+// ---------------------------------------------------------------------------
+//
+// The dynamic completers themselves are registered in
+// [`crate::datasets::dyncomp`]; what belongs here is the filter
+// domain knowledge they need: parsing the filters already typed on
+// the line, and extracting the distinct filterable values present in
+// a set of entries. Everything is pure over explicit inputs — the
+// engine-provided context words, NOT process argv (during a
+// completion callback argv is just `[binary, $COMP_LINE,
+// $COMP_POINT]`, so scanning `std::env::args()` finds no flags).
 
-/// Parse already-specified `--with-*`, `--profile`, and `--profile-regex`
-/// args from the current process args. During shell completion, the binary
-/// is re-invoked with the partial command line, so `std::env::args()`
-/// contains the tokens typed so far.
-fn parse_active_filters() -> (DatasetFilter, ProfileView) {
-    let args: Vec<String> = std::env::args().collect();
+/// Parse already-specified filter and profile options from the words
+/// typed so far (the completion engine's context slice). Both
+/// `--key value` and `--key=value` forms are honored; valueless or
+/// malformed options are ignored. Each completer filters its
+/// candidate values through the result so suggestions stay
+/// consistent with the narrowing already on the line.
+pub fn parse_active_filters(words: &[&str]) -> (DatasetFilter, ProfileView) {
     let mut filter = DatasetFilter::default();
     let mut profile: Option<String> = None;
 
     let mut i = 0;
-    while i < args.len() {
-        // Handle --key=value syntax
-        let (key, inline_val) = if let Some(eq_pos) = args[i].find('=') {
-            (&args[i][..eq_pos], Some(args[i][eq_pos + 1..].to_string()))
-        } else {
-            (args[i].as_str(), None)
+    while i < words.len() {
+        let (key, inline_val) = match words[i].find('=') {
+            Some(eq) => (&words[i][..eq], Some(words[i][eq + 1..].to_string())),
+            None => (words[i], None),
         };
-
-        let next_val = |i: usize, inline: &Option<String>, args: &[String]| -> Option<String> {
-            inline.clone().or_else(|| args.get(i + 1).cloned())
-                .filter(|v| !v.is_empty())
-                .map(|v| strip_shell_quotes(&v))
-                .filter(|v| !v.is_empty())
-        };
-
+        let value = inline_val
+            .clone()
+            .or_else(|| words.get(i + 1).map(|w| w.to_string()))
+            .filter(|v| !v.is_empty())
+            .map(|v| strip_shell_quotes(&v))
+            .filter(|v| !v.is_empty());
         let advance = if inline_val.is_some() { 0 } else { 1 };
 
-        match key {
-            "--matching-name" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.name = Some(v);
-                    i += advance;
-                }
+        if let Some(v) = value {
+            let mut consumed = true;
+            match key {
+                "--dataset" | "-d" | "--matching-name" => filter.name = Some(v),
+                "--with-facet" => filter.facet.push(v),
+                "--with-metric" => filter.metric = Some(v),
+                "--matching-desc" => filter.desc = Some(v),
+                "--with-min-count" => filter.min_count = parse_size(&v).ok(),
+                "--with-max-count" => filter.max_count = parse_size(&v).ok(),
+                "--with-count" => filter.count = parse_size(&v).ok(),
+                "--with-min-dim" => filter.min_dim = v.parse().ok(),
+                "--with-max-dim" => filter.max_dim = v.parse().ok(),
+                "--with-dim" => filter.dim = v.parse().ok(),
+                "--with-vtype" => filter.vtype = Some(v),
+                "--with-min-data" => filter.min_data = parse_bytes(&v).ok(),
+                "--with-max-data" => filter.max_data = parse_bytes(&v).ok(),
+                "--with-data" => filter.data = parse_bytes_with_unit(&v).ok(),
+                "--matching-profile" => profile = Some(v),
+                _ => consumed = false,
             }
-            "--with-facet" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.facet.push(v);
-                    i += advance;
-                }
+            if consumed {
+                i += advance;
             }
-            "--with-metric" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.metric = Some(v);
-                    i += advance;
-                }
-            }
-            "--matching-desc" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.desc = Some(v);
-                    i += advance;
-                }
-            }
-            "--with-min-size" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.min_size = parse_size(&v).ok();
-                    i += advance;
-                }
-            }
-            "--with-max-size" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.max_size = parse_size(&v).ok();
-                    i += advance;
-                }
-            }
-            "--with-size" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.size = parse_size(&v).ok();
-                    i += advance;
-                }
-            }
-            "--with-min-dim" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.min_dim = v.parse().ok();
-                    i += advance;
-                }
-            }
-            "--with-max-dim" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.max_dim = v.parse().ok();
-                    i += advance;
-                }
-            }
-            "--with-dim" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.dim = v.parse().ok();
-                    i += advance;
-                }
-            }
-            "--with-vtype" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.vtype = Some(v);
-                    i += advance;
-                }
-            }
-            "--with-data-min" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.data_min = parse_bytes(&v).ok();
-                    i += advance;
-                }
-            }
-            "--with-data-max" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.data_max = parse_bytes(&v).ok();
-                    i += advance;
-                }
-            }
-            "--matching-profile" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    profile = Some(v);
-                    i += advance;
-                }
-            }
-            _ => {}
         }
         i += 1;
     }
@@ -604,117 +872,97 @@ fn parse_active_filters() -> (DatasetFilter, ProfileView) {
     (filter, ProfileView::new(profile))
 }
 
-/// Returns `true` if `--select` is already present on the command line,
-/// meaning no further `--with-*` narrowing should be offered.
-fn select_already_specified() -> bool {
-    std::env::args().any(|a| a == "--select" || a.starts_with("--select="))
+/// Distinct canonical metrics present across `entries`, sorted.
+pub fn distinct_metrics(entries: &[&CatalogEntry]) -> Vec<String> {
+    let set: std::collections::BTreeSet<String> =
+        entries.iter().filter_map(|e| infer_metric(e)).collect();
+    set.into_iter().collect()
 }
 
-/// Returns `true` if `--select` has been given a non-empty value.
-/// When the user is currently completing `--select`'s value (i.e. `--select <TAB>`),
-/// the value is empty or missing, so this returns `false`.
-fn select_has_value() -> bool {
-    let args: Vec<String> = std::env::args().collect();
-    for (i, arg) in args.iter().enumerate() {
-        if let Some(val) = arg.strip_prefix("--select=") {
-            return !val.is_empty();
-        }
-        if arg == "--select" {
-            if let Some(next) = args.get(i + 1) {
-                return !next.is_empty() && !next.starts_with("--");
-            }
-            return false;
-        }
-    }
-    false
+/// Distinct vector data types present across `entries`, sorted.
+pub fn distinct_vtypes(entries: &[&CatalogEntry]) -> Vec<String> {
+    let set: std::collections::BTreeSet<String> =
+        entries.iter().filter_map(|e| infer_vtype(e)).collect();
+    set.into_iter().collect()
 }
 
-/// Returns the number of dataset:profile matches for the current filters
-/// and profile view. Used to decide whether to suppress all further
-/// completions (exactly 1 match with `--select`).
-fn filtered_match_count() -> usize {
-    let entries = filtered_completion_entries();
-    let (_, pv) = parse_active_filters();
-    let mut count = 0;
-    for e in &entries {
-        let profiles = pv.matching_profiles(e);
-        if profiles.is_empty() && !pv.is_active() {
-            count += 1;
-        } else {
-            count += profiles.len();
-        }
-    }
-    count
+/// Distinct facet (view) names present across `entries`, sorted.
+pub fn distinct_facets(entries: &[&CatalogEntry]) -> Vec<String> {
+    let set: std::collections::BTreeSet<String> = entries
+        .iter()
+        .flat_map(|e| collect_all_view_names(e))
+        .collect();
+    set.into_iter().collect()
 }
 
-// Per-argument value completers were removed — completion is now handled
-// by the veks-completion crate via the dyncomp command tree.
+/// Distinct dimensionalities present across `entries` under `mode`,
+/// ascending. Candidates for the `--with-dim` family.
+pub fn distinct_dims(entries: &[&CatalogEntry], mode: ProbeMode) -> Vec<String> {
+    let set: std::collections::BTreeSet<u32> =
+        entries.iter().filter_map(|e| resolve_dimension(e, mode)).collect();
+    set.into_iter().map(|d| d.to_string()).collect()
+}
 
-// Retained below: hidden_list_args() for clap arg visibility control.
-//
-pub fn hidden_list_args() -> Vec<&'static str> {
-    let (filter, pv) = parse_active_filters();
-    let selected = select_already_specified();
-    let mut hidden = Vec::new();
+/// Distinct record counts present across `entries` under `mode`, in
+/// compact suffix form (`100k`, `1m`), ascending. Candidates for the
+/// `--with-count` family.
+pub fn distinct_base_counts(entries: &[&CatalogEntry], mode: ProbeMode) -> Vec<String> {
+    let set: std::collections::BTreeSet<u64> = entries
+        .iter()
+        .filter_map(|e| max_base_count(e).or_else(|| probed_base_records(e, mode)))
+        .collect();
+    set.into_iter().map(format_count_suffix).collect()
+}
 
-    // Hide already-specified single-value filter args
-    if filter.name.is_some() { hidden.push("matching_name"); }
-    if filter.metric.is_some() { hidden.push("metric"); }
-    if filter.desc.is_some() { hidden.push("matching_desc"); }
-    if filter.min_size.is_some() { hidden.push("min_size"); }
-    if filter.max_size.is_some() { hidden.push("max_size"); }
-    if filter.size.is_some() { hidden.push("size"); }
-    if filter.min_dim.is_some() { hidden.push("min_dim"); }
-    if filter.max_dim.is_some() { hidden.push("max_dim"); }
-    if filter.dim.is_some() { hidden.push("dim"); }
-    if filter.vtype.is_some() { hidden.push("vtype"); }
-    if filter.data_min.is_some() { hidden.push("data_min"); }
-    if filter.data_max.is_some() { hidden.push("data_max"); }
+/// Distinct data sizes present across `entries` under `mode`, in raw
+/// bytes, ascending. Feeds the `--with-data` family's candidates (the
+/// completion layer formats them as byte sizes).
+pub fn distinct_data_sizes(entries: &[&CatalogEntry], mode: ProbeMode) -> Vec<u64> {
+    let set: std::collections::BTreeSet<u64> = entries
+        .iter()
+        .filter_map(|e| total_data_bytes(e, mode))
+        .collect();
+    set.into_iter().collect()
+}
 
-    // Hide --matching-profile when already specified or --select is active
-    if pv.is_active() || selected {
-        hidden.push("matching_profile");
-    }
-
-    // When --select is active, hide all remaining filter args
-    if selected {
-        for id in &["matching_name", "metric", "facet", "matching_desc",
-                     "dim", "min_dim", "max_dim", "vtype", "size", "min_size",
-                     "max_size", "data_min", "data_max"] {
-            if !hidden.contains(id) {
-                hidden.push(id);
-            }
+/// Render a byte count for the data axis: the largest decimal byte
+/// unit (`TB`/`GB`/`MB`/`KB`) whose rounded quotient is at least 10,
+/// so values keep 2–4 significant digits and read unmistakably as
+/// bytes (`118MB`, `12GB`) rather than counts (`100k`). Rounding
+/// error is at most half the displayed unit — exactly the tolerance
+/// the `--with-data` filter applies, so a displayed candidate always
+/// matches the dataset it came from.
+pub fn format_bytes_approx(n: u64) -> String {
+    for (mult, suffix) in [
+        (1_000_000_000_000u64, "TB"),
+        (1_000_000_000, "GB"),
+        (1_000_000, "MB"),
+        (1_000, "KB"),
+    ] {
+        let rounded = (n + mult / 2) / mult;
+        if rounded >= 10 {
+            return format!("{rounded}{suffix}");
         }
     }
+    n.to_string()
+}
 
-    // Hide --select only when it already has a non-empty value
-    let select_valued = select_has_value();
-    if select_valued {
-        hidden.push("select");
+/// Render `n` in the most compact form [`parse_number_with_suffix`]
+/// reads back exactly: the largest decimal suffix (`t`/`g`/`m`/`k`)
+/// that divides it evenly, else plain digits. Lossless by
+/// construction — candidates must filter precisely as displayed.
+fn format_count_suffix(n: u64) -> String {
+    for (mult, suffix) in [
+        (1_000_000_000_000u64, "t"),
+        (1_000_000_000, "g"),
+        (1_000_000, "m"),
+        (1_000, "k"),
+    ] {
+        if n > 0 && n.is_multiple_of(mult) {
+            return format!("{}{}", n / mult, suffix);
+        }
     }
-
-    // When --select has a value, hide output formatting options (they don't apply)
-    if select_valued {
-        hidden.push("output_format");
-        hidden.push("verbose");
-    }
-
-    // When --select has a value and resolves to a single match, suppress everything —
-    // the command is complete, no further options make sense.
-    if select_valued && filtered_match_count() <= 1 {
-        // Signal to hide --help via the special sentinel
-        hidden.push("__disable_help");
-    }
-
-    // Once any --with-* filter is in use, the catalog source is committed —
-    // hide --configdir, --catalog, --at to avoid confusing reloads.
-    if !filter.is_empty() || pv.is_active() {
-        hidden.push("configdir");
-        hidden.push("catalog");
-        hidden.push("at");
-    }
-
-    hidden
+    n.to_string()
 }
 
 #[cfg(test)]
@@ -844,10 +1092,260 @@ mod tests {
 
     #[test]
     fn test_infer_dimension_from_name() {
+        // `_dNNN` pipeline convention wins over bare numbers.
         assert_eq!(extract_dim_from_name("emb_002_d1536_b10000_q10000_mk100"), Some(1536));
-        assert_eq!(extract_dim_from_name("vecs-128"), None);
         assert_eq!(extract_dim_from_name("emb-base-v2_d768_b10000"), Some(768));
+        // ann-benchmarks bare-number convention.
+        assert_eq!(extract_dim_from_name("vecs-128"), Some(128));
+        assert_eq!(extract_dim_from_name("glove-25-angular"), Some(25));
+        assert_eq!(extract_dim_from_name("sift-128-euclidean"), Some(128));
+        assert_eq!(extract_dim_from_name("openai-v3-large-3072-100k"), Some(3072));
+        // Count suffixes, version tokens, and dimensionless names stay unknown.
+        assert_eq!(extract_dim_from_name("ada002-100k"), None);
+        assert_eq!(extract_dim_from_name("colbert-1M"), None);
+        assert_eq!(extract_dim_from_name("e5-base-v2-100k"), None);
+        assert_eq!(extract_dim_from_name("emb_002_b10000"), None);
         assert_eq!(extract_dim_from_name("no-dimension-here"), None);
+    }
+
+    #[test]
+    fn metric_canonicalization_and_synonyms() {
+        assert_eq!(canonicalize_metric("angular"), "COSINE");
+        assert_eq!(canonicalize_metric("Cosine"), "COSINE");
+        assert_eq!(canonicalize_metric("euclidean"), "L2");
+        assert_eq!(canonicalize_metric("L2"), "L2");
+        assert_eq!(canonicalize_metric("dot"), "DOT_PRODUCT");
+        assert_eq!(canonicalize_metric("ip"), "DOT_PRODUCT");
+        // Declared-but-unknown metrics pass through uppercased.
+        assert_eq!(canonicalize_metric("chebyshev"), "CHEBYSHEV");
+    }
+
+    #[test]
+    fn infer_metric_from_name_convention() {
+        let e = entry_with_views("glove-25-angular", &["base_vectors"]);
+        assert_eq!(infer_metric(&e), Some("COSINE".to_string()));
+        let e = entry_with_views("sift-128-euclidean", &["base_vectors"]);
+        assert_eq!(infer_metric(&e), Some("L2".to_string()));
+        let e = entry_with_views("lastfm-64-dot", &["base_vectors"]);
+        assert_eq!(infer_metric(&e), Some("DOT_PRODUCT".to_string()));
+        let e = entry_with_views("ada002-100k", &["base_vectors"]);
+        assert_eq!(infer_metric(&e), None);
+    }
+
+    #[test]
+    fn metric_filter_matches_across_synonyms() {
+        // `--with-metric angular` matches a declared `cosine` and a
+        // name-inferred `-angular` alike.
+        let f = DatasetFilter { metric: Some("angular".to_string()), ..Default::default() };
+        assert!(f.matches(&entry_with_attrs("test", "cosine")));
+        assert!(f.matches(&entry_with_views("glove-25-angular", &["base_vectors"])));
+        assert!(!f.matches(&entry_with_views("sift-128-euclidean", &["base_vectors"])));
+    }
+
+    #[test]
+    fn parse_active_filters_reads_context_words() {
+        let ctx = [
+            "--with-metric", "angular",
+            "--with-vtype=float32",
+            "--with-min-dim", "64",
+            "--matching-profile", "def*",
+            "--dataset", "glove",
+        ];
+        let (f, pv) = parse_active_filters(&ctx);
+        assert_eq!(f.metric.as_deref(), Some("angular"));
+        assert_eq!(f.vtype.as_deref(), Some("float32"));
+        assert_eq!(f.min_dim, Some(64));
+        assert_eq!(f.name.as_deref(), Some("glove"));
+        assert!(pv.is_active());
+    }
+
+    #[test]
+    fn distinct_value_extractors() {
+        let a = entry_with_views("glove-25-angular", &["base_vectors", "query_vectors"]);
+        let b = entry_with_views("sift-128-euclidean", &["base_vectors", "neighbor_indices"]);
+        let entries: Vec<&CatalogEntry> = vec![&a, &b];
+        assert_eq!(distinct_metrics(&entries), vec!["COSINE".to_string(), "L2".to_string()]);
+        assert_eq!(distinct_dims(&entries, ProbeMode::Off), vec!["25".to_string(), "128".to_string()]);
+        let facets = distinct_facets(&entries);
+        assert!(facets.contains(&"base_vectors".to_string()));
+        assert!(facets.contains(&"neighbor_indices".to_string()));
+    }
+
+    #[test]
+    fn facet_filter_accepts_capital_codes() {
+        let entry = entry_with_views("ds", &["base_vectors", "neighbor_indices"]);
+        for code in ["B", "G"] {
+            let f = DatasetFilter { facet: vec![code.to_string()], ..Default::default() };
+            assert!(f.matches(&entry), "code {code} should match its facet");
+        }
+        let f = DatasetFilter { facet: vec!["Q".to_string()], ..Default::default() };
+        assert!(!f.matches(&entry), "code Q has no matching facet here");
+        // Lowercase single letters are NOT codes — they fall through
+        // to name resolution and match nothing standard.
+        let f = DatasetFilter { facet: vec!["b".to_string()], ..Default::default() };
+        assert!(!f.matches(&entry));
+    }
+
+    #[test]
+    fn count_suffix_formatting_is_lossless() {
+        assert_eq!(format_count_suffix(100_000), "100k");
+        assert_eq!(format_count_suffix(1_000_000), "1m");
+        assert_eq!(format_count_suffix(2_500_000), "2500k");
+        assert_eq!(format_count_suffix(1_000_000_000), "1g");
+        assert_eq!(format_count_suffix(123), "123");
+        for n in [100_000u64, 2_500_000, 1_000_000_000, 123] {
+            assert_eq!(parse_size(&format_count_suffix(n)), Ok(n), "round-trip {n}");
+        }
+    }
+
+    #[test]
+    fn distinct_size_and_data_extractors() {
+        let mut a = entry_with_views("glove-25-angular", &["base_vectors"]);
+        if let Some(p) = a.layout.profiles.profiles.get_mut("default") {
+            p.base_count = Some(100_000);
+        }
+        let entries: Vec<&CatalogEntry> = vec![&a];
+        assert_eq!(distinct_base_counts(&entries, ProbeMode::Off), vec!["100k".to_string()]);
+        // Offline (no probe): the base-only estimate is the fallback —
+        // 100_000 records × dim 25 × 4 bytes (fvec) = 10_000_000.
+        assert_eq!(distinct_data_sizes(&entries, ProbeMode::Off), vec![10_000_000]);
+        assert_eq!(format_bytes_approx(10_000_000), "10MB");
+    }
+
+    #[test]
+    fn data_size_prefers_real_facet_bytes_over_base_only_estimate() {
+        // Regression: `--with-data` must report the dataset's true
+        // footprint (summed facet bytes), not the base_count × dim ×
+        // elem estimate which covers base vectors only and badly
+        // under-reports a dataset with large query / GT / metadata
+        // facets (e.g. a 43MB estimate for a multi-GB dataset).
+        let mut e = entry_with_views("ds", &["base_vectors", "neighbor_indices"]);
+        if let Some(p) = e.layout.profiles.profiles.get_mut("default") {
+            p.base_count = Some(1_000); // estimate would be tiny
+        }
+        // Cache real (large) facet sizes keyed by resolved URL.
+        let paths = entry_facet_paths(&e);
+        let cache: FacetProbeCache = paths
+            .iter()
+            .map(|p| (p.clone(), FacetProbe { bytes: Some(100_000_000), dim: Some(128) }))
+            .collect();
+
+        // Two facets × 100MB = 200MB physical — NOT the 1000×128×4
+        // (512KB) base-only estimate.
+        assert_eq!(
+            distinct_data_sizes(&[&e], ProbeMode::Cached(&cache)),
+            vec![200_000_000]
+        );
+
+        // And the over-/under-report no longer produces false matches:
+        // a 1MB ceiling must NOT match this 200MB dataset.
+        let f = DatasetFilter {
+            max_data: Some(1_000_000),
+            ..Default::default()
+        };
+        assert!(!f.matches_with(&e, ProbeMode::Cached(&cache)));
+    }
+
+    #[test]
+    fn bytes_approx_reads_as_bytes_not_counts() {
+        // Always a 2-byte (KB/MB/GB/TB) unit, never a bare k/m/g, so
+        // the data axis is never mistaken for the count axis.
+        assert_eq!(format_bytes_approx(118_400_000), "118MB");
+        assert_eq!(format_bytes_approx(12_000_000_000), "12GB");
+        assert_eq!(format_bytes_approx(10_000), "10KB");
+        // Below 10 of the smallest unit, fall back to raw bytes.
+        assert_eq!(format_bytes_approx(9_000), "9000");
+    }
+
+    #[test]
+    fn exact_data_filter_tolerates_unit_granularity() {
+        // A dataset estimated at ~118.4 MB must match the candidate
+        // displayed as `118MB` (target 118_000_000, unit 1_000_000:
+        // tolerance ±500_000).
+        let mut a = entry_with_views("emb_d2960_b10000", &["base_vectors"]);
+        if let Some(p) = a.layout.profiles.profiles.get_mut("default") {
+            p.base_count = Some(10_000);
+        }
+        // 10_000 × 2960 × 4 = 118_400_000 bytes.
+        assert_eq!(distinct_data_sizes(&[&a], ProbeMode::Off), vec![118_400_000]);
+        let displayed = format_bytes_approx(118_400_000);
+        assert_eq!(displayed, "118MB");
+        let f = DatasetFilter {
+            data: Some(parse_bytes_with_unit(&displayed).unwrap()),
+            ..Default::default()
+        };
+        assert!(f.matches(&a), "picked candidate must match its own dataset");
+        // A different MB value outside tolerance does not match.
+        let f2 = DatasetFilter {
+            data: Some(parse_bytes_with_unit("120MB").unwrap()),
+            ..Default::default()
+        };
+        assert!(!f2.matches(&a));
+    }
+
+    #[test]
+    fn offline_matching_never_probes_unknown_dims() {
+        // Unknown dim + dim filter: offline matching must simply
+        // fail the entry (no file/network reads to find out).
+        let e = entry_with_views("ada002-100k", &["base_vectors"]);
+        let f = DatasetFilter { min_dim: Some(1), ..Default::default() };
+        assert!(!f.matches_offline(&e));
+    }
+
+    #[test]
+    fn needs_probe_only_for_count_dim_data_filters() {
+        // The gate completion uses to skip warming the probe cache:
+        // pure-offline filters never trigger facet I/O.
+        assert!(!DatasetFilter::default().needs_probe());
+        assert!(!DatasetFilter { metric: Some("L2".into()), ..Default::default() }.needs_probe());
+        assert!(!DatasetFilter { vtype: Some("float32".into()), ..Default::default() }.needs_probe());
+        assert!(!DatasetFilter { name: Some("glove".into()), ..Default::default() }.needs_probe());
+        assert!(!DatasetFilter { facet: vec!["B".into()], ..Default::default() }.needs_probe());
+        // Count / dim / data predicates may need a probe → warm.
+        assert!(DatasetFilter { count: Some(1), ..Default::default() }.needs_probe());
+        assert!(DatasetFilter { min_count: Some(1), ..Default::default() }.needs_probe());
+        assert!(DatasetFilter { dim: Some(1), ..Default::default() }.needs_probe());
+        assert!(DatasetFilter { max_dim: Some(1), ..Default::default() }.needs_probe());
+        assert!(DatasetFilter { data: Some((1, 1)), ..Default::default() }.needs_probe());
+        assert!(DatasetFilter { min_data: Some(1), ..Default::default() }.needs_probe());
+    }
+
+    #[test]
+    fn cached_probe_matching_is_consistent_with_a_live_run() {
+        // The reported bug: a count that only resolves via probe
+        // (no `base_count` metadata, no dim in the name) was matched
+        // by the live run but dropped by completion's offline
+        // narrowing — so the next filter completed to nothing.
+        //
+        // Here `ds` has dim 128, float32 (4B), base file of
+        // 83818 × (4 + 128×4) bytes ⇒ exactly 83818 records.
+        let e = entry_with_views("ds", &["base_vectors"]);
+        // Key the cache by the resolved facet URL the probe path uses.
+        let base = base_vectors_path(&e).expect("base path");
+        let bytes = 83_818u64 * (4 + 128 * 4);
+        let cache: FacetProbeCache = [(
+            base,
+            FacetProbe { bytes: Some(bytes), dim: Some(128) },
+        )]
+        .into_iter()
+        .collect();
+
+        let f = DatasetFilter { count: Some(83_818), ..Default::default() };
+
+        // Offline narrowing drops it (the bug).
+        assert!(!f.matches_offline(&e));
+        // Cached narrowing (warm cache) matches — consistent with a run.
+        assert!(f.matches_with(&e, ProbeMode::Cached(&cache)));
+
+        // And the count appears as a candidate under the same cache,
+        // so the user could have completed `--with-count 83818`.
+        assert_eq!(
+            distinct_base_counts(&[&e], ProbeMode::Cached(&cache)),
+            vec!["83818".to_string()]
+        );
+        // A cache MISS reads as unknown — never a phantom match.
+        let empty = FacetProbeCache::new();
+        assert!(!f.matches_with(&e, ProbeMode::Cached(&empty)));
     }
 
     #[test]
@@ -946,13 +1444,13 @@ mod tests {
         };
 
         let f = DatasetFilter {
-            min_size: Some(500_000),
+            min_count: Some(500_000),
             ..Default::default()
         };
         assert!(f.matches(&entry));
 
         let f2 = DatasetFilter {
-            min_size: Some(2_000_000),
+            min_count: Some(2_000_000),
             ..Default::default()
         };
         assert!(!f2.matches(&entry));

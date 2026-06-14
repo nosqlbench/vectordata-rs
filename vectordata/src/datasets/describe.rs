@@ -35,13 +35,15 @@ pub struct DescribeArgs {
 /// Drive `describe` from parsed [`DescribeArgs`].
 #[cfg(feature = "cli")]
 pub fn run_args(args: DescribeArgs, configdir: &str, catalog: &[String], at_extra: &[String]) -> i32 {
+    // `--at` pins describe to a single catalog source; numbered
+    // shortcuts (`--at 2`) resolve against the configured list.
     let sources = if let Some(at) = args.at {
-        CatalogSources::new().add_catalogs(&[at])
+        CatalogSources::new().add_catalogs(&[crate::catalog::sources::resolve_catalog_value(&at)])
     } else {
         CatalogSources::new()
             .configure(configdir)
-            .add_catalogs(catalog)
-            .add_catalogs(at_extra)
+            .add_catalogs(&crate::catalog::sources::resolve_catalog_values(catalog))
+            .add_catalogs(&crate::catalog::sources::resolve_catalog_values(at_extra))
     };
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");

@@ -10,12 +10,12 @@
 //! 3. Fetch `catalog.json` from each location (HTTP or local file).
 //! 4. Display the aggregated dataset entries.
 
+use super::build_sources;
 use super::filter::{DatasetFilter, ProfileView};
 // The `filter::` free functions are only called from `cli`-gated arg parsing.
 #[cfg(feature = "cli")]
 use super::filter;
 use crate::catalog::resolver::Catalog;
-use crate::catalog::sources::CatalogSources;
 use crate::dataset::CatalogEntry;
 
 /// Shared clap-derived argument struct for `<binary> datasets
@@ -80,16 +80,16 @@ pub struct ListArgs {
     pub matching_desc: Option<String>,
 
     /// Filter: dataset has at least this many base vectors (supports K/M/B suffixes)
-    #[arg(long = "with-min-size")]
-    pub min_size: Option<String>,
+    #[arg(long = "with-min-count")]
+    pub min_count: Option<String>,
 
     /// Filter: dataset has at most this many base vectors (supports K/M/B suffixes)
-    #[arg(long = "with-max-size")]
-    pub max_size: Option<String>,
+    #[arg(long = "with-max-count")]
+    pub max_count: Option<String>,
 
     /// Filter: dataset has exactly this many base vectors (supports K/M/B suffixes)
-    #[arg(long = "with-size")]
-    pub size: Option<String>,
+    #[arg(long = "with-count", conflicts_with_all = ["min_count", "max_count"])]
+    pub count: Option<String>,
 
     /// Filter: minimum dimensionality of base vectors
     #[arg(long = "with-min-dim")]
@@ -100,20 +100,24 @@ pub struct ListArgs {
     pub max_dim: Option<u32>,
 
     /// Filter: exact dimensionality of base vectors
-    #[arg(long = "with-dim")]
+    #[arg(long = "with-dim", conflicts_with_all = ["min_dim", "max_dim"])]
     pub dim: Option<u32>,
 
-    /// Filter: vector data type (float32, float16, uint8, int32, numpy, hdf5)
+    /// Filter: vector data type (e.g. float32, float16, uint8, int32, numpy, hdf5)
     #[arg(long = "with-vtype")]
     pub vtype: Option<String>,
 
     /// Filter: minimum total data size in bytes (supports K/M/G/T suffixes)
-    #[arg(long = "with-data-min")]
-    pub data_min: Option<String>,
+    #[arg(long = "with-min-data")]
+    pub min_data: Option<String>,
 
     /// Filter: maximum total data size in bytes (supports K/M/G/T suffixes)
-    #[arg(long = "with-data-max")]
-    pub data_max: Option<String>,
+    #[arg(long = "with-max-data")]
+    pub max_data: Option<String>,
+
+    /// Filter: exact total data size in bytes (supports K/M/G/T suffixes)
+    #[arg(long = "with-data", conflicts_with_all = ["min_data", "max_data"])]
+    pub data: Option<String>,
 }
 
 /// Drive `list::run` from a parsed [`ListArgs`]. Handles the
@@ -140,15 +144,16 @@ pub fn run_args(args: ListArgs) -> i32 {
         facet: args.facet,
         metric: args.metric,
         desc,
-        min_size: parse_size_opt(args.min_size.as_deref(), "--with-min-size"),
-        max_size: parse_size_opt(args.max_size.as_deref(), "--with-max-size"),
-        size: parse_size_opt(args.size.as_deref(), "--with-size"),
+        min_count: parse_size_opt(args.min_count.as_deref(), "--with-min-count"),
+        max_count: parse_size_opt(args.max_count.as_deref(), "--with-max-count"),
+        count: parse_size_opt(args.count.as_deref(), "--with-count"),
         min_dim: args.min_dim,
         max_dim: args.max_dim,
         dim: args.dim,
         vtype: args.vtype,
-        data_min: parse_bytes_opt(args.data_min.as_deref(), "--with-data-min"),
-        data_max: parse_bytes_opt(args.data_max.as_deref(), "--with-data-max"),
+        min_data: parse_bytes_opt(args.min_data.as_deref(), "--with-min-data"),
+        max_data: parse_bytes_opt(args.max_data.as_deref(), "--with-max-data"),
+        data: parse_data_opt(args.data.as_deref(), "--with-data"),
     };
     let view = ProfileView::new(profile_pat);
     run(
@@ -178,6 +183,19 @@ fn parse_size_opt(raw: Option<&str>, label: &str) -> Option<u64> {
 fn parse_bytes_opt(raw: Option<&str>, label: &str) -> Option<u64> {
     raw.map(|s| {
         filter::parse_bytes(s).unwrap_or_else(|e| {
+            eprintln!("error: {label}: {e}");
+            std::process::exit(1);
+        })
+    })
+}
+
+/// Like [`parse_bytes_opt`] but keeping the spelled unit's
+/// granularity — the exact `--with-data` filter matches within half
+/// a unit (see [`DatasetFilter::data`]).
+#[cfg(feature = "cli")]
+fn parse_data_opt(raw: Option<&str>, label: &str) -> Option<(u64, u64)> {
+    raw.map(|s| {
+        filter::parse_bytes_with_unit(s).unwrap_or_else(|e| {
             eprintln!("error: {label}: {e}");
             std::process::exit(1);
         })
@@ -352,24 +370,6 @@ fn output_select(entries: &[&CatalogEntry], pv: &ProfileView, select_value: &str
     }
 }
 
-/// Build `CatalogSources` from CLI arguments, mirroring the Java
-/// `CMD_datasets_list.call()` logic.
-fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> CatalogSources {
-    let mut sources = CatalogSources::new();
-
-    if !at.is_empty() {
-        // --at overrides everything: use those locations directly
-        sources = sources.add_catalogs(at);
-    } else {
-        // Load from configdir (catalogs.yaml), then add extras
-        sources = sources.configure(configdir);
-        if !extra_catalogs.is_empty() {
-            sources = sources.add_catalogs(extra_catalogs);
-        }
-    }
-
-    sources
-}
 
 /// Detect terminal column width, defaulting to 80 if not on a terminal.
 fn terminal_width() -> usize {
@@ -504,9 +504,8 @@ fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: 
 
         let group_key = match key {
             "source" => entry.path.clone(),
-            "metric" => entry.layout.attributes.as_ref()
-                .and_then(|a| a.distance_function.clone())
-                .unwrap_or_else(|| "(no distance_function in attributes)".into()),
+            "metric" => filter::infer_metric(entry)
+                .unwrap_or_else(|| "(no metric in attributes or name)".into()),
             "profile" => {
                 // Group by profile: each profile becomes a group key
                 for pname in &profile_names {
@@ -662,6 +661,7 @@ fn escape_csv(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::sources::CatalogSources;
 
     fn make_sources_from_dir(dir: &std::path::Path) -> CatalogSources {
         CatalogSources::new().add_catalogs(&[dir.to_string_lossy().to_string()])

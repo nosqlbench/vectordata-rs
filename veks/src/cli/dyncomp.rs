@@ -7,7 +7,16 @@
 //! candidates are always in sync with the actual CLI definition. No
 //! static command map — the tree is built from `build_augmented_cli()`
 //! on every invocation.
+//!
+//! The dataset-domain completers (`--dataset`, `--profile`, `--at`,
+//! and the datasets positionals) are NOT defined here — they live in
+//! [`vectordata::datasets::dyncomp`] alongside the commands they
+//! complete, and both binaries register the same resolvers. This
+//! module only adds the veks-specific ones (`--metric`, `--shell`).
 
+use vectordata::datasets::dyncomp::{
+    complete_catalog_urls, complete_dataset_names, complete_profile_names, datasets_resolvers,
+};
 use veks_completion::{CommandOption, OptionDef, OptionRegistry, ParseMismatch, ValueProvider};
 
 /// One shared option: a DRY parse definition plus the value resolver to use
@@ -35,7 +44,7 @@ fn shared_options() -> Vec<SharedOpt> {
     use veks_completion::fn_provider;
     let mk = |def: OptionDef, r: ValueProvider| SharedOpt { def, resolver: r };
     vec![
-        mk(OptionDef::value("--dataset").value_name("DATASET"), fn_provider(complete_dataset_names)),
+        mk(OptionDef::value("--dataset").short('d').value_name("DATASET"), fn_provider(complete_dataset_names)),
         mk(OptionDef::value("--profile").value_name("PROFILE"), fn_provider(complete_profile_names)),
         mk(OptionDef::value("--metric").value_name("METRIC"), fn_provider(complete_metrics)),
         mk(OptionDef::value("--at").value_name("URL").multiple(true), fn_provider(complete_catalog_urls)),
@@ -43,12 +52,15 @@ fn shared_options() -> Vec<SharedOpt> {
     ]
 }
 
-/// The shared per-flag value resolvers (`--at`/`--dataset`/`--profile`/
-/// `--metric`/`--shell`), keyed by canonical long token, for
-/// [`veks_completion::cli::build_completion_tree`]. These are the dynamic
-/// completers the derive structs don't carry on their own `OptionSpec`s.
+/// The shared value resolvers for
+/// [`veks_completion::cli::build_completion_tree`]: the dataset-domain
+/// map from [`vectordata::datasets::dyncomp::datasets_resolvers`]
+/// (flag keys plus the `datasets …` positional path keys), extended
+/// with the veks-specific per-flag completers (`--metric`/`--shell`).
+/// These are the dynamic completers the derive structs don't carry on
+/// their own `OptionSpec`s.
 pub fn shared_resolvers() -> std::collections::BTreeMap<String, ValueProvider> {
-    let mut map = std::collections::BTreeMap::new();
+    let mut map = datasets_resolvers();
     for opt in &shared_options() {
         if let Some(r) = opt.value_resolver() {
             map.insert(opt.definition().name, r);
@@ -88,68 +100,6 @@ pub fn audit_parse_consistency_spec(spec: &veks_completion::CommandSpec) -> Vec<
     registry.audit(&observed)
 }
 
-/// Extract the value of a previously typed `--option` from the completion args.
-fn extract_option(option: &str) -> Option<String> {
-    let args: Vec<String> = std::env::args().collect();
-    let words_start = args.iter().position(|a| a == "--").map(|i| i + 1).unwrap_or(1);
-    let words = &args[words_start..];
-    words.windows(2)
-        .find(|w| w[0] == option)
-        .map(|w| w[1].clone())
-}
-
-/// Build a catalog resolver that respects `--at` and `--catalog` from the
-/// command line. Falls back to the default configured catalogs.
-fn resolve_catalog() -> crate::catalog::resolver::Catalog {
-    let at_values: Vec<String> = {
-        let args: Vec<String> = std::env::args().collect();
-        let words_start = args.iter().position(|a| a == "--").map(|i| i + 1).unwrap_or(1);
-        let words = &args[words_start..];
-        words.windows(2)
-            .filter(|w| w[0] == "--at")
-            .map(|w| crate::datasets::resolve_catalog_value(&w[1]))
-            .collect()
-    };
-
-    if at_values.is_empty() {
-        let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-        crate::catalog::resolver::Catalog::of(&sources)
-    } else {
-        let sources = crate::catalog::sources::CatalogSources::new()
-            .add_catalogs(&at_values);
-        crate::catalog::resolver::Catalog::of(&sources)
-    }
-}
-
-/// Suggest dataset names from catalogs (respects `--at`).
-fn complete_dataset_names(partial: &str, _context: &[&str]) -> Vec<String> {
-    let catalog = resolve_catalog();
-    let prefix = partial.to_lowercase();
-    catalog.datasets().iter()
-        .map(|e| e.name.clone())
-        .filter(|n| prefix.is_empty() || n.to_lowercase().starts_with(&prefix))
-        .collect()
-}
-
-/// Suggest profile names (respects `--at` and `--dataset`).
-fn complete_profile_names(partial: &str, _context: &[&str]) -> Vec<String> {
-    let catalog = resolve_catalog();
-    let prefix = partial.to_lowercase();
-    let dataset_name = extract_option("--dataset");
-
-    let mut profiles = std::collections::BTreeSet::new();
-    for entry in catalog.datasets() {
-        if let Some(ref ds) = dataset_name
-            && !entry.name.eq_ignore_ascii_case(ds) { continue; }
-        for name in entry.profile_names() {
-            if prefix.is_empty() || name.to_lowercase().starts_with(&prefix) {
-                profiles.insert(name.to_string());
-            }
-        }
-    }
-    profiles.into_iter().collect()
-}
-
 /// Suggest distance metrics.
 fn complete_metrics(partial: &str, _context: &[&str]) -> Vec<String> {
     let metrics = ["L2", "COSINE", "DOT_PRODUCT", "L1"];
@@ -158,48 +108,6 @@ fn complete_metrics(partial: &str, _context: &[&str]) -> Vec<String> {
         .filter(|m| prefix.is_empty() || m.starts_with(&prefix))
         .map(|m| m.to_string())
         .collect()
-}
-
-/// Suggest configured catalog URLs by index.
-///
-/// Each configured catalog can be referenced by its 1-based index or its
-/// full URL. When multiple candidates match, the index-to-URL mapping is
-/// printed to stderr (which goes to /dev/tty) so the user can see what
-/// each number means. Only the numbers are returned as completable values.
-///
-/// Bash calls the completer twice per tab press (generate + display).
-/// We use a lock file keyed on the partial string to avoid printing
-/// descriptions twice.
-fn complete_catalog_urls(partial: &str, _context: &[&str]) -> Vec<String> {
-    let config_dir = crate::catalog::sources::expand_tilde(
-        crate::catalog::sources::DEFAULT_CONFIG_DIR,
-    );
-    let entries = crate::catalog::sources::raw_catalog_entries(&config_dir);
-    let mut results: Vec<(String, String)> = Vec::new();
-    for (i, url) in entries.iter().enumerate() {
-        let num = format!("{}", i + 1);
-        if partial.is_empty() || num.starts_with(partial) || url.starts_with(partial) {
-            results.push((num, url.clone()));
-        }
-    }
-    // Only show descriptions when there are multiple candidates.
-    // Use a temp file to avoid printing twice per tab press.
-    if results.len() > 1 {
-        let lock = format!("/tmp/.veks_comp_at_{}", partial);
-        let lock_path = std::path::Path::new(&lock);
-        let stale = lock_path.metadata()
-            .and_then(|m| m.modified())
-            .map(|t| t.elapsed().unwrap_or_default().as_secs() > 2)
-            .unwrap_or(true);
-        if stale {
-            let _ = std::fs::write(lock_path, "");
-            eprintln!();
-            for (num, url) in &results {
-                eprintln!("  {} = {}", num, url);
-            }
-        }
-    }
-    results.into_iter().map(|(num, _)| num).collect()
 }
 
 /// Suggest shell names.

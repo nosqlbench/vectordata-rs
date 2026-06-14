@@ -323,7 +323,7 @@ enum DatasetsCmd {
         /// `dataset.yaml`, path to a `dataset.yaml` file, or HTTPS URL.
         /// Local directories take a fast path that bypasses the
         /// runtime cache + access layer entirely.
-        #[arg(long)]
+        #[arg(long, short = 'd')]
         dataset: String,
         /// Profile to derive. Required.
         #[arg(long)]
@@ -507,6 +507,21 @@ fn complete_config_get(partial: &str, _ctx: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Every dynamic value resolver this binary registers with the
+/// completion tree: the shared dataset-domain map (`--dataset`,
+/// `--profile`, `--at`, and the `datasets ping`/`describe`/`precache`
+/// positionals — see [`vectordata::datasets::dyncomp`]) plus the
+/// vectordata-specific entries.
+fn completion_resolvers() -> std::collections::BTreeMap<String, veks_completion::ValueProvider> {
+    let mut resolvers = vectordata::datasets::dyncomp::datasets_resolvers();
+    // `--to` (push destination): suggest namespace URLs on the logged-in endpoint.
+    resolvers.insert("--to".to_string(), veks_completion::fn_provider(complete_push_to));
+    // Positional completion, keyed by subcommand path.
+    resolvers.insert("config set".to_string(), veks_completion::fn_provider(complete_config_set));
+    resolvers.insert("config get".to_string(), veks_completion::fn_provider(complete_config_get));
+    resolvers
+}
+
 fn main() {
     // Detached update-probe child (see update_check module docs):
     // marked by an internal env var, does one fetch + state write,
@@ -521,14 +536,7 @@ fn main() {
     // `_VECTORDATA_COMPLETE=…`), emit candidates and exit. The snippet from
     // `vectordata completions` re-invokes the binary with that env var set, so
     // completion logic lives in the spec rather than a frozen script.
-    let mut resolvers: std::collections::BTreeMap<String, veks_completion::ValueProvider> =
-        std::collections::BTreeMap::new();
-    // `--to` (push destination): suggest namespace URLs on the logged-in endpoint.
-    resolvers.insert("--to".to_string(), veks_completion::fn_provider(complete_push_to));
-    // Positional completion, keyed by subcommand path.
-    resolvers.insert("config set".to_string(), veks_completion::fn_provider(complete_config_set));
-    resolvers.insert("config get".to_string(), veks_completion::fn_provider(complete_config_get));
-    let tree = vcli::build_completion_tree(&spec, &resolvers);
+    let tree = vcli::build_completion_tree(&spec, &completion_resolvers());
     if veks_completion::handle_complete_env("vectordata", &tree) {
         return;
     }
@@ -951,4 +959,46 @@ fn fmt_size(bytes: u64) -> String {
     else if bytes >= MIB { format!("{:.1} MiB", bytes as f64 / MIB as f64) }
     else if bytes >= KIB { format!("{:.1} KiB", bytes as f64 / KIB as f64) }
     else { format!("{} B", bytes) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registration contract for this binary's dynamic
+    /// completion: the shared dataset-domain resolvers plus the
+    /// vectordata-specific ones, no more and no less. The
+    /// key → tree attachment mechanics are veks-completion's own
+    /// tested behavior; what this binary owns is WHICH resolvers it
+    /// registers.
+    #[test]
+    fn completion_resolvers_cover_datasets_and_local_surfaces() {
+        let keys: Vec<String> = completion_resolvers().into_keys().collect();
+        assert_eq!(keys, vec![
+            "--at".to_string(),
+            "--dataset".to_string(),
+            "--matching-name".to_string(),
+            "--matching-profile".to_string(),
+            "--profile".to_string(),
+            "--select".to_string(),
+            "--to".to_string(),
+            "--with-count".to_string(),
+            "--with-data".to_string(),
+            "--with-dim".to_string(),
+            "--with-facet".to_string(),
+            "--with-max-count".to_string(),
+            "--with-max-data".to_string(),
+            "--with-max-dim".to_string(),
+            "--with-metric".to_string(),
+            "--with-min-count".to_string(),
+            "--with-min-data".to_string(),
+            "--with-min-dim".to_string(),
+            "--with-vtype".to_string(),
+            "config get".to_string(),
+            "config set".to_string(),
+            "datasets describe".to_string(),
+            "datasets ping".to_string(),
+            "datasets precache".to_string(),
+        ]);
+    }
 }

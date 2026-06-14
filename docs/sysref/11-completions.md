@@ -506,10 +506,15 @@ Each line earns its place — see §11.13 for the rationale behind
 - `-o nosort` — preserves the engine's intentional layer ordering
   (rapid-tap tier ordering). Without this, readline alphabetises
   and the layer-stratified display is destroyed.
-- `-o nospace` — most engine candidates are mid-context inserts
-  (`delta(`, `up{`, `[5m`); a trailing space would push the cursor
-  outside the context the user is building. The user types their
-  own space when done.
+- `-o nospace` — the engine owns spacing per candidate, not
+  readline. Grammar candidates (`delta(`, `up{`, `[5m`) are
+  mid-context inserts where a shell-appended space would push the
+  cursor outside the context being built; word-complete candidates
+  (subcommands, flags, finished values) instead carry their
+  trailing space inside the candidate bytes, baked in by
+  `shell_ready_candidates` at the emission boundary and preserved
+  by the newline-only IFS. Global `-o nospace` plus engine-side
+  spaces is the only way bash allows per-candidate control.
 - The shell's PID is read by the binary via `getppid()` (no env
   var plumbing needed).
 - The completer name in the snippet is `argv[0]` verbatim — whatever
@@ -549,12 +554,18 @@ Concrete consequences:
 - An `APPEND` candidate (a label key) extends current context;
   trailing space depends on whether the user is composing a list
   (no space) or finishing a token (space).
-- The engine currently expresses intent implicitly via the shape
-  of the candidate (presence of `(`, trailing operator, etc.) and
-  via the `-o nospace` shell directive (which uniformly suppresses
-  trailing space — the user provides it). Promoting intent to a
-  first-class enum is a natural future refactor; today the model
-  lives in this doc and in the choice of candidate string.
+- The engine expresses intent via the shape of the candidate
+  bytes themselves. `OPEN`/`APPEND` shapes come from providers
+  (presence of `(`, trailing operator, trailing `=`); `TERMINAL`
+  spacing is realized by `shell_ready_candidates` at the emission
+  boundary, which appends the trailing space to word-complete
+  tree-walk candidates (subcommands, flags, finished values) while
+  leaving `=`/`/`-ending candidates and all subtree-provider
+  output untouched. The `-o nospace` shell directive suppresses
+  readline's own uniform space so the per-candidate bytes win.
+  Promoting intent to a first-class enum is a natural future
+  refactor; today the model lives in this doc, in the choice of
+  candidate string, and in the `shell_ready_candidates` pass.
 
 ### Layer 2 — Raw Mode (Engine ↔ Bash Hook Cooperation)
 
@@ -583,9 +594,12 @@ engine owns the splice contract end-to-end:
    so the engine's `shell_word_start()` reasons about the same
    boundaries bash will splice against.
 
-2. **`-o nospace`** — engine candidates are typically mid-context
-   inserts; a trailing space would land the cursor outside the
-   context being built. The user types their own space.
+2. **`-o nospace`** — readline must never append its own uniform
+   space: grammar candidates are mid-context inserts where it
+   would land the cursor outside the context being built. The
+   engine instead bakes the trailing space into word-complete
+   candidates (`shell_ready_candidates`), giving per-candidate
+   spacing bash cannot express natively.
 
 3. **`-o nosort`** — preserves engine's tier ordering.
 
@@ -627,3 +641,10 @@ both layers:
   check the resulting line is exactly what the user expected to
   see — proving the engine's view of the splice point matches the
   hook's `COMP_WORDBREAKS`-driven view.
+- The trailing-space contract is pinned by the emission tests in
+  `veks-completion/src/lib.rs` (`trace_unique_subcommand_carries_trailing_space`
+  and friends), which drive `trace_completion_candidates` — the
+  pure surface behind the `---trace-completion` diagnostic — and
+  assert byte-exact `COMPREPLY` content: `TERMINAL` words carry
+  the space, `=`/`/` endings stay glued, subtree-provider output
+  passes through verbatim.

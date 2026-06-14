@@ -181,6 +181,17 @@ pub fn format_count_with_suffix(n: u64) -> String {
 /// - `GB` → ×1,000,000,000, `GiB` → ×1,073,741,824
 /// - `TB` → ×1,000,000,000,000, `TiB` → ×1,099,511,627,776
 pub fn parse_number_with_suffix(s: &str) -> Result<u64, String> {
+    parse_number_with_suffix_unit(s).map(|(value, _unit)| value)
+}
+
+/// Like [`parse_number_with_suffix`], additionally returning the
+/// multiplier of the unit the user actually spelled: `1` for bare
+/// digits, `1_000_000` for `118MB`/`118m`, the smallest term's unit
+/// for compound forms (`1g24m` → `1_000_000`). Callers use it as the
+/// value's implied granularity — e.g. the approximate matching of
+/// `--with-data`, where a candidate displayed as `118MB` must match
+/// the ~118.4 MB dataset it was derived from.
+pub fn parse_number_with_suffix_unit(s: &str) -> Result<(u64, u64), String> {
     let s = s.replace('_', "");
     if s.is_empty() {
         return Err("empty number".to_string());
@@ -189,8 +200,8 @@ pub fn parse_number_with_suffix(s: &str) -> Result<u64, String> {
     // Try compound format first: e.g., "1g24m" = 1 billion + 24 million.
     // Split at positions where a digit is followed by an alpha suffix which
     // is then followed by another digit (the start of the remainder term).
-    if let Some(total) = try_parse_compound(&s) {
-        return Ok(total);
+    if let Some(total_and_unit) = try_parse_compound(&s) {
+        return Ok(total_and_unit);
     }
 
     // Try multi-char ISO suffixes first (case-insensitive for the letter,
@@ -234,14 +245,15 @@ pub fn parse_number_with_suffix(s: &str) -> Result<u64, String> {
     let n: u64 = num_part
         .parse()
         .map_err(|e| format!("invalid number '{}': {}", num_part, e))?;
-    Ok(n * multiplier)
+    Ok((n * multiplier, multiplier))
 }
 
 /// Try to parse a compound suffix string like `1g24m` or `524g288m`.
 ///
 /// Splits into terms where each term is `{digits}{suffix}`. Returns the
-/// sum of all terms, or None if the string doesn't match compound format.
-fn try_parse_compound(s: &str) -> Option<u64> {
+/// sum of all terms plus the smallest term's multiplier (the value's
+/// granularity), or None if the string doesn't match compound format.
+fn try_parse_compound(s: &str) -> Option<(u64, u64)> {
     // Must have at least two terms (digit-suffix-digit pattern)
     let bytes = s.as_bytes();
     if bytes.len() < 4 { return None; }
@@ -267,6 +279,7 @@ fn try_parse_compound(s: &str) -> Option<u64> {
 
     // Parse each term as a simple number+suffix
     let mut total = 0u64;
+    let mut smallest_unit = u64::MAX;
     for term in &terms {
         // Each term must end with a suffix
         let term_bytes = term.as_bytes();
@@ -290,9 +303,10 @@ fn try_parse_compound(s: &str) -> Option<u64> {
             _ => return None,
         };
         total += n * multiplier;
+        smallest_unit = smallest_unit.min(multiplier);
     }
 
-    Some(total)
+    Some((total, smallest_unit))
 }
 
 /// Parse a single interval from a string.
@@ -658,6 +672,18 @@ mod tests {
     #[test]
     fn test_parse_plain_number() {
         assert_eq!(parse_number_with_suffix("1000").unwrap(), 1000);
+    }
+
+    #[test]
+    fn test_parse_with_suffix_unit_reports_granularity() {
+        // Bare digits → granularity 1 (exact).
+        assert_eq!(parse_number_with_suffix_unit("1000").unwrap(), (1000, 1));
+        // A spelled unit → that unit's multiplier.
+        assert_eq!(parse_number_with_suffix_unit("118MB").unwrap(), (118_000_000, 1_000_000));
+        assert_eq!(parse_number_with_suffix_unit("12g").unwrap(), (12_000_000_000, 1_000_000_000));
+        assert_eq!(parse_number_with_suffix_unit("5KiB").unwrap(), (5_120, 1_024));
+        // Compound → the smallest term's unit is the granularity.
+        assert_eq!(parse_number_with_suffix_unit("1g24m").unwrap(), (1_024_000_000, 1_000_000));
     }
 
     #[test]

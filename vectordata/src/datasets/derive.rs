@@ -41,8 +41,8 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use super::build_sources;
 use crate::catalog::resolver::Catalog;
-use crate::catalog::sources::CatalogSources;
 use crate::dataset::config::DatasetConfig as RichDatasetConfig;
 use crate::dataset::source::DSWindow;
 use crate::merkle::MerkleRef;
@@ -1056,19 +1056,6 @@ enum Resolved {
     CatalogEntry { catalog: Catalog, name: String, yaml_url: String },
     Local(String),
     Url(String),
-}
-
-fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> CatalogSources {
-    let mut sources = CatalogSources::new();
-    if !at.is_empty() {
-        sources = sources.add_catalogs(at);
-    } else {
-        sources = sources.configure(configdir);
-        if !extra_catalogs.is_empty() {
-            sources = sources.add_catalogs(extra_catalogs);
-        }
-    }
-    sources
 }
 
 /// Fetch the dataset.yaml as raw text and parse it as the rich

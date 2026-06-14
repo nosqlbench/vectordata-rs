@@ -794,17 +794,12 @@ fn kv(key: &str, value: &str, key_style: Style, val_style: Style) -> Line<'stati
 }
 
 /// Strip a window notation (`[lo..hi)` or `(lo..hi]`) from a source
-/// path, returning just the underlying file path. Source strings in
-/// `dataset.yaml` use these brackets to denote subranges of a shared
-/// base file (e.g. `base.fvec[0..1000000)`); the picker compares
-/// stripped paths to detect when a profile is a window into the
-/// dataset's default base data rather than its own download.
+/// path — see [`crate::dataset::catalog::strip_window_suffix`], the
+/// single authority this delegates to. The picker compares stripped
+/// paths to detect when a profile is a window into the dataset's
+/// default base data rather than its own download.
 fn strip_window_suffix(source_path: &str) -> &str {
-    if let Some(bracket) = source_path.find(['[', '(']) {
-        &source_path[..bracket]
-    } else {
-        source_path
-    }
+    crate::dataset::catalog::strip_window_suffix(source_path)
 }
 
 /// Walk the cache root once and build a `canonical_url → (valid_chunks,
@@ -1236,18 +1231,7 @@ fn resolve_facet_url(
     entry: &CatalogEntry,
     view: &crate::dataset::DSView,
 ) -> Option<String> {
-    let raw = strip_window_suffix(&view.source.path);
-    if raw.is_empty() { return None; }
-    if raw.starts_with("http://")
-        || raw.starts_with("https://")
-        || raw.starts_with("s3://")
-        || raw.starts_with("file://")
-        || raw.starts_with('/')
-    {
-        return Some(raw.to_string());
-    }
-    let parent = entry.path.rsplit_once('/').map(|(p, _)| p)?;
-    Some(format!("{parent}/{raw}"))
+    entry.resolve_facet_url(&view.source.path)
 }
 
 /// Classify a profile by its `base_vectors` source — the file the

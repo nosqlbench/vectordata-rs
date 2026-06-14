@@ -220,6 +220,9 @@ pub enum ParseError {
     /// A value failed to convert to the field's type (e.g. `--count abc` for a
     /// `usize`). Produced during typed extraction by the derive macro.
     InvalidValue { flag: String, value: String, message: String },
+    /// Two mutually exclusive options were both supplied (see
+    /// [`OptionDef::conflicts_with`]).
+    ConflictingOptions { command: String, flag: String, other: String },
 }
 
 /// Implemented by `#[derive(VeksCli)]` types: a command/args struct or a
@@ -254,6 +257,8 @@ impl std::fmt::Display for ParseError {
                 write!(f, "{command}: a subcommand is required"),
             ParseError::InvalidValue { flag, value, message } =>
                 write!(f, "invalid value '{value}' for '{flag}': {message}"),
+            ParseError::ConflictingOptions { command, flag, other } =>
+                write!(f, "'{flag}' cannot be combined with '{other}' (in '{command}')"),
         }
     }
 }
@@ -374,6 +379,25 @@ pub fn parse(spec: &CommandSpec, argv: &[String]) -> Result<ParsedArgs, ParseErr
 /// Apply defaults, then validate required options/positionals and subcommand
 /// presence.
 fn finalize(spec: &CommandSpec, out: &mut ParsedArgs) -> Result<(), ParseError> {
+    // Mutual exclusions first — before defaults are injected, so
+    // only options the user actually supplied count as present.
+    for opt in &spec.options {
+        let canon = opt.def.name.trim_start_matches('-');
+        if !out.flags.contains(canon) && !out.values.contains_key(canon) {
+            continue;
+        }
+        for conflict in &opt.def.conflicts_with {
+            let other = conflict.trim_start_matches('-');
+            if out.flags.contains(other) || out.values.contains_key(other) {
+                return Err(ParseError::ConflictingOptions {
+                    command: spec.name.clone(),
+                    flag: opt.def.name.clone(),
+                    other: conflict.clone(),
+                });
+            }
+        }
+    }
+
     for opt in &spec.options {
         let canon = opt.def.name.trim_start_matches('-').to_string();
         let present = out.flags.contains(&canon) || out.values.contains_key(&canon);
@@ -637,6 +661,16 @@ fn spec_to_node(
                 }
             }
         }
+        // Mutual exclusions, symmetrized: declaring `--with-dim`
+        // conflicts_with `--with-min-dim` on either side hides each
+        // from completion once the other is on the line.
+        for o in &spec.options {
+            for c in &o.def.conflicts_with {
+                node = node
+                    .with_flag_conflict(&o.def.name, c)
+                    .with_flag_conflict(c, &o.def.name);
+            }
+        }
         // First-positional completion: a resolver registered under this command's
         // full path (e.g. "backends remove"), applied only when the command
         // actually takes a positional.
@@ -687,6 +721,52 @@ mod tests {
 
     fn argv(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// An exact/min/max filter family: the exact flag declares the
+    /// conflicts; symmetry is the bridge's job.
+    fn dim_family() -> CommandSpec {
+        CommandSpec::new("list")
+            .option(OptionSpec::new(
+                OptionDef::value("--with-dim")
+                    .conflicts_with(&["--with-min-dim", "--with-max-dim"]),
+            ))
+            .option(vopt("--with-min-dim"))
+            .option(vopt("--with-max-dim"))
+    }
+
+    #[test]
+    fn conflicting_flags_withheld_from_completion_both_directions() {
+        let spec = dim_family();
+        let tree = build_completion_tree(&spec, &std::collections::BTreeMap::new());
+
+        // Exact on the line → neither range flag is offered.
+        let cands = crate::complete(&tree, &["list", "--with-dim", "5", "--with-"]);
+        assert!(!cands.iter().any(|c| c == "--with-min-dim"), "{cands:?}");
+        assert!(!cands.iter().any(|c| c == "--with-max-dim"), "{cands:?}");
+
+        // A range flag on the line → the exact flag is not offered,
+        // but the other end of the range still is.
+        let cands = crate::complete(&tree, &["list", "--with-min-dim", "4", "--with-"]);
+        assert!(!cands.iter().any(|c| c == "--with-dim"), "{cands:?}");
+        assert!(cands.iter().any(|c| c == "--with-max-dim"), "{cands:?}");
+    }
+
+    #[test]
+    fn conflicting_options_rejected_at_parse_in_either_order() {
+        let spec = dim_family();
+        for words in [
+            ["--with-dim", "5", "--with-min-dim", "4"],
+            ["--with-min-dim", "4", "--with-dim", "5"],
+        ] {
+            let err = parse(&spec, &argv(&words)).unwrap_err();
+            assert!(
+                matches!(err, ParseError::ConflictingOptions { .. }),
+                "expected conflict error, got {err:?}"
+            );
+        }
+        // The range pair itself is NOT a conflict.
+        assert!(parse(&spec, &argv(&["--with-min-dim", "4", "--with-max-dim", "9"])).is_ok());
     }
 
     #[test]

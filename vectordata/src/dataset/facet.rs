@@ -173,6 +173,31 @@ impl StandardFacet {
         }
     }
 
+    /// Inverse of [`Self::code`]: resolve a capital facet code letter
+    /// to its facet. `F` and `E` each denote a filtered *family*
+    /// (indices + distances share the code); they resolve to the
+    /// indices member, the family's primary facet. `None` for letters
+    /// that aren't facet codes.
+    ///
+    /// This is user-input vocabulary (filters, pickers). The loader
+    /// path canonicalizes via [`resolve_standard_key`], which
+    /// deliberately does NOT consume single letters — a custom facet
+    /// literally keyed `"B"` in a dataset.yaml is left alone.
+    pub fn from_code(code: char) -> Option<Self> {
+        match code {
+            'B' => Some(Self::BaseVectors),
+            'Q' => Some(Self::QueryVectors),
+            'G' => Some(Self::NeighborIndices),
+            'D' => Some(Self::NeighborDistances),
+            'M' => Some(Self::MetadataContent),
+            'P' => Some(Self::MetadataPredicates),
+            'R' => Some(Self::MetadataResults),
+            'F' => Some(Self::PrefilteredNeighborIndices),
+            'E' => Some(Self::PostfilteredNeighborIndices),
+            _ => None,
+        }
+    }
+
     /// The value-shape(s) this facet's bytes may legitimately take. The
     /// authority for "can facet X be stored as format Y?".
     pub fn formats(self) -> &'static [FacetFormat] {

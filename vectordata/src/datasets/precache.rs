@@ -29,8 +29,8 @@
 
 use std::path::Path;
 
+use super::build_sources;
 use crate::catalog::resolver::Catalog;
-use crate::catalog::sources::CatalogSources;
 use crate::{PrebufferProgress, TestDataView};
 
 /// Entry point.
@@ -212,19 +212,6 @@ fn resolve_spec(
         }
     let name = entry.name.clone();
     Some((Resolved::CatalogEntry { catalog, name }, profile_sel))
-}
-
-fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> CatalogSources {
-    let mut sources = CatalogSources::new();
-    if !at.is_empty() {
-        sources = sources.add_catalogs(at);
-    } else {
-        sources = sources.configure(configdir);
-        if !extra_catalogs.is_empty() {
-            sources = sources.add_catalogs(extra_catalogs);
-        }
-    }
-    sources
 }
 
 // ─── Drivers ─────────────────────────────────────────────────────────

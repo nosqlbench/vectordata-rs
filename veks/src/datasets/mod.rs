@@ -73,7 +73,7 @@ pub enum DatasetsCommand {
         // -- Filter predicates --
 
         /// Filter by dataset name (exact match, substring, regex, or glob)
-        #[arg(long)]
+        #[arg(long, short = 'd')]
         dataset: Option<String>,
 
         /// Filter by dataset name (substring, regex, or glob) — alias for --dataset
@@ -93,16 +93,16 @@ pub enum DatasetsCommand {
         matching_desc: Option<String>,
 
         /// Filter: dataset has at least this many base vectors (supports K/M/B suffixes)
-        #[arg(long = "with-min-size")]
-        min_size: Option<String>,
+        #[arg(long = "with-min-count")]
+        min_count: Option<String>,
 
         /// Filter: dataset has at most this many base vectors (supports K/M/B suffixes)
-        #[arg(long = "with-max-size")]
-        max_size: Option<String>,
+        #[arg(long = "with-max-count")]
+        max_count: Option<String>,
 
         /// Filter: dataset has exactly this many base vectors (supports K/M/B suffixes)
-        #[arg(long = "with-size")]
-        size: Option<String>,
+        #[arg(long = "with-count", conflicts_with_all = ["min_count", "max_count"])]
+        count: Option<String>,
 
         /// Filter: minimum dimensionality of base vectors
         #[arg(long = "with-min-dim")]
@@ -113,7 +113,7 @@ pub enum DatasetsCommand {
         max_dim: Option<u32>,
 
         /// Filter: exact dimensionality of base vectors
-        #[arg(long = "with-dim")]
+        #[arg(long = "with-dim", conflicts_with_all = ["min_dim", "max_dim"])]
         dim: Option<u32>,
 
         /// Filter: vector data type (float32, float16, uint8, int32, numpy, hdf5)
@@ -121,12 +121,16 @@ pub enum DatasetsCommand {
         vtype: Option<String>,
 
         /// Filter: minimum total data size in bytes (supports K/M/G/T suffixes)
-        #[arg(long = "with-data-min")]
-        data_min: Option<String>,
+        #[arg(long = "with-min-data")]
+        min_data: Option<String>,
 
         /// Filter: maximum total data size in bytes (supports K/M/G/T suffixes)
-        #[arg(long = "with-data-max")]
-        data_max: Option<String>,
+        #[arg(long = "with-max-data")]
+        max_data: Option<String>,
+
+        /// Filter: exact total data size in bytes (supports K/M/G/T suffixes)
+        #[arg(long = "with-data", conflicts_with_all = ["min_data", "max_data"])]
+        data: Option<String>,
 
         /// List locally cached datasets instead of catalog entries
         #[arg(long)]
@@ -155,7 +159,7 @@ pub enum DatasetsCommand {
     /// Show cache status for a dataset (merkle coverage, sizes, completion)
     CacheStatus {
         /// Dataset name from catalog (omit with --all for all cached datasets)
-        #[arg(long)]
+        #[arg(long, short = 'd')]
         dataset: Option<String>,
 
         /// Show status for all cached datasets
@@ -191,7 +195,7 @@ pub enum DatasetsCommand {
         at: Vec<String>,
 
         /// Dataset name within the catalog
-        #[arg(long)]
+        #[arg(long, short = 'd')]
         dataset: String,
 
         /// Profile to ping (default: "default")
@@ -236,7 +240,7 @@ pub enum DatasetsCommand {
         /// `dataset.yaml`, path to a `dataset.yaml` file, or HTTPS URL.
         /// Local directories take a fast path that bypasses the
         /// runtime cache + access layer entirely.
-        #[arg(long)]
+        #[arg(long, short = 'd')]
         dataset: String,
 
         /// Profile to derive. Required.
@@ -271,7 +275,7 @@ pub enum DatasetsCommand {
     /// Download and cache dataset facets locally
     Precache {
         /// Dataset name or dataset:profile from catalog
-        #[arg(long)]
+        #[arg(long, short = 'd')]
         dataset: String,
 
         /// Profile name (overrides profile in dataset:profile)
@@ -368,15 +372,16 @@ pub fn run(args: DatasetsArgs) {
             matching_desc,
             matching_profile,
             select,
-            min_size,
-            max_size,
-            size,
+            min_count,
+            max_count,
+            count,
             min_dim,
             max_dim,
             dim,
             vtype,
-            data_min,
-            data_max,
+            min_data,
+            max_data,
+            data,
             cached,
             cache_dir,
         } => {
@@ -398,20 +403,22 @@ pub fn run(args: DatasetsArgs) {
                 facet,
                 metric,
                 desc,
-                min_size: min_size.as_deref().map(filter::parse_size).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-min-size: {}", e); std::process::exit(1); }),
-                max_size: max_size.as_deref().map(filter::parse_size).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-max-size: {}", e); std::process::exit(1); }),
-                size: size.as_deref().map(filter::parse_size).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-size: {}", e); std::process::exit(1); }),
+                min_count: min_count.as_deref().map(filter::parse_size).transpose()
+                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-min-count: {}", e); std::process::exit(1); }),
+                max_count: max_count.as_deref().map(filter::parse_size).transpose()
+                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-max-count: {}", e); std::process::exit(1); }),
+                count: count.as_deref().map(filter::parse_size).transpose()
+                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-count: {}", e); std::process::exit(1); }),
                 min_dim,
                 max_dim,
                 dim,
                 vtype,
-                data_min: data_min.as_deref().map(filter::parse_bytes).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-data-min: {}", e); std::process::exit(1); }),
-                data_max: data_max.as_deref().map(filter::parse_bytes).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-data-max: {}", e); std::process::exit(1); }),
+                min_data: min_data.as_deref().map(filter::parse_bytes).transpose()
+                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-min-data: {}", e); std::process::exit(1); }),
+                max_data: max_data.as_deref().map(filter::parse_bytes).transpose()
+                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-max-data: {}", e); std::process::exit(1); }),
+                data: data.as_deref().map(filter::parse_bytes_with_unit).transpose()
+                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-data: {}", e); std::process::exit(1); }),
             };
             let profile_view = filter::ProfileView::new(profile_pat);
             list::run(&configdir, &catalog, &at, &output_format, verbose, group_by.as_deref(), &filter, &profile_view, select.as_deref());
@@ -563,24 +570,12 @@ fn run_config_command(command: ConfigSubcommand) {
     if code != 0 { std::process::exit(code); }
 }
 
-/// Completer for `--catalog`: suggests configured catalog sources from catalogs.yaml.
-/// Completer for `--catalog`: suggests numbered shortcuts for configured
-/// Resolve a `--catalog` value: if it's a number, look up the configured
-/// catalog by index (1-based). Otherwise use it as a literal URL/path.
-pub fn resolve_catalog_value(value: &str) -> String {
-    if let Ok(n) = value.parse::<usize>() {
-        if n >= 1 {
-            let config_dir = crate::catalog::sources::expand_tilde(
-                crate::catalog::sources::DEFAULT_CONFIG_DIR,
-            );
-            let entries = crate::catalog::sources::raw_catalog_entries(&config_dir);
-            if let Some(url) = entries.get(n - 1) {
-                return url.clone();
-            }
-        }
-        eprintln!("Error: catalog #{} not found. Use 'veks datasets config catalog list' to see available catalogs.", value);
-        std::process::exit(1);
-    }
-    value.to_string()
-}
+/// Resolve a `--at`/`--catalog` value: a positive integer is a
+/// 1-based index into the configured catalog list, anything else a
+/// literal URL/path. Canonical implementation lives with the catalog
+/// sources in vectordata (it also honors `$VECTORDATA_HOME`, which
+/// the old veks-local copy did not); the shared `datasets` run paths
+/// resolve again idempotently, so dispatch-side use here is belt and
+/// braces, not load-bearing.
+pub use vectordata::catalog::sources::resolve_catalog_value;
 

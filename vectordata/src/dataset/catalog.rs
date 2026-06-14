@@ -111,6 +111,34 @@ impl CatalogEntry {
         }
     }
 
+    /// Resolve a facet view's raw source path to an absolute URL/path
+    /// to read. Window notation (`base.fvec[0..1M)`) is stripped, an
+    /// already-absolute source (`http(s)://`, `s3://`, `file://`, or a
+    /// leading `/`) passes through, and a relative source is joined
+    /// against [`Self::dataset_home_url`] — the single authority for
+    /// the dataset's home location. `None` for an empty source.
+    ///
+    /// This is the one resolver the picker's facet probes, `ping`, and
+    /// the `datasets list` filter/completion probes all go through, so
+    /// a `dataset.yaml`-shaped catalog (relative facet paths) resolves
+    /// the same everywhere instead of a raw relative string being
+    /// mistaken for a local file.
+    pub fn resolve_facet_url(&self, raw_path: &str) -> Option<String> {
+        let raw = strip_window_suffix(raw_path);
+        if raw.is_empty() {
+            return None;
+        }
+        if raw.starts_with("http://")
+            || raw.starts_with("https://")
+            || raw.starts_with("s3://")
+            || raw.starts_with("file://")
+            || raw.starts_with('/')
+        {
+            return Some(raw.to_string());
+        }
+        Some(format!("{}{}", self.dataset_home_url(), raw))
+    }
+
     /// Returns view names from the default profile (convenience accessor).
     pub fn view_names(&self) -> Vec<&str> {
         self.layout.profiles.view_names()
@@ -124,6 +152,17 @@ impl CatalogEntry {
     /// Returns profile names.
     pub fn profile_names(&self) -> Vec<&str> {
         self.layout.profiles.profile_names()
+    }
+}
+
+/// Strip a window notation (`[lo..hi)` or `(lo..hi]`) from a source
+/// path, returning just the underlying file path. Source strings in
+/// `dataset.yaml` use these brackets to denote subranges of a shared
+/// base file (e.g. `base.fvec[0..1000000)`).
+pub(crate) fn strip_window_suffix(source_path: &str) -> &str {
+    match source_path.find(['[', '(']) {
+        Some(bracket) => &source_path[..bracket],
+        None => source_path,
     }
 }
 
@@ -164,6 +203,37 @@ pub fn find_catalog(dir: &Path) -> Option<Result<Vec<CatalogEntry>, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_facet_url_joins_relative_against_home() {
+        // A dataset.yaml-shaped entry: the facet source is relative to
+        // the dataset.yaml's directory. Resolution must produce the
+        // absolute URL the probe reads — the bug was a bare relative
+        // string being treated as a local file.
+        let json = r#"[{"name":"sift1m",
+            "path":"https://host/bucket/sift1m/dataset.yaml",
+            "dataset_type":"dataset.yaml",
+            "layout":{"profiles":{"default":{
+                "base_vectors":"profiles/base/base_vectors.fvecs"}}}}]"#;
+        let e: Vec<CatalogEntry> = serde_json::from_str(json).unwrap();
+        let e = &e[0];
+        assert_eq!(
+            e.resolve_facet_url("profiles/base/base_vectors.fvecs").as_deref(),
+            Some("https://host/bucket/sift1m/profiles/base/base_vectors.fvecs")
+        );
+        // Window suffix is stripped before joining.
+        assert_eq!(
+            e.resolve_facet_url("profiles/base/base_vectors.fvecs[0..1000)").as_deref(),
+            Some("https://host/bucket/sift1m/profiles/base/base_vectors.fvecs")
+        );
+        // Already-absolute sources pass through unchanged (knn_entries
+        // catalogs pre-resolve their facet paths this way).
+        assert_eq!(
+            e.resolve_facet_url("s3://other/x.fvecs").as_deref(),
+            Some("s3://other/x.fvecs")
+        );
+        assert_eq!(e.resolve_facet_url("").as_deref(), None);
+    }
 
     #[test]
     fn test_roundtrip_json() {

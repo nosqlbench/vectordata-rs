@@ -52,6 +52,14 @@ pub struct OptionDef {
     /// Help text. Part of the shared definition so the same option reads the
     /// same everywhere.
     pub help: Option<String>,
+    /// Long tokens (with dashes) of options this one cannot be combined
+    /// with — e.g. an exact `--with-dim` conflicts with the
+    /// `--with-min-dim`/`--with-max-dim` range pair. Declaring on one
+    /// side is enough: the completion bridge and the parser both
+    /// symmetrize. A conflicting flag is withheld from tab-completion
+    /// once its counterpart is on the line, and the pair is rejected
+    /// at parse time.
+    pub conflicts_with: Vec<String>,
 }
 
 impl OptionDef {
@@ -64,6 +72,7 @@ impl OptionDef {
             multiple: false,
             value_name: None,
             help: None,
+            conflicts_with: Vec::new(),
         }
     }
 
@@ -76,7 +85,20 @@ impl OptionDef {
             multiple: false,
             value_name: None,
             help: None,
+            conflicts_with: Vec::new(),
         }
+    }
+
+    /// Declare options this one cannot be combined with, by long
+    /// token (with dashes). One-sided declaration suffices — see the
+    /// field docs on [`OptionDef::conflicts_with`].
+    pub fn conflicts_with(mut self, others: &[&str]) -> Self {
+        for o in others {
+            if !self.conflicts_with.iter().any(|c| c == o) {
+                self.conflicts_with.push((*o).to_string());
+            }
+        }
+        self
     }
 
     pub fn short(mut self, c: char) -> Self {
@@ -160,8 +182,11 @@ pub trait CommandOption {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OptionConflict {
     pub name: String,
-    pub existing: OptionDef,
-    pub attempted: OptionDef,
+    // Boxed: OptionDef carries several owned collections, and this
+    // error rides in `Result` return slots — keep the Err variant
+    // pointer-sized rather than inflating every call frame.
+    pub existing: Box<OptionDef>,
+    pub attempted: Box<OptionDef>,
 }
 
 impl std::fmt::Display for OptionConflict {
@@ -202,8 +227,8 @@ impl OptionRegistry {
         match self.defs.get(&def.name) {
             Some(existing) if existing != def => Err(OptionConflict {
                 name: def.name.clone(),
-                existing: existing.clone(),
-                attempted: def.clone(),
+                existing: Box::new(existing.clone()),
+                attempted: Box::new(def.clone()),
             }),
             Some(_) => Ok(()),
             None => {

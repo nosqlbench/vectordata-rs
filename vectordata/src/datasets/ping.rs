@@ -47,13 +47,14 @@ pub fn run_args(args: PingArgs, configdir: &str, catalog: &[String], at_extra: &
     let sources = if let Some(at) = args.at {
         // --at pins ping to a single catalog source. The user is
         // saying "verify the dataset *here*", so don't expand back
-        // out to every configured catalog.
-        CatalogSources::new().add_catalogs(&[at])
+        // out to every configured catalog. Numbered shortcuts
+        // (`--at 2`) resolve against the configured list.
+        CatalogSources::new().add_catalogs(&[crate::catalog::sources::resolve_catalog_value(&at)])
     } else {
         CatalogSources::new()
             .configure(configdir)
-            .add_catalogs(catalog)
-            .add_catalogs(at_extra)
+            .add_catalogs(&crate::catalog::sources::resolve_catalog_values(catalog))
+            .add_catalogs(&crate::catalog::sources::resolve_catalog_values(at_extra))
     };
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");

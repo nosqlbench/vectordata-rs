@@ -415,6 +415,11 @@ pub struct Node {
     flag_long_help: BTreeMap<String, String>,
     /// Dynamic value providers keyed by flag name.
     value_providers: BTreeMap<String, ValueProvider>,
+    /// Mutual-exclusion sets: flag → flags it cannot be combined
+    /// with. Symmetric by construction (the completion bridge
+    /// registers both directions). A flag whose conflict is already
+    /// on the line is withheld from completion.
+    flag_conflicts: BTreeMap<String, Vec<String>>,
     /// How many positional slots this command's provider serves.
     /// 1 (the default) preserves the original first-positional-only
     /// behavior; a command like `config set <key> <value>` sets 2
@@ -897,6 +902,19 @@ impl Node {
     /// Attach a value provider to one of this node's flags.
     pub fn with_value_provider(mut self, flag: &str, provider: ValueProvider) -> Self {
         self.value_providers.insert(flag.to_string(), provider);
+        self
+    }
+
+    /// Declare that `flag` cannot be combined with `conflicts` —
+    /// once `conflicts` is on the line, `flag` is withheld from
+    /// completion. One direction only; callers wanting symmetric
+    /// exclusion (the normal case — see
+    /// [`cli::build_completion_tree`]) register both directions.
+    pub fn with_flag_conflict(mut self, flag: &str, conflicts: &str) -> Self {
+        let entry = self.flag_conflicts.entry(flag.to_string()).or_default();
+        if !entry.iter().any(|c| c == conflicts) {
+            entry.push(conflicts.to_string());
+        }
         self
     }
 
@@ -1556,6 +1574,21 @@ fn is_consumed(option: &str, consumed: &std::collections::HashSet<String>) -> bo
     consumed.contains(key)
 }
 
+/// True when any flag that `flag` conflicts with is already on the
+/// line — `flag` is then withheld from completion. Conflicting flags
+/// match in any spelling `word_matches_option` understands plus
+/// registered short aliases.
+fn conflict_on_line(node: &Node, flag: &str, remaining: &[&str]) -> bool {
+    let Some(conflicts) = node.flag_conflicts.get(flag) else {
+        return false;
+    };
+    conflicts.iter().any(|c| {
+        remaining.iter().any(|w| {
+            word_matches_option(w, c) || node.resolve_flag_token(w) == Some(c.as_str())
+        })
+    })
+}
+
 /// Compute completion candidates for the given input words.
 ///
 /// Options already present on the command line are excluded. Both
@@ -1679,17 +1712,7 @@ pub fn complete_rotating_with_raw(
     // modulo-by-max-children version) so the provider can layer
     // its own output by tap (e.g., metricsql shows metric names
     // at tap 1 and adds inner functions at tap 2).
-    let mut subtree_node = &tree.root;
-    let mut has_subtree = subtree_node.subtree_provider().is_some();
-    for &word in completed {
-        if let Some(child) = subtree_node.child(word) {
-            subtree_node = child;
-            if subtree_node.subtree_provider().is_some() {
-                has_subtree = true;
-            }
-        } else { break; }
-    }
-    if has_subtree {
+    if path_has_subtree_provider(tree, completed) {
         return complete_at_tap_with_raw(tree, words, tap_count, raw_line, cursor_offset);
     }
 
@@ -1907,7 +1930,10 @@ pub fn complete_at_tap_with_raw(
         }
         let consumed = consumed_keys(remaining, &all_flags);
         for f in &all_flags {
-            if f.starts_with(partial) && !is_consumed(f, &consumed) {
+            if f.starts_with(partial)
+                && !is_consumed(f, &consumed)
+                && !conflict_on_line(node, f, remaining)
+            {
                 flag_candidates.push(f.clone());
             }
         }
@@ -1967,6 +1993,77 @@ fn positionals_entered(
         i += 1;
     }
     count
+}
+
+/// True when any node on the path resolved by `completed` (including
+/// the root itself) carries a [`SubtreeProvider`]. Resolution stops at
+/// the first word that isn't a known child — same walk the completion
+/// engine performs.
+pub(crate) fn path_has_subtree_provider(tree: &CommandTree, completed: &[&str]) -> bool {
+    let mut node = &tree.root;
+    if node.subtree_provider().is_some() {
+        return true;
+    }
+    for &word in completed {
+        match node.child(word) {
+            Some(child) => {
+                node = child;
+                if node.subtree_provider().is_some() {
+                    return true;
+                }
+            }
+            None => break,
+        }
+    }
+    false
+}
+
+/// Convert semantic candidates into the exact bytes handed to bash.
+///
+/// The bash hook registers with a global `-o nospace` (see
+/// [`print_bash_script`]), so readline never appends a space — any
+/// trailing space must travel inside the candidate string itself.
+/// This is the engine's per-candidate spacing pass, applied at the
+/// emission boundary ([`handle_complete_env`] and the
+/// `---trace-completion` diagnostic) so the semantic [`complete`]
+/// family keeps returning bare words:
+///
+/// - Tree-walk candidates (subcommands, flags, value/positional
+///   provider output) are complete words — `TERMINAL` in the intent
+///   model of sysref §11.13 — and get a trailing space appended, so
+///   accepting `list` yields `list ` with the cursor ready for the
+///   next word.
+/// - Candidates ending in `=` (`cycles=`, `--mode=`) await their
+///   value and stay open — the cursor stays glued.
+/// - Candidates ending in `/` are path prefixes still being built
+///   and stay open.
+/// - When a [`SubtreeProvider`] sits anywhere on the resolved path,
+///   the whole candidate set is grammar-owned (`delta(`, `up{job=`,
+///   `[5m`) and passes through verbatim — the provider alone decides
+///   its spacing.
+///
+/// `words` has the same shape the completion engine takes: index 0
+/// is the binary name, the last entry is the (possibly empty) word
+/// under the cursor.
+pub fn shell_ready_candidates(
+    tree: &CommandTree,
+    words: &[&str],
+    candidates: Vec<String>,
+) -> Vec<String> {
+    let completed: &[&str] = if words.len() > 1 { &words[1..words.len() - 1] } else { &[] };
+    if path_has_subtree_provider(tree, completed) {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .map(|c| {
+            if c.is_empty() || c.ends_with([' ', '=', '/']) {
+                c
+            } else {
+                format!("{c} ")
+            }
+        })
+        .collect()
 }
 
 /// Supported shells for completion-script generation.
@@ -2183,10 +2280,16 @@ pub fn print_bash_script(app_name: &str) {
     //       ordering) — readline must not re-sort alphabetically.
     //
     //   `-o nospace`
-    //       Most engine candidates are mid-context inserts
-    //       (`delta(`, `up{`, `[5m`) — adding a trailing space
-    //       would put the cursor outside the context the user is
-    //       building. The user types their own space when done.
+    //       The ENGINE owns per-candidate spacing, not readline.
+    //       Grammar candidates (`delta(`, `up{`, `[5m`) are
+    //       mid-context inserts — a shell-appended space would put
+    //       the cursor outside the context the user is building.
+    //       Word-complete candidates (subcommands, flags, finished
+    //       values) instead carry their trailing space inside the
+    //       candidate bytes (see [`shell_ready_candidates`]), which
+    //       `IFS=$'\n'` preserves through the array expansion.
+    //       Global `-o nospace` + engine-side spaces is the only
+    //       way bash allows per-candidate control.
     //
     // Things deliberately NOT in the script:
     //   - `_COMP_SHELL_PID=$$`: engine reads it via `getppid()`.
@@ -2345,7 +2448,7 @@ pub const DIAGNOSTIC_FLAGS: &[&str] = &[
 /// | `---dump-tree` | — | Pretty-printed tree shape (children, flags, levels) |
 /// | `---list-providers` | — | Each path that has a `SubtreeProvider` attached |
 /// | `---validate` | — | Run `CommandTree::validate()`; exit non-zero if errors |
-/// | `---trace-completion` | `<line> <point>` | Run the completion engine on the synthetic input and print one candidate per line |
+/// | `---trace-completion` | `<line> <point>` | Run the completion engine on the synthetic input and print one candidate per line — byte-exact `COMPREPLY` content, including the trailing space on word-complete candidates |
 /// | `---trace-partial-parse` | `<line> <point>` | Print `PartialParse` state (raw_line, cursor, before/after, bracket_state, ident, trigger) |
 /// | `---metricsql-vocab` | — | Print built-in MetricsQL vocab (functions, time units, modifiers) |
 /// | `---metricsql-context` | `<line> <point>` | Same as `---trace-partial-parse` plus the values `metricsql_provider` would derive |
@@ -2397,14 +2500,9 @@ pub fn handle_diagnostic_args(app_name: &str, tree: &CommandTree) -> bool {
             }
         },
         "---trace-completion" => {
-            let (line_with_app, point_in_line) = synth_line_for_trace(app_name, &rest);
-            let (prior, cur) = split_line(&line_with_app, point_in_line);
-            let mut words_owned: Vec<String> = vec![app_name.to_string()];
-            words_owned.extend(prior);
-            words_owned.push(cur);
-            let words: Vec<&str> = words_owned.iter().map(|s| s.as_str()).collect();
-            let cands = complete_at_tap_with_raw(tree, &words, 1, &line_with_app, point_in_line);
-            for c in cands {
+            let user_line = rest.first().copied().unwrap_or("");
+            let user_point = rest.get(1).and_then(|s| s.parse().ok());
+            for c in trace_completion_candidates(app_name, tree, user_line, user_point) {
                 println!("{c}");
             }
         }
@@ -2441,14 +2539,48 @@ pub fn handle_diagnostic_args(app_name: &str, tree: &CommandTree) -> bool {
 /// engine sees the same shape it would from a real bash invocation.
 fn synth_line_for_trace(app_name: &str, rest: &[&str]) -> (String, usize) {
     let user_line = rest.first().copied().unwrap_or("");
-    let user_point: usize = rest.get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(user_line.len());
+    let user_point = rest.get(1).and_then(|s| s.parse().ok());
+    synth_line(app_name, user_line, user_point)
+}
+
+/// Core of [`synth_line_for_trace`] with the inputs already parsed:
+/// `user_line` is everything after the binary name, `user_point` the
+/// byte offset of the cursor within `user_line` (default: its end).
+fn synth_line(app_name: &str, user_line: &str, user_point: Option<usize>) -> (String, usize) {
+    let user_point = user_point.unwrap_or(user_line.len());
     let prefix_len = app_name.len() + 1; // "metricsql "
     (
         format!("{} {}", app_name, user_line),
         user_point + prefix_len,
     )
+}
+
+/// Pure core of the `---trace-completion` diagnostic: run the
+/// completion engine for `user_line` (the command line as typed
+/// AFTER the binary name, e.g. `"datasets li"`) with the cursor at
+/// byte offset `user_point` within it (default: end of line), and
+/// return exactly the lines the diagnostic prints.
+///
+/// The returned strings are the byte-exact candidates bash receives
+/// in `COMPREPLY` — including the trailing space that
+/// [`shell_ready_candidates`] bakes into word-complete candidates
+/// (the hook registers with a global `-o nospace`, so spacing lives
+/// in the candidate bytes). Unit tests call this directly instead of
+/// spawning a process or mutating `std::env`.
+pub fn trace_completion_candidates(
+    app_name: &str,
+    tree: &CommandTree,
+    user_line: &str,
+    user_point: Option<usize>,
+) -> Vec<String> {
+    let (line_with_app, point_in_line) = synth_line(app_name, user_line, user_point);
+    let (prior, cur) = split_line(&line_with_app, point_in_line);
+    let mut words_owned: Vec<String> = vec![app_name.to_string()];
+    words_owned.extend(prior);
+    words_owned.push(cur);
+    let words: Vec<&str> = words_owned.iter().map(|s| s.as_str()).collect();
+    let cands = complete_at_tap_with_raw(tree, &words, 1, &line_with_app, point_in_line);
+    shell_ready_candidates(tree, &words, cands)
 }
 
 /// Pretty-print the engine's view of a `PartialParse` for the
@@ -2728,7 +2860,10 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     // returns the same layer-1 set (no stratification visible).
     let candidates = complete_rotating_with_raw(tree, &words, tap_count, &line, point);
 
-    for candidate in candidates {
+    // Per-candidate spacing pass: the hook registers with a global
+    // `-o nospace`, so word-complete candidates must carry their
+    // trailing space inside the candidate bytes.
+    for candidate in shell_ready_candidates(tree, &words, candidates) {
         println!("{}", candidate);
     }
 
@@ -4197,5 +4332,100 @@ mod tests {
         let _tree = CommandTree::new("app")
             .require_metadata()
             .command("bad", Node::leaf(&[])); // missing both
+    }
+
+    // ---- shell emission: per-candidate trailing space ---------------
+    //
+    // The bash hook registers with a global `-o nospace`
+    // (print_bash_script), so readline never appends a space — any
+    // trailing space must travel inside the candidate bytes. These
+    // tests drive `trace_completion_candidates`, the pure surface
+    // behind the `---trace-completion` diagnostic, whose output is
+    // byte-identical to the COMPREPLY content handle_complete_env
+    // hands bash.
+
+    fn vd_like_tree() -> CommandTree {
+        CommandTree::new("vd")
+            .command("datasets", Node::group(vec![
+                ("list", Node::leaf(&[])),
+                ("fetch", Node::leaf(&[])),
+            ]))
+            .command("run", Node::leaf_with_flags(&["cycles="], &["--strict"]))
+    }
+
+    #[test]
+    fn trace_unique_subcommand_carries_trailing_space() {
+        // Repro: `vd datasets li<TAB>` used to complete to `list`
+        // with no trailing space, leaving the cursor glued to the
+        // word and forcing the user to type the space themselves.
+        let tree = vd_like_tree();
+        let cands = trace_completion_candidates("vd", &tree, "datasets li", None);
+        assert_eq!(cands, vec!["list ".to_string()],
+            "a uniquely-completed subcommand is TERMINAL and must carry its trailing space");
+    }
+
+    #[test]
+    fn trace_group_command_carries_trailing_space() {
+        let tree = vd_like_tree();
+        let cands = trace_completion_candidates("vd", &tree, "data", None);
+        assert_eq!(cands, vec!["datasets ".to_string()]);
+    }
+
+    #[test]
+    fn trace_flag_carries_trailing_space() {
+        let tree = vd_like_tree();
+        let cands = trace_completion_candidates("vd", &tree, "run --st", None);
+        assert_eq!(cands, vec!["--strict ".to_string()]);
+    }
+
+    #[test]
+    fn trace_key_eq_candidate_stays_open() {
+        // `cycles=` awaits its value — the cursor must stay glued
+        // to the `=`, so no trailing space.
+        let tree = vd_like_tree();
+        let cands = trace_completion_candidates("vd", &tree, "run cy", None);
+        assert_eq!(cands, vec!["cycles=".to_string()]);
+    }
+
+    #[test]
+    fn trace_sibling_prefix_candidates_all_carry_spaces() {
+        // Multiple matches: readline inserts the longest common
+        // prefix of COMPREPLY (`list `/`fetch ` share none beyond
+        // the menu), so trailing spaces on every entry are inert
+        // for prefix insertion and correct on final acceptance.
+        let tree = vd_like_tree();
+        let cands = trace_completion_candidates("vd", &tree, "datasets ", None);
+        assert_eq!(cands, vec!["fetch ".to_string(), "list ".to_string()]);
+    }
+
+    #[test]
+    fn trace_subtree_provider_output_is_verbatim() {
+        // Grammar providers own their spacing: mid-context inserts
+        // like `delta(` must pass through with no space appended.
+        let provider: SubtreeProvider = std::sync::Arc::new(|pp: &PartialParse| {
+            vec![format!("{}delta(", pp.partial)]
+        });
+        let tree = CommandTree::new("vd")
+            .command("query", Node::leaf(&[]).with_subtree_provider(provider));
+        let cands = trace_completion_candidates("vd", &tree, "query del", None);
+        assert_eq!(cands, vec!["deldelta(".to_string()],
+            "subtree-provider candidates are grammar-owned and must not be space-suffixed");
+    }
+
+    #[test]
+    fn shell_ready_keeps_open_endings_glued() {
+        // Direct contract check on the finalization pass: `=` and
+        // `/` endings stay open, complete words get the space.
+        let tree = vd_like_tree();
+        let out = shell_ready_candidates(
+            &tree,
+            &["vd", "run", ""],
+            vec!["sub/".into(), "key=".into(), "word".into()],
+        );
+        assert_eq!(out, vec![
+            "sub/".to_string(),
+            "key=".to_string(),
+            "word ".to_string(),
+        ]);
     }
 }

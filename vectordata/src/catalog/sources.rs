@@ -137,6 +137,48 @@ pub fn raw_catalog_entries(config_dir: &str) -> Vec<String> {
     named_catalog_entries(config_dir).into_iter().map(|n| n.location).collect()
 }
 
+/// Pure core of the numbered catalog shortcut (`--at 2` → second
+/// configured catalog). `None` when `value` isn't a positive integer
+/// (it's a literal URL/path); `Some(Ok(url))` when the 1-based index
+/// resolves against `configured`; `Some(Err(n))` when the index is
+/// out of range.
+pub fn lookup_catalog_index(value: &str, configured: &[String]) -> Option<Result<String, usize>> {
+    let n: usize = value.parse().ok().filter(|n| *n >= 1)?;
+    Some(configured.get(n - 1).cloned().ok_or(n))
+}
+
+/// Resolve a `--at`/`--catalog` value for command execution: a
+/// positive integer is a 1-based index into the configured catalog
+/// list (see `config catalog list`); anything else passes through as
+/// a literal URL/path. Exits with an error on an out-of-range index —
+/// this is a CLI-boundary helper for the `datasets` command family,
+/// shared by every binary that dispatches into it.
+///
+/// Idempotent: resolving an already-resolved URL is a no-op, so
+/// callers layered above (e.g. binary dispatch arms) may resolve
+/// early without harm.
+pub fn resolve_catalog_value(value: &str) -> String {
+    let configured = raw_catalog_entries(&config_dir());
+    match lookup_catalog_index(value, &configured) {
+        None => value.to_string(),
+        Some(Ok(url)) => url,
+        Some(Err(n)) => {
+            eprintln!(
+                "Error: catalog #{n} not found; list configured catalogs with \
+                 the `config catalog list` subcommand."
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// [`resolve_catalog_value`] over a slice — the seam the shared
+/// `datasets` run paths use so numbered shortcuts work identically
+/// from every binary.
+pub fn resolve_catalog_values(values: &[String]) -> Vec<String> {
+    values.iter().map(|v| resolve_catalog_value(v)).collect()
+}
+
 /// A configured catalog source: symbolic name + location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedCatalogSource {
@@ -413,6 +455,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn catalog_index_lookup_rules() {
+        let configured = vec!["https://a/".to_string(), "https://b/".to_string()];
+        assert_eq!(lookup_catalog_index("https://a/", &configured), None);
+        assert_eq!(lookup_catalog_index("0", &configured), None);
+        assert_eq!(lookup_catalog_index("1", &configured), Some(Ok("https://a/".to_string())));
+        assert_eq!(lookup_catalog_index("3", &configured), Some(Err(3)));
+    }
 
     #[test]
     fn test_expand_tilde() {
