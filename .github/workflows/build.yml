@@ -45,18 +45,36 @@ on:
       - 'v*'
       - 'vectordata@*'
       - 'veks@*'
+      - 'veks-completion@*'
+      - 'veks-completion-derive@*'
       - 'veks-pipeline@*'
       - 'veks-core@*'
       - 'veks-anode@*'
       - 'slabtastic@*'
   pull_request:
+  # Manual trigger. Pass `tag` to build that tag's code and (re)publish
+  # its GitHub Release — the reliable fallback for when an automatic
+  # `v*` tag push produced no Release. GitHub drops the push event for
+  # ALL tags when more than three are pushed at once (`cargo ws release`
+  # pushes one `<crate>@<ver>` tag per changed crate plus `v<ver>`), so
+  # once the workspace had >3 release tags the tag-triggered run — and
+  # thus the Release — silently stopped firing. Dispatching with the
+  # `v<ver>` tag here rebuilds and releases it without that limit. Leave
+  # `tag` empty to just build the default branch.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'v<version> tag to build and (re)publish a GitHub Release for (e.g. v1.6.1); empty = build only'
+        required: false
+        type: string
 
 # Cancel superseded runs on the same branch / PR. Tag pushes keep
-# running uniquely (each tag is its own ref).
+# running uniquely (each tag is its own ref). A manual release
+# dispatch (ref is the branch, but `tag` is set) must also keep
+# running so a later `main` push can't cancel an in-flight release.
 concurrency:
-  group: build-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+  group: build-${{ github.workflow }}-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') && github.event.inputs.tag == '' }}
 
 permissions:
   contents: read
@@ -94,6 +112,12 @@ jobs:
             exe_suffix: ".exe"
     steps:
       - uses: actions/checkout@v6
+        with:
+          # On a tag-targeted manual dispatch, build that tag's code —
+          # not the branch the workflow file lives on. Empty/absent
+          # input (push, PR, plain dispatch) falls back to the
+          # triggering ref.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       # ─── Linux deps:
       #   - `musl-tools` provides `musl-gcc`, which `cc-rs` uses when
@@ -275,8 +299,11 @@ jobs:
     # The `!contains('@')` guard distinguishes `refs/tags/v1.2.1`
     # (publish) from `refs/tags/vectordata@1.2.1` (build only) —
     # both start with `refs/tags/v` so the `startsWith` alone
-    # isn't enough.
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '@')
+    # isn't enough. The second clause is the manual fallback: a
+    # `workflow_dispatch` carrying a `tag` input publishes that tag.
+    if: >-
+      (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '@'))
+      || github.event.inputs.tag != ''
     permissions:
       contents: write
     steps:
@@ -317,8 +344,11 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IS_PRERELEASE: ${{ contains(github.ref_name, '-') }}
-          TAG: ${{ github.ref_name }}
+          # On manual dispatch `github.ref_name` is the branch, so the
+          # release tag comes from the `tag` input; on a tag push it is
+          # the pushed tag. Pre-release status follows a `-` in the tag.
+          IS_PRERELEASE: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
           REPO: ${{ github.repository }}
         shell: bash
         run: |
