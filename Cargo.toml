@@ -14,6 +14,26 @@ members = [
 ]
 resolver = "3"
 
+# cargo-workspaces (`cargo ws version` / `cargo ws publish`) release config.
+#
+#   allow_branch = "main"
+#     We release from `main`; cargo-workspaces defaults to `master` and
+#     would otherwise refuse (or need `--allow-branch main` every time).
+#
+#   no_individual_tags = true
+#     Create ONLY the global `v<version>` tag, not a `<crate>@<version>`
+#     tag per changed crate. This is load-bearing for releases: GitHub
+#     fires NO push events when more than three tags are pushed at once,
+#     and a multi-crate bump pushed 4–6 tags together — silently
+#     swallowing the `v<version>` push so the release workflow never ran
+#     (v1.6.0 and v1.6.1 shipped no GitHub Release for this reason). One
+#     tag per push stays under the limit, so the `v*` push reliably
+#     triggers `.github/workflows/build.yml`. (That workflow also keeps a
+#     `workflow_dispatch` fallback for re-publishing any tag by hand.)
+[workspace.metadata.workspaces]
+allow_branch = "main"
+no_individual_tags = true
+
 # Workspace lint policy. Member crates opt in via `[lints] workspace = true`.
 [workspace.lints.clippy]
 # This codebase is dense with SIMD/BLAS-style numeric kernels that
