@@ -194,6 +194,26 @@ jobs:
             --target ${{ matrix.target }} \
             --no-default-features
 
+      # ─── Build the `vecd` daemon in release mode — Linux only.
+      # vecd's lifecycle (`start`/`stop`/`status`) self-daemonizes via
+      # Unix fork/setsid/dup2; the `cfg(not(unix))` arms compile but a
+      # background daemon is a Unix concept, so we ship it for Linux
+      # targets only (no macOS / Windows asset). It pulls the
+      # `vectordata` library with default features off (push core only,
+      # no clap/explore) and rusqlite's bundled SQLite, so it needs the
+      # same musl-gcc shim as the other crates. Default features ([]),
+      # so no extra `--features`.
+      - name: Build vecd (release, Linux only)
+        if: matrix.os == 'linux'
+        shell: bash
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          set -euo pipefail
+          cargo build --release -p vecd \
+            --target ${{ matrix.target }}
+
       # ─── Run vectordata's own tests against the target. cargo
       # test routes to a native or cross-built test runner based on
       # the target triple; our matrix uses native runners only, so
@@ -225,7 +245,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for name in vectordata veks; do
+          names="vectordata veks"
+          # vecd is a Linux-only asset (see its build step).
+          [ "${{ matrix.os }}" = "linux" ] && names="$names vecd"
+          for name in $names; do
             bin_path="target/${{ matrix.target }}/release/${name}${{ matrix.exe_suffix }}"
             "$bin_path" --version
           done
@@ -240,7 +263,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for name in vectordata veks; do
+          names="vectordata veks"
+          [ "${{ matrix.os }}" = "linux" ] && names="$names vecd"
+          for name in $names; do
             bin_path="target/${{ matrix.target }}/release/${name}${{ matrix.exe_suffix }}"
             echo "── $name ──"
             file "$bin_path"
@@ -271,6 +296,15 @@ jobs:
         with:
           name: veks-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/veks${{ matrix.exe_suffix }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload vecd binary
+        if: matrix.os == 'linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: vecd-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/vecd${{ matrix.exe_suffix }}
           if-no-files-found: error
           retention-days: 14
 
@@ -310,12 +344,12 @@ jobs:
       - name: Download per-target binary artifacts
         # @v8 is required to read artifacts produced by
         # actions/upload-artifact@v7 (v7 uploads zipped; v8 download
-        # unzips by default). Two artifacts per platform — vectordata
-        # and veks — pulled by globbing both name prefixes.
+        # unzips by default). vectordata + veks on every platform, plus
+        # vecd on Linux only — pulled by globbing all three prefixes.
         uses: actions/download-artifact@v8
         with:
           path: artifacts
-          pattern: '{vectordata,veks}-*'
+          pattern: '{vectordata,veks,vecd}-*'
 
       - name: Stage release assets
         shell: bash
@@ -360,17 +394,21 @@ jobs:
 
           Self-contained per-platform binaries — no archive, no install step.
 
-          | Platform | `vectordata` | `veks` |
-          | --- | --- | --- |
-          | Linux amd64 | `vectordata-x86_64-unknown-linux-musl` | `veks-x86_64-unknown-linux-musl` |
-          | Linux arm64 | `vectordata-aarch64-unknown-linux-musl` | `veks-aarch64-unknown-linux-musl` |
-          | macOS Apple Silicon | `vectordata-aarch64-apple-darwin` | `veks-aarch64-apple-darwin` |
-          | Windows amd64 | `vectordata-x86_64-pc-windows-msvc.exe` | `veks-x86_64-pc-windows-msvc.exe` |
+          | Platform | `vectordata` | `veks` | `vecd` |
+          | --- | --- | --- | --- |
+          | Linux amd64 | `vectordata-x86_64-unknown-linux-musl` | `veks-x86_64-unknown-linux-musl` | `vecd-x86_64-unknown-linux-musl` |
+          | Linux arm64 | `vectordata-aarch64-unknown-linux-musl` | `veks-aarch64-unknown-linux-musl` | `vecd-aarch64-unknown-linux-musl` |
+          | macOS Apple Silicon | `vectordata-aarch64-apple-darwin` | `veks-aarch64-apple-darwin` | — |
+          | Windows amd64 | `vectordata-x86_64-pc-windows-msvc.exe` | `veks-x86_64-pc-windows-msvc.exe` | — |
 
           The Linux binaries are statically linked against musl libc.
           They run on any Linux kernel ≥ 2.6.39 with no glibc
           dependency — Ubuntu, Debian, RHEL/CentOS, Alpine, Amazon
           Linux, etc.
+
+          `vecd` (the vectordata endpoint daemon) ships for Linux only —
+          its `start`/`stop`/`status` lifecycle self-daemonizes via Unix
+          fork/setsid, so there is no macOS or Windows asset.
 
           Verify with `SHA256SUMS`.
 

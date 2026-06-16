@@ -403,20 +403,29 @@ fn remove_catalog_entry(source: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
+// The palette/curve settings configure the `explore` TUI's
+// appearance, so the whole surface lives behind the `explore`
+// feature — its single authority for the name lists and defaults is
+// `crate::explore::palette`, which only compiles with that feature.
+// Library consumers without `explore` (e.g. `vecd`) don't see these.
+
 /// Canonical palette names for `config set palette` validation and
 /// tab-completion. Delegates to the palette module's single
 /// authority so the lists can't drift.
+#[cfg(feature = "explore")]
 pub fn ui_palette_names() -> Vec<&'static str> {
     crate::explore::palette::ALL_PALETTES.iter().map(|p| p.name()).collect()
 }
 
 /// Canonical curve names; see [`ui_palette_names`].
+#[cfg(feature = "explore")]
 pub fn ui_curve_names() -> Vec<&'static str> {
     crate::explore::palette::ALL_CURVES.iter().map(|c| c.name()).collect()
 }
 
 /// Print one UI setting (`palette` / `curve`): the configured value
 /// or the project standard when unset.
+#[cfg(feature = "explore")]
 pub fn get_ui_setting(key: &str) -> i32 {
     let standard = match key {
         "palette" => crate::explore::palette::Palette::default().name(),
@@ -432,6 +441,7 @@ pub fn get_ui_setting(key: &str) -> i32 {
 
 /// Validate and persist a UI setting (`palette` / `curve`) to
 /// `settings.yaml` via the comment-preserving line editor.
+#[cfg(feature = "explore")]
 pub fn set_ui_setting(key: &str, value: &str) -> i32 {
     let valid = match key {
         "palette" => ui_palette_names(),

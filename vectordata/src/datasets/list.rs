@@ -11,10 +11,8 @@
 //! 4. Display the aggregated dataset entries.
 
 use super::build_sources;
-use super::filter::{DatasetFilter, ProfileView};
-// The `filter::` free functions are only called from `cli`-gated arg parsing.
-#[cfg(feature = "cli")]
 use super::filter;
+use super::filter::{DatasetFilter, ProfileView};
 use crate::catalog::resolver::Catalog;
 use crate::dataset::CatalogEntry;
 
