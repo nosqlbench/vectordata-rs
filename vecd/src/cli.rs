@@ -122,6 +122,16 @@ pub enum Cmd {
         #[command(flatten)]
         serve: ServeArgs,
     },
+    /// Install or remove a systemd service for the gateway.
+    ///
+    /// `service install` writes a unit that runs `vecd serve`, enables
+    /// it, and sets `daemon_mode = systemd` — after which `start` /
+    /// `stop` / `status` / `restart` delegate to `systemctl` (with a
+    /// notice on stderr). `service uninstall` reverses it.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCmd,
+    },
     /// Manage users.
     Users {
         #[command(subcommand)]
@@ -381,6 +391,32 @@ pub enum ConfigCmd {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(veks_completion_derive::VeksCli)]
+pub enum ServiceCmd {
+    /// Write a systemd unit that runs `vecd serve`, enable it, and set
+    /// `daemon_mode = systemd`.
+    ///
+    ///   vecd service install              # write + enable + start (needs root)
+    ///   sudo vecd service install         # the usual form
+    ///   vecd service install --print      # emit the unit to stdout, change nothing
+    Install {
+        /// Print the unit to stdout and change nothing (no root needed).
+        #[arg(long)]
+        print: bool,
+        /// vecd binary the unit runs (default: this executable's path).
+        #[arg(long, value_name = "PATH")]
+        exec: Option<PathBuf>,
+        /// Install and enable the unit but don't start it now.
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Remove the systemd unit and revert `daemon_mode` to adhoc.
+    ///
+    /// Only meaningful once `service install` has set systemd mode —
+    /// refuses with a note when `daemon_mode` is still adhoc.
+    Uninstall,
 }
 
 #[derive(veks_completion_derive::VeksCli)]
@@ -866,33 +902,50 @@ fn dispatch(
         }
         Cmd::Logout { url } => cmd_logout(resolved, resolve_endpoint(resolved, url)?.as_str()),
         Cmd::Whoami { url } => cmd_client_whoami(resolved, resolve_endpoint(resolved, url)?.as_str()),
+        // `serve` is the foreground gateway the systemd unit itself
+        // execs — it must NEVER indirect, regardless of daemon_mode.
         Cmd::Serve { serve } => cmd_serve(data_dir, cfg, &serve),
-        Cmd::Start { serve } => {
-            let dd = data_dir.to_path_buf();
-            let cfg = cfg.clone();
-            crate::daemon::start(data_dir, move || match cmd_serve(&dd, &cfg, &serve) {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("vecd: {e}");
-                    e.exit_code()
-                }
-            })
-        }
-        Cmd::Stop => crate::daemon::stop(data_dir),
-        Cmd::Status => crate::daemon::status(data_dir),
-        Cmd::Restart { serve } => {
-            // Best-effort stop (ignore "not running"), then start.
-            let _ = crate::daemon::stop(data_dir);
-            let dd = data_dir.to_path_buf();
-            let cfg = cfg.clone();
-            crate::daemon::start(data_dir, move || match cmd_serve(&dd, &cfg, &serve) {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("vecd: {e}");
-                    e.exit_code()
-                }
-            })
-        }
+        Cmd::Service { command } => cmd_service(resolved, data_dir, command),
+        Cmd::Start { serve } => match cfg.daemon_mode() {
+            config::DaemonMode::Systemd => crate::service::delegate("start"),
+            config::DaemonMode::Adhoc => {
+                crate::service::refuse_if_systemd_active()?;
+                let dd = data_dir.to_path_buf();
+                let cfg = cfg.clone();
+                crate::daemon::start(data_dir, move || match cmd_serve(&dd, &cfg, &serve) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("vecd: {e}");
+                        e.exit_code()
+                    }
+                })
+            }
+        },
+        Cmd::Stop => match cfg.daemon_mode() {
+            config::DaemonMode::Systemd => crate::service::delegate("stop"),
+            config::DaemonMode::Adhoc => crate::daemon::stop(data_dir),
+        },
+        Cmd::Status => match cfg.daemon_mode() {
+            config::DaemonMode::Systemd => crate::service::delegate("status"),
+            config::DaemonMode::Adhoc => crate::daemon::status(data_dir),
+        },
+        Cmd::Restart { serve } => match cfg.daemon_mode() {
+            config::DaemonMode::Systemd => crate::service::delegate("restart"),
+            config::DaemonMode::Adhoc => {
+                crate::service::refuse_if_systemd_active()?;
+                // Best-effort stop (ignore "not running"), then start.
+                let _ = crate::daemon::stop(data_dir);
+                let dd = data_dir.to_path_buf();
+                let cfg = cfg.clone();
+                crate::daemon::start(data_dir, move || match cmd_serve(&dd, &cfg, &serve) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("vecd: {e}");
+                        e.exit_code()
+                    }
+                })
+            }
+        },
         Cmd::Users { command } => cmd_users(data_dir, cfg, command),
         Cmd::Tokens { command } => cmd_tokens(data_dir, cfg, command),
         Cmd::Roles { command } => cmd_roles(data_dir, cfg, command),
@@ -1089,6 +1142,34 @@ fn cmd_config(resolved: &config::Resolved, cmd: ConfigCmd) -> Result<(), VecdErr
         ConfigCmd::Get { param, out, format } => cmd_config_get(resolved, param, out, format),
         ConfigCmd::Set { param, value, from, force } => {
             cmd_config_set(resolved, param, value, from, force)
+        }
+    }
+}
+
+/// `vecd service …` — install/uninstall the systemd unit. `uninstall`
+/// is gated on `daemon_mode=systemd` (the "available only once
+/// installed" semantic): it refuses with a note when the mode is still
+/// adhoc, since there's nothing this command installed to remove.
+fn cmd_service(
+    resolved: &config::Resolved,
+    data_dir: &std::path::Path,
+    cmd: ServiceCmd,
+) -> Result<(), VecdError> {
+    match cmd {
+        ServiceCmd::Install { print, exec, no_start } => {
+            crate::service::install(resolved, data_dir, exec, print, no_start)
+        }
+        ServiceCmd::Uninstall => {
+            let cfg = config::Config::load(&resolved.dir)?;
+            if cfg.daemon_mode() != config::DaemonMode::Systemd {
+                return Err(VecdError::usage(
+                    "daemon_mode is adhoc — no systemd service installed by vecd to uninstall. \
+                     (`vecd service install` switches to systemd mode; if a unit was created \
+                     out-of-band, remove it with `systemctl disable --now vecd` and delete its \
+                     unit file.)",
+                ));
+            }
+            crate::service::uninstall(resolved)
         }
     }
 }

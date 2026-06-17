@@ -102,6 +102,48 @@ pub fn owners(partial: &str, ctx: &[&str]) -> Vec<String> {
     prefixed(names, partial)
 }
 
+/// The bare positional words already typed after a command path,
+/// skipping flags and the value consumed by `--from` (the only
+/// value-taking flag on `config set`). Used to tell the key slot
+/// from the value slot for `config set`/`config get`.
+fn config_positionals<'a>(ctx: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < ctx.len() {
+        let w = ctx[i];
+        if w == "--from" {
+            i += 2; // skip the flag and its value
+            continue;
+        }
+        if w.starts_with('-') {
+            i += 1; // `--force`, `--from=…`, etc.
+            continue;
+        }
+        out.push(w);
+        i += 1;
+    }
+    out
+}
+
+/// Positional completion for `config set <key> [value]` and
+/// `config get <key>`: the recognized config keys
+/// ([`config::KNOWN_KEYS`]) at the key slot, and — for `config set` —
+/// the closed value set of a key that has one (`lock_config`: on/off)
+/// at the value slot. No DB access; purely the static schema.
+pub fn config_keys(partial: &str, ctx: &[&str]) -> Vec<String> {
+    let pos = config_positionals(ctx);
+    match pos.first() {
+        // Key slot: offer every known config parameter.
+        None => prefixed(config::KNOWN_KEYS.iter().map(|k| k.to_string()), partial),
+        // Value slot for the one key with a closed value set.
+        Some(&"lock_config") if pos.len() == 1 => {
+            prefixed(["on", "off"].iter().map(|s| s.to_string()), partial)
+        }
+        // Any other key's value is free-form (addresses, paths, sizes).
+        _ => Vec::new(),
+    }
+}
+
 /// A provider over a fixed set of valid values (enum-like flags).
 fn static_set(values: &'static [&'static str]) -> ValueProvider {
     std::sync::Arc::new(move |partial: &str, _: &[&str]| {
@@ -140,6 +182,8 @@ pub fn positional_resolvers() -> BTreeMap<String, ValueProvider> {
         ("ns remove".to_string(), fn_provider(namespaces)),
         ("users remove".to_string(), fn_provider(principals)),
         ("roles remove".to_string(), fn_provider(roles)),
+        ("config set".to_string(), fn_provider(config_keys)),
+        ("config get".to_string(), fn_provider(config_keys)),
     ])
 }
 
@@ -194,6 +238,8 @@ mod tests {
             ("ns", "remove"),
             ("users", "remove"),
             ("roles", "remove"),
+            ("config", "set"),
+            ("config", "get"),
         ];
         for (group, sub) in cases {
             let g = tree.root.child(group).unwrap_or_else(|| panic!("{group} group missing"));
@@ -203,5 +249,27 @@ mod tests {
                 "{group} {sub} should complete its positional"
             );
         }
+    }
+
+    /// `config set`/`config get` complete the key slot with the known
+    /// config parameters; the value slot completes a closed set only
+    /// for `lock_config`.
+    #[test]
+    fn config_keys_complete_param_then_value() {
+        // Key slot (no positional typed yet): every known key, prefix-filtered.
+        let all = config_keys("", &[]);
+        assert_eq!(all.len(), config::KNOWN_KEYS.len());
+        assert!(all.contains(&"bind".to_string()));
+        assert!(all.contains(&"lock_config".to_string()));
+        assert_eq!(config_keys("rate", &[]),
+            config::KNOWN_KEYS.iter().filter(|k| k.starts_with("rate"))
+                .map(|k| k.to_string()).collect::<Vec<_>>());
+
+        // Value slot: lock_config offers on/off; a free-form key offers nothing.
+        assert_eq!(config_keys("", &["lock_config"]), vec!["on".to_string(), "off".to_string()]);
+        assert!(config_keys("", &["bind"]).is_empty());
+
+        // `--from`'s value isn't mistaken for the key positional.
+        assert_eq!(config_keys("", &["--from", "cfg.json"]).len(), config::KNOWN_KEYS.len());
     }
 }

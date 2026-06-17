@@ -252,6 +252,16 @@ impl Config {
         self.get("lock_config").and_then(as_bool).unwrap_or(false)
     }
 
+    /// The configured [`DaemonMode`] — [`DaemonMode::Adhoc`] when unset
+    /// or unrecognized. Drives whether `start`/`stop`/`status`/`restart`
+    /// self-daemonize or delegate to systemd.
+    pub fn daemon_mode(&self) -> DaemonMode {
+        match self.get("daemon_mode") {
+            Some(v) if v.eq_ignore_ascii_case("systemd") => DaemonMode::Systemd,
+            _ => DaemonMode::Adhoc,
+        }
+    }
+
     /// Validate every key/value (used after a bulk import/load).
     pub fn validate_all(&self) -> Result<(), VecdError> {
         for (k, v) in &self.values {
@@ -325,12 +335,34 @@ pub const KNOWN_KEYS: &[&str] = &[
     "ratelimit_connection_upload",
     "ratelimit_client_download",
     "ratelimit_client_upload",
+    "daemon_mode",
     "lock_config",
 ];
 
 /// Whether `key` is a recognized config key.
 pub fn is_known_key(key: &str) -> bool {
     KNOWN_KEYS.contains(&key)
+}
+
+/// How the background lifecycle verbs (`start`/`stop`/`status`/
+/// `restart`) behave, per the `daemon_mode` config key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonMode {
+    /// Self-daemonize via `fork`/`setsid` — the default (see
+    /// [`crate::daemon`]).
+    Adhoc,
+    /// Delegate to `systemctl`; set by `vecd service install`.
+    Systemd,
+}
+
+impl DaemonMode {
+    /// The canonical `daemon_mode` config-value spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DaemonMode::Adhoc => "adhoc",
+            DaemonMode::Systemd => "systemd",
+        }
+    }
 }
 
 /// Parse a boolean-ish config value: `on/true/1/yes` → `true`,
@@ -366,6 +398,16 @@ pub fn validate_kv(key: &str, value: &str) -> Result<(), VecdError> {
             as_bool(value).ok_or_else(|| {
                 VecdError::usage(format!("config 'lock_config' = '{value}': expected on/off"))
             })?;
+        }
+        "daemon_mode" => {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "adhoc" | "systemd" => {}
+                _ => {
+                    return Err(VecdError::usage(format!(
+                        "config 'daemon_mode' = '{value}': expected adhoc or systemd"
+                    )));
+                }
+            }
         }
         _ => {} // paths / secret keys accepted as-is
     }
@@ -624,6 +666,21 @@ mod tests {
         c.set("lock_config", "off").unwrap();
         assert!(!c.is_locked());
         assert!(c.set("lock_config", "perhaps").is_err());
+    }
+
+    #[test]
+    fn daemon_mode_default_set_validate() {
+        let mut c = Config::default();
+        // Default (unset) is adhoc.
+        assert_eq!(c.daemon_mode(), DaemonMode::Adhoc);
+        c.set("daemon_mode", "systemd").unwrap();
+        assert_eq!(c.daemon_mode(), DaemonMode::Systemd);
+        // Case-insensitive read, canonical spelling round-trips.
+        c.set("daemon_mode", "ADHOC").unwrap();
+        assert_eq!(c.daemon_mode(), DaemonMode::Adhoc);
+        assert_eq!(DaemonMode::Systemd.as_str(), "systemd");
+        // Bad value rejected at set time.
+        assert!(c.set("daemon_mode", "upstart").is_err());
     }
 
     #[test]
