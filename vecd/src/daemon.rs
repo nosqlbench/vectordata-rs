@@ -96,7 +96,7 @@ pub fn start(data_dir: &Path, run_foreground: impl FnOnce() -> i32) -> Result<()
 #[cfg(not(unix))]
 pub fn start(_data_dir: &Path, _run_foreground: impl FnOnce() -> i32) -> Result<(), VecdError> {
     Err(VecdError::usage(
-        "`vecd start` (self-daemonize) is unix-only; run `vecd serve` under a supervisor",
+        "`vecd daemon start` (self-daemonize) is unix-only; run `vecd serve` under a supervisor",
     ))
 }
 
@@ -123,7 +123,7 @@ pub fn stop(data_dir: &Path) -> Result<(), VecdError> {
 
 #[cfg(not(unix))]
 pub fn stop(_data_dir: &Path) -> Result<(), VecdError> {
-    Err(VecdError::usage("`vecd stop` is unix-only"))
+    Err(VecdError::usage("`vecd daemon stop` is unix-only"))
 }
 
 /// Report whether the daemon is running, and where it is bound.

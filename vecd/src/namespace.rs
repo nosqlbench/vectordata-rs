@@ -87,17 +87,17 @@ pub fn resolve(snap: &Snapshot, request_path: &str) -> Result<Resolved, VecdErro
         if !ns.active {
             return Err(VecdError::usage(format!(
                 "namespace '{label}' is inactive (config-only) — activate it with \
-                 `vecd ns set {label} --active`"
+                 `vecd store ns set {label} --active`"
             )));
         }
         return match &ns.backend_config {
             None => Err(VecdError::usage(format!(
                 "namespace '{label}' has no storage backend — attach one with \
-                 `vecd ns set {label} --backend-config <name>`"
+                 `vecd store ns set {label} --backend-config <name>`"
             ))),
             Some(bn) => Err(VecdError::usage(format!(
                 "namespace '{label}' uses backend '{bn}', which is missing or inactive — \
-                 check `vecd backends list` (activate with `vecd backends set {bn} --active`)"
+                 check `vecd store backends list` (activate with `vecd store backends set {bn} --active`)"
             ))),
         };
     }

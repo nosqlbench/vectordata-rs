@@ -3,7 +3,7 @@
 
 //! systemd integration: generate and install a unit that runs the
 //! gateway under systemd (`vecd serve`), plus a best-effort interlock
-//! against running the ad-hoc daemon (`vecd start`) and the systemd
+//! against running the ad-hoc daemon (`vecd daemon start`) and the systemd
 //! service at the same time.
 //!
 //! vecd has two ways to run as a background service:
@@ -11,7 +11,7 @@
 //!   1. **systemd** — a unit whose `ExecStart` runs the foreground
 //!      `vecd serve`; systemd owns the process lifecycle. This module
 //!      writes that unit.
-//!   2. **ad-hoc** — `vecd start`/`stop`/`status`, which self-daemonize
+//!   2. **ad-hoc** — `vecd daemon start`/`stop`/`status`, which self-daemonize
 //!      via `fork`/`setsid` (see [`crate::daemon`]).
 //!
 //! Use one OR the other. Running both points two daemons at the same
@@ -50,7 +50,7 @@ pub fn unit_text(exec: &str, conf_dir: &Path) -> String {
          Wants=network-online.target\n\
          \n\
          [Service]\n\
-         # Foreground gateway under systemd's control — NOT `vecd start`\n\
+         # Foreground gateway under systemd's control — NOT `vecd daemon start`\n\
          # (that self-daemonizes and would fight systemd for the process).\n\
          Type=simple\n\
          ExecStart={exec} --conf {conf} serve\n\
@@ -86,7 +86,7 @@ pub fn refuse_if_systemd_active() -> Result<(), VecdError> {
         return Err(VecdError::usage(
             "the vecd systemd service is active but daemon_mode=adhoc — refusing to also \
              start an ad-hoc daemon (they would collide on the bind address and control DB). \
-             Run `vecd service install` to adopt systemd mode, or `systemctl disable --now vecd` \
+             Run `vecd daemon install` to adopt systemd mode, or `systemctl disable --now vecd` \
              to stay ad-hoc.",
         ));
     }
@@ -176,7 +176,7 @@ pub fn install(
     // up would run two gateways against the same bind + DB.
     if let Some(pid) = crate::daemon::running_pid(data_dir) {
         return Err(VecdError::usage(format!(
-            "an ad-hoc vecd daemon is running (pid {pid}); stop it with `vecd stop` before \
+            "an ad-hoc vecd daemon is running (pid {pid}); stop it with `vecd daemon stop` before \
              installing the systemd service — the two would conflict on the bind address \
              and control DB",
         )));
@@ -186,7 +186,7 @@ pub fn install(
     std::fs::write(&unit_path, &unit).map_err(|e| {
         VecdError::op(format!(
             "writing {}: {e}\n  installing a system unit needs root — re-run with `sudo`, or \
-             write it yourself: `vecd service install --print | sudo tee {}`",
+             write it yourself: `vecd daemon install --print | sudo tee {}`",
             unit_path.display(),
             unit_path.display()
         ))
@@ -249,7 +249,7 @@ pub fn uninstall(resolved: &Resolved) -> Result<(), VecdError> {
     cfg.set("daemon_mode", DaemonMode::Adhoc.as_str())?;
     cfg.write_to(&resolved.dir)?;
     println!(
-        "set daemon_mode = adhoc — `vecd start`/`stop`/`status`/`restart` now self-daemonize"
+        "set daemon_mode = adhoc — `vecd daemon start`/`stop`/`status`/`restart` now self-daemonize"
     );
     Ok(())
 }

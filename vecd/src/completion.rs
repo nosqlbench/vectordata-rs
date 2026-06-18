@@ -176,12 +176,12 @@ pub fn option_resolvers() -> BTreeMap<String, ValueProvider> {
 /// keys in [`option_resolvers`], so both share the engine's one resolver map.
 pub fn positional_resolvers() -> BTreeMap<String, ValueProvider> {
     BTreeMap::from([
-        ("backends remove".to_string(), fn_provider(backends)),
-        ("backends set".to_string(), fn_provider(backends)),
-        ("ns set".to_string(), fn_provider(namespaces)),
-        ("ns remove".to_string(), fn_provider(namespaces)),
-        ("users remove".to_string(), fn_provider(principals)),
-        ("roles remove".to_string(), fn_provider(roles)),
+        ("store backends remove".to_string(), fn_provider(backends)),
+        ("store backends set".to_string(), fn_provider(backends)),
+        ("store ns set".to_string(), fn_provider(namespaces)),
+        ("store ns remove".to_string(), fn_provider(namespaces)),
+        ("access users remove".to_string(), fn_provider(principals)),
+        ("access roles remove".to_string(), fn_provider(roles)),
         ("config set".to_string(), fn_provider(config_keys)),
         ("config get".to_string(), fn_provider(config_keys)),
     ])
@@ -210,43 +210,49 @@ mod tests {
         let spec = Cli::veks_command_spec("vecd");
         let tree = build_completion_tree(&spec, &resolvers());
 
-        // Option-value completion, per command.
-        let has_flags = |group: &str, sub: Option<&str>, flags: &[&str]| {
-            let g = tree.root.child(group).unwrap_or_else(|| panic!("{group} missing"));
-            let node = match sub {
-                Some(s) => g.child(s).unwrap_or_else(|| panic!("{group} {s} missing")),
-                None => g,
-            };
+        // Walk a full command path (e.g. ["store", "ns", "add"]) to its node.
+        let node_at = |path: &[&str]| {
+            let mut node = &tree.root;
+            for seg in path {
+                node = node
+                    .child(seg)
+                    .unwrap_or_else(|| panic!("path {} missing at {seg}", path.join(" ")));
+            }
+            node
+        };
+
+        // Option-value completion, at the new grouped paths.
+        let has_flags = |path: &[&str], flags: &[&str]| {
+            let node = node_at(path);
             for f in flags {
                 assert!(
                     node.value_providers().contains_key(*f),
-                    "{group} {} should complete {f}",
-                    sub.unwrap_or("")
+                    "{} should complete {f}",
+                    path.join(" ")
                 );
             }
         };
-        has_flags("bind", None, &["--ns", "--to", "--role"]);
-        has_flags("ns", Some("add"), &["--owner", "--backend-config", "--listable"]);
-        has_flags("backends", Some("add"), &["--kind"]);
-        has_flags("users", Some("add"), &["--level"]);
+        has_flags(&["access", "bind"], &["--ns", "--to", "--role"]);
+        has_flags(&["store", "ns", "add"], &["--owner", "--backend-config", "--listable"]);
+        has_flags(&["store", "backends", "add"], &["--kind"]);
+        has_flags(&["access", "users", "add"], &["--level"]);
 
-        // First-positional completion on backends / ns / users / roles.
-        let cases = [
-            ("backends", "remove"),
-            ("backends", "set"),
-            ("ns", "set"),
-            ("ns", "remove"),
-            ("users", "remove"),
-            ("roles", "remove"),
-            ("config", "set"),
-            ("config", "get"),
+        // First-positional completion at the grouped leaf paths.
+        let positional_paths: &[&[&str]] = &[
+            &["store", "backends", "remove"],
+            &["store", "backends", "set"],
+            &["store", "ns", "set"],
+            &["store", "ns", "remove"],
+            &["access", "users", "remove"],
+            &["access", "roles", "remove"],
+            &["config", "set"],
+            &["config", "get"],
         ];
-        for (group, sub) in cases {
-            let g = tree.root.child(group).unwrap_or_else(|| panic!("{group} group missing"));
-            let leaf = g.child(sub).unwrap_or_else(|| panic!("{group} {sub} missing"));
+        for path in positional_paths {
             assert!(
-                leaf.positional_provider().is_some(),
-                "{group} {sub} should complete its positional"
+                node_at(path).positional_provider().is_some(),
+                "{} should complete its positional",
+                path.join(" ")
             );
         }
     }

@@ -351,7 +351,7 @@ pub enum DaemonMode {
     /// Self-daemonize via `fork`/`setsid` — the default (see
     /// [`crate::daemon`]).
     Adhoc,
-    /// Delegate to `systemctl`; set by `vecd service install`.
+    /// Delegate to `systemctl`; set by `vecd daemon install`.
     Systemd,
 }
 

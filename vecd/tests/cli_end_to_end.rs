@@ -172,7 +172,7 @@ impl Drop for DaemonGuard<'_> {
             .env("VECD_CONFIG", &self.h.config_dir)
             .arg("--data-dir")
             .arg(&self.h.data_dir)
-            .arg("stop")
+            .args(["daemon", "stop"])
             .output();
     }
 }
@@ -185,10 +185,10 @@ fn cli_daemon_start_status_stop() {
     h.vecd(&["init", "--superuser", "root"]);
 
     // status before start: not running.
-    assert!(h.vecd(&["status"]).contains("not running"));
+    assert!(h.vecd(&["daemon", "status"]).contains("not running"));
 
     // start daemonizes; the parent returns once the pidfile is written.
-    let started = h.vecd(&["start", "--bind", "127.0.0.1:0"]);
+    let started = h.vecd(&["daemon", "start", "--bind", "127.0.0.1:0"]);
     assert!(started.contains("started"), "{started}");
     let _guard = DaemonGuard { h: &h };
 
@@ -198,19 +198,19 @@ fn cli_daemon_start_status_stop() {
     assert_eq!(resp.status(), 200);
 
     // status reports running + the bound address.
-    let status = h.vecd(&["status"]);
+    let status = h.vecd(&["daemon", "status"]);
     assert!(status.contains("running"), "{status}");
 
     // stop drains it; status then reports not running.
-    let stopped = h.vecd(&["stop"]);
+    let stopped = h.vecd(&["daemon", "stop"]);
     assert!(stopped.contains("stopped"), "{stopped}");
 
     // Give the OS a moment, then confirm it's down.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && h.vecd(&["status"]).contains("is running") {
+    while Instant::now() < deadline && h.vecd(&["daemon", "status"]).contains("is running") {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(h.vecd(&["status"]).contains("not running"));
+    assert!(h.vecd(&["daemon", "status"]).contains("not running"));
 }
 
 #[test]
@@ -228,20 +228,20 @@ fn cli_init_serve_push_pull() {
 
     // Set up an endpoint exactly as an operator would.
     let objects = h._work.path().join("objects");
-    h.vecd(&["backends", "add", "store", "--kind", "local", "--endpoint",
+    h.vecd(&["store", "backends", "add", "store", "--kind", "local", "--endpoint",
              &format!("local:{}", objects.display()), "--active"]);
-    h.vecd(&["users", "add", "alice", "--level", "user"]);
-    h.vecd(&["ns", "add", "datasets/glove", "--owner", "alice", "--backend-config", "store", "--active"]);
-    h.vecd(&["bind", "--to", "alice", "--role", "curate", "--ns", "datasets/glove"]);
-    h.vecd(&["bind", "--to", "PUBLIC", "--role", "reader", "--ns", "datasets/glove"]);
-    let tok_out = h.vecd(&["tokens", "create", "--user", "alice", "--description", "push key", "--expires", "30d"]);
+    h.vecd(&["access", "users", "add", "alice", "--level", "user"]);
+    h.vecd(&["store", "ns", "add", "datasets/glove", "--owner", "alice", "--backend-config", "store", "--active"]);
+    h.vecd(&["access", "bind", "--to", "alice", "--role", "curate", "--ns", "datasets/glove"]);
+    h.vecd(&["access", "bind", "--to", "PUBLIC", "--role", "reader", "--ns", "datasets/glove"]);
+    let tok_out = h.vecd(&["access", "tokens", "create", "--user", "alice", "--description", "push key", "--expires", "30d"]);
     let token = token_from(&tok_out);
 
     // Listings reflect the setup.
-    let ns_list = h.vecd(&["ns", "list"]);
+    let ns_list = h.vecd(&["store", "ns", "list"]);
     assert!(ns_list.contains("datasets/glove"));
-    assert!(h.vecd(&["backends", "list"]).contains("store"));
-    assert!(h.vecd(&["users", "list"]).contains("alice"));
+    assert!(h.vecd(&["store", "backends", "list"]).contains("store"));
+    assert!(h.vecd(&["access", "users", "list"]).contains("alice"));
 
     // Start the daemon and push the real dataset through it.
     let server = h.serve();

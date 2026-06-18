@@ -29,7 +29,7 @@ pub struct LocalBackend {
 /// created if missing, and canonicalized to an absolute path. Two reasons this
 /// matters: the on-disk format `open()` expects is `local:DIR`, and the path
 /// must be absolute because `vecd serve` may run from a different working
-/// directory than the `vecd backends add` that created it — a relative endpoint
+/// directory than the `vecd store backends add` that created it — a relative endpoint
 /// would silently resolve against the *server's* CWD (or nowhere).
 ///
 /// Returns the canonical `local:<abs>` string; the caller can compare it against

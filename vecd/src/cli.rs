@@ -47,6 +47,17 @@ pub struct Cli {
 
 #[derive(veks_completion_derive::VeksCli)]
 pub enum Cmd {
+    /// Run the gateway in the foreground — the workhorse that `daemon
+    /// start` execs and that a systemd unit runs.
+    Serve {
+        #[command(flatten)]
+        serve: ServeArgs,
+    },
+    /// Run and manage vecd as a background service (ad-hoc or systemd).
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCmd,
+    },
     /// Create the DB + schema and mint the first superuser token.
     Init {
         /// Name for the bootstrap superuser.
@@ -60,54 +71,58 @@ pub enum Cmd {
         #[arg(long, value_name = "PATH")]
         config_import: Option<PathBuf>,
     },
-    /// Inspect and edit operator configuration (`vecd.conf`).
+    /// Inspect and edit operator configuration (`vecd.conf`) and TLS.
     Config {
         #[command(subcommand)]
         command: ConfigCmd,
     },
-    /// Generate or export the server's TLS certificate.
-    Tls {
+    /// Identity and access control: users, roles, tokens, bindings, privileges.
+    Access {
         #[command(subcommand)]
-        command: TlsCmd,
+        command: AccessCmd,
     },
-    /// Authenticate to a vecd endpoint and store its token (in the config
-    /// dir's `credentials.json`); it's then used automatically for that
-    /// endpoint (e.g. `vecd whoami`).
-    Login {
-        /// Endpoint URL (its origin identifies the credential). Omit with `--list`.
-        url: Option<String>,
-        /// Store this token directly instead of logging in with a password.
-        #[arg(long)]
-        token: Option<String>,
-        /// User to authenticate as (with `--password`).
-        #[arg(long)]
-        user: Option<String>,
-        /// Password for `--user` (a password grant via `/auth/token`); else
-        /// `$VECD_PASSWORD`.
-        #[arg(long)]
-        password: Option<String>,
-        /// Requested token lifetime, e.g. `30d`.
-        #[arg(long)]
-        expires: Option<String>,
-        /// List endpoints with stored credentials and exit.
-        #[arg(long)]
-        list: bool,
+    /// Storage admin: backend configs, namespaces, objects, versions, cleanup.
+    Store {
+        #[command(subcommand)]
+        command: StoreCmd,
     },
-    /// Forget the stored token for an endpoint.
-    Logout {
-        /// Endpoint URL (defaults to the one you're logged in to).
-        url: Option<String>,
+    /// Act as a client to a remote vecd endpoint (login/logout/whoami).
+    Endpoint {
+        #[command(subcommand)]
+        command: EndpointCmd,
     },
-    /// Show your effective access at an endpoint (uses the stored token).
-    Whoami {
-        /// Endpoint URL (defaults to the one you're logged in to).
-        url: Option<String>,
+    /// Control-plane DB maintenance (backup/restore).
+    Db {
+        #[command(subcommand)]
+        command: DbCmd,
     },
-    /// Run the gateway in the foreground (the workhorse `start` execs).
-    Serve {
-        #[command(flatten)]
-        serve: ServeArgs,
+    /// Read the access log (newest last), with optional filters.
+    Log {
+        #[arg(long, default_value = "50")]
+        tail: usize,
+        /// Only rows for this principal.
+        #[arg(long)]
+        principal: Option<String>,
+        /// Only rows with this HTTP status code (e.g. 403).
+        #[arg(long)]
+        status: Option<i64>,
+        /// Only rows for this action (HTTP method, e.g. GET, PUT).
+        #[arg(long)]
+        action: Option<String>,
     },
+    /// Emit a sourceable shell snippet that activates dynamic completions:
+    ///   eval "$(vecd completions)"
+    Completions {
+        #[arg(long, value_parser = ["bash", "zsh", "fish", "elvish", "powershell"])]
+        shell: Option<String>,
+    },
+}
+
+/// Run and manage vecd as a background service. The `daemon_mode` config
+/// key (set by `daemon install`) decides whether `start`/`stop`/`status`/
+/// `restart` self-daemonize or delegate to systemd.
+#[derive(veks_completion_derive::VeksCli)]
+pub enum DaemonCmd {
     /// Start the gateway as a background daemon (self-daemonizing).
     Start {
         #[command(flatten)]
@@ -115,59 +130,61 @@ pub enum Cmd {
     },
     /// Stop the background daemon (SIGTERM, graceful drain).
     Stop,
-    /// Report whether the daemon is running and where it is bound.
-    Status,
     /// Restart the background daemon.
     Restart {
         #[command(flatten)]
         serve: ServeArgs,
     },
-    /// Install or remove a systemd service for the gateway.
-    ///
-    /// `service install` writes a unit that runs `vecd serve`, enables
-    /// it, and sets `daemon_mode = systemd` — after which `start` /
-    /// `stop` / `status` / `restart` delegate to `systemctl` (with a
-    /// notice on stderr). `service uninstall` reverses it.
-    Service {
-        #[command(subcommand)]
-        command: ServiceCmd,
+    /// Report whether the daemon is running and where it is bound.
+    Status,
+    /// Install a systemd unit that runs `vecd serve`, enable it, and set
+    /// `daemon_mode = systemd` — after which `start`/`stop`/`status`/
+    /// `restart` delegate to `systemctl` (with a notice on stderr).
+    Install {
+        /// Print the unit to stdout and change nothing (no root needed).
+        #[arg(long)]
+        print: bool,
+        /// vecd binary the unit runs (default: this executable's path).
+        #[arg(long, value_name = "PATH")]
+        exec: Option<PathBuf>,
+        /// Install and enable the unit but don't start it now.
+        #[arg(long)]
+        no_start: bool,
     },
+    /// Remove the systemd unit and revert `daemon_mode` to adhoc.
+    /// (Meaningful once `daemon install` has set systemd mode.)
+    Uninstall,
+}
+
+/// Identity and access control.
+#[derive(veks_completion_derive::VeksCli)]
+pub enum AccessCmd {
     /// Manage users.
     Users {
         #[command(subcommand)]
         command: UsersCmd,
-    },
-    /// Manage API tokens.
-    Tokens {
-        #[command(subcommand)]
-        command: TokensCmd,
     },
     /// Manage roles.
     Roles {
         #[command(subcommand)]
         command: RolesCmd,
     },
-    /// Manage named storage backend configs.
-    Backends {
+    /// Manage API tokens.
+    Tokens {
         #[command(subcommand)]
-        command: BackendsCmd,
-    },
-    /// Manage namespaces.
-    Ns {
-        #[command(subcommand)]
-        command: NsCmd,
+        command: TokensCmd,
     },
     /// Bind a role to a principal on a namespace subtree.
     #[command(
         after_help = "Examples:\n  \
-            vecd bind --to alice  --role curate --ns datasets\n  \
-            vecd bind --to PUBLIC --role reader --ns datasets"
+            vecd access bind --to alice  --role curate --ns datasets\n  \
+            vecd access bind --to PUBLIC --role reader --ns datasets"
     )]
     Bind {
         /// Principal to grant: a user name, or `PUBLIC` for anyone.
         #[arg(long)]
         to: String,
-        /// Role to grant (see `vecd roles list`), e.g. reader, curate.
+        /// Role to grant (see `vecd access roles list`), e.g. reader, curate.
         #[arg(long)]
         role: String,
         /// Namespace subtree the binding applies to.
@@ -175,7 +192,7 @@ pub enum Cmd {
         ns: String,
     },
     /// Remove a binding (omit `--role` to remove all for the principal).
-    #[command(after_help = "Example:\n  vecd unbind --to alice --ns datasets")]
+    #[command(after_help = "Example:\n  vecd access unbind --to alice --ns datasets")]
     Unbind {
         /// Principal whose binding to remove.
         #[arg(long)]
@@ -187,8 +204,14 @@ pub enum Cmd {
         #[arg(long)]
         ns: String,
     },
+    /// List role bindings (who has what access where).
+    Bindings {
+        /// Only bindings whose namespace path starts with this prefix.
+        #[arg(long)]
+        ns: Option<String>,
+    },
     /// Convenience grant: map `--read/--write/--delete/--admin` to a role.
-    #[command(after_help = "Example:\n  vecd grant --to alice --ns datasets --read --write")]
+    #[command(after_help = "Example:\n  vecd access grant --to alice --ns datasets --read --write")]
     Grant {
         /// Principal to grant access to (a user, or `PUBLIC`).
         #[arg(long)]
@@ -219,19 +242,21 @@ pub enum Cmd {
         #[command(subcommand)]
         command: ProfilesCmd,
     },
-    /// Control-plane DB backup.
-    Backup {
+}
+
+/// Storage admin: backend configs, namespaces, and the objects/versions
+/// they hold.
+#[derive(veks_completion_derive::VeksCli)]
+pub enum StoreCmd {
+    /// Manage named storage backend configs.
+    Backends {
         #[command(subcommand)]
-        command: BackupCmd,
+        command: BackendsCmd,
     },
-    /// Install a snapshot as the active DB (stop the daemon first).
-    Restore {
-        snapshot: String,
-    },
-    /// Inspect and act on the lifecycle cleanup queue (stasis versions).
-    Cleanup {
+    /// Manage namespaces.
+    Ns {
         #[command(subcommand)]
-        command: CleanupCmd,
+        command: NsCmd,
     },
     /// List live objects under a namespace (key + size), with a total.
     Objects {
@@ -239,37 +264,69 @@ pub enum Cmd {
         ns: String,
     },
     /// List session-published versions of a namespace (newest first). Plain
-    /// `push` writes are lone objects (see `vecd objects`); versions appear
+    /// `push` writes are lone objects (see `store objects`); versions appear
     /// here only for transactional, session-based publication.
     Versions {
         /// Namespace path, e.g. `datasets/mydata`.
         ns: String,
     },
-    /// List role bindings (who has what access where).
-    Bindings {
-        /// Only bindings whose namespace path starts with this prefix.
-        #[arg(long)]
-        ns: Option<String>,
+    /// Inspect and act on the lifecycle cleanup queue (stasis versions).
+    Cleanup {
+        #[command(subcommand)]
+        command: CleanupCmd,
     },
-    /// Read the access log (newest last), with optional filters.
-    Log {
-        #[arg(long, default_value = "50")]
-        tail: usize,
-        /// Only rows for this principal.
+}
+
+/// Act as a client to a remote vecd endpoint.
+#[derive(veks_completion_derive::VeksCli)]
+pub enum EndpointCmd {
+    /// Authenticate to a vecd endpoint and store its token (in the config
+    /// dir's `credentials.json`); it's then used automatically for that
+    /// endpoint (e.g. `vecd endpoint whoami`).
+    Login {
+        /// Endpoint URL (its origin identifies the credential). Omit with `--list`.
+        url: Option<String>,
+        /// Store this token directly instead of logging in with a password.
         #[arg(long)]
-        principal: Option<String>,
-        /// Only rows with this HTTP status code (e.g. 403).
+        token: Option<String>,
+        /// User to authenticate as (with `--password`).
         #[arg(long)]
-        status: Option<i64>,
-        /// Only rows for this action (HTTP method, e.g. GET, PUT).
+        user: Option<String>,
+        /// Password for `--user` (a password grant via `/auth/token`); else
+        /// `$VECD_PASSWORD`.
         #[arg(long)]
-        action: Option<String>,
+        password: Option<String>,
+        /// Requested token lifetime, e.g. `30d`.
+        #[arg(long)]
+        expires: Option<String>,
+        /// List endpoints with stored credentials and exit.
+        #[arg(long)]
+        list: bool,
     },
-    /// Emit a sourceable shell snippet that activates dynamic completions:
-    ///   eval "$(vecd completions)"
-    Completions {
-        #[arg(long, value_parser = ["bash", "zsh", "fish", "elvish", "powershell"])]
-        shell: Option<String>,
+    /// Forget the stored token for an endpoint.
+    Logout {
+        /// Endpoint URL (defaults to the one you're logged in to).
+        url: Option<String>,
+    },
+    /// Show your effective access at an endpoint (uses the stored token).
+    Whoami {
+        /// Endpoint URL (defaults to the one you're logged in to).
+        url: Option<String>,
+    },
+}
+
+/// Control-plane DB maintenance.
+#[derive(veks_completion_derive::VeksCli)]
+pub enum DbCmd {
+    /// Control-plane DB backup.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCmd,
+    },
+    /// Install a snapshot as the active DB (stop the daemon first).
+    Restore {
+        /// Snapshot path to install as the active control-plane DB.
+        snapshot: String,
     },
 }
 
@@ -321,7 +378,7 @@ pub struct ServeArgs {
 pub enum TlsCmd {
     /// Generate a self-signed cert + key and configure vecd to serve HTTPS.
     #[command(
-        after_help = "Example:\n  vecd tls generate            # cert for the bind host + loopback\n  vecd tls generate --host my-host.local"
+        after_help = "Example:\n  vecd config tls generate            # cert for the bind host + loopback\n  vecd config tls generate --host my-host.local"
     )]
     Generate {
         /// Directory for tls-cert.pem / tls-key.pem (default: the config dir).
@@ -334,7 +391,7 @@ pub enum TlsCmd {
     },
     /// Export the configured server certificate (the trust anchor) to a file,
     /// to add to vectordata's `settings.yaml` `trusted_ca_certs`.
-    #[command(after_help = "Example:\n  vecd tls export ~/.config/vectordata/vecd-ca.pem")]
+    #[command(after_help = "Example:\n  vecd config tls export ~/.config/vectordata/vecd-ca.pem")]
     Export {
         /// File to write the certificate PEM to.
         out: PathBuf,
@@ -343,6 +400,11 @@ pub enum TlsCmd {
 
 #[derive(veks_completion_derive::VeksCli)]
 pub enum ConfigCmd {
+    /// Generate or export the server's TLS certificate.
+    Tls {
+        #[command(subcommand)]
+        command: TlsCmd,
+    },
     /// Write sensible defaults (local-only bind + data dir) and confirm.
     Auto {
         /// Don't prompt — write the defaults straight away (for scripts).
@@ -394,35 +456,9 @@ pub enum ConfigCmd {
 }
 
 #[derive(veks_completion_derive::VeksCli)]
-pub enum ServiceCmd {
-    /// Write a systemd unit that runs `vecd serve`, enable it, and set
-    /// `daemon_mode = systemd`.
-    ///
-    ///   vecd service install              # write + enable + start (needs root)
-    ///   sudo vecd service install         # the usual form
-    ///   vecd service install --print      # emit the unit to stdout, change nothing
-    Install {
-        /// Print the unit to stdout and change nothing (no root needed).
-        #[arg(long)]
-        print: bool,
-        /// vecd binary the unit runs (default: this executable's path).
-        #[arg(long, value_name = "PATH")]
-        exec: Option<PathBuf>,
-        /// Install and enable the unit but don't start it now.
-        #[arg(long)]
-        no_start: bool,
-    },
-    /// Remove the systemd unit and revert `daemon_mode` to adhoc.
-    ///
-    /// Only meaningful once `service install` has set systemd mode —
-    /// refuses with a note when `daemon_mode` is still adhoc.
-    Uninstall,
-}
-
-#[derive(veks_completion_derive::VeksCli)]
 pub enum UsersCmd {
     /// Create a user (a principal you can bind roles to and mint tokens for).
-    #[command(after_help = "Example:\n  vecd users add alice --level user")]
+    #[command(after_help = "Example:\n  vecd access users add alice --level user")]
     Add {
         /// User name.
         name: String,
@@ -474,7 +510,7 @@ pub enum TokensCmd {
     /// Mint an API token for a user (used by clients to authenticate).
     #[command(
         after_help = "Example:\n  \
-            vecd tokens create --user alice --description \"push key\" --expires 30d --quiet > alice.token"
+            vecd access tokens create --user alice --description \"push key\" --expires 30d --quiet > alice.token"
     )]
     Create {
         /// User the token authenticates as.
@@ -520,8 +556,8 @@ pub enum TokensCmd {
 pub enum RolesCmd {
     /// List roles and the actions each grants.
     List,
-    /// Define a role as a set of actions (bind it with `vecd bind --role`).
-    #[command(after_help = "Example:\n  vecd roles add publisher --actions read,write,publish")]
+    /// Define a role as a set of actions (bind it with `vecd access bind --role`).
+    #[command(after_help = "Example:\n  vecd access roles add publisher --actions read,write,publish")]
     Add {
         /// Role name.
         name: String,
@@ -545,8 +581,8 @@ pub enum BackendsCmd {
     /// (and the directory is created), so a bare/relative name is corrected for you.
     #[command(
         after_help = "Examples:\n  \
-            vecd backends add store --kind local --endpoint ~/vecd-store --active\n  \
-            vecd backends add s3 --kind s3 --endpoint my-bucket --region us-east-1 --active"
+            vecd store backends add store --kind local --endpoint ~/vecd-store --active\n  \
+            vecd store backends add s3 --kind s3 --endpoint my-bucket --region us-east-1 --active"
     )]
     Add {
         /// Backend name, referenced by `ns add --backend-config <name>`.
@@ -575,8 +611,8 @@ pub enum BackendsCmd {
     /// Change a backend: activate/deactivate it, or repoint its storage.
     #[command(
         after_help = "Examples:\n  \
-            vecd backends set store --endpoint ~/vecd-store2\n  \
-            vecd backends set store --active"
+            vecd store backends set store --endpoint ~/vecd-store2\n  \
+            vecd store backends set store --active"
     )]
     Set {
         /// Backend name to modify.
@@ -607,7 +643,7 @@ pub enum NsCmd {
     /// and bindings. A namespace must be `--active` AND have a `--backend-config`
     /// before it can store objects.
     #[command(
-        after_help = "Example:\n  vecd ns add datasets --owner alice --backend-config store --active"
+        after_help = "Example:\n  vecd store ns add datasets --owner alice --backend-config store --active"
     )]
     Add {
         /// Namespace path prefix, e.g. `datasets` or `team/exp`.
@@ -615,7 +651,7 @@ pub enum NsCmd {
         /// Owning principal — a user, or a system role like `@operator`.
         #[arg(long)]
         owner: String,
-        /// Storage backend that serves this namespace (see `vecd backends list`).
+        /// Storage backend that serves this namespace (see `vecd store backends list`).
         #[arg(long)]
         backend_config: Option<String>,
         /// Activate now; otherwise it's config-only and rejects writes.
@@ -635,7 +671,7 @@ pub enum NsCmd {
     List,
     /// Change an existing namespace (activate it, repoint its backend, etc.).
     #[command(
-        after_help = "Examples:\n  vecd ns set datasets --active\n  vecd ns set datasets --backend-config store"
+        after_help = "Examples:\n  vecd store ns set datasets --active\n  vecd store ns set datasets --backend-config store"
     )]
     Set {
         /// Namespace path to modify.
@@ -745,9 +781,9 @@ fn requires_config(cmd: &Cmd) -> bool {
         cmd,
         Cmd::Config { .. }
             | Cmd::Completions { .. }
-            | Cmd::Login { .. }
-            | Cmd::Logout { .. }
-            | Cmd::Whoami { .. }
+            // Client-to-remote verbs (login/logout/whoami) operate on a
+            // stored credential, not a server config.
+            | Cmd::Endpoint { .. }
             | Cmd::Init { config_import: Some(_), .. }
     )
 }
@@ -755,7 +791,7 @@ fn requires_config(cmd: &Cmd) -> bool {
 /// Resolve the bind address: `--bind`, else config `bind`, else the default
 /// **loopback** `127.0.0.1:8443`. Mirrors [`resolve_data_dir`]'s
 /// flag-over-config precedence. The default is loopback so a bare
-/// `vecd start` is safe out of the box — reachable only from the local host;
+/// `vecd daemon start` is safe out of the box — reachable only from the local host;
 /// exposing it to the network is an explicit choice (set `bind` to a
 /// non-loopback address), and pairing that with TLS is checked by
 /// [`exposes_plaintext`].
@@ -891,98 +927,161 @@ fn dispatch(
     cfg: &config::Config,
 ) -> Result<(), VecdError> {
     match cmd {
+        // `serve` is the foreground gateway the systemd unit itself
+        // execs — it must NEVER indirect, regardless of daemon_mode.
+        Cmd::Serve { serve } => cmd_serve(data_dir, cfg, &serve),
+        Cmd::Daemon { command } => cmd_daemon(resolved, data_dir, cfg, command),
         // config_import was already applied in `run`; just build the DB here.
         Cmd::Init { superuser, quiet, config_import: _ } => {
             cmd_init(resolved, data_dir, cfg, &superuser, quiet)
         }
         Cmd::Config { command } => cmd_config(resolved, command),
-        Cmd::Tls { command } => cmd_tls(resolved, command),
-        Cmd::Login { url, token, user, password, expires, list } => {
-            cmd_login(resolved, url, token, user, password, expires.as_deref(), list)
-        }
-        Cmd::Logout { url } => cmd_logout(resolved, resolve_endpoint(resolved, url)?.as_str()),
-        Cmd::Whoami { url } => cmd_client_whoami(resolved, resolve_endpoint(resolved, url)?.as_str()),
-        // `serve` is the foreground gateway the systemd unit itself
-        // execs — it must NEVER indirect, regardless of daemon_mode.
-        Cmd::Serve { serve } => cmd_serve(data_dir, cfg, &serve),
-        Cmd::Service { command } => cmd_service(resolved, data_dir, command),
-        Cmd::Start { serve } => match cfg.daemon_mode() {
-            config::DaemonMode::Systemd => crate::service::delegate("start"),
-            config::DaemonMode::Adhoc => {
-                crate::service::refuse_if_systemd_active()?;
-                let dd = data_dir.to_path_buf();
-                let cfg = cfg.clone();
-                crate::daemon::start(data_dir, move || match cmd_serve(&dd, &cfg, &serve) {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        eprintln!("vecd: {e}");
-                        e.exit_code()
-                    }
-                })
-            }
-        },
-        Cmd::Stop => match cfg.daemon_mode() {
-            config::DaemonMode::Systemd => crate::service::delegate("stop"),
-            config::DaemonMode::Adhoc => crate::daemon::stop(data_dir),
-        },
-        Cmd::Status => match cfg.daemon_mode() {
-            config::DaemonMode::Systemd => crate::service::delegate("status"),
-            config::DaemonMode::Adhoc => crate::daemon::status(data_dir),
-        },
-        Cmd::Restart { serve } => match cfg.daemon_mode() {
-            config::DaemonMode::Systemd => crate::service::delegate("restart"),
-            config::DaemonMode::Adhoc => {
-                crate::service::refuse_if_systemd_active()?;
-                // Best-effort stop (ignore "not running"), then start.
-                let _ = crate::daemon::stop(data_dir);
-                let dd = data_dir.to_path_buf();
-                let cfg = cfg.clone();
-                crate::daemon::start(data_dir, move || match cmd_serve(&dd, &cfg, &serve) {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        eprintln!("vecd: {e}");
-                        e.exit_code()
-                    }
-                })
-            }
-        },
-        Cmd::Users { command } => cmd_users(data_dir, cfg, command),
-        Cmd::Tokens { command } => cmd_tokens(data_dir, cfg, command),
-        Cmd::Roles { command } => cmd_roles(data_dir, cfg, command),
-        Cmd::Backends { command } => cmd_backends(data_dir, cfg, command),
-        Cmd::Ns { command } => cmd_ns(data_dir, cfg, command),
-        Cmd::Bind { to, role, ns } => {
-            let mut db = open_db(data_dir, cfg)?;
-            admin::bind(&mut db, &to, &role, &ns)?;
-            println!("bound {role} → {to} on {ns}");
-            Ok(())
-        }
-        Cmd::Unbind { to, role, ns } => {
-            let mut db = open_db(data_dir, cfg)?;
-            admin::unbind(&mut db, &to, role.as_deref(), &ns)?;
-            println!("unbound {to} on {ns}");
-            Ok(())
-        }
-        Cmd::Grant { to, ns, read, write, delete, admin: adm } => {
-            cmd_grant(data_dir, cfg, &to, &ns, read, write, delete, adm)
-        }
-        Cmd::Priv { command } => cmd_priv(data_dir, cfg, command),
-        Cmd::Profiles { command } => cmd_profiles(data_dir, cfg, command),
-        Cmd::Backup { command } => cmd_backup(data_dir, cfg, command),
-        Cmd::Restore { snapshot } => {
-            backup::restore(&snapshot, &config::db_path(data_dir))?;
-            println!("restored {snapshot} → {}", config::db_path(data_dir).display());
-            Ok(())
-        }
-        Cmd::Cleanup { command } => cmd_cleanup(data_dir, cfg, command),
-        Cmd::Objects { ns } => cmd_objects(data_dir, cfg, &ns),
-        Cmd::Versions { ns } => cmd_versions(data_dir, cfg, &ns),
-        Cmd::Bindings { ns } => cmd_bindings(data_dir, cfg, ns.as_deref()),
+        Cmd::Access { command } => cmd_access(data_dir, cfg, command),
+        Cmd::Store { command } => cmd_store(data_dir, cfg, command),
+        Cmd::Endpoint { command } => cmd_endpoint(resolved, command),
+        Cmd::Db { command } => cmd_db(data_dir, cfg, command),
         Cmd::Log { tail, principal, status, action } => {
             cmd_log(data_dir, cfg, tail, principal.as_deref(), status, action.as_deref())
         }
         Cmd::Completions { shell } => {
             cmd_completions(shell);
+            Ok(())
+        }
+    }
+}
+
+/// `vecd daemon …` — background lifecycle + systemd integration.
+/// `start`/`stop`/`status`/`restart` self-daemonize under
+/// `daemon_mode=adhoc` and delegate to systemctl under
+/// `daemon_mode=systemd`; `install`/`uninstall` manage the unit and the
+/// mode itself.
+fn cmd_daemon(
+    resolved: &config::Resolved,
+    data_dir: &std::path::Path,
+    cfg: &config::Config,
+    cmd: DaemonCmd,
+) -> Result<(), VecdError> {
+    let adhoc_start = |serve: ServeArgs| -> Result<(), VecdError> {
+        crate::service::refuse_if_systemd_active()?;
+        let dd = data_dir.to_path_buf();
+        let cfg = cfg.clone();
+        crate::daemon::start(data_dir, move || match cmd_serve(&dd, &cfg, &serve) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("vecd: {e}");
+                e.exit_code()
+            }
+        })
+    };
+    match cmd {
+        DaemonCmd::Start { serve } => match cfg.daemon_mode() {
+            config::DaemonMode::Systemd => crate::service::delegate("start"),
+            config::DaemonMode::Adhoc => adhoc_start(serve),
+        },
+        DaemonCmd::Stop => match cfg.daemon_mode() {
+            config::DaemonMode::Systemd => crate::service::delegate("stop"),
+            config::DaemonMode::Adhoc => crate::daemon::stop(data_dir),
+        },
+        DaemonCmd::Status => match cfg.daemon_mode() {
+            config::DaemonMode::Systemd => crate::service::delegate("status"),
+            config::DaemonMode::Adhoc => crate::daemon::status(data_dir),
+        },
+        DaemonCmd::Restart { serve } => match cfg.daemon_mode() {
+            config::DaemonMode::Systemd => crate::service::delegate("restart"),
+            config::DaemonMode::Adhoc => {
+                // Best-effort stop (ignore "not running"), then start.
+                let _ = crate::daemon::stop(data_dir);
+                adhoc_start(serve)
+            }
+        },
+        DaemonCmd::Install { print, exec, no_start } => {
+            crate::service::install(resolved, data_dir, exec, print, no_start)
+        }
+        DaemonCmd::Uninstall => {
+            // "Available once installed": refuse cleanly when there's no
+            // vecd-installed service to remove (mode still adhoc).
+            let cfg = config::Config::load(&resolved.dir)?;
+            if cfg.daemon_mode() != config::DaemonMode::Systemd {
+                return Err(VecdError::usage(
+                    "daemon_mode is adhoc — no systemd service installed by vecd to uninstall. \
+                     (`vecd daemon install` switches to systemd mode; if a unit was created \
+                     out-of-band, remove it with `systemctl disable --now vecd` and delete its \
+                     unit file.)",
+                ));
+            }
+            crate::service::uninstall(resolved)
+        }
+    }
+}
+
+/// `vecd access …` — identity and authorization.
+fn cmd_access(
+    data_dir: &std::path::Path,
+    cfg: &config::Config,
+    cmd: AccessCmd,
+) -> Result<(), VecdError> {
+    match cmd {
+        AccessCmd::Users { command } => cmd_users(data_dir, cfg, command),
+        AccessCmd::Roles { command } => cmd_roles(data_dir, cfg, command),
+        AccessCmd::Tokens { command } => cmd_tokens(data_dir, cfg, command),
+        AccessCmd::Bind { to, role, ns } => {
+            let mut db = open_db(data_dir, cfg)?;
+            admin::bind(&mut db, &to, &role, &ns)?;
+            println!("bound {role} → {to} on {ns}");
+            Ok(())
+        }
+        AccessCmd::Unbind { to, role, ns } => {
+            let mut db = open_db(data_dir, cfg)?;
+            admin::unbind(&mut db, &to, role.as_deref(), &ns)?;
+            println!("unbound {to} on {ns}");
+            Ok(())
+        }
+        AccessCmd::Bindings { ns } => cmd_bindings(data_dir, cfg, ns.as_deref()),
+        AccessCmd::Grant { to, ns, read, write, delete, admin: adm } => {
+            cmd_grant(data_dir, cfg, &to, &ns, read, write, delete, adm)
+        }
+        AccessCmd::Priv { command } => cmd_priv(data_dir, cfg, command),
+        AccessCmd::Profiles { command } => cmd_profiles(data_dir, cfg, command),
+    }
+}
+
+/// `vecd store …` — storage backends, namespaces, and their contents.
+fn cmd_store(
+    data_dir: &std::path::Path,
+    cfg: &config::Config,
+    cmd: StoreCmd,
+) -> Result<(), VecdError> {
+    match cmd {
+        StoreCmd::Backends { command } => cmd_backends(data_dir, cfg, command),
+        StoreCmd::Ns { command } => cmd_ns(data_dir, cfg, command),
+        StoreCmd::Objects { ns } => cmd_objects(data_dir, cfg, &ns),
+        StoreCmd::Versions { ns } => cmd_versions(data_dir, cfg, &ns),
+        StoreCmd::Cleanup { command } => cmd_cleanup(data_dir, cfg, command),
+    }
+}
+
+/// `vecd endpoint …` — client auth against a remote vecd endpoint.
+fn cmd_endpoint(resolved: &config::Resolved, cmd: EndpointCmd) -> Result<(), VecdError> {
+    match cmd {
+        EndpointCmd::Login { url, token, user, password, expires, list } => {
+            cmd_login(resolved, url, token, user, password, expires.as_deref(), list)
+        }
+        EndpointCmd::Logout { url } => {
+            cmd_logout(resolved, resolve_endpoint(resolved, url)?.as_str())
+        }
+        EndpointCmd::Whoami { url } => {
+            cmd_client_whoami(resolved, resolve_endpoint(resolved, url)?.as_str())
+        }
+    }
+}
+
+/// `vecd db …` — control-plane DB maintenance.
+fn cmd_db(data_dir: &std::path::Path, cfg: &config::Config, cmd: DbCmd) -> Result<(), VecdError> {
+    match cmd {
+        DbCmd::Backup { command } => cmd_backup(data_dir, cfg, command),
+        DbCmd::Restore { snapshot } => {
+            backup::restore(&snapshot, &config::db_path(data_dir))?;
+            println!("restored {snapshot} → {}", config::db_path(data_dir).display());
             Ok(())
         }
     }
@@ -1011,8 +1110,8 @@ fn cmd_init(
 
     // Auto-login: store the superuser token in the credential store, keyed by
     // the local endpoint the configured bind implies — so the admin can use
-    // the client commands (`vecd whoami`, pushes, …) the moment `vecd start`
-    // is up, with no separate `vecd login`. The token is irrecoverable, so we
+    // the client commands (`vecd endpoint whoami`, pushes, …) the moment `vecd daemon start`
+    // is up, with no separate `vecd endpoint login`. The token is irrecoverable, so we
     // point the user at the file that now holds it.
     let endpoint = local_endpoint_url(cfg);
     let origin = vectordata::credentials::origin_of_str(&endpoint).unwrap_or_else(|| endpoint.clone());
@@ -1116,14 +1215,14 @@ fn cmd_tls(resolved: &config::Resolved, cmd: TlsCmd) -> Result<(), VecdError> {
             println!("  cert: {}", cert_path.display());
             println!("  key:  {}", key_path.display());
             println!("configured tls_cert/tls_key in vecd.conf — restart vecd to serve HTTPS.");
-            println!("trust it from a client:  vecd tls export <file>");
+            println!("trust it from a client:  vecd config tls export <file>");
             Ok(())
         }
         TlsCmd::Export { out } => {
             let cfg = config::Config::load(&resolved.dir)?;
             let cert = cfg.get("tls_cert").ok_or_else(|| {
                 VecdError::usage(
-                    "no tls_cert configured — run `vecd tls generate` first, or set tls_cert in vecd.conf",
+                    "no tls_cert configured — run `vecd config tls generate` first, or set tls_cert in vecd.conf",
                 )
             })?;
             let pem = std::fs::read(cert)
@@ -1138,38 +1237,11 @@ fn cmd_tls(resolved: &config::Resolved, cmd: TlsCmd) -> Result<(), VecdError> {
 
 fn cmd_config(resolved: &config::Resolved, cmd: ConfigCmd) -> Result<(), VecdError> {
     match cmd {
+        ConfigCmd::Tls { command } => cmd_tls(resolved, command),
         ConfigCmd::Auto { yes, force } => cmd_config_auto(resolved, yes, force),
         ConfigCmd::Get { param, out, format } => cmd_config_get(resolved, param, out, format),
         ConfigCmd::Set { param, value, from, force } => {
             cmd_config_set(resolved, param, value, from, force)
-        }
-    }
-}
-
-/// `vecd service …` — install/uninstall the systemd unit. `uninstall`
-/// is gated on `daemon_mode=systemd` (the "available only once
-/// installed" semantic): it refuses with a note when the mode is still
-/// adhoc, since there's nothing this command installed to remove.
-fn cmd_service(
-    resolved: &config::Resolved,
-    data_dir: &std::path::Path,
-    cmd: ServiceCmd,
-) -> Result<(), VecdError> {
-    match cmd {
-        ServiceCmd::Install { print, exec, no_start } => {
-            crate::service::install(resolved, data_dir, exec, print, no_start)
-        }
-        ServiceCmd::Uninstall => {
-            let cfg = config::Config::load(&resolved.dir)?;
-            if cfg.daemon_mode() != config::DaemonMode::Systemd {
-                return Err(VecdError::usage(
-                    "daemon_mode is adhoc — no systemd service installed by vecd to uninstall. \
-                     (`vecd service install` switches to systemd mode; if a unit was created \
-                     out-of-band, remove it with `systemctl disable --now vecd` and delete its \
-                     unit file.)",
-                ));
-            }
-            crate::service::uninstall(resolved)
         }
     }
 }
@@ -1355,7 +1427,7 @@ fn read_file_or_stdin(file: Option<&std::path::Path>) -> Result<String, VecdErro
     }
 }
 
-/// `vecd login <url>` — authenticate to a vecd endpoint and store its token in
+/// `vecd endpoint login <url>` — authenticate to a vecd endpoint and store its token in
 /// the config dir's `credentials.json`, keyed by origin. Either `--token`
 /// (store a token directly) or `--user` + `--password` (a password grant via
 /// the endpoint's `/auth/token`).
@@ -1410,7 +1482,7 @@ fn cmd_login(
                     VecdError::usage("login with --user needs --password or $VECD_PASSWORD")
                 })?;
             let resp =
-                vectordata::endpoint::login_password(&url, &user, &password, Some("vecd login"), expires)
+                vectordata::endpoint::login_password(&url, &user, &password, Some("vecd endpoint login"), expires)
                     .map_err(VecdError::op)?;
             let exp = resp.expires_at.map(|e| e.to_string());
             (resp.token, resp.user.or(Some(user)), exp)
@@ -1449,7 +1521,7 @@ fn resolve_endpoint(resolved: &config::Resolved, url: Option<String>) -> Result<
     let entries = store.list();
     if entries.is_empty() {
         return Err(VecdError::usage(
-            "not logged in to any endpoint — give a <url>, or run `vecd login <url>` first".to_string(),
+            "not logged in to any endpoint — give a <url>, or run `vecd endpoint login <url>` first".to_string(),
         ));
     }
     if entries.len() > 1 {
@@ -1461,7 +1533,7 @@ fn resolve_endpoint(resolved: &config::Resolved, url: Option<String>) -> Result<
     Ok(entries[0].0.clone())
 }
 
-/// `vecd logout [url]` — forget the stored token for an endpoint's origin.
+/// `vecd endpoint logout [url]` — forget the stored token for an endpoint's origin.
 fn cmd_logout(resolved: &config::Resolved, url: &str) -> Result<(), VecdError> {
     let origin = vectordata::credentials::origin_of_str(url)
         .ok_or_else(|| VecdError::usage(format!("not a valid endpoint URL: {url}")))?;
@@ -1475,7 +1547,7 @@ fn cmd_logout(resolved: &config::Resolved, url: &str) -> Result<(), VecdError> {
     Ok(())
 }
 
-/// `vecd whoami <url>` — show effective access at an endpoint, using the
+/// `vecd endpoint whoami <url>` — show effective access at an endpoint, using the
 /// stored token automatically.
 fn cmd_client_whoami(resolved: &config::Resolved, url: &str) -> Result<(), VecdError> {
     let origin = vectordata::credentials::origin_of_str(url)
@@ -1485,7 +1557,7 @@ fn cmd_client_whoami(resolved: &config::Resolved, url: &str) -> Result<(), VecdE
         if e == "not-a-vecd" {
             VecdError::op(format!("{origin} is not a vecd endpoint"))
         } else if token.is_none() {
-            VecdError::op(format!("{e} (no stored credential — try `vecd login {url}`)"))
+            VecdError::op(format!("{e} (no stored credential — try `vecd endpoint login {url}`)"))
         } else {
             VecdError::op(e)
         }
@@ -1591,7 +1663,7 @@ fn cmd_serve(data_dir: &std::path::Path, cfg: &config::Config, a: &ServeArgs) ->
     })
 }
 
-/// Resolve on the first of SIGINT (Ctrl-C) or SIGTERM (`vecd stop`).
+/// Resolve on the first of SIGINT (Ctrl-C) or SIGTERM (`vecd daemon stop`).
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -1893,7 +1965,7 @@ fn cmd_grant(
         .ok_or_else(|| {
             VecdError::usage(
                 "no action flag given, or a non-nesting combination; use \
-                 `vecd bind --role <role>` for an ad-hoc role",
+                 `vecd access bind --role <role>` for an ad-hoc role",
             )
         })?;
     let mut db = open_db(data_dir, cfg)?;
@@ -2018,7 +2090,7 @@ fn open_backend_for_ns(
     crate::backend::open(row)
 }
 
-/// `vecd objects <ns>` — the live objects under a namespace subtree (what a
+/// `vecd store objects <ns>` — the live objects under a namespace subtree (what a
 /// plain `push` writes), with sizes and a total. This is the "what's actually
 /// published here" view, distinct from session `versions`.
 fn cmd_objects(data_dir: &std::path::Path, cfg: &config::Config, ns: &str) -> Result<(), VecdError> {
@@ -2051,13 +2123,13 @@ fn cmd_objects(data_dir: &std::path::Path, cfg: &config::Config, ns: &str) -> Re
     Ok(())
 }
 
-/// `vecd versions <ns>` — the session-published versions of a namespace,
+/// `vecd store versions <ns>` — the session-published versions of a namespace,
 /// newest first.
 fn cmd_versions(data_dir: &std::path::Path, cfg: &config::Config, ns: &str) -> Result<(), VecdError> {
     let db = open_db(data_dir, cfg)?;
     let rows = crate::session::list_versions(&db, ns)?;
     if rows.is_empty() {
-        println!("no session versions for '{ns}' (plain `push` writes show under `vecd objects {ns}`)");
+        println!("no session versions for '{ns}' (plain `push` writes show under `vecd store objects {ns}`)");
         return Ok(());
     }
     println!("{:>4}  {:<10} {:<10} {:<20} manifest", "seq", "state", "tag", "committed");
@@ -2075,7 +2147,7 @@ fn cmd_versions(data_dir: &std::path::Path, cfg: &config::Config, ns: &str) -> R
     Ok(())
 }
 
-/// `vecd bindings [--ns <prefix>]` — every role binding, optionally filtered to
+/// `vecd access bindings [--ns <prefix>]` — every role binding, optionally filtered to
 /// a namespace prefix. Answers "who can do what, where" from the admin CLI
 /// instead of needing the introspection endpoint or raw DB access.
 fn cmd_bindings(

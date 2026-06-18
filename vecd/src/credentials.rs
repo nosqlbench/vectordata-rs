@@ -1,10 +1,10 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Client-side credential store for `vecd login` — bearer tokens keyed by
+//! Client-side credential store for `vecd endpoint login` — bearer tokens keyed by
 //! endpoint **origin** (`scheme://host[:port]`), so a stored token is applied
 //! automatically to any request `vecd` makes to that endpoint (today:
-//! `vecd whoami`).
+//! `vecd endpoint whoami`).
 //!
 //! The store is `credentials.json` in the resolved config dir (so `--conf` /
 //! `$VECD_CONFIG` isolate it, defaulting to `~/.config/vecd/`), created

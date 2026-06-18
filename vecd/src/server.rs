@@ -16,7 +16,7 @@
 //! `Mutex<Db>`. The snapshot is **live-reloaded**: a background tick polls
 //! the cheap `PRAGMA data_version` and, when `auth_generation` has
 //! advanced, atomically swaps in a freshly built snapshot — so an admin's
-//! `vecd bind …` / `vecd ns set …` takes effect within ~1s, no restart.
+//! `vecd access bind …` / `vecd store ns set …` takes effect within ~1s, no restart.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -703,7 +703,7 @@ fn gate(
                 format!(
                     "forbidden: your credentials are valid but not authorized for \
                      {action_name} on '{path}'. Ask the namespace owner to grant \
-                     access (e.g. `vecd bind --to <you> --role <role> --ns <ns>`).\n"
+                     access (e.g. `vecd access bind --to <you> --role <role> --ns <ns>`).\n"
                 ),
             )
         } else {
@@ -958,7 +958,7 @@ fn quota_exceeded_response(quota: u64) -> Out {
             format!(
                 "insufficient storage: this write would exceed the namespace quota \
                  of {quota} bytes. Remove old objects/versions, or ask an operator to \
-                 raise it with `vecd ns set <ns> --quota <bytes>`.\n"
+                 raise it with `vecd store ns set <ns> --quota <bytes>`.\n"
             )
             .into_bytes(),
         )
@@ -1261,8 +1261,8 @@ fn handle_object(
                 body.push_str(
                     "This endpoint has no namespace with a storage backend attached. \
                      An operator must add one, e.g.:\n  \
-                     vecd backends add store --kind local --endpoint <dir> --active\n  \
-                     vecd ns add <namespace> --owner <user> --backend-config store --active\n",
+                     vecd store backends add store --kind local --endpoint <dir> --active\n  \
+                     vecd store ns add <namespace> --owner <user> --backend-config store --active\n",
                 );
             }
             return Ok(Out::status(StatusCode::NOT_FOUND).body(body.into_bytes()));

@@ -310,7 +310,7 @@ fn push_to_inactive_namespace_says_to_activate_it() {
     let err = execute(&opts(src.path(), server.ns_url("datasets/dormant"), Some(token))).unwrap_err();
     match err {
         vectordata::push::Failure::Operational(m) => assert!(
-            m.contains("is inactive") && m.contains("vecd ns set datasets/dormant --active"),
+            m.contains("is inactive") && m.contains("vecd store ns set datasets/dormant --active"),
             "an inactive namespace should say to activate it: {m}"
         ),
         other => panic!("expected an Operational error telling us to activate, got {other:?}"),
