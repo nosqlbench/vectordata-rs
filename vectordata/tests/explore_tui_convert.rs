@@ -1,6 +1,12 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
+// shadow-terminal drives a real PTY; ConPTY automation on Windows is unreliable
+// (Ctrl-G / prompt timing races, e.g. a 5s `wait_for_string` that never sees the
+// pane render), so this end-to-end TUI test runs on Unix (Linux + macOS CI) only
+// — it must never gate the Windows release binary in build.yml's `Test vectordata`.
+#![cfg(unix)]
+
 //! E2E: naming a catalog on a legacy **list-formatted** catalogs.yaml
 //! prompts (on the suspended console) to convert it to name-based form;
 //! accepting rewrites the file to the `name: url` map form.
