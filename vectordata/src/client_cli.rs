@@ -82,7 +82,7 @@ pub fn login(
     let key = crate::credentials::credential_key(url).unwrap_or_else(|| origin.clone());
     let mut store = Store::load();
     let user_note = user.as_deref().map(|u| format!(" as {u}")).unwrap_or_default();
-    store.set(key.clone(), Entry { token, user, expires: expires_at });
+    store.set(key.clone(), Entry { token, user, expires: expires_at, catalog: None });
     if let Err(e) = store.save() {
         eprintln!("could not write credentials: {e}");
         return 1;

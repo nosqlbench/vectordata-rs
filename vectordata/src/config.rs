@@ -335,6 +335,100 @@ fn remove_entry_text(content: &str, target: &str) -> (String, bool) {
     (out, removed)
 }
 
+/// The structural shape of `catalogs.yaml`, so the explorer can prompt
+/// before rewriting a legacy list file (which can't store names) into the
+/// name-based map form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogsFormat {
+    /// No entries (missing/empty file).
+    Empty,
+    /// Legacy `- url` sequence — names are synthesized, not storable.
+    List,
+    /// `name: url` mapping — names persist.
+    Map,
+    /// Both shapes present — not auto-editable.
+    Mixed,
+}
+
+/// Classify the on-disk `catalogs.yaml`.
+pub fn catalogs_format() -> CatalogsFormat {
+    match std::fs::read_to_string(catalogs_path()) {
+        Ok(c) => classify_catalogs(&c),
+        Err(_) => CatalogsFormat::Empty,
+    }
+}
+
+fn classify_catalogs(content: &str) -> CatalogsFormat {
+    let mut has_list = false;
+    let mut has_map = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if is_list_entry_line(line) {
+            has_list = true;
+        } else if map_entry_line(line).is_some() {
+            has_map = true;
+        }
+    }
+    match (has_list, has_map) {
+        (true, true) => CatalogsFormat::Mixed,
+        (true, false) => CatalogsFormat::List,
+        (false, true) => CatalogsFormat::Map,
+        (false, false) => CatalogsFormat::Empty,
+    }
+}
+
+/// Rewrite a legacy list-form `catalogs.yaml` into the name-based map form
+/// (`name: url`), deriving a name per entry from its URL and preserving
+/// every comment / blank line. Returns the number of entries converted
+/// (0 if already map/empty). Refuses a mixed file.
+pub fn convert_catalogs_to_map() -> Result<usize, String> {
+    let path = catalogs_path();
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let (new_content, converted) = list_to_map_text(&content)?;
+    if converted > 0 {
+        std::fs::write(&path, new_content)
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
+    Ok(converted)
+}
+
+/// Pure core of [`convert_catalogs_to_map`]: list entries become
+/// `name: url` (name derived from the URL, deduped), every other line is
+/// kept verbatim. A trailing inline comment on a list line is preserved.
+fn list_to_map_text(content: &str) -> Result<(String, usize), String> {
+    if classify_catalogs(content) == CatalogsFormat::Mixed {
+        return Err("catalogs.yaml mixes list and map entries; fix it manually".to_string());
+    }
+    let mut taken: Vec<String> = Vec::new();
+    let mut converted = 0usize;
+    let mut out: Vec<String> = Vec::new();
+    for line in content.lines() {
+        if is_list_entry_line(line)
+            && let Some(url) = entry_line_value(line)
+        {
+            // Preserve any YAML inline comment (" #…") after the value.
+            let comment = line.trim_start().strip_prefix('-')
+                .and_then(|after| after.find(" #").map(|i| after[i..].to_string()))
+                .unwrap_or_default();
+            let name = derive_catalog_name(&url, &taken);
+            taken.push(name.clone());
+            out.push(format!("{name}: {url}{comment}"));
+            converted += 1;
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    let mut joined = out.join("\n");
+    if !joined.is_empty() {
+        joined.push('\n');
+    }
+    Ok((joined, converted))
+}
+
 /// Derive a symbolic catalog name from its location: the last path
 /// segment's stem, lowercased and sanitized to `[a-z0-9-]`. Empty
 /// when nothing usable remains — the caller falls back to the
@@ -525,43 +619,102 @@ pub fn verify_catalog_source(source: &str) -> Result<usize, String> {
     Ok(count)
 }
 
-/// Append a catalog source. The source must pass
-/// [`verify_catalog_source`] — parse to at least one dataset AND
-/// answer a catalog ping — before anything is recorded. Returns 1
-/// if verification fails; nothing is saved in that case.
-pub fn add_catalog(source: &str, name: Option<&str>) -> i32 {
+/// Outcome of [`try_add_catalog`] on success: either a freshly
+/// recorded catalog (with its saved name + dataset count) or a no-op
+/// because the same location was already configured.
+pub enum AddCatalogOutcome {
+    /// The source was verified and appended to `catalogs.yaml`.
+    Added {
+        /// The symbolic name it was saved under.
+        name: String,
+        /// Dataset count reported by [`verify_catalog_source`].
+        count: usize,
+    },
+    /// The exact location was already present; nothing changed.
+    AlreadyConfigured,
+}
+
+/// Non-printing core of [`add_catalog`]: resolve/validate the name,
+/// verify the source (parse to ≥1 dataset AND answer a catalog ping),
+/// and append it to `catalogs.yaml` byte-preservingly. Returns the
+/// outcome on success, or a human-readable error string with nothing
+/// saved. Shared by the CLI wrapper and the explorer's catalog editor
+/// so both surfaces apply the identical verify-then-save contract.
+pub fn try_add_catalog(source: &str, name: Option<&str>) -> Result<AddCatalogOutcome, String> {
     let entries = load_catalog_entries();
     if entries.iter().any(|e| e.location == source) {
-        println!("Already configured: {source}");
-        return 0;
+        return Ok(AddCatalogOutcome::AlreadyConfigured);
     }
     let taken: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
     let name = match name {
         Some(n) => {
             let n = n.trim();
-            if n.is_empty() || taken.iter().any(|t| t == n) {
-                eprintln!("error: catalog name '{n}' is empty or already in use");
-                return 1;
+            if n.is_empty() {
+                return Err("catalog name is empty".to_string());
+            }
+            if taken.iter().any(|t| t == n) {
+                return Err(format!("catalog name '{n}' is already in use"));
             }
             n.to_string()
         }
         None => derive_catalog_name(source, &taken),
     };
+    let count = verify_catalog_source(source).map_err(|e| format!("{source} — {e}"))?;
+    append_catalog_entry(&name, source)?;
+    Ok(AddCatalogOutcome::Added { name, count })
+}
 
-    let count = match verify_catalog_source(source) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("FAIL {source} — {e}");
-            eprintln!("Not saved.");
-            return 1;
-        }
-    };
-    println!("OK   {source} ({count} dataset(s))");
-
-    match append_catalog_entry(&name, source) {
-        Ok(path) => { println!("Saved as '{name}' to {}", path.display()); 0 }
-        Err(e) => { eprintln!("error: {e}"); 1 }
+/// Append a catalog source to `catalogs.yaml` **without** verifying it —
+/// for the explorer's "save it anyway, disabled" path when verification
+/// fails, so a typo'd URL isn't lost and can be fixed in place. Validates
+/// the name (non-empty, unique) and refuses an already-configured
+/// location, but performs no parse/ping. Returns the saved name.
+pub fn force_add_catalog(name: &str, source: &str) -> Result<String, String> {
+    let entries = load_catalog_entries();
+    if entries.iter().any(|e| e.location == source) {
+        return Err(format!("already configured: {source}"));
     }
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("catalog name is empty".to_string());
+    }
+    if entries.iter().any(|e| e.name == name) {
+        return Err(format!("catalog name '{name}' is already in use"));
+    }
+    append_catalog_entry(name, source)?;
+    Ok(name.to_string())
+}
+
+/// Append a catalog source. The source must pass
+/// [`verify_catalog_source`] — parse to at least one dataset AND
+/// answer a catalog ping — before anything is recorded. Returns 1
+/// if verification fails; nothing is saved in that case.
+pub fn add_catalog(source: &str, name: Option<&str>) -> i32 {
+    match try_add_catalog(source, name) {
+        Ok(AddCatalogOutcome::AlreadyConfigured) => {
+            println!("Already configured: {source}");
+            0
+        }
+        Ok(AddCatalogOutcome::Added { name, count }) => {
+            println!("OK   {source} ({count} dataset(s))");
+            println!("Saved as '{name}' to {}", catalogs_path().display());
+            0
+        }
+        Err(e) => {
+            eprintln!("FAIL {e}");
+            eprintln!("Not saved.");
+            1
+        }
+    }
+}
+
+/// Non-printing removal of the `catalogs.yaml` entry whose name,
+/// URL/path (or, for legacy list entries, value) equals `target`,
+/// preserving every other byte. Returns whether a line was removed.
+/// The explorer's catalog editor calls this directly; the CLI's
+/// [`remove_catalog`] adds index resolution + console output.
+pub fn try_remove_catalog(target: &str) -> Result<bool, String> {
+    remove_catalog_entry(target)
 }
 
 /// Remove a catalog source by name, URL/path, or 1-based index.
@@ -680,6 +833,36 @@ mod tests {
         // Existing list file → list line for document validity.
         let out = append_entry_text("- https://a/", "x", "https://x/").unwrap();
         assert_eq!(out, "- https://a/\n- https://x/\n");
+    }
+
+    #[test]
+    fn list_converts_to_map_preserving_comments() {
+        // A legacy list file with comments + an inline comment.
+        let content = "# my catalogs\n- https://h/glove/   # the big one\n- /data/local-lab\n";
+        let (out, n) = list_to_map_text(content).unwrap();
+        assert_eq!(n, 2);
+        // List entries become `name: url` (name derived from the URL);
+        // comments are kept (inline-comment spacing normalizes to one space).
+        assert_eq!(
+            out,
+            "# my catalogs\nglove: https://h/glove/ # the big one\nlocal-lab: /data/local-lab\n"
+        );
+        // Already map form → no conversion, bytes unchanged in count terms.
+        let (_, n2) = list_to_map_text("prot: https://a/\n").unwrap();
+        assert_eq!(n2, 0);
+        // Empty → nothing.
+        assert_eq!(list_to_map_text("").unwrap(), (String::new(), 0));
+        // Mixed → refused.
+        assert!(list_to_map_text("- https://a/\nx: https://b/\n").is_err());
+    }
+
+    #[test]
+    fn classify_detects_shape() {
+        assert_eq!(classify_catalogs(""), CatalogsFormat::Empty);
+        assert_eq!(classify_catalogs("# only comments\n"), CatalogsFormat::Empty);
+        assert_eq!(classify_catalogs("- https://a/\n"), CatalogsFormat::List);
+        assert_eq!(classify_catalogs("x: https://a/\n"), CatalogsFormat::Map);
+        assert_eq!(classify_catalogs("- https://a/\nx: https://b/\n"), CatalogsFormat::Mixed);
     }
 
     #[test]

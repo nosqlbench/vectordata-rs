@@ -5041,6 +5041,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "shadow-terminal",
  "signal-hook",
  "simsimd",
  "slabtastic",

@@ -192,9 +192,10 @@ const VIEW_INFO_RAW: &[&str] = &[
         "  The data fills the available space evenly.\n\n",
         "  Elongated shapes: Strong directional variance along certain PCs.\n",
         "  The longest axis is PC1 (highest variance).\n\n",
-        "  Rotation (←→↑↓ a/d w/s) explores different 3D projections\n",
-        "  of the same high-dimensional data. Some rotations reveal\n",
-        "  structure that is invisible from the default viewing angle.",
+        "  Rotation: ←→↑↓ a/d spin the 3 spatial axes (PC1-3); w/s\n",
+        "  rotates PC4 into the color channel, so the colors shift while\n",
+        "  the on-screen positions hold. Together they explore the full\n",
+        "  4D structure — some angles reveal what the default view hides.",
     ),
     // 8: Dimension distribution
     concat!(
@@ -309,9 +310,9 @@ impl WelfordStats {
 
 /// How the explore session ended.
 pub(super) enum ExploreExit {
-    /// User pressed q or Ctrl-C — hard quit.
+    /// User pressed Ctrl-C — immediate hard quit (escape hatch).
     Quit,
-    /// User pressed Esc when idle — return to previous screen.
+    /// User pressed Esc/Ctrl-D twice when idle — return to the picker.
     Back,
 }
 
@@ -419,6 +420,12 @@ pub(super) fn run_interactive_explore(
     let mut exit_reason = ExploreExit::Quit;
     // Theme-save confirmation, appended to the status line briefly.
     let mut save_flash: Option<(String, Instant)> = None;
+    // Two-press guard for leaving to the picker. Esc (or Ctrl-D) is a
+    // single, easy-to-fat-finger key, so the first press only arms +
+    // prompts; a second within LEAVE_CONFIRM actually leaves. Ctrl-C
+    // stays the unguarded escape hatch.
+    const LEAVE_CONFIRM: std::time::Duration = std::time::Duration::from_secs(1);
+    let mut leave_armed: Option<Instant> = None;
     // read_rx lives across restarts — reassigned each iteration
     let mut read_rx: mpsc::Receiver<ReadBatch>;
 
@@ -862,6 +869,16 @@ pub(super) fn run_interactive_explore(
                 save_flash = None;
             }
         }
+        // While the leave is armed, take over the status line with the
+        // confirm prompt; a stale arm (window elapsed) disarms itself.
+        let leave_pending = match leave_armed {
+            Some(t) if t.elapsed() < LEAVE_CONFIRM => true,
+            Some(_) => { leave_armed = None; false }
+            None => false,
+        };
+        if leave_pending {
+            status_msg = "⚠  Press Esc or Ctrl-D again to return to the picker".to_string();
+        }
 
         // ── Stats line for current view ──
         let stats_line = match view_mode {
@@ -963,9 +980,9 @@ pub(super) fn run_interactive_explore(
                     Line::from("   Space                           Double sample size"),
                     Line::from("   + / =                           Increase sample by 50%"),
                     Line::from("   r                               Reset sample size + rotations"),
-                    Line::from("   Esc (while loading)             Stop in-flight processing"),
-                    Line::from("   Esc (when idle)                 Return to the dataset picker"),
-                    Line::from("   q / Ctrl-C                      Quit immediately (no picker)"),
+                    Line::from("   Esc / Ctrl-D (while loading)    Stop in-flight processing"),
+                    Line::from("   Esc / Ctrl-D ×2 (when idle)     Return to the dataset picker"),
+                    Line::from("   Ctrl-C                          Quit immediately (no picker)"),
                     Line::from("   Ctrl-S                          Save palette/curve to settings as default theme"),
                 ];
                 // View-specific keys
@@ -1055,14 +1072,14 @@ pub(super) fn run_interactive_explore(
                 .map(|(i, n)| if i == view_mode { format!("[{}]", n) } else { n.to_string() })
                 .collect::<Vec<_>>().join(" ");
             frame.render_widget(Paragraph::new(Span::styled(
-                format!(" {} | Tab/PgDn/PgUp | /: info | ?: help | {} | q: quit",
+                format!(" {} | Tab/PgDn/PgUp | /: info | ?: help | {} | Ctrl-C: quit",
                     vi,
-                    if all_done { "Esc: back to picker" } else { "Esc: stop loading" }),
+                    if all_done { "Esc/Ctrl-D ×2: back to picker" } else { "Esc: stop loading" }),
                 Style::default().fg(Color::DarkGray))), chunks[3]);
 
             // View-specific controls line
             let view_controls: String = match view_mode {
-                V_PCA => format!(" ←→↑↓ a/d w/s: rotate | c/C: slide PCs | x/X: swap axes [X:PC{} Y:PC{} Z:PC{} color:PC{}] | r +/Space",
+                V_PCA => format!(" ←→↑↓ a/d: rotate space | w/s: rotate PC4→color | c/C: slide PCs | x/X: swap axes [X:PC{} Y:PC{} Z:PC{} color:PC{}] | r +/Space",
                     pc_axes[0]+1, pc_axes[1]+1, pc_axes[2]+1, pc_axes[3]+1),
                 V_DIMDIST => format!(" ←/→: dimension ({}/{}) | Home/End: first/last | ↑↓: bins | b/B: bins",
                     selected_dim, dim),
@@ -1081,7 +1098,7 @@ pub(super) fn run_interactive_explore(
             frame.render_widget(Paragraph::new(Span::styled(
                 &view_controls, Style::default().fg(Color::DarkGray))), chunks[4]);
 
-            let sc = if all_done { Color::Green } else { Color::Yellow };
+            let sc = if leave_pending || !all_done { Color::Yellow } else { Color::Green };
             frame.render_widget(Paragraph::new(Span::styled(&status_msg, Style::default().fg(sc))), chunks[5]);
         }).unwrap();
 
@@ -1090,7 +1107,44 @@ pub(super) fn run_interactive_explore(
         if event::poll(std::time::Duration::from_millis(poll_ms)).unwrap() {
             match event::read().unwrap() {
                 Event::Key(key) => {
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { break; }
+                    // Ctrl-C: the unguarded escape hatch — immediate hard
+                    // quit (exit_reason defaults to Quit).
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        break;
+                    }
+                    // Esc — or Ctrl-D as a synonym — is the guarded leave.
+                    // Mid-load it cancels the in-flight phases (single
+                    // press; not an exit). Once loaded, the first press
+                    // arms + prompts and a second within LEAVE_CONFIRM
+                    // returns to the picker. `q` is left free for search.
+                    let is_leave = matches!(key.code, KeyCode::Esc)
+                        || (key.code == KeyCode::Char('d')
+                            && key.modifiers.contains(KeyModifiers::CONTROL));
+                    if is_leave {
+                        if !all_done {
+                            phase1_done = true;
+                            phase2_done = true;
+                            phase3_done = true;
+                            phase4_done = true;
+                            dist_rx = None;
+                            eigen_rx = None;
+                            proj_rx = None;
+                            leave_armed = None;
+                        } else {
+                            match leave_armed {
+                                Some(t) if t.elapsed() < LEAVE_CONFIRM => {
+                                    exit_reason = ExploreExit::Back;
+                                    break;
+                                }
+                                _ => leave_armed = Some(Instant::now()),
+                            }
+                        }
+                        continue;
+                    }
+                    // Any other key cancels a pending leave.
+                    leave_armed = None;
                     if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
                         // Save the active palette/curve as the user's
                         // default theme. Cycling keys ('p'/'f') write
@@ -1105,31 +1159,6 @@ pub(super) fn run_interactive_explore(
                         continue;
                     }
                     match key.code {
-                        KeyCode::Char('q') => {
-                            exit_reason = ExploreExit::Quit;
-                            break;
-                        }
-                        KeyCode::Esc => {
-                            if !all_done {
-                                // Mid-load Esc: cancel every in-flight
-                                // phase. Subsequent Esc (now that
-                                // `all_done` is true) backs out to the
-                                // picker — same key, just whichever
-                                // action makes sense in the current
-                                // state. The footer reflects the
-                                // pending action live.
-                                phase1_done = true;
-                                phase2_done = true;
-                                phase3_done = true;
-                                phase4_done = true;
-                                dist_rx = None;
-                                eigen_rx = None;
-                                proj_rx = None;
-                            } else {
-                                exit_reason = ExploreExit::Back;
-                                break;
-                            }
-                        }
                         KeyCode::Char('?') => { show_help = !show_help; show_info = false; }
                         KeyCode::Char('/') => { show_info = !show_info; show_help = false; info_scroll = 0; }
                         // Arrow keys scroll info when info panel is open
@@ -1721,9 +1750,19 @@ fn render_pca_scatter(
         if idx < 5 { p[idx] } else { 0.0 }
     };
 
-    // Apply 4 rotation planes: Y, X, Z, W
+    // Rotate the four axes. rot_y/rot_x/rot_z fully orient the three
+    // SPATIAL PCs (x,y,z): their planes (x-z, y-z, x-y) span all of
+    // SO(3), so the projected (x,y) shows that 3D structure from any
+    // angle. rot_w is the genuine 4th degree of freedom — it rotates
+    // the (unseen) depth axis z against the COLOUR axis w (PC4). So
+    // `w/s` swings PC4 into the colour channel: the colours shift while
+    // the on-screen (x,y) positions stay put. (A redundant 4th spatial
+    // rotation here would just re-reach a view the first three already
+    // can; rotating into w is the only way to surface the 4th PC.)
     let rotated: Vec<(f64, f64, f64, f64)> = projected.iter().map(|p| {
         let (x, y, z) = (get_pc(p, 0), get_pc(p, 1), get_pc(p, 2));
+        let w = get_pc(p, 3); // PC4 — the colour axis, now a rotation participant
+        // 3D spatial orientation of (x, y, z).
         let x1 = x * cy + z * sy;
         let y1 = y;
         let z1 = -x * sy + z * cy;
@@ -1732,9 +1771,12 @@ fn render_pca_scatter(
         let z2 = y1 * sx + z1 * cx;
         let x3 = x2 * cz - y2 * sz;
         let y3 = x2 * sz + y2 * cz;
-        let x4 = x3 * cw - z2 * sw;
-        let y4 = y3;
-        (x4, y4, get_pc(p, 3), get_pc(p, 4))
+        // 4th-D rotation: oriented depth (z2) against colour (w). The
+        // colour shown is the rotated w; the rotated depth isn't drawn
+        // (depth already shows through the spatial rotations above), so
+        // `w/s` moves only the colours, not the (x3, y3) positions.
+        let w4 = z2 * sw + w * cw;
+        (x3, y3, w4, get_pc(p, 4))
     }).collect();
 
     let x_min = rotated.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
@@ -1787,7 +1829,7 @@ fn render_pca_scatter(
             bins[(t * BIN_COUNT as f64) as usize].push((p.0, p.1));
         }
         let title = if dims == 4 {
-            format!(" 4D Scatter — PC4→color · palette={} · curve={} · p/f to cycle ",
+            format!(" 4D Scatter — PC4→color (w/s rotates it in) · palette={} · curve={} · p/f cycle ",
                 palette.label(), curve.label())
         } else {
             format!(" 5D Scatter — PC4→color PC5→brightness · palette={} · curve={} ",

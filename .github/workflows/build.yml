@@ -394,6 +394,12 @@ jobs:
 
           Self-contained per-platform binaries — no archive, no install step.
 
+          **Which one do you want?**
+
+          - **`vectordata`** — the client. Get this if you want to *use* remote vector datasets: browse a catalog, download/stream datasets, explore them interactively, and manage the local cache.
+          - **`veks`** — the prep toolkit. Get this if you want to *prepare or compute on* vector data: run download/conversion pipelines, build KNN ground-truth, and analyze datasets.
+          - **`vecd`** — the endpoint daemon (Linux only). Get this if you want to *host* a remote endpoint that serves datasets to `vectordata` clients, fronted by an auth + object-storage gateway.
+
           | Platform | `vectordata` | `veks` | `vecd` |
           | --- | --- | --- | --- |
           | Linux amd64 | `vectordata-x86_64-unknown-linux-musl` | `veks-x86_64-unknown-linux-musl` | `vecd-x86_64-unknown-linux-musl` |

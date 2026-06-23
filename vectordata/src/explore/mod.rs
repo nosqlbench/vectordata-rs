@@ -96,10 +96,14 @@ pub(crate) fn save_theme_to_settings() -> Result<std::path::PathBuf, String> {
 /// applies again, and reset the session theme to match. Catalog
 /// enablement is data scope, not display — deliberately untouched.
 pub(crate) fn reset_display_options() -> Result<(), String> {
+    // Reset the live session theme FIRST and unconditionally, so the UI
+    // reverts to the standard immediately even if a settings key is absent
+    // or the file can't be rewritten (e.g. protected settings) — otherwise
+    // an early `?` return would leave the old theme applied on screen.
+    set_theme(palette::Palette::default(), palette::Curve::default());
     crate::settings::remove_setting("palette")?;
     crate::settings::remove_setting("curve")?;
     crate::settings::remove_setting("disabled_columns")?;
-    set_theme(palette::Palette::default(), palette::Curve::default());
     Ok(())
 }
 
@@ -244,46 +248,59 @@ pub fn run(args: ExploreArgs) -> i32 {
     // inline. Visualize → Quit exits the picker too; Visualize → Back
     // keeps the picker open. locate/download/purge/ping always return
     // to the picker so the user can chain operations.
-    let dispatch = |specifier: &str, action: PickerAction, pause: bool| -> ActionFlow {
-        match action {
-            PickerAction::Visualize => {
-                // Interactive viewer — `pause` is irrelevant; the
-                // viewer owns the terminal until the user exits it.
-                let _ = pause;
-                match unified::run_interactive_explore(specifier, sample, seed, sample_mode, resolved_palette, resolved_curve) {
-                    unified::ExploreExit::Quit => ActionFlow::Exit,
-                    unified::ExploreExit::Back => ActionFlow::Stay,
+    //
+    // The picker returns `Reload` when its catalog set changed (a
+    // source added/removed in the settings editor); re-running it
+    // re-resolves catalogs and rebuilds the dataset list against the
+    // new configuration. The dispatch closure captures only `Copy`
+    // values, so it is re-created cheaply each pass.
+    // A reload comes from a catalog change made in the config view, so
+    // reopen the picker straight onto that view (Catalogs tab) to show the
+    // result. The first run starts on the dataset list.
+    let mut start_in_settings = false;
+    loop {
+        let dispatch = |specifier: &str, action: PickerAction, pause: bool| -> ActionFlow {
+            match action {
+                PickerAction::Visualize => {
+                    // Interactive viewer — `pause` is irrelevant; the
+                    // viewer owns the terminal until the user exits it.
+                    let _ = pause;
+                    match unified::run_interactive_explore(specifier, sample, seed, sample_mode, resolved_palette, resolved_curve) {
+                        unified::ExploreExit::Quit => ActionFlow::Exit,
+                        unified::ExploreExit::Back => ActionFlow::Stay,
+                    }
+                }
+                PickerAction::Locate => {
+                    run_locate(specifier, pause);
+                    ActionFlow::Stay
+                }
+                PickerAction::Download => {
+                    run_precache(specifier, pause);
+                    ActionFlow::Stay
+                }
+                PickerAction::Purge => {
+                    run_purge(specifier, pause);
+                    ActionFlow::Stay
+                }
+                PickerAction::Ping => {
+                    run_ping(specifier, pause);
+                    ActionFlow::Stay
+                }
+                PickerAction::Describe | PickerAction::Source | PickerAction::Details => {
+                    // Picker-local — the action menu handles them
+                    // directly via `is_picker_local()` and never reaches
+                    // dispatch. These arms are unreachable in practice
+                    // but the match needs to be exhaustive.
+                    let _ = pause;
+                    ActionFlow::Stay
                 }
             }
-            PickerAction::Locate => {
-                run_locate(specifier, pause);
-                ActionFlow::Stay
-            }
-            PickerAction::Download => {
-                run_precache(specifier, pause);
-                ActionFlow::Stay
-            }
-            PickerAction::Purge => {
-                run_purge(specifier, pause);
-                ActionFlow::Stay
-            }
-            PickerAction::Ping => {
-                run_ping(specifier, pause);
-                ActionFlow::Stay
-            }
-            PickerAction::Describe | PickerAction::Source => {
-                // Picker-local — the action menu handles them
-                // directly via `is_picker_local()` and never reaches
-                // dispatch. These arms are unreachable in practice
-                // but the match needs to be exhaustive.
-                let _ = pause;
-                ActionFlow::Stay
-            }
+        };
+        match dataset_picker::run_picker(dispatch, start_in_settings) {
+            PickerOutcome::Done => return 0,
+            PickerOutcome::Failed => return 1,
+            PickerOutcome::Reload => { start_in_settings = true; }
         }
-    };
-    match dataset_picker::run_picker(dispatch) {
-        PickerOutcome::Done => 0,
-        PickerOutcome::Failed => 1,
     }
 }
 

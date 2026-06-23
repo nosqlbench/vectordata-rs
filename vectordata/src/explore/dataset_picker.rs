@@ -132,6 +132,8 @@ impl PickerColumn {
 enum SettingsItem {
     /// Toggle one configured catalog by name.
     CatalogToggle(String),
+    /// Open the inline editor to add a new catalog source.
+    AddCatalog,
     /// Toggle one optional column.
     ColumnToggle(PickerColumn),
     /// Cycle the global palette.
@@ -144,17 +146,136 @@ enum SettingsItem {
     ResetDisplay,
 }
 
-/// Build the settings screen's actionable items in display order.
-fn settings_items(catalog_list: &[(String, usize)]) -> Vec<SettingsItem> {
-    let mut items: Vec<SettingsItem> = catalog_list.iter()
-        .map(|(name, _)| SettingsItem::CatalogToggle(name.clone()))
-        .collect();
-    items.extend(ALL_COLUMNS.iter().map(|c| SettingsItem::ColumnToggle(*c)));
-    items.push(SettingsItem::PaletteCycle);
-    items.push(SettingsItem::CurveCycle);
-    items.push(SettingsItem::SaveTheme);
-    items.push(SettingsItem::ResetDisplay);
-    items
+/// Which field the inline "Add catalog" editor is currently capturing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AddField {
+    /// The symbolic name the catalog will be saved under.
+    Name,
+    /// The catalog URL or local path.
+    Url,
+    /// An optional bearer token for a catalog whose endpoint needs auth.
+    Token,
+}
+
+/// Transient state of the settings screen's "Add catalog" flow: a name,
+/// a URL/path, then an optional auth token, each typed into a single-line
+/// field. A catalog must be given a name (the [`AddField::Name`] stage
+/// refuses to advance on an empty one), mirroring `config catalog add
+/// --name`. When a token is supplied it is recorded (keyed by the
+/// catalog URL, tagged with the name) *before* verification, so a
+/// protected endpoint authenticates during the add.
+#[derive(Clone, Debug)]
+struct AddCatalogInput {
+    /// The field keystrokes currently land in.
+    field: AddField,
+    /// The name buffer.
+    name: String,
+    /// The URL/path buffer.
+    url: String,
+    /// The optional token buffer (blank → add anonymously).
+    token: String,
+    /// When editing an existing catalog, the prior name to drop on submit
+    /// (so a fix replaces in place); `None` for a fresh add.
+    replacing: Option<String>,
+}
+
+impl AddCatalogInput {
+    /// A fresh editor, parked on the name field.
+    fn new() -> Self {
+        AddCatalogInput {
+            field: AddField::Name,
+            name: String::new(),
+            url: String::new(),
+            token: String::new(),
+            replacing: None,
+        }
+    }
+
+    /// An editor pre-filled to fix an existing catalog in place.
+    fn editing(name: String, url: String, token: String) -> Self {
+        AddCatalogInput {
+            field: AddField::Url,
+            replacing: Some(name.clone()),
+            name,
+            url,
+            token,
+        }
+    }
+}
+
+/// Transient state of the "Set auth" flow for an already-configured
+/// catalog: a single masked token field. Submitting empty clears any
+/// stored credential; submitting a token records one keyed by the
+/// catalog's URL and tagged with its name.
+#[derive(Clone, Debug)]
+struct AuthInput {
+    /// The catalog name (the credential's name-tag, and the prompt label).
+    name: String,
+    /// The catalog URL the credential is keyed against.
+    url: String,
+    /// The token buffer.
+    token: String,
+}
+
+/// The faceted settings screen (Ctrl-G) is a tabbed view; each tab owns
+/// one group of actionable items. Tab / Shift-Tab move between tabs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Catalogs,
+    Columns,
+    Theme,
+    Maintenance,
+}
+
+impl SettingsTab {
+    /// Tabs in display order.
+    const ALL: [SettingsTab; 4] = [
+        SettingsTab::Catalogs,
+        SettingsTab::Columns,
+        SettingsTab::Theme,
+        SettingsTab::Maintenance,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            SettingsTab::Catalogs => "Catalogs",
+            SettingsTab::Columns => "Columns",
+            SettingsTab::Theme => "Theme",
+            SettingsTab::Maintenance => "Maintenance",
+        }
+    }
+
+    fn idx(self) -> usize {
+        Self::ALL.iter().position(|&t| t == self).unwrap_or(0)
+    }
+    fn next(self) -> Self {
+        Self::ALL[(self.idx() + 1) % Self::ALL.len()]
+    }
+    fn prev(self) -> Self {
+        Self::ALL[(self.idx() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// The actionable items shown on this tab, in order. The cursor only
+    /// lands on these; the tab bar itself is navigated with Tab.
+    fn items(self, catalog_list: &[(String, usize)]) -> Vec<SettingsItem> {
+        match self {
+            SettingsTab::Catalogs => {
+                let mut v: Vec<SettingsItem> = catalog_list.iter()
+                    .map(|(name, _)| SettingsItem::CatalogToggle(name.clone()))
+                    .collect();
+                v.push(SettingsItem::AddCatalog);
+                v
+            }
+            SettingsTab::Columns =>
+                ALL_COLUMNS.iter().map(|c| SettingsItem::ColumnToggle(*c)).collect(),
+            SettingsTab::Theme => vec![
+                SettingsItem::PaletteCycle,
+                SettingsItem::CurveCycle,
+                SettingsItem::SaveTheme,
+            ],
+            SettingsTab::Maintenance => vec![SettingsItem::ResetDisplay],
+        }
+    }
 }
 
 struct PickerRow {
@@ -385,7 +506,7 @@ fn facet_stat_string(
     Some(parts.join(", "))
 }
 
-/// Compose stats lines for the Ctrl-D details overlay. Pulls
+/// Compose stats lines for the details overlay (Enter menu → Details). Pulls
 /// dataset-level attributes (model / license / vendor / distance)
 /// from the catalog entry plus profile-level facets (each view's
 /// cardinality and size when known, then its source path with
@@ -1820,6 +1941,10 @@ pub enum PickerAction {
     /// entries pulled out of `knn_entries.yaml` for the legacy
     /// shape. Picker-local like Describe.
     Source,
+    /// Toggle the quick stats overlay (dims, counts, sizes, cache state)
+    /// for the highlighted profile. Picker-local; was Ctrl-D before
+    /// Ctrl-D became the alternate exit key.
+    Details,
     /// Download every facet's bytes into the local cache directory.
     /// (Drives the `datasets precache` machinery; the menu label is
     /// "Download" because that's what the user experiences.)
@@ -1838,6 +1963,7 @@ impl PickerAction {
             PickerAction::Locate    => "Locate",
             PickerAction::Describe  => "Describe",
             PickerAction::Source    => "Source",
+            PickerAction::Details   => "Details",
             PickerAction::Download  => "Download",
             PickerAction::Purge     => "Purge",
             PickerAction::Ping      => "Ping",
@@ -1854,6 +1980,8 @@ impl PickerAction {
                 "Show full descriptor: attributes, facets (paths + windows), origin, cache state. Scrollable.",
             PickerAction::Source =>
                 "Show the raw catalog YAML — dataset.yaml verbatim, or the relevant entries from knn_entries.yaml. Scrollable.",
+            PickerAction::Details =>
+                "Quick stats overlay: dimensions, counts, byte sizes, and cache state for this profile.",
             PickerAction::Download =>
                 "Download every facet of this profile into the cache directory.",
             PickerAction::Purge =>
@@ -1873,6 +2001,7 @@ impl PickerAction {
             PickerAction::Visualize,
             PickerAction::Describe,
             PickerAction::Source,
+            PickerAction::Details,
             PickerAction::Locate,
             PickerAction::Download,
             PickerAction::Ping,
@@ -1884,7 +2013,7 @@ impl PickerAction {
     /// rather than dispatched to the runner. Picker-local actions
     /// don't suspend the chrome and don't go through `dispatch`.
     fn is_picker_local(self) -> bool {
-        matches!(self, PickerAction::Describe | PickerAction::Source)
+        matches!(self, PickerAction::Describe | PickerAction::Source | PickerAction::Details)
     }
 
     /// True when this action can sensibly run against a set of
@@ -1929,6 +2058,185 @@ pub enum PickerOutcome {
     /// terminal-init failure). An error message has already been
     /// printed to stderr.
     Failed,
+    /// The catalog set changed (a source was added or removed in the
+    /// settings editor). The caller should re-run the picker so the
+    /// dataset list, counts, and probes rebuild against the new
+    /// configuration. Distinct from [`Self::Done`] so a reload never
+    /// looks like the user closing the picker.
+    Reload,
+}
+
+/// Run `body` with the picker's chrome suspended — so it can print freely
+/// to the real console (verification progress, prompts, the persistent
+/// failure message) — then pause for Enter and restore the chrome.
+fn with_console<F: FnOnce()>(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, body: F) {
+    use std::io::Write as _;
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    body();
+    println!();
+    print!("Press Enter to return to the explorer… ");
+    let _ = std::io::stdout().flush();
+    let mut _line = String::new();
+    let _ = std::io::stdin().read_line(&mut _line);
+    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+    let _ = enable_raw_mode();
+    let _ = terminal.clear();
+}
+
+/// A console y/N prompt (default No). Used on the suspended-chrome path.
+fn prompt_yes_no(question: &str) -> bool {
+    use std::io::Write as _;
+    print!("{question} ");
+    let _ = std::io::stdout().flush();
+    let mut ans = String::new();
+    let _ = std::io::stdin().read_line(&mut ans);
+    matches!(ans.trim(), "y" | "Y" | "yes" | "YES")
+}
+
+/// Add (or edit) a catalog, on the console (chrome already suspended).
+///
+/// A named write needs the name-based (`map`) form of `catalogs.yaml`; if
+/// the file is the legacy list form the user is prompted to convert it
+/// (recommended) and may decline (aborting). On success the catalog is
+/// recorded active and its disabled/unvalidated flags cleared; on a
+/// verification failure it is saved **disabled** + flagged *unvalidated*
+/// (so a typo isn't lost and can be fixed in place). `replacing` names a
+/// prior entry to drop first (edit); a non-empty `token` records a
+/// credential before verifying so a protected endpoint authenticates.
+#[allow(clippy::too_many_arguments)]
+fn add_or_edit_console(
+    name: &str,
+    url: &str,
+    token: &str,
+    replacing: Option<&str>,
+    catalog_locations: &std::collections::HashMap<String, String>,
+    disabled: &mut std::collections::HashSet<String>,
+    unvalidated: &mut std::collections::HashSet<String>,
+) {
+    // Format gate: keeping a name requires the map form.
+    match crate::config::catalogs_format() {
+        crate::config::CatalogsFormat::List => {
+            println!("Your catalogs.yaml is list-formatted, which can't store catalog names.");
+            println!("To keep the name '{name}' it must be rewritten to name-based form (recommended).");
+            if !prompt_yes_no("Convert catalogs.yaml now? [y/N]") {
+                println!("Cancelled — catalogs.yaml left unchanged; nothing was added.");
+                return;
+            }
+            match crate::config::convert_catalogs_to_map() {
+                Ok(n) => println!("Converted {n} catalog entr{} to name-based form.",
+                    if n == 1 { "y" } else { "ies" }),
+                Err(e) => { eprintln!("Conversion failed: {e} — aborting."); return; }
+            }
+        }
+        crate::config::CatalogsFormat::Mixed => {
+            eprintln!("catalogs.yaml mixes list and map entries — fix it manually first. Aborting.");
+            return;
+        }
+        crate::config::CatalogsFormat::Map | crate::config::CatalogsFormat::Empty => {}
+    }
+
+    // Editing: drop the prior entry + its flags first so a successful
+    // re-add lands clean (and a name change doesn't dup).
+    if let Some(old) = replacing {
+        let target = catalog_locations.get(old).cloned().unwrap_or_else(|| old.to_string());
+        let _ = crate::config::try_remove_catalog(&target);
+        if disabled.remove(old) {
+            let _ = crate::settings::write_disabled_catalogs(disabled);
+        }
+        if unvalidated.remove(old) {
+            let _ = crate::settings::write_unvalidated_catalogs(unvalidated);
+        }
+    }
+
+    if !token.is_empty()
+        && let Err(e) = crate::credentials::set_catalog_credential(name, url, token, None)
+    {
+        eprintln!("auth save failed: {e}");
+    }
+
+    println!("Adding catalog '{name}' — {url}");
+    match crate::config::try_add_catalog(url, Some(name)) {
+        Ok(crate::config::AddCatalogOutcome::Added { count, .. }) => {
+            if unvalidated.remove(name) {
+                let _ = crate::settings::write_unvalidated_catalogs(unvalidated);
+            }
+            if disabled.remove(name) {
+                let _ = crate::settings::write_disabled_catalogs(disabled);
+            }
+            println!("OK — {count} dataset(s). Saved and enabled.");
+        }
+        Ok(crate::config::AddCatalogOutcome::AlreadyConfigured) => {
+            println!("Already configured: {url}");
+        }
+        Err(reason) => {
+            eprintln!("Verification failed: {reason}");
+            match crate::config::force_add_catalog(name, url) {
+                Ok(_) => {
+                    disabled.insert(name.to_string());
+                    let _ = crate::settings::write_disabled_catalogs(disabled);
+                    unvalidated.insert(name.to_string());
+                    let _ = crate::settings::write_unvalidated_catalogs(unvalidated);
+                    eprintln!("Saved '{name}' but left it DISABLED until it validates.");
+                    eprintln!("Fix the URL with 'e' (edit) in the config view, or press Space on it to re-check.");
+                }
+                Err(e) => {
+                    if !token.is_empty() {
+                        let _ = crate::credentials::clear_catalog_credential(url);
+                    }
+                    eprintln!("Could not save '{name}': {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Add/edit a catalog with the chrome suspended (see [`add_or_edit_console`]).
+#[allow(clippy::too_many_arguments)]
+fn add_or_edit_catalog(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    name: &str,
+    url: &str,
+    token: &str,
+    replacing: Option<&str>,
+    catalog_locations: &std::collections::HashMap<String, String>,
+    disabled: &mut std::collections::HashSet<String>,
+    unvalidated: &mut std::collections::HashSet<String>,
+) {
+    with_console(terminal, || {
+        add_or_edit_console(name, url, token, replacing, catalog_locations, disabled, unvalidated);
+    });
+}
+
+/// Re-verify an already-configured (unvalidated) catalog with the chrome
+/// suspended. No file rewrite — the entry already exists; on success it
+/// just clears the disabled/unvalidated flags (enabling it), else it stays
+/// disabled with the failure on the console.
+fn revalidate_catalog(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    name: &str,
+    url: &str,
+    disabled: &mut std::collections::HashSet<String>,
+    unvalidated: &mut std::collections::HashSet<String>,
+) {
+    with_console(terminal, || {
+        println!("Re-checking catalog '{name}' — {url}");
+        match crate::config::verify_catalog_source(url) {
+            Ok(count) => {
+                if unvalidated.remove(name) {
+                    let _ = crate::settings::write_unvalidated_catalogs(unvalidated);
+                }
+                if disabled.remove(name) {
+                    let _ = crate::settings::write_disabled_catalogs(disabled);
+                }
+                println!("OK — {count} dataset(s). Enabled.");
+            }
+            Err(e) => {
+                eprintln!("Still failing: {e}");
+                eprintln!("Left disabled. Fix the URL with 'e' (edit) in the config view.");
+            }
+        }
+    });
 }
 
 /// Run the dataset picker. The caller provides a `dispatch` closure
@@ -1940,7 +2248,7 @@ pub enum PickerOutcome {
 /// restores its own chrome immediately after. Picker state (cursor,
 /// expanded set, filter, scroll, menu cursor) is preserved across
 /// dispatches because the function never exits between them.
-pub fn run_picker<F>(mut dispatch: F) -> PickerOutcome
+pub fn run_picker<F>(mut dispatch: F, start_in_settings: bool) -> PickerOutcome
 where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
 {
     // Third dispatch argument is `pause_after`: when true, the runner
@@ -2032,6 +2340,21 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     // dataset counts, the disabled set (session-scoped — comment the
     // entry out in catalogs.yaml to disable persistently), and the
     // screen's open/cursor state.
+    // name → configured location, from catalogs.yaml (the authoritative
+    // name↔location binding) — EVERY configured catalog, including disabled
+    // and unvalidated ones that resolve to no datasets. Drives the config
+    // pane's catalog list, the URL shown under the highlighted catalog, and
+    // removal by exact source line.
+    let catalog_locations: std::collections::HashMap<String, String> =
+        crate::catalog::sources::named_catalog_entries(
+            &crate::catalog::sources::config_dir())
+            .into_iter()
+            .map(|s| (s.name, s.location))
+            .collect();
+    // Every configured catalog with its dataset count: resolved catalogs
+    // (from `entries`) first, then any configured catalog that resolved to
+    // 0 datasets (disabled / unvalidated / unreachable) so it still shows
+    // in the config pane and can be fixed or re-enabled.
     let catalog_list: Vec<(String, usize)> = {
         let mut ordered: Vec<(String, usize)> = Vec::new();
         for e in entries {
@@ -2041,19 +2364,52 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 None => ordered.push((name, 1)),
             }
         }
+        let mut extra: Vec<&String> = catalog_locations.keys()
+            .filter(|n| !ordered.iter().any(|(x, _)| x == *n))
+            .collect();
+        extra.sort();
+        for name in extra {
+            ordered.push((name.clone(), 0));
+        }
         ordered
     };
+    // Catalog names that have a credential recorded for their URL (the
+    // auth indicator). Joined pairwise by name: catalogs.yaml gives
+    // name→url, credentials.toml is keyed by url. Rebuilt on reload (the
+    // whole picker re-runs), so it always reflects what's on disk.
+    let authed_catalogs: std::collections::HashSet<String> = catalog_locations.iter()
+        .filter(|(_, url)| crate::credentials::credential_for_url(url).is_some())
+        .map(|(name, _)| name.clone())
+        .collect();
     // Seed from the persisted `disabled_catalogs` setting; only
     // names that actually exist in this session's catalog list count
     // (a stale name in settings silently waits for its catalog to
     // come back).
     let mut disabled_catalogs: std::collections::HashSet<String> =
         crate::settings::disabled_catalogs().into_iter().collect();
+    // Catalogs saved but failing verification — kept disabled and flagged
+    // for fixing (edit / re-check). Mutated + persisted alongside
+    // disabled_catalogs by the add/edit/re-validate flow.
+    let mut unvalidated_catalogs: std::collections::HashSet<String> =
+        crate::settings::unvalidated_catalogs().into_iter().collect();
     // Hidden columns, persisted as the `disabled_columns` key.
     let mut disabled_columns: std::collections::HashSet<String> =
         crate::settings::disabled_columns().into_iter().collect();
-    let mut catalog_screen = false;
+    // Opens straight onto the config view after a reload triggered by a
+    // catalog change (add/edit/remove/auth), so the user sees the result
+    // (and the colour-coded status) on the Catalogs pane they came from.
+    let mut catalog_screen = start_in_settings;
     let mut catalog_cursor: usize = 0;
+    // Which settings tab is active (the screen is a tabbed/faceted view);
+    // Tab / Shift-Tab move between tabs, resetting catalog_cursor.
+    let mut settings_tab = SettingsTab::Catalogs;
+    // Settings-screen sub-modes (meaningful only while `catalog_screen`):
+    //   add_input      — capturing a new catalog's name, URL, token.
+    //   auth_input     — setting/clearing auth for an existing catalog.
+    //   confirm_remove — holds a catalog name pending a remove keystroke.
+    let mut add_input: Option<AddCatalogInput> = None;
+    let mut auth_input: Option<AuthInput> = None;
+    let mut confirm_remove: Option<String> = None;
     let mut cursor: usize = 0;
     let mut scroll: usize = 0;
     let mut show_all_profiles = false;
@@ -2061,6 +2417,11 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     let mut show_help = false;
     let mut show_details = false;
     let mut menu_open = false;
+    // Two-press quit guard for the picker's final exit (Esc / Ctrl-D):
+    // the first press arms + prompts, a second within QUIT_CONFIRM quits.
+    // Ctrl-C stays the unguarded escape hatch.
+    const QUIT_CONFIRM: std::time::Duration = std::time::Duration::from_secs(1);
+    let mut quit_armed: Option<std::time::Instant> = None;
     // ── Multi-select state ─────────────────────────────────────────
     // `selected` is the persistent set of toggled row specifiers
     // (`<dataset>:<profile>`). Space toggles the cursor row in/out.
@@ -2138,6 +2499,20 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
             cursor = visible.len() - 1;
         }
 
+        // Catalog activity for the title summary: `[n catalogs]` when
+        // they're all on, `[m/n catalogs] active` once any has been
+        // toggled off (Ctrl-G), so the row count is read against how
+        // many catalogs are actually contributing.
+        let total_catalogs = catalog_list.len();
+        let active_catalogs = catalog_list.iter()
+            .filter(|(n, _)| !disabled_catalogs.contains(n))
+            .count();
+        let catalog_summary = if active_catalogs == total_catalogs {
+            format!("[{total_catalogs} catalogs]")
+        } else {
+            format!("[{active_catalogs}/{total_catalogs} catalogs] active")
+        };
+
         // Local closures bound to the current theme state. `tinted`
         // applies an accent colour only when colours are enabled; in
         // mono mode it returns terminal-default styling (with modifier
@@ -2180,9 +2555,10 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     .block(Block::default().borders(Borders::ALL)
                         .border_style(bordered(theme().info))
                         .title(Span::styled(
-                            format!(" Select Dataset — {} shown ({}) ",
+                            format!(" Select Dataset — {} shown ({}) {} ",
                                 visible.len(),
-                                if show_all_profiles { "all profiles" } else { "default only — Tab for all" }),
+                                if show_all_profiles { "all profiles" } else { "default only — Tab for all" },
+                                catalog_summary),
                             tinted(theme().primary),
                         ))),
                 chunks[0],
@@ -2235,12 +2611,12 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     cont("D=Distances M=Meta P=Predicates R=Results F=Filtered"),
                     group("Select",    "Space toggles row · Shift+↑↓ extends range, Space commits"),
                     cont("Enter with a selection → batch menu (Download/Ping/Purge)"),
-                    group("Inspect",   "Ctrl-D details panel · Enter menu → Describe/Source/Locate"),
+                    group("Inspect",   "Enter menu → Describe / Source / Details / Locate"),
                     group("Configure", "Ctrl-G settings: catalogs · columns · theme · reset"),
                     cont("Ctrl-T mono/colour (terminals that mangle ANSI)"),
                     group("Overlays",  "↑↓ or j/k scroll · g/G Home/End ends · Esc or q close"),
-                    group("Exit",      "Esc peels: help → range → selection → details →"),
-                    cont("expanded → filter → exit · Ctrl-C quits now · ? this help"),
+                    group("Exit",      "Esc/Ctrl-D peel: help → range → selection → details →"),
+                    cont("expanded → filter, then again to quit · Ctrl-C quits now"),
                 ];
                 frame.render_widget(
                     Paragraph::new(help).block(Block::default().borders(Borders::ALL)
@@ -2552,17 +2928,26 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
             // in nano) keeps the config entry point discoverable
             // without blowing the width budget — settings must be
             // findable without first finding help.
+            // When a quit is armed, the hint line becomes the confirm
+            // prompt (in the warning colour) so the second Esc/Ctrl-D is
+            // a deliberate one.
+            let quit_pending = quit_armed.map(|t| t.elapsed() < QUIT_CONFIRM).unwrap_or(false);
+            let (hint, hint_color) = if quit_pending {
+                (" Press Esc (or Ctrl-D) again to quit — any other key cancels",
+                 theme().warning)
+            } else {
+                (" type: filter · Space: select · Enter: menu · ^G: config · ?: help · Esc/^D: quit",
+                 theme().text_muted)
+            };
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from(Span::styled(summary_line, tinted(theme().primary))),
-                    Line::from(Span::styled(
-                        " type: filter · Space: select · Enter: menu · ^G: config · ?: help · Esc: quit",
-                        tinted(theme().text_muted))),
+                    Line::from(Span::styled(hint, tinted(hint_color))),
                 ]),
                 chunks[3],
             );
 
-            // Stats overlay (Ctrl-D toggle). Renders on top of the
+            // Stats overlay (Enter menu → Details). Renders on top of the
             // list area, anchored to the bottom of the screen and
             // covering roughly the lower 60% horizontally centred,
             // so the filter line and footer stay visible.
@@ -2595,7 +2980,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 }
 
             // Descriptor overlay (Describe action). Larger than the
-            // Ctrl-D details popup so the full facet list, windows,
+            // Details popup so the full facet list, windows,
             // and origin URLs stay readable; scrollable to handle
             // dataset.yaml descriptors that overflow the screen.
             if descriptor_open {
@@ -2749,16 +3134,33 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 );
             }
 
-            // Settings screen (Ctrl-G): catalogs, columns, theme,
-            // reset — one cursor over the actionable items, section
-            // headers rendered between them. Toggles persist
-            // immediately; theme cycles are session state with an
-            // explicit save item.
+            // Settings screen (Ctrl-G): a faceted, tabbed view —
+            // Catalogs / Columns / Theme / Maintenance. Tab and Shift-Tab
+            // move between tabs; ↑↓ move the cursor within the active tab.
+            // Toggles persist immediately; theme cycles are session state
+            // with an explicit save item.
             if catalog_screen {
-                let items = settings_items(&catalog_list);
+                let items = settings_tab.items(&catalog_list);
                 let outer = frame.area();
-                // items + 4 section headers + frame + hint rows.
-                let h: u16 = (items.len() as u16) + 9;
+                // Only the highlighted catalog reveals its URL + count +
+                // auth (three detail rows); every other catalog shows name
+                // only.
+                let highlighted_catalog = match items.get(catalog_cursor) {
+                    Some(SettingsItem::CatalogToggle(n)) => Some(n.clone()),
+                    _ => None,
+                };
+                let highlighted_unvalidated = highlighted_catalog.as_ref()
+                    .map(|n| unvalidated_catalogs.contains(n)).unwrap_or(false);
+                // Validated catalog detail = url + count + auth (3 rows); an
+                // unvalidated one = url + the ⚠ fix line (2 rows).
+                let detail_h: u16 = match (&highlighted_catalog, highlighted_unvalidated) {
+                    (Some(_), false) => 3,
+                    (Some(_), true) => 2,
+                    (None, _) => 0,
+                };
+                // tab bar (1) + blank (1) + items + detail + blank (1)
+                // + hint (1) + borders (2).
+                let h: u16 = (items.len() as u16) + 6 + detail_h;
                 let w: u16 = 76;
                 let area = ratatui::layout::Rect {
                     x: outer.x + outer.width.saturating_sub(w) / 2,
@@ -2767,73 +3169,272 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     height: h.min(outer.height),
                 };
                 let (cur_palette, cur_curve) = super::theme_palette_curve();
-                let header = |t: &str| Line::from(Span::styled(
-                    format!(" {t}"), tinted(theme().info)));
+                // Palette/curve are session state persisted only by "save
+                // theme"; flag them when the live value differs from what's
+                // saved in settings.yaml so unsaved changes are visible.
+                let (saved_palette, saved_curve) = super::resolve_palette_curve(None, None);
+                let palette_dirty = cur_palette.name() != saved_palette.name();
+                let curve_dirty = cur_curve.name() != saved_curve.name();
+                let theme_dirty = palette_dirty || curve_dirty;
+                // Warning-coloured style for a modified-but-unsaved row.
+                let dirty_style = |selected: bool| if selected {
+                    tinted(theme().warning).add_modifier(Modifier::REVERSED)
+                } else {
+                    tinted(theme().warning)
+                };
                 let mut lines: Vec<Line> = Vec::new();
-                let mut last_section = "";
-                for (i, item) in items.iter().enumerate() {
-                    let section = match item {
-                        SettingsItem::CatalogToggle(_) => "Catalogs",
-                        SettingsItem::ColumnToggle(_) => "Columns",
-                        SettingsItem::PaletteCycle
-                        | SettingsItem::CurveCycle
-                        | SettingsItem::SaveTheme => "Theme",
-                        SettingsItem::ResetDisplay => "Maintenance",
-                    };
-                    if section != last_section {
-                        lines.push(header(section));
-                        last_section = section;
+                // Tab bar: the active tab inverted, the rest dim.
+                let mut tab_spans: Vec<Span> = vec![Span::raw(" ")];
+                for (i, t) in SettingsTab::ALL.iter().enumerate() {
+                    if i > 0 {
+                        tab_spans.push(Span::styled(" · ", tinted(theme().text_dim)));
                     }
+                    let style = if *t == settings_tab {
+                        selected_style()
+                    } else {
+                        tinted(theme().text_dim)
+                    };
+                    tab_spans.push(Span::styled(format!(" {} ", t.title()), style));
+                }
+                lines.push(Line::from(tab_spans));
+                lines.push(Line::from(""));
+                for (i, item) in items.iter().enumerate() {
                     let marker = if i == catalog_cursor { " ▸ " } else { "   " };
                     let (text, enabled) = match item {
+                        // Name + checkbox only, with a lock when a
+                        // credential is recorded for it; the URL/count/auth
+                        // detail appears below for the highlighted one.
                         SettingsItem::CatalogToggle(name) => {
                             let enabled = !disabled_catalogs.contains(name);
-                            let count = catalog_list.iter()
-                                .find(|(n, _)| n == name)
-                                .map(|(_, c)| *c)
-                                .unwrap_or(0);
-                            (format!("[{}] {name}  ({count} dataset{})",
-                                if enabled { "x" } else { " " },
-                                if count == 1 { "" } else { "s" }), enabled)
+                            let lock = if authed_catalogs.contains(name) { "  🔒" } else { "" };
+                            let warn = if unvalidated_catalogs.contains(name) { "  ⚠" } else { "" };
+                            (format!("[{}] {name}{lock}{warn}",
+                                if enabled { "x" } else { " " }), enabled)
                         }
+                        SettingsItem::AddCatalog =>
+                            ("+ add a catalog…".to_string(), true),
                         SettingsItem::ColumnToggle(col) => {
                             let enabled = !disabled_columns.contains(col.name());
                             (format!("[{}] {} column",
                                 if enabled { "x" } else { " " }, col.name()), enabled)
                         }
                         SettingsItem::PaletteCycle =>
-                            (format!("palette: {}  (Space cycles)", cur_palette.name()), true),
+                            (format!("palette: {}{}  (Space cycles)", cur_palette.name(),
+                                if palette_dirty { " *modified" } else { "" }), true),
                         SettingsItem::CurveCycle =>
-                            (format!("curve: {}  (Space cycles)", cur_curve.name()), true),
+                            (format!("curve: {}{}  (Space cycles)", cur_curve.name(),
+                                if curve_dirty { " *modified" } else { "" }), true),
                         SettingsItem::SaveTheme =>
-                            ("save theme to settings as default".to_string(), true),
+                            (if theme_dirty {
+                                "save theme to settings as default  *unsaved".to_string()
+                            } else {
+                                "save theme to settings as default".to_string()
+                            }, true),
                         SettingsItem::ResetDisplay =>
                             ("reset display options (palette, curve, columns)".to_string(), true),
                     };
-                    let style = if i == catalog_cursor {
-                        selected_style()
-                    } else if enabled {
-                        tinted(theme().text_primary)
-                    } else {
-                        tinted(theme().text_dim)
+                    // Catalog rows are colour-coded by status — green active,
+                    // dim disabled, warning unvalidated — so state reads at a
+                    // glance; the cursor row keeps that colour but reversed.
+                    let style = match item {
+                        SettingsItem::CatalogToggle(name) => {
+                            let sc = if unvalidated_catalogs.contains(name) {
+                                theme().warning
+                            } else if disabled_catalogs.contains(name) {
+                                theme().text_dim
+                            } else {
+                                theme().success
+                            };
+                            if i == catalog_cursor {
+                                tinted(sc).add_modifier(Modifier::REVERSED)
+                            } else {
+                                tinted(sc)
+                            }
+                        }
+                        SettingsItem::PaletteCycle if palette_dirty =>
+                            dirty_style(i == catalog_cursor),
+                        SettingsItem::CurveCycle if curve_dirty =>
+                            dirty_style(i == catalog_cursor),
+                        SettingsItem::SaveTheme if theme_dirty =>
+                            dirty_style(i == catalog_cursor),
+                        _ if i == catalog_cursor => selected_style(),
+                        _ if enabled => tinted(theme().text_primary),
+                        _ => tinted(theme().text_dim),
                     };
                     lines.push(Line::from(Span::styled(format!("{marker}{text}"), style)));
                 }
+                // Detail for the highlighted catalog: source URL, then either
+                // the count + auth (validated) or the ⚠ fix line (unvalidated).
+                if let Some(SettingsItem::CatalogToggle(name)) = items.get(catalog_cursor) {
+                    let loc = catalog_locations.get(name).map(String::as_str)
+                        .unwrap_or("(not a catalogs.yaml entry — not removable here)");
+                    lines.push(Line::from(Span::styled(
+                        format!("      {loc}"), tinted(theme().text_muted))));
+                    if unvalidated_catalogs.contains(name) {
+                        lines.push(Line::from(Span::styled(
+                            "      ⚠ not validated — e: edit & re-check · Space: re-check",
+                            tinted(theme().warning))));
+                    } else {
+                        let count = catalog_list.iter()
+                            .find(|(n, _)| n == name).map(|(_, c)| *c).unwrap_or(0);
+                        lines.push(Line::from(Span::styled(
+                            format!("      {count} dataset{}", if count == 1 { "" } else { "s" }),
+                            tinted(theme().text_dim))));
+                        // Auth line: who when a credential is stored, else a
+                        // hint that `c` provides one.
+                        let auth_line = match catalog_locations.get(name)
+                            .and_then(|u| crate::credentials::credential_for_url(u))
+                        {
+                            Some(e) => {
+                                let who = e.user.as_deref().unwrap_or("token");
+                                format!("      🔒 auth: {who} (c: change · c then empty: clear)")
+                            }
+                            None => "      no auth — c: provide a token".to_string(),
+                        };
+                        lines.push(Line::from(Span::styled(auth_line, tinted(theme().info))));
+                    }
+                }
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    " Space/Enter: toggle/activate — toggles persist to settings.yaml",
-                    tinted(theme().text_muted),
-                )));
+                let hint = if matches!(settings_tab, SettingsTab::Catalogs) {
+                    " ←→ tabs · ↑↓ move · Space toggle · a:add e:edit c:auth x:remove"
+                } else {
+                    " ←→ tabs · ↑↓ move · Space: toggle/activate"
+                };
+                lines.push(Line::from(Span::styled(hint, tinted(theme().text_muted))));
                 frame.render_widget(ratatui::widgets::Clear, area);
                 frame.render_widget(
                     Paragraph::new(lines)
                         .block(Block::default().borders(Borders::ALL)
                             .border_style(bordered(theme().primary))
                             .title(Span::styled(
-                                " Settings — ↑↓ j/k move · Space toggle · Esc/q close ",
+                                " Settings — ←→/Tab: tabs · Esc/Ctrl-D: close ",
                                 tinted(theme().primary)))),
                     area,
                 );
+
+                // Add-catalog input overlay (on top of the settings box).
+                if let Some(input) = &add_input {
+                    let iw: u16 = 66;
+                    let ih: u16 = 9;
+                    let ia = ratatui::layout::Rect {
+                        x: outer.x + outer.width.saturating_sub(iw) / 2,
+                        y: outer.y + outer.height.saturating_sub(ih) / 2,
+                        width: iw.min(outer.width),
+                        height: ih.min(outer.height),
+                    };
+                    let field_style = |active: bool| if active {
+                        tinted(theme().info)
+                    } else {
+                        tinted(theme().text_dim)
+                    };
+                    // The token is a secret — show it masked.
+                    let masked = "•".repeat(input.token.chars().count());
+                    // Each field line is "  <label>  <value>"; the value
+                    // starts at a fixed column (FIELD_COL) so the cursor
+                    // math is uniform.
+                    const FIELD_COL: u16 = 10;
+                    let il = vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            format!("  name:   {}", input.name),
+                            field_style(input.field == AddField::Name))),
+                        Line::from(Span::styled(
+                            format!("  url:    {}", input.url),
+                            field_style(input.field == AddField::Url))),
+                        Line::from(Span::styled(
+                            format!("  token:  {masked}"),
+                            field_style(input.field == AddField::Token))),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Tab: next field · Enter: verify+save · Esc: cancel · token optional",
+                            tinted(theme().text_muted))),
+                    ];
+                    frame.render_widget(ratatui::widgets::Clear, ia);
+                    frame.render_widget(
+                        Paragraph::new(il).block(Block::default().borders(Borders::ALL)
+                            .border_style(bordered(theme().primary))
+                            .title(Span::styled(" Add catalog ", tinted(theme().primary)))),
+                        ia,
+                    );
+                    // Real (terminal-native, blinking) cursor at the end of
+                    // the active field — replaces the painted underscore.
+                    let (line_idx, val_len) = match input.field {
+                        AddField::Name => (1u16, input.name.chars().count() as u16),
+                        AddField::Url => (2, input.url.chars().count() as u16),
+                        AddField::Token => (3, input.token.chars().count() as u16),
+                    };
+                    let cx = (ia.x + 1 + FIELD_COL + val_len)
+                        .min(ia.x + ia.width.saturating_sub(2));
+                    frame.set_cursor_position((cx, ia.y + 1 + line_idx));
+                }
+
+                // Set-auth input overlay (token for an existing catalog).
+                if let Some(auth) = &auth_input {
+                    let aw: u16 = 66;
+                    let ah: u16 = 8;
+                    let aa = ratatui::layout::Rect {
+                        x: outer.x + outer.width.saturating_sub(aw) / 2,
+                        y: outer.y + outer.height.saturating_sub(ah) / 2,
+                        width: aw.min(outer.width),
+                        height: ah.min(outer.height),
+                    };
+                    let masked = "•".repeat(auth.token.chars().count());
+                    const AUTH_FIELD_COL: u16 = 11; // width of "  token:   "
+                    let al = vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            format!("  catalog: {}", auth.name), tinted(theme().text_muted))),
+                        Line::from(Span::styled(
+                            format!("  {}", auth.url), tinted(theme().text_dim))),
+                        Line::from(Span::styled(
+                            format!("  token:   {masked}"), tinted(theme().info))),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Enter: save (empty clears) · Esc: cancel",
+                            tinted(theme().text_muted))),
+                    ];
+                    frame.render_widget(ratatui::widgets::Clear, aa);
+                    frame.render_widget(
+                        Paragraph::new(al).block(Block::default().borders(Borders::ALL)
+                            .border_style(bordered(theme().info))
+                            .title(Span::styled(" Set auth ", tinted(theme().info)))),
+                        aa,
+                    );
+                    // Real (blinking) cursor at the end of the token field.
+                    let cx = (aa.x + 1 + AUTH_FIELD_COL + auth.token.chars().count() as u16)
+                        .min(aa.x + aa.width.saturating_sub(2));
+                    frame.set_cursor_position((cx, aa.y + 1 + 3));
+                }
+
+                // Remove-confirmation overlay.
+                if let Some(name) = &confirm_remove {
+                    let cw: u16 = 64;
+                    let ch: u16 = 7;
+                    let ca = ratatui::layout::Rect {
+                        x: outer.x + outer.width.saturating_sub(cw) / 2,
+                        y: outer.y + outer.height.saturating_sub(ch) / 2,
+                        width: cw.min(outer.width),
+                        height: ch.min(outer.height),
+                    };
+                    let loc = catalog_locations.get(name).map(String::as_str).unwrap_or("");
+                    let cl = vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            format!("  Remove catalog '{name}'?"), tinted(theme().text_primary))),
+                        Line::from(Span::styled(format!("  {loc}"), tinted(theme().text_muted))),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  y: remove from catalogs.yaml · any other key: cancel",
+                            tinted(theme().text_muted))),
+                    ];
+                    frame.render_widget(ratatui::widgets::Clear, ca);
+                    frame.render_widget(
+                        Paragraph::new(cl).block(Block::default().borders(Borders::ALL)
+                            .border_style(bordered(theme().warning))
+                            .title(Span::styled(" Confirm remove ", tinted(theme().warning)))),
+                        ca,
+                    );
+                }
             }
         });
         if let Err(e) = drew {
@@ -2846,14 +3447,28 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
         // Events
         if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false)
             && let Ok(Event::Key(key)) = event::read() {
+                // Ctrl-C: immediate hard quit (the escape hatch), before
+                // any rewrite below.
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     result = PickerOutcome::Done;
                     break;
                 }
-                if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    show_details = !show_details;
-                    continue;
-                }
+                // Ctrl-D is an alternate Esc — the soft "back / quit" key,
+                // matching the visualizer. Rewriting it to Esc here means it
+                // flows through the same cascade + double-tap-to-quit below
+                // (and closes modals) with no special-casing. (Details moved
+                // to the Enter menu so Ctrl-D is free for this.)
+                let key = if key.code == KeyCode::Char('d')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+                } else {
+                    key
+                };
+                // Any key disarms a pending quit-confirm; the Esc cascade's
+                // final step re-arms it, so two Escs (or Ctrl-Ds) in a row
+                // quit while a stray key cancels.
+                let prev_quit = quit_armed.take();
                 if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     // Ctrl-T: toggle colour theme. The rendering
                     // codepaths fall back to terminal-default fg/bg
@@ -2879,9 +3494,169 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 // persist immediately (checkbox semantics); theme
                 // cycles are session state with an explicit save item.
                 if catalog_screen {
-                    let items = settings_items(&catalog_list);
+                    // Sub-modal: typing a new catalog's name, URL, token.
+                    // Captures every key; Enter advances/saves, Esc cancels.
+                    if add_input.is_some() {
+                        match key.code {
+                            KeyCode::Esc => { add_input = None; }
+                            // Tab / Shift-Tab cycle between the fields so any
+                            // can be edited (not just forward via Enter).
+                            KeyCode::Tab => {
+                                let input = add_input.as_mut().unwrap();
+                                input.field = match input.field {
+                                    AddField::Name => AddField::Url,
+                                    AddField::Url => AddField::Token,
+                                    AddField::Token => AddField::Name,
+                                };
+                            }
+                            KeyCode::BackTab => {
+                                let input = add_input.as_mut().unwrap();
+                                input.field = match input.field {
+                                    AddField::Name => AddField::Token,
+                                    AddField::Url => AddField::Name,
+                                    AddField::Token => AddField::Url,
+                                };
+                            }
+                            KeyCode::Backspace => {
+                                let input = add_input.as_mut().unwrap();
+                                match input.field {
+                                    AddField::Name => { input.name.pop(); }
+                                    AddField::Url => { input.url.pop(); }
+                                    AddField::Token => { input.token.pop(); }
+                                }
+                            }
+                            KeyCode::Char(c)
+                                if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let input = add_input.as_mut().unwrap();
+                                match input.field {
+                                    AddField::Name => input.name.push(c),
+                                    AddField::Url => input.url.push(c),
+                                    AddField::Token => input.token.push(c),
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let field = add_input.as_ref().unwrap().field;
+                                match field {
+                                    // Enter advances linearly; Tab jumps freely.
+                                    AddField::Name =>
+                                        add_input.as_mut().unwrap().field = AddField::Url,
+                                    AddField::Url =>
+                                        add_input.as_mut().unwrap().field = AddField::Token,
+                                    // Token (optional) → validate the required
+                                    // fields (Tab may have skipped them), record
+                                    // any credential first (so a protected
+                                    // endpoint authenticates), then verify + save.
+                                    AddField::Token => {
+                                        let (name, url, token) = {
+                                            let inp = add_input.as_ref().unwrap();
+                                            (inp.name.trim().to_string(),
+                                             inp.url.trim().to_string(),
+                                             inp.token.trim().to_string())
+                                        };
+                                        if name.is_empty() {
+                                            flash = Some("a catalog must be given a name".into());
+                                            add_input.as_mut().unwrap().field = AddField::Name;
+                                            continue;
+                                        }
+                                        if url.is_empty() {
+                                            flash = Some("enter a catalog URL or path".into());
+                                            add_input.as_mut().unwrap().field = AddField::Url;
+                                            continue;
+                                        }
+                                        let replacing = add_input.as_ref()
+                                            .unwrap().replacing.clone();
+                                        // Verify with the chrome suspended so
+                                        // progress + any failure message land
+                                        // on the console; saves disabled +
+                                        // flags unvalidated on failure.
+                                        add_or_edit_catalog(
+                                            &mut terminal, &name, &url, &token,
+                                            replacing.as_deref(), &catalog_locations,
+                                            &mut disabled_catalogs, &mut unvalidated_catalogs);
+                                        result = PickerOutcome::Reload;
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    // Sub-modal: setting/clearing auth for an existing catalog.
+                    if auth_input.is_some() {
+                        match key.code {
+                            KeyCode::Esc => { auth_input = None; }
+                            KeyCode::Backspace => { auth_input.as_mut().unwrap().token.pop(); }
+                            KeyCode::Char(c)
+                                if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                auth_input.as_mut().unwrap().token.push(c);
+                            }
+                            KeyCode::Enter => {
+                                let AuthInput { name, url, token } = auth_input.take().unwrap();
+                                let token = token.trim();
+                                let outcome = if token.is_empty() {
+                                    crate::credentials::clear_catalog_credential(&url)
+                                        .map(|removed| if removed {
+                                            format!("cleared auth for '{name}'")
+                                        } else {
+                                            format!("no auth was set for '{name}'")
+                                        })
+                                } else {
+                                    crate::credentials::set_catalog_credential(
+                                        &name, &url, token, None)
+                                        .map(|()| format!("auth set for '{name}'"))
+                                };
+                                match outcome {
+                                    // Reload so a now-authed catalog's datasets
+                                    // load (or a cleared one drops them).
+                                    Ok(_) => { result = PickerOutcome::Reload; break; }
+                                    Err(e) => flash = Some(format!("auth failed: {e}")),
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    // Sub-modal: confirming a catalog removal.
+                    if let Some(name) = confirm_remove.clone() {
+                        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                            confirm_remove = None;
+                            // Remove by exact source (works for both the map
+                            // and legacy-list forms); fall back to the name.
+                            let target = catalog_locations.get(&name).cloned()
+                                .unwrap_or_else(|| name.clone());
+                            match crate::config::try_remove_catalog(&target) {
+                                Ok(true) => {
+                                    if disabled_catalogs.remove(&name) {
+                                        let _ = crate::settings::write_disabled_catalogs(
+                                            &disabled_catalogs);
+                                    }
+                                    // Reload; the catalog vanishing from the
+                                    // list is the confirmation.
+                                    result = PickerOutcome::Reload;
+                                    break;
+                                }
+                                Ok(false) =>
+                                    flash = Some(format!("'{name}' not found in catalogs.yaml")),
+                                Err(e) => flash = Some(format!("remove failed: {e}")),
+                            }
+                        } else {
+                            confirm_remove = None;
+                        }
+                        continue;
+                    }
+                    let items = settings_tab.items(&catalog_list);
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => { catalog_screen = false; }
+                        // Tab / Shift-Tab and ←/→ move between the faceted tabs.
+                        KeyCode::Tab | KeyCode::Right => {
+                            settings_tab = settings_tab.next();
+                            catalog_cursor = 0;
+                        }
+                        KeyCode::BackTab | KeyCode::Left => {
+                            settings_tab = settings_tab.prev();
+                            catalog_cursor = 0;
+                        }
                         KeyCode::Up | KeyCode::Char('k') => {
                             catalog_cursor = catalog_cursor.saturating_sub(1);
                         }
@@ -2890,22 +3665,93 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                 catalog_cursor += 1;
                             }
                         }
+                        // Add a catalog from anywhere on the screen (jumps
+                        // to the Catalogs tab implicitly via the add modal).
+                        KeyCode::Char('a') => { add_input = Some(AddCatalogInput::new()); }
+                        // Set/clear auth for the highlighted catalog.
+                        KeyCode::Char('c') => {
+                            if let Some(SettingsItem::CatalogToggle(name)) =
+                                items.get(catalog_cursor)
+                            {
+                                match catalog_locations.get(name) {
+                                    Some(url) => auth_input = Some(AuthInput {
+                                        name: name.clone(),
+                                        url: url.clone(),
+                                        token: String::new(),
+                                    }),
+                                    None => flash = Some(format!(
+                                        "'{name}' has no URL — can't attach auth")),
+                                }
+                            }
+                        }
+                        // Edit the highlighted catalog in place (fix a typo,
+                        // change URL/token), then re-validate on submit.
+                        KeyCode::Char('e') => {
+                            if let Some(SettingsItem::CatalogToggle(name)) =
+                                items.get(catalog_cursor)
+                            {
+                                match catalog_locations.get(name) {
+                                    Some(url) => {
+                                        let token = crate::credentials::credential_for_url(url)
+                                            .map(|e| e.token).unwrap_or_default();
+                                        add_input = Some(AddCatalogInput::editing(
+                                            name.clone(), url.clone(), token));
+                                    }
+                                    None => flash = Some(format!(
+                                        "'{name}' isn't a catalogs.yaml entry — can't edit here")),
+                                }
+                            }
+                        }
+                        // Remove the highlighted catalog (with confirm).
+                        KeyCode::Char('x') | KeyCode::Delete => {
+                            if let Some(SettingsItem::CatalogToggle(name)) =
+                                items.get(catalog_cursor)
+                            {
+                                if catalog_list.len() <= 1 {
+                                    flash = Some(
+                                        "can't remove the only catalog — add another first".into());
+                                } else if catalog_locations.contains_key(name) {
+                                    confirm_remove = Some(name.clone());
+                                } else {
+                                    flash = Some(format!(
+                                        "'{name}' isn't a removable catalogs.yaml entry"));
+                                }
+                            }
+                        }
                         KeyCode::Char(' ') | KeyCode::Enter => {
                             match items.get(catalog_cursor) {
                                 Some(SettingsItem::CatalogToggle(name)) => {
-                                    if !disabled_catalogs.remove(name) {
-                                        disabled_catalogs.insert(name.clone());
+                                    if unvalidated_catalogs.contains(name) {
+                                        // Not enableable while unvalidated:
+                                        // re-verify in place; it only turns on
+                                        // if it now passes (no file rewrite).
+                                        if let Some(url) = catalog_locations.get(name).cloned() {
+                                            let nm = name.clone();
+                                            revalidate_catalog(
+                                                &mut terminal, &nm, &url,
+                                                &mut disabled_catalogs,
+                                                &mut unvalidated_catalogs);
+                                            result = PickerOutcome::Reload;
+                                            break;
+                                        }
+                                    } else {
+                                        if !disabled_catalogs.remove(name) {
+                                            disabled_catalogs.insert(name.clone());
+                                        }
+                                        if let Err(e) = crate::settings::write_disabled_catalogs(
+                                            &disabled_catalogs)
+                                        {
+                                            flash = Some(format!(
+                                                "could not persist disabled_catalogs: {e}"));
+                                        }
+                                        // The visible row set just changed out
+                                        // from under the main cursor — snap back.
+                                        cursor = 0;
+                                        scroll = 0;
                                     }
-                                    if let Err(e) =
-                                        crate::settings::write_disabled_catalogs(&disabled_catalogs)
-                                    {
-                                        flash = Some(format!("could not persist disabled_catalogs: {e}"));
-                                    }
-                                    // The visible row set just changed
-                                    // out from under the main cursor —
-                                    // snap it back.
-                                    cursor = 0;
-                                    scroll = 0;
+                                }
+                                Some(SettingsItem::AddCatalog) => {
+                                    add_input = Some(AddCatalogInput::new());
                                 }
                                 Some(SettingsItem::ColumnToggle(col)) => {
                                     let name = col.name().to_string();
@@ -3146,6 +3992,11 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                             descriptor_scroll = 0;
                                             descriptor_open = true;
                                         }
+                                        PickerAction::Details => {
+                                            // Quick stats overlay for the
+                                            // cursor row (was Ctrl-D).
+                                            show_details = true;
+                                        }
                                         _ => {} // future picker-local actions land here
                                     }
                                     continue;
@@ -3236,8 +4087,18 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                             cursor = 0;
                             scroll = 0;
                         } else {
-                            result = PickerOutcome::Done;
-                            break;
+                            // Nothing left to peel: two presses within
+                            // QUIT_CONFIRM quit. The first only arms +
+                            // prompts (see the footer). `prev_quit` was
+                            // taken at the top of key handling, so any
+                            // intervening key cancels the arm.
+                            match prev_quit {
+                                Some(t) if t.elapsed() < QUIT_CONFIRM => {
+                                    result = PickerOutcome::Done;
+                                    break;
+                                }
+                                _ => { quit_armed = Some(std::time::Instant::now()); }
+                            }
                         }
                     }
                     KeyCode::Enter => {
@@ -3423,6 +4284,19 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     size_probe_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    // On final exit (not a reload), leave a persistent note on the console
+    // for any catalog still saved-but-unvalidated, so it isn't forgotten.
+    if !matches!(result, PickerOutcome::Reload) && !unvalidated_catalogs.is_empty() {
+        let mut names: Vec<&str> = unvalidated_catalogs.iter().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        eprintln!();
+        eprintln!("⚠ {} catalog(s) saved but disabled — failed validation, needs fixing:",
+            names.len());
+        for n in names {
+            eprintln!("    {n}");
+        }
+        eprintln!("  In `vectordata explore`, open the config view (Ctrl-G) and press 'e' to edit & re-validate.");
+    }
     result
 }
 

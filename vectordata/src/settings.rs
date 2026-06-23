@@ -379,6 +379,19 @@ pub fn write_disabled_catalogs(names: &std::collections::HashSet<String>) -> Res
     write_csv_setting("disabled_catalogs", names)
 }
 
+/// Catalog names that were saved but failed verification (parse/ping) —
+/// kept disabled and flagged for fixing in the picker's config view, so a
+/// typo'd URL isn't lost. A catalog leaves this set only by re-validating
+/// (edit-and-re-add, or enable-which-re-checks).
+pub fn unvalidated_catalogs() -> Vec<String> {
+    csv_setting("unvalidated_catalogs")
+}
+
+/// Persist the unvalidated-catalog set.
+pub fn write_unvalidated_catalogs(names: &std::collections::HashSet<String>) -> Result<PathBuf, String> {
+    write_csv_setting("unvalidated_catalogs", names)
+}
+
 /// Picker columns hidden by the user; see the settings screen.
 pub fn disabled_columns() -> Vec<String> {
     csv_setting("disabled_columns")

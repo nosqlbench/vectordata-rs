@@ -54,6 +54,12 @@ pub struct Entry {
     /// credential lapses rather than surprising the user with a 401.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
+    /// Informational name-tag: the configured catalog this credential was
+    /// provided for, so the explorer can join credentials to catalogs
+    /// pairwise by name. Resolution still matches by URL (this field is
+    /// never consulted for that) — it only labels the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
 }
 
 /// A stored credential's standing relative to a reference time.
@@ -170,18 +176,74 @@ pub fn credential_key(url: &str) -> Option<String> {
 }
 
 /// The cached store for this process (so per-request reads don't re-read
-/// the file). A short-lived CLI invocation loads it once.
-fn cached_store() -> &'static Store {
-    static STORE: OnceLock<Store> = OnceLock::new();
-    STORE.get_or_init(Store::load)
+/// the file). A short-lived CLI invocation loads it once; a long-running
+/// one (the explorer) refreshes it via [`reload_credentials`] after
+/// writing a credential, so reads pick up the change without a restart.
+fn store_cache() -> &'static std::sync::RwLock<Store> {
+    static STORE: OnceLock<std::sync::RwLock<Store>> = OnceLock::new();
+    STORE.get_or_init(|| std::sync::RwLock::new(Store::load()))
+}
+
+/// Re-read the process credential cache from disk. Call after a write so
+/// subsequent [`resolve_read_token`] calls in the same process see the
+/// new credential (the interactive explorer relies on this; short-lived
+/// CLI runs never need it).
+pub fn reload_credentials() {
+    if let Ok(mut g) = store_cache().write() {
+        *g = Store::load();
+    }
 }
 
 /// Resolve a bearer token for a **read/pull** to `url`: `$VECTORDATA_TOKEN`,
 /// then the credential recorded at `vectordata login` for the URL's origin,
 /// else `None` (anonymous).
 pub fn resolve_read_token(url: &Url) -> Option<String> {
-    let env = std::env::var("VECTORDATA_TOKEN").ok().filter(|t| !t.is_empty());
-    resolve_read_token_with(env.as_deref(), url, cached_store())
+    if let Some(t) = std::env::var("VECTORDATA_TOKEN").ok().filter(|t| !t.is_empty()) {
+        return Some(t);
+    }
+    let guard = store_cache().read().ok()?;
+    resolve_read_token_with(None, url, &guard)
+}
+
+/// The stored credential governing `url` (longest-prefix match), loaded
+/// fresh from disk — for the explorer's auth indicator and detail. None
+/// means no credential is recorded for that URL.
+pub fn credential_for_url(url: &str) -> Option<Entry> {
+    Store::load().token_for_url(url).cloned()
+}
+
+/// Record a bearer credential for a catalog: stored under the catalog
+/// URL's [`credential_key`] (so catalog fetch, verify, and every facet
+/// read authenticate by URL) and tagged with the catalog `name` for the
+/// pairwise join in the config view. Persists to `credentials.toml`
+/// (`0600`) and refreshes the process cache so it takes effect at once.
+pub fn set_catalog_credential(
+    name: &str, url: &str, token: &str, user: Option<&str>,
+) -> Result<(), String> {
+    let key = credential_key(url).ok_or_else(|| format!("not a valid catalog URL: {url}"))?;
+    let mut store = Store::load();
+    store.set(key, Entry {
+        token: token.to_string(),
+        user: user.map(str::to_string).filter(|u| !u.is_empty()),
+        expires: None,
+        catalog: Some(name.to_string()),
+    });
+    store.save().map_err(|e| format!("saving {}: {e}", credentials_path().display()))?;
+    reload_credentials();
+    Ok(())
+}
+
+/// Remove any credential stored for a catalog URL. Returns whether one
+/// was present. Refreshes the process cache on removal.
+pub fn clear_catalog_credential(url: &str) -> Result<bool, String> {
+    let Some(key) = credential_key(url) else { return Ok(false) };
+    let mut store = Store::load();
+    let removed = store.remove(&key);
+    if removed {
+        store.save().map_err(|e| format!("saving {}: {e}", credentials_path().display()))?;
+        reload_credentials();
+    }
+    Ok(removed)
 }
 
 /// Pure core of [`resolve_read_token`]: `$VECTORDATA_TOKEN` (passed in) wins,
@@ -383,7 +445,7 @@ mod tests {
         let mut store = Store::default();
         store.set(
             "https://vecd-host:8443".to_string(),
-            Entry { token: "login-tok".to_string(), user: Some("alice".to_string()), expires: None },
+            Entry { token: "login-tok".to_string(), user: Some("alice".to_string()), expires: None, catalog: None },
         );
         // A facet URL under that origin — what the access API reads.
         let facet =
@@ -412,11 +474,11 @@ mod tests {
         let mut store = Store::default();
         store.set(
             "https://h:8443".to_string(),
-            Entry { token: "origin-tok".into(), user: None, expires: None },
+            Entry { token: "origin-tok".into(), user: None, expires: None, catalog: None },
         );
         store.set(
             "https://h:8443/datasets".to_string(),
-            Entry { token: "cat-tok".into(), user: None, expires: None },
+            Entry { token: "cat-tok".into(), user: None, expires: None, catalog: None },
         );
 
         // A read under the catalog path → the catalog-scoped token (most specific).
@@ -430,7 +492,7 @@ mod tests {
         let mut store2 = Store::default();
         store2.set(
             "https://h:8443/data".to_string(),
-            Entry { token: "data-tok".into(), user: None, expires: None },
+            Entry { token: "data-tok".into(), user: None, expires: None, catalog: None },
         );
         let sibling = Url::parse("https://h:8443/datasets/x.fvecs").unwrap();
         assert_eq!(
@@ -486,6 +548,7 @@ mod tests {
             token: "t".into(),
             user: None,
             expires: exp.map(str::to_string),
+            catalog: None,
         };
         // now = 1_000_000.
         assert_eq!(mk(None).expiry_status(1_000_000), Expiry::Unknown);
@@ -510,7 +573,7 @@ mod tests {
         let mut s = Store::default();
         s.set(
             "https://h:1".into(),
-            Entry { token: "vd_abc".into(), user: Some("alice".into()), expires: None },
+            Entry { token: "vd_abc".into(), user: Some("alice".into()), expires: None, catalog: None },
         );
         assert_eq!(s.get("https://h:1").unwrap().token, "vd_abc");
         assert_eq!(s.list().len(), 1);
@@ -523,7 +586,7 @@ mod tests {
         let mut s = Store::default();
         s.set(
             "https://vecd-host:8443".into(),
-            Entry { token: "vd_x".into(), user: Some("bob".into()), expires: Some("2026-01-01T00:00:00Z".into()) },
+            Entry { token: "vd_x".into(), user: Some("bob".into()), expires: Some("2026-01-01T00:00:00Z".into()), catalog: None },
         );
         let text = toml::to_string_pretty(&s).unwrap();
         let back: Store = toml::from_str(&text).unwrap();

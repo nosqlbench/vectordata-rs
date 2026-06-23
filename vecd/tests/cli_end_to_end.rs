@@ -5,7 +5,13 @@
 //! (`init` → `backends add` → `users add` → `ns add` → `bind` →
 //! `tokens create`), start `vecd serve` as a child process on an
 //! ephemeral port, then run the real `vectordata push` engine against it
-//! over HTTP and pull the result back anonymously.
+//! over HTTP and pull results back two ways:
+//!
+//!   * a **public** dataset (`PUBLIC reader` bound) pulled **anonymously**, and
+//!   * a **private** dataset (owner-only) that is refused anonymously and
+//!     pulled with an **authenticated** `vectordata` reader after
+//!     `vectordata login` records the endpoint credential — the binary-level
+//!     proof of authenticated upload **and** download.
 //!
 //! This complements `push_against_vecd.rs` (which drives the library
 //! `AppState` in-process) by exercising the binary, the config/data-dir
@@ -131,6 +137,19 @@ fn make_dataset(dir: &Path) {
     std::fs::write(dir.join("base.fvec"), b"VECDBASE").unwrap();
 }
 
+/// A tiny valid `.fvec` (two dim-3 f32 vectors) so the private dataset can
+/// be opened + verified by the real `XvecReader` after an authenticated pull.
+fn fvec_bytes() -> Vec<u8> {
+    let mut b = Vec::new();
+    for v in [[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]] {
+        b.extend_from_slice(&3i32.to_le_bytes());
+        for x in v {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    b
+}
+
 fn push_opts(src: &Path, to: String, token: Option<String>) -> Options {
     Options {
         path: src.to_path_buf(),
@@ -234,6 +253,10 @@ fn cli_init_serve_push_pull() {
     h.vecd(&["store", "ns", "add", "datasets/glove", "--owner", "alice", "--backend-config", "store", "--active"]);
     h.vecd(&["access", "bind", "--to", "alice", "--role", "curate", "--ns", "datasets/glove"]);
     h.vecd(&["access", "bind", "--to", "PUBLIC", "--role", "reader", "--ns", "datasets/glove"]);
+    // A second namespace with NO PUBLIC binding — owner-only (private).
+    // Created before `serve` so the running server sees it at startup.
+    h.vecd(&["store", "ns", "add", "datasets/priv", "--owner", "alice", "--backend-config", "store", "--active"]);
+    h.vecd(&["access", "bind", "--to", "alice", "--role", "curate", "--ns", "datasets/priv"]);
     let tok_out = h.vecd(&["access", "tokens", "create", "--user", "alice", "--description", "push key", "--expires", "30d"]);
     let token = token_from(&tok_out);
 
@@ -264,6 +287,75 @@ fn cli_init_serve_push_pull() {
     // The access log recorded the traffic.
     let log = h.vecd(&["log", "--tail", "100"]);
     assert!(log.contains("datasets/glove/base.fvec"));
+
+    // ── Authenticated upload + download of the PRIVATE dataset ────────
+    // (namespace `datasets/priv` set up before `serve`, above.)
+    // Authenticated UPLOAD: push a real fvec privately with alice's token.
+    let psrc = tempfile::tempdir().unwrap();
+    std::fs::write(psrc.path().join("dataset.yaml"), "name: priv\n").unwrap();
+    std::fs::write(psrc.path().join("base.fvec"), fvec_bytes()).unwrap();
+    let pout = execute(&push_opts(
+        psrc.path(),
+        format!("{}/datasets/priv/", server.base),
+        Some(token.clone()),
+    ))
+    .expect("authenticated private push");
+    assert_eq!(pout.version, 1);
+
+    let priv_facet = server.url("datasets/priv/base.fvec");
+
+    // Anonymous download of the private dataset is refused.
+    let anon = client.get(&priv_facet).send().unwrap();
+    assert!(
+        !anon.status().is_success(),
+        "private dataset must not be readable anonymously (got {})",
+        anon.status()
+    );
+
+    // Isolate the vectordata client's credential store + cache (this only
+    // affects the client side — vecd uses VECD_CONFIG/--data-dir), and make
+    // sure no env token can shortcut the resolution under test.
+    let vd_home = tempfile::tempdir().unwrap();
+    let vd_cache = vd_home.path().join("cache");
+    std::fs::create_dir_all(&vd_cache).unwrap();
+    std::fs::write(
+        vd_home.path().join("settings.yaml"),
+        format!("cache_dir: {}\n", vd_cache.display()),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("VECTORDATA_HOME", vd_home.path());
+        std::env::remove_var("VECTORDATA_TOKEN");
+    }
+
+    // `vectordata login` (the binary's library entry) records alice's token
+    // for the catalog URL — the CLI counterpart of the auth config view.
+    assert_eq!(
+        vectordata::client_cli::login(
+            &format!("{}/datasets/priv/", server.base),
+            Some("alice"),
+            Some(&token),
+            None,
+            None,
+        ),
+        0,
+        "vectordata login should store the endpoint credential"
+    );
+    // In-session: pick up the just-written credential (the long-running
+    // refresh the explorer relies on).
+    vectordata::credentials::reload_credentials();
+
+    // Authenticated DOWNLOAD via the stored credential alone — no
+    // $VECTORDATA_TOKEN — returns the exact uploaded vectors.
+    let reader = vectordata::XvecReader::<f32>::open(&priv_facet)
+        .expect("authenticated private download via the stored login credential");
+    assert_eq!(reader.count(), 2);
+    assert_eq!(reader.get_slice(0), &[1.0f32, 2.0, 3.0][..]);
+    assert_eq!(reader.get_slice(1), &[4.0f32, 5.0, 6.0][..]);
+
+    unsafe {
+        std::env::remove_var("VECTORDATA_HOME");
+    }
 
     // A second init refuses to clobber the DB.
     let reinit = Command::new(vecd_bin())
