@@ -18,6 +18,8 @@ use shadow_terminal::steppable_terminal::SteppableTerminal;
 pub const CTRL_G: &str = "\u{07}";
 /// Down-arrow ANSI sequence.
 pub const DOWN: &str = "\u{1b}[B";
+/// Up-arrow ANSI sequence.
+pub const UP: &str = "\u{1b}[A";
 /// Carriage return = Enter in raw mode.
 pub const ENTER: &str = "\r";
 

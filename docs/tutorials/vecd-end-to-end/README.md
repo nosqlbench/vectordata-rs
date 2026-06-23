@@ -6,9 +6,16 @@ This tutorial walks the full loop, **one copy-pasteable command block per step**
    its principals, namespace, and tokens.
 2. **Generate a toy dataset** with `veks` (a one-liner, or the full all-facets
    build).
-3. **Upload** the dataset into `vecd` and **publish a catalog** for it.
-4. **Add the catalog** to a `vectordata` client and **explore** the dataset —
-   listing, describing, pinging, and precaching it over **verified HTTPS**.
+3. **Register the catalog by name** (the single place the URL appears on the
+   client side), then **upload** the dataset and **publish a catalog** — login
+   and push both **by name**.
+4. **Find and fetch it back by name** (list, describe, ping, precache) over
+   HTTPS — no URLs at all.
+5. **(Interactive)** do the catalog + auth configuration inside the explorer's
+   **config view** instead — including authenticating a *private* endpoint.
+
+Steps 1–4 are copy-pasteable command blocks; step 5 is an interactive
+keystroke walk-through of the same configuration in the TUI.
 
 Run the blocks **in order, in one shell session** (the variables set in
 [Set up your shell](#set-up-your-shell) carry through). Each block is
@@ -16,10 +23,8 @@ self-contained copy-pasta; the prose under it explains what just happened.
 
 > Prefer to run it hands-off? The numbered scripts in this directory
 > (`bash 01-start-vecd.sh`, `02-…`, `03-…`, `04-…`, `99-teardown.sh`) automate
-> the same flow, but currently over **plain HTTP** (port 18443, no TLS) — this
-> README is the canonical, **TLS-enabled** walk-through. The TLS steps below
-> (`vecd tls generate`/`export`, `trusted_ca_certs`, `https://` URLs) are the
-> delta the scripts don't yet carry.
+> the same flow over self-signed **HTTPS** with the relaxed `trust_self_signed`
+> posture shown below — the same commands this README walks through in prose.
 
 ## Isolation: nothing touches your real config
 
@@ -36,7 +41,7 @@ namespace `datasets`, the dataset `toy`, the loopback bind `127.0.0.1:18443`.
 
 ## Prerequisites
 
-You need the three binaries — `vecd`, `veks`, and `vectordata` — plus `curl`.
+You need the three binaries — `vecd`, `veks`, and `vectordata`.
 Build them from the workspace root:
 
 ```bash
@@ -57,8 +62,7 @@ cd docs/tutorials/vecd-end-to-end
 export DEMO="$PWD/vecd-demo"            # one throwaway root for everything
 export VECD_CONFIG="$DEMO/server"       # vecd's DB + objects live under here
 export VECTORDATA_HOME="$DEMO/client"   # all client config + cache, isolated
-export VECD_URL="https://127.0.0.1:18443"      # real TLS (configured in step 1)
-export VECD_CA="$VECTORDATA_HOME/vecd-ca.pem"  # vecd's cert, exported for the client to trust
+export VECD_URL="https://127.0.0.1:18443"  # self-signed TLS, configured in step 1
 
 # Run the freshly-built binaries straight from the checkout (no-op if you
 # installed them on PATH):
@@ -75,59 +79,58 @@ mkdir -p "$VECD_CONFIG"
 #     in data/ under it automatically.
 vecd config set bind 127.0.0.1:18443
 
-# 1b. Real TLS. Generate a self-signed cert for the bind host (127.0.0.1 +
+# 1b. Self-signed TLS. Generate a cert + key for the bind host (127.0.0.1 +
 #     localhost) and configure vecd to serve HTTPS (writes tls_cert/tls_key into
-#     vecd.conf). No openssl needed — vecd does it in-process.
-vecd tls generate
+#     vecd.conf). No openssl needed — vecd does it in-process. The CLIENT trusts
+#     this cert later, in step 3, as part of the single `config catalog add`
+#     (its --trust-self-signed flag) — so nothing client-side is written here.
+vecd config tls generate
 
-# 1c. Export that cert and have the vectordata client trust it — verification
-#     stays ON (this is NOT "accept any cert"). cache_dir falls back to
-#     $VECTORDATA_HOME/cache, so settings.yaml needs only this line.
-mkdir -p "$VECTORDATA_HOME"
-vecd tls export "$VECD_CA"
-printf 'trusted_ca_certs:\n  - %s\n' "$VECD_CA" > "$VECTORDATA_HOME/settings.yaml"
-
-# 1d. Create the control-plane DB and mint a one-time superuser token (--quiet
+# 1c. Create the control-plane DB and mint a one-time superuser token (--quiet
 #     prints just the token, so we can capture it).
 vecd init --superuser root --quiet > "$DEMO/root.token"
 
-# 1e. Register a local object backend — a plain directory blobs are written to.
+# 1d. Register a local object backend — a plain directory blobs are written to.
 #     The stored endpoint MUST be local:<absolute-dir>.
-vecd backends add store --kind local --endpoint "local:$DEMO/objects" --active
+vecd store backends add store --kind local --endpoint "local:$DEMO/objects" --active
 
-# 1f. A user who will own the namespace.
-vecd users add alice --level user
+# 1e. A user who will own the namespace.
+vecd access users add alice --level user
 
-# 1g. The 'datasets' namespace: a path prefix served by the backend, owned by
+# 1f. The 'datasets' namespace: a path prefix served by the backend, owned by
 #     alice. Everything at datasets/* — the dataset and the catalog — lives here.
-vecd ns add datasets --owner alice --backend-config store --active
+vecd store ns add datasets --owner alice --backend-config store --active
 
-# 1h. Access: alice curates the namespace; the public can read it.
-vecd bind --to alice  --role curate --ns datasets
-vecd bind --to PUBLIC --role reader --ns datasets
+# 1g. Access: alice curates the namespace; the public can read it. (Drop the
+#     PUBLIC bind to require a token for reads — then step 5 authenticates.)
+vecd access bind --to alice  --role curate --ns datasets
+vecd access bind --to PUBLIC --role reader --ns datasets
 
-# 1i. A push token for alice (used to upload in step 3).
-vecd tokens create --user alice --description "tutorial push key" --expires 30d --quiet \
+# 1h. A push token for alice (used to upload in step 3).
+vecd access tokens create --user alice --description "tutorial push key" --expires 30d --quiet \
   > "$DEMO/alice.token"
 
-# 1j. Start the daemon (bind + TLS come from vecd.conf) and wait for health.
-#     `--cacert` makes curl verify vecd's cert — the same trust the client uses.
-vecd start
-for _ in $(seq 1 40); do curl -fsS --cacert "$VECD_CA" "$VECD_URL/healthz" >/dev/null 2>&1 && break; sleep 0.25; done
-
-vecd status
-vecd ns list
+# 1i. Start the daemon, then block until it answers /healthz. `daemon status
+#     --wait` resolves the scheme/bind itself and self-checks over the self-signed
+#     cert — no curl, exits non-zero on timeout — so the next step never races a
+#     not-yet-listening server.
+vecd daemon start
+vecd daemon status --wait
+vecd store ns list
 ```
 
-You now have a running **HTTPS** server at `$VECD_URL` (real TLS, cert verified),
-a writable namespace `datasets` (active, backed by `store`), and alice's push
-token in `$DEMO/alice.token`. `vecd ns list` shows `datasets` as `active` with
-`backend=store`.
+You now have a running **HTTPS** server at `$VECD_URL` (self-signed TLS), a
+writable namespace `datasets` (active, backed by `store`), and alice's push
+token in `$DEMO/alice.token`. `vecd store ns list` shows `datasets` as `active`
+with `backend=store`.
 
-> **TLS note:** vecd terminates TLS in-process with rustls. The client trusts
-> vecd's cert because step 1c added it to `trusted_ca_certs` — verification is on,
-> so a wrong/forged cert is rejected. (The insecure alternative, for throwaway
-> dev only, is `trust_self_signed: [https://127.0.0.1:18443]` in `settings.yaml`.)
+> **TLS note:** vecd terminates TLS in-process with rustls. The client will
+> accept vecd's self-signed cert because step 3's `config catalog add
+> --trust-self-signed` records this origin under `trust_self_signed` — the
+> **relaxed** posture (no verification), fine for a throwaway local demo. For
+> anything real, export the cert (`vecd config tls export <file>`) and trust it
+> via `trusted_ca_certs:` instead, which keeps verification ON so a
+> wrong/forged cert is rejected.
 
 > **Re-running:** start clean after `99-teardown.sh` + removing `vecd-demo`.
 > Running 1b twice without a teardown refuses to re-init — vecd protects its DB.
@@ -189,81 +192,161 @@ ground truth, metadata, predicates, and predicate results. `--predicate-count
 12000` deliberately makes the `metadata_results` facet a multi-MB object to
 exercise vecd's large-object streaming (see [object sizes](#a-note-on-object-sizes)).
 
-## Step 3 — authenticate, upload, publish a catalog
+## Step 3 — register the catalog by name, then upload + publish
+
+This is the **only** place the endpoint URL appears on the client side. Register
+the catalog with a **name** once; from then on — here and in step 4 — refer to it
+by that name (or its 1-based index): `login`, `logout`, `whoami`, `ping`,
+`token`, `backup`/`restore`, and `push --to` all accept it, so you never paste
+the URL again.
 
 ```bash
 TOKEN="$(cat "$DEMO/alice.token")"   # minted for alice in step 1
 
-# 3a. Log in: stores alice's token for this endpoint under $VECTORDATA_HOME,
-#     keyed by origin. Pushes and reads then use it automatically — no --token.
-vectordata login "$VECD_URL/" --token "$TOKEN"
-vectordata whoami "$VECD_URL/"
+# 3a. Register the vecd namespace as a NAMED catalog — the single client-side URL
+#     reference. The namespace is still empty (we publish to it just below), so
+#     --no-verify skips the parse+ping gate and simply records it. --trust-self-
+#     signed accepts vecd's self-signed cert for this origin WITHOUT verification
+#     (writes trust_self_signed into settings.yaml) — insecure, dev/throwaway
+#     only. (For production, export the cert with `vecd config tls export <file>`
+#     and list it under `trusted_ca_certs:` instead, which keeps verification ON.)
+vectordata config catalog add "$VECD_URL/datasets/" \
+  --name toy-vecd --no-verify --trust-self-signed
 
-# 3b. Push the dataset — a versioned, bearer-authenticated PUT of every facet
-#     under datasets/toy/. The first push to an empty namespace creates v1.
-vectordata datasets push "$DEMO/work/toy" --to "$VECD_URL/datasets/toy/" --yes
+# 3b. Log in BY NAME: stores alice's token for this catalog's endpoint under
+#     $VECTORDATA_HOME. Pushes and reads then use it automatically — no --token.
+vectordata login toy-vecd --token "$TOKEN"
+vectordata whoami toy-vecd
 
 # 3c. Generate a catalog that lists the dataset. Mark toy publishable, point the
-#     catalog root's .publish_url at the namespace, then generate.
+#     catalog root's .publish_url at the namespace, then generate — leaving
+#     catalog.{json,yaml} next to toy/ under $DEMO/work. (.publish_url is catalog
+#     metadata — it records where the published datasets are served from.)
 : > "$DEMO/work/toy/.publish"                       # mark toy publishable
-rm -f "$DEMO/work/toy/.publish_url"                 # push wrote this; the root owns it
+rm -f "$DEMO/work/toy/.publish_url"                 # the catalog root owns the binding
 printf '%s\n' "$VECD_URL/datasets/" > "$DEMO/work/.publish_url"
 veks prepare catalog generate "$DEMO/work"
 
-# 3d. Upload the catalog to the namespace ROOT — that is what makes the whole
-#     namespace a discoverable catalog (the resolver probes for catalog.json/yaml).
-#     `--cacert "$VECD_CA"` so curl verifies vecd's TLS cert.
-for c in catalog.json catalog.yaml; do
-  curl -fsS --cacert "$VECD_CA" -X PUT "$VECD_URL/datasets/$c" \
-    -H "Authorization: Bearer $TOKEN" \
-    --data-binary @"$DEMO/work/$c" -o /dev/null \
-    -w "  PUT $c -> HTTP %{http_code}\n"
-done
+# 3d. Push the catalog DIRECTORY BY NAME — one bearer-authenticated `vectordata`
+#     push uploads the dataset (→ datasets/toy/…) AND the catalog files
+#     (→ datasets/catalog.{json,yaml}) together; no curl needed. `--to` takes the
+#     catalog name (resolved to its URL). The catalog at the namespace root is
+#     what makes the whole namespace discoverable (the resolver probes for
+#     catalog.json/yaml). The stored login supplies the token. `--raw` pushes the
+#     tree as-is, which the quick (Option A) dataset needs — it isn't a pipelined
+#     "known-good" dataset; for Option B's fully-checked dataset you can drop
+#     --raw for a provenance-verified push.
+vectordata datasets push "$DEMO/work" --to toy-vecd --raw --yes
 ```
 
-> **Catalog is now optional:** vecd also *synthesizes* a live `catalog.json` for a
-> namespace from the datasets stored under it, so after just the `push` the
-> dataset is already discoverable. Steps 3c–3d publish an explicit, curated
-> catalog (which takes precedence) — skip them and `datasets list` still finds
-> `toy` via the dynamic catalog.
+> **Catalog is optional:** vecd also *synthesizes* a live `catalog.json` for a
+> namespace from the datasets stored under it, so even pushing just `toy/`
+> leaves the dataset discoverable. Generating + pushing the explicit catalog
+> (above) publishes a curated one (which takes precedence).
 
-> **Tip:** with a stored login, `--to datasets` (a bare namespace name) also
-> works — it resolves to `$VECD_URL/datasets/toy/` for you. The explicit URL is
-> used here to show the structure.
+> **By name or index:** `--to toy-vecd` could equally be `--to 1` (the 1-based
+> position in `vectordata config catalog list`); a `scheme://…` URL is still
+> accepted verbatim. With a stored login, `--to datasets` (a bare namespace
+> name) also resolves to the endpoint. The vecd CLI mirrors the name-or-URL
+> model — `vecd endpoint login`, `vecd endpoint whoami`.
 
-## Step 4 — explore over HTTPS
+## Step 4 — find and fetch it back, by name
+
+The catalog `toy-vecd` and the login are already in place from step 3, so this
+step touches **no URLs at all** — everything is by name. (A separate consumer,
+with their own `$VECTORDATA_HOME`, would first run the same one-time `config
+catalog add … --name toy-vecd --trust-self-signed` + `login toy-vecd` from step
+3, then exactly the commands below.)
 
 ```bash
-# 4a. Register the vecd namespace as a catalog, then browse it. The catalog and
-#     every facet are fetched over verified HTTPS (the client trusts vecd's cert
-#     via trusted_ca_certs from step 1c).
-vectordata config catalog add "$VECD_URL/datasets/"
+vectordata config catalog list                 # toy-vecd is registered (#1)
+vectordata whoami toy-vecd                      # confirm the stored login
 vectordata datasets list
 vectordata datasets describe "toy:default"
-
-# 4b. Read every facet over HTTPS (anonymously, via the public read grant).
 vectordata datasets ping toy --profile default
 vectordata datasets precache "toy:default"
 vectordata cache list
-
-# 4c. The vecd CLI is a client too. Its HTTP routes through the same vectordata
-#     client, so it trusts vecd's cert via the trusted_ca_certs from step 1c —
-#     verified HTTPS, no extra setup.
-vecd login "$VECD_URL/" --token "$DEMO/alice.token"
-vecd whoami
 ```
 
 `ping` reports every facet readable; `precache` pulls them into the isolated
 cache under `$VECTORDATA_HOME/cache`.
 
-> **Heads-up (interactive):** running `vectordata login` yourself will also offer
-> to add this endpoint's namespaces as catalogs — say yes and step 4a's
-> `config catalog add` is already done for you.
+## Step 5 — configure catalogs & auth in the explorer (interactive)
+
+Steps 3–4 did everything from the command line. The same two things — *adding a
+catalog* and *providing its credentials* — are also doable interactively, inside
+the explorer's **config view**, which is the natural place to manage them and to
+see each catalog's live status. This is also a convenient way to authenticate a
+catalog whose endpoint is **private** (no `PUBLIC reader` grant) without dropping
+to `vectordata login`.
+
+The relaxed self-signed trust recorded by step 3's `--trust-self-signed` is in
+force, so HTTPS verification works inside the explorer too. (The explorer's own
+`a` add does **not** record self-signed trust — if you skipped step 3, set it
+once first via `config catalog add … --trust-self-signed --no-verify`.)
+
+Launch the explorer (no arguments → the dataset picker):
+
+```bash
+vectordata explore
+```
+
+Press **`Ctrl-G`** to open the config view. It's a tabbed pane — **`←`/`→`** (or
+`Tab`/`Shift-Tab`) move between **Catalogs · Columns · Theme · Maintenance**; on
+the **Catalogs** tab:
+
+| Key | Action |
+|-----|--------|
+| `↑` `↓` | move between catalogs |
+| `a` | **add** a catalog — prompts for a **name**, a **URL**, and an optional **token** (`Tab` cycles the fields; the token is masked) |
+| `c` | set/clear the catalog's **auth token** (empty = clear) |
+| `e` | **edit** the highlighted catalog (name / URL / token) and re-validate |
+| `x` / `Del` | **remove** the highlighted catalog (`y` to confirm) |
+| `Space` | enable/disable (or, for an unvalidated catalog, **re-check** it) |
+| `Esc` / `q` | close the config view (back to the picker) |
+
+From the picker list, **`Esc`** (or **`Ctrl-D`**) twice quits the app, and
+**`Ctrl-C`** quits immediately.
+
+Each catalog is **colour-coded** — green = active, dim = disabled, ⚠ amber =
+saved-but-unvalidated — and shows a **🔒** when a credential is recorded for it.
+The highlighted catalog reveals its URL, dataset count, and auth state below the
+list. You'll see **`toy-vecd`** here — green with a **🔒** (added and logged in
+during step 3).
+
+To practice the interactive **add** flow on it, **remove** it first (**`x`** →
+**`y`**), then press **`a`** and fill in:
+
+- **name:** `toy-vecd`
+- **url:** `$VECD_URL/datasets/` — i.e. `https://127.0.0.1:18443/datasets/`
+- **token:** paste the contents of `$DEMO/alice.token`
+
+On submit the explorer **verifies** the catalog (parse + ping) over the
+relaxed-trusted self-signed HTTPS — using the token you just provided — and, on
+success, saves it and shows it green with a 🔒. The dataset `toy` appears in the
+picker, and opening it streams its facets over **authenticated** HTTPS, with the
+credential resolved from the catalog you configured. (The token is stored in
+`credentials.toml` under `$VECTORDATA_HOME`, keyed by the catalog URL and
+tagged with the name.)
+
+If verification fails (e.g. a typo'd URL), the catalog is **saved but left
+disabled** with an ⚠ marker and a message on the console — fix it with **`e`**
+(edit) or re-check with **`Space`**, so a mistyped URL is never lost.
+
+> **Make it truly auth-required:** to prove authenticated *download*, omit the
+> `vecd access bind --to PUBLIC --role reader` line in step 1g. Anonymous reads then
+> fail, and the dataset only becomes readable once you supply alice's token via
+> `a` (token field) or `c` — exactly the flow above.
+
+> **List-format `catalogs.yaml`:** if your file is the legacy `- url` list form
+> (which can't store names), naming a catalog prompts you on the console to
+> **rewrite it to name-based form** (recommended) — accept to convert (comments
+> preserved) or decline to cancel.
 
 ## Teardown
 
 ```bash
-vecd stop
+vecd daemon stop
 ```
 
 The demo directory is left in place so you can inspect it. To remove it, from

@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
-# Step 04 — register the vecd namespace as a vectordata catalog and explore
-# the dataset through the client, fetching facets over HTTP from vecd.
+set -euo pipefail   # fail-fast in this script; NOT in env.sh (would kill a sourcing shell)
+# Step 04 — find and fetch the dataset back, addressing the catalog entirely BY
+# NAME (`toy-vecd`, registered in step 03) — no URLs. Facets are fetched over
+# HTTPS, authenticated by the login stored in step 03.
 #
 # Run:  bash 04-explore.sh   (after 01–03)
 #
 # $VECTORDATA_HOME (set in env.sh) isolates ALL client state — catalogs,
-# credentials, settings, AND the cache (it lands in $VECTORDATA_HOME/cache by
-# default) — so your real ~/.config/vectordata and ~/.cache stay untouched.
+# credentials, settings, AND the cache (under $VECTORDATA_HOME/cache) — so your
+# real ~/.config/vectordata and ~/.cache stay untouched.
+#
+# A separate consumer (their own $VECTORDATA_HOME) would do the same one-time
+# `config catalog add … --name toy-vecd --trust-self-signed` + `login toy-vecd`
+# from step 03, then run exactly the name-based commands below.
 source "$(dirname "$0")/env.sh"
 
-say "add the vecd namespace as a catalog"
-vectordata config catalog add "$(vecd_base)/datasets/"
+say "confirm the catalog + login from step 03 (addressed by name)"
+vectordata config catalog list
+vectordata whoami toy-vecd
 
-say "list datasets in the catalog"
+say "list datasets (uses the configured catalogs — no URL)"
 vectordata datasets list
 
 say "describe the dataset (profiles, attributes, every facet)"
 vectordata datasets describe "toy:default"
 
-say "ping every facet (verifies remote readability over HTTP)"
+say "ping every facet (verifies remote readability over HTTPS)"
 vectordata datasets ping toy --profile default
 
 say "precache the profile (download all facets into the local cache)"
@@ -27,13 +34,5 @@ vectordata datasets precache "toy:default"
 say "show what was cached"
 vectordata cache list
 
-say "the vecd CLI is also a client — log in and check access with it"
-# `vecd login`/`whoami` mirror vectordata's: the token is stored under
-# $VECD_CONFIG (keyed by origin) and used automatically. --token accepts the
-# token file directly, and once you're logged in the endpoint commands
-# (whoami, logout, …) default to that endpoint — so no URL needed.
-vecd login "$(vecd_base)/" --token "$DEMO/alice.token"
-vecd whoami
-
 echo
-echo "explored toy from $(vecd_base)/datasets/ — all facets readable."
+echo "explored 'toy-vecd' — all facets readable, addressed by name."

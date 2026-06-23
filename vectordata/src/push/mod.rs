@@ -1135,17 +1135,22 @@ mod cli {
 
     /// Dispatch entry point. Returns a process exit code.
     pub fn run(mut args: PushArgs) -> i32 {
-        // A bare `--to <namespace>` (or `--to root`) is shorthand for a full URL
-        // on the endpoint you're logged in to — expand it before anything reads
-        // the destination (token resolution, the engine, .publish_url).
+        // A bare `--to <name>` is expanded before anything reads the
+        // destination (token resolution, the engine, .publish_url). It may be a
+        // configured catalog NAME or 1-based INDEX (→ that catalog's URL), or —
+        // failing that — a vecd namespace shorthand on the logged-in endpoint
+        // (`--to datasets`/`root`). Catalog match wins.
         if let Some(to) = args.to.clone()
             && !to.contains("://") {
-                match super::resolve_to(&to, &args.path) {
+                match crate::credentials::resolve_endpoint_spec(&to) {
                     Ok(url) => args.to = Some(url),
-                    Err(e) => {
-                        eprintln!("push: {e}");
-                        return 2;
-                    }
+                    Err(_) => match super::resolve_to(&to, &args.path) {
+                        Ok(url) => args.to = Some(url),
+                        Err(e) => {
+                            eprintln!("push: {e}");
+                            return 2;
+                        }
+                    },
                 }
             }
 

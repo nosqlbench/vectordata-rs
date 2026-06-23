@@ -506,95 +506,11 @@ fn facet_stat_string(
     Some(parts.join(", "))
 }
 
-/// Compose stats lines for the details overlay (Enter menu → Details). Pulls
-/// dataset-level attributes (model / license / vendor / distance)
-/// from the catalog entry plus profile-level facets (each view's
-/// cardinality and size when known, then its source path with
-/// window notation kept inline for clarity).
-fn build_details_lines(
-    row: &PickerRow,
-    entry: Option<&CatalogEntry>,
-    knowledge: &std::collections::HashMap<String, FacetKnowledge>,
-    colors_on: bool,
-) -> Vec<Line<'static>> {
-    let tint = |c: Color| if colors_on { Style::default().fg(c) } else { Style::default() };
-    let dim_gray = tint(theme().text_muted);
-    let val_white = tint(theme().text_primary);
-    let head_cyan = tint(theme().primary);
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    if let Some(entry) = entry
-        && let Some(attrs) = entry.layout.attributes.as_ref()
-    {
-        if let Some(v) = attrs.model.as_deref()
-            { lines.push(kv("model", v, dim_gray, val_white)); }
-        if let Some(v) = attrs.distance_function.as_deref()
-            { lines.push(kv("metric", v, dim_gray, val_white)); }
-        if let Some(v) = attrs.vendor.as_deref()
-            { lines.push(kv("vendor", v, dim_gray, val_white)); }
-        if let Some(v) = attrs.license.as_deref()
-            { lines.push(kv("license", v, dim_gray, val_white)); }
-        if let Some(v) = attrs.url.as_deref()
-            { lines.push(kv("upstream", v, dim_gray, val_white)); }
-        if let Some(true) = attrs.is_normalized
-            { lines.push(kv("normalized", "yes", dim_gray, val_white)); }
-        if let Some(v) = attrs.notes.as_deref()
-            { lines.push(kv("notes", v, dim_gray, val_white)); }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(" Profile ", head_cyan)));
-    if let Some(entry) = entry
-        && let Some(profile) = entry.layout.profiles.profile(&row.profile)
-    {
-        if let Some(maxk) = profile.maxk
-            { lines.push(kv("maxk", &maxk.to_string(), dim_gray, val_white)); }
-        if let Some(bc) = profile.base_count
-            { lines.push(kv("base_count", &format_count(bc), dim_gray, val_white)); }
-        if profile.partition
-            { lines.push(kv("partition", "yes (independent base)", dim_gray, val_white)); }
-
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(" Facets ", head_cyan)));
-        for (facet, view) in &profile.views {
-            let path = if view.window.is_some() {
-                format!("{} (view window)", view.source.path)
-            } else {
-                view.source.path.clone()
-            };
-            // Cardinality first — it's the question this panel
-            // answers at a glance; the path follows for context.
-            let value = match facet_stat_string(entry, view, knowledge) {
-                Some(stat) => format!("{stat} — {path}"),
-                None => path,
-            };
-            lines.push(kv(facet, &value, dim_gray, val_white));
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(" Access ", head_cyan)));
-    let access_color = match row.access {
-        AccessMode::Local         => theme().primary,
-        AccessMode::MerkleHashed  => theme().success,
-        AccessMode::MerkleChunked => theme().info,
-        AccessMode::FullTransfer  => theme().error,
-    };
-    lines.push(Line::from(Span::styled(
-        format!(" {}", row.access.description()),
-        tint(access_color),
-    )));
-    lines.push(kv("cache", &row.cache_status, dim_gray, val_white));
-
-    lines
-}
-
-/// Compose the full descriptor for the scrollable Describe overlay.
-/// Goes deeper than [`build_details_lines`]: every view's path,
-/// namespace (when set), explicit window range, and cardinality /
-/// byte size when known; the origin URL pulled from the catalog
-/// entry; access mode rationale; per-row cache state.
+/// Compose the full descriptor for the scrollable Describe overlay — the
+/// single dataset-inspect view. Covers every view's path, namespace (when
+/// set), explicit window range, and cardinality / byte size when known; the
+/// origin URL pulled from the catalog entry; access mode rationale; per-row
+/// cache state.
 fn build_descriptor_lines(
     row: &PickerRow,
     entry: Option<&CatalogEntry>,
@@ -1931,20 +1847,17 @@ pub enum PickerAction {
     /// or a commented not-cached note), then return to the picker.
     /// Batch-safe: selecting several datasets prints one block each.
     Locate,
-    /// Open a scrollable text view of the full catalog descriptor
-    /// for this dataset+profile (attributes, facets with windows,
-    /// origin URLs, cache state). Renders inside the picker as an
-    /// overlay — does not exit the picker.
+    /// Open a scrollable text view of the full catalog descriptor for this
+    /// dataset+profile: attributes, profile (maxk/base_count), facets with
+    /// their paths, windows, and per-facet dims/counts/byte-sizes, origin
+    /// URLs, access mode, and cache state. The single "inspect this dataset"
+    /// view. Renders inside the picker as an overlay — does not exit it.
     Describe,
     /// Open a scrollable text view of the raw catalog YAML — the
     /// `dataset.yaml` file for canonical catalogs, or the relevant
     /// entries pulled out of `knn_entries.yaml` for the legacy
     /// shape. Picker-local like Describe.
     Source,
-    /// Toggle the quick stats overlay (dims, counts, sizes, cache state)
-    /// for the highlighted profile. Picker-local; was Ctrl-D before
-    /// Ctrl-D became the alternate exit key.
-    Details,
     /// Download every facet's bytes into the local cache directory.
     /// (Drives the `datasets precache` machinery; the menu label is
     /// "Download" because that's what the user experiences.)
@@ -1963,7 +1876,6 @@ impl PickerAction {
             PickerAction::Locate    => "Locate",
             PickerAction::Describe  => "Describe",
             PickerAction::Source    => "Source",
-            PickerAction::Details   => "Details",
             PickerAction::Download  => "Download",
             PickerAction::Purge     => "Purge",
             PickerAction::Ping      => "Ping",
@@ -1977,11 +1889,9 @@ impl PickerAction {
             PickerAction::Locate =>
                 "Print the dataset's cache directory (commented note when not cached), then return to the picker. Works on a multi-selection.",
             PickerAction::Describe =>
-                "Show full descriptor: attributes, facets (paths + windows), origin, cache state. Scrollable.",
+                "Show full descriptor: attributes, facets (paths, windows, dims/counts/sizes), origin, access + cache state. Scrollable.",
             PickerAction::Source =>
                 "Show the raw catalog YAML — dataset.yaml verbatim, or the relevant entries from knn_entries.yaml. Scrollable.",
-            PickerAction::Details =>
-                "Quick stats overlay: dimensions, counts, byte sizes, and cache state for this profile.",
             PickerAction::Download =>
                 "Download every facet of this profile into the cache directory.",
             PickerAction::Purge =>
@@ -2001,7 +1911,6 @@ impl PickerAction {
             PickerAction::Visualize,
             PickerAction::Describe,
             PickerAction::Source,
-            PickerAction::Details,
             PickerAction::Locate,
             PickerAction::Download,
             PickerAction::Ping,
@@ -2013,7 +1922,7 @@ impl PickerAction {
     /// rather than dispatched to the runner. Picker-local actions
     /// don't suspend the chrome and don't go through `dispatch`.
     fn is_picker_local(self) -> bool {
-        matches!(self, PickerAction::Describe | PickerAction::Source | PickerAction::Details)
+        matches!(self, PickerAction::Describe | PickerAction::Source)
     }
 
     /// True when this action can sensibly run against a set of
@@ -2064,6 +1973,24 @@ pub enum PickerOutcome {
     /// configuration. Distinct from [`Self::Done`] so a reload never
     /// looks like the user closing the picker.
     Reload,
+}
+
+/// Window a single-line input field's value to `width` display columns. The
+/// active field anchors to the END (so the caret — where you're typing — stays
+/// visible as a long URL scrolls left); other fields anchor to the start. The
+/// returned `u16` is the caret's column offset from the field's value start
+/// (only meaningful for the active field).
+fn field_window(value: &str, width: u16, anchor_end: bool) -> (String, u16) {
+    let w = width as usize;
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= w {
+        return (value.to_string(), chars.len() as u16);
+    }
+    if anchor_end {
+        (chars[chars.len() - w..].iter().collect(), w as u16)
+    } else {
+        (chars[..w].iter().collect(), w as u16)
+    }
 }
 
 /// Run `body` with the picker's chrome suspended — so it can print freely
@@ -2415,7 +2342,6 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     let mut show_all_profiles = false;
     let mut expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut show_help = false;
-    let mut show_details = false;
     let mut menu_open = false;
     // Two-press quit guard for the picker's final exit (Esc / Ctrl-D):
     // the first press arms + prompts, a second within QUIT_CONFIRM quits.
@@ -2611,11 +2537,11 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     cont("D=Distances M=Meta P=Predicates R=Results F=Filtered"),
                     group("Select",    "Space toggles row · Shift+↑↓ extends range, Space commits"),
                     cont("Enter with a selection → batch menu (Download/Ping/Purge)"),
-                    group("Inspect",   "Enter menu → Describe / Source / Details / Locate"),
+                    group("Inspect",   "Enter menu → Describe / Source / Locate"),
                     group("Configure", "Ctrl-G settings: catalogs · columns · theme · reset"),
                     cont("Ctrl-T mono/colour (terminals that mangle ANSI)"),
                     group("Overlays",  "↑↓ or j/k scroll · g/G Home/End ends · Esc or q close"),
-                    group("Exit",      "Esc/Ctrl-D peel: help → range → selection → details →"),
+                    group("Exit",      "Esc/Ctrl-D peel: help → range → selection →"),
                     cont("expanded → filter, then again to quit · Ctrl-C quits now"),
                 ];
                 frame.render_widget(
@@ -2947,42 +2873,8 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 chunks[3],
             );
 
-            // Stats overlay (Enter menu → Details). Renders on top of the
-            // list area, anchored to the bottom of the screen and
-            // covering roughly the lower 60% horizontally centred,
-            // so the filter line and footer stay visible.
-            if show_details
-                && let Some(row) = visible.get(cursor) {
-                    let outer = frame.area();
-                    let popup_h = outer.height.saturating_sub(6).clamp(6, 20);
-                    let popup_w = outer.width.saturating_sub(8).max(40);
-                    let popup_x = (outer.width.saturating_sub(popup_w)) / 2;
-                    let popup_y = outer.height.saturating_sub(popup_h + 1);
-                    let area = ratatui::layout::Rect {
-                        x: outer.x + popup_x,
-                        y: outer.y + popup_y,
-                        width: popup_w,
-                        height: popup_h,
-                    };
-                    let entry = entries.iter().find(|e| e.name == row.dataset);
-                    let lines = build_details_lines(row, entry, &facet_knowledge, theme_on);
-                    frame.render_widget(ratatui::widgets::Clear, area);
-                    frame.render_widget(
-                        Paragraph::new(lines)
-                            .block(Block::default().borders(Borders::ALL)
-                                .border_style(bordered(theme().info))
-                                .title(Span::styled(
-                                    format!(" Dataset Details — {}:{} (Ctrl-D / Esc to close) ", row.dataset, row.profile),
-                                    tinted(theme().primary),
-                                ))),
-                        area,
-                    );
-                }
-
-            // Descriptor overlay (Describe action). Larger than the
-            // Details popup so the full facet list, windows,
-            // and origin URLs stay readable; scrollable to handle
-            // dataset.yaml descriptors that overflow the screen.
+            // Descriptor overlay (Describe action) — the single dataset-inspect
+            // view. Scrollable to handle descriptors that overflow the screen.
             if descriptor_open {
                 // No row guard: descriptor_title was captured when
                 // the overlay opened, so the popup keeps making
@@ -3314,12 +3206,15 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
 
                 // Add-catalog input overlay (on top of the settings box).
                 if let Some(input) = &add_input {
-                    let iw: u16 = 66;
+                    // Use most of the terminal width (capped) so long URLs have
+                    // room; the active field also scrolls to keep the caret in
+                    // view (see field_window), so it's never clipped off-screen.
+                    let iw: u16 = outer.width.saturating_sub(6).clamp(40, 100).min(outer.width);
                     let ih: u16 = 9;
                     let ia = ratatui::layout::Rect {
                         x: outer.x + outer.width.saturating_sub(iw) / 2,
                         y: outer.y + outer.height.saturating_sub(ih) / 2,
-                        width: iw.min(outer.width),
+                        width: iw,
                         height: ih.min(outer.height),
                     };
                     let field_style = |active: bool| if active {
@@ -3329,24 +3224,23 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     };
                     // The token is a secret — show it masked.
                     let masked = "•".repeat(input.token.chars().count());
-                    // Each field line is "  <label>  <value>"; the value
-                    // starts at a fixed column (FIELD_COL) so the cursor
-                    // math is uniform.
+                    // Each field line is "  <label>  <value>"; the value starts
+                    // at a fixed column (FIELD_COL). `vis_w` is how many value
+                    // columns fit inside the box.
                     const FIELD_COL: u16 = 10;
+                    let vis_w = iw.saturating_sub(2 + FIELD_COL);
+                    let is = |f: AddField| input.field == f;
+                    let (name_v, name_caret) = field_window(&input.name, vis_w, is(AddField::Name));
+                    let (url_v, url_caret) = field_window(&input.url, vis_w, is(AddField::Url));
+                    let (tok_v, tok_caret) = field_window(&masked, vis_w, is(AddField::Token));
                     let il = vec![
                         Line::from(""),
-                        Line::from(Span::styled(
-                            format!("  name:   {}", input.name),
-                            field_style(input.field == AddField::Name))),
-                        Line::from(Span::styled(
-                            format!("  url:    {}", input.url),
-                            field_style(input.field == AddField::Url))),
-                        Line::from(Span::styled(
-                            format!("  token:  {masked}"),
-                            field_style(input.field == AddField::Token))),
+                        Line::from(Span::styled(format!("  name:   {name_v}"), field_style(is(AddField::Name)))),
+                        Line::from(Span::styled(format!("  url:    {url_v}"), field_style(is(AddField::Url)))),
+                        Line::from(Span::styled(format!("  token:  {tok_v}"), field_style(is(AddField::Token)))),
                         Line::from(""),
                         Line::from(Span::styled(
-                            "  Tab: next field · Enter: verify+save · Esc: cancel · token optional",
+                            "  Tab/↑↓: fields · Enter: verify+save · Esc: cancel · token optional",
                             tinted(theme().text_muted))),
                     ];
                     frame.render_widget(ratatui::widgets::Clear, ia);
@@ -3356,38 +3250,42 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                             .title(Span::styled(" Add catalog ", tinted(theme().primary)))),
                         ia,
                     );
-                    // Real (terminal-native, blinking) cursor at the end of
+                    // Real (terminal-native, blinking) cursor at the caret of
                     // the active field — replaces the painted underscore.
-                    let (line_idx, val_len) = match input.field {
-                        AddField::Name => (1u16, input.name.chars().count() as u16),
-                        AddField::Url => (2, input.url.chars().count() as u16),
-                        AddField::Token => (3, input.token.chars().count() as u16),
+                    let (line_idx, caret) = match input.field {
+                        AddField::Name => (1u16, name_caret),
+                        AddField::Url => (2, url_caret),
+                        AddField::Token => (3, tok_caret),
                     };
-                    let cx = (ia.x + 1 + FIELD_COL + val_len)
+                    let cx = (ia.x + 1 + FIELD_COL + caret)
                         .min(ia.x + ia.width.saturating_sub(2));
                     frame.set_cursor_position((cx, ia.y + 1 + line_idx));
                 }
 
                 // Set-auth input overlay (token for an existing catalog).
                 if let Some(auth) = &auth_input {
-                    let aw: u16 = 66;
+                    let aw: u16 = outer.width.saturating_sub(6).clamp(40, 100).min(outer.width);
                     let ah: u16 = 8;
                     let aa = ratatui::layout::Rect {
                         x: outer.x + outer.width.saturating_sub(aw) / 2,
                         y: outer.y + outer.height.saturating_sub(ah) / 2,
-                        width: aw.min(outer.width),
+                        width: aw,
                         height: ah.min(outer.height),
                     };
                     let masked = "•".repeat(auth.token.chars().count());
                     const AUTH_FIELD_COL: u16 = 11; // width of "  token:   "
+                    let (tok_v, tok_caret) =
+                        field_window(&masked, aw.saturating_sub(2 + AUTH_FIELD_COL), true);
+                    // The (display-only) URL line: prefix "  " = 2 cols.
+                    let (url_disp, _) = field_window(&auth.url, aw.saturating_sub(4), false);
                     let al = vec![
                         Line::from(""),
                         Line::from(Span::styled(
                             format!("  catalog: {}", auth.name), tinted(theme().text_muted))),
                         Line::from(Span::styled(
-                            format!("  {}", auth.url), tinted(theme().text_dim))),
+                            format!("  {url_disp}"), tinted(theme().text_dim))),
                         Line::from(Span::styled(
-                            format!("  token:   {masked}"), tinted(theme().info))),
+                            format!("  token:   {tok_v}"), tinted(theme().info))),
                         Line::from(""),
                         Line::from(Span::styled(
                             "  Enter: save (empty clears) · Esc: cancel",
@@ -3400,8 +3298,8 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                             .title(Span::styled(" Set auth ", tinted(theme().info)))),
                         aa,
                     );
-                    // Real (blinking) cursor at the end of the token field.
-                    let cx = (aa.x + 1 + AUTH_FIELD_COL + auth.token.chars().count() as u16)
+                    // Real (blinking) cursor at the caret of the token field.
+                    let cx = (aa.x + 1 + AUTH_FIELD_COL + tok_caret)
                         .min(aa.x + aa.width.saturating_sub(2));
                     frame.set_cursor_position((cx, aa.y + 1 + 3));
                 }
@@ -3456,8 +3354,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 // Ctrl-D is an alternate Esc — the soft "back / quit" key,
                 // matching the visualizer. Rewriting it to Esc here means it
                 // flows through the same cascade + double-tap-to-quit below
-                // (and closes modals) with no special-casing. (Details moved
-                // to the Enter menu so Ctrl-D is free for this.)
+                // (and closes modals) with no special-casing.
                 let key = if key.code == KeyCode::Char('d')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
@@ -3499,9 +3396,10 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     if add_input.is_some() {
                         match key.code {
                             KeyCode::Esc => { add_input = None; }
-                            // Tab / Shift-Tab cycle between the fields so any
-                            // can be edited (not just forward via Enter).
-                            KeyCode::Tab => {
+                            // Tab / ↓ go to the next field, Shift-Tab / ↑ the
+                            // previous — so any field can be edited, not just
+                            // forward via Enter.
+                            KeyCode::Tab | KeyCode::Down => {
                                 let input = add_input.as_mut().unwrap();
                                 input.field = match input.field {
                                     AddField::Name => AddField::Url,
@@ -3509,7 +3407,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                     AddField::Token => AddField::Name,
                                 };
                             }
-                            KeyCode::BackTab => {
+                            KeyCode::BackTab | KeyCode::Up => {
                                 let input = add_input.as_mut().unwrap();
                                 input.field = match input.field {
                                     AddField::Name => AddField::Token,
@@ -3631,6 +3529,11 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                         let _ = crate::settings::write_disabled_catalogs(
                                             &disabled_catalogs);
                                     }
+                                    // Keep credentials.toml in step with the
+                                    // catalogs: drop any token now left without a
+                                    // configured catalog. (The edit flow's
+                                    // internal remove does NOT prune — it re-adds.)
+                                    crate::credentials::prune_orphan_credentials();
                                     // Reload; the catalog vanishing from the
                                     // list is the confirmation.
                                     result = PickerOutcome::Reload;
@@ -3992,11 +3895,6 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                             descriptor_scroll = 0;
                                             descriptor_open = true;
                                         }
-                                        PickerAction::Details => {
-                                            // Quick stats overlay for the
-                                            // cursor row (was Ctrl-D).
-                                            show_details = true;
-                                        }
                                         _ => {} // future picker-local actions land here
                                     }
                                     continue;
@@ -4070,16 +3968,13 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                         // just keep tapping Esc until they're out.
                         // Order matters — the topmost overlay (help)
                         // peels first, then multi-select state (most
-                        // ephemeral), then the details overlay, then
-                        // list shape, then filter, then exit.
+                        // ephemeral), then list shape, then filter, then exit.
                         if show_help {
                             show_help = false;
                         } else if range_anchor.is_some() {
                             range_anchor = None;
                         } else if !selected.is_empty() {
                             selected.clear();
-                        } else if show_details {
-                            show_details = false;
                         } else if !expanded.is_empty() && !show_all_profiles {
                             expanded.clear();
                         } else if !filter.is_empty() {

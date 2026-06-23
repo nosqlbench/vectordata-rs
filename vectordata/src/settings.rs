@@ -674,6 +674,64 @@ fn rewrite_setting_line(existing: &str, key: &str, value: &str) -> String {
     out
 }
 
+/// Record `origin` (a `scheme://host[:port]`) under the `trust_self_signed:`
+/// list in the user's `settings.yaml`, creating the file/dir as needed. This
+/// is the **insecure** relaxed-trust mode (the server cert is accepted without
+/// verification) — intended for local dev against a self-signed `vecd`. No-op
+/// if the origin is already listed. Returns the settings path written.
+pub fn add_trust_self_signed(origin: &str) -> Result<PathBuf, String> {
+    add_trust_self_signed_at(&settings_path(), origin)
+}
+
+/// [`add_trust_self_signed`] targeting an explicit settings path (tests pass a
+/// tempdir path rather than mutating process env).
+pub fn add_trust_self_signed_at(settings: &Path, origin: &str) -> Result<PathBuf, String> {
+    let existing = std::fs::read_to_string(settings).unwrap_or_default();
+    let updated = add_yaml_list_item(&existing, "trust_self_signed", origin);
+    if updated != existing {
+        if let Some(parent) = settings.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(settings, updated).map_err(|e| e.to_string())?;
+    }
+    Ok(settings.to_path_buf())
+}
+
+/// Add `item` as an element of the block-sequence under top-level YAML `key:`,
+/// preserving every other line (comments, other keys, formatting). No-op when
+/// `item` is already listed under that key. When the key is absent, appends a
+/// fresh `key:` block. Textual line edit only — never a serializer round-trip.
+fn add_yaml_list_item(content: &str, key: &str, item: &str) -> String {
+    let key_line = format!("{key}:");
+    let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
+    if let Some(ki) = lines.iter().position(|l| l.trim() == key_line) {
+        // Scan the block's existing items; bail (no-op) if already present.
+        for l in lines.iter().skip(ki + 1) {
+            let t = l.trim_start();
+            if let Some(v) = t.strip_prefix("- ") {
+                if v.trim().trim_matches(['"', '\'']) == item {
+                    return content.to_string();
+                }
+            } else if t.is_empty() || t.starts_with('#') {
+                continue;
+            } else {
+                break; // reached the next key — item is not in this block
+            }
+        }
+        lines.insert(ki + 1, format!("  - {item}"));
+        let mut out = lines.join("\n");
+        out.push('\n');
+        return out;
+    }
+    // Key absent: append a new block.
+    let mut out = content.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("{key}:\n  - {item}\n"));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +749,35 @@ cache_dir: /x
         assert_eq!(setting_value_from(content, "palette").as_deref(), Some("turbo"));
         assert_eq!(setting_value_from(content, "curve").as_deref(), Some("square"));
         assert_eq!(setting_value_from(content, "nope"), None);
+    }
+
+    /// `add_yaml_list_item` appends a fresh block when the key is absent,
+    /// inserts into an existing block, no-ops on a duplicate, and never
+    /// disturbs comments or other keys.
+    #[test]
+    fn add_yaml_list_item_block_cases() {
+        // Absent key → fresh block, leaving prior content intact.
+        let started = "cache_dir: /x\n# keep me\n";
+        let added = add_yaml_list_item(started, "trust_self_signed", "https://h:1");
+        assert_eq!(
+            added,
+            "cache_dir: /x\n# keep me\ntrust_self_signed:\n  - https://h:1\n"
+        );
+
+        // Existing block → insert; duplicate → no-op (byte-identical).
+        let again = add_yaml_list_item(&added, "trust_self_signed", "https://h:2");
+        assert_eq!(
+            again,
+            "cache_dir: /x\n# keep me\ntrust_self_signed:\n  - https://h:2\n  - https://h:1\n"
+        );
+        assert_eq!(add_yaml_list_item(&again, "trust_self_signed", "https://h:1"), again);
+        assert_eq!(add_yaml_list_item(&again, "trust_self_signed", "https://h:2"), again);
+
+        // Empty file → fresh block, no leading blank line.
+        assert_eq!(
+            add_yaml_list_item("", "trust_self_signed", "https://h:1"),
+            "trust_self_signed:\n  - https://h:1\n"
+        );
     }
 
     /// `disabled_catalogs` round-trips through the comma-scalar form,

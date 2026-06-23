@@ -690,6 +690,63 @@ pub fn force_add_catalog(name: &str, source: &str) -> Result<String, String> {
 /// answer a catalog ping — before anything is recorded. Returns 1
 /// if verification fails; nothing is saved in that case.
 pub fn add_catalog(source: &str, name: Option<&str>) -> i32 {
+    add_catalog_ex(source, name, false, false)
+}
+
+/// [`add_catalog`] with two opt-in relaxations for registering an endpoint
+/// that isn't ready to be probed yet (e.g. a private/self-signed `vecd`
+/// namespace you're about to publish *to*):
+///
+/// - `no_verify` — skip the parse+ping gate and append the source
+///   unconditionally (via [`force_add_catalog`]). Lets you name a catalog
+///   before any dataset exists there, so later commands can address it by
+///   name (`login`/`push --to`/…) without re-pasting the URL.
+/// - `trust_self_signed` — record the source's origin under
+///   `settings.yaml`'s `trust_self_signed:` list first, so the **insecure**
+///   relaxed-TLS mode is in force for it (local dev only). Done before any
+///   verification so a verify fetch over a self-signed cert can succeed.
+///
+/// This makes `config catalog add` the single place a catalog's URL needs
+/// to appear on the client side.
+pub fn add_catalog_ex(
+    source: &str,
+    name: Option<&str>,
+    no_verify: bool,
+    trust_self_signed: bool,
+) -> i32 {
+    if trust_self_signed {
+        match crate::credentials::origin_of_str(source) {
+            Some(origin) => match crate::settings::add_trust_self_signed(&origin) {
+                Ok(_) => println!("Trusting self-signed cert for {origin} (relaxed TLS — dev only)."),
+                Err(e) => eprintln!("warning: could not record trust_self_signed for {origin}: {e}"),
+            },
+            None => eprintln!("note: --trust-self-signed ignored — '{source}' has no URL origin"),
+        }
+    }
+
+    if no_verify {
+        let entries = load_catalog_entries();
+        if entries.iter().any(|e| e.location == source) {
+            println!("Already configured: {source}");
+            return 0;
+        }
+        let taken: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let resolved = match name {
+            Some(n) => n.trim().to_string(),
+            None => derive_catalog_name(source, &taken),
+        };
+        return match force_add_catalog(&resolved, source) {
+            Ok(n) => {
+                println!("Saved as '{n}' (unverified) to {}", catalogs_path().display());
+                0
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        };
+    }
+
     match try_add_catalog(source, name) {
         Ok(AddCatalogOutcome::AlreadyConfigured) => {
             println!("Already configured: {source}");
@@ -734,7 +791,16 @@ pub fn remove_catalog(spec: RemoveCatalogSpec<'_>) -> i32 {
         }
     };
     match remove_catalog_entry(&target) {
-        Ok(true) => { println!("Removed: {target}"); 0 }
+        Ok(true) => {
+            println!("Removed: {target}");
+            // Keep credentials.toml in step with the catalogs: drop any token
+            // left with no configured catalog to authenticate.
+            let pruned = crate::credentials::prune_orphan_credentials();
+            if pruned > 0 {
+                println!("Removed {pruned} now-orphaned credential(s).");
+            }
+            0
+        }
         Ok(false) => { eprintln!("Not found: {target}"); 1 }
         Err(e) => { eprintln!("error: {e}"); 1 }
     }

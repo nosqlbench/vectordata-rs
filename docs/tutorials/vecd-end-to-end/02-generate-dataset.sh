@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail   # fail-fast in this script; NOT in env.sh (would kill a sourcing shell)
 # Step 02 — use veks to build a small, fully-synthetic toy dataset that
 # exercises EVERY core facet, then materialize and verify it locally.
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail   # fail-fast in this script; NOT in env.sh (would kill a sourcing shell)
 # Step 02 (SHORTCUT) — the one-command alternative to 02-generate-dataset.sh.
 #
 # The full 02-generate-dataset.sh builds a dataset that exercises EVERY core

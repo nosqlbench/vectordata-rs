@@ -136,7 +136,17 @@ pub enum DaemonCmd {
         serve: ServeArgs,
     },
     /// Report whether the daemon is running and where it is bound.
-    Status,
+    Status {
+        /// Block until the server answers `GET /healthz` (or `--timeout`
+        /// elapses) before reporting — so a script can wait for readiness
+        /// right after `daemon start` instead of polling with curl. Without
+        /// it, report the current state and return immediately.
+        #[arg(long)]
+        wait: bool,
+        /// Maximum seconds to wait when `--wait` is given.
+        #[arg(long, default_value_t = 30, value_name = "SECS")]
+        timeout: u64,
+    },
     /// Install a systemd unit that runs `vecd serve`, enable it, and set
     /// `daemon_mode = systemd` — after which `start`/`stop`/`status`/
     /// `restart` delegate to `systemctl` (with a notice on stderr).
@@ -982,10 +992,17 @@ fn cmd_daemon(
             config::DaemonMode::Systemd => crate::service::delegate("stop"),
             config::DaemonMode::Adhoc => crate::daemon::stop(data_dir),
         },
-        DaemonCmd::Status => match cfg.daemon_mode() {
-            config::DaemonMode::Systemd => crate::service::delegate("status"),
-            config::DaemonMode::Adhoc => crate::daemon::status(data_dir),
-        },
+        DaemonCmd::Status { wait, timeout } => {
+            // Readiness is a property of the HTTP endpoint, not the process
+            // manager, so the health poll runs the same way in both modes.
+            if wait {
+                wait_for_health(data_dir, cfg, timeout)?;
+            }
+            match cfg.daemon_mode() {
+                config::DaemonMode::Systemd => crate::service::delegate("status"),
+                config::DaemonMode::Adhoc => crate::daemon::status(data_dir),
+            }
+        }
         DaemonCmd::Restart { serve } => match cfg.daemon_mode() {
             config::DaemonMode::Systemd => crate::service::delegate("restart"),
             config::DaemonMode::Adhoc => {
@@ -1663,6 +1680,83 @@ fn cmd_serve(data_dir: &std::path::Path, cfg: &config::Config, a: &ServeArgs) ->
     })
 }
 
+/// The `GET /healthz` URL to probe for readiness, resolved the same way
+/// `cmd_serve` resolves its listener: the plain-HTTP path publishes its real
+/// bound address (including an ephemeral `:0` port) to `<data_dir>/vecd.addr`,
+/// so prefer that; otherwise fall back to the configured bind + TLS scheme.
+/// A wildcard bind (`0.0.0.0` / `[::]`) isn't a connectable client address, so
+/// probe loopback instead.
+fn health_probe_url(data_dir: &std::path::Path, cfg: &config::Config) -> Result<String, VecdError> {
+    let from_file = std::fs::read_to_string(data_dir.join("vecd.addr"))
+        .ok()
+        .and_then(|s| s.trim().parse::<SocketAddr>().ok())
+        .map(|a| ("http", a));
+    let (scheme, addr) = match from_file {
+        Some(x) => x,
+        None => {
+            let bind = resolve_bind(&None, cfg);
+            let addr: SocketAddr = bind
+                .parse()
+                .map_err(|e| VecdError::usage(format!("bad bind address '{bind}': {e}")))?;
+            let tls = cfg.get("tls_cert").is_some() && cfg.get("tls_key").is_some();
+            (if tls { "https" } else { "http" }, addr)
+        }
+    };
+    Ok(format_health_url(scheme, addr))
+}
+
+/// Format the `/healthz` URL for a resolved scheme + bound address. A wildcard
+/// bind (`0.0.0.0` / `[::]`) isn't a connectable client address, so it maps to
+/// loopback; IPv6 hosts are bracketed.
+fn format_health_url(scheme: &str, addr: SocketAddr) -> String {
+    use std::net::IpAddr;
+    let host = match addr.ip() {
+        IpAddr::V4(v4) if v4.is_unspecified() => "127.0.0.1".to_string(),
+        IpAddr::V6(v6) if v6.is_unspecified() => "[::1]".to_string(),
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    format!("{scheme}://{host}:{}/healthz", addr.port())
+}
+
+/// Poll `GET /healthz` until it answers 2xx or `timeout_secs` elapses — the
+/// readiness wait behind `vecd daemon status --wait`. Invalid certs are
+/// accepted: this is a liveness self-check of vecd's own (often self-signed)
+/// loopback endpoint, where cert trust is beside the point. The URL is
+/// re-resolved each iteration so an ephemeral-port plain-HTTP serve is picked
+/// up once it publishes `vecd.addr`.
+fn wait_for_health(
+    data_dir: &std::path::Path,
+    cfg: &config::Config,
+    timeout_secs: u64,
+) -> Result<(), VecdError> {
+    use std::time::{Duration, Instant};
+    let client = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| VecdError::op(e.to_string()))?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        // Every arm but the 2xx success (which returns) records why this
+        // attempt failed, for the timeout message.
+        let last = match health_probe_url(data_dir, cfg) {
+            Ok(url) => match client.get(&url).send() {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) => format!("{url} → HTTP {}", resp.status()),
+                Err(e) => format!("{url}: {e}"),
+            },
+            Err(e) => e.to_string(),
+        };
+        if Instant::now() >= deadline {
+            return Err(VecdError::op(format!(
+                "vecd did not answer /healthz within {timeout_secs}s (last: {last})"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Resolve on the first of SIGINT (Ctrl-C) or SIGTERM (`vecd daemon stop`).
 async fn shutdown_signal() {
     #[cfg(unix)]
@@ -2289,6 +2383,43 @@ fn toggle_opt(active: bool, no_active: bool, what: &str) -> Result<Option<bool>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_health_url_normalizes_host_and_scheme() {
+        let p = |s: &str, a: &str| format_health_url(s, a.parse().unwrap());
+        // Wildcard binds → loopback (not connectable as a client address).
+        assert_eq!(p("https", "0.0.0.0:18443"), "https://127.0.0.1:18443/healthz");
+        assert_eq!(p("http", "[::]:8443"), "http://[::1]:8443/healthz");
+        // Concrete hosts pass through; IPv6 is bracketed.
+        assert_eq!(p("https", "127.0.0.1:443"), "https://127.0.0.1:443/healthz");
+        assert_eq!(p("http", "[2001:db8::1]:80"), "http://[2001:db8::1]:80/healthz");
+    }
+
+    #[test]
+    fn health_probe_url_prefers_addr_file_then_config_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        // No addr file → resolve scheme from config TLS keys + the bind.
+        let tls = config::Config::parse(
+            "bind = 0.0.0.0:18443\ntls_cert = /c.pem\ntls_key = /k.pem",
+        )
+        .unwrap();
+        assert_eq!(
+            health_probe_url(dir.path(), &tls).unwrap(),
+            "https://127.0.0.1:18443/healthz"
+        );
+        let plain = config::Config::parse("bind = 127.0.0.1:9000").unwrap();
+        assert_eq!(
+            health_probe_url(dir.path(), &plain).unwrap(),
+            "http://127.0.0.1:9000/healthz"
+        );
+        // A published vecd.addr (plain-HTTP ephemeral port) takes precedence and
+        // is always http, regardless of the configured bind/TLS.
+        std::fs::write(dir.path().join("vecd.addr"), "127.0.0.1:54321\n").unwrap();
+        assert_eq!(
+            health_probe_url(dir.path(), &tls).unwrap(),
+            "http://127.0.0.1:54321/healthz"
+        );
+    }
 
     #[test]
     fn resolve_bind_precedence() {

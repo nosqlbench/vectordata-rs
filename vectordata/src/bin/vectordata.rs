@@ -431,6 +431,16 @@ enum CatalogCmd {
         /// Derived from the location when omitted.
         #[arg(long)]
         name: Option<String>,
+        /// Register without the parse+ping verification gate — so you can
+        /// name an endpoint before any dataset is published there (then
+        /// address it by name via `login`, `push --to`, etc.).
+        #[arg(long)]
+        no_verify: bool,
+        /// Accept this endpoint's self-signed TLS cert WITHOUT verification
+        /// (records its origin under `trust_self_signed` in settings.yaml).
+        /// Insecure — local dev only.
+        #[arg(long)]
+        trust_self_signed: bool,
     },
     /// Remove a catalog source (by URL/path or `--at <index>`).
     #[command(alias = "rm")]
@@ -638,8 +648,10 @@ fn main() {
                 },
                 ConfigCmd::Mounts { all } => vectordata::config::list_mounts(all),
                 ConfigCmd::Catalog { command } => match command {
-                    CatalogCmd::Add { source, name } =>
-                        vectordata::config::add_catalog(&source, name.as_deref()),
+                    CatalogCmd::Add { source, name, no_verify, trust_self_signed } =>
+                        vectordata::config::add_catalog_ex(
+                            &source, name.as_deref(), no_verify, trust_self_signed,
+                        ),
                     CatalogCmd::Remove { source, at } => match (source, at) {
                         (Some(s), _) => vectordata::config::remove_catalog(
                             vectordata::config::RemoveCatalogSpec::Source(&s)),
@@ -661,6 +673,8 @@ fn main() {
             let code = if list {
                 vectordata::client_cli::list_logins()
             } else if let Some(url) = url {
+                // Accept a URL or a configured catalog name/index.
+                let url = endpoint_or_exit(Some(url));
                 let code = vectordata::client_cli::login(
                     &url, user.as_deref(), token.as_deref(), password.as_deref(), expires.as_deref(),
                 );
@@ -699,10 +713,14 @@ fn main() {
             if code != 0 { std::process::exit(code); }
         }
         Cmd::Backup { url, to, incremental } => {
+            // `url` (the source endpoint) accepts a URL or catalog name/index.
+            let url = endpoint_or_exit(Some(url));
             let code = vectordata::client_cli::backup(&url, &to, incremental);
             if code != 0 { std::process::exit(code); }
         }
         Cmd::Restore { src, to } => {
+            // `to` (the target endpoint) accepts a URL or catalog name/index.
+            let to = endpoint_or_exit(Some(to));
             let code = vectordata::client_cli::restore(&src, &to);
             if code != 0 { std::process::exit(code); }
         }

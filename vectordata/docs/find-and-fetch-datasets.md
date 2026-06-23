@@ -23,9 +23,9 @@ The whole loop in five commands (Linux x64 — other platforms under [Install](#
 ```bash
 curl -fL -o vectordata https://github.com/nosqlbench/vectordata-rs/releases/latest/download/vectordata-x86_64-unknown-linux-musl
 chmod +x vectordata
-./vectordata config set cache auto                             # cache → largest writable mount
-./vectordata config catalog add https://example.com/datasets/  # your catalog URL
-./vectordata explore                                           # browse + visualize the datasets
+./vectordata config set cache auto                                    # cache → largest writable mount
+./vectordata config catalog add https://example.com/datasets/ --name benches  # your catalog, named
+./vectordata explore                                                  # browse + visualize the datasets
 ```
 
 The sections below explain every step (and other platforms) in detail.
@@ -129,10 +129,28 @@ Register a catalog source once; it's remembered in `catalogs.yaml` and used by
 every later command.
 
 ```bash
-vectordata config catalog add https://example.com/datasets/   # an HTTP(S) URL …
-vectordata config catalog add s3://my-bucket/datasets/        # … a public S3 bucket …
-vectordata config catalog add /shared/datasets                # … or a local directory
-vectordata config catalog list                                # what's registered
+vectordata config catalog add https://example.com/datasets/ --name benches  # HTTP(S) URL, named
+vectordata config catalog add s3://my-bucket/datasets/                       # public S3 bucket
+vectordata config catalog add /shared/datasets                              # or a local directory
+vectordata config catalog list                                             # what's registered (with #)
+```
+
+Give a catalog a `--name` and you can refer to it by that name — or by its
+1-based index from `config catalog list` — anywhere an endpoint is expected
+(`login`, `logout`, `whoami`, `ping`, `token`, `push --to`), instead of pasting
+the URL again. (Without `--name`, a name is derived from the URL.)
+
+Two flags help when registering an endpoint that can't be probed yet:
+
+```bash
+# Register before anything is published there (skip the parse+ping check) —
+# handy when you're about to push to a fresh namespace and want to address it
+# by name:
+vectordata config catalog add https://my-host/datasets/ --name mine --no-verify
+
+# Accept a self-signed cert for a local/dev endpoint (records the origin under
+# trust_self_signed — insecure, dev only):
+vectordata config catalog add https://localhost:8443/datasets/ --name dev --trust-self-signed
 ```
 
 ## 3. Explore — the fastest way in
@@ -241,33 +259,37 @@ Public catalogs need no credentials — everything above works as-is. A **privat
 catalog expects a bearer token. Log in once; `vectordata` stores the credential
 per endpoint and attaches it automatically to every later request there.
 
-```bash
-# Store a pre-issued token (a literal token, or a path to a token file):
-vectordata login https://catalog.example.com/ --token vd_xxxxxxxx
-
-# …or exchange a username + password for one — prompts for the password
-# (or reads $VECTORDATA_PASSWORD):
-vectordata login https://catalog.example.com/ --user alice
-```
-
-Check who you are and what you're allowed to see at an endpoint:
+The tidiest flow is to **name** the catalog, then address it by name:
 
 ```bash
-vectordata whoami https://catalog.example.com/   # identity, access level, visible namespaces
-vectordata whoami                                # …the endpoint you last logged in to
+# 1. Log in by URL the first time (a literal token, or a path to a token file),
+#    or exchange a username + password (prompts, or reads $VECTORDATA_PASSWORD):
+vectordata login https://catalog.example.com/datasets/ --token vd_xxxxxxxx
+vectordata login https://catalog.example.com/datasets/ --user alice
+
+# 2. Register it with a name (the login above lets the add verify a private one):
+vectordata config catalog add https://catalog.example.com/datasets/ --name prod
 ```
 
-Manage stored credentials:
+From here on, refer to it by **name** (or its 1-based index) — no URL:
 
 ```bash
-vectordata login --list                          # endpoints you have credentials for
-vectordata logout https://catalog.example.com/   # forget one
+vectordata whoami prod        # identity, access level, visible namespaces
+vectordata login prod --token vd_yyyy   # refresh/replace the stored token, by name
+vectordata logout prod        # forget it
+vectordata login --list       # all endpoints you have credentials for
 ```
 
-Once you're logged in, `datasets list`, `describe`, `ping`, and `precache`
-against that endpoint are authenticated transparently — no extra flags. Logging
-in interactively also offers to register the endpoint's namespaces as catalogs,
-so `datasets list` immediately shows what's published there.
+`login`, `logout`, `whoami`, `ping`, `token`, and `push --to` all accept a
+configured catalog **name** or **index** (or a `scheme://…` URL verbatim). Once
+logged in, `datasets list`, `describe`, `ping`, and `precache` are authenticated
+transparently — no extra flags.
+
+> **Prefer a TUI?** `vectordata explore` → `Ctrl-G` opens a config view where you
+> add a catalog (name + URL + token) and manage its auth interactively — a
+> private catalog's token can be supplied right there, so the add verifies
+> without a separate `login`. See the
+> [vecd end-to-end tutorial](../../docs/tutorials/vecd-end-to-end/) (step 5).
 
 ## Where to go next
 

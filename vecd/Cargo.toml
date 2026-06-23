@@ -60,6 +60,12 @@ libc = "0.2"
 # stack — vecd only needs the push core (binding/pushlog/checksums).
 vectordata = { path = "../vectordata", version = "1.3.0", default-features = false }
 
+# Blocking HTTP client for the `daemon status --wait` readiness probe — a
+# liveness self-check of vecd's own (often self-signed) loopback /healthz, so it
+# accepts invalid certs. rustls to match the in-tree TLS backend; already in the
+# build graph via vectordata's transport, so this adds no new crates.
+reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "rustls", "json"] }
+
 [features]
 default = []
 # Encrypt the control-plane DB at the SQLite layer (SQLCipher). Off by
@@ -91,7 +97,6 @@ required-features = ["extended-tests"]
 
 [dev-dependencies]
 tempfile = "3.8"
-reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "rustls", "json"] }
 serde_json = "1"
 
 [lints]

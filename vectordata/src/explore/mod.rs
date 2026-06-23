@@ -286,7 +286,7 @@ pub fn run(args: ExploreArgs) -> i32 {
                     run_ping(specifier, pause);
                     ActionFlow::Stay
                 }
-                PickerAction::Describe | PickerAction::Source | PickerAction::Details => {
+                PickerAction::Describe | PickerAction::Source => {
                     // Picker-local — the action menu handles them
                     // directly via `is_picker_local()` and never reaches
                     // dispatch. These arms are unreachable in practice

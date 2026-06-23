@@ -233,6 +233,54 @@ pub fn set_catalog_credential(
     Ok(())
 }
 
+/// Whether a stored credential key and a catalog's [`credential_key`] lie on
+/// the same segment-aligned path chain — i.e. the credential governs that
+/// catalog (origin-wide or exact) or is scoped under it. Mirrors the
+/// longest-prefix logic in [`Store::token_for_url`], so "the credential serves
+/// this catalog" and "the credential is justified by this catalog" agree.
+fn keys_on_same_chain(cred: &str, cat: &str) -> bool {
+    cred == cat
+        || cat.starts_with(&format!("{cred}/"))
+        || cred.starts_with(&format!("{cat}/"))
+}
+
+/// Pure core of [`prune_orphan_credentials`]: drop every entry whose key is
+/// justified by none of `catalog_keys`, returning the removed keys. Separated
+/// so the matching rule is testable without the on-disk store or catalogs.
+fn prune_orphans_in(store: &mut Store, catalog_keys: &[String]) -> Vec<String> {
+    let orphans: Vec<String> = store
+        .entries
+        .keys()
+        .filter(|k| !catalog_keys.iter().any(|c| keys_on_same_chain(k, c)))
+        .cloned()
+        .collect();
+    for k in &orphans {
+        store.entries.remove(k);
+    }
+    orphans
+}
+
+/// Reconcile `credentials.toml` with the configured catalogs: drop every stored
+/// credential that corresponds (by URL, longest-prefix) to no configured
+/// catalog — so the file only holds catalog-justified entries. Catalogs without
+/// a URL key (local paths) contribute nothing to match against. Persists +
+/// refreshes the process cache only when something changed. Returns the number
+/// of credentials removed. Called after an explicit catalog **removal** (the op
+/// that orphans a credential); never on add/login, so a credential created by
+/// `login` before its catalog exists is left alone.
+pub fn prune_orphan_credentials() -> usize {
+    let cats = crate::catalog::sources::named_catalog_entries(
+        &crate::catalog::sources::config_dir());
+    let keys: Vec<String> = cats.iter().filter_map(|c| credential_key(&c.location)).collect();
+    let mut store = Store::load();
+    let removed = prune_orphans_in(&mut store, &keys);
+    if !removed.is_empty() {
+        let _ = store.save();
+        reload_credentials();
+    }
+    removed.len()
+}
+
 /// Remove any credential stored for a catalog URL. Returns whether one
 /// was present. Refreshes the process cache on removal.
 pub fn clear_catalog_credential(url: &str) -> Result<bool, String> {
@@ -262,25 +310,75 @@ pub fn stored_token(url: &str) -> Option<String> {
     Store::load().token_for_url(url).map(|e| e.token.clone())
 }
 
-/// The endpoint a command should act on: the given `url`, else the sole
-/// logged-in endpoint's origin — so commands "just work" while logged in.
-/// Errors (asking for an explicit `<url>`) when none or several are stored.
+/// The endpoint a command should act on: the given specifier (resolved by
+/// [`resolve_endpoint_spec`] — a URL, or a configured catalog name/index),
+/// else the sole logged-in endpoint's origin — so commands "just work" while
+/// logged in. Errors (asking for an explicit endpoint) when none or several
+/// are stored.
 pub fn resolve_endpoint(url: Option<&str>) -> Result<String, String> {
     if let Some(u) = url {
-        return Ok(u.to_string());
+        return resolve_endpoint_spec(u);
     }
     let entries = Store::load().list();
     match entries.len() {
         0 => Err(
-            "not logged in to any endpoint — give a <url>, or run `vectordata login <url>` first"
+            "not logged in to any endpoint — give a <url> (or a configured catalog name/index), \
+             or run `vectordata login <url>` first"
                 .to_string(),
         ),
         1 => Ok(entries.into_iter().next().unwrap().0),
         _ => Err(format!(
-            "logged in to several endpoints — specify one as <url>: {}",
+            "logged in to several endpoints — specify one as a <url>, or a configured catalog \
+             name/index: {}",
             entries.iter().map(|(o, _)| o.as_str()).collect::<Vec<_>>().join(", ")
         )),
     }
+}
+
+/// Resolve an endpoint specifier to a URL: a URL (`scheme://…`) is taken
+/// verbatim; otherwise it is looked up among the **configured catalogs**
+/// (catalogs.yaml) as a NAME or a 1-based INDEX and resolved to that
+/// catalog's location — so `vectordata logout protected` or `… 2` work
+/// instead of pasting the full URL.
+pub fn resolve_endpoint_spec(spec: &str) -> Result<String, String> {
+    let cats = crate::catalog::sources::named_catalog_entries(
+        &crate::catalog::sources::config_dir());
+    resolve_endpoint_spec_in(spec, &cats)
+}
+
+/// Pure core of [`resolve_endpoint_spec`] (catalogs passed in, so it's
+/// testable without touching the config dir).
+fn resolve_endpoint_spec_in(
+    spec: &str,
+    cats: &[crate::catalog::sources::NamedCatalogSource],
+) -> Result<String, String> {
+    if spec.contains("://") {
+        return Ok(spec.to_string());
+    }
+    if cats.is_empty() {
+        return Err(format!(
+            "'{spec}' is not a URL and no catalogs are configured to resolve it against \
+             (add one with `vectordata config catalog add`)"
+        ));
+    }
+    // A 1-based index into the configured catalogs.
+    if let Ok(n) = spec.parse::<usize>()
+        && (1..=cats.len()).contains(&n)
+    {
+        return Ok(cats[n - 1].location.clone());
+    }
+    // Otherwise a catalog name (covers legacy list entries named "0", "1", …).
+    if let Some(c) = cats.iter().find(|c| c.name == spec) {
+        return Ok(c.location.clone());
+    }
+    Err(format!(
+        "no configured catalog named or indexed '{spec}'; configured: {}",
+        cats.iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}={}", i + 1, c.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// A bearer token resolved from a `--token` argument, with any user/expiry the
@@ -566,6 +664,64 @@ mod tests {
             mk(Some("1000000")).expiry_status(1_000_000),
             Expiry::Expired { secs_ago: 0 }
         );
+    }
+
+    #[test]
+    fn endpoint_spec_resolves_url_name_or_index() {
+        use crate::catalog::sources::NamedCatalogSource;
+        let cats = vec![
+            NamedCatalogSource { name: "prot".into(), location: "https://h/datasets/".into() },
+            NamedCatalogSource { name: "lab".into(), location: "/data/lab".into() },
+        ];
+        // A URL is taken verbatim.
+        assert_eq!(resolve_endpoint_spec_in("https://x/y", &cats).unwrap(), "https://x/y");
+        // By catalog name.
+        assert_eq!(resolve_endpoint_spec_in("prot", &cats).unwrap(), "https://h/datasets/");
+        // By 1-based index.
+        assert_eq!(resolve_endpoint_spec_in("2", &cats).unwrap(), "/data/lab");
+        // Out-of-range index and unknown name both error.
+        assert!(resolve_endpoint_spec_in("9", &cats).is_err());
+        assert!(resolve_endpoint_spec_in("nope", &cats).is_err());
+        // A non-URL with no configured catalogs errors.
+        assert!(resolve_endpoint_spec_in("prot", &[]).is_err());
+        // A legacy list entry literally named "0" resolves by name even though
+        // 0 isn't a valid 1-based index.
+        let list = vec![NamedCatalogSource { name: "0".into(), location: "https://z/".into() }];
+        assert_eq!(resolve_endpoint_spec_in("0", &list).unwrap(), "https://z/");
+    }
+
+    #[test]
+    fn prune_keeps_only_catalog_justified_entries() {
+        let mk = || Entry { token: "t".into(), user: None, expires: None, catalog: None };
+        let mut store = Store::default();
+        store.set("https://h:8443/datasets".into(), mk()); // exact catalog key
+        store.set("https://h:8443".into(), mk()); // origin-wide → governs the catalog
+        store.set("https://h:8443/datasets/sub".into(), mk()); // scoped under the catalog
+        store.set("https://h:8443/other".into(), mk()); // sibling path — orphan
+        store.set("https://elsewhere:9000".into(), mk()); // unrelated origin — orphan
+        store.set("https://h:8443/data".into(), mk()); // prefix-of-string but not segment — orphan
+
+        let catalog_keys = vec!["https://h:8443/datasets".to_string()];
+        let mut removed = prune_orphans_in(&mut store, &catalog_keys);
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec![
+                "https://elsewhere:9000".to_string(),
+                "https://h:8443/data".to_string(),
+                "https://h:8443/other".to_string(),
+            ]
+        );
+        // The three justified entries survive.
+        assert!(store.get("https://h:8443/datasets").is_some());
+        assert!(store.get("https://h:8443").is_some());
+        assert!(store.get("https://h:8443/datasets/sub").is_some());
+
+        // No catalog keys (e.g. all catalogs removed) → every entry is an orphan.
+        let mut store2 = Store::default();
+        store2.set("https://h:8443/datasets".into(), mk());
+        assert_eq!(prune_orphans_in(&mut store2, &[]).len(), 1);
+        assert!(store2.list().is_empty());
     }
 
     #[test]
