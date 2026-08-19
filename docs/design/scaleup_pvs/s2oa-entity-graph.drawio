@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="s2oa-entity-graph">
+    <mxGraphModel dx="1600" dy="1080" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1620" pageHeight="1060" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="S2OA entity graph — entities, relationships, cardinalities (desk estimates; verify per union doc §7)" style="text;html=1;fontSize=18;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="10" width="960" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="legend" value="boxes: entity ×cardinality · edge labels: avg relative cardinality (fan-out) · dashed: derivation / flattening" style="text;html=1;fontSize=11;fontColor=#666666;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="820" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lane_oa" value="OpenAlex (CC0) — metadata enrichment graph" style="swimlane;startSize=30;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=14;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="40" y="70" width="650" height="650" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_domain" value="Domain ×4&#xa;marginal ~25%" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="lane_oa">
+          <mxGeometry x="30" y="50" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_field" value="Field ×26&#xa;marginal ~4%" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="lane_oa">
+          <mxGeometry x="30" y="150" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_subfield" value="Subfield ×252&#xa;marginal ~0.4%" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="lane_oa">
+          <mxGeometry x="30" y="250" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_topic" value="Topic ×~4,516&#xa;marginal ~0.02%" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="lane_oa">
+          <mxGeometry x="30" y="350" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="note_ladder" value="selectivity ladder (T6-hier):&#xa;same predicate shape,&#xa;~10× selectivity per level" style="text;html=1;fontSize=11;fontColor=#666666;align=left;verticalAlign=top;" vertex="1" parent="lane_oa">
+          <mxGeometry x="30" y="420" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_work" value="Work ×~250M&#xa;metadata anchor&#xa;~100M+ with abstracts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="lane_oa">
+          <mxGeometry x="330" y="340" width="280" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_author" value="Author ×~90M&#xa;(ultra-tail T2)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="lane_oa">
+          <mxGeometry x="350" y="60" width="240" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_source" value="Source / venue ×~250k&#xa;(Zipfian; T2/T8, T7 strings)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="lane_oa">
+          <mxGeometry x="350" y="160" width="240" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_inst" value="Institution ×~110k&#xa;+ country (T1)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="lane_oa">
+          <mxGeometry x="350" y="480" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_funder" value="Funder ×~32k&#xa;(sparse population)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="lane_oa">
+          <mxGeometry x="350" y="590" width="240" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lane_s2" value="Semantic Scholar — S2AG / S2ORC (ODC-BY)" style="swimlane;startSize=30;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=14;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="890" y="70" width="670" height="440" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_paper" value="Paper (S2AG) ×~200M&#xa;doc-level sibling corpus" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="lane_s2">
+          <mxGeometry x="50" y="70" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_specter" value="SPECTER vector ×~200M&#xa;(free doc-level embedding set)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="lane_s2">
+          <mxGeometry x="390" y="60" width="240" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_tldr" value="TLDR (large subset)&#xa;query-shaped text" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="lane_s2">
+          <mxGeometry x="390" y="150" width="240" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_fos" value="s2 field of study ×~23&#xa;(flat T6 cross-check)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="lane_s2">
+          <mxGeometry x="390" y="240" width="240" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_ftp" value="Full-text paper (S2ORC) ×~15.7M&#xa;parsed body + span annotations&#xa;(the corpus spine)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="lane_s2">
+          <mxGeometry x="50" y="280" width="260" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lane_dx" value="Derived passage spine — published as vectors + coordinates, no prose (ODC-BY attribution in metadata)" style="swimlane;startSize=30;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;fontSize=14;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="560" y="770" width="1000" height="250" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_passage" value="Passage ×~1–2B&#xa;id = (corpusid, section, ordinal)&#xa;the vector spine — carries the flattened star&#xa;+ section label (~6/doc, correlated T1)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;fontStyle=1;" vertex="1" parent="lane_dx">
+          <mxGeometry x="60" y="60" width="340" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_pvec" value="Passage vector (B) ×~1–2B&#xa;Qwen3-0.6B @ 1024-d" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="lane_dx">
+          <mxGeometry x="520" y="60" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ent_qvec" value="Query vector (Q)&#xa;TLDR/title-as-query or held-out self-search" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="lane_dx">
+          <mxGeometry x="520" y="160" width="300" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_topic_sub" value="18 : 1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_topic" target="ent_subfield">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_sub_field" value="~10 : 1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_subfield" target="ent_field">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_field_dom" value="~6 : 1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_field" target="ent_domain">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_work_topic" value="1–3 : 1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_work" target="ent_topic">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_work_author" value="~4 : 1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.15;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_work" target="ent_author">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="310" y="422" />
+              <mxPoint x="310" y="205" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_work_source" value="n : 1 (~60 works/source)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.7;exitY=0;exitDx=0;exitDy=0;entryX=0.7;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_work" target="ent_source">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_work_inst" value="~2–5 : 1&#xa;(via authorship)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.4;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_work" target="ent_inst">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_work_funder" value="0–2 : 1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_work" target="ent_funder">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="668" y="530" />
+              <mxPoint x="668" y="685" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_paper_cites" value="cites ~20–40 : 1&#xa;(×~2B+ citation edges; T3/T8)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=0;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_paper" target="ent_paper">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1005" y="115" />
+              <mxPoint x="1135" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_paper_specter" value="1 : 1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.3;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_paper" target="ent_specter">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_paper_tldr" value="0..1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.6;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_paper" target="ent_tldr">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_paper_fos" value="1..n" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.85;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_paper" target="ent_fos">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_ftp_paper" value="⊂ subset (15.7M of 200M)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_ftp" target="ent_paper">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_join" value="spine join: DOI → MAG → PMID → arXiv&#xa;join rate ≥90% (measured gate)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=3;strokeColor=#b85450;fontColor=#b85450;fontStyle=1;startArrow=classic;startFill=1;endArrow=classic;endFill=1;exitX=1;exitY=0.3;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_work" target="ent_paper">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="760" y="434" />
+              <mxPoint x="760" y="175" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_ftp_passage" value="chunker para-v1 (versioned, provenance axis)&#xa;~100 : 1 (60–120 passages/doc)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#d79b00;fontColor=#d79b00;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_ftp" target="ent_passage">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1070" y="740" />
+              <mxPoint x="790" y="740" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_work_passage" value="star flattening: parent fields&#xa;copied onto every passage" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#666666;fontColor=#666666;exitX=1;exitY=0.8;exitDx=0;exitDy=0;entryX=0.3;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_work" target="ent_passage">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="722" y="474" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_passage_pvec" value="1 : 1 (ordinal-aligned)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.35;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_passage" target="ent_pvec">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_tldr_qvec" value="embedded as&#xa;asymmetric queries" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#82b366;fontColor=#82b366;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ent_tldr" target="ent_qvec">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1545" y="245" />
+              <mxPoint x="1545" y="960" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

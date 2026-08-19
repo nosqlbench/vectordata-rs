@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="facets-BQGD">
+    <mxGraphModel dx="1400" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1460" pageHeight="770" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="BQGD dataset — the minimal ground-truth quad and its ordinal referencing" style="text;html=1;fontSize=18;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="15" width="820" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="qc" value="query_vectors.fvecs — Q  (Q records)" style="swimlane;startSize=28;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="40" y="110" width="340" height="290" as="geometry" />
+        </mxCell>
+        <mxCell id="qn" value="record = [dim: u32][f32 × dim] — ordinal is the record position (not stored)" style="text;html=1;fontSize=10;fontColor=#666666;align=left;verticalAlign=middle;" vertex="1" parent="qc">
+          <mxGeometry x="12" y="32" width="316" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="qo0" value="0" style="text;html=1;fontStyle=2;fontColor=#888888;align=right;verticalAlign=middle;" vertex="1" parent="qc">
+          <mxGeometry x="12" y="62" width="55" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="qr0" value="f32 × d" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="qc">
+          <mxGeometry x="78" y="62" width="240" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="qo1" value="1" style="text;html=1;fontStyle=2;fontColor=#888888;align=right;verticalAlign=middle;" vertex="1" parent="qc">
+          <mxGeometry x="12" y="97" width="55" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="qr1" value="f32 × d" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="qc">
+          <mxGeometry x="78" y="97" width="240" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="qo2" value="2" style="text;html=1;fontStyle=2;fontColor=#888888;align=right;verticalAlign=middle;fontStyle=3" vertex="1" parent="qc">
+          <mxGeometry x="12" y="132" width="55" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="qr2" value="q[2] — f32 × d" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;" vertex="1" parent="qc">
+          <mxGeometry x="78" y="132" width="240" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="qo3" value="3" style="text;html=1;fontStyle=2;fontColor=#888888;align=right;verticalAlign=middle;" vertex="1" parent="qc">
+          <mxGeometry x="12" y="167" width="55" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="qr3" value="f32 × d" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="qc">
+          <mxGeometry x="78" y="167" width="240" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="qdots" value="⋮" style="text;html=1;align=center;verticalAlign=middle;fontSize=14;" vertex="1" parent="qc">
+          <mxGeometry x="78" y="202" width="240" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="qoN" value="Q−1" style="text;html=1;fontStyle=2;fontColor=#888888;align=right;verticalAlign=middle;" vertex="1" parent="qc">
+          <mxGeometry x="12" y="232" width="55" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="qrN" value="f32 × d" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="qc">
+          <mxGeometry x="78" y="232" width="240" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="gc" value="neighbor_indices.ivecs — G  (Q records × k)" style="swimlane;startSize=28;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="500" y="110" width="380" height="290" as="geometry" />
+        </mxCell>
+        <mxCell id="gn" value="record = [k: u32][i32 × k] — row i pairs with query ordinal i; values ordered nearest → farthest" style="text;html=1;fontSize=10;fontColor=#666666;align=left;verticalAlign=middle;" vertex="1" parent="gc">
+          <mxGeometry x="12" y="30" width="356" height="28" as="geometry" />
+        </mxCell>
+        <mxCell id="go0" value="0" style="text;html=1;fontStyle=2;fontColor=#888888;align=right;verticalAlign=middle;" vertex="1" parent="gc">
+          <mxGeometry x="12" y="62" width="55" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="gr0" value="…" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;" vertex="1" parent="gc">
+          <mxGeometry x="78" y="62" width="285" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="go1" value="1" style="text;html=1;fontStyle=2;fontColor=#888888;align=right;verticalAlign=middle;" vertex="1" parent="gc">
+          <mxGeometry x="12" y="97" width="55" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="gr1" value="…" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;" vertex="1" parent="gc">
+          <mxGeometry x="78" y="97" width="285" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="go2" value="2" style="text;html=1;fontStyle=2;fontColor=#888888;align=right;verticalAlign=middle;" vertex="1" parent="gc">
+          <mxGeometry x="12" y="132" width="55" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="gr2" value="17 │ 0 │ 42 │ …  (×k)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;" vertex="1" parent="gc">
+          <mxGeometry x="78" y="132" width="285" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="go3" value="3" style="text;html=1;fontStyle=2;fontColor=#888888;align=right;verticalAlign=middle;" vertex="1" parent="gc">
+          <mxGeometry x="12" y="167" width="55" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="gr3" value="…" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;" vertex="1" parent="gc">
+          <mxGeometry x="78" y="167" width="285" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="gdots" value="⋮" style="text;html=1;align=center;verticalAlign=middle;fontSize=14;" vertex="1" parent="gc">
+          <mxGeometry x="78" y="202" width="285" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="goN" value="Q−1" style="text;html=1;fontStyle=2;fontColor=#888888;align=right;verticalAlign=middle;" vertex="1" parent="gc">
+          <mxGeometry x="12" y="232" width="55" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="grN" value="…" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;" vertex="1" parent="gc">
+          <mxGeometry x="78" y="232" width="285" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="dbox" value="neighbor_distances.fvecs — D (Q records × k)&#xa;cell-aligned twin of G — one distance per G cell (published convention)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="500" y="406" width="380" height="48" as="geometry" />
+        </mxCell>
+        <mxCell id="gsem" value="G[2] holds the ordinals of the k nearest base vectors to q[2], under attributes.distance_function" style="text;html=1;fontSize=10;fontStyle=2;fontColor=#666666;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="500" y="462" width="400" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="bc" value="base_vectors.fvecs — B  (N records)" style="swimlane;startSize=28;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="110" width="380" height="330" as="geometry" />
+        </mxCell>
+        <mxCell id="bn" value="record = [dim: u32][f32 × dim] — ordinal is the record position (not stored)" style="text;html=1;fontSize=10;fontColor=#666666;align=left;verticalAlign=middle;" vertex="1" parent="bc">
+          <mxGeometry x="12" y="32" width="356" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="bo0" value="0" style="text;html=1;fontStyle=2;fontColor=#888888;align=left;verticalAlign=middle;" vertex="1" parent="bc">
+          <mxGeometry x="325" y="62" width="45" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="br0" value="b[0] — f32 × d" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="bc">
+          <mxGeometry x="15" y="62" width="300" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="bd1" value="⋮" style="text;html=1;align=center;verticalAlign=middle;fontSize=14;" vertex="1" parent="bc">
+          <mxGeometry x="15" y="97" width="300" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="bo17" value="17" style="text;html=1;fontStyle=2;fontColor=#888888;align=left;verticalAlign=middle;" vertex="1" parent="bc">
+          <mxGeometry x="325" y="127" width="45" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="br17" value="b[17] — f32 × d" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="bc">
+          <mxGeometry x="15" y="127" width="300" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="bd2" value="⋮" style="text;html=1;align=center;verticalAlign=middle;fontSize=14;" vertex="1" parent="bc">
+          <mxGeometry x="15" y="162" width="300" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="bo42" value="42" style="text;html=1;fontStyle=2;fontColor=#888888;align=left;verticalAlign=middle;" vertex="1" parent="bc">
+          <mxGeometry x="325" y="192" width="45" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="br42" value="b[42] — f32 × d" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="bc">
+          <mxGeometry x="15" y="192" width="300" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="bd3" value="⋮" style="text;html=1;align=center;verticalAlign=middle;fontSize=14;" vertex="1" parent="bc">
+          <mxGeometry x="15" y="227" width="300" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="boN" value="N−1" style="text;html=1;fontStyle=2;fontColor=#888888;align=left;verticalAlign=middle;" vertex="1" parent="bc">
+          <mxGeometry x="325" y="257" width="45" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="brN" value="f32 × d" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="bc">
+          <mxGeometry x="15" y="257" width="300" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="e_align" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;startArrow=none;endArrow=open;fontSize=11;exitX=0;exitY=0.507;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="gc" target="qr2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e17" value="17" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="gr2" target="br17">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e0" value="0" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="gr2" target="br0">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e42" value="42" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=11;exitX=1;exitY=0.75;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="gr2" target="br42">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="aligntxt" value="row-aligned&#xa;G[i] ↔ Q[i]&#xa;(same ordinal)" style="text;html=1;fontSize=10;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="386" y="180" width="108" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="vnote" value="G cell values are&#xa;base ordinals ∈ [0, N)" style="text;html=1;fontSize=11;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="885" y="62" width="145" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="yamlbox" value="# dataset.yaml (BQGD view)&#xa;profiles:&#xa;&#160;&#160;default:&#xa;&#160;&#160;&#160;&#160;maxk: 100&#xa;&#160;&#160;&#160;&#160;base_vectors:&#160;&#160;&#160;&#160;&#160;profiles/base/base_vectors.fvecs&#xa;&#160;&#160;&#160;&#160;query_vectors:&#160;&#160;&#160;&#160;profiles/base/query_vectors.fvecs&#xa;&#160;&#160;&#160;&#160;neighbor_indices: profiles/default/neighbor_indices.ivecs&#xa;&#160;&#160;&#160;&#160;neighbor_distances: profiles/default/neighbor_distances.fvecs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontFamily=Courier New;fontSize=11;align=left;verticalAlign=top;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="505" width="450" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="invbox" value="Ordinal referencing invariants&#xa;• ordinals are implicit — a record&#39;s ordinal is its position; row order is load-bearing&#xa;• B and Q are independent ordinal spaces; G is the only bridge between them&#xa;• row alignment: |G| = |Q| — record i of G describes query ordinal i&#xa;• value reference: every cell v of G is a base ordinal, 0 ≤ v &lt; |B|&#xa;• G row width k ≤ maxk; values ordered nearest → farthest&#xa;• D (neighbor_distances.fvecs) is cell-for-cell aligned with G — one distance per neighbor cell&#xa;(spec: docs/sysref/01-data-model.md §1.5–1.6)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="540" y="505" width="560" height="160" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

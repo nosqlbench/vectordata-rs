@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="facets-BQGDMPREF">
+    <mxGraphModel dx="1500" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1580" pageHeight="930" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="BQGDMPREF dataset — derivation graph and the pre/post-filter junctions" style="text;html=1;fontSize=18;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="14" width="860" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="st1" value="stage 1 — independent truths" style="text;html=1;fontSize=11;fontStyle=2;fontColor=#666666;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="400" y="98" width="540" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="st2" value="stage 2 — filtered-truth junctions" style="text;html=1;fontSize=11;fontStyle=2;fontColor=#666666;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="98" width="310" height="22" as="geometry" />
+        </mxCell>
+        <mxCell id="qcard" value="Q — query_vectors.fvecs&#xa;query space · Q records · f32 × d" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="130" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="bcard" value="B — base_vectors.fvecs&#xa;base space · N records · f32 × d" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="235" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="mcard" value="M — metadata_content.slab&#xa;MNode · M[i] describes b[i]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="340" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="lcard" value="metadata_layout.slab — schema namespace" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f2ebf5;strokeColor=#9673a6;dashed=1;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="422" width="260" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="pcard" value="P — predicates.slab&#xa;PNode trees · predicate space · P records" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="490" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="j1" value="&lt;b&gt;compute knn&lt;/b&gt;&#xa;exact top-k of q[i]&#xa;over all of B" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;" vertex="1" parent="1">
+          <mxGeometry x="400" y="160" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="j2" value="&lt;b&gt;compute evaluate-predicates&lt;/b&gt;&#xa;scan M against each P[j]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;" vertex="1" parent="1">
+          <mxGeometry x="400" y="400" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="gd" value="G + D — unfiltered ground truth" style="swimlane;startSize=26;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;fontSize=12;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="680" y="140" width="260" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="gdg" value="neighbor_indices.ivecs — base ordinals" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="gd">
+          <mxGeometry x="10" y="32" width="240" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="gdd" value="neighbor_distances.fvecs — distances" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="gd">
+          <mxGeometry x="10" y="62" width="240" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="gdn" value="cell-aligned pair · row-aligned with Q" style="text;html=1;fontSize=9;fontColor=#666666;align=left;verticalAlign=middle;" vertex="1" parent="gd">
+          <mxGeometry x="10" y="94" width="240" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="rc2" value="R — predicate match oracle" style="swimlane;startSize=26;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;fontSize=12;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="680" y="390" width="260" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="rr" value="metadata_results.ivvecs — base ordinals" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;fontSize=10;" vertex="1" parent="rc2">
+          <mxGeometry x="10" y="32" width="240" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="ri" value="IDXFOR__….ivvecs.i32 — offset sidecar" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;dashed=1;fontSize=10;" vertex="1" parent="rc2">
+          <mxGeometry x="10" y="62" width="240" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="rn" value="vvec (variable length) · row-aligned with P" style="text;html=1;fontSize=9;fontColor=#666666;align=left;verticalAlign=middle;" vertex="1" parent="rc2">
+          <mxGeometry x="10" y="94" width="240" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="j3" value="&lt;b&gt;PRE-FILTER JUNCTION&lt;/b&gt;&#xa;compute prefiltered-knn&#xa;exact top-k of q[i] over&#xa;X_p = { b[v] : v ∈ R[i] }" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#333333;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="140" width="220" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="j4" value="&lt;b&gt;POST-FILTER JUNCTION&lt;/b&gt;&#xa;compute postfiltered-knn&#xa;E[i] = G[i] ∩ R[i]&#xa;ranks kept · O(K) per query" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#333333;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="430" width="220" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="fc" value="F — prefiltered ground truth" style="swimlane;startSize=26;html=1;fillColor=#b0e3e6;strokeColor=#0e8088;fontStyle=1;fontSize=12;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="1320" y="130" width="230" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="ff1" value="prefiltered_neighbor_indices.ivec" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#0e8088;fontSize=10;" vertex="1" parent="fc">
+          <mxGeometry x="10" y="32" width="210" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="ff2" value="prefiltered_neighbor_distances.fvec" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#0e8088;fontSize=10;" vertex="1" parent="fc">
+          <mxGeometry x="10" y="62" width="210" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="fn" value="exact over the passing subset&#xa;perfect-recall target · |F[i]| = K if |X_p| ≥ K" style="text;html=1;fontSize=9;fontColor=#444444;align=left;verticalAlign=middle;" vertex="1" parent="fc">
+          <mxGeometry x="10" y="92" width="210" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="ec" value="E — postfiltered ground truth" style="swimlane;startSize=26;html=1;fillColor=#c3d3e8;strokeColor=#4f6c92;fontStyle=1;fontSize=12;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="1320" y="420" width="230" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="ee1" value="postfiltered_neighbor_indices.ivec" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4f6c92;fontSize=10;" vertex="1" parent="ec">
+          <mxGeometry x="10" y="32" width="210" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="ee2" value="postfiltered_neighbor_distances.fvec" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#4f6c92;fontSize=10;" vertex="1" parent="ec">
+          <mxGeometry x="10" y="62" width="210" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="en" value="G ∩ R · sentinels −1 / +∞&#xa;may be sparse — sparsity is the truth" style="text;html=1;fontSize=9;fontColor=#444444;align=left;verticalAlign=middle;" vertex="1" parent="ec">
+          <mxGeometry x="10" y="92" width="210" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="elm" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;startArrow=none;endArrow=open;strokeColor=#9673a6;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="lcard" target="mcard">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eq1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.7;exitDx=0;exitDy=0;entryX=0;entryY=0.3;entryDx=0;entryDy=0;" edge="1" parent="1" source="qcard" target="j1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eb1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.3;exitDx=0;exitDy=0;entryX=0;entryY=0.7;entryDx=0;entryDy=0;" edge="1" parent="1" source="bcard" target="j1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="em2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.3;exitDx=0;exitDy=0;entryX=0;entryY=0.3;entryDx=0;entryDy=0;" edge="1" parent="1" source="mcard" target="j2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ep2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.7;entryDx=0;entryDy=0;" edge="1" parent="1" source="pcard" target="j2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ej1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="j1" target="gd">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ej2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="j2" target="rc2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eqj3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.7;exitY=0;exitDx=0;exitDy=0;entryX=0.6;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="qcard" target="j3">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="222" y="78" />
+              <mxPoint x="1152" y="78" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ebj3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.3;exitDx=0;exitDy=0;entryX=0.3;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="bcard" target="j3">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="350" y="256" />
+              <mxPoint x="350" y="90" />
+              <mxPoint x="1086" y="90" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="erj3" value="X_p" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;strokeColor=#d79b00;fontColor=#d79b00;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="rc2" target="j3">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="975" y="195" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="egj4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.7;exitDx=0;exitDy=0;entryX=0;entryY=0.3;entryDx=0;entryDy=0;" edge="1" parent="1" source="gd" target="j4">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="995" y="463" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="erj4" value="membership" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;strokeColor=#d79b00;fontColor=#d79b00;exitX=1;exitY=0.7;exitDx=0;exitDy=0;entryX=0;entryY=0.7;entryDx=0;entryDy=0;" edge="1" parent="1" source="rc2" target="j4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ej3f" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="j3" target="fc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ej4e" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="j4" target="ec">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="pairbox" value="Pairing at the junctions: the standard scheme sets |P| = |Q|, and ordinal i means ⟨query i, predicate i⟩ — so G, D, R (paired view), F, and E are all row-aligned on the same i." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f9f9f9;strokeColor=#666666;fontSize=10;align=left;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="400" y="580" width="540" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="obox" value="O — oracle partitions (companion construct): profiles/label_NN/ re-materialize B/Q/G/D per label value, each in its own ordinal space. A profile-level construct, not a facet file." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f9f9f9;strokeColor=#666666;dashed=1;fontSize=10;align=left;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="580" width="530" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="yamlbox" value="# dataset.yaml (full facet set)&#xa;profiles:&#xa;&#160;&#160;default:&#xa;&#160;&#160;&#160;&#160;maxk: 100&#xa;&#160;&#160;&#160;&#160;base_vectors:&#160;&#160;&#160;&#160;&#160;&#160;profiles/base/base_vectors.fvecs&#xa;&#160;&#160;&#160;&#160;query_vectors:&#160;&#160;&#160;&#160;&#160;profiles/base/query_vectors.fvecs&#xa;&#160;&#160;&#160;&#160;neighbor_indices:&#160;&#160;profiles/default/neighbor_indices.ivecs&#xa;&#160;&#160;&#160;&#160;neighbor_distances: profiles/default/neighbor_distances.fvecs&#xa;&#160;&#160;&#160;&#160;metadata_content:&#160;&#160;profiles/base/metadata_content.slab&#xa;&#160;&#160;&#160;&#160;metadata_predicates: profiles/base/predicates.slab&#xa;&#160;&#160;&#160;&#160;metadata_results:&#160;&#160;profiles/default/metadata_results.ivvecs&#xa;&#160;&#160;&#160;&#160;metadata_layout:&#160;&#160;&#160;profiles/base/metadata_layout.slab&#xa;&#160;&#160;&#160;&#160;prefiltered_neighbor_indices:&#160;&#160;&#160;profiles/default/prefiltered_neighbor_indices.ivec&#xa;&#160;&#160;&#160;&#160;prefiltered_neighbor_distances:&#160;&#160;profiles/default/prefiltered_neighbor_distances.fvec&#xa;&#160;&#160;&#160;&#160;postfiltered_neighbor_indices:&#160;&#160;profiles/default/postfiltered_neighbor_indices.ivec&#xa;&#160;&#160;&#160;&#160;postfiltered_neighbor_distances: profiles/default/postfiltered_neighbor_distances.fvec" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontFamily=Courier New;fontSize=10;align=left;verticalAlign=top;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="660" width="600" height="250" as="geometry" />
+        </mxCell>
+        <mxCell id="invbox" value="Filtered-truth junction invariants&#xa;• F (pre-filter) = ACORN G_K: exact top-k over X_p, the predicate-passing base subset — perfect-recall target; |F[i]| = K whenever |X_p| ≥ K&#xa;• E (post-filter) = G ∩ R with ranks preserved; sentinel-padded (−1 indices, +∞ distances); may be sparse — sparsity itself is the expected truth&#xa;• the junctions differ in inputs: F re-searches vectors (B + Q + R); E only intersects existing truth (G + D + R) — no distance recompute&#xa;• all four filtered files are uniform singular-extension (.ivec / .fvec), row-aligned with Q&#xa;• D and all distance files use the FAISS publication convention (L2: smaller-better; dot/cosine: larger-better)&#xa;• verifiers: verify prefiltered-knn-consolidated (sampled brute-force recompute) · verify postfiltered-knn-consolidated (re-derive + byte-compare)&#xa;(spec: prefilter-postfilter-facets.md · 01-data-model.md §1.5)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;align=left;verticalAlign=top;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="660" y="660" width="890" height="250" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

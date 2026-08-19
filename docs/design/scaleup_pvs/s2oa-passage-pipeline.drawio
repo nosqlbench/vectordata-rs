@@ -1,0 +1,222 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="s2oa-passage-pipeline">
+    <mxGraphModel dx="1600" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1750" pageHeight="950" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="S2OA passage pipeline — data flow from raw corpora to a BQGDMPREF dataset" style="text;html=1;fontSize=18;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="14" width="900" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="p1" value="1 · Acquire" style="swimlane;startSize=26;html=1;fillColor=#ffffff;strokeColor=#666666;fontStyle=1;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="40" y="120" width="280" height="300" as="geometry" />
+        </mxCell>
+        <mxCell id="oa" value="OpenAlex snapshot&#xa;s3://openalex — works, topics, sources (parquet)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="p1">
+          <mxGeometry x="15" y="40" width="250" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="s2" value="S2AG bulk datasets&#xa;papers · TLDRs · s2orc full text (JSONL)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="p1">
+          <mxGeometry x="15" y="130" width="250" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="acqn" value="veks download bulk + Datasets API&#xa;resumable · snapshot/release pinned in provenance" style="text;html=1;fontSize=9;fontColor=#666666;align=left;verticalAlign=middle;" vertex="1" parent="p1">
+          <mxGeometry x="15" y="220" width="250" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="p2" value="2 · Join spine" style="swimlane;startSize=26;html=1;fillColor=#ffffff;strokeColor=#666666;fontStyle=1;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="380" y="120" width="280" height="300" as="geometry" />
+        </mxCell>
+        <mxCell id="jb" value="join builder (Polars)&#xa;DOI → MAG → PMID precedence" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=11;" vertex="1" parent="p2">
+          <mxGeometry x="15" y="40" width="250" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="spine" value="paper_spine.parquet&#xa;corpusid ↔ openalex_id + join provenance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#333333;fontSize=11;fontStyle=1;" vertex="1" parent="p2">
+          <mxGeometry x="15" y="120" width="250" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="gate1" value="GATE: join rate ≥ 90%&#xa;per-key contribution report" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;dashed=1;fontSize=10;fontColor=#b85450;" vertex="1" parent="p2">
+          <mxGeometry x="15" y="200" width="250" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="p3" value="3 · Derive passages" style="swimlane;startSize=26;html=1;fillColor=#ffffff;strokeColor=#666666;fontStyle=1;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="720" y="120" width="300" height="340" as="geometry" />
+        </mxCell>
+        <mxCell id="chunker" value="chunker vX — section-aware&#xa;150–300 tokens · deterministic · versioned" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=11;" vertex="1" parent="p3">
+          <mxGeometry x="15" y="40" width="270" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="passages" value="passages/part-*.parquet&#xa;(corpusid, section, ordinal, text)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;fontStyle=1;" vertex="1" parent="p3">
+          <mxGeometry x="15" y="124" width="270" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="shufn" value="parent-granularity shuffle order&#xa;→ strata-safe prefix windows" style="text;html=1;fontSize=9;fontColor=#666666;align=left;verticalAlign=middle;" vertex="1" parent="p3">
+          <mxGeometry x="15" y="204" width="270" height="48" as="geometry" />
+        </mxCell>
+        <mxCell id="gate2" value="GATE: passages/paper fan-out ≈ 60–120" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;dashed=1;fontSize=10;fontColor=#b85450;" vertex="1" parent="p3">
+          <mxGeometry x="15" y="262" width="270" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="p4" value="4 · Embed (GPU)" style="swimlane;startSize=26;html=1;fillColor=#ffffff;strokeColor=#666666;fontStyle=1;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="90" width="300" height="310" as="geometry" />
+        </mxCell>
+        <mxCell id="tok" value="pre-tokenize → embed shards (S3)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;" vertex="1" parent="p4">
+          <mxGeometry x="15" y="36" width="270" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="fleet" value="spot fleet — g6e.xlarge ×16&#xa;Qwen3-Embedding-0.6B @ 1024d&#xa;idempotent shard writers · atomic S3" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;" vertex="1" parent="p4">
+          <mxGeometry x="15" y="96" width="270" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="vec" value="vectors/base_all — f32 × 1024&#xa;ordinal-aligned with passages" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#b0e3e6;strokeColor=#0e8088;fontSize=11;fontStyle=1;" vertex="1" parent="p4">
+          <mxGeometry x="15" y="188" width="270" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="qemb" value="TLDR/title → query vectors (Q)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="p4">
+          <mxGeometry x="15" y="256" width="270" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="p5" value="5 · Metadata star" style="swimlane;startSize=26;html=1;fillColor=#ffffff;strokeColor=#666666;fontStyle=1;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="440" width="300" height="340" as="geometry" />
+        </mxCell>
+        <mxCell id="dim1" value="dimension: topic hierarchy&#xa;topic → subfield → field → domain" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=9;" vertex="1" parent="p5">
+          <mxGeometry x="15" y="36" width="128" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="dim2" value="dimension: source / venue&#xa;+ type, year (work-level)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=9;" vertex="1" parent="p5">
+          <mxGeometry x="157" y="36" width="128" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="starflat" value="star flattening (Polars)&#xa;spine joins dims → per-passage rows" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;" vertex="1" parent="p5">
+          <mxGeometry x="15" y="116" width="270" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="meta" value="metadata_all.parquet&#xa;ordinal-aligned with passages" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;fontStyle=1;" vertex="1" parent="p5">
+          <mxGeometry x="15" y="192" width="270" height="54" as="geometry" />
+        </mxCell>
+        <mxCell id="opt" value="optional: entity vectors — topic labels (~4.5k) · venue names (~250k) · SPECTER doc sidecar (per parent)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#0e8088;dashed=1;fontSize=9;" vertex="1" parent="p5">
+          <mxGeometry x="15" y="262" width="270" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="p6" value="6 · veks build" style="swimlane;startSize=26;html=1;fillColor=#ffffff;strokeColor=#666666;fontStyle=1;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="200" width="270" height="400" as="geometry" />
+        </mxCell>
+        <mxCell id="boot" value="veks prepare bootstrap&#xa;B + M + Q in" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;" vertex="1" parent="p6">
+          <mxGeometry x="15" y="40" width="240" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="run" value="veks run&#xa;dedup/shuffle → G/D → survey&#xa;→ P → R → F/E → verify" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;" vertex="1" parent="p6">
+          <mxGeometry x="15" y="110" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="ds" value="s2oa-⟨constellation⟩&#xa;BQGDMPREF dataset + strata" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;fontStyle=1;" vertex="1" parent="p6">
+          <mxGeometry x="15" y="210" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="pub" value="vectordata push (publish)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;" vertex="1" parent="p6">
+          <mxGeometry x="15" y="290" width="240" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.3;entryDx=0;entryDy=0;" edge="1" parent="1" source="oa" target="jb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.7;entryDx=0;entryDy=0;" edge="1" parent="1" source="s2" target="jb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="jb" target="spine">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="s2orc body text" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;strokeColor=#82b366;fontColor=#82b366;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="s2" target="chunker">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="345" y="105" />
+              <mxPoint x="700" y="105" />
+              <mxPoint x="700" y="192" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="chunker" target="passages">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" value="text" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="passages" target="tok">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1040" y="274" />
+              <mxPoint x="1040" y="148" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e8" value="ordinal skeleton" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;strokeColor=#d79b00;fontColor=#d79b00;exitX=1;exitY=0.75;exitDx=0;exitDy=0;entryX=0;entryY=0.25;entryDx=0;entryDy=0;" edge="1" parent="1" source="passages" target="starflat">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1055" y="289" />
+              <mxPoint x="1055" y="571" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e9" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.75;entryDx=0;entryDy=0;" edge="1" parent="1" source="spine" target="starflat">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="690" y="270" />
+              <mxPoint x="690" y="601" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e10" value="topic / source entities" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;strokeColor=#6c8ebf;fontColor=#6c8ebf;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="oa" target="dim1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="25" y="195" />
+              <mxPoint x="25" y="815" />
+              <mxPoint x="1050" y="815" />
+              <mxPoint x="1050" y="508" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e11a" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.24;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="dim1" target="starflat">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11b" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.76;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="dim2" target="starflat">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="starflat" target="meta">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" value="M" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.25;entryDx=0;entryDy=0;" edge="1" parent="1" source="meta" target="boot">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1395" y="659" />
+              <mxPoint x="1395" y="252" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e14" value="B" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=10;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.75;entryDx=0;entryDy=0;" edge="1" parent="1" source="vec" target="boot">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1435" y="306" />
+              <mxPoint x="1435" y="277" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e15" value="Q" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;fontSize=10;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="qemb" target="boot">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1415" y="366" />
+              <mxPoint x="1415" y="265" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e16" value="TLDRs / titles" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;fontSize=10;strokeColor=#82b366;fontColor=#82b366;exitX=1;exitY=0.7;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="s2" target="qemb">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="350" y="299" />
+              <mxPoint x="350" y="468" />
+              <mxPoint x="1035" y="468" />
+              <mxPoint x="1035" y="366" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e17a" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="boot" target="run">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e17b" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="run" target="ds">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e17c" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="ds" target="pub">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e18" value="auxiliary sidecars" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;fontSize=9;strokeColor=#0e8088;fontColor=#0e8088;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="opt" target="ds">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1425" y="734" />
+              <mxPoint x="1425" y="440" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="inv" value="ORDINAL ALIGNMENT INVARIANT — the passage ordinal is an explicit column from the chunker onward; every artifact (text shards, vectors, metadata) is sorted by it and verified monotone at each seam. S3 is the durable tier between phases; all long stages checkpoint per-segment and are spot-interruption safe." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;align=left;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="380" y="840" width="1330" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="ref" value="Plan view of pvs-s2orc-openalex-union.md §3–§4. Constellation selection (§5) applies at the spine: a graph predicate picks the parent papers before passages are derived." style="text;html=1;whiteSpace=wrap;fontSize=10;fontStyle=2;fontColor=#666666;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="40" y="840" width="320" height="70" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
