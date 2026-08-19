@@ -1,5 +1,59 @@
+# Root package: the `vectordata` umbrella binary, so the whole toolkit is
+# installable with one `cargo install --path .` at the project root. It
+# multiplexes the workspace's CLI personalities (veks / vecd / slab) by
+# subcommand or argv0 symlink; each personality's shell lives in its own
+# crate's `shell` module and the member binaries remain the canonical
+# standalone installs (`cargo install --path veks`, …).
+[package]
+name = "vectordata-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Umbrella binary for the vectordata-rs toolkit: veks, vecd, and slab behind one installable multiplexer"
+license = "Apache-2.0"
+homepage = "https://github.com/nosqlbench/vectordata-rs"
+repository = "https://github.com/nosqlbench/vectordata-rs"
+
+[[bin]]
+name = "vectordata"
+path = "src/main.rs"
+
+[dependencies]
+slabtastic = { path = "slabtastic", version = "1.0.0" }
+vecd = { path = "vecd", version = "1.0.0" }
+veks = { path = "veks", version = "1.0.0", default-features = false }
+
+# Mirror veks's feature surface so `cargo install --path .` gets the same
+# default personality as `cargo install --path veks` (knnutils is veks's
+# default because bootstrap emits `compute knn-blas`).
+[features]
+default = ["knnutils"]
+knnutils = ["veks/knnutils"]
+faiss = ["veks/faiss"]
+embed = ["veks/embed"]
+embed-cuda = ["veks/embed-cuda"]
+
+[lints]
+workspace = true
+
 [workspace]
 members = [
+    "vectordata",
+    "veks-anode",
+    "veks-core",
+    "veks-pipeline",
+    "veks-completion",
+    "veks-completion-derive",
+    "veks",
+    "vecd",
+    "slabtastic",
+    "veks-io",
+    "tools",
+]
+# Preserve the virtual-workspace default: bare `cargo build`/`cargo test`
+# at the root still covers every member (plus the root package), not just
+# the root package the [package] section introduced.
+default-members = [
+    ".",
     "vectordata",
     "veks-anode",
     "veks-core",

@@ -28,3 +28,4 @@ pub mod datasets;
 // `vectordata explore` binary is the single entry point now.
 pub mod prepare;
 pub mod publish;
+pub mod shell;

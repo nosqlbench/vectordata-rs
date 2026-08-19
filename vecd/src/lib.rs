@@ -43,6 +43,7 @@ pub mod ratelimit;
 pub mod server;
 pub mod service;
 pub mod session;
+pub mod shell;
 pub mod store;
 pub mod upload;
 
