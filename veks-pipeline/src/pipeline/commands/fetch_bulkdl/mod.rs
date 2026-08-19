@@ -18,10 +18,13 @@
 //! of files is produced; the download mechanics below are mode-aware only at
 //! the per-request level.
 
-mod config;
+// config, download, and expand are shared with the sibling `download s2ag`
+// command (fetch_s2ag), which reuses the status-file resume tracking, the
+// verified download primitive, and URL-basename derivation.
+pub(crate) mod config;
 mod cos;
-mod download;
-mod expand;
+pub(crate) mod download;
+pub(crate) mod expand;
 
 use std::fs;
 use std::path::{Path, PathBuf};

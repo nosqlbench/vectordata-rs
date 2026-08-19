@@ -1,0 +1,586 @@
+// Copyright (c) Jonathan Shook
+// SPDX-License-Identifier: Apache-2.0
+
+//! Pipeline command: embed a parquet text column into an npy vector
+//! artifact with an in-process candle backend (Qwen3-Embedding).
+//!
+//! This is the plan-D3 option (a) end state: the embed stage runs inside
+//! `veks run`, so model identity, revision, and every knob that can change
+//! output bytes are step options and therefore provenance axes. Row i of
+//! the output embeds parquet row i — the ordinal-identity contract that
+//! `verify alignment` gates downstream.
+//!
+//! Feature-gated (`embed`); CUDA acceleration is a further feature flip
+//! (`embed-cuda`) plus `device: cuda` — sized for A100/H100-class hosts at
+//! full-corpus scale, while CPU covers pilot-scale runs.
+
+mod qwen3;
+
+use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use crate::pipeline::atomic_write::AtomicWriter;
+use crate::pipeline::command::{
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ResourceDesc, Status, StreamContext, ValueCompletions, render_options_table,
+};
+use candle_core::{DType, Device};
+use candle_nn::VarBuilder;
+use hf_hub::{Repo, RepoType, api::sync::Api};
+
+/// Pipeline command: candle-backed text embedding.
+pub struct GenerateEmbedOp;
+
+pub fn factory() -> Box<dyn CommandOp> {
+    Box::new(GenerateEmbedOp)
+}
+
+const DEFAULT_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
+
+impl CommandOp for GenerateEmbedOp {
+    fn command_path(&self) -> &str {
+        "generate embed"
+    }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_GENERATE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag {
+        &crate::pipeline::command::LVL_PRIMARY
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Embed a parquet text column into an npy vector artifact".into(),
+            body: format!(
+                r#"# generate embed
+
+Embed a parquet text column into an npy vector artifact.
+
+## Description
+
+Reads the `column` strings of `source` in row order, embeds each with an
+in-process candle backend (default model {model}, last-token pooling,
+unit-normalized), and writes a C-order f32 `.npy` of shape
+`[rows, hidden]` where **row i embeds parquet row i** — the ordinal
+contract that `verify alignment` asserts downstream. Model weights are
+fetched once into the shared HuggingFace cache and reused.
+
+## Determinism and provenance
+
+Model id, revision, batching, and length caps are all step options, so
+embedding identity is fully recorded in provenance. Identical options on
+identical input produce identical output bytes on a given device class.
+
+## Devices
+
+`device: cpu` runs everywhere; `device: cuda[:N]` needs a binary built
+with the `embed-cuda` feature (A100/H100-class hosts; pair with
+`dtype: bf16` and a larger `batch-size`). `device: auto` picks CUDA when
+compiled in and available, else CPU. `dtype: auto` maps to f32 on CPU and
+bf16 on CUDA.
+
+## Options
+
+{opts}"#,
+                model = DEFAULT_MODEL,
+                opts = render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc {
+                name: "mem".into(),
+                description: "Model weights + activations".into(),
+                adjustable: false,
+            },
+            ResourceDesc {
+                name: "threads".into(),
+                description: "CPU gemm parallelism".into(),
+                adjustable: false,
+            },
+        ]
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+
+        let source = match options.require("source") {
+            Ok(s) => resolve_path(s, &ctx.workspace),
+            Err(e) => return error_result(e, start),
+        };
+        let output = match options.require("output") {
+            Ok(s) => resolve_path(s, &ctx.workspace),
+            Err(e) => return error_result(e, start),
+        };
+        let column = options.get("column").unwrap_or("text").to_string();
+        let model_id = options.get("model").unwrap_or(DEFAULT_MODEL).to_string();
+        let revision = options.get("revision").unwrap_or("main").to_string();
+        let batch_size: usize = match options.parse_or("batch-size", 16) {
+            Ok(n) if n > 0 => n,
+            Ok(_) => return error_result("batch-size must be > 0".into(), start),
+            Err(e) => return error_result(e, start),
+        };
+        let max_length: usize = match options.parse_or("max-length", 1024) {
+            Ok(n) if n >= 2 => n,
+            Ok(_) => return error_result("max-length must be >= 2".into(), start),
+            Err(e) => return error_result(e, start),
+        };
+        let device = match resolve_device(options.get("device").unwrap_or("auto")) {
+            Ok(d) => d,
+            Err(e) => return error_result(e, start),
+        };
+        let dtype = match resolve_dtype(options.get("dtype").unwrap_or("auto"), &device) {
+            Ok(d) => d,
+            Err(e) => return error_result(e, start),
+        };
+
+        let texts = match veks_core::formats::passage_table::read_text_column(&source, &column) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
+        };
+        if texts.is_empty() {
+            return error_result(format!("no rows in {}", source.display()), start);
+        }
+        ctx.ui.log(&format!(
+            "embedding {} row(s) of {}:{} with {} (rev {}, {:?}/{:?}, batch {}, max-length {})",
+            texts.len(),
+            source.display(),
+            column,
+            model_id,
+            revision,
+            device_name(&device),
+            dtype,
+            batch_size,
+            max_length
+        ));
+
+        // ── Model + tokenizer, via the shared HF cache ───────────────────
+        let fetch = ctx.ui.spinner("fetch model");
+        let files = match fetch_model_files(&model_id, &revision) {
+            Ok(f) => f,
+            Err(e) => {
+                fetch.finish();
+                return error_result(e, start);
+            }
+        };
+        fetch.finish();
+
+        let config: qwen3::Config = match std::fs::read_to_string(&files.config)
+            .map_err(|e| format!("read config: {}", e))
+            .and_then(|s| serde_json::from_str(&s).map_err(|e| format!("parse config: {}", e)))
+        {
+            Ok(c) => c,
+            Err(e) => return error_result(e, start),
+        };
+        let tokenizer = match tokenizers::Tokenizer::from_file(&files.tokenizer) {
+            Ok(t) => t,
+            Err(e) => return error_result(format!("load tokenizer: {}", e), start),
+        };
+        let eos = match config
+            .eos_token_id
+            .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
+        {
+            Some(id) => id,
+            None => return error_result("cannot determine EOS token id".into(), start),
+        };
+
+        let load = ctx.ui.spinner("load weights");
+        let vb = match unsafe {
+            VarBuilder::from_mmaped_safetensors(&files.weights, dtype, &device)
+        } {
+            Ok(vb) => vb,
+            Err(e) => {
+                load.finish();
+                return error_result(format!("load weights: {}", e), start);
+            }
+        };
+        let model = match qwen3::EmbeddingModel::new(&config, vb) {
+            Ok(m) => m,
+            Err(e) => {
+                load.finish();
+                return error_result(format!("build model: {}", e), start);
+            }
+        };
+        load.finish();
+
+        // ── Tokenize (EOS-terminated, capped), plan length-sorted batches ─
+        let mut rows: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+        for text in &texts {
+            let ids = match tokenizer.encode(text.as_str(), false) {
+                Ok(enc) => enc.get_ids().to_vec(),
+                Err(e) => return error_result(format!("tokenize: {}", e), start),
+            };
+            rows.push(prepare_ids(ids, eos, max_length));
+        }
+        let plan = batch_plan(&rows, batch_size);
+
+        // ── Embed ────────────────────────────────────────────────────────
+        let pb = ctx.ui.bar_with_unit(rows.len() as u64, "embed", "psg");
+        let hidden = config.hidden_size;
+        let mut vectors: Vec<Vec<f32>> = vec![Vec::new(); rows.len()];
+        let mut done = 0u64;
+        for batch in &plan {
+            let batch_rows: Vec<Vec<u32>> = batch.iter().map(|&i| rows[i].clone()).collect();
+            let embedded = match model.embed_batch(&batch_rows) {
+                Ok(v) => v,
+                Err(e) => return error_result(format!("embed failed: {}", e), start),
+            };
+            for (&idx, vec) in batch.iter().zip(embedded) {
+                vectors[idx] = vec;
+            }
+            done += batch.len() as u64;
+            pb.set_position(done);
+        }
+        pb.finish();
+
+        // ── Write npy (atomic) ───────────────────────────────────────────
+        if let Err(e) = write_npy_f32(&output, &vectors, hidden) {
+            return error_result(e, start);
+        }
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace,
+            "embed_dim",
+            &hidden.to_string(),
+        );
+        ctx.defaults.insert("embed_dim".to_string(), hidden.to_string());
+
+        let elapsed = start.elapsed();
+        CommandResult {
+            status: Status::Ok,
+            message: format!(
+                "embedded {} row(s) @ {}-d to {} ({:.1} rows/s)",
+                vectors.len(),
+                hidden,
+                output.display(),
+                vectors.len() as f64 / elapsed.as_secs_f64().max(0.001)
+            ),
+            produced: vec![output],
+            elapsed,
+        }
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        vec![
+            OptionDesc {
+                name: "source".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Parquet file whose text column is embedded row-by-row".to_string(),
+                extended_description: None,
+                role: OptionRole::Input,
+            },
+            OptionDesc {
+                name: "output".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Output .npy path (C-order f32, row i embeds source row i)".to_string(),
+                extended_description: None,
+                role: OptionRole::Output,
+            },
+            OptionDesc {
+                name: "column".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: Some("text".to_string()),
+                description: "Source column holding the text".to_string(),
+                extended_description: None,
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "model".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: Some(DEFAULT_MODEL.to_string()),
+                description: "HuggingFace model id (Qwen3-Embedding family)".to_string(),
+                extended_description: None,
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "revision".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: Some("main".to_string()),
+                description: "Model revision (pin a commit for strict reproducibility)".to_string(),
+                extended_description: None,
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "batch-size".to_string(),
+                type_name: "int".to_string(),
+                required: false,
+                default: Some("16".to_string()),
+                description: "Sequences per forward pass (raise substantially on GPU)".to_string(),
+                extended_description: None,
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "max-length".to_string(),
+                type_name: "int".to_string(),
+                required: false,
+                default: Some("1024".to_string()),
+                description: "Token cap per row (truncated before the EOS pooling token)".to_string(),
+                extended_description: None,
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "device".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: Some("auto".to_string()),
+                description: "auto, cpu, or cuda[:N] (cuda needs the embed-cuda build feature)"
+                    .to_string(),
+                extended_description: None,
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "dtype".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: Some("auto".to_string()),
+                description: "auto (f32 on cpu, bf16 on cuda), f32, bf16, or f16".to_string(),
+                extended_description: None,
+                role: OptionRole::Config,
+            },
+        ]
+    }
+
+    fn value_completions(&self) -> HashMap<String, ValueCompletions> {
+        let mut map = HashMap::new();
+        map.insert(
+            "device".to_string(),
+            ValueCompletions::enum_values(&["auto", "cpu", "cuda", "cuda:0"]),
+        );
+        map.insert(
+            "dtype".to_string(),
+            ValueCompletions::enum_values(&["auto", "f32", "bf16", "f16"]),
+        );
+        map
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id,
+            self.command_path(),
+            options,
+            &["source"],
+            &["output"],
+        )
+    }
+}
+
+struct ModelFiles {
+    config: PathBuf,
+    tokenizer: PathBuf,
+    weights: Vec<PathBuf>,
+}
+
+/// Fetch config/tokenizer/weights through the shared HF cache (no network
+/// when already cached). Single-file weights cover the Qwen3-Embedding
+/// sizes this command targets.
+fn fetch_model_files(model_id: &str, revision: &str) -> Result<ModelFiles, String> {
+    let api = Api::new().map_err(|e| format!("hf api: {}", e))?;
+    let repo = api.repo(Repo::with_revision(
+        model_id.to_string(),
+        RepoType::Model,
+        revision.to_string(),
+    ));
+    let get = |name: &str| {
+        repo.get(name)
+            .map_err(|e| format!("fetch {}/{}: {}", model_id, name, e))
+    };
+    Ok(ModelFiles {
+        config: get("config.json")?,
+        tokenizer: get("tokenizer.json")?,
+        weights: vec![get("model.safetensors")?],
+    })
+}
+
+fn resolve_device(spec: &str) -> Result<Device, String> {
+    match spec {
+        "cpu" => Ok(Device::Cpu),
+        "auto" => {
+            if candle_core::utils::cuda_is_available() {
+                Device::new_cuda(0).map_err(|e| format!("cuda init: {}", e))
+            } else {
+                Ok(Device::Cpu)
+            }
+        }
+        s if s == "cuda" || s.starts_with("cuda:") => {
+            let ordinal: usize = s
+                .strip_prefix("cuda:")
+                .map(|n| n.parse().map_err(|_| format!("invalid device '{}'", s)))
+                .unwrap_or(Ok(0))?;
+            Device::new_cuda(ordinal).map_err(|e| {
+                format!(
+                    "cuda device '{}' unavailable: {} (build with the embed-cuda feature on a GPU host)",
+                    s, e
+                )
+            })
+        }
+        other => Err(format!("unknown device '{}': expected auto, cpu, or cuda[:N]", other)),
+    }
+}
+
+fn resolve_dtype(spec: &str, device: &Device) -> Result<DType, String> {
+    match spec {
+        "auto" => Ok(if device.is_cuda() { DType::BF16 } else { DType::F32 }),
+        "f32" => Ok(DType::F32),
+        "bf16" => Ok(DType::BF16),
+        "f16" => Ok(DType::F16),
+        other => Err(format!("unknown dtype '{}': expected auto, f32, bf16, or f16", other)),
+    }
+}
+
+fn device_name(device: &Device) -> &'static str {
+    if device.is_cuda() { "cuda" } else { "cpu" }
+}
+
+/// Cap token ids to `max_length` including a terminal EOS, appending EOS
+/// when absent — the last-token pooling position must always be EOS.
+fn prepare_ids(mut ids: Vec<u32>, eos: u32, max_length: usize) -> Vec<u32> {
+    if ids.len() > max_length - 1 {
+        ids.truncate(max_length - 1);
+    }
+    if ids.last() != Some(&eos) {
+        ids.push(eos);
+    }
+    ids
+}
+
+/// Group row indices into batches of near-equal token length (sorted
+/// descending) so padding waste stays low; callers scatter results back by
+/// index, so output order is unaffected.
+fn batch_plan(rows: &[Vec<u32>], batch_size: usize) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(rows[i].len()));
+    order.chunks(batch_size).map(|c| c.to_vec()).collect()
+}
+
+/// Write a C-order f32 `.npy` of shape [rows, dim] atomically.
+fn write_npy_f32(output: &Path, vectors: &[Vec<f32>], dim: usize) -> Result<(), String> {
+    let header_body = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, {}), }}",
+        vectors.len(),
+        dim
+    );
+    let unpadded = 10 + header_body.len() + 1;
+    let padding = (64 - unpadded % 64) % 64;
+    let header = format!("{}{}\n", header_body, " ".repeat(padding));
+
+    let mut writer = AtomicWriter::new(output)
+        .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
+    writer.write_all(b"\x93NUMPY\x01\x00").map_err(|e| e.to_string())?;
+    writer
+        .write_all(&(header.len() as u16).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer.write_all(header.as_bytes()).map_err(|e| e.to_string())?;
+    for row in vectors {
+        if row.len() != dim {
+            return Err(format!("row width {} != dim {}", row.len(), dim));
+        }
+        for v in row {
+            writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
+    writer.finish().map_err(|e| e.to_string())
+}
+
+fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
+    let p = PathBuf::from(path_str);
+    if p.is_absolute() { p } else { workspace.join(p) }
+}
+
+fn error_result(message: String, start: Instant) -> CommandResult {
+    CommandResult {
+        status: Status::Error,
+        message,
+        produced: vec![],
+        elapsed: start.elapsed(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_ids_caps_and_terminates_with_eos() {
+        assert_eq!(prepare_ids(vec![1, 2, 3], 9, 8), vec![1, 2, 3, 9]);
+        assert_eq!(prepare_ids(vec![1, 2, 9], 9, 8), vec![1, 2, 9]);
+        // Cap 4 → 3 content tokens + EOS.
+        assert_eq!(prepare_ids((1..=10).collect(), 9, 4), vec![1, 2, 3, 9]);
+        assert_eq!(prepare_ids(vec![], 9, 4), vec![9]);
+    }
+
+    #[test]
+    fn batch_plan_covers_all_rows_once_longest_first() {
+        let rows: Vec<Vec<u32>> = vec![vec![0; 3], vec![0; 10], vec![0; 5], vec![0; 7]];
+        let plan = batch_plan(&rows, 2);
+        assert_eq!(plan, vec![vec![1, 3], vec![2, 0]]);
+        let mut seen: Vec<usize> = plan.into_iter().flatten().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn npy_writer_round_trips_through_veks_core_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v.npy");
+        let vectors: Vec<Vec<f32>> = (0..7).map(|i| vec![i as f32; 4]).collect();
+        write_npy_f32(&path, &vectors, 4).unwrap();
+        let meta = veks_core::formats::reader::probe_source(
+            &path,
+            veks_core::formats::VecFormat::Npy,
+        )
+        .unwrap();
+        assert_eq!(meta.record_count, Some(7));
+        assert_eq!(meta.dimension, 4);
+    }
+
+    /// Full-model smoke test — downloads Qwen3-Embedding-0.6B, so ignored
+    /// by default; run with `--ignored` on a networked host to verify the
+    /// backend end-to-end (norms ≈ 1, batching invariant to batch-size).
+    #[test]
+    #[ignore = "downloads the embedding model (~1.2GB)"]
+    fn real_model_embeds_unit_vectors() {
+        let files = fetch_model_files(DEFAULT_MODEL, "main").unwrap();
+        let config: qwen3::Config =
+            serde_json::from_str(&std::fs::read_to_string(&files.config).unwrap()).unwrap();
+        let tokenizer = tokenizers::Tokenizer::from_file(&files.tokenizer).unwrap();
+        let eos = config
+            .eos_token_id
+            .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
+            .unwrap();
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&files.weights, DType::F32, &Device::Cpu)
+        }
+        .unwrap();
+        let model = qwen3::EmbeddingModel::new(&config, vb).unwrap();
+
+        let texts = ["gravity bends light", "chunking scientific text into passages"];
+        let rows: Vec<Vec<u32>> = texts
+            .iter()
+            .map(|t| prepare_ids(tokenizer.encode(*t, false).unwrap().get_ids().to_vec(), eos, 64))
+            .collect();
+        let batched = model.embed_batch(&rows).unwrap();
+        let single: Vec<Vec<f32>> = rows
+            .iter()
+            .map(|r| model.embed_batch(std::slice::from_ref(r)).unwrap().remove(0))
+            .collect();
+        for (b, s) in batched.iter().zip(&single) {
+            let norm: f32 = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-3, "norm {}", norm);
+            let dot: f32 = b.iter().zip(s).map(|(x, y)| x * y).sum();
+            assert!(dot > 0.999, "batched vs single cosine {}", dot);
+        }
+    }
+}

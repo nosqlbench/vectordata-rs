@@ -11,9 +11,31 @@ repository = "https://github.com/nosqlbench/vectordata-rs"
 default = []
 knnutils = ["dep:rand_mt"]
 faiss = ["knnutils", "dep:faiss"]
+# In-process embedding backend (`generate embed`) on candle — heavy model
+# runtime, so strictly opt-in.
+embed = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
+# CUDA acceleration for `generate embed` (A100/H100-class hosts): same
+# command, `device: cuda`, typically with `dtype: bf16`.
+embed-cuda = [
+    "embed",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+]
 
 [dependencies]
 byteorder = "1"
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+hf-hub = { version = "0.4", optional = true }
+tokenizers = { version = "0.21", optional = true }
 faiss = { version = "0.13", features = ["static"], optional = true }
 rand_mt = { version = "6", optional = true }
 chrono = { version = "0.4", features = ["serde"] }

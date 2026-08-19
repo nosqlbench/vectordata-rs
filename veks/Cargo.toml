@@ -58,9 +58,14 @@ libc = "0.2.183"
 default = ["knnutils"]
 knnutils = ["veks-pipeline/knnutils"]
 faiss = ["knnutils", "veks-pipeline/faiss"]
+embed = ["veks-pipeline/embed"]
+embed-cuda = ["veks-pipeline/embed-cuda"]
 
 [dev-dependencies]
 arrow = "54"
+# Used by the passages-pilot e2e test (tests/e2e_passages_pilot.rs) to write
+# gzipped synthetic s2orc shards for `generate passages`.
+flate2 = "1"
 parquet = "54"
 shadow-terminal = "0.2"
 tempfile = "3"

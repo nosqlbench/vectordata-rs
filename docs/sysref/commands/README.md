@@ -37,6 +37,14 @@ Every command with a working example run against the
 | [generate metadata](./generate-metadata.md) | Random integer metadata labels |
 | [generate predicates](./generate-predicates.md) | Random equality predicates |
 | [generate vvec-index](./generate-vvec-index.md) | Build offset indices for vvec files |
+| [generate passages](./generate-passages.md) | Chunk an s2orc-format text corpus into passages.parquet (+ parent manifest) |
+| [generate embed](./generate-embed.md) | Embed a parquet text column into npy vectors (candle, Qwen3-Embedding; `embed`/`embed-cuda` features) |
+
+## Download
+
+| Command | Description |
+|---------|-------------|
+| [download s2ag](./download-s2ag.md) | S2AG Datasets API bulk files (signed URLs, `S2_API_KEY`, resume) |
 
 ## Verify
 
@@ -44,6 +52,7 @@ Every command with a working example run against the
 |---------|-------------|
 | [verify knn-consolidated](./verify-knn-consolidated.md) | Multi-threaded KNN verification |
 | [verify predicates-sqlite](./verify-predicates-sqlite.md) | SQLite oracle verification |
+| [verify alignment](./verify-alignment.md) | Row-count/ordinal alignment between artifacts (embed-contract gate) |
 
 ## Merkle
 

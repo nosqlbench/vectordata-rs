@@ -248,6 +248,24 @@ fn count_file(path: &Path) -> Result<String, String> {
         }
     }
 
+    // Single-file container formats (npy, parquet, hdf5 without a
+    // `#dataset` selector) are counted via the format-aware probes; xvec
+    // and scalar files fall through to the element-type reader below.
+    if let Some(format) = veks_core::formats::VecFormat::detect_from_path(path)
+        && !format.is_xvec()
+        && !format.is_scalar()
+    {
+        let meta = veks_core::formats::reader::probe_source(path, format)
+            .map_err(|e| format!("failed to probe {}: {}", path.display(), e))?;
+        return match meta.record_count {
+            Some(n) => Ok(n.to_string()),
+            None => Err(format!(
+                "cannot determine record count for '{}'",
+                path.display()
+            )),
+        };
+    }
+
     let etype = ElementType::from_path(path)
         .map_err(|_| format!(
             "cannot count records in '{}': unsupported extension '.{}'",
@@ -261,6 +279,18 @@ fn count_file(path: &Path) -> Result<String, String> {
 
 fn dim_file(path: &Path) -> Result<String, String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    // Container formats (single file or directory) carry their dimension in
+    // format metadata — use the format-aware probes, mirroring count_file.
+    if let Some(format) = veks_core::formats::VecFormat::detect(path)
+        && !format.is_xvec()
+        && !format.is_scalar()
+    {
+        let meta = veks_core::formats::reader::probe_source(path, format)
+            .map_err(|e| format!("failed to probe {}: {}", path.display(), e))?;
+        return Ok(meta.dimension.to_string());
+    }
+
     let etype = ElementType::from_path(path)
         .map_err(|_| format!(
             "cannot get dimension for '{}': unsupported extension '.{}'",
@@ -362,6 +392,32 @@ mod tests {
             tmp.path(),
         ).unwrap();
         assert_eq!(dim, "8");
+    }
+
+    #[test]
+    fn test_evaluate_count_and_dim_single_npy_file() {
+        // Bootstrap's count-source-base step evaluates `count:` against the
+        // original source, which may be a single .npy file (not a dir).
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let npy = tmp.path().join("base_all.npy");
+        let header_body = "{'descr': '<f4', 'fortran_order': False, 'shape': (7, 5), }";
+        let unpadded = 10 + header_body.len() + 1;
+        let padding = (64 - unpadded % 64) % 64;
+        let header = format!("{}{}\n", header_body, " ".repeat(padding));
+        let mut f = std::fs::File::create(&npy).unwrap();
+        f.write_all(b"\x93NUMPY\x01\x00").unwrap();
+        f.write_all(&(header.len() as u16).to_le_bytes()).unwrap();
+        f.write_all(header.as_bytes()).unwrap();
+        for i in 0..35 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let count = evaluate_expr(&format!("count:{}", npy.display()), tmp.path()).unwrap();
+        assert_eq!(count, "7");
+        let dim = evaluate_expr(&format!("dim:{}", npy.display()), tmp.path()).unwrap();
+        assert_eq!(dim, "5");
     }
 
     #[test]
