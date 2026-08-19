@@ -152,13 +152,31 @@ impl GzStats {
     }
 }
 
-/// Compress data in memory and write to `.gz`, returning stats.
+/// The path [`save_gz`] actually writes for `path`: the `.gz` sidecar when
+/// compression is enabled, otherwise the raw `path` itself. Pure (takes the
+/// mode as a parameter) so the branch selection is unit-testable without
+/// mutating the process-global compression level.
+fn written_path(path: &Path, compressed: bool) -> PathBuf {
+    if compressed { gz_path(path) } else { path.to_path_buf() }
+}
+
+/// Save `data` via [`save_gz`] and return its size stats (original vs.
+/// on-disk).
+///
+/// Stats are read from the file that was *actually* written — the `.gz`
+/// sidecar when compression is enabled, or the raw `path` when it's
+/// disabled (level 0). A failure to stat that file is a genuine error (the
+/// write just succeeded), so it is propagated rather than silently reported
+/// as `compressed_size = 0` — the latter made [`GzStats::ratio`] /
+/// [`GzStats::savings_pct`] report bogus values (and previously mis-read the
+/// `.gz` path even in raw mode, where it never reflects the real size).
 pub fn save_gz_with_stats(path: &Path, data: &[u8]) -> Result<GzStats, String> {
     let original_size = data.len() as u64;
     save_gz(path, data)?;
-    let compressed_size = std::fs::metadata(gz_path(path))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let written = written_path(path, compression_enabled());
+    let compressed_size = std::fs::metadata(&written)
+        .map_err(|e| format!("failed to stat written cache file {}: {}", written.display(), e))?
+        .len();
     Ok(GzStats { original_size, compressed_size })
 }
 
@@ -210,5 +228,36 @@ mod tests {
         save_gz(&path, &[]).unwrap();
         let loaded = load_gz(&path).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    /// `save_gz_with_stats` must stat the file that was actually written:
+    /// the `.gz` sidecar when compression is on, the raw path when it's off.
+    /// Pure check — no global compression-level mutation (which would race
+    /// with other tests in this binary).
+    #[test]
+    fn written_path_tracks_compression_mode() {
+        let p = Path::new("seg.bin");
+        assert_eq!(written_path(p, true), PathBuf::from("seg.bin.gz"));
+        assert_eq!(written_path(p, false), PathBuf::from("seg.bin"));
+        // An already-`.gz` path is returned unchanged in compressed mode.
+        let g = Path::new("seg.bin.gz");
+        assert_eq!(written_path(g, true), PathBuf::from("seg.bin.gz"));
+    }
+
+    /// Compressed-mode stats (the default) report a real non-zero size and a
+    /// sane ratio — and `save_gz_with_stats` now surfaces a stat failure as
+    /// an error instead of silently reporting zero bytes.
+    #[test]
+    fn stats_report_real_compressed_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.bin");
+        let data: Vec<u8> = (0..100_000u32).flat_map(|i| i.to_le_bytes()).collect();
+
+        let stats = save_gz_with_stats(&path, &data).unwrap();
+        // The on-disk size matches the actual `.gz` file (default level 9).
+        let on_disk = std::fs::metadata(gz_path(&path)).unwrap().len();
+        assert_eq!(stats.compressed_size, on_disk);
+        assert!(stats.compressed_size > 0, "compressed size must be measured, not zeroed");
+        assert!(stats.ratio() > 1.0 && stats.savings_pct() > 0.0);
     }
 }

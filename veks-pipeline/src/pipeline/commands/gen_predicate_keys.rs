@@ -295,6 +295,8 @@ fn build_run_provenance(
     build_version: &str,
     command_path: &str,
     options: &crate::pipeline::command::Options,
+    cache_dir: &Path,
+    workspace: &Path,
     inputs: &[(&str, &Path)],
 ) -> crate::pipeline::provenance::ProvenanceMap {
     use crate::pipeline::provenance::{BinaryVersion, ProvenanceMap};
@@ -302,15 +304,12 @@ fn build_run_provenance(
     let mut upstream: std::collections::BTreeMap<String, ProvenanceMap> =
         std::collections::BTreeMap::new();
     for (role, path) in inputs {
-        // Sidecar first — that's the strong signal (full
-        // producer lineage). Degenerate fallback covers
-        // hand-curated files that pre-date the convention.
-        let entry = match ProvenanceMap::read_sidecar(path) {
-            Ok(Some(p)) => p,
-            _ => match ProvenanceMap::degenerate_from_artifact(path) {
-                Ok(p) => p,
-                Err(_) => continue, // file missing → caller will surface
-            },
+        // Sidecar first — that's the strong signal (full producer
+        // lineage), checked at both its cached and co-located homes;
+        // degenerate fallback covers hand-curated files that pre-date
+        // the convention. A missing file → caller surfaces it later.
+        let Ok(entry) = ProvenanceMap::for_input(cache_dir, workspace, path) else {
+            continue;
         };
         upstream.insert((*role).to_string(), entry);
     }
@@ -1300,6 +1299,8 @@ sweep.
             self.build_version(),
             self.command_path(),
             options,
+            &ctx.cache,
+            &ctx.workspace,
             &[("source", &input_path), ("predicates", &predicates_path)],
         );
         let cache_prefix = run_provenance.hash(
@@ -2554,12 +2555,14 @@ mod tests {
             "1.0.0+abcd",
             "compute evaluate-predicates",
             &opts_a,
+            ws, ws,
             &[("source", &meta_path), ("predicates", &pred_path_a)],
         );
         let prov_b = build_run_provenance(
             "1.0.0+abcd",
             "compute evaluate-predicates",
             &opts_b,
+            ws, ws,
             &[("source", &meta_path), ("predicates", &pred_path_b)],
         );
 
@@ -2592,12 +2595,14 @@ mod tests {
             "1.0.0+abcd1234",
             "compute evaluate-predicates",
             &opts,
+            ws, ws,
             &[("source", &meta_path), ("predicates", &pred_path)],
         );
         let prov_v2 = build_run_provenance(
             "1.0.0+ffff5678", // same version, different git hash
             "compute evaluate-predicates",
             &opts,
+            ws, ws,
             &[("source", &meta_path), ("predicates", &pred_path)],
         );
         let h1 = prov_v1.hash(crate::pipeline::provenance::ProvenanceFlags::STRICT);

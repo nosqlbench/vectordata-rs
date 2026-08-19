@@ -301,7 +301,7 @@ fn plan_prebuffer(view: &dyn TestDataView) -> PrebufferPlan {
             // pulls a fraction. `facet_download_bytes` handles the
             // local/remote and windowed/full split in one call.
             total_bytes += crate::view::facet_download_bytes(
-                desc.source_path.as_deref(), &storage);
+                desc.source_path.as_deref(), desc.window.as_deref(), &storage);
             facets.push(FacetPlanRow { qualified_name: name });
         }
     }

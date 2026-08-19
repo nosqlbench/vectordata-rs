@@ -14,6 +14,7 @@ pub(crate) mod cleanup;
 pub(crate) mod infer_manifest;
 pub mod import;
 pub mod stratify;
+pub(crate) mod synthesize;
 pub(crate) mod wizard;
 
 use std::path::PathBuf;
@@ -280,6 +281,68 @@ pub enum PrepareCommand {
         /// Fully automatic — use standard spec, overwrite existing (implies -iy --force)
         #[arg(long)]
         auto: bool,
+    },
+    /// Synthesize a complete dataset from scratch in one command.
+    ///
+    /// Orchestrates the existing facility end-to-end: generates base
+    /// vectors (uniform, or from a `--model` JSON), bootstraps the
+    /// dataset + pipeline (with `--sized-profiles`), and runs the pipeline
+    /// — so queries, per-profile ground truth, dedup/zero scans, and merkle
+    /// are all computed by `veks run`, not re-implemented here.
+    Synthesize {
+        /// Output directory for the new dataset.
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Dataset name (default: the output directory's name).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Base (corpus) vector count. Accepts unit suffixes (e.g. `1M`, `100k`).
+        #[arg(long, default_value = "10000")]
+        base_count: String,
+
+        /// Query vector count (queries are extracted from the base via shuffle).
+        #[arg(long, default_value = "1000")]
+        query_count: String,
+
+        /// Vector dimensionality (required unless --model supplies it).
+        #[arg(long)]
+        dimension: Option<u32>,
+
+        /// Distance metric for ground truth: L2, COSINE, DOT_PRODUCT, L1.
+        #[arg(long, default_value = "L2")]
+        metric: String,
+
+        /// Number of ground-truth neighbors (k).
+        #[arg(long, default_value = "100")]
+        neighbors: u32,
+
+        /// Sized-profile spec (e.g. `mul:10k..1m/2`); each becomes a windowed
+        /// profile with its own ground truth, computed by the pipeline.
+        #[arg(long)]
+        sized_profiles: Option<String>,
+
+        /// VectorSpaceModel JSON for distribution-matched base vectors
+        /// (dimension is taken from the model). Omit for uniform vectors.
+        #[arg(long)]
+        model: Option<PathBuf>,
+
+        /// Minimum value for uniform base vectors (ignored with --model).
+        #[arg(long, default_value = "0.0")]
+        min: f32,
+
+        /// Maximum value for uniform base vectors (ignored with --model).
+        #[arg(long, default_value = "1.0")]
+        max: f32,
+
+        /// Random seed (deterministic output for a given seed).
+        #[arg(long, default_value = "42")]
+        seed: u32,
+
+        /// Overwrite an existing dataset in the output directory.
+        #[arg(long)]
+        force: bool,
     },
     /// Generate and manage dataset catalog index files
     #[command(disable_help_subcommand = true)]
@@ -930,6 +993,15 @@ pub fn run(args: PrepareArgs) {
             };
             stratify::run(&path, spec.as_deref(), force, yes);
         }
+        PrepareCommand::Synthesize {
+            output, name, base_count, query_count, dimension, metric, neighbors,
+            sized_profiles, model, min, max, seed, force,
+        } => {
+            synthesize::run(synthesize::SynthesizeArgs {
+                output, name, base_count, query_count, dimension, metric, neighbors,
+                sized_profiles, model, min, max, seed, force,
+            });
+        }
         PrepareCommand::Catalog { command } => {
             match command {
                 CatalogSubcommand::Generate { input, basename, for_publish_url, update } => {
@@ -1126,7 +1198,7 @@ fn clean_single_dataset(workspace: &std::path::Path) {
                     attributes: None,
                     profiles: Default::default(),
                     upstream: None,
-                    strata: Vec::new(),
+                    strata: Default::default(),
                     variables: Default::default(),
                 }
             });

@@ -325,18 +325,36 @@ profiles:
     metadata_content: profiles/base/metadata_content.u8
     metadata_indices: profiles/default/metadata_indices.ivvecs
 
-# Strata are generators that expand into per-size sized profiles at
-# load/publish time. They live at the root of dataset.yaml — not under
-# profiles: — so the strata templates and the resulting (already
-# expanded) sized profiles can both be visible in the same file.
+# Strata are named generators that expand into per-size sized profiles
+# at load/publish time. They live at the root of dataset.yaml — not
+# under profiles: — so the strata definitions and the resulting
+# (already expanded) sized profiles can both be visible in the same
+# file. Each stratum carries its generator `spec` and, once expansion
+# has run, the `series` of profile names it produced. A profile may
+# belong to multiple strata — overlapping series are valid.
 strata:
-  - "decade"             # 100k, 200k, …, 900k, 1m, 2m, … (default start 100k)
-  - "mul:1m..16m/2"      # 1m, 2m, 4m, 8m, 16m
-  - "fib:1m"             # 1m, 2m, 3m, 5m, 8m, … capped at base_count
-  - "linear:10m/10m"     # every 10M up to base_count
-  - "step:1m..3m/1m"     # explicit-step arithmetic: 1m, 2m, 3m
-  - "parts:0m..400m/10"  # 10 equal divisions: 40m, 80m, … 400m
+  decade:
+    spec: "decade"            # 100k, 200k, …, 900k, 1m, 2m, … (default start 100k)
+    series: ["100k", "200k", "300k", "400k", "500k", "600k", "700k", "800k", "900k", "1m", "2m"]
+  mul:
+    spec: "mul:1m..16m/2"     # 1m, 2m, 4m, 8m, 16m
+    series: ["1m", "2m"]      # series stops below base_count
+  fib:
+    spec: "fib:1m"            # 1m, 2m, 3m, 5m, 8m, … capped at base_count
+    series: ["1m", "2m"]
 ```
+
+Authors may also write the compact list shorthand:
+
+```yaml
+strata: ["decade", "mul:1m..16m/2", "fib:1m"]
+```
+
+Stratum names are then synthesized from each spec's generator strategy
+(`mul`, `fib`, `linear`, `decade`, `step`, `parts`; `-2`, `-3`, …
+suffixes on collision). Every save — and in particular the published
+`dataset.yaml` / `dataset.json` — renders the structured form above,
+with `series` reflecting the actual expansion.
 
 ### Profiles
 
@@ -362,7 +380,7 @@ estimate costs, and display summaries.
 
 ### Strata generator strategies
 
-Each entry under `strata:` is one generator string. Every multi-form
+Each stratum's `spec` is one generator string. Every multi-form
 strategy uses an explicit prefix so the intent is unambiguous; only
 the bare literal form is unprefixed.
 

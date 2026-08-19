@@ -287,12 +287,22 @@ impl ProgressLog {
     /// these sidecars to populate their own `upstream` cascade
     /// (see [`ProvenanceMap::read_sidecar`]).
     pub fn record_step(&mut self, step_id: &str, record: StepRecord) {
-        if let Some(prov) = record.provenance.as_ref() {
+        // Provenance sidecars for dataset outputs are staleness metadata,
+        // not dataset content — they belong under `<cache>/provenance/`,
+        // never beside the artifact. The cache directory is the progress
+        // log's own parent (`<dataset>/.cache`); without a progress path
+        // (purely in-memory log) there's nowhere to persist them, so skip.
+        if let (Some(prov), Some(cache_dir)) =
+            (record.provenance.as_ref(), self.path.as_deref().and_then(Path::parent))
+        {
+            // Migrate away any sidecar a previous version wrote beside the
+            // artifact, so re-running cleans up the dataset layer.
+            let workspace = cache_dir.parent();
             for out in &record.outputs {
                 let artifact = Path::new(&out.path);
-                // A derived sidecar (a `.mref` the merkle step just produced, or
-                // a provenance sidecar) must not itself get a provenance sidecar,
-                // or the suffixes compound — `…fvecs.provenance.json.mref.provenance.json`.
+                // A derived sidecar (a `.mref` the merkle step just produced,
+                // or a provenance sidecar) must not itself get a provenance
+                // sidecar, or the suffixes compound.
                 let is_sidecar = artifact
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -301,7 +311,24 @@ impl ProgressLog {
                 if is_sidecar {
                     continue;
                 }
-                if let Err(e) = prov.write_sidecar(artifact) {
+                // Map to a workspace-relative path so the provenance
+                // mirror under `<cache>/provenance/` stays clean (the
+                // runner may record outputs as absolute or relative paths).
+                let rel = workspace
+                    .and_then(|ws| artifact.strip_prefix(ws).ok())
+                    .unwrap_or(artifact);
+                // Migrate away any sidecar a previous version wrote beside
+                // the artifact — resolve the artifact to absolute first so a
+                // relative output path still points at the dataset file.
+                let abs_artifact = match (artifact.is_absolute(), workspace) {
+                    (false, Some(ws)) => ws.join(artifact),
+                    _ => artifact.to_path_buf(),
+                };
+                let stale = ProvenanceMap::sidecar_path(&abs_artifact);
+                if stale.exists() {
+                    let _ = std::fs::remove_file(&stale);
+                }
+                if let Err(e) = prov.write_cached_sidecar(cache_dir, rel) {
                     log::warn!(
                         "provenance: failed to write sidecar for {}: {}",
                         out.path, e,
@@ -501,12 +528,21 @@ mod tests {
     /// upstream-cascade contract: downstream consumers find the
     /// sidecar via [`ProvenanceMap::read_sidecar`] and merge it
     /// into their own `upstream` map.
+    /// A progress log wired to a dataset's `.cache/.upstream.progress.yaml`,
+    /// so `record_step` can derive the cache dir for provenance placement.
+    fn log_for_dataset(dataset: &Path) -> ProgressLog {
+        let cache = dataset.join(".cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut log = ProgressLog::new();
+        log.path = Some(cache.join(".upstream.progress.yaml"));
+        log
+    }
+
     #[test]
-    fn record_step_writes_sidecars_for_outputs() {
+    fn record_step_writes_sidecars_under_cache_provenance() {
         use super::super::provenance::BinaryVersion;
-        let tmp = tempfile::tempdir().unwrap();
-        let artifact = tmp.path().join("out.slab");
-        std::fs::write(&artifact, b"placeholder").unwrap();
+        let ds = tempfile::tempdir().unwrap();
+        let cache = ds.path().join(".cache");
 
         let prov = ProvenanceMap::build(
             "test-step",
@@ -516,24 +552,50 @@ mod tests {
             std::collections::BTreeMap::new(),
         );
         let mut r = rec(Some(prov.clone()));
-        r.outputs.push(OutputRecord {
-            path: artifact.to_string_lossy().into_owned(),
-            size: 12,
-            mtime: None,
-        });
+        // Workspace-relative output path (as the runner records it).
+        let rel = "profiles/base/out.slab";
+        r.outputs.push(OutputRecord { path: rel.to_string(), size: 12, mtime: None });
 
-        let mut log = ProgressLog::new();
+        let mut log = log_for_dataset(ds.path());
         log.record_step("test-step", r);
 
-        // Sidecar appears at the conventional path…
-        let sidecar = ProvenanceMap::sidecar_path(&artifact);
-        assert!(sidecar.exists(),
-            "record_step should write a sidecar at {}", sidecar.display());
+        // Sidecar lands under <cache>/provenance/, mirroring the artifact
+        // path — and NOT beside the dataset artifact.
+        let cached = ProvenanceMap::cached_sidecar_path(&cache, Path::new(rel));
+        assert!(cached.exists(), "sidecar should be at {}", cached.display());
+        assert!(!ds.path().join("profiles/base/out.slab.provenance.json").exists(),
+            "provenance must not pollute the dataset storage layer");
 
         // …and round-trips to a structurally-equal map.
-        let recovered = ProvenanceMap::read_sidecar(&artifact).unwrap().unwrap();
+        let recovered = ProvenanceMap::read_cached_sidecar(&cache, Path::new(rel))
+            .unwrap().unwrap();
         assert_eq!(recovered.hash(super::super::provenance::ProvenanceFlags::STRICT),
                    prov.hash(super::super::provenance::ProvenanceFlags::STRICT));
+    }
+
+    /// A stale sidecar a previous version wrote *beside* the artifact is
+    /// migrated away (removed) on the next `record_step`.
+    #[test]
+    fn record_step_migrates_legacy_colocated_sidecar() {
+        use super::super::provenance::BinaryVersion;
+        let ds = tempfile::tempdir().unwrap();
+        let rel = "profiles/base/out.slab";
+        let legacy = ds.path().join("profiles/base/out.slab.provenance.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"{}").unwrap();
+
+        let prov = ProvenanceMap::build("s", "c",
+            &BinaryVersion::parse("1.0.0+abcd"), &HashMap::new(),
+            std::collections::BTreeMap::new());
+        let mut r = rec(Some(prov));
+        r.outputs.push(OutputRecord { path: rel.to_string(), size: 1, mtime: None });
+
+        let mut log = log_for_dataset(ds.path());
+        log.record_step("s", r);
+
+        assert!(!legacy.exists(), "legacy co-located sidecar must be removed");
+        assert!(ProvenanceMap::cached_sidecar_path(&ds.path().join(".cache"), Path::new(rel))
+            .exists(), "new sidecar must be under cache/provenance");
     }
 
     /// A derived sidecar output (a `.mref` from the merkle step, or a provenance
@@ -541,7 +603,8 @@ mod tests {
     /// compound without bound (`…fvecs.provenance.json.mref.provenance.json`).
     #[test]
     fn record_step_skips_sidecar_for_derived_outputs() {
-        let tmp = tempfile::tempdir().unwrap();
+        let ds = tempfile::tempdir().unwrap();
+        let cache = ds.path().join(".cache");
         let prov = ProvenanceMap::build(
             "merkle-step",
             "merkle create",
@@ -550,18 +613,12 @@ mod tests {
             std::collections::BTreeMap::new(),
         );
         for derived in ["base.fvec.mref", "base.fvec.provenance.json", "data.mrkl"] {
-            let artifact = tmp.path().join(derived);
-            std::fs::write(&artifact, b"derived").unwrap();
             let mut r = rec(Some(prov.clone()));
-            r.outputs.push(OutputRecord {
-                path: artifact.to_string_lossy().into_owned(),
-                size: 7,
-                mtime: None,
-            });
-            let mut log = ProgressLog::new();
+            r.outputs.push(OutputRecord { path: derived.to_string(), size: 7, mtime: None });
+            let mut log = log_for_dataset(ds.path());
             log.record_step("merkle-step", r);
             assert!(
-                !ProvenanceMap::sidecar_path(&artifact).exists(),
+                !ProvenanceMap::cached_sidecar_path(&cache, Path::new(derived)).exists(),
                 "{derived} must not get a provenance sidecar"
             );
         }
@@ -569,26 +626,18 @@ mod tests {
 
     /// Producer steps without a `ProvenanceMap` (legacy records or
     /// commands that haven't been wired up yet) must NOT crash on
-    /// `record_step`. Missing sidecar is the equivalent of "no
-    /// upstream provenance to cascade" — consumers fall back to
-    /// `degenerate_from_artifact`.
+    /// `record_step`, and write no sidecar.
     #[test]
     fn record_step_without_provenance_does_not_write_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
-        let artifact = tmp.path().join("legacy.slab");
-        std::fs::write(&artifact, b"placeholder").unwrap();
-
+        let ds = tempfile::tempdir().unwrap();
+        let rel = "legacy.slab";
         let mut r = rec(None);
-        r.outputs.push(OutputRecord {
-            path: artifact.to_string_lossy().into_owned(),
-            size: 12,
-            mtime: None,
-        });
+        r.outputs.push(OutputRecord { path: rel.to_string(), size: 12, mtime: None });
 
-        let mut log = ProgressLog::new();
+        let mut log = log_for_dataset(ds.path());
         log.record_step("legacy-step", r);
-        assert!(!ProvenanceMap::sidecar_path(&artifact).exists(),
-            "no provenance → no sidecar (best-effort, not mandatory)");
+        assert!(!ProvenanceMap::cached_sidecar_path(&ds.path().join(".cache"), Path::new(rel))
+            .exists(), "no provenance → no sidecar (best-effort, not mandatory)");
     }
 
     #[test]

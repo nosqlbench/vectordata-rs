@@ -14,6 +14,11 @@ Sort-based deduplication using bitwise vector equality:
 The unified `prepare-vectors` step (`compute sort`) handles sort +
 dedup + zero detection + norm measurement in a single pass.
 
+Extract steps that apply an ordinal reorder map (shuffle, dedup
+ordinals) use the SPLAT rewrite — see
+[09-algorithms.md §9.4](./09-algorithms.md#94-splat-io-sympathetic-ordinal-rewrite)
+and the step guides in [splat/](./splat/README.md).
+
 ---
 
 ## 6.2 L2 Normalization

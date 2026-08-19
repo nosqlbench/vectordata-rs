@@ -238,6 +238,14 @@ const VIEW_NAMES: &[&str] = &[
 ];
 const NUM_VIEWS: usize = 9;
 
+/// How many principal components are projected per point for the PCA scatter
+/// (PC1..=PC5). The scatter shows 4 at a time (3 spatial + colour) and lets you
+/// slide/swap which; everything that indexes a point's PCs — the `[f64; N]`
+/// point type, `pc_axes`, the `c`/`C` slide modulus, and `get_pc`'s bound — is
+/// keyed off this one constant so a slid axis can never index past the
+/// projection (which would silently read 0 and duplicate axes).
+const PROJECTED_PCS: usize = 5;
+
 // ---------------------------------------------------------------------------
 // Background messages
 // ---------------------------------------------------------------------------
@@ -264,7 +272,7 @@ struct EigenMsg {
 
 /// Phase 4: projected points.
 struct ProjectionMsg {
-    points: Vec<[f64; 5]>,
+    points: Vec<[f64; PROJECTED_PCS]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +382,7 @@ pub(super) fn run_interactive_explore(
     let mut rot_z: f64 = 0.0;  // a/d keys
     let mut rot_w: f64 = 0.0;  // w/s keys
     let mut selected_dim: usize = 0; // for DimDist view
-    let mut pc_axes: [usize; 5] = [0, 1, 2, 3, 4];
+    let mut pc_axes: [usize; PROJECTED_PCS] = std::array::from_fn(|i| i);
     let mut loadings_bar_mode: bool = true; // true=bar chart (default), false=heatmap
     let mut loadings_band_size: usize = 0;   // 0 = auto-fit to terminal height
     let mut loadings_scroll: usize = 0;      // vertical scroll offset (band index)
@@ -410,7 +418,7 @@ pub(super) fn run_interactive_explore(
     let mut phase3_done;
     let eigen_target = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(10usize.min(dim)));
     let mut avg_eigen_ms;
-    let mut projected: Vec<[f64; 5]> = Vec::new();
+    let mut projected: Vec<[f64; PROJECTED_PCS]> = Vec::new();
     let mut proj_rx: Option<mpsc::Receiver<ProjectionMsg>>;
     let mut phase4_done;
     let mut status_msg;
@@ -739,12 +747,12 @@ pub(super) fn run_interactive_explore(
                                 proj_rx = Some(prx);
                                 std::thread::spawn(move || {
                                     use rayon::prelude::*;
-                                    let ev_f32: Vec<Vec<f32>> = (0..5.min(evecs.len()))
+                                    let ev_f32: Vec<Vec<f32>> = (0..PROJECTED_PCS.min(evecs.len()))
                                         .map(|i| evecs[i].iter().map(|&x| x as f32).collect())
                                         .collect();
                                     let zero = vec![0.0f32; dim_c];
                                     let chunk_size = 4096.max(n / rayon::current_num_threads().max(1));
-                                    let pts: Vec<[f64; 5]> = (0..n)
+                                    let pts: Vec<[f64; PROJECTED_PCS]> = (0..n)
                                         .collect::<Vec<_>>()
                                         .par_chunks(chunk_size)
                                         .flat_map(|idx_chunk| {
@@ -752,8 +760,8 @@ pub(super) fn run_interactive_explore(
                                             idx_chunk.iter().map(|&vi| {
                                                 let off = vi * dim_c;
                                                 for d in 0..dim_c { centered[d] = buf[off + d] - mean_f32[d]; }
-                                                let mut pcs = [0.0f64; 5];
-                                                for k in 0..5 {
+                                                let mut pcs = [0.0f64; PROJECTED_PCS];
+                                                for k in 0..PROJECTED_PCS {
                                                     let ev = if k < ev_f32.len() { &ev_f32[k] } else { &zero };
                                                     pcs[k] = <f32 as SpatialSimilarity>::dot(&centered, ev).unwrap_or(0.0) as f64;
                                                 }
@@ -1247,14 +1255,18 @@ pub(super) fn run_interactive_explore(
                                 break;
                             }
                         }
-                        // c/C: slide the component window (PC1-4 → PC2-5 → PC3-6...)
+                        // c/C: slide which projected PC fills each display slot,
+                        // cycling within PC1..=PC5. The modulus MUST be the
+                        // projected width (PROJECTED_PCS), NOT the full
+                        // eigenvalue count: only the top 5 PCs are
+                        // projected per point, so an index ≥ 5 has no data and
+                        // `render_pca_scatter` collapses it to 0.0 — making
+                        // every slid-past axis render identically (duplicated).
                         KeyCode::Char('c') if view_mode == V_PCA => {
-                            let max_pc = eigenvalues.len().max(5);
-                            for a in pc_axes.iter_mut() { *a = (*a + 1) % max_pc; }
+                            for a in pc_axes.iter_mut() { *a = (*a + 1) % PROJECTED_PCS; }
                         }
                         KeyCode::Char('C') if view_mode == V_PCA => {
-                            let max_pc = eigenvalues.len().max(5);
-                            for a in pc_axes.iter_mut() { *a = (*a + max_pc - 1) % max_pc; }
+                            for a in pc_axes.iter_mut() { *a = (*a + PROJECTED_PCS - 1) % PROJECTED_PCS; }
                         }
                         // x/X: rotate axis assignment within the current set
                         // x: X→Y→Z→color cycle (rotate display roles forward)
@@ -1729,8 +1741,8 @@ fn render_variance_bars(frame: &mut ratatui::Frame, area: ratatui::layout::Rect,
 
 fn render_pca_scatter(
     frame: &mut ratatui::Frame, area: ratatui::layout::Rect,
-    projected: &[[f64; 5]], rot_y: f64, rot_x: f64, rot_z: f64, rot_w: f64,
-    pc_axes: &[usize; 5], dims: usize,
+    projected: &[[f64; PROJECTED_PCS]], rot_y: f64, rot_x: f64, rot_z: f64, rot_w: f64,
+    pc_axes: &[usize; PROJECTED_PCS], dims: usize,
     palette: super::palette::Palette, curve: super::palette::Curve,
 ) {
     if projected.is_empty() {
@@ -1745,9 +1757,9 @@ fn render_pca_scatter(
     let (sw, cw) = rot_w.sin_cos();
 
     // Map PC axes: pc_axes[0..5] selects which of the projected PCs to use
-    let get_pc = |p: &[f64; 5], axis: usize| -> f64 {
+    let get_pc = |p: &[f64; PROJECTED_PCS], axis: usize| -> f64 {
         let idx = pc_axes[axis];
-        if idx < 5 { p[idx] } else { 0.0 }
+        if idx < PROJECTED_PCS { p[idx] } else { 0.0 }
     };
 
     // Rotate the four axes. rot_y/rot_x/rot_z fully orient the three

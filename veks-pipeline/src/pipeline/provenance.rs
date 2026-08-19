@@ -30,11 +30,10 @@ use serde::{Deserialize, Serialize};
 
 use super::progress::FnvHasher;
 
-/// Extension appended to an artifact path to locate its
-/// provenance sidecar. Co-located with the artifact (rather
-/// than centralised in `.cache/`) so the pair survives
-/// `cp -a`, archival, and `mv`. Same convention every consumer
-/// uses; see [`ProvenanceMap::sidecar_path`].
+/// Extension appended to the cached provenance path for an artifact.
+/// Sidecars are centralised under `<cache>/provenance/` (never beside
+/// the dataset artifact) — see [`ProvenanceMap::sidecar_path`] for the
+/// 1-1 affine mapping.
 pub const SIDECAR_EXT: &str = "provenance.json";
 
 /// Structured provenance of a single step's execution.
@@ -186,11 +185,12 @@ impl ProvenanceMap {
         }
     }
 
-    /// Path of the provenance sidecar for an artifact. The sidecar
-    /// lives next to the artifact (e.g. `metadata_predicates.slab`
-    /// → `metadata_predicates.slab.provenance.json`) so the pair
-    /// survives `cp -a`, archival, and `mv`. Every producer/consumer
-    /// uses this same convention — see [`SIDECAR_EXT`].
+    /// Path of the provenance sidecar **co-located** with a cache
+    /// segment (e.g. `<cache>/run-3.slab` →
+    /// `<cache>/run-3.slab.provenance.json`). Used only for
+    /// intermediate cache files that already live under `.cache/` —
+    /// dataset artifacts use [`cached_sidecar_path`](Self::cached_sidecar_path)
+    /// instead so provenance never lands in the dataset storage layer.
     pub fn sidecar_path(artifact: &Path) -> PathBuf {
         let mut p = artifact.as_os_str().to_os_string();
         p.push(".");
@@ -198,28 +198,65 @@ impl ProvenanceMap {
         PathBuf::from(p)
     }
 
-    /// Write this `ProvenanceMap` to `artifact`'s sidecar. Producers
-    /// call this immediately after their output artifact is durable
-    /// on disk; consumers can then pick it up via
-    /// [`read_sidecar`](Self::read_sidecar) to populate their own
-    /// `upstream` entry. Pretty-printed JSON so the file is greppable
-    /// in the field.
-    pub fn write_sidecar(&self, artifact: &Path) -> std::io::Result<()> {
-        let path = Self::sidecar_path(artifact);
+    /// Path of the provenance sidecar for a **dataset artifact**.
+    ///
+    /// Provenance is staleness *metadata*, not dataset content, so it
+    /// must never pollute the dataset storage layer. Dataset-artifact
+    /// sidecars live under the cache directory in a dedicated
+    /// `provenance/` subdirectory, at a **1-1 affine mapping** of the
+    /// artifact's workspace-relative path:
+    ///
+    /// ```text
+    /// profiles/base/base_vectors.fvecs
+    ///   → <cache>/provenance/profiles/base/base_vectors.fvecs.provenance.json
+    /// ```
+    ///
+    /// The transform is structure-preserving and reversible (strip the
+    /// `<cache>/provenance/` prefix and the `.provenance.json` suffix to
+    /// recover the artifact's relative path). `rel_artifact` is taken
+    /// relative to the dataset workspace; any leading root/prefix is
+    /// dropped so an absolute path still nests under `provenance/`.
+    pub fn cached_sidecar_path(cache_dir: &Path, rel_artifact: &Path) -> PathBuf {
+        use std::path::Component;
+        let rel: PathBuf = rel_artifact
+            .components()
+            .filter(|c| !matches!(c, Component::RootDir | Component::Prefix(_)))
+            .collect();
+        let mut p = cache_dir.join("provenance").join(&rel).into_os_string();
+        p.push(".");
+        p.push(SIDECAR_EXT);
+        PathBuf::from(p)
+    }
+
+    /// Write this `ProvenanceMap` to `path`, creating parent dirs.
+    /// Pretty-printed JSON so the file is greppable in the field.
+    fn write_to(&self, path: &Path) -> std::io::Result<()> {
         let body = serde_json::to_vec_pretty(self).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, body)
+        std::fs::write(path, body)
     }
 
-    /// Read the provenance sidecar paired with `artifact`. Returns
-    /// `Ok(None)` if no sidecar is present — consumers should fall
-    /// back to [`degenerate_from_artifact`](Self::degenerate_from_artifact)
-    /// in that case so hand-curated or pre-existing dataset files
-    /// still cascade *something* into the consumer's hash.
+    /// Write this map as the co-located sidecar of a cache segment
+    /// (see [`sidecar_path`](Self::sidecar_path)).
+    pub fn write_sidecar(&self, artifact: &Path) -> std::io::Result<()> {
+        self.write_to(&Self::sidecar_path(artifact))
+    }
+
+    /// Write this map as the cached sidecar of a dataset artifact
+    /// (see [`cached_sidecar_path`](Self::cached_sidecar_path)).
+    pub fn write_cached_sidecar(&self, cache_dir: &Path, rel_artifact: &Path) -> std::io::Result<()> {
+        self.write_to(&Self::cached_sidecar_path(cache_dir, rel_artifact))
+    }
+
+    /// Read the co-located sidecar of a cache segment. Returns
+    /// `Ok(None)` if absent — consumers should fall back to
+    /// [`degenerate_from_artifact`](Self::degenerate_from_artifact)
+    /// so hand-curated or pre-existing files still cascade *something*
+    /// into the consumer's hash.
     pub fn read_sidecar(artifact: &Path) -> std::io::Result<Option<Self>> {
         let path = Self::sidecar_path(artifact);
         match std::fs::read(&path) {
@@ -232,6 +269,42 @@ impl ProvenanceMap {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Read the cached sidecar of a dataset artifact (the counterpart of
+    /// [`write_cached_sidecar`](Self::write_cached_sidecar)). `Ok(None)`
+    /// when absent.
+    pub fn read_cached_sidecar(
+        cache_dir: &Path,
+        rel_artifact: &Path,
+    ) -> std::io::Result<Option<Self>> {
+        match std::fs::read(Self::cached_sidecar_path(cache_dir, rel_artifact)) {
+            Ok(bytes) => {
+                let parsed: Self = serde_json::from_slice(&bytes).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                })?;
+                Ok(Some(parsed))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolve the provenance of an input artifact for an upstream
+    /// cascade, checking both sidecar homes before degrading: the
+    /// cached (relocated) sidecar of a dataset artifact, then the
+    /// co-located sidecar of a cache segment, then a degenerate
+    /// `(path, size, mtime)` map from the file itself. `workspace` is
+    /// the dataset root used to derive the artifact's relative path.
+    pub fn for_input(cache_dir: &Path, workspace: &Path, artifact: &Path) -> std::io::Result<Self> {
+        let rel = artifact.strip_prefix(workspace).unwrap_or(artifact);
+        if let Some(p) = Self::read_cached_sidecar(cache_dir, rel)? {
+            return Ok(p);
+        }
+        if let Some(p) = Self::read_sidecar(artifact)? {
+            return Ok(p);
+        }
+        Self::degenerate_from_artifact(artifact)
     }
 
     /// Build a degenerate `ProvenanceMap` from a file's path, size,

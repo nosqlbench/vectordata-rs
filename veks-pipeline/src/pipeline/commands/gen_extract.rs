@@ -19,6 +19,10 @@
 //! All support range specifications in the format `[start,end)` or `start..end`
 //! to select a subset of the source file.
 //!
+//! Index-based fvec/mvec/slab extraction applies the reorder map with the
+//! SPLAT rewrite (segment, plan, linearize, assemble, transfer) — canonical
+//! spec in docs/sysref/09-algorithms.md §9.4, step guides in docs/sysref/splat/.
+//!
 //! Equivalent to Java `CMD_generate_fvecExtract` and `CMD_generate_ivecExtract`.
 
 use std::path::{Path, PathBuf};
@@ -68,15 +72,16 @@ selects which entries of the ivec to use (not which source records to
 read). For example, `range=[0,1000)` reads the first 1000 ivec entries
 and copies the source vectors they reference.
 
-## Partitioned-pass extraction
+## SPLAT extraction
 
-When the source file is too large to random-access efficiently, the
-extraction uses a partitioned-pass algorithm. The requested indices are
-sorted and bucketed into contiguous partitions of the source file. Each
-partition is read sequentially in a single pass, and the matching vectors
-are collected. Multiple passes over the source may be needed if the
-indices span the entire file, but each pass reads sequentially, which is
-far more efficient than scattered random reads on large datasets.
+Index-based extraction uses the SPLAT rewrite (segment, plan, linearize,
+assemble, transfer): the output is divided into segments sized by the
+memory budget, and for each segment the matching reorder-map entries are
+collected and sorted by source position. The source is then read in
+ascending order, each vector is scattered to its final position in an
+in-memory segment buffer, and the segment is written to disk in one
+contiguous burst. Disk sees only monotonic reads and contiguous writes;
+random access is confined to RAM. See docs/sysref/splat/README.md.
 
 ## Role in dataset pipelines
 
@@ -397,13 +402,13 @@ the half-open interval of source ordinals to copy.
 
 Ranges are specified as `[start,end)` or `start..end`.
 
-## Partitioned-pass extraction (index mode)
+## Direct indexed lookup (index mode)
 
-For index-based extraction on datasets larger than RAM, the algorithm
-buckets the requested indices into partitions aligned to the source file
-layout. Each partition is read sequentially in a single pass, collecting
-the matching records. This avoids scattered random I/O and keeps memory
-usage bounded regardless of dataset size.
+Unlike the fvec/mvec/slab extractors, ivec-extract does not use the
+SPLAT rewrite (docs/sysref/splat/README.md): source records are single
+integers, so even a fully shuffled access pattern touches few enough
+pages that the page cache absorbs it. Records are copied by direct
+lookup in index order.
 
 ## Role in dataset pipelines
 
@@ -731,14 +736,15 @@ records from the mvec file directly.
 
 Ranges are specified as `[start,end)` or `start..end`.
 
-## Partitioned-pass extraction (index mode)
+## SPLAT extraction (index mode)
 
-For index-based extraction on large datasets, the algorithm buckets the
-requested indices into partitions of the source file and reads each
-partition sequentially. This avoids scattered random I/O and keeps memory
-usage bounded. Multiple sequential passes over the source may be needed if
-the requested indices span the entire file, but each pass is a linear scan
-rather than random access.
+Index-based extraction uses the SPLAT rewrite (segment, plan, linearize,
+assemble, transfer): the output is divided into segments sized by the
+memory budget; each segment's reorder-map entries are collected, sorted
+by source position, read in ascending order, scattered into an in-memory
+segment buffer, and flushed to disk in one contiguous burst. Disk sees
+only monotonic reads and contiguous writes; random access is confined to
+RAM. See docs/sysref/splat/README.md.
 
 ## Role in dataset pipelines
 
@@ -1110,7 +1116,7 @@ impl CommandOp for GenerateSlabExtractOp {
             .unwrap_or(65536);
 
         if let Some(ref ivec_p) = ivec_path {
-            // Index-based extraction: partitioned-pass approach for sequential I/O
+            // Index-based extraction: SPLAT rewrite for sequential I/O
             let ivec_reader = match XvecReader::<i32>::open_path(ivec_p) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1388,20 +1394,24 @@ fn half_system_ram() -> u64 {
     }
 }
 
-/// Partitioned-pass extraction for mvec files.
+/// SPLAT extraction for mvec files — the reference implementation of the
+/// segment/plan/linearize/assemble/transfer rewrite. Canonical spec:
+/// docs/sysref/09-algorithms.md §9.4; step guides: docs/sysref/splat/.
 ///
-/// For each output partition:
-/// 1. Scan the ivec (just integers) to find entries whose output position
-///    falls in this partition. Build a read plan: `(source_idx, local_out_pos)`.
-/// 2. Sort the read plan by source_idx — this is the sequential read order.
-/// 3. Walk the read plan, reading source records in order (sequential I/O).
-///    Each record is placed directly into the partition buffer at its
-///    transpose position.
-/// 4. Write the entire partition buffer contiguously.
+/// The output is segmented by the memory budget, then for each segment:
+/// 1. Plan: scan the ivec window whose output positions fall in this
+///    segment, building a read plan of `(source_idx, local_out_pos)`.
+/// 2. Linearize: sort the read plan by source_idx — the sequential read
+///    order.
+/// 3. Assemble: walk the read plan, reading source records in ascending
+///    order (sequential I/O); each record is placed into the segment
+///    buffer at its transpose position.
+/// 4. Transfer: write the entire segment buffer contiguously.
 ///
-/// Both reads and writes are sequential. The ivec scan per pass is cheap
-/// (integer range check only). Source data is only read for records in the
-/// current partition.
+/// Both reads and writes are sequential; random access is confined to the
+/// in-memory segment buffer. The ivec scan per pass is cheap (integer
+/// range check only). Source data is only read for records in the current
+/// segment.
 /// Zero a byte slice in 256 MiB chunks, ticking a UI progress bar each
 /// chunk. Equivalent in cost to `slice.fill(0)` but produces visible
 /// throughput in the TUI for hundred-GiB buffers that would otherwise
@@ -1828,10 +1838,14 @@ fn sorted_index_extract_mvec(
     ))
 }
 
-/// Partitioned-pass extraction for fvec files.
+/// SPLAT extraction for fvec files (see `sorted_index_extract_mvec` and
+/// docs/sysref/splat/).
 ///
-/// Same algorithm as mvec: for each output partition, scan ivec to build
-/// a read plan, sort by source position, read sequentially, write contiguously.
+/// Same rewrite as mvec: for each output segment, plan from the ivec
+/// window, linearize by source position, assemble with sequential reads,
+/// transfer contiguously. Adds pread-based reads (bounded RSS), an
+/// already-sorted fast path that streams without transposing, and
+/// near-zero-vector skipping with output compaction.
 fn sorted_index_extract_fvec(
     fvec_reader: &XvecReader<f32>,
     fvec_path: &Path,
@@ -2731,12 +2745,13 @@ struct SlabExtractMeta {
     page_size: u32,
 }
 
-/// Partitioned-pass extraction for slab files.
+/// SPLAT extraction for slab files (see docs/sysref/splat/).
 ///
-/// Same principle as xvec extraction: partition by output position, scan ivec
-/// per partition, sort by source ordinal for sequential slab reads, then write
-/// in output order. Since slab records are variable-length, we collect
-/// `(local_out_pos, data)` pairs and sort by output position before writing.
+/// Same rewrite as xvec extraction: segment by output position, plan from
+/// the ivec window per segment, linearize by source ordinal for sequential
+/// slab reads, then write in output order. Since slab records are
+/// variable-length, assemble collects `(local_out_pos, data)` pairs and
+/// sorts by output position before writing.
 ///
 /// Supports per-partition cache/resume: each partition is written to a cache
 /// file under `ctx.cache`. On re-run with matching parameters, partitions

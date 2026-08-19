@@ -230,16 +230,36 @@ fn e2e_sized_profiles_published_and_fetchable_over_http() {
             dist_path, yaml,
         );
     }
-    // The compact generator spec is preserved at root-level as
-    // `strata:` (migrated out from `profiles.sized:`) — idempotent
-    // re-processing needs the generator source, and root-level keeps
-    // the profile map clean of non-profile entries.
+    // The generator specs are preserved at root-level as `strata:`
+    // (migrated out from `profiles.sized:`) — idempotent re-processing
+    // needs the generator source, and root-level keeps the profile map
+    // clean of non-profile entries. The published form is the
+    // structured one: named strata carrying `spec` plus the `series`
+    // of profile names each generator produced.
     assert!(
         yaml.contains("\nstrata:"),
         "the root-level `strata:` spec must stay in dataset.yaml for round-trip \
          re-processing, got:\n{}",
         yaml,
     );
+    assert!(
+        !yaml.contains("strata: ["),
+        "published dataset.yaml must render structured strata, not the compact \
+         list shorthand, got:\n{}",
+        yaml,
+    );
+    for sized in &["25", "50", "100"] {
+        let stratum = format!(
+            "  {}:\n    spec: \"{}\"\n    series: [\"{}\"]\n",
+            sized, sized, sized,
+        );
+        assert!(
+            yaml.contains(&stratum),
+            "expected named stratum with spec+series for '{}' in published \
+             dataset.yaml, got:\n{}",
+            sized, yaml,
+        );
+    }
     // And `sized:` must NOT live inside the profiles map any more —
     // having it there forces every consumer of `profiles:` to skip it.
     let profiles_section = yaml.split("\nprofiles:\n").nth(1).unwrap_or("");

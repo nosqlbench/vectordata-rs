@@ -1124,15 +1124,7 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
     // paths" view. The compact `sized:` spec is preserved alongside
     // the concrete entries for round-trip re-processing — see
     // `DatasetConfig::save_expanded` for the file shape.
-    if config.profiles.has_deferred() {
-        let base_count: u64 = ["base_count", "clean_count", "vector_count", "source_base_count"]
-            .iter()
-            .find_map(|k| vars.get(*k).and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0))
-            .unwrap_or(0);
-        if base_count > 0 {
-            config.profiles.expand_deferred_sized(&vars, base_count);
-        }
-    }
+    config.expand_sized_profiles(&vars);
     let templates: Vec<_> = vectordata::dataset::collect_all_steps(&config)
         .into_iter()
         .filter(|s| s.per_profile)

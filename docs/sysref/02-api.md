@@ -909,7 +909,9 @@ if let Some(view) = group.profile("100K") {
 
 ```yaml
 strata:
-  - "mul:100K..1M/2"
+  mul:
+    spec: "mul:100K..1M/2"
+    series: ["100k", "200k", "400k", "800k"]
 
 profiles:
   default:

@@ -148,21 +148,42 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
 
     println!("  Spec: {}", spec_str);
 
-    // Parse the spec into (name, base_count) pairs
-    let pairs = parse_spec_to_pairs(&spec_str);
+    // Parse each comma-separated generator spec against the known
+    // base-count bound, keeping the per-spec series so the named
+    // strata can record which profiles each generator produced.
+    let spec_series = parse_spec_series(&spec_str, effective_max);
+    let mut pairs: Vec<(String, u64)> = spec_series.iter()
+        .flat_map(|(_, pairs)| pairs.iter().cloned())
+        .collect();
+    pairs.sort_by_key(|(_, count)| *count);
+    pairs.dedup_by(|a, b| a.0 == b.0);
     if pairs.is_empty() {
         eprintln!("Error: spec produced no profiles");
         std::process::exit(1);
     }
 
-    // Filter out profiles larger than effective_max
-    let pairs: Vec<(String, u64)> = pairs.into_iter()
-        .filter(|(_, count)| *count <= effective_max)
-        .collect();
-
     println!("  Generating {} sized profiles:", pairs.len());
     for (name, count) in &pairs {
         println!("    {} — {} base vectors", name, count);
+    }
+
+    // Record the named strata — one per generator spec, carrying the
+    // series of profile names it produced — and mirror the expansion
+    // record in the profile group so the profiles are marked as
+    // generated (compact saves re-generate them from the specs).
+    if force {
+        config.strata = Default::default();
+        config.profiles.series_by_spec.clear();
+        config.profiles.raw_sized.clear();
+        config.profiles.deferred_sized.clear();
+    }
+    for (spec, entry_pairs) in &spec_series {
+        let series: Vec<String> = entry_pairs.iter().map(|(n, _)| n.clone()).collect();
+        config.strata.insert_spec(spec, series.clone());
+        config.profiles.series_by_spec.insert(spec.clone(), series);
+        if !config.profiles.raw_sized.contains(spec) {
+            config.profiles.raw_sized.push(spec.clone());
+        }
     }
 
     // Build sized profile views from the default profile
@@ -333,17 +354,29 @@ fn detect_self_search(config: &DatasetConfig) -> bool {
     false
 }
 
-/// Parse a spec string into (name, base_count) pairs.
-fn parse_spec_to_pairs(spec: &str) -> Vec<(String, u64)> {
-    let specs: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
-    let mut all_pairs = Vec::new();
-    for entry in specs {
-        if let Ok(pairs) = vectordata::dataset::profile::parse_sized_entry(entry) {
-            all_pairs.extend(pairs);
-        } else {
-            eprintln!("Warning: failed to parse spec '{}'", entry);
+/// Parse a comma-separated spec string into per-spec series:
+/// `(spec, [(profile_name, base_count), …])` in input order. Each spec
+/// is resolved against `max_count`, so implicit upper-bound forms
+/// (`mul:1mi/2`, `fib:1m`, `decade`) work here the same way they do in
+/// deferred pipeline expansion.
+fn parse_spec_series(spec: &str, max_count: u64) -> Vec<(String, Vec<(String, u64)>)> {
+    let mut result = Vec::new();
+    for entry in spec.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        match vectordata::dataset::profile::parse_sized_entry_bounded(entry, max_count) {
+            Ok(pairs) => result.push((entry.to_string(), pairs)),
+            Err(e) => eprintln!("Warning: failed to parse spec '{}': {}", entry, e),
         }
     }
+    result
+}
+
+/// Parse a spec string into merged, size-sorted (name, base_count)
+/// pairs — the flattened union of every spec's series.
+fn parse_spec_to_pairs(spec: &str, max_count: u64) -> Vec<(String, u64)> {
+    let mut all_pairs: Vec<(String, u64)> = parse_spec_series(spec, max_count)
+        .into_iter()
+        .flat_map(|(_, pairs)| pairs)
+        .collect();
     all_pairs.sort_by_key(|(_, count)| *count);
     all_pairs.dedup_by(|a, b| a.0 == b.0);
     all_pairs
@@ -408,13 +441,12 @@ pub fn interactive_spec_wizard(path: &Path) -> String {
     }
 
     // Preview standard spec
-    let std_pairs = parse_spec_to_pairs(&std_spec);
-    let std_filtered: Vec<_> = std_pairs.iter().filter(|(_, c)| *c <= effective_max).collect();
+    let std_pairs = parse_spec_to_pairs(&std_spec, effective_max);
     println!();
     println!("  Standard spec: {}", std_spec);
     println!("  ({} profiles: {})",
-        std_filtered.len(),
-        std_filtered.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "));
+        std_pairs.len(),
+        std_pairs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "));
 
     println!();
     println!("  Choose a strategy:");
@@ -462,15 +494,14 @@ pub fn interactive_spec_wizard(path: &Path) -> String {
     };
 
     // Preview
-    let pairs = parse_spec_to_pairs(&spec);
-    let filtered: Vec<_> = pairs.iter().filter(|(_, c)| *c <= effective_max).collect();
+    let pairs = parse_spec_to_pairs(&spec, effective_max);
     println!();
-    println!("  Preview: {} profiles from spec '{}'", filtered.len(), spec);
-    for (name, count) in &filtered {
+    println!("  Preview: {} profiles from spec '{}'", pairs.len(), spec);
+    for (name, count) in &pairs {
         println!("    {:<10} {:>12} vectors", name, count);
     }
 
-    if filtered.is_empty() {
+    if pairs.is_empty() {
         eprintln!("  Warning: spec produced no valid profiles within the size limit.");
     }
 

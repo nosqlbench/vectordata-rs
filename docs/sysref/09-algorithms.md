@@ -218,7 +218,92 @@ O(1) memory per dimension. Thread-safe via per-dimension locking.
 
 ---
 
-## 9.4 References
+## 9.4 SPLAT: I/O-Sympathetic Ordinal Rewrite
+
+**SPLAT** — **S**egment, **P**lan, **L**inearize, **A**ssemble,
+**T**ransfer — is the external-memory permutation pattern behind
+index-based `transform extract`. It applies a reorder map (shuffle,
+dedup ordinals, stratification) to datasets larger than RAM using
+only sequential disk I/O, confining all random access to memory.
+
+Step-by-step guides: [SPLAT guide](./splat/README.md).
+Implementations: `sorted_index_extract_{fvec,mvec,slab}` in
+`veks-pipeline/src/pipeline/commands/gen_extract.rs`.
+
+### Problem
+
+A reorder map assigns `output[i] = source[map[i]]`. Applying it
+naively costs N random reads (walking the output in order) or N
+random writes (walking the source in order). At multi-TB scale with
+~KB records, random access runs orders of magnitude below sequential
+throughput, and mmap-based access faults the entire touched set into
+RSS.
+
+### Pass structure
+
+```
+ output ordinal space                      reorder map (ivec)
+ ┌──────────┬──────────┬──────────┐        out[i] = src[map[i]]
+ │ segment 0│ segment 1│ segment 2│
+ └──────────┴──────────┴──────────┘
+      pass k rewrites segment k:
+
+  P  plan        scan map window for segment k
+                 → [(src 902117, out 2), (src 3, out 0), (src 71442, out 1)]
+  L  linearize   sort plan by source position
+                 → [(src 3, out 0), (src 71442, out 1), (src 902117, out 2)]
+  A  assemble    read source ascending; scatter records into RAM buffer
+                     src 3      ──► buf[out 0]
+                     src 71442  ──► buf[out 1]    random writes stay in RAM
+                     src 902117 ──► buf[out 2]
+  T  transfer    write buffer contiguously at segment k's file offset
+```
+
+### Steps
+
+| | Step | Action |
+|---|------|--------|
+| **S** | Segment | Divide the output ordinal space into contiguous segments sized by the governor memory budget (always ≥ 2 segments, so the buffer stays at or below half the output size) |
+| **P** | Plan | Scan the reorder-map window whose output positions fall in the active segment; emit bounds-checked `(source_idx, local_out_pos)` pairs |
+| **L** | Linearize | Sort the plan by source index (parallel 256-way bucket sort) so the pass reads ascend monotonically through the file |
+| **A** | Assemble | Walk the sorted plan reading source records in file order; place each at its transpose position in the segment buffer (positions are disjoint, so scatter is lock-free parallel) |
+| **T** | Transfer | Write the assembled buffer contiguously at the segment's output offset; sync; advance to the next segment |
+
+Segmenting happens once; **P–L–A–T** repeat per pass.
+
+### Cost model
+
+```
+P        = ceil(N_out × record_bytes / M)      M = memory budget
+map I/O  = P sequential window scans (4-byte ints; cheap)
+src I/O  = each mapped record read exactly once, ascending per pass
+out I/O  = each output byte written exactly once, contiguous per pass
+RAM      = one segment buffer (≤ M) + the read plan
+```
+
+Disk never sees random access: the permutation's scatter is absorbed
+by the segment buffer. This is the distribution strategy of
+external-memory permutation [6], specialized to a permutation that is
+fully known up front (the reorder map is materialized on disk).
+
+### Variants
+
+All three implementations share the pass structure and differ in
+per-record handling:
+
+| Variant | Records | Notable behavior |
+|---------|---------|------------------|
+| `sorted_index_extract_fvec` | f32, fixed stride | `pread` instead of mmap slices (bounds RSS); already-sorted plans skip **L** and stream chunk-wise; near-zero vectors skipped with output compaction and final truncate; L2 normalize with skip-detection sampling |
+| `sorted_index_extract_mvec` | f16, fixed stride | Reference implementation of the pattern; segment buffer allocated once and reused across passes; optional L2 normalize |
+| `sorted_index_extract_slab` | variable length | Segments sized from a sampled mean record size; assemble collects `(out_pos, bytes)` pairs and re-sorts by output position before writing; per-segment cache files enable resume |
+
+`ivec-extract` deliberately does not use SPLAT: its records are
+single integers, so direct indexed lookup through the page cache
+wins over pass orchestration.
+
+---
+
+## 9.5 References
 
 1. N. J. Higham, *Accuracy and Stability of Numerical Algorithms*,
    2nd ed., SIAM, 2002
@@ -234,3 +319,6 @@ O(1) memory per dimension. Thread-safe via per-dimension locking.
 
 5. K. Pearson, "Contributions to the Mathematical Theory of Evolution,"
    *Phil. Trans. Royal Soc.*, 1895
+
+6. A. Aggarwal and J. S. Vitter, "The Input/Output Complexity of
+   Sorting and Related Problems," *Commun. ACM*, 31(9), 1988

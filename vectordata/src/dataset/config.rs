@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::facet::StandardFacet;
 use super::pipeline::PipelineConfig;
 use super::profile::{DSProfile, DSProfileGroup};
+use super::strata::Strata;
 
 /// Dataset-level attributes — metadata describing the dataset itself.
 ///
@@ -123,19 +124,25 @@ pub struct DatasetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream: Option<PipelineConfig>,
 
-    /// Root-level sized-profile generator specs. Canonical location
-    /// for the `mul:/fib:/linear:/N..M/K`-style expressions the
-    /// pipeline uses to mint sized profiles; replaces the legacy
-    /// `profiles.sized:` placement (which collided with the profile
-    /// mapping and forced every consumer of `profiles:` to special-
-    /// case the `sized` key).
+    /// Root-level named strata — the sized-profile generators.
+    /// Canonical location for the `mul:/fib:/linear:/N..M/K`-style
+    /// expressions the pipeline uses to mint sized profiles; replaces
+    /// the legacy `profiles.sized:` placement (which collided with the
+    /// profile mapping and forced every consumer of `profiles:` to
+    /// special-case the `sized` key).
+    ///
+    /// Each stratum is keyed by name and carries its generator `spec`
+    /// plus the `series` of profile names the spec produced. Authors
+    /// may write the compact list form (`strata: ["mul:1mi/2", ...]`)
+    /// — names are synthesized from the generator strategy — but every
+    /// save renders the structured form.
     ///
     /// Preserved across save/load cycles so sized profiles can be
     /// re-generated idempotently from the same dataset.yaml even
     /// after the concrete per-profile entries have been materialised
     /// alongside them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub strata: Vec<String>,
+    #[serde(default, skip_serializing_if = "Strata::is_empty")]
+    pub strata: Strata,
 
     /// Named profiles, each mapping view names to data sources.
     #[serde(default)]
@@ -160,22 +167,33 @@ impl DatasetConfig {
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         let mut config: Self = serde_yaml::from_str(&content)
             .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
-        // Unify root-level `strata:` with the legacy `profiles.sized:`
-        // location (which is still accepted by the deserializer and
-        // surfaces through `DSProfileGroup.raw_sized` +
-        // `deferred_sized`). The modern canonical location is root-
-        // level; if both exist, root-level wins. If only the legacy
-        // location populated `raw_sized`, promote it so downstream
-        // save() emits the modern shape.
-        if config.strata.is_empty() && !config.profiles.raw_sized.is_empty() {
-            config.strata = config.profiles.raw_sized.clone();
-        } else if !config.strata.is_empty() && config.profiles.raw_sized.is_empty() {
+        config.unify_strata();
+        Ok(config)
+    }
+
+    /// Unify root-level `strata:` with the legacy `profiles.sized:`
+    /// location (which is still accepted by the deserializer and
+    /// surfaces through `DSProfileGroup.raw_sized` + `deferred_sized`).
+    /// The modern canonical location is root-level; if both exist,
+    /// root-level wins. If only the legacy location populated
+    /// `raw_sized`, promote it — synthesizing stratum names — so
+    /// downstream save() emits the modern shape.
+    ///
+    /// Must be called after any direct deserialization of a
+    /// `DatasetConfig` (`load()` does this automatically).
+    pub fn unify_strata(&mut self) {
+        if self.strata.is_empty() && !self.profiles.raw_sized.is_empty() {
+            self.strata = Strata::from_specs(self.profiles.raw_sized.iter().cloned());
+        } else if !self.strata.is_empty() && self.profiles.raw_sized.is_empty() {
             // Root-level `strata:` — propagate into the profile group
             // so `expand_deferred_sized` finds something to expand.
-            config.profiles.raw_sized = config.strata.clone();
-            config.profiles.deferred_sized = config.strata.clone();
+            let specs: Vec<String> = self.strata.specs().map(str::to_string).collect();
+            self.profiles.raw_sized = specs.clone();
+            self.profiles.deferred_sized = specs;
         }
-        Ok(config)
+        // Legacy inline `profiles.sized:` entries with explicit bounds
+        // expand at deserialize time — pick up their series now.
+        self.strata.sync_series(&self.profiles.series_by_spec);
     }
 
     /// Load a dataset config and resolve deferred sized profiles from
@@ -210,26 +228,47 @@ impl DatasetConfig {
                         }
                     }
 
-            // Fall through several count variables in priority order.
-            // Different stages of the pipeline produce different ones:
-            //   base_count        → count-base step (post extract-base)
-            //   clean_count       → prepare-vectors (post dedup/zero)
-            //   vector_count      → count-vectors (very early)
-            //   source_base_count → source counter alias
-            // For sized-profile expansion we just need *some* positive
-            // upper bound on the base size. Picking the first
-            // available means expansion works even on a freshly
-            // cleaned workspace where only the early counters have
-            // been written.
-            let base_count: u64 = ["base_count", "clean_count", "vector_count", "source_base_count"]
-                .iter()
-                .find_map(|k| vars.get(*k).and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0))
-                .unwrap_or(0);
-            if base_count > 0 {
-                config.profiles.expand_deferred_sized(&vars, base_count);
-            }
+            config.expand_sized_profiles(&vars);
         }
         Ok(config)
+    }
+
+    /// Expand deferred sized profiles from `vars` and refresh each
+    /// stratum's `series` with the profile names its spec generated.
+    ///
+    /// This is the single entry point every expansion site must use
+    /// (loader, finalize pass, dataset.json generation) — calling
+    /// `profiles.expand_deferred_sized` directly would leave the
+    /// strata series stale. Returns the number of profiles added.
+    pub fn expand_sized_profiles(&mut self, vars: &IndexMap<String, String>) -> usize {
+        let mut added = 0;
+        if self.profiles.has_deferred() {
+            let base_count = Self::base_count_from_vars(vars);
+            if base_count > 0 {
+                added = self.profiles.expand_deferred_sized(vars, base_count);
+            }
+        }
+        self.strata.sync_series(&self.profiles.series_by_spec);
+        added
+    }
+
+    /// Pick the effective base count from pipeline variables, falling
+    /// through several count variables in priority order. Different
+    /// stages of the pipeline produce different ones:
+    ///   base_count        → count-base step (post extract-base)
+    ///   clean_count       → prepare-vectors (post dedup/zero)
+    ///   vector_count      → count-vectors (very early)
+    ///   source_base_count → source counter alias
+    /// For sized-profile expansion we just need *some* positive upper
+    /// bound on the base size. Picking the first available means
+    /// expansion works even on a freshly cleaned workspace where only
+    /// the early counters have been written. Returns 0 when no counter
+    /// is available.
+    pub fn base_count_from_vars(vars: &IndexMap<String, String>) -> u64 {
+        ["base_count", "clean_count", "vector_count", "source_base_count"]
+            .iter()
+            .find_map(|k| vars.get(*k).and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0))
+            .unwrap_or(0)
     }
 
     /// Returns the default profile, if one exists.
@@ -441,7 +480,7 @@ impl DatasetConfig {
             }
         }
 
-        // strata — root-level sized-profile generator specs.
+        // strata — root-level named sized-profile generators.
         // Canonical location, replaces the legacy `profiles.sized:`
         // slot. Always emitted (in both compact and expanded modes)
         // so a dataset can be re-rendered with `veks run` on a fresh
@@ -449,16 +488,38 @@ impl DatasetConfig {
         // been materialised. `profiles:` now contains only real
         // profiles — consumers never have to special-case a
         // `sized` key inside the profile map.
+        //
+        // Always rendered in the structured form — one named stratum
+        // per generator, carrying its `spec` and (once expansion has
+        // run) the `series` of profile names it produced. The compact
+        // `strata: [...]` list is an accepted *input* shorthand only.
         let strata = if !self.strata.is_empty() {
             self.strata.clone()
         } else {
-            self.profiles.raw_sized.clone()
+            Strata::from_specs(self.profiles.raw_sized.iter().cloned())
         };
         if !strata.is_empty() {
-            let entries: Vec<String> = strata.iter()
-                .map(|s| format!("\"{}\"", s))
-                .collect();
-            out.push_str(&format!("\nstrata: [{}]\n", entries.join(", ")));
+            out.push_str("\nstrata:\n");
+            for (name, stratum) in strata.iter() {
+                out.push_str(&format!("  {}:\n", name));
+                out.push_str(&format!("    spec: \"{}\"\n", stratum.spec));
+                // Prefer the stratum's own series; fall back to the
+                // profile group's expansion record for configs that
+                // were expanded without a strata sync.
+                let series = if !stratum.series.is_empty() {
+                    &stratum.series
+                } else if let Some(s) = self.profiles.series_by_spec.get(&stratum.spec) {
+                    s
+                } else {
+                    continue;
+                };
+                if !series.is_empty() {
+                    let names: Vec<String> = series.iter()
+                        .map(|n| format!("\"{}\"", n))
+                        .collect();
+                    out.push_str(&format!("    series: [{}]\n", names.join(", ")));
+                }
+            }
         }
 
         // profiles
@@ -491,9 +552,7 @@ impl DatasetConfig {
             let default_views = self.profiles.profiles.get("default")
                 .map(|p| &p.views);
             for name in save_names {
-                if !expand_sized
-                    && self.profiles.sized_profile_names.contains(&name.to_string())
-                {
+                if !expand_sized && self.profiles.is_generated_profile(name) {
                     continue;
                 }
                 let profile = self.profiles.profiles.get(name).unwrap();
@@ -759,6 +818,154 @@ profiles:
             "variables.yaml should override dataset.yaml; got: {:?}",
             names,
         );
+    }
+
+    /// Compact list input (`strata: ["spec", ...]`) must load with
+    /// synthesized stratum names, expand into per-stratum series, and
+    /// render (publish form) as the structured map — never the list.
+    #[test]
+    fn test_strata_list_form_expands_and_renders_structured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dataset_yaml = r#"
+name: strata-test
+strata: ["mul:1m/2", "fib:1m"]
+profiles:
+  default:
+    maxk: 100
+    base_vectors: base.fvec
+"#;
+        std::fs::write(tmp.path().join("dataset.yaml"), dataset_yaml).unwrap();
+        std::fs::write(tmp.path().join("variables.yaml"), "base_count: '10000000'\n").unwrap();
+
+        let config = DatasetConfig::load_and_resolve(&tmp.path().join("dataset.yaml"))
+            .expect("load_and_resolve");
+
+        // Names synthesized from the generator strategy; series filled
+        // from expansion (base_count 10m).
+        let mul = config.strata.get("mul").expect("mul stratum");
+        assert_eq!(mul.spec, "mul:1m/2");
+        assert_eq!(mul.series, vec!["1m", "2m", "4m", "8m"]);
+        let fib = config.strata.get("fib").expect("fib stratum");
+        assert_eq!(fib.series, vec!["1m", "2m", "3m", "5m", "8m"]);
+
+        // 1m/2m/8m belong to both strata — valid overlap, one profile each.
+        for name in ["1m", "2m", "3m", "4m", "5m", "8m"] {
+            assert!(config.profile(name).is_some(), "missing profile {}", name);
+        }
+
+        // The publish render is the structured form.
+        let yaml = config.to_expanded_yaml_string(&tmp.path().join("dataset.yaml"))
+            .expect("render");
+        assert!(!yaml.contains("strata: ["),
+            "compact list form must not be rendered:\n{}", yaml);
+        assert!(yaml.contains(
+            "  mul:\n    spec: \"mul:1m/2\"\n    series: [\"1m\", \"2m\", \"4m\", \"8m\"]\n"),
+            "structured mul stratum expected in:\n{}", yaml);
+        assert!(yaml.contains(
+            "  fib:\n    spec: \"fib:1m\"\n    series: [\"1m\", \"2m\", \"3m\", \"5m\", \"8m\"]\n"),
+            "structured fib stratum expected in:\n{}", yaml);
+
+        // The published artifact reloads standalone: named strata with
+        // series, plus the concrete profile entries.
+        let pubdir = tmp.path().join("pub");
+        std::fs::create_dir(&pubdir).unwrap();
+        std::fs::write(pubdir.join("dataset.yaml"), &yaml).unwrap();
+        let reloaded = DatasetConfig::load(&pubdir.join("dataset.yaml")).expect("reload");
+        assert_eq!(reloaded.strata.get("mul").unwrap().series,
+            vec!["1m", "2m", "4m", "8m"]);
+        assert!(reloaded.profile("8m").is_some(), "concrete profiles preserved");
+    }
+
+    /// The structured map form is accepted as input: user-chosen
+    /// stratum names are preserved and series are refreshed from
+    /// expansion.
+    #[test]
+    fn test_strata_structured_input_keeps_names() {
+        let yaml = r#"
+name: structured
+strata:
+  binomial:
+    spec: "mul:1m/2"
+  fixed:
+    spec: "500k"
+profiles:
+  default:
+    base_vectors: base.fvec
+"#;
+        let mut config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        config.unify_strata();
+        assert_eq!(config.strata.get("binomial").unwrap().spec, "mul:1m/2");
+
+        let mut vars: IndexMap<String, String> = IndexMap::new();
+        vars.insert("base_count".into(), "4000000".into());
+        let added = config.expand_sized_profiles(&vars);
+        assert!(added > 0, "expansion should add profiles");
+
+        // mul from 1m doubling under 4m → 1m, 2m; the fixed 500k stands alone.
+        assert_eq!(config.strata.get("binomial").unwrap().series, vec!["1m", "2m"]);
+        assert_eq!(config.strata.get("fixed").unwrap().series, vec!["500k"]);
+    }
+
+    /// Two generators emitting the same profile name — a profile may
+    /// belong to multiple strata; this must not be a conflict.
+    #[test]
+    fn test_strata_overlapping_series_are_valid() {
+        let yaml = r#"
+name: overlap
+profiles:
+  default:
+    base_vectors: base.fvec
+  sized: ["fib:1m..8m", "mul:1m..8m/2"]
+"#;
+        let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        // Union of both series, one profile per name.
+        for name in ["1m", "2m", "3m", "4m", "5m", "8m"] {
+            assert!(config.profile(name).is_some(), "missing profile {}", name);
+        }
+        // Both series keep the shared members.
+        let fib = config.profiles.series_by_spec.get("fib:1m..8m").unwrap();
+        let mul = config.profiles.series_by_spec.get("mul:1m..8m/2").unwrap();
+        assert_eq!(fib, &vec!["1m", "2m", "3m", "5m", "8m"]);
+        assert_eq!(mul, &vec!["1m", "2m", "4m", "8m"]);
+    }
+
+    /// A generated name colliding with an explicitly defined profile is
+    /// still an error — only overlap between generators is valid.
+    #[test]
+    fn test_sized_conflict_with_explicit_profile_still_errors() {
+        let yaml = r#"
+name: conflict
+profiles:
+  default:
+    base_vectors: base.fvec
+  1m:
+    base_count: 1000000
+  sized: ["1m"]
+"#;
+        let err = serde_yaml::from_str::<DatasetConfig>(yaml).unwrap_err();
+        assert!(err.to_string().contains("conflicts"),
+            "expected conflict error, got: {}", err);
+    }
+
+    /// dataset.json carries the same structured strata as the YAML.
+    #[test]
+    fn test_strata_json_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dataset_yaml = r#"
+name: json-test
+strata: ["mul:1m/2"]
+profiles:
+  default:
+    base_vectors: base.fvec
+"#;
+        std::fs::write(tmp.path().join("dataset.yaml"), dataset_yaml).unwrap();
+        std::fs::write(tmp.path().join("variables.yaml"), "base_count: '4000000'\n").unwrap();
+        let config = DatasetConfig::load_and_resolve(&tmp.path().join("dataset.yaml"))
+            .expect("load_and_resolve");
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""strata":{"mul":{"spec":"mul:1m/2","series":["1m","2m"]}}"#),
+            "structured strata expected in JSON:\n{}", json);
     }
 
     #[test]

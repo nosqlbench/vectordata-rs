@@ -259,12 +259,14 @@ Zero vectors (all-component-zero) are detected and removed from the ordinal set 
 
 `update_dataset_attributes` is the *single* writer of `dataset.yaml` after pipeline runs — earlier commands return their changes via the `DatasetConfig` model rather than touching the file directly. This avoids the multi-writer races that were causing "fixes don't stick" issues where `generate-dataset-json` recorded the file as an output and then `update_dataset_attributes` overwrote it with different content.
 
-Sized profiles live under the root-level `strata:` block as generator strings (`decade`, `mul:1m..16m/2`, `fib:1m`, etc.); see §1.7 for the full list of strategies. Both the unexpanded `strata:` and the resulting per-size profile entries are persisted, so consumers that don't run the loader still see the concrete profile list.
+Sized profiles live under the root-level `strata:` block as named generators; see §1.7 for the full list of strategies. Each stratum is keyed by name and carries its generator `spec` plus the `series` of profile names the spec produced. Authors may write the compact list shorthand (`strata: ["mul:1m..16m/2"]`) — stratum names are synthesized from the generator strategy — but every save renders the structured form. A profile may belong to multiple strata (overlapping series are valid). Both the strata definitions and the resulting per-size profile entries are persisted, so consumers that don't run the loader still see the concrete profile list.
 
 ```yaml
-# Strata generators at the root, expanded per-size profiles under profiles:
+# Named strata generators at the root, expanded per-size profiles under profiles:
 strata:
-  - "mul:1m..16m/2"
+  mul:
+    spec: "mul:1m..16m/2"
+    series: ["1m", "2m", "4m", "8m", "16m"]
 profiles:
   default:
     maxk: 100

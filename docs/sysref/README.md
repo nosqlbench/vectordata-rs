@@ -92,6 +92,8 @@ Detailed specifications for statistical and numerical algorithms.
 - Normalization analysis (Higham bounds, precision-aware thresholds)
 - Statistical vector generation (Virtdata: deterministic inverse CDF)
 - Statistical model extraction (Vshapes: Pearson classification, EM clustering)
+- SPLAT ordinal rewrite (I/O-sympathetic external-memory permutation;
+  step guides in [splat/](./splat/README.md))
 - Shared numerical utilities (log gamma, incomplete beta/gamma)
 
 ### [10. ANode Codec](./10-anode-codec.md)

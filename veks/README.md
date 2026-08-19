@@ -85,7 +85,10 @@ veks cache-compress                  # gzip eligible cache artifacts
 ```
 
 Sized profiles live under the root-level `strata:` block in
-`dataset.yaml`. Available generator strategies:
+`dataset.yaml` — named strata, each carrying its generator `spec` and
+the `series` of profile names it produced (a compact
+`strata: ["mul:1mi/2", ...]` list is accepted as authoring shorthand;
+saves always render the named form). Available generator strategies:
 
 | Strategy        | Effect |
 |-----------------|--------|

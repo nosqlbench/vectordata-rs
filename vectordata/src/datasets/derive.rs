@@ -1079,15 +1079,10 @@ fn load_rich_config(group_path: &str) -> Result<RichDatasetConfig, String> {
     };
     let mut config: RichDatasetConfig = serde_yaml::from_str(&yaml)
         .map_err(|e| format!("parsing dataset.yaml: {e}"))?;
-    // Mirror DatasetConfig::load's strata-vs-profiles.raw_sized
-    // unification so downstream window resolution works the same
-    // way it does on a `load()`ed config.
-    if config.strata.is_empty() && !config.profiles.raw_sized.is_empty() {
-        config.strata = config.profiles.raw_sized.clone();
-    } else if !config.strata.is_empty() && config.profiles.raw_sized.is_empty() {
-        config.profiles.raw_sized = config.strata.clone();
-        config.profiles.deferred_sized = config.strata.clone();
-    }
+    // Same strata-vs-profiles.raw_sized unification `DatasetConfig::load`
+    // applies, so downstream window resolution works the same way it
+    // does on a `load()`ed config.
+    config.unify_strata();
     Ok(config)
 }
 

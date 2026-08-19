@@ -10,6 +10,7 @@
 //! ## Sub-modules
 //!
 //! - **config** — Top-level `DatasetConfig` and `DatasetAttributes`.
+//! - **strata** — `Strata`, `Stratum` (named sized-profile generators).
 //! - **profile** — `DSProfile`, `DSProfileGroup`, `DSView` with inheritance.
 //! - **facet** — `StandardFacet` enum (canonical facet names and aliases).
 //! - **source** — `DSSource`, `DSInterval`, `DSWindow` (path + range parsing).
@@ -25,6 +26,7 @@ pub mod layout;
 pub mod pipeline;
 pub mod profile;
 pub mod source;
+pub mod strata;
 
 pub use catalog::{CatalogEntry, CatalogLayout, find_catalog, load_catalog};
 pub use config::{DatasetAttributes, DatasetConfig};
@@ -33,3 +35,4 @@ pub use facet::StandardFacet;
 pub use pipeline::{OnPartial, PipelineConfig, StepDef};
 pub use profile::{DSProfile, DSProfileGroup, DSView};
 pub use source::{DSInterval, DSSource, DSWindow};
+pub use strata::{Strata, Stratum};

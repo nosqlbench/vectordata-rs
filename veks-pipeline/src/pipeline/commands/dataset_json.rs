@@ -108,16 +108,10 @@ impl CommandOp for DatasetJsonOp {
                     vars.insert(k, v);
                 }
             }
-            let base_count: u64 = ["base_count", "clean_count", "vector_count", "source_base_count"]
-                .iter()
-                .find_map(|k| vars.get(*k).and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0))
-                .unwrap_or(0);
-            if base_count > 0 {
-                let added = config.profiles.expand_deferred_sized(&vars, base_count);
-                if added > 0 {
-                    ctx.ui.log(&format!(
-                        "  expanded {} sized profile(s) for publish", added));
-                }
+            let added = config.expand_sized_profiles(&vars);
+            if added > 0 {
+                ctx.ui.log(&format!(
+                    "  expanded {} sized profile(s) for publish", added));
             }
         }
 
