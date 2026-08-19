@@ -10,6 +10,13 @@
 //! The `log` crate is also configured so that `log::info!()` etc. from
 //! library code reach the file, but `UiHandle::log()` does NOT depend on
 //! `log::set_logger` succeeding — the file write is direct.
+//!
+//! The global level defaults to `Info` and is raised (or lowered) with the
+//! `VEKS_LOG` environment variable (`error`/`warn`/`info`/`debug`/`trace`).
+//! Capping at the `log` max-level gates chatty dependencies at the callsite
+//! (their `trace!`/`debug!` macros short-circuit), which matters: the
+//! `tokenizers` crate traces per *character*, and an unfiltered run once
+//! wrote a 9 GB, 70M-line runlog.jsonl during a single embed step.
 
 use std::io::Write;
 use std::path::Path;
@@ -104,9 +111,23 @@ pub fn install_logger(sink: Arc<dyn UiSink>, log_path: Option<&Path>, jsonl_path
             eprintln!("WARNING: failed to install log crate logger: {e}");
         }
     }
-    log::set_max_level(log::LevelFilter::Trace);
+    log::set_max_level(parse_level_filter(std::env::var("VEKS_LOG").ok().as_deref()));
 
     writers
+}
+
+/// Resolve the global log level from a `VEKS_LOG` environment value (pure;
+/// unit-testable without process-env mutation). Default: `Info` — Debug and
+/// Trace are diagnostics, opted into per run, never recorded by default.
+pub fn parse_level_filter(value: Option<&str>) -> log::LevelFilter {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("off") => log::LevelFilter::Off,
+        Some(v) if v.eq_ignore_ascii_case("error") => log::LevelFilter::Error,
+        Some(v) if v.eq_ignore_ascii_case("warn") => log::LevelFilter::Warn,
+        Some(v) if v.eq_ignore_ascii_case("debug") => log::LevelFilter::Debug,
+        Some(v) if v.eq_ignore_ascii_case("trace") => log::LevelFilter::Trace,
+        _ => log::LevelFilter::Info,
+    }
 }
 
 /// Write a message to both log files (plain text + JSONL) with timestamp.
@@ -143,15 +164,18 @@ struct PipelineLogger {
 }
 
 impl log::Log for PipelineLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        true
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
         let ts = chrono::Local::now();
         let message = format!("{}", record.args());
 
-        // Write all levels to the persistent plain text log file.
+        // Write enabled levels to the persistent plain text log file.
         if let Some(ref fw) = self.file_writer
             && let Ok(mut w) = fw.lock() {
                 let _ = writeln!(w, "[{}] {:5} {} — {}",
@@ -163,7 +187,7 @@ impl log::Log for PipelineLogger {
                 let _ = w.flush();
             }
 
-        // Write all levels to the JSONL log file.
+        // Write enabled levels to the JSONL log file.
         if let Some(ref jw) = self.jsonl_writer
             && let Ok(mut w) = jw.lock() {
                 let escaped = message.replace('\\', "\\\\")
@@ -192,5 +216,24 @@ impl log::Log for PipelineLogger {
             && let Ok(mut w) = fw.lock() { let _ = w.flush(); }
         if let Some(ref jw) = self.jsonl_writer
             && let Ok(mut w) = jw.lock() { let _ = w.flush(); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_filter_defaults_to_info_and_parses_overrides() {
+        use log::LevelFilter as L;
+        assert_eq!(parse_level_filter(None), L::Info);
+        assert_eq!(parse_level_filter(Some("")), L::Info);
+        assert_eq!(parse_level_filter(Some("garbage")), L::Info);
+        assert_eq!(parse_level_filter(Some("info")), L::Info);
+        assert_eq!(parse_level_filter(Some("TRACE")), L::Trace);
+        assert_eq!(parse_level_filter(Some(" debug ")), L::Debug);
+        assert_eq!(parse_level_filter(Some("warn")), L::Warn);
+        assert_eq!(parse_level_filter(Some("Error")), L::Error);
+        assert_eq!(parse_level_filter(Some("off")), L::Off);
     }
 }
