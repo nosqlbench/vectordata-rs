@@ -216,65 +216,97 @@ bf16 on CUDA.
         }
         load.finish();
 
-        // ── Tokenize (EOS-terminated, capped), plan length-sorted batches ─
-        // encode_batch fans out across cores via the tokenizers crate's
-        // internal rayon pool; the per-text loop it replaces was a
-        // single-threaded serial stretch ahead of every run.
-        let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let rows: Vec<Vec<u32>> = match tokenizer.encode_batch(inputs, false) {
-            Ok(encs) => encs
-                .into_iter()
-                .map(|enc| prepare_ids(enc.get_ids().to_vec(), eos, max_length))
-                .collect(),
-            Err(e) => return error_result(format!("tokenize: {}", e), start),
-        };
-        let plan = batch_plan(&rows, batch_size);
-
-        // ── Embed: one worker thread per device, batches round-robin ─────
-        // The length-sorted plan hands out near-equal work per worker; the
-        // main thread scatters results and drives progress. On the first
-        // worker error the receiver stops, pending sends fail, and every
-        // worker unwinds before the scope joins.
-        let pb = ctx.ui.bar_with_unit(rows.len() as u64, "embed", "psg");
+        // ── Embed: tokenizer producer + one worker thread per device ─────
+        // Tokenization (EOS-terminated, capped) runs on a producer thread in
+        // chunks, each chunk length-sorted into batches (chunk-local sorting
+        // keeps pad waste at the ~1% the global sort measured), so the GPUs
+        // start embedding while later chunks still tokenize — at production
+        // step sizes the up-front tokenize stretch was ~9% of the run with
+        // idle GPUs. encode_batch fans out across cores via the tokenizers
+        // crate's internal rayon pool. Workers pull batches from a shared
+        // channel; the main thread scatters results by absolute row index
+        // and drives progress. On the first error the receiver stops,
+        // pending sends fail, and every thread unwinds before the scope
+        // joins (the producer also checks an abort flag between chunks).
+        const TOKENIZE_CHUNK: usize = 65_536;
+        type Batch = (Vec<usize>, Vec<Vec<u32>>);
+        let n_texts = texts.len();
+        let pb = ctx.ui.bar_with_unit(n_texts as u64, "embed", "psg");
         let hidden = config.hidden_size;
-        let mut vectors: Vec<Vec<f32>> = vec![Vec::new(); rows.len()];
+        let mut vectors: Vec<Vec<f32>> = vec![Vec::new(); n_texts];
         let mut done = 0u64;
-        let n_workers = models.len();
         let mut first_err: Option<String> = None;
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        let (btx, brx) = std::sync::mpsc::channel::<Result<Batch, String>>();
+        let brx = std::sync::Mutex::new(brx);
+        let (rtx, rrx) =
+            std::sync::mpsc::channel::<Result<(Vec<usize>, Vec<Vec<f32>>), String>>();
         std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::channel::<Result<(&[usize], Vec<Vec<f32>>), String>>();
-            for (w, model) in models.iter().enumerate() {
-                let tx = tx.clone();
-                let plan = &plan;
-                let rows = &rows;
-                scope.spawn(move || {
-                    for batch in plan.iter().skip(w).step_by(n_workers) {
+            let (tokenizer, texts, abort, brx) = (&tokenizer, &texts, &abort, &brx);
+            scope.spawn(move || {
+                let mut base = 0usize;
+                for chunk in texts.chunks(TOKENIZE_CHUNK) {
+                    if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    let inputs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+                    let rows: Vec<Vec<u32>> = match tokenizer.encode_batch(inputs, false) {
+                        Ok(encs) => encs
+                            .into_iter()
+                            .map(|e| prepare_ids(e.get_ids().to_vec(), eos, max_length))
+                            .collect(),
+                        Err(e) => {
+                            let _ = btx.send(Err(format!("tokenize: {}", e)));
+                            return;
+                        }
+                    };
+                    for batch in batch_plan(&rows, batch_size) {
+                        let abs: Vec<usize> = batch.iter().map(|&i| base + i).collect();
                         let batch_rows: Vec<Vec<u32>> =
                             batch.iter().map(|&i| rows[i].clone()).collect();
-                        let msg = model
-                            .embed_batch(&batch_rows)
-                            .map(|v| (batch.as_slice(), v))
-                            .map_err(|e| format!("embed failed: {}", e));
-                        let failed = msg.is_err();
-                        if tx.send(msg).is_err() || failed {
+                        if btx.send(Ok((abs, batch_rows))).is_err() {
                             return;
                         }
                     }
+                    base += chunk.len();
+                }
+            });
+            for model in models.iter() {
+                let rtx = rtx.clone();
+                scope.spawn(move || loop {
+                    let msg = brx.lock().unwrap().recv();
+                    let (idx, batch_rows) = match msg {
+                        Ok(Ok(b)) => b,
+                        Ok(Err(e)) => {
+                            let _ = rtx.send(Err(e));
+                            return;
+                        }
+                        Err(_) => return, // producer done, channel drained
+                    };
+                    let res = model
+                        .embed_batch(&batch_rows)
+                        .map(|v| (idx, v))
+                        .map_err(|e| format!("embed failed: {}", e));
+                    let failed = res.is_err();
+                    if rtx.send(res).is_err() || failed {
+                        return;
+                    }
                 });
             }
-            drop(tx);
-            while let Ok(msg) = rx.recv() {
+            drop(rtx);
+            while let Ok(msg) = rrx.recv() {
                 match msg {
                     Ok((batch, embedded)) => {
-                        for (&idx, vec) in batch.iter().zip(embedded) {
+                        done += batch.len() as u64;
+                        for (idx, vec) in batch.into_iter().zip(embedded) {
                             vectors[idx] = vec;
                         }
-                        done += batch.len() as u64;
                         pb.set_position(done);
                     }
                     Err(e) => {
                         first_err = Some(e);
-                        break; // drops rx; workers' sends fail and they exit
+                        abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break; // drops rrx; senders fail and threads exit
                     }
                 }
             }
