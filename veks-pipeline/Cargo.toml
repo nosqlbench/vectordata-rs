@@ -28,12 +28,19 @@ embed-cuda = [
     "candle-nn/cuda",
     "candle-transformers/cuda",
 ]
+# Fused flash-attention (FA2) attention core for `generate embed` on CUDA:
+# never materializes the (b, h, l, l) score tensor, which the unfused path
+# is bandwidth-bound on. Separate feature because the FA2 kernel build is
+# long and its arch support (sm80+; sm120 verified on the scaleup-pvs GPU
+# node) trails the plain CUDA path.
+embed-cuda-flash = ["embed-cuda", "dep:candle-flash-attn"]
 
 [dependencies]
 byteorder = "1"
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
+candle-flash-attn = { version = "0.9", optional = true }
 hf-hub = { version = "0.4", optional = true }
 tokenizers = { version = "0.21", optional = true }
 faiss = { version = "0.13", features = ["static"], optional = true }

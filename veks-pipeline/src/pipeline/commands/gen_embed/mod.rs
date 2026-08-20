@@ -132,11 +132,11 @@ bf16 on CUDA.
             Ok(_) => return error_result("max-length must be >= 2".into(), start),
             Err(e) => return error_result(e, start),
         };
-        let device = match resolve_device(options.get("device").unwrap_or("auto")) {
+        let devices = match resolve_devices(options.get("device").unwrap_or("auto")) {
             Ok(d) => d,
             Err(e) => return error_result(e, start),
         };
-        let dtype = match resolve_dtype(options.get("dtype").unwrap_or("auto"), &device) {
+        let dtype = match resolve_dtype(options.get("dtype").unwrap_or("auto"), &devices[0]) {
             Ok(d) => d,
             Err(e) => return error_result(e, start),
         };
@@ -149,13 +149,14 @@ bf16 on CUDA.
             return error_result(format!("no rows in {}", source.display()), start);
         }
         ctx.ui.log(&format!(
-            "embedding {} row(s) of {}:{} with {} (rev {}, {:?}/{:?}, batch {}, max-length {})",
+            "embedding {} row(s) of {}:{} with {} (rev {}, {:?}x{}/{:?}, batch {}, max-length {})",
             texts.len(),
             source.display(),
             column,
             model_id,
             revision,
-            device_name(&device),
+            device_name(&devices[0]),
+            devices.len(),
             dtype,
             batch_size,
             max_length
@@ -192,53 +193,94 @@ bf16 on CUDA.
         };
 
         let load = ctx.ui.spinner("load weights");
-        let vb = match unsafe {
-            VarBuilder::from_mmaped_safetensors(&files.weights, dtype, &device)
-        } {
-            Ok(vb) => vb,
-            Err(e) => {
-                load.finish();
-                return error_result(format!("load weights: {}", e), start);
+        let mut models: Vec<qwen3::EmbeddingModel> = Vec::with_capacity(devices.len());
+        for device in &devices {
+            let vb = match unsafe {
+                VarBuilder::from_mmaped_safetensors(&files.weights, dtype, device)
+            } {
+                Ok(vb) => vb,
+                Err(e) => {
+                    load.finish();
+                    return error_result(format!("load weights: {}", e), start);
+                }
+            };
+            match qwen3::EmbeddingModel::new(&config, vb) {
+                Ok(m) => models.push(m),
+                Err(e) => {
+                    load.finish();
+                    return error_result(format!("build model: {}", e), start);
+                }
             }
-        };
-        let model = match qwen3::EmbeddingModel::new(&config, vb) {
-            Ok(m) => m,
-            Err(e) => {
-                load.finish();
-                return error_result(format!("build model: {}", e), start);
-            }
-        };
+        }
         load.finish();
 
         // ── Tokenize (EOS-terminated, capped), plan length-sorted batches ─
-        let mut rows: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
-        for text in &texts {
-            let ids = match tokenizer.encode(text.as_str(), false) {
-                Ok(enc) => enc.get_ids().to_vec(),
-                Err(e) => return error_result(format!("tokenize: {}", e), start),
-            };
-            rows.push(prepare_ids(ids, eos, max_length));
-        }
+        // encode_batch fans out across cores via the tokenizers crate's
+        // internal rayon pool; the per-text loop it replaces was a
+        // single-threaded serial stretch ahead of every run.
+        let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let rows: Vec<Vec<u32>> = match tokenizer.encode_batch(inputs, false) {
+            Ok(encs) => encs
+                .into_iter()
+                .map(|enc| prepare_ids(enc.get_ids().to_vec(), eos, max_length))
+                .collect(),
+            Err(e) => return error_result(format!("tokenize: {}", e), start),
+        };
         let plan = batch_plan(&rows, batch_size);
 
-        // ── Embed ────────────────────────────────────────────────────────
+        // ── Embed: one worker thread per device, batches round-robin ─────
+        // The length-sorted plan hands out near-equal work per worker; the
+        // main thread scatters results and drives progress. On the first
+        // worker error the receiver stops, pending sends fail, and every
+        // worker unwinds before the scope joins.
         let pb = ctx.ui.bar_with_unit(rows.len() as u64, "embed", "psg");
         let hidden = config.hidden_size;
         let mut vectors: Vec<Vec<f32>> = vec![Vec::new(); rows.len()];
         let mut done = 0u64;
-        for batch in &plan {
-            let batch_rows: Vec<Vec<u32>> = batch.iter().map(|&i| rows[i].clone()).collect();
-            let embedded = match model.embed_batch(&batch_rows) {
-                Ok(v) => v,
-                Err(e) => return error_result(format!("embed failed: {}", e), start),
-            };
-            for (&idx, vec) in batch.iter().zip(embedded) {
-                vectors[idx] = vec;
+        let n_workers = models.len();
+        let mut first_err: Option<String> = None;
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(&[usize], Vec<Vec<f32>>), String>>();
+            for (w, model) in models.iter().enumerate() {
+                let tx = tx.clone();
+                let plan = &plan;
+                let rows = &rows;
+                scope.spawn(move || {
+                    for batch in plan.iter().skip(w).step_by(n_workers) {
+                        let batch_rows: Vec<Vec<u32>> =
+                            batch.iter().map(|&i| rows[i].clone()).collect();
+                        let msg = model
+                            .embed_batch(&batch_rows)
+                            .map(|v| (batch.as_slice(), v))
+                            .map_err(|e| format!("embed failed: {}", e));
+                        let failed = msg.is_err();
+                        if tx.send(msg).is_err() || failed {
+                            return;
+                        }
+                    }
+                });
             }
-            done += batch.len() as u64;
-            pb.set_position(done);
-        }
+            drop(tx);
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    Ok((batch, embedded)) => {
+                        for (&idx, vec) in batch.iter().zip(embedded) {
+                            vectors[idx] = vec;
+                        }
+                        done += batch.len() as u64;
+                        pb.set_position(done);
+                    }
+                    Err(e) => {
+                        first_err = Some(e);
+                        break; // drops rx; workers' sends fail and they exit
+                    }
+                }
+            }
+        });
         pb.finish();
+        if let Some(e) = first_err {
+            return error_result(e, start);
+        }
 
         // ── Write npy (atomic) ───────────────────────────────────────────
         if let Err(e) = write_npy_f32(&output, &vectors, hidden) {
@@ -336,7 +378,9 @@ bf16 on CUDA.
                 type_name: "String".to_string(),
                 required: false,
                 default: Some("auto".to_string()),
-                description: "auto, cpu, or cuda[:N] (cuda needs the embed-cuda build feature)"
+                description: "auto, cpu, or cuda[:N]; a comma-separated list (cuda:0,cuda:1) \
+                              shards batches across one worker per entry (cuda needs the \
+                              embed-cuda build feature)"
                     .to_string(),
                 extended_description: None,
                 role: OptionRole::Config,
@@ -357,7 +401,7 @@ bf16 on CUDA.
         let mut map = HashMap::new();
         map.insert(
             "device".to_string(),
-            ValueCompletions::enum_values(&["auto", "cpu", "cuda", "cuda:0"]),
+            ValueCompletions::enum_values(&["auto", "cpu", "cuda", "cuda:0", "cuda:0,cuda:1"]),
         );
         map.insert(
             "dtype".to_string(),
@@ -407,6 +451,25 @@ fn fetch_model_files(model_id: &str, revision: &str) -> Result<ModelFiles, Strin
         tokenizer: get("tokenizer.json")?,
         weights: vec![get("model.safetensors")?],
     })
+}
+
+/// Resolve a device spec into one device per embed worker. A comma
+/// -separated list (`cuda:0,cuda:1`) shards batches round-robin across
+/// workers; repeating a device (`cuda:0,cuda:0`) is allowed and runs two
+/// overlapping workers on one GPU.
+fn resolve_devices(spec: &str) -> Result<Vec<Device>, String> {
+    spec.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(resolve_device)
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|v| {
+            if v.is_empty() {
+                Err(format!("no devices in spec '{}'", spec))
+            } else {
+                Ok(v)
+            }
+        })
 }
 
 fn resolve_device(spec: &str) -> Result<Device, String> {

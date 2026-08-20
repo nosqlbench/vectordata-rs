@@ -10,7 +10,10 @@ into the shared HuggingFace cache and reused.
 Feature-gated: build with `--features embed` (CPU), or `--features
 embed-cuda` for CUDA hosts (A100/H100-class), where `device: cuda` with
 `dtype: bf16` and a large `batch-size` is the intended full-scale
-configuration.
+configuration. `--features embed-cuda-flash` additionally compiles the
+fused flash-attention (FA2) attention core, used automatically on CUDA
+with f16/bf16 — it never materializes the (b, h, l, l) score tensor the
+unfused path is bandwidth-bound on (verified on Blackwell sm120).
 
 ## Usage (pipeline step)
 
@@ -37,7 +40,7 @@ configuration.
 | `--revision` | no | Model revision (default: `main`; pin a commit sha for strict reproducibility) |
 | `--batch-size` | no | Sequences per forward pass (default: 16; raise substantially on GPU) |
 | `--max-length` | no | Token cap per row, including the terminal EOS pooling token (default: 1024) |
-| `--device` | no | `auto` (default), `cpu`, or `cuda[:N]` (needs the `embed-cuda` build feature) |
+| `--device` | no | `auto` (default), `cpu`, or `cuda[:N]`; a comma-separated list (`cuda:0,cuda:1`) shards batches round-robin across one worker per entry — repeating a device runs overlapping workers on one GPU (needs the `embed-cuda` build feature) |
 | `--dtype` | no | `auto` (f32 on cpu, bf16 on cuda), `f32`, `bf16`, `f16` |
 
 ## Notes
@@ -46,6 +49,11 @@ configuration.
   under a causal mask (pads can never influence real tokens), so batches
   mix lengths safely; batches are planned longest-first to minimize
   padding waste, and results scatter back into source row order.
+- Unfused-path limit: keep `batch-size × 16 heads × max-length²` below
+  2^32 — at or past it a candle kernel's u32 indexing overflows and the
+  run dies with `CUDA_ERROR_ILLEGAL_ADDRESS` (e.g. batch 256 at
+  max-length 1024 crashes; batch 128 is the measured edge). The
+  flash-attention path has no such ceiling.
 - Model id, revision, and every byte-affecting knob are step options and
   therefore provenance axes. Sets the `embed_dim` pipeline variable.
 - The full-model smoke test is `#[ignore]`d (downloads ~1.2GB); run it

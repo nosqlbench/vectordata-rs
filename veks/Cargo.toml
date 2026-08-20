@@ -60,6 +60,7 @@ knnutils = ["veks-pipeline/knnutils"]
 faiss = ["knnutils", "veks-pipeline/faiss"]
 embed = ["veks-pipeline/embed"]
 embed-cuda = ["veks-pipeline/embed-cuda"]
+embed-cuda-flash = ["veks-pipeline/embed-cuda-flash"]
 
 [dev-dependencies]
 arrow = "54"
