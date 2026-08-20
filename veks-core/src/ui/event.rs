@@ -50,6 +50,11 @@ pub struct ResourceMetrics {
     pub emergency: bool,
     /// Whether throttle is active.
     pub throttle: bool,
+    /// Per-GPU telemetry, one entry per visible NVIDIA device in index
+    /// order. Empty on hosts with no GPUs — which is the common case, so
+    /// consumers skip their GPU display rather than reserving space for
+    /// it.
+    pub gpus: Vec<crate::gpu::GpuSample>,
 }
 
 /// Opaque handle that identifies a progress indicator within a session.

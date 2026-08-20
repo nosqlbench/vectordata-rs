@@ -13,6 +13,7 @@
 /// where the single definition lives so the push engine shares the same rules.
 pub use vectordata::filters;
 pub mod formats;
+pub mod gpu;
 pub mod legacy_sweep;
 pub mod paths;
 pub mod term;

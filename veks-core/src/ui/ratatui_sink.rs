@@ -485,6 +485,37 @@ struct RenderState {
     dirty: bool,
     /// Recent log messages for the bottom log window.
     recent_logs: Vec<String>,
+    /// Per-GPU chart state, one entry per visible device. Empty on hosts
+    /// without GPUs, which is what makes the GPU panels disappear
+    /// entirely rather than render as empty boxes.
+    gpus: Vec<GpuPanelState>,
+}
+
+/// Chart state for one GPU: utilization and memory-use percentages share
+/// a panel, both on a fixed 0–100 axis so devices read comparably.
+struct GpuPanelState {
+    /// NVML device index, as shown in the panel title.
+    index: u32,
+    /// Utilization percent history (0–100).
+    util_history: MetricsHistory,
+    /// Memory-in-use percent history (0–100).
+    mem_history: MetricsHistory,
+    /// Current memory readout for the title, e.g. "12.4G/95.6G".
+    mem_readout: String,
+    /// Current utilization percent for the title.
+    util_pct: u32,
+}
+
+impl GpuPanelState {
+    fn new(index: u32) -> Self {
+        Self {
+            index,
+            util_history: MetricsHistory::new(120),
+            mem_history: MetricsHistory::new(120),
+            mem_readout: String::new(),
+            util_pct: 0,
+        }
+    }
 }
 
 impl RenderState {
@@ -529,6 +560,7 @@ impl RenderState {
             suspended: false,
             dirty: false,
             recent_logs: Vec::new(),
+            gpus: Vec::new(),
         }
     }
 
@@ -856,6 +888,29 @@ fn process_msg(
                 state.rss_readout = format!("{}/{}", format_mb(rss_mb), format_mb(state.rss_ceiling_mb));
             } else {
                 state.rss_readout = format_mb(rss_mb);
+            }
+
+            // GPUs — one panel per device, keyed by NVML index so a
+            // device appearing or disappearing mid-run re-syncs rather
+            // than shifting every subsequent device's history.
+            for sample in &m.gpus {
+                let slot = match state.gpus.iter().position(|g| g.index == sample.index) {
+                    Some(pos) => pos,
+                    None => {
+                        state.gpus.push(GpuPanelState::new(sample.index));
+                        state.gpus.sort_by_key(|g| g.index);
+                        state.gpus.iter().position(|g| g.index == sample.index).unwrap()
+                    }
+                };
+                let gpu = &mut state.gpus[slot];
+                gpu.util_pct = sample.utilization_pct;
+                gpu.util_history.push(sample.utilization_pct as f64);
+                gpu.mem_history.push(sample.memory_fraction() * 100.0);
+                gpu.mem_readout = format!(
+                    "{}/{}",
+                    format_mb(bytes_to_mb(sample.memory_used_bytes)),
+                    format_mb(bytes_to_mb(sample.memory_total_bytes))
+                );
             }
 
             // CPU
@@ -1660,17 +1715,25 @@ fn rw_chart<'a>(
 /// Each chart's title includes the current readout value so that the separate
 /// status text line is no longer needed.
 fn render_resource_chart(frame: &mut ratatui::Frame, area: Rect, state: &RenderState) {
+    // Proportional fills rather than fixed percentages: GPU panels are
+    // appended only when devices exist, and every other panel shrinks to
+    // make room. On a GPU-less host the weights below sum to 100, so the
+    // layout is identical to the fixed-percentage one they replaced —
+    // no width is reserved for hardware that isn't there.
+    let mut weights: Vec<u16> = vec![
+        16, // RSS
+        14, // page cache (adjacent to RSS)
+        10, // faults (adjacent to page cache)
+        14, // CPU
+        18, // I/O throughput
+        14, // I/O queue
+        14, // threads
+    ];
+    weights.extend(std::iter::repeat_n(14u16, state.gpus.len()));
+    let constraints: Vec<Constraint> = weights.into_iter().map(Constraint::Fill).collect();
     let panels = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(16), // RSS
-            Constraint::Percentage(14), // page cache (adjacent to RSS)
-            Constraint::Percentage(10), // faults (adjacent to page cache)
-            Constraint::Percentage(14), // CPU
-            Constraint::Percentage(18), // I/O throughput
-            Constraint::Percentage(14), // I/O queue
-            Constraint::Percentage(14), // threads
-        ])
+        .constraints(constraints)
         .split(area);
 
     let dim = Style::default().fg(Color::DarkGray);
@@ -1803,6 +1866,75 @@ fn render_resource_chart(frame: &mut ratatui::Frame, area: Rect, state: &RenderS
             panels[6],
         );
     }
+
+    // GPUs — one panel per device, utilization (green, matching cpu) over
+    // memory use (magenta, matching rss). Nothing renders here when the
+    // host has no GPUs, because there are no panels to render into.
+    for (i, gpu) in state.gpus.iter().enumerate() {
+        let Some(&slot) = panels.get(7 + i) else { break };
+        let title_spans = vec![
+            Span::styled(format!(" gpu{} ", gpu.index), Style::default().fg(Color::White)),
+            Span::styled(format!("{}%", gpu.util_pct), Style::default().fg(Color::Green)),
+            Span::styled(" ", dim),
+            Span::styled(format!("{} ", gpu.mem_readout), Style::default().fg(Color::Magenta)),
+        ];
+        frame.render_widget(
+            gpu_chart(&gpu.util_history, &gpu.mem_history, title_spans, dim),
+            slot,
+        );
+    }
+}
+
+/// Two-series percentage chart for one GPU: utilization and memory use,
+/// both pinned to a 0–100 axis so panels read comparably across devices
+/// and across time (an auto-scaled axis would make an idle GPU's noise
+/// look like load).
+fn gpu_chart<'a>(
+    util_history: &'a MetricsHistory,
+    mem_history: &'a MetricsHistory,
+    title_spans: Vec<Span<'a>>,
+    dim: Style,
+) -> Chart<'a> {
+    let mut datasets = Vec::new();
+    if !util_history.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("util")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Green))
+                .data(util_history.as_slice()),
+        );
+    }
+    if !mem_history.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("mem")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Magenta))
+                .data(mem_history.as_slice()),
+        );
+    }
+    let x_bounds = if util_history.is_empty() {
+        mem_history.x_bounds()
+    } else {
+        util_history.x_bounds()
+    };
+    Chart::new(datasets)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(title_spans))
+                .border_style(dim),
+        )
+        .x_axis(Axis::default().bounds(x_bounds).style(dim))
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(vec![Span::styled("0", dim), Span::styled("100%", dim)])
+                .style(dim),
+        )
 }
 
 /// Render a single progress bar or spinner into a one-line area.
@@ -2528,6 +2660,106 @@ mod tests {
     }
 
     /// Render the full progress region into a test buffer and return it.
+    /// Build a GPU sample with the given index, utilization, and memory
+    /// fraction (used bytes derived from a fixed 96 GiB device).
+    fn gpu_sample(index: u32, util: u32, mem_frac: f64) -> crate::gpu::GpuSample {
+        let total = 96u64 << 30;
+        crate::gpu::GpuSample {
+            index,
+            name: format!("NVIDIA Test Device {index}"),
+            utilization_pct: util,
+            memory_io_pct: util / 2,
+            memory_used_bytes: (total as f64 * mem_frac) as u64,
+            memory_total_bytes: total,
+            temperature_c: Some(40),
+            power_watts: Some(120.0),
+        }
+    }
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn gpu_panels_absent_when_host_has_no_devices() {
+        // The common case: no GPUs, so no GPU panels and no width
+        // reserved for them.
+        let state = state_with_chart(&[100.0, 200.0, 300.0], &[8.0, 8.0, 8.0]);
+        assert!(state.gpus.is_empty());
+        let buf = render_state_to_buffer(&state, 200, 24);
+        let text = buffer_text(&buf);
+        assert!(!text.contains("gpu"), "GPU panel rendered on a GPU-less host");
+    }
+
+    #[test]
+    fn gpu_panels_render_one_per_device() {
+        let mut state = state_with_chart(&[100.0, 200.0, 300.0], &[8.0, 8.0, 8.0]);
+        let mut logs = Vec::new();
+        let mut emits = Vec::new();
+        for tick in 0..3 {
+            let metrics = ResourceMetrics {
+                gpus: vec![
+                    gpu_sample(0, 90 - tick, 0.5),
+                    gpu_sample(1, 40 + tick, 0.25),
+                ],
+                ..Default::default()
+            };
+            process_msg(
+                &RenderMsg::Event(UiEvent::ResourceStatus { line: "s".into(), metrics }),
+                &mut state, &mut logs, &mut emits,
+            );
+        }
+
+        // One panel state per device, in index order, with history.
+        assert_eq!(state.gpus.len(), 2);
+        assert_eq!(state.gpus[0].index, 0);
+        assert_eq!(state.gpus[1].index, 1);
+        assert_eq!(state.gpus[0].util_history.as_slice().len(), 3);
+        assert_eq!(state.gpus[0].util_pct, 88); // last tick
+        // Memory history is a percentage of the device, not raw bytes.
+        let mem_pct = state.gpus[0].mem_history.as_slice().last().unwrap().1;
+        assert!((mem_pct - 50.0).abs() < 0.01, "mem pct was {mem_pct}");
+
+        let buf = render_state_to_buffer(&state, 220, 24);
+        let text = buffer_text(&buf);
+        assert!(text.contains("gpu0"), "missing gpu0 panel:\n{text}");
+        assert!(text.contains("gpu1"), "missing gpu1 panel:\n{text}");
+        // Titles carry the live readout: utilization and used/total.
+        assert!(text.contains("88%"), "gpu0 utilization missing:\n{text}");
+        assert!(text.contains("42%"), "gpu1 utilization missing:\n{text}");
+        assert!(text.contains("48.0G/96.0G"), "memory readout missing:\n{text}");
+    }
+
+    #[test]
+    fn gpu_panel_state_keys_by_device_index() {
+        // A device dropping out of a sample (driver reset, MIG change)
+        // must not shift the surviving device's history into the wrong
+        // panel — slots are keyed by NVML index, not sample position.
+        let mut state = RenderState::new();
+        let mut logs = Vec::new();
+        let mut emits = Vec::new();
+        let send = |state: &mut RenderState, logs: &mut Vec<String>, emits: &mut Vec<(String, bool)>, gpus: Vec<crate::gpu::GpuSample>| {
+            process_msg(
+                &RenderMsg::Event(UiEvent::ResourceStatus {
+                    line: "s".into(),
+                    metrics: ResourceMetrics { gpus, ..Default::default() },
+                }),
+                state, logs, emits,
+            );
+        };
+
+        send(&mut state, &mut logs, &mut emits, vec![gpu_sample(0, 10, 0.1), gpu_sample(1, 20, 0.2)]);
+        // gpu0 vanishes; only gpu1 reports.
+        send(&mut state, &mut logs, &mut emits, vec![gpu_sample(1, 30, 0.3)]);
+
+        assert_eq!(state.gpus.len(), 2, "known devices are retained");
+        assert_eq!(state.gpus[0].index, 0);
+        assert_eq!(state.gpus[0].util_pct, 10, "stale device keeps its last reading");
+        assert_eq!(state.gpus[1].index, 1);
+        assert_eq!(state.gpus[1].util_pct, 30, "live device updated in its own slot");
+        assert_eq!(state.gpus[1].util_history.as_slice().len(), 2);
+    }
+
     fn render_state_to_buffer(state: &RenderState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         use ratatui::backend::TestBackend;
 

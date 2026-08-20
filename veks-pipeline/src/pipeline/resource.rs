@@ -1915,6 +1915,7 @@ impl ResourceGovernor {
             prev_cpu: Arc::new(Mutex::new(None)),
             prev_per_core: Arc::new(Mutex::new(Vec::new())),
             prev_snapshot_faults: Arc::new(Mutex::new(None)),
+            gpus: Arc::new(veks_core::gpu::GpuMonitor::new()),
         }
     }
 
@@ -1979,6 +1980,11 @@ pub struct ResourceStatusSource {
     prev_per_core: Arc<Mutex<Vec<(u64, u64)>>>,
     /// Previous snapshot for computing page cache hit ratio from fault deltas.
     prev_snapshot_faults: Arc<Mutex<Option<(u64, u64)>>>,
+    /// GPU telemetry source, shared across clones. Initializing NVML
+    /// dlopens the driver library, so it is done once per governor and
+    /// reused; on hosts without GPUs the monitor reports no devices and
+    /// every sample is empty.
+    gpus: Arc<veks_core::gpu::GpuMonitor>,
 }
 
 impl ResourceStatusSource {
@@ -2119,6 +2125,20 @@ impl ResourceStatusSource {
             let eff = effective.get(*name).copied().unwrap_or(0);
             let ceiling = self.budget.get(*name).map(|v| v.ceiling()).unwrap_or(eff);
             parts.push(format!("{}: {}/{}", name, format_value(name, eff), format_value(name, ceiling)));
+        }
+
+        // GPUs — omitted entirely from both the metrics and the status
+        // line on hosts without them, so a CPU-only run reads exactly as
+        // it did before GPU support existed.
+        metrics.gpus = self.gpus.sample();
+        for gpu in &metrics.gpus {
+            parts.push(format!(
+                "gpu{}: {}% {}/{}",
+                gpu.index,
+                gpu.utilization_pct,
+                format_value("mem", gpu.memory_used_bytes),
+                format_value("mem", gpu.memory_total_bytes)
+            ));
         }
 
         // Throttle/emergency indicator
