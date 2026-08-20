@@ -175,6 +175,97 @@ example with all BQGDMPRF facets.
 
 ---
 
+## Recipe 8: Text Corpus → Embedded Predicated Dataset (GPU)
+
+Building a dataset from raw text rather than existing vectors: acquire a
+corpus, chunk it into passages, embed them, join metadata, then bootstrap.
+Every stage is a pipeline step, so the whole upstream half is one
+`veks run` with provenance, resume, and `dataset.log`.
+
+Build with the CUDA features — the embedding stage is the long pole and
+the fused path is roughly three orders of magnitude faster than CPU:
+
+```bash
+cargo install --path veks --features embed-cuda-flash   # needs nvcc
+```
+
+`upstream/dataset.yaml`:
+
+```yaml
+name: corpus-upstream
+upstream:
+  steps:
+    - id: download-corpus
+      run: download s2ag
+      release: 2026-08-11          # pin: 'latest' is rejected
+      dataset-name: s2orc
+      api-key-file: keys.yaml      # never inline the key
+      output: sources/s2orc_v2
+    - id: generate-passages
+      run: generate passages
+      after: [download-corpus]
+      source: sources/s2orc_v2
+      files: first:8               # shard subset — a provenance axis
+      output: upstream/passages/passages.parquet
+      doc-limit: 350000
+      doc-order: corpusid
+      chunker: para-v1
+      seed: 42
+    - id: generate-embed
+      run: generate embed
+      after: [generate-passages]
+      source: upstream/passages/passages.parquet
+      output: upstream/vectors/base_all.npy
+      model: Qwen/Qwen3-Embedding-0.6B
+      dtype: bf16                  # pin explicitly: an identity axis
+      # device/batch-size default to every visible GPU at batch 128
+    - id: verify-alignment
+      run: verify alignment
+      after: [generate-embed]
+      source: upstream/vectors/base_all.npy
+      reference: upstream/passages/passages.parquet
+      dim: 1024
+    - id: generate-metadata        # M facet: parent metadata per passage
+      run: generate passage-metadata
+      after: [download-papers, generate-passages]
+      source: sources/papers
+      passages: upstream/passages/passages.parquet
+      output: upstream/metadata/metadata.parquet
+```
+
+Then the dataset itself — the two raw artifacts are all the bootstrap
+needs, and it infers the predicated facets from them:
+
+```bash
+veks run upstream/dataset.yaml
+veks prepare bootstrap --name corpus-10m --output datasets/corpus-10m \
+    --base-vectors upstream/vectors/base_all.npy \
+    --metadata upstream/metadata/metadata.parquet \
+    --self-search --query-count 10000 \
+    --metric Cosine --assume-normalized-like-faiss \
+    --neighbors 100 --seed 42 --required-facets BQGMPRF
+veks run datasets/corpus-10m/dataset.yaml --output batch
+veks check datasets/corpus-10m --check-integrity
+```
+
+Notes:
+
+- **Ordinal identity is the whole contract**: row i of the passage table,
+  the vectors, and the metadata table all describe the same passage.
+  `verify alignment` gates it after each producing stage; run it against
+  the metadata table too, not just the vectors.
+- **Metric**: Qwen3 embeddings are unit-normalized, so
+  `--metric Cosine --assume-normalized-like-faiss` evaluates cosine as
+  inner product exactly, with no extra norm work.
+- **Deduplicate expectations**: real corpora repeat boilerplate — a 10M
+  passage set deduped to 9.76M (5.7%) in practice. Base counts shrink;
+  that is the dedup stage working, not data loss.
+- **Interrupted runs**: split very large embeds into 1–2M-passage steps.
+  Text, token ids, and vectors are all resident per step (~5 GB per 1M
+  passages at 1024-d), and a step boundary is a resume point.
+
+---
+
 ## Key Rules
 
 - **Ordinal correspondence**: `metadata[i]` describes `base_vectors[i]`.

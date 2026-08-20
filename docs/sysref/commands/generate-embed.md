@@ -41,9 +41,9 @@ time) at cuBLAS-peak 83–84% SM throughput (measured on Blackwell sm120).
 | `--column` | no | Source column holding the text (default: `text`) |
 | `--model` | no | HuggingFace model id (default: `Qwen/Qwen3-Embedding-0.6B`) |
 | `--revision` | no | Model revision (default: `main`; pin a commit sha for strict reproducibility) |
-| `--batch-size` | no | Sequences per forward pass (default: 16; raise substantially on GPU) |
+| `--batch-size` | no | Sequences per forward pass (default: 128 — the GPU-tuned value; wall time is flat from 128 to 512 on the fused path) |
 | `--max-length` | no | Token cap per row, including the terminal EOS pooling token (default: 1024) |
-| `--device` | no | `auto` (default), `cpu`, or `cuda[:N]`; a comma-separated list (`cuda:0,cuda:1`) shards batches round-robin across one worker per entry — repeating a device runs overlapping workers on one GPU (needs the `embed-cuda` build feature) |
+| `--device` | no | `auto` (default) claims **every** visible CUDA device, one worker each, else CPU; `cpu`; or `cuda[:N]`. A comma-separated list (`cuda:0,cuda:1`) shards batches round-robin across one worker per entry — repeating a device runs overlapping workers on one GPU (needs the `embed-cuda` build feature) |
 | `--dtype` | no | `auto` (f32 on cpu, bf16 on cuda), `f32`, `bf16`, `f16` |
 
 ## Notes
@@ -59,6 +59,13 @@ time) at cuBLAS-peak 83–84% SM throughput (measured on Blackwell sm120).
   flash-attention path has no such ceiling.
 - Model id, revision, and every byte-affecting knob are step options and
   therefore provenance axes. Sets the `embed_dim` pipeline variable.
+  `device` and thread counts are not: sharding batches across GPUs
+  reorders nothing within a row.
+- A CPU run over more than 10k rows logs a warning with the rate
+  arithmetic. CPU throughput is single-digit rows/s against ~2,500/s
+  measured on a two-GPU host, so a large CPU embed is nearly always a
+  stale recipe or a build missing `embed-cuda-flash` rather than an
+  intent.
 - The full-model smoke test is `#[ignore]`d (downloads ~1.2GB); run it
   with `cargo test -p veks-pipeline --features embed real_model_embeds --
   --ignored` on a networked host.

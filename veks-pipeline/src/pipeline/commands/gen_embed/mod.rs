@@ -124,7 +124,7 @@ bf16 on CUDA.
         let column = options.get("column").unwrap_or("text").to_string();
         let model_id = options.get("model").unwrap_or(DEFAULT_MODEL).to_string();
         let revision = options.get("revision").unwrap_or("main").to_string();
-        let batch_size: usize = match options.parse_or("batch-size", 16) {
+        let batch_size: usize = match options.parse_or("batch-size", 128) {
             Ok(n) if n > 0 => n,
             Ok(_) => return error_result("batch-size must be > 0".into(), start),
             Err(e) => return error_result(e, start),
@@ -163,6 +163,19 @@ bf16 on CUDA.
             batch_size,
             max_length
         ));
+        // Guardrail: a large CPU embed is almost always a misconfiguration
+        // (CPU-only build, `device: cpu` from a stale recipe) — the GPU
+        // path is ~3 orders of magnitude faster. Warn with the arithmetic
+        // up front instead of letting a silent multi-hour grind start.
+        if devices.iter().all(|d| !d.is_cuda()) && texts.len() > 10_000 {
+            ctx.ui.log(&format!(
+                "WARNING: embedding {} row(s) on CPU — expect hours (CPU runs at roughly \
+                 single-digit rows/s vs ~2,500/s measured on a 2-GPU host). If this host \
+                 has GPUs, build with --features embed-cuda-flash and use device: auto; \
+                 otherwise consider running this step on a GPU node.",
+                texts.len()
+            ));
+        }
 
         // ── Model + tokenizer, via the shared HF cache ───────────────────
         let fetch = ctx.ui.spinner("fetch model");
@@ -393,8 +406,10 @@ bf16 on CUDA.
                 name: "batch-size".to_string(),
                 type_name: "int".to_string(),
                 required: false,
-                default: Some("16".to_string()),
-                description: "Sequences per forward pass (raise substantially on GPU)".to_string(),
+                default: Some("128".to_string()),
+                description: "Sequences per forward pass (the GPU-tuned default; wall time is \
+                              flat 128-512 on the fused path)"
+                    .to_string(),
                 extended_description: None,
                 role: OptionRole::Config,
             },
@@ -487,11 +502,22 @@ fn fetch_model_files(model_id: &str, revision: &str) -> Result<ModelFiles, Strin
     })
 }
 
-/// Resolve a device spec into one device per embed worker. A comma
-/// -separated list (`cuda:0,cuda:1`) shards batches round-robin across
-/// workers; repeating a device (`cuda:0,cuda:0`) is allowed and runs two
-/// overlapping workers on one GPU.
+/// Resolve a device spec into one device per embed worker. `auto` claims
+/// **every** visible CUDA device (one worker each — this command is a
+/// throughput stage, and a single-GPU default silently halves a multi-GPU
+/// host), else CPU. A comma-separated list (`cuda:0,cuda:1`) shards batches
+/// round-robin across workers; repeating a device (`cuda:0,cuda:0`) is
+/// allowed and runs two overlapping workers on one GPU.
 fn resolve_devices(spec: &str) -> Result<Vec<Device>, String> {
+    if spec == "auto" {
+        let n = cuda_device_count();
+        if n > 0 {
+            return (0..n)
+                .map(|i| Device::new_cuda(i).map_err(|e| format!("cuda:{} init: {}", i, e)))
+                .collect();
+        }
+        return Ok(vec![Device::Cpu]);
+    }
     spec.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -504,6 +530,20 @@ fn resolve_devices(spec: &str) -> Result<Vec<Device>, String> {
                 Ok(v)
             }
         })
+}
+
+/// Number of visible CUDA devices (0 when CUDA is unavailable or the
+/// binary was built without it).
+fn cuda_device_count() -> usize {
+    #[cfg(feature = "embed-cuda")]
+    {
+        if candle_core::utils::cuda_is_available() {
+            return candle_core::cuda_backend::cudarc::driver::CudaContext::device_count()
+                .map(|n| n.max(0) as usize)
+                .unwrap_or(0);
+        }
+    }
+    0
 }
 
 fn resolve_device(spec: &str) -> Result<Device, String> {
@@ -621,6 +661,22 @@ mod tests {
         // Cap 4 → 3 content tokens + EOS.
         assert_eq!(prepare_ids((1..=10).collect(), 9, 4), vec![1, 2, 3, 9]);
         assert_eq!(prepare_ids(vec![], 9, 4), vec![9]);
+    }
+
+    #[test]
+    fn resolve_devices_lists_and_rejects() {
+        // A list yields one device (one worker) per entry, repeats included.
+        assert_eq!(resolve_devices("cpu").unwrap().len(), 1);
+        assert_eq!(resolve_devices("cpu,cpu,cpu").unwrap().len(), 3);
+        assert_eq!(resolve_devices(" cpu , cpu ").unwrap().len(), 2);
+        // Empty and unknown specs are errors, not silent CPU fallbacks —
+        // a typo'd device must never quietly cost 1000x throughput.
+        assert!(resolve_devices("").is_err());
+        assert!(resolve_devices("gpu").is_err());
+        assert!(resolve_devices("cuda:x").is_err());
+        // `auto` always resolves to at least one worker (every visible GPU
+        // on a CUDA host, else CPU).
+        assert!(!resolve_devices("auto").unwrap().is_empty());
     }
 
     #[test]
