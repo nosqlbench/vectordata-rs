@@ -103,6 +103,12 @@ pub mod config;
 /// GitHub Releases redirect (no API quota). Never blocks, never
 /// fails a command, never prints mid-run — see the module docs.
 pub mod update_check;
+
+/// The `vectordata` CLI shell (cache admin, datasets, config, explore) —
+/// shared by the crate's own bin shim and the workspace-root umbrella
+/// binary, which embeds it as its default personality.
+#[cfg(feature = "cli")]
+pub mod shell;
 /// Canonical implementation of `<binary> datasets …` subcommands.
 /// Both binaries dispatch into this module — there is exactly one
 /// implementation of each command.
