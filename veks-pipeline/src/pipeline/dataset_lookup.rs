@@ -102,6 +102,12 @@ fn lookup_facet(
     };
     let p = Path::new(file_part);
     let resolved = if p.is_absolute() { p.to_path_buf() } else { dataset_root.join(p) };
+    // Absolutize before returning: callers hand this value to their own
+    // workspace-relative `resolve_path`, and when the dataset root IS the
+    // workspace (the no-`--dataset` flow) a relative return would get the
+    // workspace prefix applied twice ("datasets/x/datasets/x/…"). An
+    // absolute path is a fixed point of every downstream resolver.
+    let resolved = std::path::absolute(&resolved).unwrap_or(resolved);
     let resolved = resolved.to_string_lossy().into_owned();
     Some(match ns_part {
         Some(ns) => format!("{resolved}#{ns}"),
