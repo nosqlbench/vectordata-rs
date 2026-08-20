@@ -95,7 +95,7 @@ pub fn parents_schema() -> SchemaRef {
 
 /// Shared staged-file plumbing: an [`ArrowWriter`] over `<path>.partial`,
 /// renamed to `path` on finish.
-struct StagedParquetWriter {
+pub(crate) struct StagedParquetWriter {
     writer: ArrowWriter<File>,
     final_path: PathBuf,
     partial_path: PathBuf,
@@ -103,7 +103,7 @@ struct StagedParquetWriter {
 }
 
 impl StagedParquetWriter {
-    fn create(path: &Path, schema: SchemaRef) -> Result<Self, String> {
+    pub(crate) fn create(path: &Path, schema: SchemaRef) -> Result<Self, String> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -126,14 +126,14 @@ impl StagedParquetWriter {
         })
     }
 
-    fn write_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
+    pub(crate) fn write_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
         self.rows_written += batch.num_rows() as u64;
         self.writer
             .write(&batch)
             .map_err(|e| format!("parquet write failed: {}", e))
     }
 
-    fn finish(self) -> Result<u64, String> {
+    pub(crate) fn finish(self) -> Result<u64, String> {
         self.writer
             .close()
             .map_err(|e| format!("parquet close failed: {}", e))?;
@@ -349,6 +349,39 @@ pub fn read_text_column(path: &Path, column: &str) -> Result<Vec<String>, String
         let col = column_as::<StringArray>(&batch, column)?;
         for i in 0..batch.num_rows() {
             values.push(col.value(i).to_string());
+        }
+    }
+    Ok(values)
+}
+
+/// Read a single Int64 column of a parquet file in row order (projected —
+/// other columns are not decoded). Same ordinal contract as
+/// [`read_text_column`]: element i is row i's value.
+pub fn read_i64_column(path: &Path, column: &str) -> Result<Vec<i64>, String> {
+    use parquet::arrow::ProjectionMask;
+    let file = File::open(path)
+        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("failed to read parquet {}: {}", path.display(), e))?;
+    let schema = builder.parquet_schema();
+    let indices: Vec<usize> = (0..schema.num_columns())
+        .filter(|&i| schema.column(i).name() == column)
+        .collect();
+    if indices.is_empty() {
+        return Err(format!("no column '{}' in {}", column, path.display()));
+    }
+    let mask = ProjectionMask::leaves(schema, indices);
+    let reader = builder
+        .with_projection(mask)
+        .build()
+        .map_err(|e| format!("failed to build parquet reader: {}", e))?;
+
+    let mut values = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("parquet read failed: {}", e))?;
+        let col = column_as::<Int64Array>(&batch, column)?;
+        for i in 0..batch.num_rows() {
+            values.push(col.value(i));
         }
     }
     Ok(values)

@@ -24,6 +24,7 @@ pub use vectordata::formats::anode_vernacular;
 
 pub mod facet;
 pub mod parquet_compiler;
+pub mod passage_metadata;
 pub mod passage_table;
 pub mod parquet_vector_compiler;
 pub mod portable_io;

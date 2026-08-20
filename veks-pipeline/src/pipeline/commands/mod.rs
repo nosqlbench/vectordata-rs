@@ -75,6 +75,7 @@ pub mod gen_derive;
 pub mod gen_extract;
 pub mod gen_metadata;
 pub mod gen_from_model;
+pub mod gen_passage_metadata;
 pub mod gen_passages;
 pub mod gen_predicate_keys;
 pub mod inspect_filtered_knn;
@@ -211,6 +212,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate embed", gen_embed::factory);
     registry.register("generate from-model", gen_from_model::factory);
     registry.register("generate metadata", gen_metadata::factory);
+    registry.register("generate passage-metadata", gen_passage_metadata::factory);
     registry.register("generate passages", gen_passages::factory);
     registry.register("generate predicates", gen_predicates::factory);
     registry.register("generate simple-predicates", gen_simple_predicates::factory);
