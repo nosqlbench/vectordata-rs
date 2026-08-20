@@ -104,6 +104,7 @@ pub mod slab;
 pub mod survey;
 pub mod verify_alignment;
 pub mod verify_consolidated;
+pub mod verify_similarity;
 #[cfg(feature = "knnutils")]
 pub mod transform_normalize_knnutils;
 #[cfg(all(feature = "knnutils", unix))]
@@ -266,6 +267,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
 
     // ── verify ───────────────────────────────────────────────────────
     registry.register("verify alignment", verify_alignment::factory);
+    registry.register("verify similarity", verify_similarity::factory);
     #[cfg(all(feature = "knnutils", unix))]
     registry.register("verify dataset-knnutils", verify_dataset_knnutils::factory);
     // verify knn-groundtruth: per-profile, default is SimSIMD (metal)
