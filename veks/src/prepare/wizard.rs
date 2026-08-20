@@ -530,27 +530,65 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     } else if let Some(ref seeded) = seeds.metadata {
         (Some(seeded.clone()), false, "simple-int-eq".into(), "slab".into(), 3, 0, 1000, 0, 1000)
     } else {
-        // M facet was confirmed but no metadata file is available.
-        // Offer synthesis modes.
+        // M facet was confirmed but no metadata file was auto-detected.
+        // Auto-detection is filename-keyword scanning over one directory,
+        // so "not detected" must never be conflated with "doesn't exist":
+        // the primary option is naming the real source (vetted for
+        // readability); synthesis is the fallback.
         {
             println!();
-            println!("--- Metadata & Predicate Synthesis ---");
-            println!("  No metadata source detected. Choose a synthesis mode:");
+            println!("--- Metadata Source ---");
+            println!("  No metadata source was auto-detected next to the inputs.");
             println!();
-            println!("    1. Simple integer equality");
+            println!("    1. Specify a metadata source path");
+            println!("       A file or directory (parquet with scalar columns, slab,");
+            println!("       or any recognized metadata artifact). It is probed for");
+            println!("       readability before being accepted.");
+            println!();
+            println!("    2. Synthesize: simple integer equality");
             println!("       Each record gets integer fields in a range.");
             println!("       Predicates are single-field equality checks.");
             println!();
-            println!("    2. Compound predicates with selectivity targeting");
+            println!("    3. Synthesize: compound predicates with selectivity targeting");
             println!("       Synthesizes metadata, surveys it (`analyze survey`,");
             println!("       sysref §13), then generates compound AND predicates");
             println!("       whose combined selectivity hits a configured target");
             println!("       (`generate predicates --mode=survey --strategy=compound`).");
             println!();
 
-            let mode_choice = prompt_with_default("Synthesis mode [1/2]", "1");
+            let mode_choice = prompt_with_default("Metadata source [1/2/3]", "1");
 
-            if mode_choice == "1" || mode_choice == "2" {
+            if mode_choice == "1" {
+                let mut provided: Option<PathBuf> = None;
+                for attempt in 1..=3 {
+                    let raw = prompt_with_default("Metadata source path", "");
+                    if raw.is_empty() {
+                        println!("  (empty — {} attempt(s) left)", 3 - attempt);
+                        continue;
+                    }
+                    match vet_metadata_source(Path::new(&raw)) {
+                        Ok(summary) => {
+                            println!("  ✓ {}", summary);
+                            provided = Some(PathBuf::from(raw));
+                            break;
+                        }
+                        Err(e) => {
+                            println!("  ✗ not usable as metadata: {}", e);
+                            println!("    ({} attempt(s) left)", 3 - attempt);
+                        }
+                    }
+                }
+                match provided {
+                    Some(m) => {
+                        (Some(m), false, "simple-int-eq".into(), "slab".into(), 3, 0, 1000, 0, 1000)
+                    }
+                    None => {
+                        println!("  No readable metadata source given — dropping M facet.");
+                        confirmed_facets.retain(|c| !matches!(c, 'M' | 'P' | 'R' | 'F'));
+                        (None, false, "simple-int-eq".into(), "slab".into(), 3, 0, 1000, 0, 1000)
+                    }
+                }
+            } else if mode_choice == "2" || mode_choice == "3" {
                 println!();
                 println!("  Metadata — each record gets integer fields drawn from a range.");
                 let fields_str = prompt_with_default("Number of integer fields per record", "1");
@@ -608,12 +646,12 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                 simple_int_eq_predicate_count = Some(pred_count);
 
                 // Synthesis mode:
-                //   1 → simple-int-eq (each predicate is `field == value`)
-                //   2 → compound (per-field range predicates AND'd together,
+                //   2 → simple-int-eq (each predicate is `field == value`)
+                //   3 → compound (per-field range predicates AND'd together,
                 //       sized to hit the configured selectivity target;
                 //       drives `gen metadata → analyze survey → generate
                 //       predicates --mode=survey --strategy=compound`)
-                let mode = if mode_choice == "2" { "compound" } else { "simple-int-eq" };
+                let mode = if mode_choice == "3" { "compound" } else { "simple-int-eq" };
                 if mode == "compound" {
                     println!();
                     println!("  Compound synthesis configured. The pipeline will:");
@@ -2355,6 +2393,34 @@ fn prompt_with_prefill(label: &str, default: &str) -> String {
 
 /// Prompt with a default value. Returns the default if the user presses Enter
 /// or if auto-accept mode is active.
+/// Vet a user-supplied metadata source: it must exist, resolve to a
+/// recognized artifact format, and probe readable through the facet-aware
+/// reader (metadata parquet goes through the MNode probe, so scalar-column
+/// tables are accepted, not just vector tables). Returns a one-line summary
+/// of what was found.
+fn vet_metadata_source(path: &std::path::Path) -> Result<String, String> {
+    use veks_core::formats::VecFormat;
+    use veks_core::formats::facet::Facet;
+    use veks_core::formats::reader::probe_source_for_facet;
+
+    if !path.exists() {
+        return Err(format!("{} does not exist", path.display()));
+    }
+    let format = VecFormat::detect(path)
+        .ok_or_else(|| format!("unrecognized artifact format: {}", path.display()))?;
+    let meta = probe_source_for_facet(path, format, Facet::MetadataContent)?;
+    let count = meta
+        .record_count
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    Ok(format!(
+        "readable {:?} metadata source: {} record(s) at {}",
+        format,
+        count,
+        path.display()
+    ))
+}
+
 fn prompt_with_default(label: &str, default: &str) -> String {
     if AUTO_ACCEPT.load(Ordering::Relaxed) {
         eprintln!("{} [{}]: {}", label, default, default);
@@ -2469,6 +2535,40 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vet_metadata_source_accepts_scalar_parquet_rejects_junk() {
+        use veks_core::formats::passage_metadata::{MetadataRow, MetadataTableWriter};
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Missing path → clear error.
+        assert!(vet_metadata_source(&tmp.path().join("nope.parquet")).is_err());
+
+        // A scalar-column metadata parquet (no vector column) must vet
+        // readable through the facet-aware (MNode) probe.
+        let meta = tmp.path().join("metadata.parquet");
+        let mut w = MetadataTableWriter::create(&meta).unwrap();
+        for i in 0..5 {
+            w.push(&MetadataRow {
+                corpusid: i,
+                section: "s".into(),
+                year: 2000 + i as i32,
+                citationcount: i,
+                isopenaccess: i % 2 == 0,
+                field: "f".into(),
+                venue: "v".into(),
+            })
+            .unwrap();
+        }
+        w.finish().unwrap();
+        let summary = vet_metadata_source(&meta).unwrap();
+        assert!(summary.contains("5 record(s)"), "{}", summary);
+
+        // Unrecognized format → rejected, not accepted blind.
+        let junk = tmp.path().join("notes.txt");
+        std::fs::write(&junk, "hello").unwrap();
+        assert!(vet_metadata_source(&junk).is_err());
+    }
 
     /// Write a minimal fvec file.
     fn write_fvec(path: &Path, records: usize, dim: u32) {
