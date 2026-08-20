@@ -15,11 +15,23 @@
 //! mask is sufficient for correct last-real-token hidden states; pad-row
 //! outputs are simply never read. Pooling is last-token (Qwen3-Embedding's
 //! documented scheme), followed by L2 normalization.
+//!
+//! Projections are fused at load time (q|k|v and gate|up become single
+//! GEMMs). On CUDA with bf16 under `embed-cuda-flash`, the forward runs a
+//! fused fast path: flash-attention plus the custom kernels in `kernels.cu`
+//! (add+rmsnorm, silu·mul, per-head qk-norm+rope) — profiling showed the
+//! composed elementwise ops 2-4x off the DRAM roofline. Everywhere else the
+//! composed candle ops below remain the reference implementation.
 
-use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_core::{DType, Device, Module, Result, Tensor, D};
+#[cfg(feature = "embed-cuda-flash")]
+use candle_core::IndexOp;
 use candle_nn::{Activation, Linear, RmsNorm, VarBuilder};
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+#[cfg(feature = "embed-cuda-flash")]
+use super::kernels;
 
 /// The subset of Qwen3 `config.json` this forward needs. Fields that some
 /// exports omit get serde defaults.
@@ -48,18 +60,12 @@ impl Config {
     }
 }
 
-fn linear_maybe_bias(inp: usize, out: usize, bias: bool, vb: VarBuilder) -> Result<Linear> {
-    if bias {
-        candle_nn::linear(inp, out, vb)
-    } else {
-        candle_nn::linear_no_bias(inp, out, vb)
-    }
-}
-
 /// Precomputed RoPE tables (identical construction to the stock module).
 struct Rotary {
     sin: Tensor,
     cos: Tensor,
+    /// Per-position `[cos (d/2) | sin (d/2)]` rows for the fused kernel.
+    cos_sin: Tensor,
 }
 
 impl Rotary {
@@ -76,16 +82,14 @@ impl Rotary {
             .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
-        Ok(Self {
-            sin: freqs.sin()?.to_dtype(dtype)?,
-            cos: freqs.cos()?.to_dtype(dtype)?,
-        })
+        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let cos = freqs.cos()?.to_dtype(dtype)?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
+        Ok(Self { sin, cos, cos_sin })
     }
 
     /// Rotate q/k in (batch, seq, heads, head_dim) layout. The projections
-    /// produce this layout contiguously, so `rope_thd` needs no copies —
-    /// the profiled `ucopy_bf16` cost of rotating in (b, h, t, d) came
-    /// entirely from the `.contiguous()` after `transpose(1, 2)`.
+    /// produce this layout contiguously, so `rope_thd` needs no copies.
     fn apply_thd(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, seq_len, _, _) = q.dims4()?;
         let cos = self.cos.narrow(0, 0, seq_len)?;
@@ -97,53 +101,56 @@ impl Rotary {
 }
 
 struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
+    /// gate_proj and up_proj concatenated row-wise into one GEMM.
+    gate_up: Linear,
     down_proj: Linear,
     act_fn: Activation,
+    intermediate: usize,
 }
 
 impl Mlp {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
+        let gate_w = vb.pp("gate_proj").get((i, h), "weight")?;
+        let up_w = vb.pp("up_proj").get((i, h), "weight")?;
+        let gate_up = Linear::new(Tensor::cat(&[&gate_w, &up_w], 0)?.contiguous()?, None);
         Ok(Self {
-            gate_proj: candle_nn::linear_no_bias(
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                vb.pp("gate_proj"),
-            )?,
-            up_proj: candle_nn::linear_no_bias(
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                vb.pp("up_proj"),
-            )?,
-            down_proj: candle_nn::linear_no_bias(
-                cfg.intermediate_size,
-                cfg.hidden_size,
-                vb.pp("down_proj"),
-            )?,
+            gate_up,
+            down_proj: candle_nn::linear_no_bias(i, h, vb.pp("down_proj"))?,
             act_fn: cfg.hidden_act,
+            intermediate: i,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let lhs = x.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = x.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        let gu = x.apply(&self.gate_up)?;
+        let g = gu.narrow(D::Minus1, 0, self.intermediate)?;
+        let u = gu.narrow(D::Minus1, self.intermediate, self.intermediate)?;
+        (g.apply(&self.act_fn)? * u)?.apply(&self.down_proj)
+    }
+
+    #[cfg(feature = "embed-cuda-flash")]
+    fn forward_fused(&self, x: &Tensor) -> Result<Tensor> {
+        x.apply(&self.gate_up)?
+            .apply_op1_no_bwd(&kernels::SiluMul)?
+            .apply(&self.down_proj)
     }
 }
 
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    /// q_proj, k_proj, v_proj concatenated row-wise into one GEMM.
+    qkv: Linear,
     o_proj: Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
+    /// `[q_norm_w (scaled) | k_norm_w]` for the fused kernel.
+    qk_w: Tensor,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
     hidden_size: usize,
+    rms_eps: f32,
 }
 
 impl Attention {
@@ -151,35 +158,79 @@ impl Attention {
         let head_dim = cfg.head_dim();
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
-        let bias = cfg.attention_bias;
+        let h = cfg.hidden_size;
+        let q_w = vb.pp("q_proj").get((num_heads * head_dim, h), "weight")?;
+        let k_w = vb.pp("k_proj").get((num_kv_heads * head_dim, h), "weight")?;
+        let v_w = vb.pp("v_proj").get((num_kv_heads * head_dim, h), "weight")?;
+        let qkv_w = Tensor::cat(&[&q_w, &k_w, &v_w], 0)?.contiguous()?;
+        let qkv_b = if cfg.attention_bias {
+            let q_b = vb.pp("q_proj").get(num_heads * head_dim, "bias")?;
+            let k_b = vb.pp("k_proj").get(num_kv_heads * head_dim, "bias")?;
+            let v_b = vb.pp("v_proj").get(num_kv_heads * head_dim, "bias")?;
+            Some(Tensor::cat(&[&q_b, &k_b, &v_b], 0)?.contiguous()?)
+        } else {
+            None
+        };
+        let o_proj = if cfg.attention_bias {
+            candle_nn::linear(num_heads * head_dim, h, vb.pp("o_proj"))?
+        } else {
+            candle_nn::linear_no_bias(num_heads * head_dim, h, vb.pp("o_proj"))?
+        };
         // Fold the 1/sqrt(head_dim) attention scale into the q_norm weight:
         // RMSNorm ends in an elementwise multiply by the weight, so scaling
         // the weight scales q for free — the profiled alternative was an
         // `affine_bf16` pass over the full (b, h, l, l) score tensor.
         let scale = 1.0 / (head_dim as f64).sqrt();
         let q_norm_w = (vb.pp("q_norm").get(head_dim, "weight")? * scale)?;
+        let k_norm_w = vb.pp("k_norm").get(head_dim, "weight")?;
+        let qk_w = Tensor::cat(&[&q_norm_w, &k_norm_w], 0)?.contiguous()?;
         Ok(Self {
-            q_proj: linear_maybe_bias(cfg.hidden_size, num_heads * head_dim, bias, vb.pp("q_proj"))?,
-            k_proj: linear_maybe_bias(cfg.hidden_size, num_kv_heads * head_dim, bias, vb.pp("k_proj"))?,
-            v_proj: linear_maybe_bias(cfg.hidden_size, num_kv_heads * head_dim, bias, vb.pp("v_proj"))?,
-            o_proj: linear_maybe_bias(num_heads * head_dim, cfg.hidden_size, bias, vb.pp("o_proj"))?,
+            qkv: Linear::new(qkv_w, qkv_b),
+            o_proj,
             q_norm: RmsNorm::new(q_norm_w, cfg.rms_norm_eps),
-            k_norm: candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?,
+            k_norm: RmsNorm::new(k_norm_w, cfg.rms_norm_eps),
+            qk_w,
             num_heads,
             num_kv_heads,
             num_kv_groups: num_heads / num_kv_heads,
             head_dim,
             hidden_size: head_dim * num_heads,
+            rms_eps: cfg.rms_norm_eps as f32,
         })
     }
 
-    /// Whether the fused flash-attention core applies to this tensor: the
-    /// FA2 kernels exist only in the `embed-cuda-flash` build and only for
-    /// f16/bf16 on CUDA. Everything else takes the unfused path.
+    /// Whether the flash-attention core applies to this tensor: FA2 kernels
+    /// exist only in the `embed-cuda-flash` build and only for f16/bf16 on
+    /// CUDA. Everything else takes the composed path.
     fn use_flash(x: &Tensor) -> bool {
         cfg!(feature = "embed-cuda-flash")
             && x.device().is_cuda()
             && matches!(x.dtype(), DType::BF16 | DType::F16)
+    }
+
+    /// Fully fused attention block: one QKV GEMM, one qk-norm+rope kernel,
+    /// flash-attention over zero-copy head views, one output GEMM.
+    #[cfg(feature = "embed-cuda-flash")]
+    fn forward_fused(&self, x: &Tensor, rotary: &Rotary, seq_len: usize) -> Result<Tensor> {
+        let (b, l, _) = x.dims3()?;
+        let (h, kv_h, d) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let qkv = x.apply(&self.qkv)?;
+        let cs = rotary.cos_sin.narrow(0, 0, seq_len)?;
+        let op = kernels::QkNormRope {
+            eps: self.rms_eps,
+            n_q: h as u32,
+            n_kv: kv_h as u32,
+            seq_len: seq_len as u32,
+        };
+        let qkvr = qkv
+            .apply_op3_no_bwd(&self.qk_w, &cs, &op)?
+            .reshape((b, l, h + 2 * kv_h, d))?;
+        let q = qkvr.narrow(2, 0, h)?;
+        let k = qkvr.narrow(2, h, kv_h)?;
+        let v = qkvr.narrow(2, h + kv_h, kv_h)?;
+        // Scale is folded into q_norm's weight, so softmax_scale = 1.
+        let ctx = candle_flash_attn::flash_attn(&q, &k, &v, 1.0, true)?;
+        ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
     }
 
     fn forward(&self, x: &Tensor, rotary: &Rotary, mask: Option<&Tensor>) -> Result<Tensor> {
@@ -187,9 +238,10 @@ impl Attention {
         let (h, kv_h, d) = (self.num_heads, self.num_kv_heads, self.head_dim);
         let g = self.num_kv_groups;
 
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let qkv = x.apply(&self.qkv)?;
+        let q = qkv.narrow(D::Minus1, 0, h * d)?.contiguous()?;
+        let k = qkv.narrow(D::Minus1, h * d, kv_h * d)?.contiguous()?;
+        let v = qkv.narrow(D::Minus1, (h + kv_h) * d, kv_h * d)?.contiguous()?;
 
         // Stay in the contiguous (b, l, heads, d) projection layout for the
         // per-head RMSNorm (Qwen3's signature detail; q_norm carries the
@@ -200,10 +252,8 @@ impl Attention {
         let (q, k) = rotary.apply_thd(&q, &k)?;
         let v = v.reshape((b, l, kv_h, d))?;
 
-        // Fused path: FA2 consumes the (b, l, heads, d) layout directly
-        // (GQA handled in-kernel), never materializes the (b, h, l, l)
-        // scores, and needs no mask, no transposes, and no scale (folded
-        // into q_norm, so softmax_scale = 1).
+        // Flash path without the custom kernels (e.g. f16): FA2 consumes the
+        // (b, l, heads, d) layout directly, GQA handled in-kernel, no mask.
         #[cfg(feature = "embed-cuda-flash")]
         if Self::use_flash(x) {
             let ctx = candle_flash_attn::flash_attn(&q, &k, &v, 1.0, true)?;
@@ -239,19 +289,23 @@ struct DecoderLayer {
     mlp: Mlp,
     ln1: RmsNorm,
     ln2: RmsNorm,
+    ln1_w: Tensor,
+    ln2_w: Tensor,
 }
 
 impl DecoderLayer {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let ln1_w = vb.pp("input_layernorm").get(cfg.hidden_size, "weight")?;
+        let ln2_w = vb
+            .pp("post_attention_layernorm")
+            .get(cfg.hidden_size, "weight")?;
         Ok(Self {
             self_attn: Attention::new(cfg, vb.pp("self_attn"))?,
             mlp: Mlp::new(cfg, vb.pp("mlp"))?,
-            ln1: candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
-            ln2: candle_nn::rms_norm(
-                cfg.hidden_size,
-                cfg.rms_norm_eps,
-                vb.pp("post_attention_layernorm"),
-            )?,
+            ln1: RmsNorm::new(ln1_w.clone(), cfg.rms_norm_eps),
+            ln2: RmsNorm::new(ln2_w.clone(), cfg.rms_norm_eps),
+            ln1_w,
+            ln2_w,
         })
     }
 
@@ -270,10 +324,13 @@ pub struct EmbeddingModel {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
+    norm_w: Tensor,
     rotary: Rotary,
     device: Device,
     dtype: DType,
     hidden_size: usize,
+    rms_eps: f64,
+    fused_ok: bool,
     /// Causal masks by sequence length. Batches are planned length-sorted,
     /// so lengths repeat heavily; without this the mask was rebuilt on the
     /// host and re-uploaded every batch.
@@ -296,14 +353,25 @@ impl EmbeddingModel {
         for i in 0..cfg.num_hidden_layers {
             layers.push(DecoderLayer::new(cfg, vb_l.pp(i))?);
         }
+        let norm_w = root.pp("norm").get(cfg.hidden_size, "weight")?;
+        // The fused kernels assume head_dim 128 (the whole Qwen3-Embedding
+        // family), bias-free projections, and even hidden/intermediate
+        // sizes for bf162 vectorization.
+        let fused_ok = cfg.head_dim() == 128
+            && !cfg.attention_bias
+            && cfg.hidden_size % 2 == 0
+            && cfg.intermediate_size % 2 == 0;
         Ok(Self {
             embed_tokens,
             layers,
-            norm: candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, root.pp("norm"))?,
+            norm: RmsNorm::new(norm_w.clone(), cfg.rms_norm_eps),
+            norm_w,
             rotary: Rotary::new(cfg, vb.dtype(), vb.device())?,
             device: vb.device().clone(),
             dtype: vb.dtype(),
             hidden_size: cfg.hidden_size,
+            rms_eps: cfg.rms_norm_eps,
+            fused_ok,
             mask_cache: Mutex::new(HashMap::new()),
         })
     }
@@ -323,6 +391,30 @@ impl EmbeddingModel {
         Ok(mask)
     }
 
+    /// Fused trunk: custom add+rmsnorm carries (residual, normed) across
+    /// blocks so no separate residual adds or norms ever touch DRAM alone.
+    #[cfg(feature = "embed-cuda-flash")]
+    fn forward_fused(&self, h0: Tensor, max_len: usize) -> Result<Tensor> {
+        let eps = self.rms_eps as f32;
+        let n = self.layers.len();
+        let mut res = h0.clone();
+        let mut normed =
+            h0.apply_op2_no_bwd(&self.layers[0].ln1_w, &kernels::RmsNormOnly { eps })?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let a = layer.self_attn.forward_fused(&normed, &self.rotary, max_len)?;
+            let both =
+                res.apply_op3_no_bwd(&a, &layer.ln2_w, &kernels::AddRmsNorm { eps })?;
+            res = both.i(0)?;
+            normed = both.i(1)?;
+            let m = layer.mlp.forward_fused(&normed)?;
+            let next_w = if i + 1 < n { &self.layers[i + 1].ln1_w } else { &self.norm_w };
+            let both = res.apply_op3_no_bwd(&m, next_w, &kernels::AddRmsNorm { eps })?;
+            res = both.i(0)?;
+            normed = both.i(1)?;
+        }
+        Ok(normed)
+    }
+
     /// Embed one right-padded batch. `rows` are token-id sequences (each
     /// already ending in EOS); returns unit-normalized f32 embeddings in
     /// row order, shape [rows.len(), hidden].
@@ -337,16 +429,14 @@ impl EmbeddingModel {
         let input = Tensor::from_vec(ids, (b, max_len), &self.device)?;
 
         let h0 = self.embed_tokens.forward(&input)?;
-        let mask = if Attention::use_flash(&h0) {
-            None // FA2 applies causality in-kernel; no materialized mask.
+        #[cfg(feature = "embed-cuda-flash")]
+        let h = if self.fused_ok && self.dtype == DType::BF16 && Attention::use_flash(&h0) {
+            self.forward_fused(h0, max_len)?
         } else {
-            Some(self.causal_mask(max_len)?)
+            self.forward_composed(h0, max_len)?
         };
-        let mut h = h0;
-        for layer in &self.layers {
-            h = layer.forward(&h, &self.rotary, mask.as_ref())?;
-        }
-        let h = self.norm.forward(&h)?;
+        #[cfg(not(feature = "embed-cuda-flash"))]
+        let h = self.forward_composed(h0, max_len)?;
 
         // Last-token pooling at each row's final real position, then L2
         // normalization — all batched on-device. The per-row formulation
@@ -367,5 +457,18 @@ impl EmbeddingModel {
         debug_assert!(out.iter().all(|v| v.len() == self.hidden_size));
         Ok(out)
     }
-}
 
+    /// The composed-op trunk (reference path: CPU, f32, or non-flash builds).
+    fn forward_composed(&self, h0: Tensor, max_len: usize) -> Result<Tensor> {
+        let mask = if Attention::use_flash(&h0) {
+            None // FA2 applies causality in-kernel; no materialized mask.
+        } else {
+            Some(self.causal_mask(max_len)?)
+        };
+        let mut h = h0;
+        for layer in &self.layers {
+            h = layer.forward(&h, &self.rotary, mask.as_ref())?;
+        }
+        self.norm.forward(&h)
+    }
+}

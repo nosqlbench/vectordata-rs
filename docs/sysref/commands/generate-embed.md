@@ -11,9 +11,12 @@ Feature-gated: build with `--features embed` (CPU), or `--features
 embed-cuda` for CUDA hosts (A100/H100-class), where `device: cuda` with
 `dtype: bf16` and a large `batch-size` is the intended full-scale
 configuration. `--features embed-cuda-flash` additionally compiles the
-fused flash-attention (FA2) attention core, used automatically on CUDA
-with f16/bf16 — it never materializes the (b, h, l, l) score tensor the
-unfused path is bandwidth-bound on (verified on Blackwell sm120).
+fused flash-attention (FA2) attention core plus three custom fused
+kernels (residual-add+rmsnorm, silu·mul, per-head qk-norm+rope; PTX via
+build.rs, needs nvcc), used automatically on CUDA with bf16. The fused
+path never materializes the (b, h, l, l) score tensor, runs the custom
+kernels at 92–94% of DRAM bandwidth, and leaves the GEMMs (~2/3 of GPU
+time) at cuBLAS-peak 83–84% SM throughput (measured on Blackwell sm120).
 
 ## Usage (pipeline step)
 

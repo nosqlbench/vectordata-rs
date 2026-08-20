@@ -14,6 +14,8 @@
 //! (`embed-cuda`) plus `device: cuda` — sized for A100/H100-class hosts at
 //! full-corpus scale, while CPU covers pilot-scale runs.
 
+#[cfg(feature = "embed-cuda-flash")]
+mod kernels;
 mod qwen3;
 
 use std::collections::HashMap;

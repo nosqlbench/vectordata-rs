@@ -63,4 +63,21 @@ fn main() {
     // Rebuild if git HEAD changes (new commit)
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/refs/");
+
+    // Compile the fused CUDA kernels for `generate embed` to PTX when the
+    // embed-cuda-flash feature is enabled. PTX is emitted for compute_80
+    // (the bf16-intrinsic floor) and JIT-compiled forward by the driver,
+    // the same portability contract the FA2 kernels rely on (verified on
+    // sm120).
+    if std::env::var("CARGO_FEATURE_EMBED_CUDA_FLASH").is_ok() {
+        let src = "src/pipeline/commands/gen_embed/kernels.cu";
+        println!("cargo:rerun-if-changed={src}");
+        let out = format!("{}/gen_embed_kernels.ptx", std::env::var("OUT_DIR").unwrap());
+        let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
+        let status = std::process::Command::new(&nvcc)
+            .args(["--ptx", "--use_fast_math", "-arch=compute_80", "-o", &out, src])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run {nvcc} (needed by embed-cuda-flash): {e}"));
+        assert!(status.success(), "nvcc failed compiling {src}");
+    }
 }
