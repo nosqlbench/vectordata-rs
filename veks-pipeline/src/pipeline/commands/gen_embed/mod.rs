@@ -28,7 +28,7 @@ use crate::pipeline::command::{
 };
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
-use hf_hub::{Repo, RepoType, api::sync::Api};
+use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 
 /// Pipeline command: candle-backed text embedding.
 pub struct GenerateEmbedOp;
@@ -387,7 +387,12 @@ struct ModelFiles {
 /// when already cached). Single-file weights cover the Qwen3-Embedding
 /// sizes this command targets.
 fn fetch_model_files(model_id: &str, revision: &str) -> Result<ModelFiles, String> {
-    let api = Api::new().map_err(|e| format!("hf api: {}", e))?;
+    // ApiBuilder::from_env, not Api::new: only the former honors HF_HOME
+    // (Api::new hardcodes ~/.cache/huggingface/hub), and the shared-cache
+    // contract documented for this command depends on it.
+    let api = ApiBuilder::from_env()
+        .build()
+        .map_err(|e| format!("hf api: {}", e))?;
     let repo = api.repo(Repo::with_revision(
         model_id.to_string(),
         RepoType::Model,
