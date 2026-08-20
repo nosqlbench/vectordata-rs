@@ -611,8 +611,9 @@ fn select_files(urls: &[String], selector: &FileSelector) -> Vec<(String, String
 }
 
 /// Simple glob matching supporting `*` and `?` (same as `download
-/// huggingface`).
-fn glob_match(pattern: &str, text: &str) -> bool {
+/// huggingface`). Shared with `generate passages`' `files` selector so both
+/// commands select over basenames with identical semantics.
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
         return true;
     }

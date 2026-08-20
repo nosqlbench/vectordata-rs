@@ -221,7 +221,11 @@ offsets into the source document text.
         };
         let seed = rng::parse_seed(options.get("seed"));
 
-        let shards = match enumerate_shards(&source) {
+        let files_selector = options.get("files").unwrap_or("all").to_string();
+
+        let shards = match enumerate_shards(&source)
+            .and_then(|s| select_shards(s, &files_selector))
+        {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -460,6 +464,17 @@ offsets into the source document text.
                 role: OptionRole::Output,
             },
             OptionDesc {
+                name: "files".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: Some("all".to_string()),
+                description: "Shard selection over lexically-sorted basenames: first:N (strict), \
+                              a glob, or all — same semantics as download s2ag"
+                    .to_string(),
+                extended_description: None,
+                role: OptionRole::Config,
+            },
+            OptionDesc {
                 name: "doc-limit".to_string(),
                 type_name: "int".to_string(),
                 required: false,
@@ -560,10 +575,51 @@ offsets into the source document text.
 
 // ── Shard enumeration and streaming ──────────────────────────────────────
 
+/// Apply the `files` selector over lexically-sorted shard basenames —
+/// `first:N` (strict: fewer than N present is an error, since a silent
+/// shortfall would change the parent set), a glob, or `all`. Same selector
+/// semantics as `download s2ag`, so a chunk step can name exactly the shard
+/// subset a download step fetched.
+pub(crate) fn select_shards(shards: Vec<PathBuf>, selector: &str) -> Result<Vec<PathBuf>, String> {
+    if selector == "all" {
+        return Ok(shards);
+    }
+    if let Some(n) = selector.strip_prefix("first:") {
+        let n: usize = match n.parse() {
+            Ok(n) if n > 0 => n,
+            _ => return Err(format!("invalid files selector '{}': first:N needs N > 0", selector)),
+        };
+        if shards.len() < n {
+            return Err(format!(
+                "files selector 'first:{}' but only {} shard(s) present — \
+                 a silent shortfall would change the parent set",
+                n,
+                shards.len()
+            ));
+        }
+        return Ok(shards.into_iter().take(n).collect());
+    }
+    if selector.is_empty() {
+        return Err("empty files selector".to_string());
+    }
+    let filtered: Vec<PathBuf> = shards
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|b| super::fetch_s2ag::glob_match(selector, b))
+        })
+        .collect();
+    if filtered.is_empty() {
+        return Err(format!("files selector '{}' matched no shards", selector));
+    }
+    Ok(filtered)
+}
+
 /// List shard files: a file source is itself; a directory yields its
 /// `.jsonl` / `.jsonl.gz` / `.gz` entries in lexical filename order
 /// (that order is part of the deterministic selection rule).
-fn enumerate_shards(source: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn enumerate_shards(source: &Path) -> Result<Vec<PathBuf>, String> {
     if source.is_file() {
         return Ok(vec![source.to_path_buf()]);
     }
@@ -589,7 +645,7 @@ fn enumerate_shards(source: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 /// Open a shard as a buffered line reader, transparently gunzipping `.gz`.
-fn open_shard(path: &Path) -> Result<BufReader<Box<dyn Read>>, String> {
+pub(crate) fn open_shard(path: &Path) -> Result<BufReader<Box<dyn Read>>, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
     let inner: Box<dyn Read> = if path.extension().is_some_and(|e| e == "gz") {
@@ -1352,5 +1408,29 @@ mod tests {
         assert_eq!(result.status, Status::Error);
         let (result, ..) = run(tmp.path(), &[("max-words", "2")]);
         assert_eq!(result.status, Status::Error);
+    }
+
+    #[test]
+    fn select_shards_first_n_glob_and_strictness() {
+        let mk = |names: &[&str]| -> Vec<PathBuf> {
+            names.iter().map(PathBuf::from).collect()
+        };
+        let shards = mk(&["a.jsonl.gz", "b.jsonl.gz", "c.jsonl"]);
+        // all passes through unchanged.
+        assert_eq!(select_shards(shards.clone(), "all").unwrap(), shards);
+        // first:N takes the lexical prefix.
+        assert_eq!(
+            select_shards(shards.clone(), "first:2").unwrap(),
+            mk(&["a.jsonl.gz", "b.jsonl.gz"])
+        );
+        // first:N beyond what exists is an error, not a silent shortfall.
+        assert!(select_shards(shards.clone(), "first:4").is_err());
+        assert!(select_shards(shards.clone(), "first:0").is_err());
+        // Globs filter over basenames; no match is an error.
+        assert_eq!(
+            select_shards(shards.clone(), "*.jsonl.gz").unwrap(),
+            mk(&["a.jsonl.gz", "b.jsonl.gz"])
+        );
+        assert!(select_shards(shards, "z*").is_err());
     }
 }

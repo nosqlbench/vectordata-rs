@@ -30,6 +30,7 @@ Every option that changes output bytes is a provenance axis.
 | Option | Required | Description |
 |--------|----------|-------------|
 | `--source` | yes | s2orc-format JSONL(.gz) shard file or directory of shards |
+| `--files` | no | Shard selection over lexically-sorted basenames: `first:N` (strict — fewer than N present is an error), a glob, or `all` (default); same semantics as `download s2ag`, so a chunk step can name exactly the shard subset a download step fetched |
 | `--output` | yes | Output `passages.parquet` path |
 | `--parents` | no | Parent-manifest parquet path (default: `parents.parquet` beside output) |
 | `--doc-limit` | no | Select the N lowest corpusids with non-empty body text (default: all) |
