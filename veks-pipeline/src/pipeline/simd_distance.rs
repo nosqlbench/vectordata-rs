@@ -243,35 +243,184 @@ pub fn select_distance_fn_f16(metric: Metric) -> fn(&[half::f16], &[half::f16]) 
     }
 }
 
-/// Reinterpret a `&[half::f16]` slice as `&[simsimd::f16]`.
+/// Explicit f16 kernel selection: `f16` is a storage format here, never an
+/// accumulation format.
 ///
-/// # Safety
+/// SimSIMD dispatches each datatype to the widest kernel the CPU offers.
+/// For `f16` that is a trap: on hosts with native half-precision arithmetic
+/// (x86 `sapphire` = AVX-512-FP16, ARM `neon_f16`/`sve_f16`) its f16 kernels
+/// accumulate **in f16**, which breaks ground truth two ways —
 ///
-/// Both types are `#[repr(transparent)]` wrappers around `u16` with identical
-/// IEEE 754 half-precision layout, so this pointer cast is sound.
-unsafe fn as_simsimd_f16(s: &[half::f16]) -> &[simsimd::f16] {
-    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const simsimd::f16, s.len()) }
+/// * results land on the f16 grid: ~5e-4 relative error where an f32
+///   accumulator gives ~6e-8. Measured at dim 1024, that misorders ~1.4% of
+///   a top-100 and collapses distinct distances into ties (42 distinct
+///   values in a top-100 that has 100 in exact arithmetic), which then makes
+///   ordering depend on scan order;
+/// * anything above `f16::MAX` (65504) saturates: an exact L2sq of 81375
+///   comes back `inf`.
+///
+/// Every other capability converts to f32 and accumulates there, so rather
+/// than depend on which CPU we happen to run on, we state the requirement
+/// as policy — "any kernel except the native-f16 ones" — and then honour
+/// the capability SimSIMD reports back rather than the one we asked for.
+///
+/// The cost is the AVX-512-FP16 path: selection lands on `haswell` (AVX2 +
+/// F16C, eight lanes converted to f32) instead, narrower but correct —
+/// measured at 4.1 vs 8.2 Mdist/s for dim-1024 L2sq on Emerald Rapids, so
+/// roughly half throughput for f16 distances on hosts that have the native
+/// kernel at all. Ground truth is the one artifact that must not vary with
+/// the CPU it was computed on, so this is the right side of that trade.
+///
+/// REMINDER — if this ever needs owning outright: the constants below mirror
+/// SimSIMD's public C enums *by value*, so an upstream renumbering would
+/// mis-dispatch silently. The guard is
+/// `f16_dispatch_avoids_f16_accumulation`, which asserts on computed results
+/// rather than on the constants, so drift fails loudly. The escape hatch is
+/// to write these kernels in-repo exactly as `l1_f16_avx2` / `l1_f16_avx512`
+/// below already do (F16C convert, f32 FMA) and drop SimSIMD for f16
+/// entirely; that also removes the `extern "C"` coupling to a static library
+/// built by a dependency's build script.
+mod f16_kernel {
+    use std::sync::OnceLock;
+
+    /// A punned SimSIMD dense-metric kernel: `(a, b, count, out)`.
+    pub type Kernel = unsafe extern "C" fn(*const u16, *const u16, usize, *mut f64);
+
+    // Exported by the C library the `simsimd` crate compiles. They are
+    // linkable only because that build sets `SIMSIMD_DYNAMIC_DISPATCH=1`;
+    // without it these are header-only `inline static` and this fails to
+    // link — loudly, at build time, which is the failure mode we want.
+    unsafe extern "C" {
+        fn simsimd_capabilities() -> u32;
+        fn simsimd_find_kernel_punned(
+            kind: u32,
+            datatype: u32,
+            supported: u32,
+            allowed: u32,
+            kernel_out: *mut Option<Kernel>,
+            capability_out: *mut u32,
+        );
+    }
+
+    // SimSIMD public enum values (simsimd.h).
+    pub const METRIC_DOT: u32 = b'i' as u32;
+    pub const METRIC_COS: u32 = b'c' as u32;
+    pub const METRIC_L2SQ: u32 = b'e' as u32;
+    const DATATYPE_F16: u32 = 1 << 12;
+    const CAP_ANY: u32 = 0x7FFF_FFFF;
+    const CAP_SAPPHIRE: u32 = 1 << 14;
+    const CAP_NEON_F16: u32 = 1 << 21;
+    const CAP_SVE_F16: u32 = 1 << 25;
+    /// Every capability whose f16 kernels accumulate in f16.
+    pub const CAP_NATIVE_F16: u32 = CAP_SAPPHIRE | CAP_NEON_F16 | CAP_SVE_F16;
+
+    /// Ask for the widest f16 kernel that accumulates in at least f32, and
+    /// verify what came back. `None` means SimSIMD had nothing acceptable,
+    /// and the caller uses the in-repo scalar kernel instead.
+    pub fn select(kind: u32) -> Option<Kernel> {
+        let (mut kernel, mut capability) = (None, 0u32);
+        unsafe {
+            simsimd_find_kernel_punned(
+                kind,
+                DATATYPE_F16,
+                simsimd_capabilities(),
+                CAP_ANY & !CAP_NATIVE_F16,
+                &mut kernel,
+                &mut capability,
+            );
+        }
+        // Fail closed on the receipt, not the request: if a native-f16
+        // kernel came back anyway, refuse it.
+        if capability & CAP_NATIVE_F16 != 0 {
+            return None;
+        }
+        kernel
+    }
+
+    /// Cached selection — the lookup walks a dispatch table, so it must not
+    /// run per distance evaluation.
+    pub fn cached(kind: u32) -> Option<Kernel> {
+        static DOT: OnceLock<Option<Kernel>> = OnceLock::new();
+        static COS: OnceLock<Option<Kernel>> = OnceLock::new();
+        static L2SQ: OnceLock<Option<Kernel>> = OnceLock::new();
+        let slot = match kind {
+            METRIC_DOT => &DOT,
+            METRIC_COS => &COS,
+            _ => &L2SQ,
+        };
+        *slot.get_or_init(|| select(kind))
+    }
+
+    /// Run a selected kernel over two same-length slices.
+    pub fn eval(kernel: Kernel, a: &[half::f16], b: &[half::f16]) -> f64 {
+        let mut out = 0.0f64;
+        // SAFETY: `half::f16` is a `#[repr(transparent)]` u16 with IEEE 754
+        // half layout, and the kernel reads `a.len()` elements from each.
+        unsafe {
+            kernel(a.as_ptr() as *const u16, b.as_ptr() as *const u16, a.len(), &mut out);
+        }
+        out
+    }
+}
+
+/// Squared L2 in f32 — the fallback when no acceptable SimSIMD kernel
+/// exists, and the reference the dispatch guard checks against.
+fn l2sq_f16_scalar(a: &[half::f16], b: &[half::f16]) -> f32 {
+    let mut sum = 0.0f32;
+    for i in 0..a.len() {
+        let d = a[i].to_f32() - b[i].to_f32();
+        sum += d * d;
+    }
+    sum
+}
+
+/// Dot product in f32 (positive sense; callers negate for distance).
+fn dot_f16_scalar(a: &[half::f16], b: &[half::f16]) -> f32 {
+    let mut sum = 0.0f32;
+    for i in 0..a.len() {
+        sum += a[i].to_f32() * b[i].to_f32();
+    }
+    sum
+}
+
+/// Cosine *distance* in f32, matching SimSIMD's definition exactly:
+/// `1 - ab/(|a||b|)`, clipped at zero, with its two degenerate cases.
+fn cos_f16_scalar(a: &[half::f16], b: &[half::f16]) -> f32 {
+    let (mut ab, mut a2, mut b2) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..a.len() {
+        let (ai, bi) = (a[i].to_f32(), b[i].to_f32());
+        ab += ai * bi;
+        a2 += ai * ai;
+        b2 += bi * bi;
+    }
+    if a2 == 0.0 && b2 == 0.0 {
+        return 0.0;
+    }
+    if ab == 0.0 {
+        return 1.0;
+    }
+    (1.0 - ab / (a2.sqrt() * b2.sqrt())).max(0.0)
 }
 
 fn select_l2_f16() -> fn(&[half::f16], &[half::f16]) -> f32 {
     // Use squared L2 — sqrt is monotonic so ordering is preserved for KNN.
-    |a, b| {
-        let (sa, sb) = unsafe { (as_simsimd_f16(a), as_simsimd_f16(b)) };
-        <simsimd::f16 as SpatialSimilarity>::l2sq(sa, sb).unwrap_or(0.0) as f32
+    |a, b| match f16_kernel::cached(f16_kernel::METRIC_L2SQ) {
+        Some(k) => f16_kernel::eval(k, a, b) as f32,
+        None => l2sq_f16_scalar(a, b),
     }
 }
 
 fn select_cosine_f16() -> fn(&[half::f16], &[half::f16]) -> f32 {
-    |a, b| {
-        let (sa, sb) = unsafe { (as_simsimd_f16(a), as_simsimd_f16(b)) };
-        <simsimd::f16 as SpatialSimilarity>::cos(sa, sb).unwrap_or(1.0) as f32
+    |a, b| match f16_kernel::cached(f16_kernel::METRIC_COS) {
+        Some(k) => f16_kernel::eval(k, a, b) as f32,
+        None => cos_f16_scalar(a, b),
     }
 }
 
 fn select_dot_product_f16() -> fn(&[half::f16], &[half::f16]) -> f32 {
-    |a, b| {
-        let (sa, sb) = unsafe { (as_simsimd_f16(a), as_simsimd_f16(b)) };
-        -(<simsimd::f16 as SpatialSimilarity>::dot(sa, sb).unwrap_or(0.0) as f32)
+    |a, b| match f16_kernel::cached(f16_kernel::METRIC_DOT) {
+        Some(k) => -(f16_kernel::eval(k, a, b) as f32),
+        None => -dot_f16_scalar(a, b),
     }
 }
 
@@ -2007,6 +2156,48 @@ mod tests {
             (scalar - simd).abs() < 0.5,
             "f16 L1 mismatch: scalar={}, simd={}",
             scalar, simd
+        );
+    }
+
+    /// Guard for the f16 dispatch policy in `f16_kernel`.
+    ///
+    /// This deliberately asserts on *computed results*, not on the mirrored
+    /// SimSIMD enum constants: if an upstream renumbering made us request
+    /// the wrong metric, datatype, or capability mask, the numbers below
+    /// stop matching and this fails loudly rather than silently restoring
+    /// f16 accumulation. The two symptoms it pins are exactly the ones that
+    /// motivated the policy — saturation past `f16::MAX`, and grid
+    /// quantization of the result.
+    #[test]
+    fn f16_dispatch_avoids_f16_accumulation() {
+        // 1. Saturation: sum of i^2 for i in 0..63 = 81375, past f16::MAX
+        //    (65504). An f16 accumulator returns inf here.
+        let n = 63;
+        let a: Vec<half::f16> = (0..n).map(|i| half::f16::from_f32(i as f32)).collect();
+        let b: Vec<half::f16> = (0..n).map(|i| half::f16::from_f32(i as f32 * 2.0)).collect();
+        let l2sq = select_distance_fn_f16(Metric::L2)(&a, &b);
+        assert!(l2sq.is_finite(), "f16 L2sq saturated: {l2sq}");
+        assert!(
+            (l2sq - 81375.0).abs() < 1.0,
+            "f16 L2sq lost precision: got {l2sq}, expected 81375"
+        );
+
+        // 2. Quantization: a dot product whose exact value sits between
+        //    f16 grid points. At |result| ~ 9750 the f16 spacing is 8, so
+        //    an f16 accumulator cannot land within 1.0 of the true value.
+        let mut x: Vec<half::f16> = Vec::with_capacity(128);
+        let mut y: Vec<half::f16> = Vec::with_capacity(128);
+        for i in 0..128 {
+            x.push(half::f16::from_f32(((i % 17) as f32) - 8.5));
+            y.push(half::f16::from_f32(((i % 23) as f32) - 11.25));
+        }
+        let exact: f32 = x.iter().zip(&y).map(|(p, q)| p.to_f32() * q.to_f32()).sum();
+        // select_dot_product_f16 negates for distance ordering.
+        let got = -select_distance_fn_f16(Metric::DotProduct)(&x, &y);
+        let tol = exact.abs() * 1e-5 + 1e-3;
+        assert!(
+            (got - exact).abs() <= tol,
+            "f16 dot outside f32-grade tolerance: got {got}, exact {exact}, tol {tol}"
         );
     }
 
