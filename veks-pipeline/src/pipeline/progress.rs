@@ -486,9 +486,71 @@ fn resolve_path(value: &str, workspace: Option<&Path>) -> PathBuf {
     }
 }
 
+/// Render a produced path for storage in a step record: the inverse of
+/// [`resolve_path`], so what freshness checks resolve is exactly what was
+/// recorded.
+///
+/// Paths must be stored **workspace-relative**, not relative to whatever
+/// directory the pipeline happened to be launched from. A CWD-relative
+/// record makes a step look stale purely because it is re-run from
+/// elsewhere — the recorded `ds/.cache/vectors.npy` resolves against a
+/// workspace of `.` to `./ds/.cache/vectors.npy`, which does not exist,
+/// and a completed step recomputes for no reason.
+///
+/// Outputs written outside the workspace keep their absolute path, which
+/// `resolve_path` passes through unchanged.
+pub fn record_path(path: &Path, workspace: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(workspace) {
+        return rel.to_string_lossy().into_owned();
+    }
+    // `.`-prefixed workspaces, symlinks, and `..` segments defeat a literal
+    // prefix strip; compare resolved forms before giving up. The output
+    // exists at this point (it was just written), so canonicalize succeeds.
+    if let (Ok(canonical_path), Ok(canonical_ws)) =
+        (std::fs::canonicalize(path), std::fs::canonicalize(workspace))
+        && let Ok(rel) = canonical_path.strip_prefix(&canonical_ws)
+    {
+        return rel.to_string_lossy().into_owned();
+    }
+    path.to_string_lossy().into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `record_path` must be the exact inverse of `resolve_path`, because a
+    /// freshness check resolves what was recorded. Recording relative to the
+    /// launch directory instead made a finished step look stale whenever it
+    /// was re-run from a different one.
+    #[test]
+    fn record_path_is_workspace_relative_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ds");
+        std::fs::create_dir_all(ws.join(".cache")).unwrap();
+        let produced = ws.join(".cache/vectors.npy");
+        std::fs::write(&produced, b"x").unwrap();
+
+        // Recorded workspace-relative, whatever the workspace looks like.
+        let recorded = record_path(&produced, &ws);
+        assert_eq!(recorded, ".cache/vectors.npy");
+
+        // And resolving it against the workspace finds the file again.
+        let resolved = resolve_path(&recorded, Some(&ws));
+        assert!(resolved.exists(), "round trip lost the file: {resolved:?}");
+
+        // A workspace spelled with `.` segments still strips correctly.
+        let dotted = ws.join("./.");
+        assert_eq!(record_path(&produced, &dotted), ".cache/vectors.npy");
+
+        // Outputs outside the workspace keep an absolute path, which
+        // resolve_path passes through unchanged.
+        let outside = tmp.path().join("elsewhere.npy");
+        std::fs::write(&outside, b"y").unwrap();
+        let recorded_outside = record_path(&outside, &ws);
+        assert_eq!(recorded_outside, outside.to_string_lossy());
+        assert!(resolve_path(&recorded_outside, Some(&ws)).exists());
+    }
 
     fn rec(provenance: Option<ProvenanceMap>) -> StepRecord {
         StepRecord {

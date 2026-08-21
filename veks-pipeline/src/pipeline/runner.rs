@@ -635,7 +635,7 @@ pub fn run_steps(
 
         // 8. Record result with the original (unmunged) options
         ctx.ui.clear();
-        let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(provenance.clone()));
+        let record = step_record_from_result(&result, &resolved_opts, &ctx.workspace, resource_summary, Some(provenance.clone()));
         ctx.progress.record_step(&step.id, record);
 
         // If this step modified files that were outputs of previous steps
@@ -643,7 +643,7 @@ pub fn run_steps(
         // stored sizes in those earlier step records so freshness checks
         // don't flag them as stale.
         for produced_path in &result.produced {
-            let rel = veks_core::paths::rel_display(produced_path);
+            let rel = super::progress::record_path(produced_path, &ctx.workspace);
             if let Ok(meta) = std::fs::metadata(produced_path) {
                 ctx.progress.update_output_size(&rel, meta.len());
             }
@@ -825,6 +825,7 @@ pub fn run_steps(
 fn step_record_from_result(
     result: &CommandResult,
     resolved_opts: &indexmap::IndexMap<String, String>,
+    workspace: &std::path::Path,
     resource_summary: Option<ResourceSummary>,
     provenance: Option<ProvenanceMap>,
 ) -> StepRecord {
@@ -842,7 +843,7 @@ fn step_record_from_result(
                     Some(dt.to_rfc3339())
                 });
             OutputRecord {
-                path: veks_core::paths::rel_display(p),
+                path: super::progress::record_path(p, workspace),
                 size,
                 mtime,
             }
