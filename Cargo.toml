@@ -40,6 +40,7 @@ knnutils = ["veks/knnutils"]
 faiss = ["veks/faiss"]
 embed = ["veks/embed"]
 embed-cuda = ["veks/embed-cuda"]
+embed-cuda-flash = ["veks/embed-cuda-flash"]
 
 [lints]
 workspace = true
