@@ -1190,6 +1190,7 @@ fn explain_staleness(
             &step.def.options,
             &ctx.defaults,
             &ctx.workspace,
+            interpolate::PathBase::WorkspaceRelative,
         ) {
             Ok(o) => o,
             Err(e) => {
@@ -1603,6 +1604,7 @@ fn resolve_pipeline_yaml(
             &step.def.options,
             defaults,
             workspace,
+            interpolate::PathBase::Joined,
         )
         .map_err(|e| format!("step '{}': {}", step.id, e))?;
 

@@ -21,21 +21,48 @@
 //! - `${dataset_dir}` — directory containing the dataset.yaml
 //! - `${workspace}` — same as dataset_dir (alias)
 //! - `${cache}` — reusable cache directory (`<workspace>/.cache`)
+//!
+//! Path variables expand per [`PathBase`]: workspace-relative for values a
+//! command will re-resolve against the workspace, joined for standalone
+//! emitted artifacts.
 
 use std::path::Path;
 
 use indexmap::IndexMap;
 
+/// How the implicit path variables (`${cache}`, `${workspace}`,
+/// `${dataset_dir}`) expand.
+///
+/// The two modes exist because two consumers need different things from the
+/// same template, and conflating them is what produced `<ws>/<ws>/.cache`
+/// paths when a pipeline ran from a parent directory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathBase {
+    /// Expand workspace-relative (`.cache`, `.`). Correct for values a
+    /// command will receive as an option and re-resolve against the
+    /// workspace itself — which is every executed step, and therefore also
+    /// the staleness comparison and artifact projection that must match it.
+    /// Independent of the invoking directory, so recorded options stay
+    /// stable.
+    WorkspaceRelative,
+    /// Expand joined onto the workspace. Correct for standalone artifacts —
+    /// emitted YAML or shell scripts — where nothing re-resolves the path
+    /// afterwards, so it has to be complete on its own.
+    Joined,
+}
+
 /// Interpolate `${...}` patterns in the given string.
 ///
 /// Looks up variable names in `defaults` first, then checks for special
 /// prefixes (`env:`). Supports `${name:-fallback}` default values.
+/// `base` selects how the implicit path variables expand.
 ///
 /// Returns an error if a required variable is not found and has no fallback.
 pub fn interpolate(
     input: &str,
     defaults: &IndexMap<String, String>,
     workspace: &Path,
+    base: PathBase,
 ) -> Result<String, String> {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -63,7 +90,7 @@ pub fn interpolate(
             if depth != 0 {
                 return Err(format!("unclosed variable expression in: {}", input));
             }
-            let resolved = resolve_var(&var_expr, defaults, workspace)?;
+            let resolved = resolve_var(&var_expr, defaults, workspace, base)?;
             result.push_str(&resolved);
         } else {
             result.push(ch);
@@ -78,6 +105,7 @@ fn resolve_var(
     expr: &str,
     defaults: &IndexMap<String, String>,
     workspace: &Path,
+    base: PathBase,
 ) -> Result<String, String> {
     // Split on `:-` for default value
     let (name, fallback) = if let Some(idx) = expr.find(":-") {
@@ -116,13 +144,39 @@ fn resolve_var(
         };
     }
 
-    // Check implicit variables
+    // Check implicit variables.
+    //
+    // These expand to **workspace-relative** paths, matching every literal
+    // path in `dataset.yaml` (`profiles/base/base_vectors.fvecs` and the
+    // like) and the `resolve_path(value, &ctx.workspace)` that each command
+    // applies to its path options. Expanding them workspace-*joined*
+    // instead produced a CWD-relative string that commands then re-based
+    // onto the workspace, so running a dataset from a parent directory
+    // wrote `<ws>/<ws>/.cache/...`; it only looked correct because the
+    // second join is a no-op when the workspace is absolute or is `.`,
+    // which is how datasets are usually run.
+    //
+    // Being workspace-relative also makes the expansion independent of the
+    // invoking directory, so the resolved options recorded in provenance no
+    // longer change purely because the pipeline was launched from somewhere
+    // else. Note that this does not by itself make staleness
+    // invocation-independent: the progress log still records each output at
+    // its run-time-resolved path, so a step whose first run was launched
+    // from a parent directory is still reported stale when re-run from
+    // inside the dataset. That is a smaller, separate issue — a spurious
+    // recompute rather than a write to the wrong place.
     match name {
         "dataset_dir" | "workspace" => {
-            return Ok(workspace.to_string_lossy().into_owned());
+            return Ok(match base {
+                PathBase::WorkspaceRelative => ".".to_string(),
+                PathBase::Joined => workspace.to_string_lossy().into_owned(),
+            });
         }
         "cache" => {
-            return Ok(workspace.join(".cache").to_string_lossy().into_owned());
+            return Ok(match base {
+                PathBase::WorkspaceRelative => ".cache".to_string(),
+                PathBase::Joined => workspace.join(".cache").to_string_lossy().into_owned(),
+            });
         }
         _ => {}
     }
@@ -146,6 +200,7 @@ pub fn interpolate_options(
     options: &IndexMap<String, serde_yaml::Value>,
     defaults: &IndexMap<String, String>,
     workspace: &Path,
+    base: PathBase,
 ) -> Result<IndexMap<String, String>, String> {
     let mut resolved = IndexMap::new();
     for (key, value) in options {
@@ -156,7 +211,7 @@ pub fn interpolate_options(
             serde_yaml::Value::Null => continue,
             other => format!("{:?}", other),
         };
-        let interpolated = interpolate(&raw, defaults, workspace)
+        let interpolated = interpolate(&raw, defaults, workspace, base)
             .map_err(|e| format!("in option '{}': {}", key, e))?;
         resolved.insert(key.clone(), interpolated);
     }
@@ -176,44 +231,92 @@ mod tests {
 
     #[test]
     fn test_simple_substitution() {
-        let result = interpolate("seed=${seed}", &defaults(), Path::new("/data")).unwrap();
+        let result = interpolate("seed=${seed}", &defaults(), Path::new("/data"), PathBase::WorkspaceRelative).unwrap();
         assert_eq!(result, "seed=42");
     }
 
     #[test]
     fn test_multiple_vars() {
         let result =
-            interpolate("${seed}-${metric}", &defaults(), Path::new("/data")).unwrap();
+            interpolate("${seed}-${metric}", &defaults(), Path::new("/data"), PathBase::WorkspaceRelative).unwrap();
         assert_eq!(result, "42-COSINE");
     }
 
     #[test]
     fn test_fallback() {
         let result =
-            interpolate("${missing:-default_val}", &defaults(), Path::new("/data")).unwrap();
+            interpolate("${missing:-default_val}", &defaults(), Path::new("/data"), PathBase::WorkspaceRelative).unwrap();
         assert_eq!(result, "default_val");
     }
 
     #[test]
     fn test_missing_var_error() {
-        let result = interpolate("${missing}", &defaults(), Path::new("/data"));
+        let result = interpolate("${missing}", &defaults(), Path::new("/data"), PathBase::WorkspaceRelative);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not defined"));
     }
 
     #[test]
     fn test_workspace_implicit() {
-        let result =
-            interpolate("dir=${workspace}", &defaults(), Path::new("/my/data")).unwrap();
-        assert_eq!(result, "dir=/my/data");
+        // Joined for standalone emission, `.` for values a command will
+        // re-resolve against the workspace itself.
+        let joined =
+            interpolate("dir=${workspace}", &defaults(), Path::new("/my/data"), PathBase::Joined)
+                .unwrap();
+        assert_eq!(joined, "dir=/my/data");
+        let relative = interpolate(
+            "dir=${workspace}",
+            &defaults(),
+            Path::new("/my/data"),
+            PathBase::WorkspaceRelative,
+        )
+        .unwrap();
+        assert_eq!(relative, "dir=.");
     }
 
     #[test]
     fn test_dataset_dir_implicit() {
-        let result =
-            interpolate("${dataset_dir}/file.fvec", &defaults(), Path::new("/my/data"))
-                .unwrap();
-        assert_eq!(result, "/my/data/file.fvec");
+        let joined = interpolate(
+            "${dataset_dir}/file.fvec",
+            &defaults(),
+            Path::new("/my/data"),
+            PathBase::Joined,
+        )
+        .unwrap();
+        assert_eq!(joined, "/my/data/file.fvec");
+        let relative = interpolate(
+            "${dataset_dir}/file.fvec",
+            &defaults(),
+            Path::new("/my/data"),
+            PathBase::WorkspaceRelative,
+        )
+        .unwrap();
+        assert_eq!(relative, "./file.fvec");
+    }
+
+    /// The doubling regression: a workspace-relative expansion must stay
+    /// independent of the workspace, because the command re-bases it. With
+    /// the old joined-only behaviour this produced `datasets/d/.cache/...`,
+    /// which `resolve_path` then turned into
+    /// `datasets/d/datasets/d/.cache/...`.
+    #[test]
+    fn test_cache_expansion_survives_re_resolution() {
+        let ws = Path::new("datasets/d");
+        let value = interpolate(
+            "${cache}/all_vectors.fvecs",
+            &defaults(),
+            ws,
+            PathBase::WorkspaceRelative,
+        )
+        .unwrap();
+        assert_eq!(value, ".cache/all_vectors.fvecs");
+        // What a command does with the option value it receives.
+        let resolved = ws.join(&value);
+        assert_eq!(
+            resolved,
+            Path::new("datasets/d/.cache/all_vectors.fvecs"),
+            "re-resolution must not double the workspace prefix"
+        );
     }
 
     #[test]
@@ -221,7 +324,7 @@ mod tests {
         // SAFETY: test-only, no other threads depend on this variable
         unsafe { std::env::set_var("VECS_TEST_VAR", "hello") };
         let result =
-            interpolate("${env:VECS_TEST_VAR}", &defaults(), Path::new("/data")).unwrap();
+            interpolate("${env:VECS_TEST_VAR}", &defaults(), Path::new("/data"), PathBase::WorkspaceRelative).unwrap();
         assert_eq!(result, "hello");
         unsafe { std::env::remove_var("VECS_TEST_VAR") };
     }
@@ -232,6 +335,7 @@ mod tests {
             "${env:VECS_NONEXISTENT:-fallback}",
             &defaults(),
             Path::new("/data"),
+            PathBase::WorkspaceRelative,
         )
         .unwrap();
         assert_eq!(result, "fallback");
@@ -239,20 +343,38 @@ mod tests {
 
     #[test]
     fn test_cache_implicit() {
+        // Workspace-relative, and identical whatever the workspace is:
+        // commands re-base path options onto the workspace themselves, so
+        // expanding this workspace-joined would double the prefix.
         let result =
-            interpolate("${cache}/cached.fvec", &defaults(), Path::new("/my/data")).unwrap();
-        assert_eq!(result, "/my/data/.cache/cached.fvec");
+            interpolate("${cache}/cached.fvec", &defaults(), Path::new("/my/data"), PathBase::WorkspaceRelative).unwrap();
+        assert_eq!(result, ".cache/cached.fvec");
+        let relative =
+            interpolate("${cache}/cached.fvec", &defaults(), Path::new("datasets/d"), PathBase::WorkspaceRelative).unwrap();
+        assert_eq!(relative, ".cache/cached.fvec");
+    }
+
+    #[test]
+    fn test_workspace_implicit_is_relative_self() {
+        for ws in ["/my/data", "datasets/d", "."] {
+            let result =
+                interpolate("${workspace}/vectors.fvec", &defaults(), Path::new(ws), PathBase::WorkspaceRelative).unwrap();
+            assert_eq!(result, "./vectors.fvec", "workspace {ws}");
+            let alias =
+                interpolate("${dataset_dir}/vectors.fvec", &defaults(), Path::new(ws), PathBase::WorkspaceRelative).unwrap();
+            assert_eq!(alias, "./vectors.fvec", "dataset_dir {ws}");
+        }
     }
 
     #[test]
     fn test_no_vars() {
-        let result = interpolate("plain text", &defaults(), Path::new("/data")).unwrap();
+        let result = interpolate("plain text", &defaults(), Path::new("/data"), PathBase::WorkspaceRelative).unwrap();
         assert_eq!(result, "plain text");
     }
 
     #[test]
     fn test_empty_string() {
-        let result = interpolate("", &defaults(), Path::new("/data")).unwrap();
+        let result = interpolate("", &defaults(), Path::new("/data"), PathBase::WorkspaceRelative).unwrap();
         assert_eq!(result, "");
     }
 
@@ -265,6 +387,7 @@ mod tests {
             "${variables.yaml:vector_count}",
             &defaults(),
             tmp.path(),
+            PathBase::WorkspaceRelative,
         ).unwrap();
         assert_eq!(result, "407314954");
     }
@@ -278,6 +401,7 @@ mod tests {
             "${variables:dim}",
             &defaults(),
             tmp.path(),
+            PathBase::WorkspaceRelative,
         ).unwrap();
         assert_eq!(result, "512");
     }
@@ -289,6 +413,7 @@ mod tests {
             "${variables:nonexistent}",
             &defaults(),
             tmp.path(),
+            PathBase::WorkspaceRelative,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found in variables.yaml"));
@@ -301,6 +426,7 @@ mod tests {
             "${variables:missing:-default_val}",
             &defaults(),
             tmp.path(),
+            PathBase::WorkspaceRelative,
         ).unwrap();
         assert_eq!(result, "default_val");
     }
@@ -317,14 +443,14 @@ mod tests {
             serde_yaml::Value::Number(serde_yaml::Number::from(100)),
         );
 
-        let resolved = interpolate_options(&opts, &defaults(), Path::new("/data")).unwrap();
+        let resolved = interpolate_options(&opts, &defaults(), Path::new("/data"), PathBase::WorkspaceRelative).unwrap();
         assert_eq!(resolved.get("seed").unwrap(), "42");
         assert_eq!(resolved.get("count").unwrap(), "100");
     }
 
     #[test]
     fn test_dollar_escape() {
-        let result = interpolate("url_$${number}.npy", &defaults(), Path::new("/data")).unwrap();
+        let result = interpolate("url_$${number}.npy", &defaults(), Path::new("/data"), PathBase::WorkspaceRelative).unwrap();
         assert_eq!(result, "url_${number}.npy");
     }
 
@@ -334,6 +460,7 @@ mod tests {
             "https://host/$${number}.npy?seed=${seed}",
             &defaults(),
             Path::new("/data"),
+            PathBase::WorkspaceRelative,
         )
         .unwrap();
         assert_eq!(result, "https://host/${number}.npy?seed=42");
@@ -341,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_dollar_escape_standalone() {
-        let result = interpolate("cost: $$5", &defaults(), Path::new("/data")).unwrap();
+        let result = interpolate("cost: $$5", &defaults(), Path::new("/data"), PathBase::WorkspaceRelative).unwrap();
         assert_eq!(result, "cost: $5");
     }
 
@@ -355,7 +482,7 @@ mod tests {
             ),
         );
 
-        let resolved = interpolate_options(&opts, &defaults(), Path::new("/data")).unwrap();
+        let resolved = interpolate_options(&opts, &defaults(), Path::new("/data"), PathBase::WorkspaceRelative).unwrap();
         assert_eq!(
             resolved.get("baseurl").unwrap(),
             "https://host/img_${number}.npy"

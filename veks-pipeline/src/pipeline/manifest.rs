@@ -100,7 +100,8 @@ pub fn project_workspace(
 
         // Interpolate options
         let resolved_opts = match interpolate::interpolate_options(
-            &step.options, &defaults, workspace,
+                        &step.options, &defaults, workspace,
+            interpolate::PathBase::WorkspaceRelative,
         ) {
             Ok(opts) => opts,
             Err(_) => continue, // Can't resolve variables yet

@@ -158,6 +158,7 @@ pub fn run_steps(
             &step.def.options,
             &ctx.defaults,
             &ctx.workspace,
+            interpolate::PathBase::WorkspaceRelative,
         )
         .map_err(|e| format!("step '{}': {}", step.id, e))?;
 
