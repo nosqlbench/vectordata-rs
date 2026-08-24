@@ -67,12 +67,19 @@ constrains the other.
    destination; the value is the origin. A source-ordered map produces
    the inverse rewrite, silently — see
    [02-plan.md](./02-plan.md#orientation-is-a-contract-not-a-check).
-2. **Invariant, low-order access by ordinal.** Given an ordinal, the
-   host can produce that record at a cost that is essentially the same
-   for every ordinal, and that stays low-order when reads are issued in
-   order. Structural deserialization and decompression along the way are
-   expected, and memoizing them is normal practice. Linearize exists so
-   that this access is always issued in order.
+2. **Ordinal addressability, at a position-invariant cost.** Given an
+   ordinal, the host can produce that record, and the cost of doing so
+   does not depend on *which* ordinal is asked for. That cost is allowed
+   to be substantial — deserialization and decompression along the way
+   are expected, and memoizing them is normal practice. What it may not
+   do is vary with position, since the algorithm reorders access freely
+   and the plan's ordering decisions assume a uniform price.
+
+   Note what this does **not** say: that random access is cheap. If it
+   were — if reading in any order cost what reading in order costs —
+   gsplat would have nothing to sell, and you should skip it
+   ([When it fits](#when-it-fits)). The gap between those two prices is
+   the entire return on running this algorithm.
 3. **Strictly monotonic ordinal structure.** Within an ordinal space,
    ordinals ascend strictly with physical address:
    `i < j ⟹ address(i) < address(j)`. A flat store gets this from
