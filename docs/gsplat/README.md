@@ -217,6 +217,10 @@ Skip it when:
   and sinks, where a traversal fixes the ordinal space and a skeleton
   carries the map. Covers address-vs-ordinal ordering, container-atomic
   fetch units, ordered-append output, and per-leaf-path decomposition.
+- [annex-multiple-spaces.md](./annex-multiple-spaces.md) — exploratory
+  annex: several types in distinct ordinal spaces with independent maps,
+  interleaved into the output by a known schedule. Not depended on by
+  anything above.
 
 ## Origin
 

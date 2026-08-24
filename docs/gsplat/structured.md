@@ -629,3 +629,10 @@ sgsplat exists for.
    a survey. The cost of being wrong is bounded — a non-conforming store
    pays one indexing pass — but the claim deserves checking against real
    candidates before the requirement hardens into an interface.
+
+## Related
+
+- [Annex — Multiple ordinal spaces and interleaved output](./annex-multiple-spaces.md):
+  exploratory, for the case where the input holds several types in
+  distinct ordinal spaces with independent maps, interleaved into the
+  output by a known schedule. Nothing in this document depends on it.
