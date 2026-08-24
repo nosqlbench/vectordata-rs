@@ -46,6 +46,10 @@ pub struct ImportArgs {
     pub no_filtered: bool,
     pub normalize: bool,
     pub force: bool,
+    /// Continue an existing pipeline: carry the `upstream.steps` already
+    /// in the output directory's dataset.yaml ahead of the generated
+    /// ones instead of replacing them.
+    pub merge: bool,
     /// Target format for base vectors precision conversion (e.g., "mvec" for f32→f16).
     /// When set, a `convert` step is emitted after the base import/identity step.
     pub base_convert_format: Option<String>,
@@ -989,6 +993,102 @@ fn cmd_verify_knn(personality: &str) -> &'static str {
 }
 
 /// Walk the resolved slots and emit pipeline steps for materialized slots.
+/// Prepend the `upstream.steps` already present in `output_dir`'s
+/// `dataset.yaml` to the freshly generated ones, and make the first
+/// generated step depend on the last existing one.
+///
+/// This is what makes acquisition and facet-building one pipeline. Both
+/// halves target the same `upstream.steps` slot, so the merged file is an
+/// ordinary dataset.yaml: `veks run` executes it end to end, and the
+/// acquisition steps participate in freshness like any other — a re-run
+/// after bootstrap does not re-download or re-embed anything.
+///
+/// The dependency edge is explicit rather than relying on declaration
+/// order, because the generated steps consume artifacts the existing ones
+/// produce and nothing else records that relationship.
+///
+/// Returns the number of steps carried over (0 when there is no existing
+/// file or it declares no steps).
+fn merge_existing_steps(
+    output_dir: &std::path::Path,
+    generated: &mut Vec<Step>,
+) -> Result<usize, String> {
+    let path = output_dir.join("dataset.yaml");
+    if !path.exists() {
+        return Ok(0);
+    }
+    let config = vectordata::dataset::DatasetConfig::load(&path)
+        .map_err(|e| format!("cannot read existing {}: {}", path.display(), e))?;
+    let existing: Vec<vectordata::dataset::pipeline::StepDef> = config
+        .upstream
+        .and_then(|u| u.steps)
+        .unwrap_or_default();
+    if existing.is_empty() {
+        return Ok(0);
+    }
+
+    // Ids must stay unique across the merged list, and a collision means
+    // the author is bootstrapping over a file that already holds generated
+    // steps — re-running --merge would otherwise silently duplicate them.
+    let generated_ids: std::collections::HashSet<&str> =
+        generated.iter().map(|s| s.id.as_str()).collect();
+    if let Some(clash) = existing
+        .iter()
+        .filter_map(|s| s.id.as_deref())
+        .find(|id| generated_ids.contains(id))
+    {
+        return Err(format!(
+            "existing step '{}' collides with a generated step of the same name — \
+             the file already contains bootstrap output; re-bootstrap without --merge \
+             into a clean directory, or remove the generated steps first",
+            clash
+        ));
+    }
+
+    let carried: Vec<Step> = existing
+        .iter()
+        .map(|s| Step {
+            id: s.id.clone().unwrap_or_else(|| s.run.replace(' ', "-")),
+            run: s.run.clone(),
+            description: s.description.clone(),
+            after: s.after.clone(),
+            per_profile: s.per_profile,
+            phase: s.phase,
+            finalize: s.finalize,
+            options: s
+                .options
+                .iter()
+                .map(|(k, v)| (k.clone(), yaml_scalar_to_string(v)))
+                .collect(),
+        })
+        .collect();
+
+    if let Some(last) = carried.last().map(|s| s.id.clone())
+        && let Some(first) = generated.first_mut()
+        && !first.after.contains(&last)
+    {
+        first.after.push(last);
+    }
+    let count = carried.len();
+    let mut merged = carried;
+    merged.append(generated);
+    *generated = merged;
+    Ok(count)
+}
+
+/// Render a YAML option value the way the generated steps are written:
+/// scalars verbatim, everything else through the serializer.
+fn yaml_scalar_to_string(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        other => serde_yaml::to_string(other)
+            .map(|s| s.trim_end().to_string())
+            .unwrap_or_default(),
+    }
+}
+
 fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path::Path) -> Vec<Step> {
     let mut steps = Vec::new();
     let pp = args.profile_prefix();
@@ -2673,14 +2773,37 @@ pub fn run(mut args: ImportArgs) {
 
     let output_dir = &args.output;
 
-    if output_dir.exists() && !args.force
+    // `--merge` is a deliberate act on the existing file — it reads that
+    // dataset.yaml and rewrites it with its steps preserved — so it stands
+    // in for --force rather than demanding both.
+    if output_dir.exists() && !args.force && !args.merge
         && output_dir.join("dataset.yaml").exists() {
             eprintln!(
-                "Error: {} already contains a dataset.yaml. Use --force to overwrite.",
+                "Error: {} already contains a dataset.yaml. Use --force to overwrite, \
+                 or --merge to keep its upstream steps and append the generated ones.",
                 crate::check::rel_display(output_dir)
             );
             std::process::exit(1);
         }
+
+    // Back up before rewriting in place: --merge reads the author's file
+    // and writes over it, and a hand-written acquisition pipeline is not
+    // reproducible from anything else.
+    if args.merge && output_dir.join("dataset.yaml").exists() {
+        let existing = output_dir.join("dataset.yaml");
+        match crate::check::fix::create_backup(&existing) {
+            Ok(backup) => println!(
+                "  backed up {} → {}",
+                crate::check::rel_display(&existing),
+                crate::check::rel_display(&backup)
+            ),
+            Err(e) => {
+                eprintln!("Error: --merge could not back up {}: {}",
+                    crate::check::rel_display(&existing), e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     if let Err(e) = std::fs::create_dir_all(output_dir) {
         eprintln!("Error: failed to create directory {}: {}", crate::check::rel_display(output_dir), e);
@@ -2762,7 +2885,23 @@ pub fn run(mut args: ImportArgs) {
     if let Some(ref fknn) = slots.filtered_knn { print_slot("filtered_knn", fknn); } else { println!("  filtered_knn: Absent"); }
 
     // Emit steps
-    let steps = emit_steps(&slots, &args, &args.output);
+    let mut steps = emit_steps(&slots, &args, &args.output);
+    // `--merge`: continue an existing pipeline rather than replacing it.
+    // The acquisition half of a dataset (download, chunk, embed, join)
+    // occupies the same `upstream.steps` slot bootstrap writes into, so
+    // without this the two halves have to live in separate files that the
+    // author shuffles around by hand.
+    if args.merge {
+        match merge_existing_steps(output_dir, &mut steps) {
+            Ok(0) => {}
+            Ok(n) => println!("  merged {} existing upstream step(s) ahead of the generated ones", n),
+            Err(e) => {
+                eprintln!("Error: --merge failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    let steps = steps;
     let views = profile_views(&slots, &args, output_dir);
 
     println!();
@@ -3571,7 +3710,7 @@ mod tests {
     }
 
     fn default_args() -> ImportArgs {
-        ImportArgs {
+        ImportArgs { merge: false,
             name: "test".into(),
             output: PathBuf::from("/tmp/test-out"),
             base_vectors: None,

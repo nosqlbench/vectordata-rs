@@ -87,7 +87,7 @@ pub(crate) fn run(args: SynthesizeArgs) {
         None
     };
     println!("Bootstrapping '{name}' in {}…", args.output.display());
-    import::run(ImportArgs {
+    import::run(ImportArgs { merge: false,
         name: name.clone(),
         output: args.output.clone(),
         base_vectors: Some(base_path),

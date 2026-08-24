@@ -146,6 +146,13 @@ pub enum PrepareCommand {
         #[arg(long, alias = "overwrite")]
         force: bool,
 
+        /// Continue the pipeline already in the output directory: keep its
+        /// existing `upstream.steps` and append the generated ones after
+        /// them, so acquisition and facet-building live in one dataset.yaml
+        /// and one `veks run`. Implies --force.
+        #[arg(long)]
+        merge: bool,
+
         /// Start fresh — remove generated artifacts, dataset.yaml,
         /// variables.yaml, and .cache state, then re-bootstrap from
         /// initial conditions.
@@ -546,7 +553,7 @@ pub fn run(args: PrepareArgs) {
             force, reset, clean, recursive,
             base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
             personality, synthesize_metadata, metadata_fields, metadata_range,
-            synthesis_mode, synthesis_format, selectivity, predicate_count,
+            synthesis_mode, synthesis_format, selectivity, predicate_count, merge,
         } => {
             // Derive cosine_mode from the two mutually-exclusive
             // flags. Clap already enforces "can't both be true".
@@ -852,7 +859,7 @@ pub fn run(args: PrepareArgs) {
                             })
                     });
                     let out = output.clone().unwrap_or_else(|| PathBuf::from("."));
-                    import::run(import::ImportArgs {
+                    import::run(import::ImportArgs { merge,
                         name, output: out.clone(), base_vectors, query_vectors, self_search,
                         query_count, metadata, ground_truth, ground_truth_distances,
                         metric, neighbors, seed, description, no_dedup, no_zero_check,
@@ -928,7 +935,7 @@ pub fn run(args: PrepareArgs) {
                         })
                 });
                 let output = output.unwrap_or_else(|| PathBuf::from("."));
-                import::run(import::ImportArgs {
+                import::run(import::ImportArgs { merge,
                     name, output, base_vectors, query_vectors, self_search,
                     query_count, metadata, ground_truth, ground_truth_distances,
                     metric, neighbors, seed, description, no_dedup, no_zero_check,
