@@ -62,7 +62,7 @@ the cost of one extra copy.
 | `hint_sequential` | Turns a pass's ascending reads into streamed ones | Reads still ascend; prefetch is left to the tier's own heuristics. **Not always a win** — see the amplification regimes in [cost-model.md](./cost-model.md) |
 | `durability_barrier` | Bounds dirty-page debt per pass; without it, one pass's writeback lands inside the next pass's read phase and reads as slow reads | Throughput noise, and a weaker crash story |
 | `observe` | Long rewrites are opaque; passes give natural checkpoints to report | No visibility |
-| `checkpoint_store` | Persist each finished segment keyed by a fingerprint of the parameters; a re-run replays completed segments and recomputes only the remainder | A failure at pass `k` costs all `k` passes |
+| `checkpoint_store` | **Out of scope for now.** Persist each finished segment keyed by a fingerprint of the parameters; a re-run replays completed segments and recomputes only the remainder | A failure at pass `k` costs all `k` passes |
 
 A checkpoint fingerprint must cover everything that changes the output:
 source identity, map identity, output range, segment count, and any

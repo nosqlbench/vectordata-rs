@@ -59,6 +59,10 @@ fixed-stride ones do not.
 
 ## Checkpoint and resume
 
+**Out of scope for now.** Nothing in the current design line depends on
+resumability, and no structure should be carried to serve it. What
+follows is recorded for when it returns, not as a requirement.
+
 Passes are natural resume points: each one is an independent,
 deterministic unit of work whose output occupies a known range. Persist
 each completed segment (or a marker for it) keyed by a **fingerprint of

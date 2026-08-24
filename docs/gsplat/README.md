@@ -223,7 +223,7 @@ Skip it when:
 | **P** | Plan | [02-plan.md](./02-plan.md) — select and reverse the map window for one output segment |
 | **L** | Linearize | [03-linearize.md](./03-linearize.md) — sort the plan into source order |
 | **A** | Assemble | [04-assemble.md](./04-assemble.md) — sequential gather, in-memory scatter |
-| **T** | Transfer | [05-transfer.md](./05-transfer.md) — contiguous flush, durability, resume |
+| **T** | Transfer | [05-transfer.md](./05-transfer.md) — contiguous flush, durability, next pass |
 
 - [host-interface.md](./host-interface.md) — the six primitives a
   runtime must supply, with bindings for POSIX, JVM, object storage,

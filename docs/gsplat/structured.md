@@ -202,10 +202,6 @@ normal form.
    *exact* for a given map rather than estimated from the uniformity
    assumption in [cost-model.md](./cost-model.md). `P` can then be chosen
    by evaluating the real map instead of a model of it.
-5. **Resume is derivable.** A segment's input container set is a
-   deterministic function of the map and the index, so a restarted run
-   knows what to fetch without replaying prior passes.
-
 Point 4 deserves emphasis: it converts the pass-count decision from a
 tuning exercise into a calculation, and it costs one pass over the map
 plus the footer — no payload reads at all.

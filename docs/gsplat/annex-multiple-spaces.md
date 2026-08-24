@@ -71,12 +71,14 @@ map filtered.
 | **A** Assemble | read source ascending, contribute | one ascending sweep; each container touch drains every space's entries that fall inside it |
 | **T** Transfer | builder emits | unchanged |
 
-The schedule is consumed **sequentially** by Plan, in slot order, so the
-normal path needs no random access into it: as the scan walks slots it
-can carry each space's running index forward. Random access (`rank` to
-find a segment's per-space window without replaying, `select` to map a
-space ordinal back to its slot) is needed only for **resume** and for
-computing boundaries out of order.
+The schedule is consumed **sequentially** by Plan, in slot order: as the
+scan walks slots it carries each space's running index forward. With
+resume out of scope, nothing else needs random access into it, so **a
+sequential read of the tag stream is the whole requirement** — no
+rank/select structure, no residency claim beyond a streaming buffer.
+Random access would only be wanted for computing a segment's windows
+without replaying the prefix, which matters if resume ever comes back
+into scope.
 
 ### The builder gets simpler, not harder
 
@@ -313,10 +315,10 @@ is first on the list below.
    decides whether the free case needs to exist at all.
 2. **What does the source tag stream cost in practice?** An arbitrary,
    variable pattern is the assumed case, so the tags are materialized by
-   default. The normal path only scans them sequentially, but resume
-   wants rank/select over them, and how compressible a real pattern is
-   decides whether that structure is a rounding error or a real claim on
-   the budget.
+   default — but with resume out of scope they are only ever scanned
+   sequentially, which makes them a streaming cost rather than a
+   resident one. The question is whether any real pattern is regular
+   enough to skip materializing them at all.
 3. **Shared `P` or per-space `P_k`?** The latter needs several segments
    open at once. Which wins depends on how unequal the spaces are.
 4. **Budget allocation.** Builder slots, K plans, pinned spaces, and any
