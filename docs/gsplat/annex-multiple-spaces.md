@@ -31,7 +31,7 @@ the simplest instance; nothing below is limited to two.
 ## The model: spaces and a schedule
 
 ```
- spaces        S_1 … S_K      each with its own store, ordinals, and map m_k
+ spaces        S_1 … S_K      each with its own ordinals and map m_k, interleaved in one store
  schedule      τ(i) -> k      which space supplies output slot i
  maps          m_k[j]         source ordinal in S_k for that space's j-th output record
 ```
@@ -67,8 +67,8 @@ map filtered.
 |------|---------------|---------------|
 | **S** Segment | contiguous range of output ordinals | unchanged — but the segment is a range of *slots*, and the per-space windows follow from `cum_k` at the two boundaries |
 | **P** Plan | scan the map window, reverse each entry | scan the slot window, **bucket by space** while scanning; entries become `(space, source ordinal, segment-local slot)` |
-| **L** Linearize | sort by source ordinal | sort **per space** — ordinals from different spaces are incomparable and must never share a sort |
-| **A** Assemble | read source ascending, contribute | run per space against its own store; merge across spaces first if they share one (below) |
+| **L** Linearize | sort by source ordinal | sort by **address** — equivalently by M-ordinal — in one sort across all spaces; per-space ordinals are incomparable and must never share a sort key |
+| **A** Assemble | read source ascending, contribute | one ascending sweep; each container touch drains every space's entries that fall inside it |
 | **T** Transfer | builder emits | unchanged |
 
 The schedule is consumed **sequentially** by Plan, in slot order, so the
@@ -85,23 +85,21 @@ is addressed by **output slot alone** — the space is a property of the
 slot, not a parameter. That is the same addressing the columnar case
 wants, which is the first hint that these are one mechanism.
 
-## When spaces share a source store
+## The spaces are always interleaved
 
-Two sub-cases behave very differently, and the annex should not assume
-either.
+The serialized form is **always** an interleaving of the spaces, by some
+pattern that may vary along the stream. Concatenated layouts — all of
+one space, then all of the next — are not a case this annex supports or
+optimizes for, and neither are separate per-space stores. There is one
+address space, and every space's records are dispersed through it.
 
-**Separate stores per space.** The spaces are genuinely independent: K
-read streams against K stores, schedulable concurrently with no
-coordination. Clean, and the parallelism is free.
+Two things follow immediately, and they simplify rather than complicate:
 
-**One interleaved source store.** The spaces share containers, and two
-consequences follow:
-
-1. Their linearized plans should be **merged before reading**, so one
-   container touch serves every space with records inside it. Processing
-   spaces one after another would touch shared containers repeatedly.
-2. Merging requires a common comparison domain, and per-space ordinals
-   are incomparable by construction. That domain is the **address** —
+1. **Container touches are shared.** A container generally holds records
+   of several spaces, so one touch serves all of them. Reading is never
+   organized per space.
+2. **Per-space ordinals are incomparable, but addresses are not.**
+   Anything that must order work across spaces orders it by address —
    practically `(container id, offset)` from the container index.
 
 This is a genuine caveat to the "address = ordinal" substitution in
@@ -110,49 +108,134 @@ space, and **address is the join key across spaces.** The container
 index already supplies it, so nothing new is needed — but the concept
 that DFS normal form retires comes back at exactly this seam.
 
-## Small-space pinning
+## The global-space lens
 
-A shared segmentation serves spaces of very different size badly: `P` is
-set by the builder's capacity for the whole segment, so a small space is
-traversed `P` times for no reason.
+The cleanest way to hold all of this is to stop thinking in K spaces at
+all. Define **M**, a single global ordinal space over every source
+record, **numbered in physical address order**:
 
-The fix is the small-side broadcast from join planning. A space whose
-entire footprint fits in a slice of the budget is **loaded once and
-pinned**, and its amplification drops from `A(P)` to 1. For a small
-dictionary space interleaved with a large payload space, this is most of
-the available win.
+```
+ |M| = Σ_k |S_k|  = N          every record lands at exactly one slot
+ gmap[slot] = M-ordinal        one map, one space
+```
+
+Under this lens the multi-space problem is not a generalization — it is
+the base problem wearing a costume. `gmap` is a permutation between two
+spaces of equal size, and Plan, Linearize, Assemble and Transfer run
+unmodified. Two properties make it more than relabelling:
+
+- **Sorting by M *is* the cross-space merge.** Because M is numbered by
+  address, a single sorted plan is already the correct read order. The
+  "merge the per-space plans" step never exists.
+- **The output schedule is redundant.** With `σ(m)` the space of source
+  M-ordinal `m`, the output schedule is just `τ(slot) = σ(gmap[slot])`.
+  Only one of the two need be materialized; the other is derived.
+
+What the lens costs, and how to pay it:
+
+- **Tags cannot be inferred from value ranges.** Because M interleaves,
+  a space is not a contiguous run of M-ordinals, so nothing about the
+  numbering identifies a record's space. Carry the tag explicitly — one
+  bit per entry for two spaces.
+- **Validation weakens if you do not.** With per-space maps, an ordinal
+  past a space's end is locally, instantly wrong; with a bare global M
+  every value in `0..N-1` is structurally valid, so a cross-space error
+  reads the wrong type's record silently. The explicit tag restores the
+  per-space bounds check.
+- **Per-space accounting must be asked for.** Cost attribution and
+  pinning both need to know which records belong to which space; the tag
+  supplies it, the numbering does not.
+
+Tagged-M and spaces-plus-schedule then differ only in whether the plan
+is one tagged vector or K vectors — an implementation choice, not a
+different model. Both are lenses on one structure: use M when reasoning
+about I/O order and correctness, use spaces when reasoning about cost.
+
+### Building M
+
+`gmap` is derived from the per-space maps and the source tag stream,
+which requires `S_k → M` for each space. Since M is address-ordered and
+the spaces interleave, those translations are a **rank/select over the
+source tag stream**, not arithmetic. Two ways to pay:
+
+- once, as a preprocessing pass that rewrites the per-space maps into a
+  single `gmap` — one pass over ordinal-width data, the same class of
+  cost as flattening the skeleton; or
+- per entry during Plan, translating as the window is scanned.
+
+Either is acceptable; neither touches the inner loop of Linearize or
+Assemble.
+
+### A stronger consistency check
+
+Where both `σ` (source tags) and `τ` (output schedule) are available,
+they are redundant, and their agreement is checkable per record:
+
+```
+ for every slot:  σ(gmap[slot]) == τ(slot)
+```
+
+This is strictly stronger than comparing slot counts against map
+lengths: it catches individual misplacement, not just aggregate
+disagreement.
 
 ## Cost model
 
-The cost becomes a sum over spaces rather than a single term, with each
-space carrying its own container size `w_k`:
+Interleaving makes this simpler than it first appears. Container touches
+are counted over the **union** of containers a pass needs, not per
+space, and because every container generally holds records of several
+spaces, that union is very close to what a single-space rewrite of the
+same total record count would touch:
 
 ```
- total ≈ Σ_k A_k(P) × cost_k        A_k(P) = P · (1 − exp(−w_k / P))
- pinned space:  A_k = 1
- shared source: touches counted per container, not per space
+ touches ≈ A(P) × (number of source containers)     one global term
+ A(P)    = P · (1 − exp(−w / P))                    w = records per container, all spaces
 ```
 
-`P` is shared, so it is a compromise: a space with small containers or
-expensive decode pays for its neighbours. The alternative — per-space
-`P_k` with several segments held open at once — trades memory for
-per-space optimality and is a real design fork, not an obvious
-improvement.
+**Multi-space costs essentially nothing extra in I/O.** A per-space sum
+would double-count: two spaces sharing a container do not touch it
+twice. Where the spaces genuinely differ is in **per-record work** —
+decode, extract, contribute — which scales with each space's record
+count and its own record shape, not with container touches.
+
+`P` remains shared, and now unavoidably so: one address space means one
+traversal schedule. The per-space `P_k` alternative that a
+separate-store layout would allow does not arise here.
+
+## Pinning a small space
+
+Pinning changes character under interleaving, and the earlier
+join-planning intuition needs adjusting rather than importing.
+
+Because containers are shared, you cannot read "just the small space"
+cheaply — its containers are touched anyway on behalf of the others, so
+**pinning saves no container touches at all**. What it saves is repeated
+per-record work: extract the small space's records once while its
+containers are resident, hold them, and let later passes skip
+re-extracting and re-decoding them.
+
+That makes it worth doing when a space is small *and* its per-record
+work is significant — a dictionary space that must be decoded to be
+useful, say. It is worth nothing when the per-record work is a memcpy.
 
 ## Schedule representation
 
-The schedule's cost depends entirely on its shape, and the shapes have
-names: this is the out-of-core generalization of the AoS/SoA/AoSoA
-layout family.
+The assumed case is an **arbitrary pattern that varies along the
+stream**, so the tag stream is materialized by default. The regular
+shapes are worth naming only as lucky special cases, and as the
+in-memory ancestors of the idea — this is the out-of-core generalization
+of the AoS/SoA/AoSoA layout family:
 
-| τ shape | Layout analogue | Representation |
+| Pattern | Layout analogue | Representation |
 |---------|-----------------|----------------|
-| one long run per space | SoA | closed form; the spaces do not really interleave |
+| one long run per space | SoA | excluded — that is concatenation, not interleaving |
 | periodic, period K | AoS | closed form, nothing stored |
 | periodic in blocks | AoSoA | closed form |
-| arbitrary or data-dependent | — | materialized tag stream |
+| **arbitrary or variable** | — | **materialized tag stream — assume this** |
 
-Only the last case costs anything. Materialized, it is a **rank/select**
+Periodic patterns cost nothing and need no structure, but nothing should
+be built on the expectation of finding one. Materialized, it is a
+**rank/select**
 problem: an uncompressed bitvector with rank/select support runs about
 126% of the raw bits, while compressed representations (RRR,
 Elias-Fano) land near 30% and compress run-structured schedules much
@@ -228,9 +311,12 @@ is first on the list below.
    be related after all, the forest model handles it and most of this
    annex collapses into the existing run-expansion machinery. This
    decides whether the free case needs to exist at all.
-2. **Is the schedule a design artifact or data-dependent?** Periodic
-   schedules are free; materialized ones cost a resident structure and
-   put rank/select on the resume path.
+2. **What does the source tag stream cost in practice?** An arbitrary,
+   variable pattern is the assumed case, so the tags are materialized by
+   default. The normal path only scans them sequentially, but resume
+   wants rank/select over them, and how compressible a real pattern is
+   decides whether that structure is a rounding error or a real claim on
+   the budget.
 3. **Shared `P` or per-space `P_k`?** The latter needs several segments
    open at once. Which wins depends on how unequal the spaces are.
 4. **Budget allocation.** Builder slots, K plans, pinned spaces, and any
