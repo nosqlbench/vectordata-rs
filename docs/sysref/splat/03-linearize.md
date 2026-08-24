@@ -5,6 +5,12 @@ I/O win: after linearizing, the pass's reads ascend monotonically
 through the source file, so kernel readahead streams pages in ahead
 of the readers and no page is faulted twice.
 
+It also completes the inversion [P](./02-plan.md) began. Plan reversed
+each destination-ordered map entry into a `(source, local_out)` pair;
+sorting on the first element leaves the pass holding this segment's
+slice of the *inverse* permutation, in source order — the orientation
+assemble needs to walk the source once, forwards.
+
 ```
  plan (output order)                 plan (source order)
  (902117, 0)                         (3,      1)

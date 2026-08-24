@@ -1,9 +1,18 @@
 # SPLAT Step 1 — Segment
 
-Divide the output ordinal space into contiguous segments, each small
-enough that a fully assembled segment fits in the memory budget. The
-segment count is the pass count: everything after this step repeats
+Divide the **output** ordinal space into contiguous segments, each
+small enough that a fully assembled segment fits in the memory budget.
+The segment count is the pass count: everything after this step repeats
 once per segment.
+
+Segments never partition the input. A pass owns one contiguous slice of
+the *output* and pulls the records that belong there from arbitrary
+positions all over the source. That asymmetry is the design: the write
+side is contiguous for free, and every later step exists to tame the
+read side — [L](./03-linearize.md) sorts it into one ascending sweep,
+[A](./04-assemble.md) absorbs what remains of the scatter in RAM. See
+[02-plan.md](./02-plan.md#segments-partition-the-output-not-the-input)
+for why this is the side worth partitioning.
 
 ## Sizing
 
