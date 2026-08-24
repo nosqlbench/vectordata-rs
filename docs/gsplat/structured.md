@@ -7,10 +7,41 @@ are hierarchies — groups, row groups, chunks, pages, members, nested
 records — whose leaves hold the payload, and the rewrite must read from
 one clustering and write into a different one.
 
-This document states the reduction that makes it tractable, the four
-places the reduction leaks, and the step-by-step deltas that close
-them. It layers on [gsplat](./README.md); everything unstated here is
-unchanged.
+This document states the reduction that makes it tractable, the three
+places it leaks, the two substitutions that close all three, and the
+step-by-step deltas that follow. It layers on [gsplat](./README.md);
+everything unstated here is unchanged.
+
+## Terms
+
+Two units of grouping run through this document, and generic vocabulary
+blurs them. The distinction is load-bearing, so it gets explicit words:
+
+> **A segment is what memory can hold. A container is what the format
+> emits.**
+
+| Term | Bounded by | Governs | Sized for |
+|------|-----------|---------|-----------|
+| **segment** | the memory budget | how many passes the rewrite makes over the source | read efficiency — larger segments mean fewer passes |
+| **container** | format policy — row group, stripe, chunk, page, block, archive member | what the output looks like to whoever reads it next | write quality — compression ratio, index granularity, and the read amplification *consumers* will pay |
+
+A segment is a contiguous range of *output ordinals*; one pass
+materializes one segment, and it is gsplat's **S** step unchanged. A
+container is the format's own physical grouping, and both sides have
+them — say *source container* or *output container* where the side is
+not obvious from context.
+
+The relationship between them is many-to-many and deliberately
+unconstrained:
+
+```
+ one segment          emits         many output containers
+ one source container serves        many segments
+```
+
+The word **partition** is avoided entirely: it reads as either concept
+depending on the reader's background, which is exactly the ambiguity
+these two words exist to remove.
 
 ## Scope
 
@@ -28,7 +59,7 @@ Given that, the whole adaptation is **two substitutions**:
 | gsplat | sgsplat | Closes |
 |--------|---------|--------|
 | address = `base + ordinal × R` | address = ordinal, by [normal form](#dfs-normal-form) | ordinal-vs-address ordering |
-| segment buffer = byte array | segment buffer = [partition builder](#the-segment-buffer-is-a-partition-builder) | output positioning, variable-length records, compaction, nested layouts |
+| segment buffer = byte array | segment buffer = [container builder](#the-segment-buffer-is-a-container-builder) | output positioning, variable-length records, compaction, nested layouts |
 
 Everything else in gsplat is unchanged.
 
@@ -46,9 +77,34 @@ ignorant of the rest of the format:
 What we *do* own is **how many times each container is touched, and in
 what order**. That is the entire extent of our influence, and it turns
 out to be the entire cost model
-([below](#cost-model-deltas-the-unit-is-container-touches)). Read-side
-container atomicity is therefore not a problem sgsplat solves — it is
-the reason the cost model counts touches instead of bytes.
+([below](#cost-model-deltas-the-unit-is-container-touches)).
+
+### Read-side atomicity: an orthogonal boundary
+
+Containers are atomic on the read side — you cannot take one record out
+of a compressed row group without materializing the group. This is a
+**boundary crossing, not a problem sgsplat solves**: the cost sits with
+the host's reader and its codec, and we never see an encoded byte. Two
+nuances are worth keeping in view.
+
+**The order of that cost is a potential multiplier.** Whatever one touch
+costs, sgsplat decides how many touches happen, and that count is
+`A(P)`. We do not model the cost; we minimize the count. On compressed
+columnar data the thing being multiplied is often the most expensive
+work in the system, which is why the pass count deserves attention out
+of proportion to its apparent role.
+
+**Hosts attack the cost directly, and normally should.** Memoizing
+decoded containers, block and page caches inside the format reader, a
+decoded-record cache — all of these turn repeated touches into repeated
+*hits*, and that is the obvious and usual answer. Where a host does it
+well the multiplier stops mattering and this question recedes entirely.
+
+The one interaction worth stating: such a cache and the container
+builder draw on the same memory. Spending it on larger segments (fewer
+passes) and spending it on memoized containers (cheaper passes) are
+competing uses of one budget, and which wins depends on the codec rather
+than on anything in this algorithm.
 
 ## The reduction
 
@@ -152,10 +208,10 @@ plus the footer — no payload reads at all.
 nothing about divisibility, so containers stay atomic on the read side;
 nothing about output sizing; and nothing about record shape. Leaks 2 and
 3 below are untouched by it — they are closed by the
-[partition builder](#the-segment-buffer-is-a-partition-builder) instead,
+[container builder](#the-segment-buffer-is-a-container-builder) instead,
 which is why sgsplat needs both substitutions and not just this one.
 
-## The segment buffer is a partition builder
+## The segment buffer is a container builder
 
 gsplat's segment buffer is a byte array: slot `l` lives at `l × R`, the
 buffer *is* the output bytes, and Transfer is a memcpy. All three
@@ -164,7 +220,7 @@ bytes are an *encoding* of the records rather than the records
 themselves, and a container's metadata is a function of its contents.
 
 The generalization is to stop treating the buffer as bytes and treat it
-as the in-memory representation of the output partition under
+as the in-memory representation of the output containers under
 construction. This is not a new object: it is the one every structured
 writer already has inside it — a row-group writer, a stripe writer, a
 chunk cache. sgsplat asks two things of it:
@@ -181,10 +237,10 @@ byte offset, and no record needs to know where its predecessor ended.
 
 | Flat-buffer problem | With a builder |
 |---------------------|----------------|
-| Output cannot be positioned or preallocated | Nothing is ever positioned; whole partitions are appended |
+| Output cannot be positioned or preallocated | Nothing is ever positioned; whole output containers are appended |
 | Encoded container size unknown until written | Discovered at `emit()`, which is the only place it matters |
 | Footers, offset indexes, statistics need global knowledge | Computed by the builder from its own contents |
-| Segment boundaries must align to container boundaries | A segment *is* one or more partitions — alignment is definitional, not a constraint |
+| Segment boundaries must align to container boundaries | A segment simply emits whole output containers — alignment is definitional, not a constraint |
 | Variable-length records need a re-sort by output position | Slots are addressed logically; ordering happens inside `emit()` |
 | Filtered records need running totals and a final truncate | A dropped record is simply never contributed |
 | A record's bytes are scattered across `K` leaf paths | `contribute` is addressed by `(path, ordinal)`; the builder is the merge point |
@@ -193,16 +249,25 @@ The last three are gsplat special cases that disappear rather than
 generalize. They exist only because a byte array forces you to know
 where record `l` starts before record `l−1` is final.
 
-### Segments and partitions decouple
+### Segments and containers stop being the same number
 
-A **segment** is the unit of I/O scheduling, sized to minimize passes
-over the source. A **partition** is the unit of output structure, sized
-for what makes a good row group, stripe, or chunk. A byte-array buffer
-forced them to be the same number, which coupled read-side efficiency to
-write-side format quality. A builder does not: one segment may emit
-several partitions when it serializes. Each side is now free to be
-sized on its own terms, and the pass-count argument in the cost model
-applies without a write-side caveat.
+A byte-array buffer conflates them. The buffer is simultaneously "what
+memory holds" and "what gets written", so the segment size *is* the
+output container size, and one number has to satisfy two unrelated
+constraints: your memory budget and the format's idea of a good row
+group.
+
+A builder separates them. It accumulates a segment's worth of records
+and decides for itself how many output containers that becomes. So:
+
+- size **segments** to minimize passes — a pure memory-budget decision,
+  and the only lever in the cost model;
+- size **containers** for whatever makes the output good to read — a
+  format-policy decision sgsplat has no opinion about.
+
+The pass-count argument then applies with no write-side caveat, which is
+what makes "minimize `P`" honest advice rather than a trade against
+output quality.
 
 ### What it costs
 
@@ -213,7 +278,7 @@ applies without a write-side caveat.
   Segment must size from an estimate rather than a computation.
 - **Early close makes `P` discovered rather than computed.** If the
   builder reaches the budget before the segment's ordinal range is
-  exhausted, close the partition, emit, and re-plan the remainder as the
+  exhausted, close the segment, emit, and re-plan the remainder as the
   next segment. Plans are cheap — a contiguous map window — so this is a
   re-slice, not a restart. But wherever encoded sizes are
   unpredictable, the exact-`P` calculation that normal form buys becomes
@@ -272,7 +337,7 @@ that index once over paying the address indirection forever.
 
 ### 2. The output cannot be positioned or preallocated
 
-**Dissolved by the [partition builder](#the-segment-buffer-is-a-partition-builder).**
+**Dissolved by the [container builder](#the-segment-buffer-is-a-container-builder).**
 
 Output containers are encoded, so their sizes are unknown until written
 and their metadata — footers, offset indexes, dictionaries, statistics,
@@ -288,7 +353,7 @@ constraint evaporates and segment sizing goes back to being a pure
 I/O-scheduling decision.
 
 What survives is one step, unchanged in spirit from gsplat: a
-**finalize** after the last partition, emitting whatever the format
+**finalize** after the last container, emitting whatever the format
 keeps outside the payload — file footer, global index, manifest,
 checksum tree. It is the only part of the pipeline that needs knowledge
 spanning all passes.
@@ -353,7 +418,7 @@ varies per record. Two consequences for the per-column instances:
 | **P** Plan | read a contiguous map window | flatten the skeleton to a dense map first (one traversal); then identical, with entries still `(source ordinal, local)` |
 | **L** Linearize | sort by source ordinal | unchanged under normal form; then run-length the sorted ordinals into ranges and group them by container, so each container is fetched exactly once per pass |
 | **A** Assemble | read record, scatter to `local × R` | iterate containers in address order, take each once, and `contribute(path, local, value)` for every plan entry inside it |
-| **T** Transfer | positional contiguous write | `emit()` — the builder serializes one or more partitions and appends them; global finalize after the last pass |
+| **T** Transfer | positional contiguous write | `emit()` — the builder serializes one or more output containers and appends them; global finalize after the last pass |
 
 ## Fast paths
 
@@ -385,7 +450,7 @@ counts and the value of one parameter:
  A(P) = P · (1 − exp(−w / P)) ≈ P   because P ≪ w in practice
 
  container touches ≈ A(P) × (number of source containers)
- write work        ≈ output partitions, emitted once
+ write work        ≈ output containers, emitted once
 ```
 
 Because `w` is enormous, structured rewrites live permanently in the
@@ -402,11 +467,9 @@ container is handed to the host. Minimizing touches minimizes all of
 them at once, and [normal form](#dfs-normal-form) makes the touch count
 exactly computable in advance.
 
-This is the precise sense in which container atomicity is and is not our
-problem. The per-touch cost is the host's and we have no opinion about
-it. The multiplier is ours, it is the only lever we have, and on
-compressed columnar data it is multiplying the most expensive thing in
-the system. The
+This is why the boundary in [read-side
+atomicity](#read-side-atomicity-an-orthogonal-boundary) sits where it
+does: the per-touch cost is the host's, the multiplier is ours. The
 two-level extension from [cost-model.md](./cost-model.md) maps onto
 structure directly and is more attractive here than in the flat case:
 
@@ -434,7 +497,7 @@ Beyond gsplat's six primitives
 
  builder.contribute(path, local_ordinal, value)              (replaces the byte buffer)
  builder.current_bytes()      -> resident size estimate      (drives early close)
- builder.emit()               -> serialize partitions, append, report sizes
+ builder.emit()               -> serialize containers, append, report sizes
  finalize(structural metadata)
 
  address_of(ordinal)          -> monotone key   (escape hatch only; stores not in normal form)
@@ -552,7 +615,7 @@ sgsplat exists for.
 3. **Early-close policy.** The builder reports resident size, but by
    the time it reports "over budget" the pass has already read the
    records it is holding. Closing early wastes nothing, yet it shrinks
-   the partition and raises the effective pass count. Sizing the segment
+   the segment and raises the effective pass count. Sizing the segment
    from a conservative estimate and rarely closing early is probably
    right, but "conservative" wants a number, and that number depends on
    how variable the encoded record size is.
