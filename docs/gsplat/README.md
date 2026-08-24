@@ -67,19 +67,21 @@ constrains the other.
    destination; the value is the origin. A source-ordered map produces
    the inverse rewrite, silently — see
    [02-plan.md](./02-plan.md#orientation-is-a-contract-not-a-check).
-2. **Ordinal addressability, at a position-invariant cost.** Given an
-   ordinal, the host can produce that record, and the cost of doing so
-   does not depend on *which* ordinal is asked for. That cost is allowed
-   to be substantial — deserialization and decompression along the way
-   are expected, and memoizing them is normal practice. What it may not
-   do is vary with position, since the algorithm reorders access freely
-   and the plan's ordering decisions assume a uniform price.
+2. **Records are obtainable by ordinal, in ascending order.** Within a
+   pass, Assemble asks for records in ascending ordinal order, and the
+   host has to be able to satisfy that sequence. Indexed access
+   satisfies it directly; so does plain streaming, since an ascending
+   request sequence never asks the source to go backwards.
+   Deserialization and decompression along the way are expected, and
+   memoizing them is normal practice.
 
-   Note what this does **not** say: that random access is cheap. If it
-   were — if reading in any order cost what reading in order costs —
-   gsplat would have nothing to sell, and you should skip it
-   ([When it fits](#when-it-fits)). The gap between those two prices is
-   the entire return on running this algorithm.
+   This says nothing about what a read *costs*, deliberately. gsplat
+   assumes the opposite of uniform cost: the reason
+   [Linearize](./03-linearize.md) exists at all is that the price of a
+   read depends on where the previous read landed — consecutive reads
+   share blocks and command slots, scattered ones do not. On a tier
+   where that were untrue there would be nothing to buy, and the right
+   move is to skip the algorithm ([When it fits](#when-it-fits)).
 3. **Strictly monotonic ordinal structure.** Within an ordinal space,
    ordinals ascend strictly with physical address:
    `i < j ⟹ address(i) < address(j)`. A flat store gets this from
