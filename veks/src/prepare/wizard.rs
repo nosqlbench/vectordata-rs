@@ -248,7 +248,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         || seeds.ground_truth_distances.is_some();
 
     let inferred = {
-        let probe = ImportArgs { merge: false,
+        let probe = ImportArgs { merge: false, fetch: None,
             name: String::new(),
             output: PathBuf::new(),
             base_vectors: if has_detected_base { Some(PathBuf::from("probe")) } else { None },
@@ -1419,7 +1419,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         std::process::exit(0);
     }
 
-    ImportArgs { merge: false,
+    ImportArgs { merge: false, fetch: None,
         name,
         output,
         base_vectors,

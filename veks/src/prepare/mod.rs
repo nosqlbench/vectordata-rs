@@ -153,6 +153,15 @@ pub enum PrepareCommand {
         #[arg(long)]
         merge: bool,
 
+        /// Incorporate a completed fetch pipeline (e.g. dataset_fetch.yaml)
+        /// ahead of the generated steps. The file stays the source of truth
+        /// for its own steps and is only read, so re-bootstrapping rebuilds
+        /// dataset.yaml from it rather than accumulating merged state. The
+        /// pipeline must have completed — bootstrap inspects the artifacts
+        /// it produced to decide what the dataset needs.
+        #[arg(long, value_name = "FILE")]
+        fetch: Option<PathBuf>,
+
         /// Start fresh — remove generated artifacts, dataset.yaml,
         /// variables.yaml, and .cache state, then re-bootstrap from
         /// initial conditions.
@@ -553,7 +562,7 @@ pub fn run(args: PrepareArgs) {
             force, reset, clean, recursive,
             base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
             personality, synthesize_metadata, metadata_fields, metadata_range,
-            synthesis_mode, synthesis_format, selectivity, predicate_count, merge,
+            synthesis_mode, synthesis_format, selectivity, predicate_count, merge, fetch,
         } => {
             // Derive cosine_mode from the two mutually-exclusive
             // flags. Clap already enforces "can't both be true".
@@ -728,6 +737,17 @@ pub fn run(args: PrepareArgs) {
             };
             let reset = reset || auto;
 
+            // Gate on the fetch pipeline first: the inputs validated below
+            // are exactly what it produces, so when it hasn't finished,
+            // "base vectors don't exist" is the symptom and "the fetch
+            // pipeline hasn't run" is the cause. Report the cause.
+            if let Some(ref fetch_path) = fetch
+                && let Err(e) = import::check_fetch_complete(fetch_path)
+            {
+                eprintln!("Error: --fetch {}", e);
+                std::process::exit(1);
+            }
+
             // Validate explicitly provided paths exist before proceeding.
             // Without this, a typo or misplaced flag value (e.g. --base-vectors '5%')
             // silently falls through to auto-detection in the wizard.
@@ -859,7 +879,7 @@ pub fn run(args: PrepareArgs) {
                             })
                     });
                     let out = output.clone().unwrap_or_else(|| PathBuf::from("."));
-                    import::run(import::ImportArgs { merge,
+                    import::run(import::ImportArgs { merge, fetch: fetch.clone(),
                         name, output: out.clone(), base_vectors, query_vectors, self_search,
                         query_count, metadata, ground_truth, ground_truth_distances,
                         metric, neighbors, seed, description, no_dedup, no_zero_check,
@@ -935,7 +955,7 @@ pub fn run(args: PrepareArgs) {
                         })
                 });
                 let output = output.unwrap_or_else(|| PathBuf::from("."));
-                import::run(import::ImportArgs { merge,
+                import::run(import::ImportArgs { merge, fetch: fetch.clone(),
                     name, output, base_vectors, query_vectors, self_search,
                     query_count, metadata, ground_truth, ground_truth_distances,
                     metric, neighbors, seed, description, no_dedup, no_zero_check,

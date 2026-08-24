@@ -68,7 +68,7 @@ fn has_dataset_yaml(dir: &Path) -> bool {
 }
 
 fn default_args(name: &str, output: &Path) -> ImportArgs {
-    ImportArgs { merge: false,
+    ImportArgs { merge: false, fetch: None,
         name: name.to_string(),
         output: output.to_path_buf(),
         base_vectors: None,

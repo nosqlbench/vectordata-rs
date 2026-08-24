@@ -50,6 +50,10 @@ pub struct ImportArgs {
     /// in the output directory's dataset.yaml ahead of the generated
     /// ones instead of replacing them.
     pub merge: bool,
+    /// A completed fetch pipeline to incorporate ahead of the generated
+    /// steps. Must have fully run: bootstrap decides what the dataset
+    /// needs by inspecting the artifacts it produced.
+    pub fetch: Option<PathBuf>,
     /// Target format for base vectors precision conversion (e.g., "mvec" for f32→f16).
     /// When set, a `convert` step is emitted after the base import/identity step.
     pub base_convert_format: Option<String>,
@@ -993,6 +997,191 @@ fn cmd_verify_knn(personality: &str) -> &'static str {
 }
 
 /// Walk the resolved slots and emit pipeline steps for materialized slots.
+/// Incorporate a completed fetch pipeline (`--fetch`) into the generated
+/// steps.
+///
+/// A fetch pipeline — acquire a corpus, derive records, embed them, join
+/// metadata — is authored separately and stays the source of truth for its
+/// own steps. Bootstrap only ever *reads* it, so re-bootstrapping rebuilds
+/// the dataset.yaml from the same two inputs every time instead of
+/// accumulating state in a file it half-owns.
+///
+/// The pipeline must have **fully completed** first. Bootstrap's whole job
+/// is deciding what steps a dataset needs by inspecting real artifacts —
+/// counts, dimensions, normalization, duplicates — so running it against a
+/// half-materialized fetch would bake decisions made from missing
+/// information into the generated pipeline. Refusing is the difference
+/// between a wrong dataset and an error message.
+///
+/// Dependency edges are derived from the data: a generated step that reads
+/// a path some fetch step writes is made to wait for it. Where no such
+/// match exists, the first generated step is chained to the last fetch step
+/// so ordering is never left to declaration order alone.
+///
+/// Returns the number of steps incorporated.
+fn incorporate_fetch_pipeline(
+    fetch_path: &std::path::Path,
+    generated: &mut Vec<Step>,
+) -> Result<usize, String> {
+    let fetch_steps = check_fetch_complete(fetch_path)?;
+    let carried = carry_steps(&fetch_steps);
+    wire_fetch_dependencies(&carried, generated);
+    let count = carried.len();
+    let mut merged = carried;
+    merged.append(generated);
+    *generated = merged;
+    Ok(count)
+}
+
+/// Load a fetch pipeline and require that every one of its steps has
+/// completed, returning its steps on success.
+///
+/// Freshness, not merely "recorded Ok": a step whose outputs have since
+/// been deleted or truncated has not left behind the artifacts bootstrap
+/// is about to inspect.
+pub(crate) fn check_fetch_complete(
+    fetch_path: &std::path::Path,
+) -> Result<Vec<vectordata::dataset::pipeline::StepDef>, String> {
+    if !fetch_path.exists() {
+        return Err(format!("{} does not exist", fetch_path.display()));
+    }
+    let config = vectordata::dataset::DatasetConfig::load(fetch_path)
+        .map_err(|e| format!("cannot read {}: {}", fetch_path.display(), e))?;
+    let fetch_steps: Vec<vectordata::dataset::pipeline::StepDef> = config
+        .upstream
+        .and_then(|u| u.steps)
+        .unwrap_or_default();
+    if fetch_steps.is_empty() {
+        return Err(format!("{} declares no upstream steps", fetch_path.display()));
+    }
+
+    let progress_path =
+        veks_pipeline::pipeline::progress::ProgressLog::path_for_dataset(fetch_path);
+    let (progress, _) = veks_pipeline::pipeline::progress::ProgressLog::load(&progress_path)
+        .map_err(|e| format!("cannot read progress for {}: {}", fetch_path.display(), e))?;
+    let workspace = fetch_path.parent().unwrap_or(std::path::Path::new("."));
+    let incomplete: Vec<String> = fetch_steps
+        .iter()
+        .filter_map(|s| {
+            let id = s.id.clone().unwrap_or_else(|| s.run.replace(' ', "-"));
+            progress
+                .check_step_freshness(&id, None, Some(workspace))
+                .map(|reason| format!("    {} — {}", id, reason))
+        })
+        .collect();
+    if !incomplete.is_empty() {
+        return Err(format!(
+            "{} has not fully completed — {} of {} step(s) are not done:\n{}\n  \
+             Run `veks run {}` to completion first. Bootstrap decides what the \
+             dataset needs by inspecting the artifacts a fetch pipeline produces, \
+             so it cannot run against partial inputs.",
+            fetch_path.display(),
+            incomplete.len(),
+            fetch_steps.len(),
+            incomplete.join("\n"),
+            fetch_path.display(),
+        ));
+    }
+    Ok(fetch_steps)
+}
+
+/// Convert schema steps into the shape the generator serializes.
+fn carry_steps(defs: &[vectordata::dataset::pipeline::StepDef]) -> Vec<Step> {
+    defs.iter()
+        .map(|s| Step {
+            id: s.id.clone().unwrap_or_else(|| s.run.replace(' ', "-")),
+            run: s.run.clone(),
+            description: s.description.clone(),
+            after: s.after.clone(),
+            per_profile: s.per_profile,
+            phase: s.phase,
+            finalize: s.finalize,
+            options: s
+                .options
+                .iter()
+                .map(|(k, v)| (k.clone(), yaml_scalar_to_string(v)))
+                .collect(),
+        })
+        .collect()
+}
+
+/// Option keys that name an input a step reads. Used to match generated
+/// steps against the fetch outputs they consume.
+const INPUT_OPTION_KEYS: &[&str] = &[
+    "source", "reference", "passages", "base", "query", "metadata",
+    "metadata-indices", "predicates", "survey", "ivec-file", "ordinals",
+    "duplicates", "ground-truth", "ground-truth-distances",
+];
+
+/// Add `after` edges from generated steps to the fetch steps whose outputs
+/// they read, falling back to a single chain edge when nothing matches.
+fn wire_fetch_dependencies(fetch: &[Step], generated: &mut [Step]) {
+    // Paths the fetch pipeline produces.
+    let produced: std::collections::HashSet<String> = fetch
+        .iter()
+        .filter_map(|s| {
+            s.options
+                .iter()
+                .find(|(k, _)| k == "output")
+                .map(|(_, v)| normalize_path_option(v))
+        })
+        .collect();
+
+    // For each produced path, the *last* fetch step that touches it — as
+    // producer or reader. Depending on the producer alone would let the
+    // facet half start alongside a `verify alignment` gate that reads the
+    // artifact but writes nothing, which defeats the point of the gate:
+    // work would proceed against an artifact still being validated.
+    let mut last_touch: Vec<(String, String)> = Vec::new();
+    for step in fetch {
+        for (key, value) in &step.options {
+            if key != "output" && !INPUT_OPTION_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            let path = normalize_path_option(value);
+            if !produced.contains(&path) {
+                continue;
+            }
+            match last_touch.iter_mut().find(|(p, _)| *p == path) {
+                Some(entry) => entry.1 = step.id.clone(),
+                None => last_touch.push((path, step.id.clone())),
+            }
+        }
+    }
+
+    let mut matched_any = false;
+    for step in generated.iter_mut() {
+        for (key, value) in step.options.clone() {
+            if !INPUT_OPTION_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            let want = normalize_path_option(&value);
+            if let Some((_, gate)) = last_touch.iter().find(|(p, _)| *p == want)
+                && !step.after.contains(gate)
+            {
+                step.after.push(gate.clone());
+                matched_any = true;
+            }
+        }
+    }
+
+    // Nothing matched by path (a fetch pipeline whose outputs are consumed
+    // indirectly, say). Ordering still has to be guaranteed, so chain the
+    // first generated step to the last fetch step.
+    if !matched_any
+        && let (Some(last), Some(first)) = (fetch.last(), generated.first_mut())
+        && !first.after.contains(&last.id)
+    {
+        first.after.push(last.id.clone());
+    }
+}
+
+/// Strip window notation and surrounding whitespace so a path option
+/// compares equal to the output that produced it.
+fn normalize_path_option(value: &str) -> String {
+    value.split('[').next().unwrap_or(value).trim().to_string()
+}
+
 /// Prepend the `upstream.steps` already present in `output_dir`'s
 /// `dataset.yaml` to the freshly generated ones, and make the first
 /// generated step depend on the last existing one.
@@ -2738,6 +2927,17 @@ fn generate_yaml(
 
 /// Run the `datasets import` subcommand.
 pub fn run(mut args: ImportArgs) {
+    // Gate on the fetch pipeline before anything else validates inputs.
+    // Those inputs are exactly what a fetch pipeline produces, so when it
+    // hasn't finished, "base vectors don't exist" is a symptom and
+    // "the fetch pipeline hasn't run" is the cause — report the cause.
+    if let Some(ref fetch_path) = args.fetch
+        && let Err(e) = check_fetch_complete(fetch_path)
+    {
+        eprintln!("Error: --fetch {}", e);
+        std::process::exit(1);
+    }
+
     // Apply --provided-facets masking: null out inputs for facets not
     // in the provided set so the pipeline generates compute steps for them.
     if let Some(ref provided) = args.provided_facets {
@@ -2891,7 +3091,19 @@ pub fn run(mut args: ImportArgs) {
     // occupies the same `upstream.steps` slot bootstrap writes into, so
     // without this the two halves have to live in separate files that the
     // author shuffles around by hand.
-    if args.merge {
+    if let Some(ref fetch_path) = args.fetch {
+        match incorporate_fetch_pipeline(fetch_path, &mut steps) {
+            Ok(n) => println!(
+                "  incorporated {} completed step(s) from {}",
+                n,
+                crate::check::rel_display(fetch_path)
+            ),
+            Err(e) => {
+                eprintln!("Error: --fetch {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if args.merge {
         match merge_existing_steps(output_dir, &mut steps) {
             Ok(0) => {}
             Ok(n) => println!("  merged {} existing upstream step(s) ahead of the generated ones", n),
@@ -3710,7 +3922,7 @@ mod tests {
     }
 
     fn default_args() -> ImportArgs {
-        ImportArgs { merge: false,
+        ImportArgs { merge: false, fetch: None,
             name: "test".into(),
             output: PathBuf::from("/tmp/test-out"),
             base_vectors: None,
