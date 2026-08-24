@@ -37,7 +37,7 @@ time) at cuBLAS-peak 83–84% SM throughput (measured on Blackwell sm120).
 | Option | Required | Description |
 |--------|----------|-------------|
 | `--source` | yes | Parquet file whose text column is embedded row-by-row |
-| `--output` | yes | Output `.npy` path (C-order f32, row i embeds source row i) |
+| `--output` | yes | Output path; the format follows the extension — `.fvecs` (or any xvec) writes natively, anything else writes a C-order f32 `.npy`. Row i embeds source row i either way |
 | `--column` | no | Source column holding the text (default: `text`) |
 | `--model` | no | HuggingFace model id (default: `Qwen/Qwen3-Embedding-0.6B`) |
 | `--revision` | no | Model revision (default: `main`; pin a commit sha for strict reproducibility) |
@@ -48,6 +48,18 @@ time) at cuBLAS-peak 83–84% SM throughput (measured on Blackwell sm120).
 
 ## Notes
 
+- **Prefer `.fvecs` when the output feeds a dataset build.** `prepare
+  bootstrap` emits a conversion step only when its base vectors are not
+  already a native xvec format, so a `.fvecs` artifact collapses that step
+  to an identity symlink — removing both the conversion pass and a second
+  full copy of the vectors (410 GB at 100M x 1024-d). `.npy` remains the
+  default for anything else and is byte-for-byte the same embedding.
+- Rows stream to the output as they complete rather than accumulating in
+  memory: buffering 100M x 1024-d would need ~410 GB of RAM. Workers
+  finish batches out of order, so completed rows are held only until the
+  next contiguous run can be written, and batches are planned within a
+  tokenize chunk so that window stays small. The tokenizer feeds a bounded
+  queue for the same reason.
 - The backend is a bespoke cache-free Qwen3 forward: right-padded batching
   under a causal mask (pads can never influence real tokens), so batches
   mix lengths safely; batches are planned longest-first to minimize

@@ -246,11 +246,26 @@ bf16 on CUDA.
         let n_texts = texts.len();
         let pb = ctx.ui.bar_with_unit(n_texts as u64, "embed", "psg");
         let hidden = config.hidden_size;
-        let mut vectors: Vec<Vec<f32>> = vec![Vec::new(); n_texts];
+        // Rows stream to disk as they complete. Workers finish batches out
+        // of order, so rows land in `pending` and are drained to the sink
+        // whenever the next contiguous run is ready. The window stays small
+        // because batches are planned within a tokenize chunk, so a row is
+        // only ever reordered against its chunk-mates.
+        let mut sink = match RowSink::open(&output, n_texts, hidden) {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let mut pending: HashMap<usize, Vec<f32>> = HashMap::new();
+        let mut next_row = 0usize;
         let mut done = 0u64;
         let mut first_err: Option<String> = None;
         let abort = std::sync::atomic::AtomicBool::new(false);
-        let (btx, brx) = std::sync::mpsc::channel::<Result<Batch, String>>();
+        // Bounded so the tokenizer cannot race arbitrarily far ahead of the
+        // GPUs: unbounded, it would hold token ids for the whole input and
+        // widen the reorder window it is supposed to keep narrow.
+        let (btx, brx) = std::sync::mpsc::sync_channel::<Result<Batch, String>>(
+            (models.len() * 4).max(4),
+        );
         let brx = std::sync::Mutex::new(brx);
         let (rtx, rrx) =
             std::sync::mpsc::channel::<Result<(Vec<usize>, Vec<Vec<f32>>), String>>();
@@ -312,7 +327,19 @@ bf16 on CUDA.
                     Ok((batch, embedded)) => {
                         done += batch.len() as u64;
                         for (idx, vec) in batch.into_iter().zip(embedded) {
-                            vectors[idx] = vec;
+                            pending.insert(idx, vec);
+                        }
+                        // Drain every row that is now in order.
+                        while let Some(row) = pending.remove(&next_row) {
+                            if let Err(e) = sink.write_row(&row) {
+                                first_err = Some(e);
+                                abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                            next_row += 1;
+                        }
+                        if first_err.is_some() {
+                            break;
                         }
                         pb.set_position(done);
                     }
@@ -328,9 +355,21 @@ bf16 on CUDA.
         if let Some(e) = first_err {
             return error_result(e, start);
         }
-
-        // ── Write npy (atomic) ───────────────────────────────────────────
-        if let Err(e) = write_npy_f32(&output, &vectors, hidden) {
+        // Every row must have been written: the npy header states the row
+        // count up front, so a gap would produce a file that reads as
+        // complete and is not.
+        if next_row != n_texts || !pending.is_empty() {
+            return error_result(
+                format!(
+                    "internal: wrote {} of {} row(s), {} still buffered",
+                    next_row,
+                    n_texts,
+                    pending.len()
+                ),
+                start,
+            );
+        }
+        if let Err(e) = sink.finish() {
             return error_result(e, start);
         }
         let _ = crate::pipeline::variables::set_and_save(
@@ -345,10 +384,10 @@ bf16 on CUDA.
             status: Status::Ok,
             message: format!(
                 "embedded {} row(s) @ {}-d to {} ({:.1} rows/s)",
-                vectors.len(),
+                n_texts,
                 hidden,
                 output.display(),
-                vectors.len() as f64 / elapsed.as_secs_f64().max(0.001)
+                n_texts as f64 / elapsed.as_secs_f64().max(0.001)
             ),
             produced: vec![output],
             elapsed,
@@ -607,7 +646,97 @@ fn batch_plan(rows: &[Vec<u32>], batch_size: usize) -> Vec<Vec<usize>> {
     order.chunks(batch_size).map(|c| c.to_vec()).collect()
 }
 
+/// Streaming row sink for the embedding output.
+///
+/// Rows are written as they become available rather than collected: at
+/// 100M x 1024-d an in-memory buffer is ~410 GB, which no amount of host
+/// RAM makes reasonable. Both variants are append-only and take rows in
+/// ascending order, which is what lets the caller hold only the rows that
+/// arrived out of order.
+///
+/// Writing a native xvec format directly is not merely a convenience.
+/// `prepare bootstrap` emits a conversion step only when its base vectors
+/// are *not* already native (`needs_import = !is_native_xvec_file(..)`);
+/// handing it `.fvecs` collapses that step to an identity symlink,
+/// removing both the conversion pass and a full second copy of the
+/// vectors — 410 GB at 100M scale.
+enum RowSink {
+    /// `.npy` — the header carries the row count, so it is written up
+    /// front from the known total and rows are appended after it.
+    Npy(AtomicWriter),
+    /// Any xvec format (`.fvecs` and friends): a dimension prefix per
+    /// record, appended in order.
+    Xvec(Box<dyn veks_core::formats::writer::VecSink>),
+}
+
+impl RowSink {
+    /// Open a sink for `output`, choosing the format from its extension.
+    /// `rows` is the exact number of rows that will be written — the npy
+    /// header depends on it, so a short or long write corrupts the file.
+    fn open(output: &Path, rows: usize, dim: usize) -> Result<Self, String> {
+        let format = veks_core::formats::VecFormat::detect_from_path(output);
+        match format {
+            Some(f) if f.is_xvec() => {
+                let sink = veks_core::formats::writer::open_sink(
+                    output,
+                    f,
+                    &veks_core::formats::writer::SinkConfig {
+                        dimension: dim as u32,
+                        source_format: f,
+                        slab_page_size: None,
+                        slab_namespace: 0,
+                        schema_sidecar: None,
+                    },
+                )?;
+                Ok(RowSink::Xvec(sink))
+            }
+            // npy is the default for anything not recognized as xvec:
+            // the historical output format, and what a bare `.npy` or an
+            // extensionless path means here.
+            _ => {
+                let header_body = format!(
+                    "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, {}), }}",
+                    rows, dim
+                );
+                let unpadded = 10 + header_body.len() + 1;
+                let padding = (64 - unpadded % 64) % 64;
+                let header = format!("{}{}\n", header_body, " ".repeat(padding));
+
+                let mut writer = AtomicWriter::new(output)
+                    .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
+                writer.write_all(b"\x93NUMPY\x01\x00").map_err(|e| e.to_string())?;
+                writer
+                    .write_all(&(header.len() as u16).to_le_bytes())
+                    .map_err(|e| e.to_string())?;
+                writer.write_all(header.as_bytes()).map_err(|e| e.to_string())?;
+                Ok(RowSink::Npy(writer))
+            }
+        }
+    }
+
+    fn write_row(&mut self, row: &[f32]) -> Result<(), String> {
+        let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        match self {
+            RowSink::Npy(w) => w.write_all(&bytes).map_err(|e| e.to_string()),
+            // The xvec sink appends and ignores the ordinal; ordering is
+            // the caller's contract.
+            RowSink::Xvec(s) => {
+                s.write_record(0, &bytes);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self) -> Result<(), String> {
+        match self {
+            RowSink::Npy(w) => w.finish().map_err(|e| e.to_string()),
+            RowSink::Xvec(s) => s.finish(),
+        }
+    }
+}
+
 /// Write a C-order f32 `.npy` of shape [rows, dim] atomically.
+#[cfg(test)]
 fn write_npy_f32(output: &Path, vectors: &[Vec<f32>], dim: usize) -> Result<(), String> {
     let header_body = format!(
         "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, {}), }}",
@@ -661,6 +790,49 @@ mod tests {
         // Cap 4 → 3 content tokens + EOS.
         assert_eq!(prepare_ids((1..=10).collect(), 9, 4), vec![1, 2, 3, 9]);
         assert_eq!(prepare_ids(vec![], 9, 4), vec![9]);
+    }
+
+    #[test]
+    /// The sink picks its format from the output extension, and both
+    /// formats write rows in the order handed to them. Writing `.fvecs`
+    /// directly is what lets `prepare bootstrap` treat the artifact as
+    /// native and skip its conversion step entirely.
+    #[test]
+    fn row_sink_writes_both_formats_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows: Vec<Vec<f32>> = (0..5)
+            .map(|i| (0..4).map(|j| (i * 4 + j) as f32).collect())
+            .collect();
+
+        for (name, expected_len) in [
+            ("out.fvecs", 5 * (4 + 4 * 4)), // dim prefix + payload per record
+            ("out.npy", 128 + 5 * 4 * 4),   // padded header + payload
+        ] {
+            let path = tmp.path().join(name);
+            let mut sink = RowSink::open(&path, rows.len(), 4).unwrap();
+            for row in &rows {
+                sink.write_row(row).unwrap();
+            }
+            sink.finish().unwrap();
+            let written = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(written, expected_len as u64, "{name} size");
+
+            // Read back through the format readers and confirm both the
+            // values and their order survived.
+            let format = veks_core::formats::VecFormat::detect(&path).unwrap();
+            let mut src =
+                veks_core::formats::reader::open_source(&path, format, 1, None).unwrap();
+            assert_eq!(src.dimension(), 4, "{name} dimension");
+            for (i, expected) in rows.iter().enumerate() {
+                let bytes = src.next_record().unwrap_or_else(|| panic!("{name} row {i}"));
+                let got: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                assert_eq!(&got, expected, "{name} row {i} out of order or corrupt");
+            }
+            assert!(src.next_record().is_none(), "{name} wrote extra rows");
+        }
     }
 
     #[test]

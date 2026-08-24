@@ -359,8 +359,8 @@ impl EmbeddingModel {
         // sizes for bf162 vectorization.
         let fused_ok = cfg.head_dim() == 128
             && !cfg.attention_bias
-            && cfg.hidden_size % 2 == 0
-            && cfg.intermediate_size % 2 == 0;
+            && cfg.hidden_size.is_multiple_of(2)
+            && cfg.intermediate_size.is_multiple_of(2);
         Ok(Self {
             embed_tokens,
             layers,
