@@ -168,6 +168,21 @@ the HDD tolerates 179 passes before ordering stops paying, and the NVMe
 tolerates 3. The full table is in the [gsplat cost
 model](../../gsplat/cost-model.md#where-ordering-starts-to-pay).
 
+**What the device is actually doing.** An event-driven model of the
+storage path (`veks-studies/src/io/`) reproduces these sweeps to within
+5% on the HDD without computing a throughput anywhere, and reports where
+the time goes. Under scattered 4 KiB reads the HDD spends **99% of its
+busy time positioning and 1% transferring**; reading the same bytes in
+ascending order inverts that to 2% and 98%. SPLAT's whole effect on that
+device is this inversion.
+
+On flash the same comparison shows no difference at all — scattered and
+ascending 4 KiB reads reach the same utilization, because there is no
+position to pay for. Flash gains from SPLAT only through coalescing:
+fewer, larger requests past the controller's command-rate ceiling. That
+is a real gain, but it is a different mechanism from the one the HDD
+numbers demonstrate, and it is much smaller.
+
 ## Worked examples
 
 All three assume a full permutation (`N = N_src`), `B = 4 KiB`,

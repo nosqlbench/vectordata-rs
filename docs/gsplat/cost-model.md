@@ -185,6 +185,53 @@ constants:
 | Flash, deep queue | 32 KiB measured | 32–62 µs at ~10⁵ IOPS | bytes moved — the terms converge |
 | Object storage | 1–8 MiB effective | 20–100 ms, **priced per request** | request count and price, not time |
 
+### What a simulated device path shows
+
+The expressions above price a request stream. They cannot say what
+fraction of a device's time becomes useful work, because that is a
+consequence of how requests interleave — so `veks-studies/src/io/`
+models the path instead of pricing it: bandwidth as a resource that is
+consumed, a command queue with a finite number of slots, a controller
+with a serial command rate, a head that travels and a platter that
+turns, and the page cache in the request path. Nothing in it computes a
+throughput. It advances a clock, and it lands within 5% (spinning disk),
+9% (SATA SSD) and 17% (NVMe) of the measured random sweeps at every
+block size up to 1 MiB, reproducing all three sequential figures to
+within a percent.
+
+Two of its outputs change claims made above.
+
+**Where the time goes, at 4 KiB:**
+
+| Device | Access order | Positioning | Bandwidth used |
+|---|---|---|---|
+| Spinning disk | scattered | 99% | **1%** |
+| Spinning disk | ascending | 2% | **98%** |
+| SATA SSD | scattered | 0% | 54% |
+| SATA SSD | ascending | 0% | 55% |
+| NVMe | scattered | 0% | 33% |
+| NVMe | ascending | 0% | 33% |
+
+The disk spends 99% of its busy time moving the head and waiting for the
+platter, and converts nearly all of it into transfer once reads ascend.
+That is this algorithm's entire thesis, stated as a measurement.
+
+The flash rows say something the block-size framing obscures:
+**at 4 KiB, ordering changes nothing measurable on flash.** Scattered and
+ascending reach the same utilization to within a point, because there is
+no position to pay for. Flash gains from ordering only through
+*coalescing* — fewer, larger requests moving past the controller's
+command-rate ceiling, which is what the 33% on NVMe is — never through
+locality.
+
+**Page size is second-order.** On a bytes-moved basis a larger container
+is the lever, and `A(P)` treats it that way. In time it is not: once
+access ascends, small contiguous reads cost a disk almost nothing extra,
+so a sixteenfold page change moves an ordered run by under 15% — and a
+scattered one by about as little. Ordering the same accesses is worth
+more than 8×. The container size is worth tuning; the ordering is worth
+having.
+
 ### Concurrency is a correctness concern, not a tuning knob
 
 The same result set measures a random reader running alongside a
@@ -199,6 +246,14 @@ SATA SSD, and 208 to **25** on the spinning disk. An unthrottled
 sequential writer does not slow a concurrent reader down, it removes it
 from the schedule. **Transfer must rate-limit its output stream against
 its input stream**, or the cost model above does not describe the run.
+
+The simulator reproduces the direction of this everywhere and roughly the
+magnitude on the spinning disk, but understates it badly on flash — 2×
+against a measured 178× on NVMe. Fair bandwidth sharing lets a small read
+complete quickly, and real devices evidently do not schedule anything
+like that fairly once a bulk stream saturates them. Take the measured
+numbers as the estimate and the simulated one as a floor; the design
+conclusion is the same either way.
 
 ## Worked examples
 
