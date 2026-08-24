@@ -255,6 +255,11 @@ knowing which you have before building anything.
 
 ## The ordering forest
 
+A worked instance of everything in this section — a schema, its
+annotation, the maps, the schedule, the traced output, and the freedom
+counted exactly — is in
+[annex-ordering-forest.md](./annex-ordering-forest.md).
+
 The question a schema has to answer, type by type, is not "what is this
 type's order" but **"who decides it."** There are only two answers:
 
