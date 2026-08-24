@@ -143,6 +143,12 @@ whole reduction pay:
 
 > **ordinal order == address order**
 
+Nothing new is being asked for here. Strictly monotonic ordinal
+structure is a [premise of the whole
+family](./README.md#contract-and-preconditions); a flat store gets it
+free from stride arithmetic, and DFS normal form is simply how a
+structured store satisfies the same premise.
+
 Stated as a condition on the *format* rather than on the walk, a store
 is in **DFS normal form** when:
 

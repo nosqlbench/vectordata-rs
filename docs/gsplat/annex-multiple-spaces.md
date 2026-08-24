@@ -11,12 +11,18 @@ any of it is adopted.
 The input holds more than one **type**, physically distinct, each in its
 own ordinal space:
 
-- each space numbers its own records internally,
+- each space numbers its own records internally, and — as everywhere in
+  this family — that numbering is **strictly monotonic** in address
+  ([premise 3](./README.md#contract-and-preconditions)); the spaces are
+  *independent*, never unordered,
 - there is **no visible mapping between spaces** — space A's ordinal 7
   has no relationship to space B's ordinal 7,
 - each space carries its own transform, so each has its **own map**,
 - records of every space are dispersed through both the input and the
   output.
+
+Independence is a statement about what holds *between* spaces. Within a
+space nothing is relaxed at all.
 
 What is known is the **dispersal in the output**: for each slot of the
 prototypical output container, which space supplies it. Two spaces is
@@ -30,15 +36,14 @@ the simplest instance; nothing below is limited to two.
  maps          m_k[j]         source ordinal in S_k for that space's j-th output record
 ```
 
-One property makes the whole thing tractable, and it is worth stating
-because everything rests on it:
+The schedule therefore does exactly one thing:
 
-> **τ interleaves the spaces but never reorders within one.** Each
+> **τ interleaves the spaces; it never reorders within one.** Each
 > space's output records are consumed in its own ordinal order.
 
-That is not an extra assumption so much as what "the schedule tells us
-where records go" already means — but if a design ever violates it, the
-model below stops applying.
+This follows from the family premise rather than adding to it. Each
+space is strictly monotonic internally, so a schedule can only decide
+*where* a space's next record goes, never *which* one comes next.
 
 ### Why segmentation survives
 

@@ -53,14 +53,32 @@ monotone reads and contiguous writes.
 2. **Ordinal-addressable source.** Given an ordinal, the host can read
    that record without scanning: constant-time arithmetic for
    fixed-stride records, or an ordinal→offset index otherwise.
-3. **Positional or strictly-ordered sink.** The host can either write a
+3. **Strictly monotonic ordinal structure.** Within an ordinal space,
+   ordinals ascend strictly with physical address:
+   `i < j ⟹ address(i) < address(j)`. A flat store gets this from
+   `address = base + i × R`; a structured store gets it from [DFS normal
+   form](./structured.md#dfs-normal-form). This is a **premise of the
+   whole family**, not a per-variant assumption — it is what lets
+   Linearize sort by ordinal and call the result an I/O order, and every
+   variant of the problem inherits it. Where several spaces coexist, it
+   holds *per space*.
+4. **Positional or strictly-ordered sink.** The host can either write a
    byte range at a computed offset, or accept appends in output order.
-4. **A memory budget that fits at least two records** — in practice,
+5. **A memory budget that fits at least two records** — in practice,
    enough for a segment worth reasoning about.
 
 The map need not be *stored*: a computable permutation (a seeded
 shuffle, a modular stride, a rank function) satisfies the contract just
 as well, and makes the plan step cheaper still.
+
+Precondition 3 says *strictly* monotonic, which makes the map an
+injection: one source record lands at one output position. Relaxing it
+to non-strict would admit ties — the same source record contributed to
+several output positions — turning the map from a permutation into a
+general function. That is a coherent extension and a different problem:
+the single-read invariant survives (drain a record's slots while it is
+resident) but uniqueness validation, compaction, and the plan's
+one-slot-per-entry structure all change. Out of scope as written.
 
 ## The pattern
 
