@@ -213,6 +213,10 @@ Skip it when:
 - [cost-model.md](./cost-model.md) — order-of-growth against the naive
   permutation, the read amplification factor, worked examples, and the
   two-level extension.
+- [structured.md](./structured.md) — **sgsplat**: hierarchical sources
+  and sinks, where a traversal fixes the ordinal space and a skeleton
+  carries the map. Covers address-vs-ordinal ordering, container-atomic
+  fetch units, ordered-append output, and per-leaf-path decomposition.
 
 ## Origin
 
