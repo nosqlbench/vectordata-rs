@@ -107,7 +107,7 @@ full permutation (`N = N_src`, the shuffle split case):
 
 | `P` | 2 | 4 | 8 | 16 | 31 | 53 | 100 | 215 |
 |-----|---|---|---|----|----|----|-----|-----|
-| `A` | 2.0 | 4.0 | 7.8 | 14.4 | 19.6 | 23.5 | 27.0 | 29.1 |
+| `A` | 2.0 | 4.0 | 7.8 | 13.7 | 19.6 | 23.5 | 26.7 | 28.9 |
 
 The naive baseline's amplification is fixed and small — `⌈R/B⌉·B / R`,
 about 2.0 for `R = 4100` — because random access defeats readahead

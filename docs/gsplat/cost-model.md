@@ -97,7 +97,7 @@ permutation (`N = N_src`):
 
 | `P` | 2 | 4 | 8 | 16 | 32 | 54 | 100 |
 |-----|---|---|---|----|----|----|-----|
-| `A` | 2.0 | 4.0 | 7.9 | 14.6 | 20.2 | 24.1 | 27.3 |
+| `A` | 2.0 | 4.0 | 7.9 | 13.8 | 20.2 | 24.1 | 27.4 |
 
 The naive baseline's amplification is fixed and small — `⌈R/B⌉·B / R`,
 around 2 for a 4 KiB record — because random access defeats prefetching

@@ -57,6 +57,7 @@ members = [
     "slabtastic",
     "veks-io",
     "tools",
+    "veks-studies",
 ]
 # Preserve the virtual-workspace default: bare `cargo build`/`cargo test`
 # at the root still covers every member — and NOT the root package, whose
@@ -75,6 +76,7 @@ default-members = [
     "slabtastic",
     "veks-io",
     "tools",
+    "veks-studies",
 ]
 resolver = "3"
 
