@@ -32,10 +32,16 @@ impl Rewrite for NaiveGather {
         trace.claim_resident(geometry.record_bytes);
 
         for (slot, &source) in map.0.iter().enumerate() {
-            trace.push(Op::ReadMap { from: slot as u64, count: 1 });
+            trace.push(Op::ReadMap {
+                from: slot as u64,
+                count: 1,
+            });
             trace.push(Op::ReadRecord { ordinal: source });
             sink.slots[slot] = Some(source);
-            trace.push(Op::WriteRange { first_slot: slot as u64, records: 1 });
+            trace.push(Op::WriteRange {
+                first_slot: slot as u64,
+                records: 1,
+            });
         }
         trace.push(Op::Barrier);
 
@@ -65,7 +71,10 @@ impl Rewrite for NaiveScatter {
             inverse[source as usize] = slot as u64;
         }
         trace.push(Op::PassStart { pass: 0 });
-        trace.push(Op::ReadMap { from: 0, count: map.len() });
+        trace.push(Op::ReadMap {
+            from: 0,
+            count: map.len(),
+        });
         trace.claim_resident(geometry.record_bytes + geometry.records * 8);
 
         for source in 0..geometry.records {
@@ -77,7 +86,10 @@ impl Rewrite for NaiveScatter {
             sink.slots[slot as usize] = Some(source);
             // Each write lands wherever the inverse points — one range
             // of one record, at an unrelated position.
-            trace.push(Op::WriteRange { first_slot: slot, records: 1 });
+            trace.push(Op::WriteRange {
+                first_slot: slot,
+                records: 1,
+            });
         }
         trace.push(Op::Barrier);
 

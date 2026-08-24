@@ -1,0 +1,588 @@
+// Copyright (c) Jonathan Shook
+// SPDX-License-Identifier: Apache-2.0
+
+//! A virtual page cache, so the model can say what actually reaches the
+//! device.
+//!
+//! The perfscripts measurements this crate prices against are unbuffered
+//! (`direct=1`), which makes them the *cold* floor: every read goes to
+//! the device. Real pipelines do not run that way. Between the algorithm
+//! and the device sits a page cache, and it changes two things the cost
+//! model otherwise gets wrong.
+//!
+//! **It creates the container.** Reading one record faults in the whole
+//! page containing it, so neighbouring records come along free. With the
+//! page size set to the container size, container amplification stops
+//! being an assumption and becomes an *outcome* — the same
+//! `A(P) = P · (1 − exp(−w / P))` curve falls out of replaying the access
+//! sequence through [`PageCache`], or it does not, and then the formula
+//! is wrong. See [`crate::study`] for that comparison.
+//!
+//! **It breaks the pass model.** `A(P)` assumes each pass re-reads its
+//! containers from the device. With enough resident memory, a page
+//! touched in one pass is still there in the next, and the re-read never
+//! happens. How much memory that takes, and how sharply the benefit
+//! falls off, is what the cache simulation is for.
+//!
+//! Residency is a bitmask over the address space — one bit per page —
+//! and recency is an intrusive list over cache slots, so both membership
+//! and eviction are constant-time and the whole thing stays cheap enough
+//! to replay millions of operations.
+
+use crate::model::{Op, Trace};
+
+/// Where a page lives. Input and output occupy one flat page space so
+/// that a streaming writer competes with the reader for residency, as it
+/// would in a real page cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    Input,
+    Output,
+}
+
+/// How much memory the cache may use, and at what granularity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheConfig {
+    /// Memory available for cached pages.
+    pub ram_bytes: u64,
+    /// Page size. Sweeping this is the point — it sets how much comes
+    /// along free with each fault.
+    pub page_bytes: u64,
+    /// Whether written pages occupy cache and evict read pages. Real
+    /// page caches do; turning it off isolates read behaviour.
+    pub writes_occupy: bool,
+}
+
+impl CacheConfig {
+    pub fn new(ram_bytes: u64, page_bytes: u64) -> Self {
+        CacheConfig {
+            ram_bytes,
+            page_bytes,
+            writes_occupy: true,
+        }
+    }
+
+    /// A cache that retains nothing at all, so every page a request
+    /// touches is fetched even if the previous request just touched it.
+    /// This is a floor for comparison, not a model of any real system.
+    pub fn uncached(page_bytes: u64) -> Self {
+        CacheConfig {
+            ram_bytes: 0,
+            page_bytes,
+            writes_occupy: false,
+        }
+    }
+
+    /// One page of retention: the current block is held until the reader
+    /// moves off it, and nothing else is.
+    ///
+    /// This is the unbuffered case the fio data was measured under —
+    /// `direct=1` bypasses the page cache, but a read of `bs` bytes still
+    /// delivers all `bs` bytes, and consecutive records inside one block
+    /// arrive together. It is also exactly what the `container_touches`
+    /// metric counts, which makes it the configuration where the
+    /// simulated and table-driven costs should agree.
+    pub fn single_page(page_bytes: u64) -> Self {
+        CacheConfig {
+            ram_bytes: page_bytes,
+            page_bytes,
+            writes_occupy: false,
+        }
+    }
+
+    pub fn capacity_pages(&self) -> usize {
+        (self.ram_bytes / self.page_bytes.max(1)) as usize
+    }
+}
+
+/// What a replay cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    /// Page touches served from memory.
+    pub read_hits: u64,
+    /// Page touches that had to reach the device.
+    pub read_misses: u64,
+    pub write_hits: u64,
+    pub write_misses: u64,
+    pub evictions: u64,
+    /// Distinct pages faulted in — the cold-cache lower bound on misses.
+    pub compulsory_misses: u64,
+    pub page_bytes: u64,
+    pub capacity_pages: u64,
+}
+
+impl CacheStats {
+    /// Bytes that actually reached the device on the read path.
+    pub fn read_bytes_from_device(&self) -> u64 {
+        self.read_misses * self.page_bytes
+    }
+
+    pub fn read_hit_rate(&self) -> f64 {
+        let total = self.read_hits + self.read_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.read_hits as f64 / total as f64
+        }
+    }
+
+    /// Misses beyond the unavoidable first touch of each page. Zero means
+    /// the cache was large enough that nothing was ever re-fetched.
+    pub fn capacity_misses(&self) -> u64 {
+        self.read_misses.saturating_sub(self.compulsory_misses)
+    }
+}
+
+const NONE: u32 = u32::MAX;
+
+/// An LRU page cache over a flat virtual address space.
+pub struct PageCache {
+    config: CacheConfig,
+    /// One bit per page of the address space: is it resident?
+    resident: Vec<u64>,
+    /// Pages ever faulted in, for separating compulsory from capacity
+    /// misses.
+    ever_seen: Vec<u64>,
+    /// Which page occupies each slot.
+    slot_page: Vec<u64>,
+    /// Which slot holds each resident page. Sized to the page space
+    /// because residency is already tracked there; only entries whose
+    /// `resident` bit is set are meaningful.
+    page_slot: Vec<u32>,
+    prev: Vec<u32>,
+    next: Vec<u32>,
+    head: u32,
+    tail: u32,
+    used: usize,
+    input_pages: u64,
+    stats: CacheStats,
+}
+
+impl PageCache {
+    /// Build a cache over an address space of `input_bytes` of source
+    /// followed by `output_bytes` of destination.
+    pub fn new(config: CacheConfig, input_bytes: u64, output_bytes: u64) -> Self {
+        let page_bytes = config.page_bytes.max(1);
+        let input_pages = input_bytes.div_ceil(page_bytes);
+        let output_pages = output_bytes.div_ceil(page_bytes);
+        let total_pages = (input_pages + output_pages) as usize;
+        let capacity = config.capacity_pages().min(total_pages);
+
+        PageCache {
+            config,
+            resident: vec![0u64; total_pages.div_ceil(64)],
+            ever_seen: vec![0u64; total_pages.div_ceil(64)],
+            slot_page: vec![0; capacity],
+            page_slot: vec![NONE; total_pages],
+            prev: vec![NONE; capacity],
+            next: vec![NONE; capacity],
+            head: NONE,
+            tail: NONE,
+            used: 0,
+            input_pages,
+            stats: CacheStats {
+                page_bytes,
+                capacity_pages: capacity as u64,
+                ..CacheStats::default()
+            },
+        }
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        self.stats
+    }
+
+    fn bit(set: &[u64], page: u64) -> bool {
+        set[(page / 64) as usize] & (1u64 << (page % 64)) != 0
+    }
+
+    fn set_bit(set: &mut [u64], page: u64, on: bool) {
+        let word = &mut set[(page / 64) as usize];
+        let mask = 1u64 << (page % 64);
+        if on { *word |= mask } else { *word &= !mask }
+    }
+
+    /// Number of resident pages, counted from the bitmask.
+    pub fn resident_pages(&self) -> u32 {
+        self.resident.iter().map(|w| w.count_ones()).sum()
+    }
+
+    fn unlink(&mut self, slot: u32) {
+        let (p, n) = (self.prev[slot as usize], self.next[slot as usize]);
+        if p != NONE {
+            self.next[p as usize] = n
+        } else {
+            self.head = n
+        }
+        if n != NONE {
+            self.prev[n as usize] = p
+        } else {
+            self.tail = p
+        }
+        self.prev[slot as usize] = NONE;
+        self.next[slot as usize] = NONE;
+    }
+
+    fn push_front(&mut self, slot: u32) {
+        self.next[slot as usize] = self.head;
+        self.prev[slot as usize] = NONE;
+        if self.head != NONE {
+            self.prev[self.head as usize] = slot;
+        }
+        self.head = slot;
+        if self.tail == NONE {
+            self.tail = slot;
+        }
+    }
+
+    /// Touch one page. Returns true on a hit.
+    fn touch_page(&mut self, page: u64, write: bool) -> bool {
+        let counts_for_residency = !write || self.config.writes_occupy;
+
+        if Self::bit(&self.resident, page) {
+            let slot = self.page_slot[page as usize];
+            self.unlink(slot);
+            self.push_front(slot);
+            if write {
+                self.stats.write_hits += 1
+            } else {
+                self.stats.read_hits += 1
+            }
+            return true;
+        }
+
+        if write {
+            self.stats.write_misses += 1
+        } else {
+            self.stats.read_misses += 1
+        }
+        if !Self::bit(&self.ever_seen, page) {
+            Self::set_bit(&mut self.ever_seen, page, true);
+            if !write {
+                self.stats.compulsory_misses += 1;
+            }
+        }
+
+        if !counts_for_residency || self.stats.capacity_pages == 0 {
+            return false;
+        }
+
+        let slot = if self.used < self.slot_page.len() {
+            let s = self.used as u32;
+            self.used += 1;
+            s
+        } else {
+            let victim = self.tail;
+            let old = self.slot_page[victim as usize];
+            Self::set_bit(&mut self.resident, old, false);
+            self.page_slot[old as usize] = NONE;
+            self.stats.evictions += 1;
+            self.unlink(victim);
+            victim
+        };
+
+        self.slot_page[slot as usize] = page;
+        self.page_slot[page as usize] = slot;
+        Self::set_bit(&mut self.resident, page, true);
+        self.push_front(slot);
+        false
+    }
+
+    /// Touch every page covering `[offset, offset + len)` in `region`.
+    pub fn access(&mut self, region: Region, offset: u64, len: u64, write: bool) {
+        if len == 0 {
+            return;
+        }
+        let page_bytes = self.config.page_bytes;
+        let base = match region {
+            Region::Input => 0,
+            Region::Output => self.input_pages,
+        };
+        let first = base + offset / page_bytes;
+        let last = base + (offset + len - 1) / page_bytes;
+        for page in first..=last {
+            self.touch_page(page, write);
+        }
+    }
+}
+
+/// Replay a trace through a page cache.
+///
+/// The algorithms record what they asked for, not how it was served, so
+/// the same trace can be replayed at any RAM size and page size. That
+/// separation is deliberate: it means a change in cache behaviour cannot
+/// quietly change what an algorithm did.
+pub fn replay(trace: &Trace, config: CacheConfig) -> CacheStats {
+    let g = trace.geometry;
+    let payload = g.payload_bytes();
+    let mut cache = PageCache::new(config, payload, payload);
+
+    for op in &trace.ops {
+        match *op {
+            Op::ReadRecord { ordinal } => {
+                cache.access(
+                    Region::Input,
+                    ordinal * g.record_bytes,
+                    g.record_bytes,
+                    false,
+                );
+            }
+            Op::WriteRange {
+                first_slot,
+                records,
+            } => {
+                cache.access(
+                    Region::Output,
+                    first_slot * g.record_bytes,
+                    records * g.record_bytes,
+                    true,
+                );
+            }
+            _ => {}
+        }
+    }
+    cache.stats()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algo::{Rewrite, gsplat::Gsplat, naive::NaiveGather};
+    use crate::model::{Geometry, Map};
+
+    fn geo() -> Geometry {
+        Geometry {
+            records: 20_000,
+            record_bytes: 512,
+            container_bytes: 65_536,
+        }
+    }
+
+    #[test]
+    fn residency_never_exceeds_the_configured_ram() {
+        let g = geo();
+        let payload = g.payload_bytes();
+        let config = CacheConfig::new(payload / 8, 4_096);
+        let mut cache = PageCache::new(config, payload, payload);
+
+        for ordinal in 0..g.records {
+            cache.access(
+                Region::Input,
+                ordinal * g.record_bytes,
+                g.record_bytes,
+                false,
+            );
+            assert!(
+                cache.resident_pages() as u64 * config.page_bytes <= config.ram_bytes,
+                "cache exceeded its RAM budget"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bitmask_and_the_slot_list_agree() {
+        let g = geo();
+        let payload = g.payload_bytes();
+        let config = CacheConfig::new(payload / 4, 4_096);
+        let mut cache = PageCache::new(config, payload, payload);
+        let map = Map::shuffled(g.records, 7);
+
+        for i in 0..g.records {
+            cache.access(
+                Region::Input,
+                map.0[i as usize] * g.record_bytes,
+                g.record_bytes,
+                false,
+            );
+        }
+        assert_eq!(cache.resident_pages() as usize, cache.used);
+    }
+
+    /// With no memory to retain anything, every page touch reaches the
+    /// device — which is exactly the condition the fio numbers were
+    /// measured under.
+    #[test]
+    fn an_empty_cache_reproduces_the_unbuffered_case() {
+        let g = geo();
+        let map = Map::identity(g.records);
+        let (_, trace) = NaiveGather.run(g, &map, g.record_bytes * 64);
+        let stats = replay(&trace, CacheConfig::uncached(4_096));
+
+        assert_eq!(stats.read_hits, 0, "nothing can be retained");
+        assert_eq!(stats.read_misses, g.records, "one miss per record read");
+    }
+
+    /// A larger page brings more neighbours along, so sequential access
+    /// gets cheaper in device traffic terms as the page grows — the
+    /// mechanism the container model describes.
+    #[test]
+    fn bigger_pages_serve_sequential_access_with_fewer_faults() {
+        let g = geo();
+        let map = Map::identity(g.records);
+        let (_, trace) = NaiveGather.run(g, &map, g.record_bytes * 64);
+
+        let mut previous = u64::MAX;
+        for page_bytes in [512u64, 4_096, 16_384, 65_536] {
+            let stats = replay(&trace, CacheConfig::new(page_bytes * 4, page_bytes));
+            assert!(
+                stats.read_misses < previous,
+                "page {page_bytes}: {} misses, expected fewer than {previous}",
+                stats.read_misses
+            );
+            previous = stats.read_misses;
+        }
+    }
+
+    /// The claim that matters for the pass model: give the cache enough
+    /// memory to hold the source and multi-pass re-reads stop costing
+    /// anything.
+    #[test]
+    fn a_cache_that_holds_the_source_eliminates_repeat_passes() {
+        let g = geo();
+        let map = Map::shuffled(g.records, 42);
+        let (_, trace) = Gsplat::new().run(g, &map, g.payload_bytes() / 8);
+        let m = trace.metrics();
+        assert!(
+            m.passes >= 4,
+            "need a multi-pass run to test reuse, got {}",
+            m.passes
+        );
+
+        let page = 4_096;
+        let starved = replay(&trace, CacheConfig::new(page * 4, page));
+        let ample = replay(&trace, CacheConfig::new(g.payload_bytes() * 2, page));
+
+        assert!(starved.capacity_misses() > 0, "a tiny cache must re-fetch");
+        assert_eq!(ample.capacity_misses(), 0, "an ample cache must not");
+        assert!(
+            ample.read_misses < starved.read_misses,
+            "ample {} vs starved {}",
+            ample.read_misses,
+            starved.read_misses
+        );
+    }
+
+    /// **A partial cache is worth nothing here.** Each gsplat pass scans
+    /// the source in ascending order, so the access pattern is a cyclic
+    /// sequential scan — the case LRU handles worst. Every page is
+    /// evicted shortly before it would next be wanted, and the hit rate
+    /// collapses to zero at any size below the whole source.
+    ///
+    /// This matters more than it looks. It says the cold-cache
+    /// amplification model is not merely a pessimistic bound for
+    /// multi-pass runs: it is what actually happens, unless memory can
+    /// hold the entire source — in which case there was no need to make
+    /// multiple passes at all.
+    #[test]
+    fn an_lru_cache_smaller_than_the_source_gives_a_multipass_scan_nothing() {
+        let g = geo();
+        let map = Map::shuffled(g.records, 99);
+        let (_, trace) = Gsplat::new().run(g, &map, g.payload_bytes() / 8);
+        let payload = g.payload_bytes();
+        let page = 4_096;
+
+        // Within a page, consecutive records hit regardless of cache size,
+        // so raw hit counts are not the measure. Cross-pass reuse is, and
+        // that is what stays at zero.
+        let misses_at: Vec<u64> = [8u64, 4, 2]
+            .iter()
+            .map(|d| {
+                replay(
+                    &trace,
+                    CacheConfig {
+                        ram_bytes: payload / d,
+                        page_bytes: page,
+                        writes_occupy: false,
+                    },
+                )
+                .read_misses
+            })
+            .collect();
+
+        assert!(
+            misses_at.windows(2).all(|w| w[0] == w[1]),
+            "quadrupling the cache changed nothing, as LRU on a cyclic scan must: {misses_at:?}"
+        );
+
+        // What the re-fetching costs is not `passes × pages`: it is the
+        // amplification formula, evaluated at *page* granularity. The
+        // cache knows nothing of that formula — it just runs LRU over a
+        // recorded access sequence — so agreement here is an independent
+        // confirmation, at a granularity the formula was never fitted to.
+        let passes = trace.metrics().passes as f64;
+        let records_per_page = (page / g.record_bytes) as f64;
+        let predicted = passes * (1.0 - (-records_per_page / passes).exp());
+
+        let starved = replay(
+            &trace,
+            CacheConfig {
+                ram_bytes: payload / 8,
+                page_bytes: page,
+                writes_occupy: false,
+            },
+        );
+        let observed = starved.read_misses as f64 / starved.compulsory_misses as f64;
+        assert!(
+            (observed - predicted).abs() / predicted < 0.10,
+            "page-level amplification observed {observed:.2}, formula predicts {predicted:.2}"
+        );
+
+        let whole = replay(
+            &trace,
+            CacheConfig {
+                ram_bytes: payload * 2,
+                page_bytes: page,
+                writes_occupy: false,
+            },
+        );
+        assert_eq!(
+            whole.capacity_misses(),
+            0,
+            "holding the whole source finally eliminates re-fetching"
+        );
+        assert!(whole.read_misses < starved.read_misses / 4);
+    }
+
+    /// A streaming writer evicts the reader's pages. This is the page
+    /// cache's version of the starvation the mixed fio sweep measures at
+    /// the device — and it shows up precisely where the cache was
+    /// otherwise working.
+    #[test]
+    fn a_streaming_writer_evicts_the_readers_pages() {
+        let g = geo();
+        let map = Map::shuffled(g.records, 99);
+        let (_, trace) = Gsplat::new().run(g, &map, g.payload_bytes() / 8);
+        let page = 4_096;
+        // Sized so the source alone fits, which is the only regime where
+        // the reader had anything to lose.
+        let ram = g.payload_bytes() + page * 16;
+
+        let shared = replay(
+            &trace,
+            CacheConfig {
+                ram_bytes: ram,
+                page_bytes: page,
+                writes_occupy: true,
+            },
+        );
+        let reads_only = replay(
+            &trace,
+            CacheConfig {
+                ram_bytes: ram,
+                page_bytes: page,
+                writes_occupy: false,
+            },
+        );
+
+        assert!(
+            reads_only.read_hits > 0,
+            "the reader must be getting hits to lose any"
+        );
+        assert!(
+            shared.read_misses > reads_only.read_misses,
+            "writes competing for cache should cost the reader: {} vs {}",
+            shared.read_misses,
+            reads_only.read_misses
+        );
+    }
+}

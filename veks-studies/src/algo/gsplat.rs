@@ -22,7 +22,9 @@ pub struct Gsplat {
 
 impl Default for Gsplat {
     fn default() -> Self {
-        Gsplat { detect_sorted: true }
+        Gsplat {
+            detect_sorted: true,
+        }
     }
 }
 
@@ -33,7 +35,9 @@ impl Gsplat {
 
     /// Without the fast path, so every segment pays the full transpose.
     pub fn always_transpose() -> Self {
-        Gsplat { detect_sorted: false }
+        Gsplat {
+            detect_sorted: false,
+        }
     }
 }
 
@@ -78,7 +82,10 @@ impl Rewrite for Gsplat {
             // The map is destination-ordered, so this segment's entries
             // are the contiguous window at those positions: a seek, not
             // a filter. Each entry is reversed into (source, local).
-            trace.push(Op::ReadMap { from: start, count: len });
+            trace.push(Op::ReadMap {
+                from: start,
+                count: len,
+            });
             plan.clear();
             for slot in start..end {
                 let source = map.0[slot as usize];
@@ -113,7 +120,10 @@ impl Rewrite for Gsplat {
             // One contiguous range at the segment's position, then a
             // barrier so this pass's writeback does not land inside the
             // next pass's reads.
-            trace.push(Op::WriteRange { first_slot: start, records: len });
+            trace.push(Op::WriteRange {
+                first_slot: start,
+                records: len,
+            });
             trace.push(Op::Barrier);
         }
 
@@ -152,7 +162,11 @@ mod tests {
         let map = Map::identity(500);
         let (_, fast) = Gsplat::new().run(g, &map, 10_000);
         let (_, slow) = Gsplat::always_transpose().run(g, &map, 10_000);
-        assert_eq!(fast.metrics().scatters, 0, "sorted plans skip the transpose");
+        assert_eq!(
+            fast.metrics().scatters,
+            0,
+            "sorted plans skip the transpose"
+        );
         assert_eq!(slow.metrics().scatters, 500);
         // Both are still correct.
         assert!(run_verified(&Gsplat::new(), g, &map, 10_000).is_ok());

@@ -34,8 +34,12 @@
 //! the container notion they will need.
 
 pub mod algo;
+pub mod cache;
 pub mod check;
+pub mod device;
 pub mod model;
+pub mod price;
+pub mod regime;
 pub mod study;
 
 pub use algo::{Rewrite, gsplat::Gsplat, naive::NaiveGather, naive::NaiveScatter};

@@ -39,7 +39,11 @@ pub struct Trace {
 
 impl Trace {
     pub fn new(geometry: Geometry) -> Self {
-        Trace { geometry, ops: Vec::new(), peak_resident_bytes: 0 }
+        Trace {
+            geometry,
+            ops: Vec::new(),
+            peak_resident_bytes: 0,
+        }
     }
 
     pub fn push(&mut self, op: Op) {
@@ -85,7 +89,10 @@ impl Trace {
     /// Compute costs from the log.
     pub fn metrics(&self) -> Metrics {
         let g = self.geometry;
-        let mut m = Metrics { geometry: g, ..Default::default() };
+        let mut m = Metrics {
+            geometry: g,
+            ..Default::default()
+        };
 
         for ops in self.passes() {
             m.passes += 1;
@@ -153,7 +160,11 @@ pub struct Metrics {
 
 impl Default for Geometry {
     fn default() -> Self {
-        Geometry { records: 1, record_bytes: 1, container_bytes: 1 }
+        Geometry {
+            records: 1,
+            record_bytes: 1,
+            container_bytes: 1,
+        }
     }
 }
 

@@ -37,7 +37,11 @@ impl AmplificationRow {
 ///
 /// The formula is derived for a uniform random permutation, so that is
 /// what is used; a structured map would legitimately disagree with it.
-pub fn amplification_sweep(geometry: Geometry, seed: u64, budgets: &[u64]) -> Vec<AmplificationRow> {
+pub fn amplification_sweep(
+    geometry: Geometry,
+    seed: u64,
+    budgets: &[u64],
+) -> Vec<AmplificationRow> {
     let map = Map::shuffled(geometry.records, seed);
     let algo = Gsplat::new();
     budgets
@@ -70,7 +74,10 @@ pub fn compare_all(geometry: Geometry, map: &Map, budget_bytes: u64) -> Vec<Comp
         .into_iter()
         .map(|a| {
             let (_, trace) = a.run(geometry, map, budget_bytes);
-            Comparison { name: a.name(), metrics: trace.metrics() }
+            Comparison {
+                name: a.name(),
+                metrics: trace.metrics(),
+            }
         })
         .collect()
 }
@@ -239,4 +246,163 @@ mod tests {
             splat.metrics.container_touches
         );
     }
+}
+
+/// A worked example at a scale too large to trace operation by operation.
+///
+/// Everything here is analytic, using the amplification formula the
+/// traced simulations confirmed and the device models the measured
+/// sweeps confirmed. That combination is what makes it legitimate to
+/// quote figures for a 2 TB rewrite without simulating 450 million reads:
+/// both halves were validated at sizes where full simulation was possible.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkedExample {
+    pub label: &'static str,
+    pub records: u64,
+    pub record_bytes: u64,
+    pub container_bytes: u64,
+    pub budget_bytes: u64,
+}
+
+impl WorkedExample {
+    pub fn passes(&self) -> u64 {
+        let per_segment = (self.budget_bytes / self.record_bytes).max(1);
+        self.records.div_ceil(per_segment).max(2)
+    }
+
+    pub fn records_per_container(&self) -> u64 {
+        (self.container_bytes / self.record_bytes).max(1)
+    }
+
+    pub fn amplification(&self) -> f64 {
+        let p = self.passes() as f64;
+        let w = self.records_per_container() as f64;
+        p * (1.0 - (-w / p).exp())
+    }
+
+    pub fn payload_bytes(&self) -> u64 {
+        self.records * self.record_bytes
+    }
+
+    /// Seconds for a gather that reads each record where it lies.
+    pub fn naive_seconds(&self, model: &crate::device::DeviceModel) -> f64 {
+        model.random_read_seconds(self.records, self.record_bytes)
+            + model.sequential_seconds(self.payload_bytes())
+    }
+
+    /// Seconds for an ordered rewrite reading whole containers.
+    ///
+    /// **A pass is never more expensive than a full sequential scan.**
+    /// Because a pass visits containers in ascending order, a reader that
+    /// finds itself wanting most of them can simply stream the source and
+    /// discard what it does not need, paying the sequential rate rather
+    /// than a seek per container. That option is always available, so it
+    /// caps the cost — and in the dense regime, where each pass touches
+    /// nearly every container, it is the option that wins.
+    ///
+    /// Leaving this bound out is what made an earlier version of this
+    /// model quote 27 hours for a rewrite that streams in four: it priced
+    /// a sequential scan as though it were a million independent seeks.
+    pub fn gsplat_seconds(&self, model: &crate::device::DeviceModel) -> f64 {
+        let containers = self.payload_bytes().div_ceil(self.container_bytes);
+        let touches = (self.amplification() * containers as f64).round() as u64;
+        let passes = self.passes();
+
+        let streaming = model.sequential_seconds(self.payload_bytes());
+        let seeking = model.random_read_seconds(touches / passes.max(1), self.container_bytes);
+        let per_pass = streaming.min(seeking);
+
+        per_pass * passes as f64 + model.sequential_seconds(self.payload_bytes())
+    }
+
+    /// Whether each pass is cheaper streamed than seeked — true in the
+    /// dense regime, false once passes touch only a sparse subset.
+    pub fn passes_stream(&self, model: &crate::device::DeviceModel) -> bool {
+        let containers = self.payload_bytes().div_ceil(self.container_bytes);
+        let touches = (self.amplification() * containers as f64).round() as u64;
+        let streaming = self.payload_bytes() as f64 / model.bandwidth(self.container_bytes);
+        let seeking =
+            model.random_read_seconds(touches / self.passes().max(1), self.container_bytes);
+        streaming <= seeking
+    }
+
+    pub fn gsplat_bytes_read(&self) -> u64 {
+        (self.amplification() * self.payload_bytes() as f64) as u64
+    }
+}
+
+fn human_seconds(s: f64) -> String {
+    if s < 90.0 {
+        format!("{s:.0} s")
+    } else if s < 5_400.0 {
+        format!("{:.0} min", s / 60.0)
+    } else if s < 172_800.0 {
+        format!("{:.1} h", s / 3_600.0)
+    } else {
+        format!("{:.1} days", s / 86_400.0)
+    }
+}
+
+/// Render worked examples against every validated device model.
+pub fn render_worked_examples(examples: &[WorkedExample]) -> String {
+    use std::fmt::Write as _;
+    let models = crate::device::ALL_MODELS;
+    let mut s = String::new();
+
+    for ex in examples {
+        let _ = writeln!(
+            s,
+            "\n{} — {} records × {} B = {}, budget {}",
+            ex.label,
+            ex.records,
+            ex.record_bytes,
+            human_bytes(ex.payload_bytes()),
+            human_bytes(ex.budget_bytes)
+        );
+        let _ = writeln!(
+            s,
+            "  P = {}   w = {}   A = {:.1}   ({})",
+            ex.passes(),
+            ex.records_per_container(),
+            ex.amplification(),
+            if ex.passes() <= ex.records_per_container() {
+                "dense"
+            } else {
+                "sparse"
+            }
+        );
+        let _ = writeln!(
+            s,
+            "\n  {:<16} {:>12} {:>12} {:>12} {:>12}",
+            "", "bytes read", models[0].name, models[1].name, models[2].name
+        );
+        let _ = writeln!(
+            s,
+            "  {:<16} {:>12} {:>12} {:>12} {:>12}",
+            "naive gather",
+            human_bytes(ex.payload_bytes()),
+            human_seconds(ex.naive_seconds(&models[0])),
+            human_seconds(ex.naive_seconds(&models[1])),
+            human_seconds(ex.naive_seconds(&models[2]))
+        );
+        let _ = writeln!(
+            s,
+            "  {:<16} {:>12} {:>12} {:>12} {:>12}",
+            "gsplat",
+            human_bytes(ex.gsplat_bytes_read()),
+            human_seconds(ex.gsplat_seconds(&models[0])),
+            human_seconds(ex.gsplat_seconds(&models[1])),
+            human_seconds(ex.gsplat_seconds(&models[2]))
+        );
+        let _ = writeln!(
+            s,
+            "  {:<16} {:>12} {:>12.1} {:>12.1} {:>12.1}",
+            "speedup",
+            "",
+            ex.naive_seconds(&models[0]) / ex.gsplat_seconds(&models[0]),
+            ex.naive_seconds(&models[1]) / ex.gsplat_seconds(&models[1]),
+            ex.naive_seconds(&models[2]) / ex.gsplat_seconds(&models[2])
+        );
+    }
+    s
 }

@@ -36,7 +36,11 @@ impl Geometry {
             container_bytes >= record_bytes,
             "a container must hold at least one record"
         );
-        Self { records, record_bytes, container_bytes }
+        Self {
+            records,
+            record_bytes,
+            container_bytes,
+        }
     }
 
     /// `w` — records per container.
@@ -149,7 +153,9 @@ pub struct Sink {
 
 impl Sink {
     pub fn new(len: u64) -> Self {
-        Sink { slots: vec![None; len as usize] }
+        Sink {
+            slots: vec![None; len as usize],
+        }
     }
 
     /// Every slot filled exactly once, holding what the map called for.

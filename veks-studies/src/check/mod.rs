@@ -100,7 +100,10 @@ pub fn single_write(trace: &Trace, map: &Map) -> Vec<Violation> {
         let ranges: Vec<(u64, u64)> = ops
             .iter()
             .filter_map(|op| match op {
-                Op::WriteRange { first_slot, records } => Some((*first_slot, *records)),
+                Op::WriteRange {
+                    first_slot,
+                    records,
+                } => Some((*first_slot, *records)),
                 _ => None,
             })
             .collect();
@@ -210,7 +213,10 @@ mod tests {
         let map = Map::shuffled(400, 5);
         let (_, trace) = NaiveGather.run(g, &map, 0);
         let v = monotone_access(&trace);
-        assert!(!v.is_empty(), "scattered reads must trip the monotone check");
+        assert!(
+            !v.is_empty(),
+            "scattered reads must trip the monotone check"
+        );
         assert_eq!(v[0].invariant, "monotone access");
     }
 
