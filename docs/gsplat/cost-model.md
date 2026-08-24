@@ -14,8 +14,8 @@ constant that separates them, and worked examples across storage tiers.
 | `S` | records per segment, `≈ M / R` |
 | `P` | passes, `= max(ceil(N / S), 2)` |
 | `B` | minimum addressable transfer (page, sector, block) |
-| `W` | fetch granularity — the smallest transfer the tier performs *efficiently* |
-| `w` | records per fetch unit, `= W / R` |
+| `W` | container size — the unit the tier or format fetches as a whole |
+| `w` | records per container, `= W / R` |
 | `BW` | sequential bandwidth |
 | `IOPS` | random operations per second at the achieved concurrency |
 
@@ -68,7 +68,7 @@ wrong:
 
 The algorithm reads each mapped record exactly once; *tiers* fetch
 whole units of `W`. Per pass, a segment needs `S = N/P` of the `N_src`
-source records, so a given fetch unit holding `w` records is needed
+source records, so a given container holding `w` records is needed
 with probability
 
 ```
@@ -90,10 +90,10 @@ permutation (`N = N_src`):
 
 | Regime | Condition | Behavior | `A` |
 |--------|-----------|----------|-----|
-| Dense | `P ≤ w` — the per-pass stride `P·R` fits inside a fetch unit | every unit is needed on every pass; each pass is a true streaming scan | `≈ P` |
+| Dense | `P ≤ w` — the per-pass stride `P·R` fits inside a container | every unit is needed on every pass; each pass is a true streaming scan | `≈ P` |
 | Sparse | `P > w` | units are touched once every few passes; reads become per-record fetches, still ascending | `≈ w` |
 
-`A` for `w = 32` (4 KiB records, 128 KiB fetch unit):
+`A` for `w = 32` (4 KiB records, 128 KiB container):
 
 | `P` | 2 | 4 | 8 | 16 | 32 | 54 | 100 |
 |-----|---|---|---|----|----|----|-----|

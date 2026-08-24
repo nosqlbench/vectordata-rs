@@ -22,10 +22,15 @@ and a **reorder map** that assigns
 You want the reordered collection materialized, and the collection is
 larger than memory. Applying the map directly costs one random access
 per record — `N` random reads if you walk the output in order, or `N`
-random writes if you walk the source. On any storage tier where random
-access costs more than sequential access (spinning disk, network block
-storage, object storage priced per request, even flash under a shallow
-queue), that is the wrong shape.
+random writes if you walk the source.
+
+Storage is block-oriented, so that shape is expensive twice over. Each
+single-record access moves a whole block in order to use a fraction of
+it, which is poor economy for every operation issued; and each one
+occupies a slot in the I/O command path, so `N` of them saturate queue
+depth and command bandwidth well before the device's throughput is the
+limit. Access in order fixes both at once: blocks get used completely,
+and the same bytes move in far fewer, far larger operations.
 
 gsplat pays a bounded amount of memory to convert that cost into
 monotone reads and contiguous writes.
@@ -40,8 +45,20 @@ monotone reads and contiguous writes.
 | `M` | memory budget in bytes |
 | `S` | records per segment, `≈ M / R` |
 | `P` | pass count, `= max(ceil(N / S), 2)` |
-| `W` | fetch granularity — the smallest transfer the storage tier performs efficiently |
-| `w` | records per fetch unit, `= W / R` |
+| `W` | container size — the unit the tier or format fetches as a whole |
+| `w` | records per container, `= W / R` |
+
+Two units of grouping run through the whole set, and they are
+independent of each other:
+
+- a **segment** is what memory holds — a contiguous range of *output*
+  ordinals, sized by the budget, one per pass;
+- a **container** is what the tier or format fetches and emits as a
+  whole — a device block or readahead window on a flat store, a row
+  group, stripe, chunk, or page on a structured one.
+
+Segments are chosen by you; containers are given to you. Neither
+constrains the other.
 
 ## Contract and preconditions
 
@@ -50,9 +67,12 @@ monotone reads and contiguous writes.
    destination; the value is the origin. A source-ordered map produces
    the inverse rewrite, silently — see
    [02-plan.md](./02-plan.md#orientation-is-a-contract-not-a-check).
-2. **Ordinal-addressable source.** Given an ordinal, the host can read
-   that record without scanning: constant-time arithmetic for
-   fixed-stride records, or an ordinal→offset index otherwise.
+2. **Invariant, low-order access by ordinal.** Given an ordinal, the
+   host can produce that record at a cost that is essentially the same
+   for every ordinal, and that stays low-order when reads are issued in
+   order. Structural deserialization and decompression along the way are
+   expected, and memoizing them is normal practice. Linearize exists so
+   that this access is always issued in order.
 3. **Strictly monotonic ordinal structure.** Within an ordinal space,
    ordinals ascend strictly with physical address:
    `i < j ⟹ address(i) < address(j)`. A flat store gets this from
@@ -64,8 +84,25 @@ monotone reads and contiguous writes.
    holds *per space*.
 4. **Positional or strictly-ordered sink.** The host can either write a
    byte range at a computed offset, or accept appends in output order.
-5. **A memory budget that fits at least two records** — in practice,
-   enough for a segment worth reasoning about.
+5. **A memory budget large enough to make the pass count affordable.**
+   There is no meaningful absolute floor. Correctness needs one record's
+   worth; usefulness needs far more, because the budget *is* the pass
+   count:
+
+   ```
+    P = ceil(N × R / M)     and total work is linear in P
+                            up to the container-size crossover
+   ```
+
+   A budget of a few records is perfectly legal and completely useless:
+   with `P` that large the segments hold too little to amortize
+   anything, reads fall back to one block per record, and gsplat
+   degenerates into exactly the naive permutation it exists to avoid.
+   The real precondition is a ratio, not a constant: **`M` must be a
+   large enough fraction of `N × R` that the resulting `P` costs
+   something you would accept.** Size the budget by the pass count you
+   can afford; see [01-segment.md](./01-segment.md) and
+   [cost-model.md](./cost-model.md).
 
 The map need not be *stored*: a computable permutation (a seeded
 shuffle, a modular stride, a rank function) satisfies the contract just
@@ -112,25 +149,21 @@ Segmenting happens once; **P–L–A–T** repeat per pass.
 
 ### Data flow
 
-```mermaid
-flowchart LR
-    MAP[("reorder map<br/>storage")]
-    PLAN["read plan<br/>S pairs, memory"]
-    SORTED["linearized plan<br/>memory"]
-    SRC[("source records<br/>storage")]
-    BUF["segment buffer<br/>S x R bytes, memory"]
-    OUT[("output records<br/>storage")]
+One pass, with the memory / storage boundary drawn as the thing it
+actually is — the line every arrow has to cross, and the reason the
+algorithm is shaped the way it is.
 
-    MAP -->|"P · window for output segment k"| PLAN
-    PLAN -->|"L · sort by source ordinal"| SORTED
-    SORTED -.->|"A · drive ascending reads"| SRC
-    SRC -->|"A · one read per record"| BUF
-    BUF -->|"T · one contiguous write, durability barrier"| OUT
-    OUT -.->|"next pass"| MAP
-```
+<img src="gsplat-dataflow.drawio.svg" width="100%" alt="One gsplat pass. The reorder map, source records and output records sit in a storage lane; the read plan, linearized plan and segment buffer sit in a memory lane. P reads the map window up into memory, L sorts it there, A drives ascending reads back down and carries records up into the segment buffer, T writes the buffer back down as one contiguous range, and a dashed return edge starts the next pass." />
 
-Cylinders are on storage, rectangles in memory. Every random access in
-the algorithm happens inside a rectangle.
+*Source: [`gsplat-dataflow.drawio`](./gsplat-dataflow.drawio); the SVG
+embeds the diagram, so opening it in draw.io recovers the editable
+original.*
+
+Read it by lanes rather than by boxes. Everything scattered — building
+the plan, sorting it, transposing records into the buffer — happens in
+the **memory** lane. The **storage** lane sees only a window read, an
+ascending sweep, and one contiguous write. The whole algorithm exists to
+keep both of those statements true at the same time.
 
 ### Ordinal remapping
 
@@ -205,9 +238,9 @@ Skip it when:
 
 - **The collection fits in memory.** Read it, permute in place, write
   it. gsplat's floor of two segments already degenerates toward this.
-- **Records are smaller than the fetch granularity by a wide margin.**
+- **Records are much smaller than a container.**
   When `R << W`, a random read costs the same as a sequential one — the
-  fetch unit dominates either way — and direct indexed lookup through
+  container dominates either way — and direct indexed lookup through
   the host's cache beats pass orchestration.
 - **The map is the identity or already ascending.** A selection list in
   source order is a streaming filter, not a permutation: read and write
@@ -234,7 +267,7 @@ Skip it when:
 - [structured.md](./structured.md) — **sgsplat**: hierarchical sources
   and sinks, where a traversal fixes the ordinal space and a skeleton
   carries the map. Covers address-vs-ordinal ordering, container-atomic
-  fetch units, ordered-append output, and per-leaf-path decomposition.
+  containers, ordered-append output, and per-leaf-path decomposition.
 - [annex-multiple-spaces.md](./annex-multiple-spaces.md) — annex:
   several types in distinct ordinal spaces with independent maps,
   interleaved into the output by a known schedule. Not depended on by

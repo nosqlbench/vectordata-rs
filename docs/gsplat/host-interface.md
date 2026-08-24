@@ -9,7 +9,7 @@ observability, or resumability.
 ```
  map_window(a, b)        -> sequence of source ordinals for output positions [a, b)
  record_count()          -> N_src
- read_record(ordinal)    -> bytes                     positional, no scan
+ read_record(ordinal)    -> bytes                     cost bounded by its container
  write_range(pos, bytes) -> ()                        contiguous, at a computed position
  memory_budget()         -> bytes                     what one segment may occupy
  spawn(tasks)            -> ()                        run tasks, join, propagate failure
@@ -19,7 +19,7 @@ observability, or resumability.
 |-----------|---------|-------------|--------------------|
 | `map_window` | **P** | Sequential read of a contiguous ordinal range; the map must be destination-ordered | Filter the whole map per pass: `Θ(N·P)` instead of `Θ(N)` |
 | `record_count` | **P** | Bounds validation | Skip validation and risk silent corruption |
-| `read_record` | **A** | Addressing by ordinal without scanning; concurrent reads from several workers | Fall back to one worker, or pre-build an ordinal index |
+| `read_record` | **A** | Locating a record at a cost bounded by its container, not the store; concurrent reads from several workers | Fall back to one worker, or pre-build an ordinal index |
 | `write_range` | **T** | Either positional writes, or strictly ordered appends (see below) | No sink, no algorithm |
 | `memory_budget` | **S** | A byte figure; a constant is fine | Pick a conservative constant; the pass count follows from it |
 | `spawn` | **A**, **L** | Concurrent execution over disjoint work items | Run serially — correctness is unaffected, throughput is not |
@@ -121,7 +121,7 @@ heap — count them against the same budget.
 
 **Object storage.** This is where gsplat pays best and behaves most
 differently. Requests are priced individually and have a large
-effective fetch granularity (`W` of a megabyte or more), so `N` random
+effective container size (`W` of a megabyte or more), so `N` random
 GETs is both slow *and* a line item. Two adaptations follow: coalesce
 adjacent plan entries into single ranged GETs after linearizing (the
 sort makes them adjacent), and size segments so that each pass's reads

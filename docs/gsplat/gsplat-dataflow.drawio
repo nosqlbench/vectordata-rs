@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="gsplat-dataflow">
+    <mxGraphModel dx="1400" dy="760" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1440" pageHeight="700" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="gsplat — one pass (P–L–A–T) across the memory / storage boundary" style="text;html=1;fontSize=18;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="10" width="900" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lane_mem" value="MEMORY — bounded by the budget M" style="swimlane;startSize=34;html=1;horizontal=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=14;pointerEvents=0;swimlaneFillColor=#eef4fd;" vertex="1" parent="1">
+          <mxGeometry x="40" y="50" width="1360" height="250" as="geometry" />
+        </mxCell>
+        <mxCell id="plan" value="read plan&#xa;S entries: (source ordinal, local slot)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="lane_mem">
+          <mxGeometry x="110" y="70" width="250" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="sorted" value="linearized plan&#xa;ascending by source ordinal" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="lane_mem">
+          <mxGeometry x="580" y="70" width="250" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="buf" value="segment buffer&#xa;S × R bytes&#xa;the scatter target" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1;" vertex="1" parent="lane_mem">
+          <mxGeometry x="1000" y="60" width="270" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="mem_note" value="every random access in the algorithm happens in this lane" style="text;html=1;fontSize=12;fontColor=#3b5c8a;align=left;verticalAlign=middle;fontStyle=2;" vertex="1" parent="lane_mem">
+          <mxGeometry x="400" y="190" width="450" height="25" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lane_sto" value="STORAGE — the tier that punishes random access" style="swimlane;startSize=34;html=1;horizontal=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=14;pointerEvents=0;swimlaneFillColor=#f0f7ef;" vertex="1" parent="1">
+          <mxGeometry x="40" y="380" width="1360" height="260" as="geometry" />
+        </mxCell>
+        <mxCell id="map_store" value="reorder map&#xa;destination-ordered" style="shape=cylinder3;boundedLbl=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;fontSize=12;" vertex="1" parent="lane_sto">
+          <mxGeometry x="110" y="60" width="250" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="src_store" value="source records&#xa;N_src × R" style="shape=cylinder3;boundedLbl=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;fontSize=12;" vertex="1" parent="lane_sto">
+          <mxGeometry x="580" y="60" width="250" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="out_store" value="output records&#xa;N × R" style="shape=cylinder3;boundedLbl=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;fontSize=12;" vertex="1" parent="lane_sto">
+          <mxGeometry x="1020" y="60" width="250" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="sto_note" value="monotone reads  ·  contiguous writes  ·  never a backward seek" style="text;html=1;fontSize=12;fontColor=#4a7a45;align=left;verticalAlign=middle;fontStyle=2;" vertex="1" parent="lane_sto">
+          <mxGeometry x="580" y="185" width="700" height="25" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_p" value="P — read the window for segment k" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#6c8ebf;fontSize=12;fontColor=#3b5c8a;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="map_store" target="plan">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_l" value="L — sort by source ordinal" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;strokeColor=#6c8ebf;fontSize=12;fontColor=#3b5c8a;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="plan" target="sorted">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_a_drive" value="A — the plan drives the read order" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeWidth=2;strokeColor=#9673a6;fontSize=12;fontColor=#6b4c86;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="sorted" target="src_store">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_a_read" value="A — one read per record, ascending" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=3;strokeColor=#d79b00;fontSize=12;fontColor=#a06f00;fontStyle=1;exitX=1;exitY=0.35;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="src_store" target="buf">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="900" y="475" />
+              <mxPoint x="900" y="160" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_t" value="T — one contiguous write, then a barrier" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=3;strokeColor=#d79b00;fontSize=12;fontColor=#a06f00;fontStyle=1;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="buf" target="out_store">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_next" value="next pass — segment k+1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeWidth=2;strokeColor=#666666;fontSize=12;fontColor=#666666;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="out_store" target="map_store">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1370" y="475" />
+              <mxPoint x="1370" y="670" />
+              <mxPoint x="215" y="670" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
