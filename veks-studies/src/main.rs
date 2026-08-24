@@ -107,6 +107,71 @@ fn main() {
     ];
     print!("{}", study::render_worked_examples(&examples));
 
+    println!("\n\n=== forward simulation against the measured sweeps ===");
+    println!("  No throughput formula: a clock advanced through positioning and");
+    println!("  transfer against a shared bandwidth ceiling, a finite command");
+    println!("  queue and a serial controller.\n");
+    println!(
+        "  {:<15} {:>12} {:>12} {:>12}",
+        "device", "worst <=1MB", "sequential", "vs measured"
+    );
+    for (hardware, regime) in
+        veks_studies::io::hw::ALL_HARDWARE.iter().zip(veks_studies::regime::ALL.iter())
+    {
+        let worst = regime
+            .random_read
+            .iter()
+            .filter(|p| p.block_bytes <= 1 << 20)
+            .map(|p| {
+                let n = if p.block_bytes >= 1 << 20 { 300 } else { 2_000 };
+                let s = veks_studies::io::fio_like(hardware, p.block_bytes, n);
+                ((s.iops() - p.iops as f64) / p.iops as f64).abs()
+            })
+            .fold(0.0f64, f64::max);
+        let seq = veks_studies::io::fio_like_sequential(hardware, 1 << 20, 1_500);
+        println!(
+            "  {:<15} {:>11.1}% {:>9.0} MB/s {:>9.0} MB/s",
+            hardware.name,
+            worst * 100.0,
+            seq.throughput() / 1e6,
+            regime.seq_read.bytes_per_s() as f64 / 1e6
+        );
+    }
+
+    println!("\n  Where a device's time goes, 4 KiB reads:\n");
+    println!("  {:<15} {:>12} {:>14} {:>14}", "device", "order", "positioning", "bandwidth used");
+    for hardware in veks_studies::io::hw::ALL_HARDWARE {
+        for (label, s) in [
+            ("scattered", veks_studies::io::fio_like(hardware, 4_096, 2_000)),
+            ("ascending", veks_studies::io::fio_like_sequential(hardware, 4_096, 20_000)),
+        ] {
+            println!(
+                "  {:<15} {:>12} {:>13.0}% {:>13.0}%",
+                hardware.name,
+                label,
+                s.positioning_fraction() * 100.0,
+                s.bandwidth_utilization() * 100.0
+            );
+        }
+    }
+
+    println!("\n  A concurrent writer, capped at 40 MB/s and uncapped:\n");
+    println!("  {:<15} {:>14} {:>14} {:>10}", "device", "reader capped", "reader free", "cost");
+    for hardware in veks_studies::io::hw::ALL_HARDWARE {
+        let n = if hardware.name == "spinning-sata" { 1_500 } else { 20_000 };
+        let capped = veks_studies::io::contended(hardware, 8_192, Some(40.0e6), n);
+        let free = veks_studies::io::contended(hardware, 8_192, None, n);
+        let c = capped.stream("reader").iops();
+        let f = free.stream("reader").iops();
+        println!(
+            "  {:<15} {:>10.0} IOPS {:>9.0} IOPS {:>9.1}x",
+            hardware.name,
+            c,
+            f,
+            c / f.max(1e-9)
+        );
+    }
+
     println!("\n\n=== where ordering starts to pay ===");
     print!(
         "{}",

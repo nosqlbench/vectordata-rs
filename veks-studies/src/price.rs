@@ -689,3 +689,208 @@ mod dump {
         }
     }
 }
+
+/// Turn a trace into the access stream a real run would issue.
+///
+/// Output lands above the source in the address space so that reads and
+/// writes contend for the device and for cache residency the way they
+/// would on a volume holding both.
+pub fn accesses_of(trace: &crate::model::Trace) -> Vec<(u64, u64, bool)> {
+    use crate::model::Op;
+    let g = trace.geometry;
+    let payload = g.payload_bytes();
+    trace
+        .ops
+        .iter()
+        .filter_map(|op| match *op {
+            Op::ReadRecord { ordinal } => Some((ordinal * g.record_bytes, g.record_bytes, false)),
+            Op::WriteRange {
+                first_slot,
+                records,
+            } => Some((
+                payload + first_slot * g.record_bytes,
+                records * g.record_bytes,
+                true,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Cost a trace by simulating the whole storage path.
+///
+/// This supersedes both [`price`] and [`simulate`]. Those ask a model
+/// what a request stream costs; this one issues the requests. Bandwidth
+/// is consumed as a shared resource, the command queue has a finite
+/// number of slots and can saturate, the device reorders what it holds,
+/// and the page cache absorbs what it can — none of which is expressible
+/// as a throughput expression evaluated per request.
+///
+/// The returned [`crate::io::IoStats`] carries the diagnostics that
+/// closed forms cannot produce: how much of the device's bandwidth the
+/// run actually used, and how much of its time went to positioning
+/// rather than transferring.
+pub fn simulate_io(
+    trace: &crate::model::Trace,
+    hardware: &crate::io::hw::Hardware,
+    cache: Option<crate::cache::CacheConfig>,
+    offered_depth: usize,
+) -> crate::io::IoStats {
+    let g = trace.geometry;
+    let mut scheduler = crate::io::sched::Noop::default();
+    let mut issuer = crate::io::Recorded::new(accesses_of(trace));
+    crate::io::run(
+        hardware,
+        &mut scheduler,
+        &mut issuer,
+        crate::io::RunConfig {
+            offered_depth,
+            cache,
+            span_bytes: g.payload_bytes() * 2,
+            seed: 0x51A7,
+        },
+    )
+}
+
+#[cfg(test)]
+mod full_path {
+    use super::*;
+    use crate::algo::{Rewrite, gsplat::Gsplat, naive::NaiveGather};
+    use crate::cache::CacheConfig;
+    use crate::io::hw::{NVME_CONSUMER_HW, SPINNING_SATA_HW};
+    use crate::model::{Geometry, Map};
+
+    fn traced(geo: Geometry, budget: u64) -> (crate::model::Trace, crate::model::Trace) {
+        let map = Map::shuffled(geo.records, 0xD1CE);
+        (
+            Gsplat::new().run(geo, &map, budget).1,
+            NaiveGather.run(geo, &map, budget).1,
+        )
+    }
+
+    /// **Where the two rewrites actually differ, on a real device path.**
+    /// Not in how many bytes they move or how many reads they issue —
+    /// in what fraction of the device's time becomes useful transfer.
+    #[test]
+    fn ordering_converts_positioning_time_into_transfer_time() {
+        let geo = Geometry {
+            records: 40_000,
+            record_bytes: 512,
+            container_bytes: 65_536,
+        };
+        let (ordered, random) = traced(geo, geo.payload_bytes() / 2);
+        let cache = Some(CacheConfig::new(geo.payload_bytes() / 8, 65_536));
+
+        let o = simulate_io(&ordered, &SPINNING_SATA_HW, cache, 32);
+        let r = simulate_io(&random, &SPINNING_SATA_HW, cache, 32);
+
+        assert!(
+            r.positioning_fraction() > 0.85,
+            "scattered access should be nearly all positioning, got {:.2}",
+            r.positioning_fraction()
+        );
+        assert!(
+            o.positioning_fraction() < r.positioning_fraction() / 2.0,
+            "ordering should convert most of it back: {:.2} vs {:.2}",
+            o.positioning_fraction(),
+            r.positioning_fraction()
+        );
+        assert!(
+            o.bandwidth_utilization() > r.bandwidth_utilization() * 5.0,
+            "and that shows up as bandwidth actually used: {:.3} vs {:.3}",
+            o.bandwidth_utilization(),
+            r.bandwidth_utilization()
+        );
+        assert!(o.elapsed_s < r.elapsed_s, "so it finishes sooner");
+    }
+
+    /// The same comparison on NVMe, where positioning costs nothing and
+    /// the margin is correspondingly smaller. The simulator is not told
+    /// which device it is on.
+    #[test]
+    fn the_margin_collapses_on_a_device_with_no_geometry() {
+        let geo = Geometry {
+            records: 40_000,
+            record_bytes: 512,
+            container_bytes: 65_536,
+        };
+        let (ordered, random) = traced(geo, geo.payload_bytes() / 2);
+        let cache = Some(CacheConfig::new(geo.payload_bytes() / 8, 65_536));
+
+        let disk_gain = {
+            let o = simulate_io(&ordered, &SPINNING_SATA_HW, cache, 32);
+            let r = simulate_io(&random, &SPINNING_SATA_HW, cache, 32);
+            r.elapsed_s / o.elapsed_s
+        };
+        let flash_gain = {
+            let o = simulate_io(&ordered, &NVME_CONSUMER_HW, cache, 32);
+            let r = simulate_io(&random, &NVME_CONSUMER_HW, cache, 32);
+            r.elapsed_s / o.elapsed_s
+        };
+
+        assert!(
+            disk_gain > flash_gain * 2.0,
+            "disk {disk_gain:.1}× vs flash {flash_gain:.1}×"
+        );
+        assert!(
+            flash_gain > 1.0,
+            "ordering should still help flash at this record size"
+        );
+    }
+
+    /// **Ordering is the lever; page size is not.**
+    ///
+    /// The cost model treats the fetch granularity `W` as central, and on
+    /// a bytes-moved basis it is — a bigger page drags in more
+    /// neighbours. But time is not bytes. Once access ascends, small
+    /// contiguous reads cost a disk almost nothing extra, because there
+    /// is no seek between them; enlarging the page changes the request
+    /// count without changing the time. Scattered access is where page
+    /// size bites, and there it bites the wrong way: every fault drags in
+    /// bytes that get discarded.
+    ///
+    /// So the container size is a second-order knob. What the algorithm
+    /// buys is the ordering itself.
+    #[test]
+    fn ordering_is_the_lever_and_page_size_is_not() {
+        let geo = Geometry {
+            records: 40_000,
+            record_bytes: 512,
+            container_bytes: 65_536,
+        };
+        let (ordered, random) = traced(geo, geo.payload_bytes() / 2);
+        let ram = geo.payload_bytes() / 8;
+        let at = |trace: &crate::model::Trace, page: u64| {
+            simulate_io(
+                trace,
+                &SPINNING_SATA_HW,
+                Some(CacheConfig::new(ram, page)),
+                32,
+            )
+            .elapsed_s
+        };
+
+        let ordered_small = at(&ordered, 4_096);
+        let ordered_large = at(&ordered, 65_536);
+        assert!(
+            (ordered_large - ordered_small).abs() / ordered_small < 0.15,
+            "a sixteenfold page change should barely move an ordered run: \
+             {ordered_small:.3}s vs {ordered_large:.3}s"
+        );
+
+        let random_small = at(&random, 4_096);
+        let random_large = at(&random, 65_536);
+        assert!(
+            (random_large - random_small).abs() / random_small < 0.15,
+            "nor a scattered one: {random_small:.3}s vs {random_large:.3}s"
+        );
+
+        // Against which: ordering the same accesses is worth an order of
+        // magnitude. The two knobs are not in the same class.
+        assert!(
+            random_small > ordered_small * 8.0,
+            "ordering is worth far more than any page size: \
+             {ordered_small:.3}s vs {random_small:.3}s"
+        );
+    }
+}
