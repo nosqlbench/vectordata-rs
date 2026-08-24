@@ -47,13 +47,13 @@ space is strictly monotonic internally, so a schedule can only decide
 
 ### Why segmentation survives
 
-Let `cum_k(i)` be the number of slots before `i` that belong to space
-`k`. Because `cum_k` is monotone and each space's records are consumed
+Let `rank_k(i)` be the number of slots before `i` that belong to space
+`k`. Because `rank_k` is monotone and each space's records are consumed
 in order, a contiguous range of output slots induces a **contiguous
 range in every space's ordinal space**:
 
 ```
- output slots [s, e)   →   space k needs ordinals [cum_k(s), cum_k(e))
+ output slots [s, e)   →   space k needs ordinals [rank_k(s), rank_k(e))
 ```
 
 So segmentation is unchanged, and — the part that matters — each space
@@ -65,14 +65,16 @@ map filtered.
 
 | Step | sgsplat today | With K spaces |
 |------|---------------|---------------|
-| **S** Segment | contiguous range of output ordinals | unchanged — but the segment is a range of *slots*, and the per-space windows follow from `cum_k` at the two boundaries |
+| **S** Segment | contiguous range of output ordinals | unchanged — but the segment is a range of *slots*, and the per-space windows follow from `rank_k` at the two boundaries |
 | **P** Plan | scan the map window, reverse each entry | scan the slot window, **bucket by space** while scanning; entries become `(space, source ordinal, segment-local slot)` |
 | **L** Linearize | sort by source ordinal | sort by **address** — equivalently by M-ordinal — in one sort across all spaces; per-space ordinals are incomparable and must never share a sort key |
 | **A** Assemble | read source ascending, contribute | one ascending sweep; each container touch drains every space's entries that fall inside it |
 | **T** Transfer | builder emits | unchanged |
 
 The schedule is consumed **sequentially** by Plan, in slot order: as the
-scan walks slots it carries each space's running index forward. With
+scan walks slots it carries each space's running index — that is,
+`rank_k` — forward, computing it incrementally rather than looking it
+up. With
 resume out of scope, nothing else needs random access into it, so **a
 sequential read of the tag stream is the whole requirement** — no
 rank/select structure, no residency claim beyond a streaming buffer.
