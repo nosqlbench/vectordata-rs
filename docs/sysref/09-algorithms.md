@@ -264,27 +264,75 @@ RSS.
 | | Step | Action |
 |---|------|--------|
 | **S** | Segment | Divide the output ordinal space into contiguous segments sized by the governor memory budget (always ≥ 2 segments, so the buffer stays at or below half the output size) |
-| **P** | Plan | Scan the reorder-map window whose output positions fall in the active segment; emit bounds-checked `(source_idx, local_out_pos)` pairs |
+| **P** | Plan | Take the map window for the segment's **output** range — contiguous because the map is destination-ordered — and reverse each entry into a bounds-checked `(source_idx, local_out_pos)` pair |
 | **L** | Linearize | Sort the plan by source index (parallel 256-way bucket sort) so the pass reads ascend monotonically through the file |
 | **A** | Assemble | Walk the sorted plan reading source records in file order; place each at its transpose position in the segment buffer (positions are disjoint, so scatter is lock-free parallel) |
 | **T** | Transfer | Write the assembled buffer contiguously at the segment's output offset; sync; advance to the next segment |
 
 Segmenting happens once; **P–L–A–T** repeat per pass.
 
+Segments partition the **output** ordinal space, never the input: a
+pass owns one contiguous output range and gathers the records for it
+from arbitrary positions in the source. Partitioning the output is what
+makes the write side contiguous for free and leaves only the read side
+to tame, which **L** and **A** then do. The map's destination ordering
+(`out[i] = src[map[i]]`, position = output ordinal) is what makes the
+plan window contiguous; it is a precondition rather than a checked
+property — a source-ordered map runs clean and emits the inverse
+rewrite ([02-plan.md](./splat/02-plan.md#if-the-map-is-source-ordered)).
+
 ### Cost model
 
 ```
-P        = ceil(N_out × record_bytes / M)      M = memory budget
-map I/O  = P sequential window scans (4-byte ints; cheap)
+P        = max(ceil(N × R / M), 2)             R = record bytes, M = memory budget
+S        = ceil(N / P)                         records per segment
+map I/O  = P sequential window scans (4-byte ints; cheap), map read once
 src I/O  = each mapped record read exactly once, ascending per pass
 out I/O  = each output byte written exactly once, contiguous per pass
-RAM      = one segment buffer (≤ M) + the read plan
+RAM      = one segment buffer (≤ M) + 16 × S bytes of read plan
 ```
 
-Disk never sees random access: the permutation's scatter is absorbed
-by the segment buffer. This is the distribution strategy of
-external-memory permutation [6], specialized to a permutation that is
-fully known up front (the reorder map is materialized on disk).
+Order of growth, against the naive permutation (`N` random reads
+walking the output in order, or `N` random writes walking the source):
+
+```
+                      naive gather        SPLAT
+ random I/O ops       Θ(N)                Θ(P)          one seek per pass
+ monotone I/O ops     Θ(N·R/B) writes     Θ(N) reads + Θ(N·R/B) writes
+ bytes read           Θ(N·⌈R/B⌉·B)        Θ(A · N·R)
+ bytes written        Θ(N·R)              Θ(N·R)
+ resident memory      Θ(R)                Θ(M)
+ CPU                  Θ(N)                Θ(N log(N/P))  the linearize sort
+```
+
+SPLAT issues the same `N` record reads as the naive gather; what it
+changes is their order (monotone per pass) and the write side (`P`
+contiguous bursts instead of `N` scattered writes). The device-level
+read volume carries an amplification factor set by the pass count and
+the readahead window `W` (`w = W/R` records per window):
+
+```
+ A(P) = P · (1 − exp(−w / P))     ≤ min(P, w)      crossover at P = w
+```
+
+Below the crossover each pass is a true sequential scan (`A ≈ P`);
+above it, reads degrade to ascending per-record fetches (`A ≈ w`).
+The pass count is therefore the dominant tuning term, not an
+implementation detail: halving `P` halves the I/O until `P` reaches
+`w`. Disk still never sees *random* access — the permutation's scatter
+is absorbed by the segment buffer — which is what makes SPLAT one to
+two orders of magnitude faster on seek-bound media, while on NVMe with
+a deep queue its value is bounded RSS and page-cache behavior rather
+than raw throughput.
+
+This is the distribution strategy of external-memory permutation [6],
+specialized to a permutation that is fully known up front (the reorder
+map is materialized on disk) and applied at one level: the bound in [6]
+is reached by a two-level variant, which trades one file of scratch
+space for a cost independent of `P`.
+
+Derivations, device-level time model, and worked examples at pilot,
+100M, and spine scale: [SPLAT cost model](./splat/cost-model.md).
 
 ### Variants
 
