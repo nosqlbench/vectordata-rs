@@ -1,10 +1,12 @@
 # Annex — Multiple ordinal spaces and interleaved output
 
-Status: **exploratory annex.** Nothing here is part of the sgsplat core,
-and nothing in [structured.md](./structured.md) or the
-[gsplat](./README.md) set depends on it. This records a model, the step
-deltas it would imply, and the questions that should be answered before
-any of it is adopted.
+Status: **active annex.** The multi-root case it describes is germane to
+current work — the spaces are genuinely free, not induced by a
+relationship that has yet to be made explicit. Nothing in
+[structured.md](./structured.md) or the [gsplat](./README.md) set
+depends on this document, and the material stays here rather than being
+folded into the core, but it is a live design line rather than a
+speculative one.
 
 ## The scenario
 
@@ -251,30 +253,104 @@ A design-time schedule is almost certainly periodic and therefore free.
 A data-dependent one is where this gets expensive, and it is worth
 knowing which you have before building anything.
 
-## Generalizing to trees: free versus induced ordering
+## The ordering forest
 
-Pushing this toward tree structures forces a distinction the two-space
-case does not expose. A node type's ordering is either:
+The question a schema has to answer, type by type, is not "what is this
+type's order" but **"who decides it."** There are only two answers:
 
-- **free** — it has its own map, chosen independently, or
-- **induced** — its ordinals are determined by its parent's map plus run
-  lengths, as with repeated fields.
+- **free** — the type has its own map, chosen independently. It is an
+  **ordering root**.
+- **induced** — its order is fixed by its parent's, as runs attached to
+  each parent record. It has no map of its own; run expansion derives
+  one.
 
-So a schema is a **forest of ordering roots**: every root is an
-independent space with a free map, and every non-root is induced by run
-expansion from its parent. That single model subsumes what we already
-have:
+Annotate every type in the schema with one of the two. The induced edges
+then form a **forest** whose roots are exactly the free types, and each
+root together with everything induced beneath it is an **ordering
+domain**: a region of the schema governed by a single map.
 
-| Case | Roots | Induced levels |
-|------|-------|----------------|
-| flat gsplat | one | none |
-| columnar / nested leaf paths | one | one per leaf path |
-| this annex's scenario | K | none |
-| parent-child nesting | one | one per level |
+```
+ schema                        ordering annotation
+ ─────────────────────         ─────────────────────────────────
+ A ──┬── B                     A  free      ┐
+     └── C ── D                B  induced   │ domain 1: one map at A
+                               C  induced   │
+ E ──┬── F                     D  induced   ┘
+     └── G                     E  free      ┐ domain 2: one map at E
+                               F  induced   │
+                               G  induced   ┘
+```
 
-If this direction is taken, the forest is probably the right spine, and
-the current per-leaf-path and multi-space adaptations become two
-readings of it rather than two mechanisms.
+Inside a domain, everything follows from the root's map by run
+expansion — the machinery already in
+[structured.md](./structured.md#3-a-record-is-not-one-contiguous-range).
+Between domains, nothing follows from anything: their relative
+arrangement in the output is precisely what the schedule specifies.
+
+### What the model tells you
+
+**How many maps a rewrite needs: one per ordering root, not one per
+type.** A forty-type schema with one root needs one map; the other
+thirty-nine orders are derived. This is the answer to "what must the
+caller actually supply."
+
+**Why a schedule exists at all.** With a single root, the output
+arrangement is fully determined — the root map fixes root order, each
+record's induced children follow it, and the schema fixes the nesting.
+Nothing is left to say. With two roots, nothing determines whether
+root A's fifth record precedes root B's third, so that has to be stated
+externally. **The schedule is exactly the freedom that multiple roots
+introduce**, which is why it appears in this annex and nowhere else in
+the set.
+
+**Where the cost concentrates.** A root's map is an arbitrary
+permutation, and arbitrary permutations are what the whole SPLAT
+apparatus exists to survive. Induced levels are run copies: sequential,
+no scatter, cheap. So the expensive part of a rewrite scales with the
+number and size of **roots**, not with schema size. One root and forty
+induced types is a far cheaper problem than forty roots.
+
+**Degrees of freedom, exactly.** The choices available in a rewrite are
+one permutation per root, times the schedule. Induced levels contribute
+none. That is a precise way to check whether a requested rewrite is even
+expressible before attempting it.
+
+### What it subsumes
+
+| Case | Roots | Induced | Schedule needed |
+|------|-------|---------|-----------------|
+| flat gsplat | 1 | none | no |
+| columnar / nested leaf paths | 1 | one per leaf path | no |
+| parent-child nesting (Spanner-style) | 1 | one per level | no |
+| **this annex** | **K** | none or any | **yes** |
+
+Production interleaving is overwhelmingly the single-root shape, which
+is consistent with finding no prior art for the multi-root case: with
+one root the schedule is implied by the structure, so nobody needs to
+name it.
+
+### Where the model breaks
+
+The annotation is well-formed only if each type has **at most one
+ordering parent** — that is what makes the induced edges a forest rather
+than a general graph. A type that must be clustered by two different
+parents at once (an edge or join type wanted in both endpoints' order)
+has two candidate ordering parents and **cannot be expressed**.
+
+That is a real limit, not a gap in the write-up. The standard escape is
+the one relational systems already take: duplicate the type, once per
+clustering, which in these terms means one domain per copy. The
+alternative is to pick one parent and let the other relationship take
+whatever order falls out.
+
+### Segmentation across the forest
+
+Segments remain ranges of output slots and cut across domains freely. A
+slot range induces a contiguous ordinal range in each root (the
+`rank_k` argument above) and a contiguous set of runs in each induced
+level beneath it, so every domain gets a contiguous window from the same
+segment boundaries. Nothing about the forest disturbs the pass
+structure.
 
 ## Consistency checks
 
@@ -311,10 +387,12 @@ is first on the list below.
 
 ## Open questions
 
-1. **Is the motivating case free or induced?** If the spaces turn out to
-   be related after all, the forest model handles it and most of this
-   annex collapses into the existing run-expansion machinery. This
-   decides whether the free case needs to exist at all.
+1. **Settled: the motivating case is free.** The spaces carry
+   independent maps, so this is a genuine multi-root forest and the
+   schedule is a first-class artifact rather than an implied one. What
+   remains open is narrower: how many roots real schemas turn out to
+   have, and whether any of them also want the induced machinery
+   beneath them.
 2. **What does the source tag stream cost in practice?** An arbitrary,
    variable pattern is the assumed case, so the tags are materialized by
    default — but with resume out of scope they are only ever scanned
