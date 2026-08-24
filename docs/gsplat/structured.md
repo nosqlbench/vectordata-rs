@@ -16,11 +16,11 @@ unchanged.
 
 Two moves turn the structured problem back into the flat one.
 
-**1. A traversal fixes each ordinal space.** Choose a deterministic
-traversal of the native structure — DFS/pre-order for most container
-formats — and number the leaves in visit order. That numbering *is* the
-ordinal space, on both sides. Nothing else about the hierarchy needs to
-enter the algorithm.
+**1. A pre-order DFS fixes each ordinal space.** Number the leaves in
+pre-order visit order; that numbering *is* the ordinal space, on both
+sides. Nothing else about the hierarchy enters the algorithm. DFS is
+**required**, not merely conventional — see [DFS normal
+form](#dfs-normal-form) — and BFS is out of scope.
 
 **2. A skeleton carries the map.** Build the output structure holding
 *logical pointers* — source ordinals — in the leaf slots where payload
@@ -41,37 +41,118 @@ write boundaries; the middle stays exactly gsplat, and the invariants —
 single read, single write, monotone access, bounded memory,
 determinism — survive intact.
 
+## DFS normal form
+
+The traversal requirement is not about traversal for its own sake. It
+buys back exactly one property, and that property is what makes the
+whole reduction pay:
+
+> **ordinal order == address order**
+
+Stated as a condition on the *format* rather than on the walk, a store
+is in **DFS normal form** when:
+
+1. leaves are numbered in pre-order,
+2. a subtree's bytes are contiguous, and
+3. siblings are serialized in their logical order.
+
+Under (1)–(3), `i < j ⟹ address(i) < address(j)`. Note what is *not*
+claimed: the address function is **monotone, not affine**. Compressed or
+variable-length containers make byte offsets nonlinear in the ordinal,
+and that is fine — monotonicity is the entire requirement, because
+Linearize only needs a correct sort order, never an arithmetic address.
+
+### Two tiers, and why columnar formats still qualify
+
+| Tier | Condition | Formats | Instances |
+|------|-----------|---------|-----------|
+| **Whole-file** | the entire leaf sequence is monotone in address | record-oriented containers: archives, record streams, contiguous arrays, directory trees | one |
+| **Per-path** | each leaf path's value sequence is monotone in address | columnar and chunked: Parquet, ORC, chunk-object stores | one per leaf path |
+
+Columnar formats violate the whole-file version — the file is
+row-group-major and then column-major, so a whole-file DFS interleaves
+columns that are physically far apart — but they satisfy the per-path
+version exactly: within one column, values run in record order,
+contiguous inside each row group and ascending across them.
+
+**A columnar file is a transposed DFS, and the per-leaf-path
+decomposition undoes the transposition.** This is the useful surprise
+of requiring DFS: the fix for [leak 4](#4-a-record-is-not-one-contiguous-range)
+and the fix for [leak 1](#1-ordinal-order-versus-address-order) are the
+same fix. Decompose per leaf path and each instance is in whole-file
+normal form.
+
+### What the requirement buys
+
+1. **Linearize sorts by ordinal again** — exact gsplat, with no address
+   machinery in the inner loop.
+2. **Plans compress to ranges.** A run of consecutive source ordinals is
+   a contiguous byte range (clipped at container boundaries), so the
+   sorted plan run-length-encodes into ranged reads by construction.
+   This is the difference between `N` requests and a few thousand on
+   object storage.
+3. **A container index is sufficient addressing.** Cumulative record
+   counts per container plus container start offsets — which container
+   formats already carry in their footers — replace any per-record
+   address table. Within a container, addressing is either affine or a
+   sequential decode you are performing anyway.
+4. **Pass cost becomes computable before running.** Which containers a
+   pass touches is an interval intersection between the segment's sorted
+   ordinal set and the container index, so the amplification `A(P)` is
+   *exact* for a given map rather than estimated from the uniformity
+   assumption in [cost-model.md](./cost-model.md). `P` can then be chosen
+   by evaluating the real map instead of a model of it.
+5. **Resume is derivable.** A segment's input container set is a
+   deterministic function of the map and the index, so a restarted run
+   knows what to fetch without replaying prior passes.
+
+Point 4 deserves emphasis: it converts the pass-count decision from a
+tuning exercise into a calculation, and it costs one pass over the map
+plus the footer — no payload reads at all.
+
+**What it does not buy.** Normal form is about *ordering* only. It says
+nothing about divisibility, so container-atomic fetch and decode
+amplification stand unchanged; nothing about output sizing, so
+ordered-append and container-aligned segments stand; and nothing about
+record shape, so repeated fields still produce variable-length runs.
+Leaks 2 through 4 below are unaffected — only leak 1 dissolves.
+
 ## Where the reduction leaks
 
-### 1. Ordinal order is not address order
+### 1. Ordinal order versus address order
 
-gsplat's Linearize sorts the plan by *source ordinal* on the strength
-of `address = base + ordinal × R`. In a hierarchy that identity is
-gone. A BFS numbering over a depth-first-laid-out file, a column-major
-store traversed row-major, a container whose byte offset depends on the
-compressed size of its predecessors — in all of these, ascending
-ordinals do not mean ascending bytes, and sorting by ordinal produces
-a plan that *looks* linearized while the device still seeks.
+**Closed by the normal form**, and worth recording as the reason the
+normal form is mandatory rather than advisory.
 
-The fix is to separate the two concepts that flat storage let us
-conflate:
+gsplat's Linearize sorts by *source ordinal* on the strength of
+`address = base + ordinal × R`. In a hierarchy that identity is gone in
+general: a BFS numbering over a depth-first-laid-out file, a
+column-major store traversed row-major, or any whole-file walk of a
+columnar layout all produce plans that *look* linearized while the
+device still seeks. The two concepts flat storage let us conflate are
+genuinely distinct:
 
 | Concept | Defined by | Used for |
 |---------|-----------|----------|
-| **ordinal** | the chosen traversal | identity, the map, output placement |
-| **address** | the source's own index or footer | ordering the reads |
+| **ordinal** | the traversal | identity, the map, output placement |
+| **address** | the store's physical layout | ordering the reads |
 
-**Linearize sorts by address, not ordinal.** The address need not be a
-byte offset; any key monotone in physical layout works — `(container
-position, offset within container)` is the usual one, and it comes from
-the format's existing index. Flat gsplat is the special case where the
-two keys are the same function of the ordinal.
+[DFS normal form](#dfs-normal-form) collapses them back together —
+monotonically, not affinely — so Linearize can sort by ordinal and be
+sorting by address. That is the whole reason to require it, and why BFS
+is excluded: BFS has no such correspondence with any common
+serialization, so admitting it would mean carrying an address key
+through every step to serve a traversal nobody needs here.
 
-A corollary worth stating for implementers: prefer the traversal whose
-order matches physical layout (usually pre-order DFS). If the
-application needs BFS semantics for identity, keep BFS for the ordinal
-space and still sort by address for I/O — the two roles are
-independent, which is the whole point of splitting them.
+**The escape hatch.** A store that is not in normal form on either tier
+— a hash-partitioned layout, an LSM store where record order and
+storage order are unrelated, a chunk store with no canonical key order —
+must supply `address_of(ordinal)` explicitly, and Linearize sorts by
+that. In practice the cheapest route is one preliminary sequential
+traversal that emits an `ordinal → address` index, which is small
+(ordinal-width per record), reusable across rewrites, and turns the
+store into normal form for every subsequent operation. Prefer building
+that index once over paying the address indirection forever.
 
 ### 2. The fetch unit becomes a container, and containers are atomic
 
@@ -168,8 +249,8 @@ varies per record. Two consequences for the per-column instances:
 | Step | gsplat | sgsplat |
 |------|--------|---------|
 | **S** Segment | `S = M / R`, floor of 2 | plus: snap `S` down to whole output containers; divide the budget across concurrently-processed leaf paths |
-| **P** Plan | read a contiguous map window | flatten the skeleton to a dense map first (one traversal); then identical. Plan entries carry `(address, ordinal, local)` |
-| **L** Linearize | sort by source ordinal | **sort by source address**; group by container so each is decoded once |
+| **P** Plan | read a contiguous map window | flatten the skeleton to a dense map first (one traversal); then identical, with entries still `(source ordinal, local)` |
+| **L** Linearize | sort by source ordinal | unchanged under normal form; then run-length the sorted ordinals into ranges and group them by container, so each container is fetched and decoded exactly once per pass |
 | **A** Assemble | read record, scatter to `local × R` | iterate containers in address order, decode once, drain all entries inside; scatter per leaf path |
 | **T** Transfer | positional contiguous write | ordered append of whole containers, with per-container metadata; global finalize after the last pass |
 
@@ -229,20 +310,28 @@ Beyond gsplat's six primitives
 ([host-interface.md](./host-interface.md)):
 
 ```
- traverse_leaves(structure)   -> ordinals in traversal order   (skeleton flattening)
- address_of(ordinal)          -> monotone physical key         (from the format index)
- container_of(address)        -> container id + offset
+ traverse_leaves(structure)   -> ordinals in pre-order       (skeleton flattening)
+ container_index()            -> per container: first ordinal, record count, start offset
  read_container(id)           -> decoded records
- begin_container() / end_container(metadata)                   (ordered-append sink)
+ begin_container() / end_container(metadata)                 (ordered-append sink)
  finalize(structural metadata)
+
+ address_of(ordinal)          -> monotone key   (escape hatch only; stores not in normal form)
 ```
 
-`address_of` is the load-bearing addition: everything else is
-bookkeeping around it. A format that cannot answer it — no index, no
-footer, no way to locate a leaf without scanning — forces either a
-preliminary indexing pass (one sequential traversal producing
-`ordinal → address`, which is small and reusable) or abandonment of the
-monotone-read guarantee.
+`container_index` is the load-bearing addition, and it is deliberately
+coarse: per *container*, not per record. Every container format already
+carries it in a footer or superblock, it is small enough to hold
+resident for any realistic file, and under [normal
+form](#dfs-normal-form) it is sufficient — ordinal ranges map to
+container ranges by binary search, and within a container the records
+are located either arithmetically or by the sequential decode the
+container demands anyway.
+
+A store that cannot supply it, or that is not in normal form, falls
+back to `address_of` and pays an indirection on every plan entry. The
+better move in that case is to build the `ordinal → address` index once
+and put the store into normal form permanently.
 
 ## Related work, assessed
 
@@ -340,3 +429,9 @@ sgsplat exists for.
    output container, which at fine container granularity is a lot of
    open handles and write buffers. A hierarchical bucketing pass may be
    needed at the extremes.
+5. **How much does requiring normal form exclude?** The tier-two
+   condition is weak enough that the formats worth targeting appear to
+   satisfy it, but that is an assertion from a handful of examples, not
+   a survey. The cost of being wrong is bounded — a non-conforming store
+   pays one indexing pass — but the claim deserves checking against real
+   candidates before the requirement hardens into an interface.
