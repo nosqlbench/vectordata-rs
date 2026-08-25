@@ -244,6 +244,7 @@ veks datasets precache -d glove-100 --window '[0..1K, 5K..6K]' --profile default
 | `--window <spec>` | record window in the dataset-source grammar; default is the whole facet |
 | `--plan` | print what would be fetched and stop |
 | `--profile <name>` | which profile to resolve against |
+| `--allow-whole-facet` | accept fetching everything when the window cannot be resolved |
 
 Sample output:
 
@@ -382,10 +383,10 @@ is a later step gated on that.
 3. ~~CLI `--facet` / `--window` / `--plan` / `--profile`.~~ Done.
 4. Parquet mapping, then parquet differential fetch, as separate work.
 
-What remains open is behaviour rather than plumbing: whether prefetch
-should have a background form, what a non-rangeable source should do
-beyond reporting the degrade, and whether scattered intervals should be
-coalesced before fetching.
+Nothing is open but parquet. Every behavioural question the proposal
+raised has been answered and built: both fetch forms, chunk-adjacency
+coalescing, the handle-scoped offset cache, and consent for the
+whole-facet fallback.
 
 ## Open questions — the remaining ones
 
@@ -430,14 +431,24 @@ The three things I said this would cost, and what they turned out to be:
   detaches rather than blocking or aborting; the bytes still land,
   which is what a caller who has moved on wants.
 
-**3. What should a window against a non-rangeable source do?**
+**3. Resolved — refused unless the caller says otherwise.**
 
-Options: (a) fetch the whole file, reporting it in the plan;
-(b) return an error and make the caller ask for the full download
-explicitly; (c) fetch nothing and let reads fault it in later. I lean
-(b) — the surprise is the thing worth preventing — but it makes
-prefetch fallible in a way that a "just warm it if you can" caller will
-find annoying.
+`WholeFacetFallback::{Refuse, Allow}`, defaulting to `Refuse`, on every
+fetching method. CLI: `--allow-whole-facet`, off by default.
+
+`prefetch_plan` needs no permission — it fetches nothing, and finding
+out is how a caller decides. The refusal message carries the facet size,
+since that is the decision being asked for.
+
+This surfaced something the earlier design had wrong: **a prefetch with
+no window is a request for the whole facet, not a fallback from one.**
+It resolves to the whole byte range whatever the format, with no ordinal
+mapping needed. Routing it through the mapping had been reporting an
+unmappable format as *degraded* when the caller had asked for everything
+in the first place — so the gate would have refused a plain
+`precache` of a parquet facet. Now `degrades_to_full_download` means
+only what its name says: a window was asked for and could not be
+honoured.
 
 **4. Resolved — merged at chunk adjacency.**
 
