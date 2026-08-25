@@ -72,6 +72,11 @@ the deltas are measured against.
 
 ### Studies — where a staged rewrite becomes necessary
 
+**[docs/findings.md](docs/findings.md) is the explainer**: every table
+these produce, what each one is evidence for, and the test that keeps it
+honest. Read that if you want the results; run the commands below if you
+want to reproduce them.
+
 Sweeps run at tens of thousands of records, which finishes in seconds by
 any method and never presses against a ceiling. The **studies** ask the
 question that scale cannot: at a terabyte and a billion ordinals, with

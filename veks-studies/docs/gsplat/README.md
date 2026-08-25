@@ -304,3 +304,9 @@ multi-terabyte vector collections. That instantiation — with its
 concrete file formats, resource negotiation, and per-format variants — is
 documented separately as SPLAT; this document deliberately keeps none
 of it.
+
+## Measured results
+
+What the simulator and the cost model in this crate actually found —
+where a staged rewrite is necessary, where a naive gather wins, and the
+boundary between them: [../findings.md](../findings.md).
