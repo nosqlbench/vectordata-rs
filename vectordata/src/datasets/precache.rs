@@ -471,8 +471,8 @@ fn render_plan(plans: &[(String, crate::PrefetchPlan)]) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "\n  {:<28} {:>10} {:>10} {:>10} {:>10}  note",
-        "facet", "to fetch", "overfetch", "resident", "index"
+        "\n  {:<28} {:>10} {:>10} {:>8} {:>10} {:>8}  note",
+        "facet", "to fetch", "overfetch", "requests", "resident", "index"
     );
     let mut total = 0u64;
     for (name, plan) in plans {
@@ -488,10 +488,16 @@ fn render_plan(plans: &[(String, crate::PrefetchPlan)]) -> String {
         };
         let _ = writeln!(
             s,
-            "  {:<28} {:>10} {:>10} {:>10} {:>10}  {}",
+            "  {:<28} {:>10} {:>10} {:>8} {:>10} {:>8}  {}",
             name,
             fmt_bytes(plan.bytes_to_fetch()),
             fmt_bytes(plan.overfetch_bytes()),
+            if plan.requested_ranges.len() == plan.requests() {
+                format!("{}", plan.requests())
+            } else {
+                // Merging happened; show what was asked for beside it.
+                format!("{}/{}", plan.requests(), plan.requested_ranges.len())
+            },
             if chunks == 0 {
                 "local".to_string()
             } else {

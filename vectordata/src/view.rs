@@ -727,20 +727,29 @@ pub trait TestDataView: Send + Sync {
             match record_range_to_bytes(&path, start, end, storage) {
                 Some(m) => {
                     plan.prerequisite_bytes = plan.prerequisite_bytes.max(m.prerequisite_bytes);
-                    plan.byte_ranges.push((m.byte_start, m.byte_end));
-                    if let Some(fill) = storage.range_fill(m.byte_start, m.byte_end) {
-                        plan.fills.push(fill);
-                    }
+                    plan.requested_ranges.push((m.byte_start, m.byte_end));
                 }
                 None => {
                     // One unmappable interval makes the whole request a
                     // full download; reporting a partial plan beside it
                     // would understate what is about to happen.
                     plan.degrades_to_full_download = true;
+                    plan.requested_ranges.clear();
                     plan.byte_ranges.clear();
                     plan.fills.clear();
                     return Ok(plan);
                 }
+            }
+        }
+
+        // Merge before planning the fills, so the chunk accounting
+        // describes the requests that will actually be issued rather
+        // than the intervals that were asked for.
+        let chunk_size = storage.cache_stats().map(|c| c.chunk_size);
+        plan.byte_ranges = coalesce_ranges(plan.requested_ranges.clone(), chunk_size);
+        for (s, e) in &plan.byte_ranges {
+            if let Some(fill) = storage.range_fill(*s, *e) {
+                plan.fills.push(fill);
             }
         }
         Ok(plan)
@@ -949,6 +958,55 @@ fn vvec_range_to_bytes(
     })
 }
 
+/// Merge byte ranges whose fetches would overlap.
+///
+/// The unit of fetch is a chunk, so two ranges landing in the same
+/// chunk are already one fetch — issuing them separately asks for the
+/// same bytes twice. Ranges in *adjacent* chunks are contiguous on the
+/// device, so one request covering both beats two. Ranges with a whole
+/// chunk between them are not merged: bridging that gap would fetch a
+/// chunk nobody asked for.
+///
+/// With `chunk_size` `None` — local storage, which has no chunks —
+/// merging falls back to plain byte overlap or adjacency.
+///
+/// Pure, and separated from the plan so the boundaries can be tested
+/// without a device. Merging one chunk too eagerly silently inflates
+/// every scattered prefetch; merging one too shyly silently doubles the
+/// request count. Neither fails visibly.
+pub(crate) fn coalesce_ranges(
+    mut ranges: Vec<(u64, u64)>,
+    chunk_size: Option<u64>,
+) -> Vec<(u64, u64)> {
+    ranges.retain(|(s, e)| e > s);
+    if ranges.len() < 2 {
+        return ranges;
+    }
+    ranges.sort_unstable();
+
+    // Do two ranges belong in one request?
+    let joins = |cur_end: u64, next_start: u64| -> bool {
+        match chunk_size.filter(|cs| *cs > 0) {
+            // Touching or overlapping in chunk space: the chunk holding
+            // the current end, and the one holding the next start, are
+            // the same or neighbours.
+            Some(cs) => next_start / cs <= (cur_end - 1) / cs + 1,
+            None => next_start <= cur_end,
+        }
+    };
+
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, cur_end)) if joins(*cur_end, start) => {
+                *cur_end = (*cur_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
 /// What a prefetch would fetch, before any of it moves.
 ///
 /// The unit of fetch is a chunk, not a byte, so a window's real cost is
@@ -958,7 +1016,11 @@ fn vvec_range_to_bytes(
 /// download wearing its clothes.
 #[derive(Debug, Clone, Default)]
 pub struct PrefetchPlan {
-    /// Byte ranges the requested window resolved to.
+    /// Byte ranges the window resolved to, one per interval, before
+    /// merging. What the caller actually asked for.
+    pub requested_ranges: Vec<(u64, u64)>,
+    /// Ranges that will be issued, after merging those whose fetches
+    /// would overlap. One request each.
     pub byte_ranges: Vec<(u64, u64)>,
     /// Chunk-level cost of each range. Empty when the facet has no
     /// chunks — local storage, which is free by definition.
@@ -998,15 +1060,32 @@ impl PrefetchPlan {
         self.fills.iter().map(|f| f.chunks_to_fetch()).sum()
     }
 
-    /// Bytes fetched beyond what was asked for, because chunks are the
-    /// granularity. This is the number that tells a caller its
-    /// scattered single-record prefetches are really a full download.
+    /// Requests that will be issued. Lower than the interval count when
+    /// intervals were merged.
+    pub fn requests(&self) -> usize {
+        self.byte_ranges.len()
+    }
+
+    /// Bytes fetched beyond what was asked for.
+    ///
+    /// Two sources, counted together: chunks are the granularity, so a
+    /// 4 KiB window against 8 MiB chunks drags in most of a chunk; and
+    /// merging two nearby intervals bridges the gap between them. Both
+    /// are bytes crossing the wire that nobody asked for, and a caller
+    /// deciding whether its scattered prefetches are really a full
+    /// download needs them in one number.
     pub fn overfetch_bytes(&self) -> u64 {
-        self.fills
+        let spanned: u64 = self
+            .fills
             .iter()
-            .zip(self.byte_ranges.iter())
-            .map(|(f, (s, e))| f.overfetch_bytes(*s, *e))
-            .sum()
+            .map(|f| f.aligned_end.saturating_sub(f.aligned_start))
+            .sum();
+        let asked: u64 = self
+            .requested_ranges
+            .iter()
+            .map(|(s, e)| e.saturating_sub(*s))
+            .sum();
+        spanned.saturating_sub(asked)
     }
 
     /// Whether everything the window covers is already resident, so a
@@ -2032,6 +2111,218 @@ mod tests {
         assert!(
             facet_download_bytes(Some(&format!("{src}[0,1000)")), None, &storage).is_err(),
             "a plan built on a malformed window must fail, not size the whole file"
+        );
+    }
+
+    // ---- Coalescing -------------------------------------------------
+
+    /// 100-byte chunks, so chunk N covers bytes [N*100, N*100+100).
+    const CS: Option<u64> = Some(100);
+
+    #[test]
+    fn coalescing_leaves_a_single_range_alone() {
+        assert_eq!(coalesce_ranges(vec![], CS), vec![]);
+        assert_eq!(coalesce_ranges(vec![(10, 20)], CS), vec![(10, 20)]);
+    }
+
+    /// Overlapping and touching byte ranges merge under any granularity.
+    #[test]
+    fn overlapping_and_touching_ranges_merge() {
+        assert_eq!(coalesce_ranges(vec![(0, 50), (25, 75)], CS), vec![(0, 75)]);
+        assert_eq!(coalesce_ranges(vec![(0, 50), (50, 75)], CS), vec![(0, 75)]);
+        assert_eq!(
+            coalesce_ranges(vec![(0, 50), (50, 75)], None),
+            vec![(0, 75)]
+        );
+    }
+
+    /// **Two ranges in one chunk are already one fetch.** Issuing them
+    /// separately asks the device for the same bytes twice.
+    #[test]
+    fn ranges_sharing_a_chunk_merge() {
+        assert_eq!(
+            coalesce_ranges(vec![(10, 20), (80, 90)], CS),
+            vec![(10, 90)]
+        );
+        // Without chunking they are plainly disjoint and stay so.
+        assert_eq!(
+            coalesce_ranges(vec![(10, 20), (80, 90)], None),
+            vec![(10, 20), (80, 90)]
+        );
+    }
+
+    /// Adjacent chunks are contiguous on the device, so one request
+    /// covering both beats two.
+    #[test]
+    fn ranges_in_adjacent_chunks_merge() {
+        assert_eq!(
+            coalesce_ranges(vec![(10, 20), (150, 160)], CS),
+            vec![(10, 160)]
+        );
+    }
+
+    /// **But a whole chunk of gap is not bridged.** Merging across it
+    /// would fetch a chunk nobody asked for — the exact failure the
+    /// plan exists to make visible rather than commit.
+    #[test]
+    fn a_chunk_of_gap_is_not_bridged() {
+        assert_eq!(
+            coalesce_ranges(vec![(10, 20), (250, 260)], CS),
+            vec![(10, 20), (250, 260)]
+        );
+        assert_eq!(
+            coalesce_ranges(vec![(10, 20), (350, 360)], CS),
+            vec![(10, 20), (350, 360)]
+        );
+    }
+
+    /// Input order is not the caller's problem.
+    #[test]
+    fn ranges_are_sorted_before_merging() {
+        // Chunks 0, 1 and 4. The first two are a run; chunks 2 and 3
+        // lie untouched between that run and the last range.
+        assert_eq!(
+            coalesce_ranges(vec![(450, 460), (10, 20), (150, 160)], CS),
+            vec![(10, 160), (450, 460)],
+            "sorting happens first, then merging by chunk adjacency"
+        );
+    }
+
+    /// A chain merges transitively, and an empty range contributes
+    /// nothing rather than acting as a bridge.
+    #[test]
+    fn a_chain_merges_and_empty_ranges_drop_out() {
+        assert_eq!(
+            coalesce_ranges(vec![(0, 10), (100, 110), (200, 210)], CS),
+            vec![(0, 210)],
+            "chunks 0, 1 and 2 are a run"
+        );
+        assert_eq!(
+            coalesce_ranges(vec![(0, 10), (50, 50), (300, 310)], CS),
+            vec![(0, 10), (300, 310)],
+            "an empty range is not a bridge"
+        );
+    }
+
+    /// A degenerate chunk size must not divide by zero or merge
+    /// everything into one range.
+    #[test]
+    fn a_zero_chunk_size_falls_back_to_byte_adjacency() {
+        assert_eq!(
+            coalesce_ranges(vec![(0, 10), (300, 310)], Some(0)),
+            vec![(0, 10), (300, 310)]
+        );
+    }
+
+    // ---- RangeFill ---------------------------------------------------
+
+    /// `RangeFill`'s derived numbers are what a caller decides on: a
+    /// fetch is chunk-granular, and both "already warm" and "this is
+    /// secretly a full download" have to be readable off the struct.
+    #[test]
+    fn range_fill_reports_cost_at_chunk_granularity() {
+        let f = RangeFill {
+            first_chunk: 0,
+            last_chunk: 1,
+            chunk_size: 8 << 20,
+            chunks: 2,
+            chunks_resident: 1,
+            aligned_start: 0,
+            aligned_end: 16 << 20,
+        };
+        assert_eq!(f.chunks_to_fetch(), 1);
+        assert_eq!(f.bytes_to_fetch(), 8 << 20, "resident chunks are free");
+        assert!(!f.is_resident());
+        assert_eq!(f.overfetch_bytes(0, 4096), (16 << 20) - 4096);
+
+        let warm = RangeFill {
+            chunks_resident: 2,
+            ..f
+        };
+        assert!(warm.is_resident());
+        assert_eq!(warm.bytes_to_fetch(), 0);
+    }
+
+    /// Local storage has no chunks, so it has no plan — and a caller
+    /// must read that as "free", not as "unknown".
+    #[test]
+    fn local_storage_has_no_range_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, storage) = fvec_storage(tmp.path(), 2, 4);
+        assert!(storage.is_local());
+        assert_eq!(storage.range_fill(0, 12), None);
+    }
+
+    // ---- The offset-index cache --------------------------------------
+
+    /// Build a variable-length file: 4-byte dim then `dim` i32s, so no
+    /// two records need be the same size.
+    fn ivvec_storage(dir: &std::path::Path, dims: &[i32]) -> (PathBuf, FacetStorage) {
+        use std::io::Write as _;
+        let path = dir.join("meta.ivvec");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for &d in dims {
+            f.write_all(&d.to_le_bytes()).unwrap();
+            for e in 0..d {
+                f.write_all(&e.to_le_bytes()).unwrap();
+            }
+        }
+        drop(f);
+        let storage = crate::storage::Storage::open_path(&path).unwrap();
+        (path, FacetStorage::new(storage))
+    }
+
+    /// **The index is loaded once per handle.** Two asks return the
+    /// same allocation, not two equal ones — which is the difference
+    /// between a cache and a coincidence.
+    #[test]
+    fn a_handle_loads_its_offset_index_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, storage) = ivvec_storage(tmp.path(), &[3, 1, 8, 2]);
+        let src = path.to_string_lossy().to_string();
+
+        let first = storage.offsets(&src, 4).expect("offsets load");
+        let second = storage.offsets(&src, 4).expect("offsets load");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "the second ask must be served from the handle, not reloaded"
+        );
+        assert_eq!(first.len(), 4);
+    }
+
+    /// A handle holding offsets for one element width will not answer
+    /// for another. Offsets are computed by walking with a stride, so
+    /// serving them for a different width resolves a window to
+    /// plausible, wrong bytes.
+    #[test]
+    fn a_handle_refuses_offsets_for_a_different_element_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, storage) = ivvec_storage(tmp.path(), &[3, 1, 8, 2]);
+        let src = path.to_string_lossy().to_string();
+
+        assert!(storage.offsets(&src, 4).is_some());
+        assert!(
+            storage.offsets(&src, 8).is_none(),
+            "a width mismatch degrades to no window rather than wrong bytes"
+        );
+    }
+
+    /// Separate handles are separate caches — the point of putting the
+    /// cache on the handle. A caller wanting reuse holds one; a caller
+    /// that does not pays per handle and nothing leaks.
+    #[test]
+    fn separate_handles_do_not_share_the_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, first) = ivvec_storage(tmp.path(), &[3, 1, 8, 2]);
+        let src = path.to_string_lossy().to_string();
+        let second = FacetStorage::new(crate::storage::Storage::open_path(&path).unwrap());
+
+        let a = first.offsets(&src, 4).unwrap();
+        let b = second.offsets(&src, 4).unwrap();
+        assert_eq!(a, b, "same file, same offsets");
+        assert!(
+            !std::sync::Arc::ptr_eq(&a, &b),
+            "but a distinct handle holds its own copy, with its own lifetime"
         );
     }
 }

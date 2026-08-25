@@ -83,6 +83,64 @@ fn a_multi_interval_window_resolves_every_interval() {
     );
 }
 
+/// **Coalescing shows up as fewer requests, not just tidier ranges.**
+///
+/// Two intervals a few records apart resolve to two byte ranges, and on
+/// a local facet — where there are no chunks — they stay two. The plan
+/// reports both what was asked for and what will be issued, so the
+/// difference is visible rather than inferred.
+#[test]
+fn the_plan_separates_what_was_asked_for_from_what_is_issued() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    // Adjacent intervals: 0..10 ends exactly where 10..20 begins, so
+    // they are one range under any granularity.
+    let touching = view
+        .prefetch_plan("base_vectors", &parse_window("[0..10, 10..20]").unwrap())
+        .unwrap();
+    assert_eq!(
+        touching.requested_ranges.len(),
+        2,
+        "two intervals were asked for"
+    );
+    assert_eq!(
+        touching.byte_ranges,
+        vec![(0, 20 * BPR)],
+        "and they merge into one request"
+    );
+    assert_eq!(touching.requests(), 1);
+
+    // Far apart, on local storage with no chunk granularity to bridge
+    // them: two intervals, two requests.
+    let apart = view
+        .prefetch_plan("base_vectors", &parse_window("[0..10, 80..90]").unwrap())
+        .unwrap();
+    assert_eq!(apart.requested_ranges.len(), 2);
+    assert_eq!(
+        apart.byte_ranges,
+        vec![(0, 10 * BPR), (80 * BPR, 90 * BPR)],
+        "nothing bridges a gap this size"
+    );
+    assert_eq!(apart.requests(), 2);
+}
+
+/// Overlapping intervals are one fetch, and the plan says so — asking
+/// for the same bytes twice is the thing coalescing exists to stop.
+#[test]
+fn overlapping_intervals_become_one_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("base_vectors", &parse_window("[0..30, 20..40]").unwrap())
+        .unwrap();
+    assert_eq!(plan.requests(), 1);
+    assert_eq!(plan.byte_ranges, vec![(0, 40 * BPR)]);
+}
+
 /// An empty window means the whole facet — the same thing precache has
 /// always meant, reachable through the same call.
 #[test]
