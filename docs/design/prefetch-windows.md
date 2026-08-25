@@ -361,11 +361,12 @@ is a later step gated on that.
 
 ### The honest risks
 
-- **The index is loaded per call, not held.** A second prefetch of the
-  same vvec facet re-reads it. Fine for a few large windows, wasteful
-  for many small ones. Caching it on the facet handle is the obvious
-  fix and is deliberately not done yet — it wants a real caller to size
-  the cache against.
+- **The index is cached on the facet handle**, not process-wide. Eight
+  bytes per record is 8 GB at a billion, so a global cache would be an
+  unbounded one and the point at which to drop it is a question only
+  the caller can answer. Holding a handle is how a caller says it will
+  ask repeatedly. A plan and the fetch that follows it now share one
+  handle, so they load the index once between them rather than twice.
 - **A vvec facet without `.mref` fetches whole.** Not a failure, and
   not a separate mode — just the absence of the chunk bitmap that
   partial fetch tracks state in. Worth reporting in the plan
@@ -383,9 +384,8 @@ is a later step gated on that.
 
 What remains open is behaviour rather than plumbing: whether prefetch
 should have a background form, what a non-rangeable source should do
-beyond reporting the degrade, whether scattered intervals should be
-coalesced before fetching, and whether the vvec index should be cached
-on the facet handle rather than re-read per call.
+beyond reporting the degrade, and whether scattered intervals should be
+coalesced before fetching.
 
 ## Open questions — the remaining ones
 
