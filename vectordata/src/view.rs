@@ -125,8 +125,11 @@ fn parse_window_first(s: &str) -> Option<(usize, usize)> {
 /// Returns `None` for:
 ///   - facets that declare no window in either encoding — caller
 ///     should use the unbounded prebuffer
-///   - vvec / parquet / unrecognized formats (record→byte mapping
-///     needs metadata beyond `dim * elem_size`)
+///   - parquet and unrecognized formats. Ordinal windowing of parquet
+///     is **excluded by design**, not unimplemented: its row-group
+///     structure has no record-to-byte mapping a caller could predict,
+///     and giving it one would mean inventing a coordinate system the
+///     format does not have
 ///   - degenerate cases (zero dim, empty range, end ≤ start)
 ///
 /// The dim is read from the xvec header at byte 0 of the storage
@@ -190,10 +193,14 @@ pub(crate) fn facet_window_byte_range(
 ///     loaded whole. Record `i` begins at `offsets[i]`, so a window is
 ///     `offsets[start]` to `offsets[end]` — exact, not approximate.
 ///
-/// `None`, meaning "cannot window this, fetch it whole", for parquet
-/// (whose row-group structure means a record range snaps outward by an
-/// amount only the footer knows), unrecognized extensions, a corrupt
-/// header, an index that cannot be loaded, or an empty range.
+/// `None`, meaning "cannot window this", for parquet — whose ordinal
+/// windowing is **excluded by design**, since its row-group structure
+/// has no record-to-byte mapping a caller could predict — and for
+/// unrecognized extensions, a corrupt header, an index that cannot be
+/// loaded, or an empty range.
+///
+/// `None` is not a failure and not a placeholder. It is the answer, and
+/// [`WholeFacetFallback`] decides what a caller does with it.
 /// A record range resolved to bytes, and what resolving it cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MappedRange {
@@ -587,10 +594,9 @@ pub trait TestDataView: Send + Sync {
             // *or* as the explicit `window:` field (`desc.window`) —
             // both are passed so a sized profile in either form pulls
             // just its window. The helper returns `None` for
-            // non-windowed facets, vvec (no per-record byte-offset
-            // index at this layer), and parquet (different format
-            // model entirely) — those fall back to the unbounded
-            // prebuffer below.
+            // non-windowed facets and for parquet, whose ordinal
+            // windowing is excluded by design — those fall back to the
+            // unbounded prebuffer below.
             let window_bytes = match desc.source_path.as_deref() {
                 Some(src) => facet_window_byte_range(src, desc.window.as_deref(), &storage)?,
                 None => None,
@@ -1136,7 +1142,8 @@ pub struct PrefetchPlan {
     /// Set when the window could not be resolved and honouring the
     /// request means fetching the whole facet: a format whose
     /// record→byte mapping this layer cannot compute (vvec without its
-    /// index, parquet), or storage with no range capability.
+    /// index; parquet, excluded by design), or storage with no range
+    /// capability.
     pub degrades_to_full_download: bool,
     /// Size of the facet, for reading the degrade case against.
     pub facet_bytes: u64,
@@ -1194,11 +1201,12 @@ impl PrefetchPlan {
 /// Whether a caller will accept the whole facet when the window it
 /// asked for cannot be resolved.
 ///
-/// Some formats have no ordinal-to-byte mapping this layer can compute
-/// — parquet's row groups, a vvec with no offset index. Asking for
-/// records 5M..6M of one of those and quietly fetching a terabyte is
-/// the exact surprise windowed prefetch exists to prevent, so the
-/// fallback is **refused unless the caller says otherwise**.
+/// Some formats have no ordinal-to-byte mapping: parquet, whose
+/// windowing is excluded by design, and a vvec whose offset index
+/// cannot be loaded. Asking for records 5M..6M of one of those and
+/// quietly fetching a terabyte is the exact surprise windowed prefetch
+/// exists to prevent, so the fallback is **refused unless the caller
+/// says otherwise**.
 ///
 /// This only concerns a window that was actually asked for. A prefetch
 /// with no window is a request for the whole facet, and fetching it is

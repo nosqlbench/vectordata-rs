@@ -191,24 +191,29 @@ chunk bitmap is what windowed fetch needs to know what is already
 resident. A vvec facet without one simply has no partial state to track,
 so it fetches whole.
 
-### parquet — deferred
+### parquet — excluded
 
-No ordinal-windowed prefetch for now. Parquet's row-group and page
-structure means a record range snaps outward by an amount the caller
-cannot predict, and the footer must be read before even that is known.
+**Out of scope for this design, not pending in it.** Ordinal-windowed
+prefetch of parquet is not something this design leaves unfinished; it
+is something this design does not cover.
 
-What *is* allowed is merkle-based dynamic access for the purpose of
-**mapping** ordinals — reading the footer and row-group metadata through
-the ordinary chunked path. Only once those offsets are known does a
-differential fetch of the resulting byte ranges become possible, and
-that is a later step. Until then, `prefetch` on a parquet facet reports
-`degrades_to_full_download`.
+Parquet's row-group and page structure means a record range snaps
+outward by an amount the caller cannot predict, and the footer must be
+read before even that is known. Windowing it is a different problem with
+a different shape, and answering it inside a design about ordinal
+windows would mean inventing a coordinate system parquet does not have.
+
+What a parquet facet gets here is the honest result: `prefetch` reports
+`degrades_to_full_download`, and — since the whole-facet fallback is
+gated — a caller who asked for a window is told rather than surprised. A
+caller who wants the whole facet asks for it with no window and gets it,
+because that is a request rather than a fallback.
 
 | Format | Record → byte | Prerequisite | Requires `.mref` | Status |
 |---|---|---|---|---|
 | xvec | `4 + dim × elem_size` | 4-byte header | for windowing | ready |
 | vvec | sibling offset index | whole index file | **yes** | needs index plumbing |
-| parquet | row groups via footer | footer | for mapping only | deferred |
+| parquet | — | — | — | **excluded from this design** |
 
 ## Access modes that cannot window
 
@@ -354,11 +359,11 @@ that does not falls back to the walk it always did.
 so a caller prefetching a hundred small vvec windows can see it is
 paying for the index each time.
 
-### Deferred — parquet
+### Excluded — parquet
 
-Out of scope for ordinal windows. Merkle-based dynamic access for
-footer/row-group *mapping* is permitted; differential fetch by ordinal
-is a later step gated on that.
+Not a remaining step. See above: a parquet facet reports the degrade and
+the caller decides, which is this design's answer rather than a
+placeholder for one.
 
 ### The honest risks
 
@@ -372,8 +377,9 @@ is a later step gated on that.
   not a separate mode — just the absence of the chunk bitmap that
   partial fetch tracks state in. Worth reporting in the plan
   (`degrades_to_full_download`) so it is visible rather than inferred.
-- **`degrades_to_full_download` still has no agreed behaviour.** See the
-  remaining open question.
+- **`degrades_to_full_download` is reported, and acting on it needs
+  consent.** `WholeFacetFallback::Refuse` is the default, so a caller
+  who asked for a window is told rather than surprised.
 
 ### Order, as executed
 
@@ -381,17 +387,17 @@ is a later step gated on that.
 2. ~~vvec windowing through the offset index.~~ Done — the `IDXFOR__`
    convention already existed, so there was no config surface to add.
 3. ~~CLI `--facet` / `--window` / `--plan` / `--profile`.~~ Done.
-4. Parquet mapping, then parquet differential fetch, as separate work.
+4. ~~Consent for the whole-facet fallback.~~ Done.
 
-Nothing is open but parquet. Every behavioural question the proposal
-raised has been answered and built: both fetch forms, chunk-adjacency
-coalescing, the handle-scoped offset cache, and consent for the
-whole-facet fallback.
+Nothing is open. Every question the proposal raised has been answered
+and built: both fetch forms, chunk-adjacency coalescing, the
+handle-scoped offset cache, and consent for the whole-facet fallback.
+Parquet is excluded rather than outstanding.
 
-## Open questions — the remaining ones
+## Questions the proposal raised, and how they were settled
 
 **Resolved since the first draft:** the per-format policy (vvec requires
-its index and `.mref`, index fetched whole, parquet deferred) and the
+its index and `.mref`, index fetched whole, parquet excluded) and the
 plan accessors, both above. The comma hazard is fixed and committed.
 
 

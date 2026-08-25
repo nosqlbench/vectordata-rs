@@ -396,8 +396,9 @@ fn an_unmappable_format_reports_that_it_degrades() {
     std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
     write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 10);
 
-    // A parquet facet: row-group structure, so a record range snaps
-    // outward by an amount only the footer knows. Deferred by design.
+    // A parquet facet. Ordinal windowing of parquet is excluded by
+    // design — not unimplemented — so this is the settled answer for
+    // the format rather than a placeholder for a better one.
     let pq = ds.join("profiles/default/metadata_content.parquet");
     std::fs::write(&pq, [0u8; 64]).unwrap();
 
