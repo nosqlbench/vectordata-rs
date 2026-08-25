@@ -260,6 +260,13 @@ Notes:
 - **Deduplicate expectations**: real corpora repeat boilerplate — a 10M
   passage set deduped to 9.76M (5.7%) in practice. Base counts shrink;
   that is the dedup stage working, not data loss.
+- **Sizing the dataset**: `--base-count N` takes exactly N base vectors;
+  `--base-fraction` takes a share. They are mutually exclusive, and a
+  count larger than the source is refused with the source's actual size
+  rather than being clamped — a dataset silently smaller than asked for
+  invalidates every number derived from it. The count is applied as a
+  `limit` on the import, and the row-aligned metadata takes the identical
+  subset.
 - **Interrupted runs**: split very large embeds into 1–2M-passage steps.
   Text, token ids, and vectors are all resident per step (~5 GB per 1M
   passages at 1024-d), and a step boundary is a resume point.

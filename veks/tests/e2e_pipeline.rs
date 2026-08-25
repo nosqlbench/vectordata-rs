@@ -42,7 +42,7 @@ fn make_tempdir() -> tempfile::TempDir {
 
 /// Default ImportArgs for e2e tests.
 fn default_args(name: &str, output: &Path) -> ImportArgs {
-    ImportArgs { merge: false, fetch: None,
+    ImportArgs { merge: false, fetch: None, base_count: None,
         name: name.to_string(),
         output: output.to_path_buf(),
         base_vectors: None,

@@ -332,7 +332,7 @@ pub fn run(args: CleanupArgs) {
         });
 
         let has_query = query_link.is_some();
-        let import_args = ImportArgs { merge: false, fetch: None,
+        let import_args = ImportArgs { merge: false, fetch: None, base_count: None,
             name: name.clone(),
             output: subdir.clone(),
             base_vectors: Some(base_link),

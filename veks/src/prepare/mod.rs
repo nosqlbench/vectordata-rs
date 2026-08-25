@@ -184,6 +184,11 @@ pub enum PrepareCommand {
         #[arg(long, default_value = "100%")]
         base_fraction: String,
 
+        /// Exact number of base vectors to use, instead of a share of the
+        /// source. Mutually exclusive with --base-fraction.
+        #[arg(long, value_name = "N", conflicts_with = "base_fraction")]
+        base_count: Option<u64>,
+
         /// Required dataset facets (e.g., "BQGD", "base,query,gt,dist").
         /// Controls which pipeline steps are generated. When omitted,
         /// facets are inferred from available inputs (B->BQGD, M->BQGDMPR, B+M->BQGDMPRF).
@@ -560,7 +565,7 @@ pub fn run(args: PrepareArgs) {
             no_filtered, normalize, no_normalize,
             assume_normalized_like_faiss, use_proper_cosine_metric,
             force, reset, clean, recursive,
-            base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
+            base_fraction, base_count, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
             personality, synthesize_metadata, metadata_fields, metadata_range,
             synthesis_mode, synthesis_format, selectivity, predicate_count, merge, fetch,
         } => {
@@ -690,6 +695,8 @@ pub fn run(args: PrepareArgs) {
                         force: true,
                         classic,
                         sources: vec![],
+                        fetch: fetch.clone(),
+                        base_count,
                     };
                     let args = wizard::run_wizard_with_options(yes, auto, seeds);
                     import::run(args);
@@ -864,6 +871,8 @@ pub fn run(args: PrepareArgs) {
                         selectivity: None,
                         classic,
                         sources: sources.clone(),
+                        fetch: fetch.clone(),
+                        base_count,
                     };
                     let args = wizard::run_wizard_with_options(yes, auto, seeds);
                     let out = args.output.clone();
@@ -879,7 +888,7 @@ pub fn run(args: PrepareArgs) {
                             })
                     });
                     let out = output.clone().unwrap_or_else(|| PathBuf::from("."));
-                    import::run(import::ImportArgs { merge, fetch: fetch.clone(),
+                    import::run(import::ImportArgs { merge, fetch: fetch.clone(), base_count,
                         name, output: out.clone(), base_vectors, query_vectors, self_search,
                         query_count, metadata, ground_truth, ground_truth_distances,
                         metric, neighbors, seed, description, no_dedup, no_zero_check,
@@ -942,6 +951,8 @@ pub fn run(args: PrepareArgs) {
                     selectivity: None,
                     classic,
                     sources: sources.clone(),
+                    fetch: fetch.clone(),
+                    base_count,
                 };
                 let args = wizard::run_wizard_with_options(yes, false, seeds);
                 import::run(args);
@@ -955,7 +966,7 @@ pub fn run(args: PrepareArgs) {
                         })
                 });
                 let output = output.unwrap_or_else(|| PathBuf::from("."));
-                import::run(import::ImportArgs { merge, fetch: fetch.clone(),
+                import::run(import::ImportArgs { merge, fetch: fetch.clone(), base_count,
                     name, output, base_vectors, query_vectors, self_search,
                     query_count, metadata, ground_truth, ground_truth_distances,
                     metric, neighbors, seed, description, no_dedup, no_zero_check,

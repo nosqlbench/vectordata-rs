@@ -69,6 +69,11 @@ pub struct ImportArgs {
     /// fraction of the available (post-dedup, post-query-split) vectors
     /// are used as the base set.
     pub base_fraction: f64,
+    /// Exact number of base vectors to take, as an alternative to
+    /// `base_fraction`. Emitted as an explicit `limit` on the subset
+    /// steps, so the count is what the pipeline produces rather than a
+    /// rounded share of a total the caller has to know.
+    pub base_count: Option<u64>,
     /// When true and base_fraction < 1.0, run dedup+zeros on the full
     /// input before subsetting. Slower but guarantees dedup is stable
     /// regardless of the fraction. When false (default), subset first
@@ -1085,6 +1090,36 @@ pub(crate) fn check_fetch_complete(
     Ok(fetch_steps)
 }
 
+/// Whether the base vectors are being subset at all — by an explicit
+/// count or by a fraction. Pedantic dedup forces the full input through
+/// dedup first, so it opts out of early subsetting either way.
+fn uses_subset(args: &ImportArgs) -> bool {
+    (args.base_count.is_some() || args.base_fraction < 1.0) && !args.pedantic_dedup
+}
+
+/// The option that expresses the subset on a `transform convert` step.
+///
+/// An explicit count emits `limit`, which the command honors ahead of
+/// `fraction` — so the number the caller asked for is the number produced,
+/// rather than `ceil(total x fraction)` landing a vector either side of it.
+fn subset_option(args: &ImportArgs) -> Option<(String, String)> {
+    if !uses_subset(args) {
+        return None;
+    }
+    match args.base_count {
+        Some(n) => Some(("limit".into(), n.to_string())),
+        None => Some(("fraction".into(), args.base_fraction.to_string())),
+    }
+}
+
+/// How the subset reads in a step description.
+fn subset_label(args: &ImportArgs) -> String {
+    match args.base_count {
+        Some(n) => format!("{} vectors", n),
+        None => format!("{:.0}% of source vectors", args.base_fraction * 100.0),
+    }
+}
+
 /// Convert schema steps into the shape the generator serializes.
 fn carry_steps(defs: &[vectordata::dataset::pipeline::StepDef]) -> Vec<Step> {
     defs.iter()
@@ -1302,9 +1337,9 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // When base_fraction < 1.0 and not pedantic, limit the convert
         // step to only import the needed subset. The convert command
         // computes the actual limit from source record count × fraction.
-        let uses_fraction = args.base_fraction < 1.0 && !args.pedantic_dedup;
-        if uses_fraction {
-            convert_opts.push(("fraction".into(), args.base_fraction.to_string()));
+        let uses_fraction = uses_subset(args);
+        if let Some(opt) = subset_option(args) {
+            convert_opts.push(opt);
         }
         // Pin the compiled parquet→xvec fast path when the source is a
         // parquet file/dir and no option would block it. This makes
@@ -1342,7 +1377,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     //
     // For foreign sources, the convert step's `fraction` option already
     // handles this. For native sources, we insert an explicit extract.
-    if args.base_fraction < 1.0 && !args.pedantic_dedup && !slots.all_vectors.is_materialized() {
+    if uses_subset(args) && !slots.all_vectors.is_materialized() {
         let source_path = slots.all_vectors.path().to_string();
         let ext = args.base_vectors.as_ref()
             .and_then(|p| p.extension())
@@ -1354,17 +1389,20 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             id: "subset-vectors".into(),
             run: "transform convert".into(),
             description: Some(format!(
-                "Subset to {:.0}% of source vectors (fast mode)",
-                args.base_fraction * 100.0)),
+                "Subset to {} (fast mode)",
+                subset_label(args))),
             after: vec![],
             per_profile: false,
             phase: 0,
             finalize: false,
-            options: vec![
-                ("source".into(), source_path),
-                ("output".into(), subset_output),
-                ("fraction".into(), args.base_fraction.to_string()),
-            ],
+            options: {
+                let mut o = vec![
+                    ("source".into(), source_path),
+                    ("output".into(), subset_output),
+                ];
+                o.extend(subset_option(args));
+                o
+            },
         });
         last_vector_step = "subset-vectors";
     }
@@ -1860,8 +1898,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ("from".into(), format),
                     ("output".into(), "${cache}/metadata_all.slab".into()),
                 ];
-                if args.base_fraction < 1.0 && !args.pedantic_dedup {
-                    meta_opts.push(("fraction".into(), args.base_fraction.to_string()));
+                // The metadata table is row-aligned with the vectors, so it
+                // takes the identical subset — the same count, not a
+                // separately-rounded share.
+                if let Some(opt) = subset_option(args) {
+                    meta_opts.push(opt);
                 }
                 steps.push(Step {
                     id: "convert-metadata".into(),
@@ -2938,6 +2979,28 @@ pub fn run(mut args: ImportArgs) {
         std::process::exit(1);
     }
 
+    // An explicit base count larger than the source is a planning error,
+    // not something to silently clamp: the caller believes they are
+    // building a dataset of a size the inputs cannot produce, and every
+    // downstream number would quietly be wrong.
+    if let Some(want) = args.base_count
+        && let Some(ref base) = args.base_vectors
+        && let Some(format) = VecFormat::detect(base)
+        && let Ok(meta) = veks_core::formats::reader::probe_source(base, format)
+        && let Some(total) = meta.record_count
+        && want > total
+    {
+        eprintln!(
+            "Error: --base-count {} exceeds the source: {} holds {} vector(s).\n  \
+             Use --base-count {} or fewer, or produce a larger source first.",
+            want,
+            crate::check::rel_display(base),
+            total,
+            total,
+        );
+        std::process::exit(1);
+    }
+
     // Apply --provided-facets masking: null out inputs for facets not
     // in the provided set so the pipeline generates compute steps for them.
     if let Some(ref provided) = args.provided_facets {
@@ -3922,7 +3985,7 @@ mod tests {
     }
 
     fn default_args() -> ImportArgs {
-        ImportArgs { merge: false, fetch: None,
+        ImportArgs { merge: false, fetch: None, base_count: None,
             name: "test".into(),
             output: PathBuf::from("/tmp/test-out"),
             base_vectors: None,

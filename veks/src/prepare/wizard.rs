@@ -51,6 +51,13 @@ pub struct WizardSeeds {
     pub force: bool,
     pub classic: bool,
     pub sources: Vec<PathBuf>,
+    /// Completed fetch pipeline to incorporate (`--fetch`). Carried
+    /// through the wizard so the interactive path builds the same
+    /// pipeline as the non-interactive one.
+    pub fetch: Option<PathBuf>,
+    /// Exact base vector count (`--base-count`), carried through the
+    /// wizard so both routes build the same pipeline.
+    pub base_count: Option<u64>,
 }
 
 /// Run the wizard with auto-accept disabled (fully interactive).
@@ -248,7 +255,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         || seeds.ground_truth_distances.is_some();
 
     let inferred = {
-        let probe = ImportArgs { merge: false, fetch: None,
+        let probe = ImportArgs { merge: false, fetch: None, base_count: None,
             name: String::new(),
             output: PathBuf::new(),
             base_vectors: if has_detected_base { Some(PathBuf::from("probe")) } else { None },
@@ -1419,7 +1426,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         std::process::exit(0);
     }
 
-    ImportArgs { merge: false, fetch: None,
+    ImportArgs { merge: false, fetch: seeds.fetch.clone(), base_count: seeds.base_count,
         name,
         output,
         base_vectors,
