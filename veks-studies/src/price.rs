@@ -747,6 +747,7 @@ pub fn simulate_io(
             offered_depth,
             cache,
             span_bytes: g.payload_bytes() * 2,
+            host: crate::io::hw::HostModel::DEFAULT,
             seed: 0x51A7,
         },
     )

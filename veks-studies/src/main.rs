@@ -115,8 +115,9 @@ fn main() {
         "  {:<15} {:>12} {:>12} {:>12}",
         "device", "worst <=1MB", "sequential", "vs measured"
     );
-    for (hardware, regime) in
-        veks_studies::io::hw::ALL_HARDWARE.iter().zip(veks_studies::regime::ALL.iter())
+    for (hardware, regime) in veks_studies::io::hw::ALL_HARDWARE
+        .iter()
+        .zip(veks_studies::regime::ALL.iter())
     {
         let worst = regime
             .random_read
@@ -139,11 +140,20 @@ fn main() {
     }
 
     println!("\n  Where a device's time goes, 4 KiB reads:\n");
-    println!("  {:<15} {:>12} {:>14} {:>14}", "device", "order", "positioning", "bandwidth used");
+    println!(
+        "  {:<15} {:>12} {:>14} {:>14}",
+        "device", "order", "positioning", "bandwidth used"
+    );
     for hardware in veks_studies::io::hw::ALL_HARDWARE {
         for (label, s) in [
-            ("scattered", veks_studies::io::fio_like(hardware, 4_096, 2_000)),
-            ("ascending", veks_studies::io::fio_like_sequential(hardware, 4_096, 20_000)),
+            (
+                "scattered",
+                veks_studies::io::fio_like(hardware, 4_096, 2_000),
+            ),
+            (
+                "ascending",
+                veks_studies::io::fio_like_sequential(hardware, 4_096, 20_000),
+            ),
         ] {
             println!(
                 "  {:<15} {:>12} {:>13.0}% {:>13.0}%",
@@ -156,9 +166,16 @@ fn main() {
     }
 
     println!("\n  A concurrent writer, capped at 40 MB/s and uncapped:\n");
-    println!("  {:<15} {:>14} {:>14} {:>10}", "device", "reader capped", "reader free", "cost");
+    println!(
+        "  {:<15} {:>14} {:>14} {:>10}",
+        "device", "reader capped", "reader free", "cost"
+    );
     for hardware in veks_studies::io::hw::ALL_HARDWARE {
-        let n = if hardware.name == "spinning-sata" { 1_500 } else { 20_000 };
+        let n = if hardware.name == "spinning-sata" {
+            1_500
+        } else {
+            20_000
+        };
         let capped = veks_studies::io::contended(hardware, 8_192, Some(40.0e6), n);
         let free = veks_studies::io::contended(hardware, 8_192, None, n);
         let c = capped.stream("reader").iops();
@@ -172,10 +189,48 @@ fn main() {
         );
     }
 
+    println!("\n  What a modern drive changes, 4 KiB random reads:\n");
+    println!(
+        "  {:<15} {:>12} {:>14} {:>16}",
+        "device", "IOPS", "bandwidth used", "limited by"
+    );
+    for (hardware, host) in [
+        (&veks_studies::io::hw::NVME_CONSUMER_HW, veks_studies::io::hw::HostModel::cores(8)),
+        (&veks_studies::io::hw::NVME_MODERN_HW, veks_studies::io::hw::HostModel::DEFAULT),
+        (&veks_studies::io::hw::NVME_MODERN_HW, veks_studies::io::hw::HostModel::cores(8)),
+    ] {
+        const SPAN: u64 = 5 * 1024 * 1024 * 1024;
+        let mut sched = veks_studies::io::sched::Noop::default();
+        let mut issuer = veks_studies::io::RandomAccess::new(SPAN, 4_096, 200_000, 0xF10);
+        let s = veks_studies::io::run(
+            hardware,
+            &mut sched,
+            &mut issuer,
+            veks_studies::io::RunConfig {
+                host,
+                ..veks_studies::io::RunConfig::direct(256, SPAN)
+            },
+        );
+        let limit = if s.host_saturation() > 0.3 { "host CPU" } else { "device" };
+        println!(
+            "  {:<15} {:>12.0} {:>13.0}% {:>16}",
+            format!("{} x{}", hardware.name, host.cores),
+            s.iops(),
+            s.bandwidth_utilization() * 100.0,
+            limit
+        );
+    }
+
     println!("\n\n=== where ordering starts to pay ===");
     print!(
         "{}",
         veks_studies::device::render_crossover_table(143 * (1u64 << 30))
+    );
+
+    println!("\n\n=== and how that line moves with concurrency ===");
+    print!(
+        "{}",
+        veks_studies::device::render_concurrency_crossover(143 * (1u64 << 30), 4_096)
     );
     println!();
 }

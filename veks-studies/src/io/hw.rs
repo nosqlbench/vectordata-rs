@@ -142,6 +142,46 @@ pub enum ServicePolicy {
     NearestFirst,
 }
 
+/// How per-request cost changes with how many requests are in flight.
+///
+/// The [MQSSD model](https://arxiv.org/abs/2507.06349) finds per-request
+/// setup cost falling steeply with concurrency — on a Samsung 990 PRO,
+/// its fitted read setup term drops by roughly 700× between one
+/// outstanding request and 128 — because the flash translation layer
+/// pipelines address translation across whatever work it has in hand.
+///
+/// Most of that effect is already explicit here as parallel dies, so
+/// this captures only the residual: the per-request cost a device pays
+/// when it has nothing to overlap against. It falls from `solo_penalty`
+/// at one request in flight toward 1 as the device fills up, on a
+/// rational curve of the same family MQSSD fits.
+///
+/// **It is [`NONE`](ConcurrencyScaling::NONE) for every historical
+/// device here**, because the perfscripts corpus sweeps block size at a
+/// fixed `iodepth=10` and contains no queue-depth sweep to fit against.
+/// Asserting a curve through a single measured point would be invention.
+#[derive(Debug, Clone, Copy)]
+pub struct ConcurrencyScaling {
+    /// Per-request cost multiplier with a single request in flight.
+    pub solo_penalty: f64,
+    /// In-flight count at which half the benefit has been realised.
+    pub half_depth: f64,
+}
+
+impl ConcurrencyScaling {
+    /// Concurrency does not change per-request cost — the honest setting
+    /// when no queue-depth sweep was measured.
+    pub const NONE: Self = ConcurrencyScaling {
+        solo_penalty: 1.0,
+        half_depth: 1.0,
+    };
+
+    pub fn factor(&self, in_flight: usize) -> f64 {
+        let k = in_flight.max(1) as f64;
+        1.0 + (self.solo_penalty - 1.0) * self.half_depth / (self.half_depth + (k - 1.0))
+    }
+}
+
 /// A device, specified physically.
 #[derive(Debug, Clone, Copy)]
 pub struct Hardware {
@@ -149,12 +189,28 @@ pub struct Hardware {
     /// What the medium itself sustains, bytes per second.
     pub media_rate: f64,
     /// What the interconnect sustains, bytes per second. The lower of
-    /// this and `media_rate × service_parallelism` is the real ceiling.
+    /// this and `media_rate × dies` is the real ceiling.
     pub bus_rate: f64,
     /// Commands the device will accept and hold.
     pub queue_slots: usize,
-    /// Commands it can make progress on simultaneously.
-    pub service_parallelism: usize,
+    /// Independent units that can each work on one command at a time.
+    ///
+    /// A spinning disk has one, because it has one head. Flash has many,
+    /// and **which one serves a request is decided by its address, not by
+    /// which happens to be free** — see [`Hardware::die_of`]. That
+    /// distinction is the whole of read/write interference: a read whose
+    /// die is mid-program waits for the program to finish, however idle
+    /// the rest of the device is.
+    pub dies: usize,
+    /// Address interleave across dies.
+    pub die_stripe_bytes: u64,
+    /// How long a die is occupied programming a written page, on top of
+    /// the transfer. Flash programming is roughly an order of magnitude
+    /// slower than reading and cannot be interrupted, which is why a
+    /// writer can lock a reader out of a die.
+    pub program_time_s: f64,
+    /// Residual per-request cost dependence on concurrency.
+    pub concurrency: ConcurrencyScaling,
     /// Commands per second the controller can *start*, whatever their
     /// size and however many channels are idle. This is a serial
     /// resource, so it is what flattens the small-block end of every
@@ -176,8 +232,51 @@ pub struct Hardware {
 impl Hardware {
     /// The bandwidth ceiling actually in force.
     pub fn peak_bandwidth(&self) -> f64 {
-        self.bus_rate
-            .min(self.media_rate * self.service_parallelism as f64)
+        self.bus_rate.min(self.media_rate * self.dies as f64)
+    }
+
+    /// Which unit holds the stripe containing this address.
+    /// Address-determined, not load-balanced: that is what makes a busy
+    /// die block a request that lands on it.
+    pub fn die_of(&self, offset: u64) -> usize {
+        if self.dies <= 1 {
+            return 0;
+        }
+        ((offset / self.die_stripe_bytes.max(1)) % self.dies as u64) as usize
+    }
+
+    /// How many dies a request of this size spans.
+    ///
+    /// A request larger than the stripe is served by several dies at
+    /// once — that striping is *how* a device turns request size into
+    /// bandwidth, and a model that pins a whole request to one die caps
+    /// large reads at a single die's rate. It also aliases badly:
+    /// 1 MiB-aligned offsets over a 4 KiB stripe and 32 dies all land on
+    /// die zero.
+    pub fn dies_spanned(&self, len: u64) -> usize {
+        if self.dies <= 1 {
+            return 1;
+        }
+        let stripes = len.div_ceil(self.die_stripe_bytes.max(1)) as usize;
+        stripes.clamp(1, self.dies)
+    }
+
+    /// Whether every die a request needs is free.
+    pub fn dies_free(&self, offset: u64, len: u64, busy: &[bool]) -> bool {
+        let first = self.die_of(offset);
+        (0..self.dies_spanned(len)).all(|i| !busy[(first + i) % self.dies.max(1)])
+    }
+
+    /// The rate a single request can absorb, given how many dies it
+    /// spans. Parallelism across dies is what lets a large request beat
+    /// one die's transfer rate.
+    pub fn request_rate(&self, len: u64) -> f64 {
+        self.media_rate * self.dies_spanned(len) as f64
+    }
+
+    /// Extra die occupancy a write incurs beyond its transfer.
+    pub fn write_occupancy_s(&self, write: bool) -> f64 {
+        if write { self.program_time_s } else { 0.0 }
     }
 
     /// Sequential throughput: no seeking, no rotational waiting, so the
@@ -187,8 +286,14 @@ impl Hardware {
     }
 
     pub fn access_time_s(&self, head: u64, offset: u64, now: f64) -> f64 {
+        self.access_time_at_depth(head, offset, now, usize::MAX)
+    }
+
+    /// The same, with the residual concurrency effect applied.
+    pub fn access_time_at_depth(&self, head: u64, offset: u64, now: f64, in_flight: usize) -> f64 {
         self.positioning
             .access_time_s(head, offset, now, self.media_rate)
+            * self.concurrency.factor(in_flight)
     }
 
     /// Seconds of the controller's serial attention each command needs.
@@ -213,7 +318,10 @@ pub const SPINNING_SATA_HW: Hardware = Hardware {
     media_rate: 201.0e6,
     bus_rate: 600.0e6,
     queue_slots: 32,
-    service_parallelism: 1,
+    dies: 1,
+    die_stripe_bytes: 1 << 20,
+    program_time_s: 0.0,
+    concurrency: ConcurrencyScaling::NONE,
     max_command_rate: 100_000.0,
     reorder_window: 4,
     positioning: Positioning::Rotational {
@@ -233,11 +341,23 @@ pub const SATA_SSD_HW: Hardware = Hardware {
     media_rate: 75.0e6,
     bus_rate: 568.0e6,
     queue_slots: 32,
-    service_parallelism: 8,
+    // 8 channels of 4 dies is typical for a drive of this generation.
+    // 8 channels of 8 dies. The count matters even when requests are far
+    // smaller than the device: at ten outstanding random requests over 32
+    // dies, birthday collisions cost about 13% of the available
+    // concurrency, and the measured curve does not show that loss.
+    dies: 64,
+    // Coarse: the measured curve shows a single request served at a
+    // roughly constant ~75 MB/s from 4 KiB to 64 KiB, so this controller
+    // does not split one command across dies until it is large.
+    die_stripe_bytes: 65_536,
+    // ~1.3 ms TLC program, an order of magnitude past the read latency.
+    program_time_s: 1.3e-3,
+    concurrency: ConcurrencyScaling::NONE,
     max_command_rate: 80_000.0,
     reorder_window: 1,
     positioning: Positioning::Flat {
-        access_latency_s: 51.0e-6,
+        access_latency_s: 68.0e-6,
     },
     policy: ServicePolicy::Fifo,
 };
@@ -250,16 +370,137 @@ pub const NVME_CONSUMER_HW: Hardware = Hardware {
     media_rate: 190.0e6,
     bus_rate: 1_500.0e6,
     queue_slots: 256,
-    service_parallelism: 16,
+    dies: 128,
+    // Same reasoning as the SATA drive: the measured per-request rate is
+    // flat at ~185 MB/s out to 128 KiB.
+    die_stripe_bytes: 131_072,
+    program_time_s: 700.0e-6,
+    concurrency: ConcurrencyScaling::NONE,
     max_command_rate: 124_000.0,
     reorder_window: 1,
     positioning: Positioning::Flat {
-        access_latency_s: 60.0e-6,
+        access_latency_s: 57.0e-6,
     },
     policy: ServicePolicy::Fifo,
 };
 
-pub const ALL_HARDWARE: &[Hardware] = &[SPINNING_SATA_HW, SATA_SSD_HW, NVME_CONSUMER_HW];
+/// A current-generation NVMe drive, calibrated to published figures
+/// rather than to a sweep run here.
+///
+/// The historical devices in this module come from the perfscripts fio
+/// corpus, which was captured in 2016. Keeping them is right — they are
+/// real regimes — but treating a 2016 consumer drive as "NVMe" understates
+/// current hardware by roughly an order of magnitude in operation rate,
+/// and conclusions drawn about ordering are sensitive to exactly that.
+///
+/// Calibration targets, all published:
+///
+/// - **~1M random-read IOPS at 4 KiB and 7.0 GB/s sequential**, from the
+///   Samsung 980 PRO in Table 1 of
+///   [Ren et al., ICPE '24](https://dl.acm.org/doi/10.1145/3629526.3645053),
+///   whose eight-device testbed reached 5.9M 4 KiB IOPS in aggregate.
+/// - **68 µs mean read latency**, from the same table.
+/// - **A random-to-sequential read ratio of 1.3–1.5× at high
+///   concurrency**, from the [MQSSD model's](https://arxiv.org/abs/2507.06349)
+///   Samsung 990 PRO measurements. The command rate here is set to land
+///   inside that band, which is the one parameter fitted to an outcome
+///   rather than read off a specification.
+///
+/// The IOPS peak is reached at high *total* concurrency, not at 32
+/// outstanding requests: vendor "QD32" figures are quoted per thread
+/// across many threads, and the ICPE '24 aggregate needed many cores.
+pub const NVME_MODERN_HW: Hardware = Hardware {
+    name: "nvme-modern",
+    media_rate: 400.0e6,
+    // PCIe 4.0 x4, practical.
+    bus_rate: 7_000.0e6,
+    queue_slots: 1_024,
+    dies: 128,
+    // An effective interleave, not a physical page stripe: chosen so
+    // that both published anchors are reproduced at once. Too fine and a
+    // 1 MiB request holds so many dies that only two fit and the access
+    // latency stops being hidden, costing 20% of sequential throughput;
+    // too coarse and large requests cannot reach the bus ceiling.
+    die_stripe_bytes: 65_536,
+    program_time_s: 350.0e-6,
+    // The only device here with a fitted concurrency curve, because it is
+    // the only one for which published queue-depth behaviour exists.
+    concurrency: ConcurrencyScaling {
+        solo_penalty: 1.6,
+        half_depth: 8.0,
+    },
+    max_command_rate: 1_200_000.0,
+    reorder_window: 1,
+    positioning: Positioning::Flat {
+        access_latency_s: 68.0e-6,
+    },
+    policy: ServicePolicy::Fifo,
+};
+
+/// The three devices measured in the perfscripts corpus. These have
+/// matching [`crate::regime::Regime`] entries and are what the
+/// forward-simulation fit is checked against.
+pub const HISTORICAL_HARDWARE: &[Hardware] = &[SPINNING_SATA_HW, SATA_SSD_HW, NVME_CONSUMER_HW];
+
+pub const ALL_HARDWARE: &[Hardware] = HISTORICAL_HARDWARE;
+
+/// Every device including the modern one, for studies that are not being
+/// checked against the 2016 sweeps.
+pub const ALL_HARDWARE_WITH_MODERN: &[Hardware] = &[
+    SPINNING_SATA_HW,
+    SATA_SSD_HW,
+    NVME_CONSUMER_HW,
+    NVME_MODERN_HW,
+];
+
+/// The cost of issuing an I/O on the host, which is not free and at
+/// modern device rates is frequently the binding constraint.
+///
+/// [Ren et al., ICPE '24](https://dl.acm.org/doi/10.1145/3629526.3645053)
+/// find that with high-performance NVMe SSDs "the CPU is the primary
+/// bottleneck ... yet the SSD device itself is not saturated" at 4 KiB,
+/// and that Linux I/O schedulers can add up to 63.4% overhead on top.
+/// A storage model with no host-side cost is modelling the wrong
+/// bottleneck above roughly half a million operations per second.
+#[derive(Debug, Clone, Copy)]
+pub struct HostModel {
+    /// Serial CPU time to submit and complete one request, per core.
+    pub per_request_s: f64,
+    /// Cores issuing I/O.
+    pub cores: usize,
+}
+
+impl HostModel {
+    /// A single core at ~1.7 µs per request — about 590k IOPS, which is
+    /// the order at which the ICPE '24 testbed found the CPU saturating
+    /// before the device did.
+    pub const DEFAULT: Self = HostModel {
+        per_request_s: 1.7e-6,
+        cores: 1,
+    };
+
+    /// No host cost, for isolating device behaviour.
+    pub const FREE: Self = HostModel {
+        per_request_s: 0.0,
+        cores: 1,
+    };
+
+    pub fn cores(n: usize) -> Self {
+        HostModel {
+            per_request_s: Self::DEFAULT.per_request_s,
+            cores: n.max(1),
+        }
+    }
+
+    /// Operations per second this host can sustain, ignoring the device.
+    pub fn ceiling_iops(&self) -> f64 {
+        if self.per_request_s <= 0.0 {
+            f64::INFINITY
+        } else {
+            self.cores as f64 / self.per_request_s
+        }
+    }
+}
 
 /// Draw a rotational offset so that a simulation does not start every
 /// run with the platter in the same place.

@@ -290,6 +290,23 @@ pub const NVME_CONSUMER_MODEL: DeviceModel = DeviceModel {
     bw_ceiling: 1_750.0e6,
 };
 
+/// The closed-form counterpart of [`crate::io::hw::NVME_MODERN_HW`],
+/// calibrated to the same published figures.
+///
+/// Its reference concurrency is 128 rather than 10, because that is the
+/// regime the figures describe: the ICPE '24 testbed needed many cores
+/// to reach its aggregate, and the MQSSD measurements that pin the
+/// random-to-sequential ratio are quoted at k=128.
+pub const NVME_MODERN_MODEL: DeviceModel = DeviceModel {
+    name: "nvme-modern",
+    latency_s: 68.0e-6,
+    transfer_bytes_per_s: 400.0e6,
+    queue_depth: 128.0,
+    native_queue_depth: 1_024.0,
+    iops_ceiling: 1_200_000.0,
+    bw_ceiling: 7_000.0e6,
+};
+
 pub const ALL_MODELS: &[DeviceModel] = &[SPINNING_SATA_MODEL, SATA_SSD_MODEL, NVME_CONSUMER_MODEL];
 
 /// Pair each model with the sweep it claims to explain.
@@ -524,10 +541,30 @@ impl DeviceModel {
     ///
     /// This single number decides whether ordering is worth anything on a
     /// device, and it is a property of the *record size*, not of the
-    /// storage class. A 128-byte record on NVMe carries a penalty of 110;
-    /// a 4 KiB record on the same drive carries 3.6.
+    /// storage class. A 128-byte record on the 2016 NVMe drive carries a
+    /// penalty of 110; a 4 KiB record on the same drive carries 3.6.
     pub fn random_penalty(&self, record_bytes: u64) -> f64 {
-        let random = self.iops(record_bytes) * record_bytes as f64;
+        self.random_penalty_at_depth(record_bytes, self.queue_depth)
+    }
+
+    /// **The penalty is also a function of concurrency**, and strongly.
+    ///
+    /// Random access loses to streaming because each request pays an
+    /// access latency that a stream does not. Concurrency hides latency:
+    /// with `k` requests outstanding the latency is amortised `k` ways,
+    /// so the penalty falls as `k` rises and vanishes once a ceiling
+    /// binds instead.
+    ///
+    /// The effect is not small. The
+    /// [MQSSD measurements](https://arxiv.org/abs/2507.06349) report a
+    /// random-to-sequential read ratio of **1.3–1.5× at k=128** on a
+    /// current drive, against 38–57× for writes at k=1. Any statement
+    /// about whether ordering pays that does not name a concurrency is
+    /// underdetermined — and the perfscripts corpus was captured at
+    /// `iodepth=10`, so every figure derived from it is a statement about
+    /// that depth.
+    pub fn random_penalty_at_depth(&self, record_bytes: u64, depth: f64) -> f64 {
+        let random = self.iops_at_depth(record_bytes, depth) * record_bytes as f64;
         if random <= 0.0 {
             f64::INFINITY
         } else {
@@ -554,6 +591,11 @@ impl DeviceModel {
         (passes as f64) < self.random_penalty(record_bytes)
     }
 
+    /// The same test at a stated concurrency.
+    pub fn ordering_pays_at_depth(&self, record_bytes: u64, passes: u64, depth: f64) -> bool {
+        (passes as f64) < self.random_penalty_at_depth(record_bytes, depth)
+    }
+
     /// The same line expressed as memory, which is the parameter anyone
     /// actually controls.
     ///
@@ -561,7 +603,20 @@ impl DeviceModel {
     /// `M > payload / penalty(R)`. Below that budget an ordered rewrite
     /// re-reads the source more times than the seeks it saves are worth.
     pub fn min_budget_for_ordering(&self, payload_bytes: u64, record_bytes: u64) -> u64 {
-        let penalty = self.random_penalty(record_bytes);
+        self.min_budget_for_ordering_at_depth(payload_bytes, record_bytes, self.queue_depth)
+    }
+
+    /// The same line at a stated concurrency. Raising concurrency raises
+    /// the budget ordering needs in order to pay — and past some depth
+    /// the requirement exceeds the payload, meaning ordering has nothing
+    /// left to offer at any budget.
+    pub fn min_budget_for_ordering_at_depth(
+        &self,
+        payload_bytes: u64,
+        record_bytes: u64,
+        depth: f64,
+    ) -> u64 {
+        let penalty = self.random_penalty_at_depth(record_bytes, depth);
         if !penalty.is_finite() || penalty <= 1.0 {
             return u64::MAX;
         }
@@ -718,4 +773,128 @@ pub fn render_crossover_table(payload_bytes: u64) -> String {
         let _ = writeln!(s, "{row}");
     }
     s
+}
+
+/// Render how the crossover moves with concurrency.
+pub fn render_concurrency_crossover(payload_bytes: u64, record_bytes: u64) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "\n  Record {} B, payload {:.0} GiB. Ordering pays while P < penalty.\n",
+        record_bytes,
+        payload_bytes as f64 / (1u64 << 30) as f64
+    );
+    let _ = writeln!(
+        s,
+        "  {:>7}  {:>26}  {:>26}",
+        "depth", "nvme-consumer (2016)", "nvme-modern"
+    );
+    let _ = writeln!(
+        s,
+        "  {:>7}  {:>11} {:>14}  {:>11} {:>14}",
+        "", "penalty", "min budget", "penalty", "min budget"
+    );
+    for depth in [1.0f64, 4.0, 10.0, 32.0, 64.0, 128.0, 256.0] {
+        let mut row = format!("  {depth:>7.0}");
+        for model in [NVME_CONSUMER_MODEL, NVME_MODERN_MODEL] {
+            let penalty = model.random_penalty_at_depth(record_bytes, depth);
+            let budget = model.min_budget_for_ordering_at_depth(payload_bytes, record_bytes, depth);
+            let text = if budget == u64::MAX || budget >= payload_bytes {
+                "never pays".to_string()
+            } else if budget >= (1 << 30) {
+                format!("{:.1} GiB", budget as f64 / (1u64 << 30) as f64)
+            } else {
+                format!("{:.0} MiB", budget as f64 / (1u64 << 20) as f64)
+            };
+            let _ = write!(row, "  {penalty:>11.1} {text:>14}");
+        }
+        let _ = writeln!(s, "{row}");
+    }
+    s
+}
+
+#[cfg(test)]
+mod concurrency_crossover {
+    use super::*;
+
+    /// **Concurrency erodes the case for ordering.** Each outstanding
+    /// request hides another request's latency, so the gap random access
+    /// has to make up shrinks as the queue deepens.
+    #[test]
+    fn the_penalty_falls_as_concurrency_rises() {
+        for model in [NVME_CONSUMER_MODEL, NVME_MODERN_MODEL, SATA_SSD_MODEL] {
+            let shallow = model.random_penalty_at_depth(4_096, 1.0);
+            let deep = model.random_penalty_at_depth(4_096, 128.0);
+            assert!(
+                deep < shallow / 4.0,
+                "{}: penalty {shallow:.1}× at k=1 should fall far by k=128, got {deep:.1}×",
+                model.name
+            );
+        }
+    }
+
+    /// The modern drive at high concurrency lands inside the 1.3–1.5×
+    /// random-to-sequential band the MQSSD measurements report. That band
+    /// is the calibration target, so this test is what keeps the modern
+    /// regime honest.
+    #[test]
+    fn the_modern_drive_matches_the_published_random_sequential_ratio() {
+        let ratio = NVME_MODERN_MODEL.random_penalty_at_depth(4_096, 128.0);
+        assert!(
+            (1.3..=1.5).contains(&ratio),
+            "expected the published 1.3–1.5× band, got {ratio:.2}×"
+        );
+    }
+
+    /// **The conclusion that changes.** At `iodepth=10` on a 2016 drive,
+    /// ordering a 4 KiB-record rewrite pays given a budget of about a
+    /// quarter of the payload. At realistic concurrency on a current
+    /// drive it pays at no budget at all, because the penalty it would
+    /// have to beat is under two.
+    #[test]
+    fn ordering_stops_paying_on_a_modern_drive_at_realistic_concurrency() {
+        let payload = 1u64 << 40;
+
+        let old = NVME_CONSUMER_MODEL.min_budget_for_ordering_at_depth(payload, 4_096, 10.0);
+        assert!(
+            old < payload / 3,
+            "the 2016 drive at QD10 needs {old} bytes"
+        );
+
+        // On the modern drive the penalty drops below two, and a rewrite
+        // always makes at least two passes. So no budget wins: the floor
+        // of the pass count is already above the penalty it must beat.
+        let penalty = NVME_MODERN_MODEL.random_penalty_at_depth(4_096, 128.0);
+        assert!(
+            penalty < 2.0,
+            "penalty {penalty:.2}× is still beatable by a two-pass run"
+        );
+        assert!(!NVME_MODERN_MODEL.ordering_pays_at_depth(4_096, 2, 128.0));
+
+        let modern = NVME_MODERN_MODEL.min_budget_for_ordering_at_depth(payload, 4_096, 128.0);
+        assert!(
+            modern > payload / 2,
+            "and the nominal budget exceeds half the payload, at which point the \
+             rewrite is nearly an in-memory sort anyway: {modern}"
+        );
+    }
+
+    /// Small records still justify ordering everywhere, on every device
+    /// and at every depth measured. The technique did not stop working;
+    /// its domain narrowed to where records are small relative to what
+    /// the device serves efficiently.
+    #[test]
+    fn small_records_still_justify_ordering_at_any_depth() {
+        for depth in [1.0f64, 10.0, 128.0] {
+            for model in ALL_MODELS.iter().chain([&NVME_MODERN_MODEL]) {
+                let penalty = model.random_penalty_at_depth(128, depth);
+                assert!(
+                    penalty > 8.0,
+                    "{} at k={depth}: 128 B records should still carry a large penalty, got {penalty:.1}×",
+                    model.name
+                );
+            }
+        }
+    }
 }

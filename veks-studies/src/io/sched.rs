@@ -32,7 +32,14 @@ pub trait Scheduler {
     }
 
     /// Take the request this scheduler would hand over next.
-    fn pop_first(&mut self) -> Option<Request>;
+    fn pop_first(&mut self) -> Option<Request> {
+        self.pop_first_where(&|_| true)
+    }
+
+    /// The same, restricted to requests the device can actually accept
+    /// right now — a die that is mid-program will not take another
+    /// command, and the queue has to skip past it rather than stall.
+    fn pop_first_where(&mut self, allowed: &dyn Fn(&Request) -> bool) -> Option<Request>;
 
     /// Take whichever queued request minimises `cost`. Used when the
     /// *device* is choosing, so the scheduler is only holding the pool.
@@ -41,8 +48,21 @@ pub trait Scheduler {
     /// The same, but considering only the `window` oldest queued
     /// requests — firmware that commits some way ahead rather than
     /// re-evaluating the whole queue on every completion.
-    fn pop_best_within(&mut self, window: usize, cost: &dyn Fn(&Request) -> f64)
-    -> Option<Request>;
+    fn pop_best_within(
+        &mut self,
+        window: usize,
+        cost: &dyn Fn(&Request) -> f64,
+    ) -> Option<Request> {
+        self.pop_best_within_where(window, cost, &|_| true)
+    }
+
+    /// The same, restricted to requests the device can accept right now.
+    fn pop_best_within_where(
+        &mut self,
+        window: usize,
+        cost: &dyn Fn(&Request) -> f64,
+        allowed: &dyn Fn(&Request) -> bool,
+    ) -> Option<Request>;
 }
 
 /// No reordering: hand requests over exactly as they arrived.
@@ -67,8 +87,9 @@ impl Scheduler for Noop {
         self.queue.len()
     }
 
-    fn pop_first(&mut self) -> Option<Request> {
-        self.queue.pop_front()
+    fn pop_first_where(&mut self, allowed: &dyn Fn(&Request) -> bool) -> Option<Request> {
+        let idx = self.queue.iter().position(allowed)?;
+        self.queue.remove(idx)
     }
 
     fn pop_best(&mut self, cost: &dyn Fn(&Request) -> f64) -> Option<Request> {
@@ -81,10 +102,11 @@ impl Scheduler for Noop {
         self.queue.remove(best)
     }
 
-    fn pop_best_within(
+    fn pop_best_within_where(
         &mut self,
         window: usize,
         cost: &dyn Fn(&Request) -> f64,
+        allowed: &dyn Fn(&Request) -> bool,
     ) -> Option<Request> {
         if self.queue.is_empty() {
             return None;
@@ -95,6 +117,7 @@ impl Scheduler for Noop {
             .iter()
             .take(limit)
             .enumerate()
+            .filter(|(_, r)| allowed(r))
             .min_by(|(_, a), (_, b)| cost(a).partial_cmp(&cost(b)).unwrap())
             .map(|(i, _)| i)?;
         self.queue.remove(best)
@@ -126,7 +149,7 @@ impl Scheduler for Elevator {
         self.queue.len()
     }
 
-    fn pop_first(&mut self) -> Option<Request> {
+    fn pop_first_where(&mut self, allowed: &dyn Fn(&Request) -> bool) -> Option<Request> {
         if self.queue.is_empty() {
             return None;
         }
@@ -136,7 +159,7 @@ impl Scheduler for Elevator {
             .queue
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.offset >= self.position)
+            .filter(|(_, r)| r.offset >= self.position && allowed(r))
             .min_by_key(|(_, r)| r.offset)
             .map(|(i, _)| i);
         let idx = match ahead {
@@ -146,9 +169,9 @@ impl Scheduler for Elevator {
                 self.queue
                     .iter()
                     .enumerate()
+                    .filter(|(_, r)| allowed(r))
                     .min_by_key(|(_, r)| r.offset)
-                    .map(|(i, _)| i)
-                    .expect("queue is non-empty")
+                    .map(|(i, _)| i)?
             }
         };
         let req = self.queue.swap_remove(idx);
@@ -168,12 +191,13 @@ impl Scheduler for Elevator {
         Some(req)
     }
 
-    fn pop_best_within(
+    fn pop_best_within_where(
         &mut self,
         window: usize,
         cost: &dyn Fn(&Request) -> f64,
+        allowed: &dyn Fn(&Request) -> bool,
     ) -> Option<Request> {
-        let req = pop_best_within_slice(&mut self.queue, window, cost)?;
+        let req = pop_best_within_slice(&mut self.queue, window, cost, allowed)?;
         self.position = req.offset + req.len;
         Some(req)
     }
@@ -230,13 +254,15 @@ impl Scheduler for Deadline {
         self.inner.len()
     }
 
-    fn pop_first(&mut self) -> Option<Request> {
-        if let Some(i) = self.expired() {
+    fn pop_first_where(&mut self, allowed: &dyn Fn(&Request) -> bool) -> Option<Request> {
+        if let Some(i) = self.expired()
+            && allowed(&self.inner.queue[i])
+        {
             let req = self.inner.queue.swap_remove(i);
             self.inner.position = req.offset + req.len;
             return Some(req);
         }
-        self.inner.pop_first()
+        self.inner.pop_first_where(allowed)
     }
 
     fn pop_best(&mut self, cost: &dyn Fn(&Request) -> f64) -> Option<Request> {
@@ -248,17 +274,20 @@ impl Scheduler for Deadline {
         self.inner.pop_best(cost)
     }
 
-    fn pop_best_within(
+    fn pop_best_within_where(
         &mut self,
         window: usize,
         cost: &dyn Fn(&Request) -> f64,
+        allowed: &dyn Fn(&Request) -> bool,
     ) -> Option<Request> {
-        if let Some(i) = self.expired() {
+        if let Some(i) = self.expired()
+            && allowed(&self.inner.queue[i])
+        {
             let req = self.inner.queue.swap_remove(i);
             self.inner.position = req.offset + req.len;
             return Some(req);
         }
-        self.inner.pop_best_within(window, cost)
+        self.inner.pop_best_within_where(window, cost, allowed)
     }
 }
 
@@ -269,6 +298,7 @@ pub fn pop_best_within_slice(
     queue: &mut Vec<Request>,
     window: usize,
     cost: &dyn Fn(&Request) -> f64,
+    allowed: &dyn Fn(&Request) -> bool,
 ) -> Option<Request> {
     if queue.is_empty() {
         return None;
@@ -277,6 +307,7 @@ pub fn pop_best_within_slice(
     let best = queue[..limit]
         .iter()
         .enumerate()
+        .filter(|(_, r)| allowed(r))
         .min_by(|(_, a), (_, b)| cost(a).partial_cmp(&cost(b)).unwrap())
         .map(|(i, _)| i)?;
     Some(queue.remove(best))

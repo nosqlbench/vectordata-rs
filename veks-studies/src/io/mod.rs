@@ -86,6 +86,10 @@ struct InService {
     /// is positive the request consumes no bandwidth.
     positioning_remaining: f64,
     bytes_remaining: f64,
+    /// Extra die occupancy after the transfer — flash programming.
+    program_remaining: f64,
+    first_die: usize,
+    die_count: usize,
 }
 
 /// Where a request stream comes from.
@@ -100,6 +104,9 @@ pub struct RandomAccess {
     rng: Xoshiro256PlusPlus,
     span_bytes: u64,
     block_bytes: u64,
+    /// Upper bound when the workload uses a size range, as fio's
+    /// `bsrange` does.
+    block_bytes_max: u64,
     remaining: u64,
     write: bool,
 }
@@ -110,8 +117,17 @@ impl RandomAccess {
             rng: Xoshiro256PlusPlus::seed_from_u64(seed),
             span_bytes,
             block_bytes,
+            block_bytes_max: block_bytes,
             remaining: count,
             write: false,
+        }
+    }
+
+    /// Sizes drawn uniformly from `[low, high]`, in multiples of `low`.
+    pub fn ranged(span_bytes: u64, low: u64, high: u64, count: u64, seed: u64) -> Self {
+        RandomAccess {
+            block_bytes_max: high,
+            ..RandomAccess::new(span_bytes, low, count, seed)
         }
     }
 }
@@ -122,9 +138,15 @@ impl Issuer for RandomAccess {
             return None;
         }
         self.remaining -= 1;
+        let len = if self.block_bytes_max > self.block_bytes {
+            let steps = self.block_bytes_max / self.block_bytes;
+            self.block_bytes * self.rng.random_range(1..=steps)
+        } else {
+            self.block_bytes
+        };
         let blocks = (self.span_bytes / self.block_bytes).max(1);
         let block = self.rng.random_range(0..blocks);
-        Some((block * self.block_bytes, self.block_bytes, self.write))
+        Some((block * self.block_bytes, len, self.write))
     }
 }
 
@@ -199,6 +221,10 @@ pub struct IoStats {
     /// Time the issuer was blocked because the device would accept no
     /// more commands.
     pub queue_blocked_s: f64,
+    /// Time the issuer was blocked waiting for a CPU core to submit on.
+    /// A large value here means the model is host-bound, not
+    /// device-bound — the state Ren et al. report for modern NVMe.
+    pub host_blocked_s: f64,
     /// Integral of in-service command count over time, so mean queue
     /// occupancy is this divided by elapsed.
     pub service_occupancy_integral: f64,
@@ -260,6 +286,16 @@ impl IoStats {
         }
     }
 
+    /// Fraction of the run spent waiting on the host rather than the
+    /// device.
+    pub fn host_saturation(&self) -> f64 {
+        if self.elapsed_s <= 0.0 {
+            0.0
+        } else {
+            self.host_blocked_s / self.elapsed_s
+        }
+    }
+
     /// Fraction of the run in which the issuer could not submit.
     pub fn queue_saturation(&self) -> f64 {
         if self.elapsed_s <= 0.0 {
@@ -279,6 +315,8 @@ pub struct RunConfig {
     pub cache: Option<crate::cache::CacheConfig>,
     /// Bytes the source occupies, for sizing the cache's page space.
     pub span_bytes: u64,
+    /// What it costs the host to issue an I/O.
+    pub host: hw::HostModel,
     pub seed: u64,
 }
 
@@ -289,7 +327,17 @@ impl RunConfig {
             offered_depth,
             cache: None,
             span_bytes,
+            host: hw::HostModel::DEFAULT,
             seed: 0x5A17,
+        }
+    }
+
+    /// Unbuffered, with the host taken out of the picture, for isolating
+    /// what the device alone does.
+    pub fn device_only(offered_depth: usize, span_bytes: u64) -> Self {
+        RunConfig {
+            host: hw::HostModel::FREE,
+            ..Self::direct(offered_depth, span_bytes)
         }
     }
 }
@@ -441,7 +489,9 @@ pub fn run_streams(
         })
         .collect();
 
-    let mut serving: Vec<InService> = Vec::with_capacity(hardware.service_parallelism);
+    let mut serving: Vec<InService> = Vec::with_capacity(hardware.dies);
+    let mut die_busy = vec![false; hardware.dies.max(1)];
+    let mut host_free_at = vec![0.0f64; config.host.cores.max(1)];
     let mut controller_free_at = 0.0f64;
     let mut next_id: u64 = 0;
 
@@ -463,6 +513,7 @@ pub fn run_streams(
             break;
         }
 
+        let mut host_blocked = false;
         for (i, stream) in streams.iter_mut().enumerate() {
             while !exhausted[i] && outstanding[i] < stream.offered_depth {
                 // A rate-capped stream may simply not be allowed to
@@ -477,6 +528,20 @@ pub fn run_streams(
                     blocked = true;
                     break;
                 }
+                // Issuing an I/O costs the host CPU. Above roughly half a
+                // million operations per second this, and not the device,
+                // is what runs out.
+                let core = host_free_at
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .expect("at least one core");
+                if host_free_at[core] > clock {
+                    host_blocked = true;
+                    break;
+                }
+                host_free_at[core] = clock + config.host.per_request_s;
                 let Some((offset, len, write)) = stream.issuer.next() else {
                     exhausted[i] = true;
                     break;
@@ -536,24 +601,43 @@ pub fn run_streams(
         }
 
         // ---- Dispatch ---------------------------------------------------
-        while serving.len() < hardware.service_parallelism {
+        while serving.len() < hardware.dies {
+            // A request can only start if *its own* die is free. This is
+            // the whole of read/write interference: nothing else in the
+            // device being idle helps a request whose die is mid-program.
+            let free_die = |r: &Request| hardware.dies_free(r.offset, r.len, &die_busy);
+            let in_flight = serving.len() + scheduler.len();
             let picked = match hardware.policy {
-                ServicePolicy::Fifo => scheduler.pop_first(),
-                ServicePolicy::NearestFirst => scheduler
-                    .pop_best_within(hardware.reorder_window, &|r: &Request| {
-                        hardware.access_time_s(head, r.offset, clock)
-                    }),
+                ServicePolicy::Fifo => scheduler.pop_first_where(&free_die),
+                ServicePolicy::NearestFirst => scheduler.pop_best_within_where(
+                    hardware.reorder_window,
+                    &|r: &Request| hardware.access_time_at_depth(head, r.offset, clock, in_flight),
+                    &free_die,
+                ),
             };
             let Some(req) = picked else { break };
             let controller_wait = (controller_free_at - clock).max(0.0);
             controller_free_at = clock + controller_wait + hardware.command_time_s();
-            let positioning =
-                controller_wait + hardware.access_time_s(head, req.offset, clock + controller_wait);
+            let positioning = controller_wait
+                + hardware.access_time_at_depth(
+                    head,
+                    req.offset,
+                    clock + controller_wait,
+                    in_flight,
+                );
             head = req.offset + req.len;
+            let first_die = hardware.die_of(req.offset);
+            let die_count = hardware.dies_spanned(req.len);
+            for i in 0..die_count {
+                die_busy[(first_die + i) % hardware.dies.max(1)] = true;
+            }
             serving.push(InService {
                 req,
                 positioning_remaining: positioning,
                 bytes_remaining: req.len as f64,
+                program_remaining: hardware.write_occupancy_s(req.write),
+                first_die,
+                die_count,
             });
         }
 
@@ -566,6 +650,7 @@ pub fn run_streams(
                 continue;
             }
             let all_done = (0..n).all(|i| streams[i].looping || exhausted[i]);
+            let host_ready = host_free_at.iter().cloned().fold(f64::INFINITY, f64::min);
             let waiting = (0..n)
                 .filter(|&i| !exhausted[i] && next_submit_at[i] > clock)
                 .map(|i| next_submit_at[i])
@@ -574,7 +659,11 @@ pub fn run_streams(
                 break;
             }
             if waiting.is_finite() {
-                clock = waiting;
+                clock = waiting.min(host_ready.max(clock));
+                continue;
+            }
+            if host_ready > clock && host_ready.is_finite() {
+                clock = host_ready;
                 continue;
             }
             break;
@@ -582,20 +671,35 @@ pub fn run_streams(
 
         let transferring = serving
             .iter()
-            .filter(|s| s.positioning_remaining <= 0.0)
+            .filter(|s| s.positioning_remaining <= 0.0 && s.bytes_remaining > 1e-6)
             .count();
-        let per_request_rate = if transferring == 0 {
+        // Each transferring request takes an equal share of the device's
+        // bandwidth, capped by what its own dies can supply.
+        let share = if transferring == 0 {
             0.0
         } else {
-            (peak / transferring as f64).min(hardware.media_rate)
+            peak / transferring as f64
+        };
+        let rate_of = |s: &InService| -> f64 {
+            if s.positioning_remaining > 0.0 || s.bytes_remaining <= 1e-6 {
+                0.0
+            } else {
+                share.min(hardware.request_rate(s.req.len))
+            }
         };
 
         let mut dt = f64::INFINITY;
         for s in &serving {
             if s.positioning_remaining > 0.0 {
                 dt = dt.min(s.positioning_remaining);
-            } else if per_request_rate > 0.0 {
-                dt = dt.min(s.bytes_remaining / per_request_rate);
+            } else if s.bytes_remaining > 1e-6 {
+                let r = rate_of(s);
+                if r > 0.0 {
+                    dt = dt.min(s.bytes_remaining / r);
+                }
+            } else if s.program_remaining > 0.0 {
+                // Programming holds the die but moves no bytes.
+                dt = dt.min(s.program_remaining);
             }
         }
         // A rate-limited stream may become eligible before anything in
@@ -608,6 +712,12 @@ pub fn run_streams(
                 dt = dt.min(next_submit_at[i] - clock);
             }
         }
+        if host_blocked {
+            let next_core = host_free_at.iter().cloned().fold(f64::INFINITY, f64::min);
+            if next_core > clock {
+                dt = dt.min(next_core - clock);
+            }
+        }
         if !dt.is_finite() || dt <= 0.0 {
             dt = 1e-12;
         }
@@ -615,10 +725,14 @@ pub fn run_streams(
         stats.busy_s += dt;
         if transferring > 0 {
             stats.transferring_s += dt;
-            stats.bytes_transferred += (per_request_rate * transferring as f64 * dt).round() as u64;
+            let moved: f64 = serving.iter().map(rate_of).sum::<f64>() * dt;
+            stats.bytes_transferred += moved.round() as u64;
         }
         if blocked {
             stats.queue_blocked_s += dt;
+        }
+        if host_blocked {
+            stats.host_blocked_s += dt;
         }
         stats.service_occupancy_integral += serving.len() as f64 * dt;
         clock += dt;
@@ -626,8 +740,10 @@ pub fn run_streams(
         for s in serving.iter_mut() {
             if s.positioning_remaining > 0.0 {
                 s.positioning_remaining -= dt;
+            } else if s.bytes_remaining > 1e-6 {
+                s.bytes_remaining -= rate_of(s) * dt;
             } else {
-                s.bytes_remaining -= per_request_rate * dt;
+                s.program_remaining -= dt;
             }
         }
 
@@ -635,7 +751,13 @@ pub fn run_streams(
         let mut i = 0;
         while i < serving.len() {
             let s = serving[i];
-            if s.positioning_remaining <= 0.0 && s.bytes_remaining <= 1e-6 {
+            if s.positioning_remaining <= 0.0
+                && s.bytes_remaining <= 1e-6
+                && s.program_remaining <= 0.0
+            {
+                for i in 0..s.die_count {
+                    die_busy[(s.first_die + i) % hardware.dies.max(1)] = false;
+                }
                 stats.requests_completed += 1;
                 let latency = clock - s.req.submitted_at;
                 stats.total_latency_s += latency;
@@ -757,6 +879,42 @@ pub fn contended(
         match writer_cap {
             Some(cap) => writer.capped(cap),
             None => writer,
+        },
+    ];
+    run_streams(
+        hardware,
+        &mut scheduler,
+        &mut streams,
+        RunConfig::direct(10, SPAN),
+    )
+}
+
+/// A faithful reproduction of the perfscripts `mixed` job: a random
+/// reader at `bsrange=8k-16k` alongside a sequential reader and a
+/// sequential writer at `bs=1m`, each at `iodepth=10`, with both
+/// sequential jobs held to `cap` bytes per second (uncapped when `None`).
+///
+/// This exists so simulated contention can be compared against the
+/// measured [`crate::regime::ContentionPoint`] sweep directly, rather
+/// than only in direction.
+pub fn mixed_job(hardware: &Hardware, cap: Option<f64>, reader_requests: u64) -> RunResult {
+    const SPAN: u64 = 5 * 1024 * 1024 * 1024;
+    let mut scheduler = sched::Noop::default();
+    let mut rand_reads = RandomAccess::ranged(SPAN, 8 * 1024, 16 * 1024, reader_requests, 0xBEEF);
+    let mut seq_reads = SequentialAccess::new(SPAN, 1 << 20, u64::MAX, false);
+    let mut seq_writes = SequentialAccess::new(SPAN, 1 << 20, u64::MAX, true);
+
+    let sr = Stream::new("seqread", &mut seq_reads, 10).background();
+    let sw = Stream::new("seqwrite", &mut seq_writes, 10).background();
+    let mut streams = [
+        Stream::new("randread", &mut rand_reads, 10),
+        match cap {
+            Some(c) => sr.capped(c),
+            None => sr,
+        },
+        match cap {
+            Some(c) => sw.capped(c),
+            None => sw,
         },
     ];
     run_streams(
@@ -1011,6 +1169,7 @@ mod tests {
             offered_depth: 10,
             cache: Some(crate::cache::CacheConfig::new(8 << 20, 4_096)),
             span_bytes: SPAN,
+            host: hw::HostModel::DEFAULT,
             seed: 1,
         };
         let stats = run(&hw::SPINNING_SATA_HW, &mut sched, &mut issuer, config);
@@ -1041,5 +1200,237 @@ mod tests {
             disk.iops()
         );
         let _ = (SATA_SSD.name, NVME_CONSUMER.name);
+    }
+}
+
+#[cfg(test)]
+mod contention_fit {
+    use super::*;
+    use crate::regime::ALL;
+
+    #[test]
+    #[ignore = "diagnostic dump, not an assertion"]
+    fn print_contention_fit() {
+        for (hardware, regime) in hw::HISTORICAL_HARDWARE.iter().zip(ALL.iter()) {
+            println!("\n{} vs {}", hardware.name, regime.device);
+            println!(
+                "  {:>10}  {:>12}  {:>12}  {:>8}",
+                "seq cap", "sim randread", "fio randread", "error"
+            );
+            let n = if hardware.name == "spinning-sata" {
+                400
+            } else {
+                12_000
+            };
+            for point in regime.contention {
+                let cap = point.seq_cap.map(|c| c.bytes_per_s() as f64);
+                let r = mixed_job(hardware, cap, n);
+                let sim = r.stream("randread").iops();
+                let measured = point.random_iops as f64;
+                println!(
+                    "  {:>10}  {:>12.0}  {:>12}  {:>7.0}%",
+                    cap.map(|c| format!("{:.0}M", c / 1e6))
+                        .unwrap_or("none".into()),
+                    sim,
+                    point.random_iops,
+                    (sim - measured) / measured * 100.0
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod modern {
+    use super::*;
+    use crate::regime::ALL;
+
+    fn at_depth(
+        hardware: &Hardware,
+        block: u64,
+        depth: usize,
+        host: hw::HostModel,
+        n: u64,
+    ) -> IoStats {
+        const SPAN: u64 = 5 * 1024 * 1024 * 1024;
+        let mut sched = sched::Noop::default();
+        let mut issuer = RandomAccess::new(SPAN, block, n, 0xF10);
+        let config = RunConfig {
+            host,
+            ..RunConfig::direct(depth, SPAN)
+        };
+        run(hardware, &mut sched, &mut issuer, config)
+    }
+
+    /// **The host is the bottleneck on a modern device**, which is the
+    /// headline finding of Ren et al. and something a device-only model
+    /// cannot express. With one core issuing, throughput pins to the
+    /// host's ceiling while the device sits far from saturated.
+    #[test]
+    fn a_single_core_bottlenecks_a_modern_drive() {
+        let host = hw::HostModel::DEFAULT;
+        let s = at_depth(&hw::NVME_MODERN_HW, 4_096, 256, host, 60_000);
+
+        let ceiling = host.ceiling_iops();
+        assert!(
+            (s.iops() - ceiling).abs() / ceiling < 0.10,
+            "expected to pin near the host ceiling of {ceiling:.0} IOPS, got {:.0}",
+            s.iops()
+        );
+        assert!(
+            s.bandwidth_utilization() < 0.55,
+            "and the device should be far from saturated, at {:.0}%",
+            s.bandwidth_utilization() * 100.0
+        );
+        assert!(
+            s.host_saturation() > 0.5,
+            "most of the run should be host-blocked"
+        );
+    }
+
+    /// Give it cores and the device becomes the limit again.
+    #[test]
+    fn more_cores_move_the_bottleneck_back_to_the_device() {
+        let one = at_depth(
+            &hw::NVME_MODERN_HW,
+            4_096,
+            256,
+            hw::HostModel::DEFAULT,
+            60_000,
+        );
+        let many = at_depth(
+            &hw::NVME_MODERN_HW,
+            4_096,
+            256,
+            hw::HostModel::cores(8),
+            200_000,
+        );
+
+        assert!(
+            many.iops() > one.iops() * 1.5,
+            "cores should buy throughput"
+        );
+        assert!(many.host_saturation() < one.host_saturation());
+        let ceiling = hw::NVME_MODERN_HW.max_command_rate;
+        assert!(
+            many.iops() > ceiling * 0.8,
+            "eight cores should reach the device's command rate: {:.0} vs {ceiling:.0}",
+            many.iops()
+        );
+    }
+
+    /// The host cost is small enough that it does not disturb the
+    /// historical fits — those devices top out an order of magnitude
+    /// below where a single core runs out.
+    #[test]
+    fn the_host_does_not_bind_on_the_historical_devices() {
+        for hardware in hw::HISTORICAL_HARDWARE {
+            let s = fio_like(hardware, 4_096, 2_000);
+            assert!(
+                s.host_saturation() < 0.05,
+                "{}: should be device-bound, host-blocked {:.0}% of the run",
+                hardware.name,
+                s.host_saturation() * 100.0
+            );
+        }
+    }
+
+    /// The modern regime has to hit the published anchors it was
+    /// calibrated to: ~1M 4 KiB random read IOPS and 7 GB/s sequential.
+    #[test]
+    fn the_modern_regime_reproduces_its_published_anchors() {
+        let random = at_depth(
+            &hw::NVME_MODERN_HW,
+            4_096,
+            256,
+            hw::HostModel::cores(16),
+            300_000,
+        );
+        assert!(
+            (0.9e6..=1.3e6).contains(&random.iops()),
+            "expected ~1M 4 KiB IOPS, got {:.0}",
+            random.iops()
+        );
+
+        const SPAN: u64 = 5 * 1024 * 1024 * 1024;
+        let mut sched = sched::Noop::default();
+        let mut issuer = SequentialAccess::new(SPAN, 1 << 20, 4_000, false);
+        let seq = run(
+            &hw::NVME_MODERN_HW,
+            &mut sched,
+            &mut issuer,
+            RunConfig {
+                host: hw::HostModel::cores(4),
+                ..RunConfig::direct(32, SPAN)
+            },
+        );
+        assert!(
+            (6.3e9..=7.1e9).contains(&seq.throughput()),
+            "expected ~7 GB/s sequential, got {:.2} GB/s",
+            seq.throughput() / 1e9
+        );
+    }
+
+    /// A modern drive is roughly an order of magnitude past the 2016 one
+    /// in operation rate — which is exactly why keeping only the
+    /// historical regimes would understate current hardware.
+    #[test]
+    fn the_modern_drive_is_an_order_of_magnitude_past_the_historical_one() {
+        let old = at_depth(
+            &hw::NVME_CONSUMER_HW,
+            4_096,
+            256,
+            hw::HostModel::FREE,
+            40_000,
+        );
+        let new = at_depth(
+            &hw::NVME_MODERN_HW,
+            4_096,
+            256,
+            hw::HostModel::FREE,
+            300_000,
+        );
+        assert!(
+            new.iops() > old.iops() * 8.0,
+            "{:.0} vs {:.0} IOPS",
+            new.iops(),
+            old.iops()
+        );
+    }
+
+    /// **Simulated contention against measured contention.** Die-level
+    /// blocking is what makes this comparable at all: without it the
+    /// model produced roughly 2× starvation where the measurement shows
+    /// nearly 200×.
+    ///
+    /// The residual is honest and stated: under a cap the model gives the
+    /// random reader about 30% less than measured, and uncapped it
+    /// starves it about half as hard as reality does.
+    #[test]
+    fn simulated_contention_tracks_the_measured_mixed_sweep() {
+        for (hardware, regime) in hw::HISTORICAL_HARDWARE.iter().zip(ALL.iter()).skip(1) {
+            let n = 8_000;
+            for point in regime.capped_contention().take(3) {
+                let cap = point.seq_cap.map(|c| c.bytes_per_s() as f64);
+                let sim = mixed_job(hardware, cap, n).stream("randread").iops();
+                let measured = point.random_iops as f64;
+                let error = (sim - measured).abs() / measured;
+                assert!(
+                    error < 0.40,
+                    "{}: capped contention {sim:.0} vs measured {measured:.0}",
+                    hardware.name
+                );
+            }
+
+            let free = mixed_job(hardware, None, n).stream("randread").iops();
+            let capped = regime.capped_contention().next().unwrap().random_iops as f64;
+            let collapse = capped / free;
+            assert!(
+                collapse > 20.0,
+                "{}: uncapped sequential should collapse the reader by far more than \
+                 an order of magnitude, got {collapse:.0}×",
+                hardware.name
+            );
+        }
     }
 }
