@@ -430,15 +430,17 @@ explicitly; (c) fetch nothing and let reads fault it in later. I lean
 prefetch fallible in a way that a "just warm it if you can" caller will
 find annoying.
 
-**4. Should scattered windows be coalesced?**
+**4. Resolved — merged at chunk adjacency.**
 
-Given `[0..1K, 1K..2K]`, obviously merge. Given
-`[0..1K, 8M..8M+1K]` against 8 MiB chunks, the two chunks are adjacent
-and merging them changes nothing. Given a thousand scattered
-single-record windows, coalescing decides whether this is one request or
-a thousand. Proposed: merge intervals whose *chunk* ranges touch or
-overlap, report the resulting request count in the plan, and leave the
-policy at that.
+`coalesce_ranges` merges ranges whose fetches would overlap: the same
+chunk, or adjacent chunks, which are contiguous on the device. A whole
+chunk of gap is not bridged, because bridging it fetches a chunk nobody
+asked for.
+
+`PrefetchPlan` keeps `requested_ranges` and `byte_ranges` apart, so what
+was asked for and what will be issued are both visible, and
+`overfetch_bytes` counts chunk granularity and bridged gaps together —
+both are bytes crossing the wire that nobody asked for.
 
 **5. Should prefetch honor multi-interval windows when no reader can?**
 
