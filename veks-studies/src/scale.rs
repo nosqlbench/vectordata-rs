@@ -400,8 +400,12 @@ pub fn human_bytes(n: u64) -> String {
         format!("{:.2}T", v / (1u64 << 40) as f64)
     } else if v >= (1u64 << 30) as f64 {
         format!("{:.1}G", v / (1u64 << 30) as f64)
-    } else {
+    } else if v >= (1u64 << 20) as f64 {
         format!("{:.0}M", v / (1u64 << 20) as f64)
+    } else {
+        // Container sizes live down here, and rounding 16 KiB to "0M"
+        // makes the fan-out table unreadable.
+        format!("{:.0}K", v / 1024.0)
     }
 }
 

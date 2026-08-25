@@ -529,7 +529,7 @@ fn readahead_study() -> String {
     let mut s = String::new();
     heading(
         &mut s,
-        "Study 10 — readahead on a scattered rewrite",
+        "Study 9 — readahead on a scattered rewrite",
         "This one is simulated rather than priced: 200,000 records of\n\
          512 B through the discrete-event storage path, with the kernel's\n\
          readahead on and off. Readahead does not merely fail to help a\n\
@@ -643,7 +643,7 @@ fn scheduler_study() -> String {
     let mut s = String::new();
     heading(
         &mut s,
-        "Study 11 — the block scheduler",
+        "Study 10 — the block scheduler",
         "Which scheduler is in force is configuration a benchmark usually\n\
          forgets to state. It can cost 60% of a modern NVMe's throughput —\n\
          and cost a gsplat rewrite nothing at all. Both halves are here.",
@@ -775,7 +775,7 @@ fn writeback_study() -> String {
     let mut s = String::new();
     heading(
         &mut s,
-        "Study 12 — dirty-page pacing",
+        "Study 11 — dirty-page pacing",
         "The same rewrites, buffered. A write does not reach the device;\n\
          it dirties a page and returns, and what happens next is decided\n\
          by dirty_background_ratio, dirty_ratio, and how well the pages\n\
@@ -992,7 +992,7 @@ fn corners_study() -> String {
     let mut s = String::new();
     heading(
         &mut s,
-        "Study 13 — corner cases, differentially",
+        "Study 12 — corner cases, differentially",
         "The single-axis walks above show shape. This shows *attribution*:\n\
          one factor changed at a time from a fixed baseline, so each delta\n\
          belongs to exactly one parameter.",
@@ -1107,7 +1107,7 @@ fn frontier_study() -> String {
     let mut s = String::new();
     heading(
         &mut s,
-        "Study 9 — the frontier",
+        "Study 13 — the frontier",
         "The boundary itself. For each device and memory budget, the\n\
          largest record size at which the staged rewrite still beats the\n\
          best naive strategy on a 1 TiB payload — and what the naive\n\
