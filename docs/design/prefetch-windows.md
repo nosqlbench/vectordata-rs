@@ -226,29 +226,62 @@ a source that cannot range-request is not an error exactly, but silently
 downloading 1.3 TiB when the caller asked for 150 MiB is the failure
 mode this whole proposal exists to avoid.
 
-## CLI
+## CLI — implemented
 
-Mirroring the library, on the existing `precache` command:
+On the existing `precache` command, since an empty window already means
+the whole facet and precache is therefore prefetch with no window rather
+than a separate verb.
 
 ```
-veks datasets precache -d glove-100 \
-    --facet base \
-    --window '[0..1M)'
-
-veks datasets precache -d glove-100 \
-    --facet base --window '[0..1K, 5K..6K]' \
-    --plan
+veks datasets precache -d glove-100 --plan
+veks datasets precache -d glove-100 --facet base_vectors --window '0..1M'
+veks datasets precache -d glove-100 --window '[0..1K, 5K..6K]' --profile default
 ```
 
-- `--facet <name>` — repeatable; default is every facet, as today.
-- `--window <spec>` — the existing `DSWindow` syntax. Applies to the
-  named facets. Absent means the whole facet, as today.
-- `--bytes` — interpret `--window` as byte offsets rather than records.
-- `--plan` — print the plan and exit without fetching.
+| Flag | Meaning |
+|---|---|
+| `--facet <name>` | repeatable; default is every facet the profile declares |
+| `--window <spec>` | record window in the dataset-source grammar; default is the whole facet |
+| `--plan` | print what would be fetched and stop |
+| `--profile <name>` | which profile to resolve against |
 
-`--plan` output is the `PrefetchPlan` rendered as a table: per facet, the
-requested window, the resolved byte range, chunks total and resident,
-bytes to fetch, overfetch, and any prerequisite.
+Sample output:
+
+```
+Precache ./ds:default — records [2..5]
+
+  facet                          to fetch  overfetch   resident      index  note
+  base_vectors                       8.0M       6.2M       3/4          —
+  metadata_content                    0 B        0 B      local       64 B  already resident
+
+  8.0M to fetch
+```
+
+Three decisions worth stating:
+
+- **The plan prints on every selective run, not only under `--plan`.**
+  A chunk-granular fetch means a small window can be a large download.
+  Printing that only when asked would hide it from every run that did
+  not think to ask, which is the failure the plan exists to prevent.
+- **`--profile` is a flag, not a spec suffix.** `resolve_spec` reads any
+  spec containing `/` as naming every profile, so a local directory has
+  no way to spell `path:profile` at all. The suffix works for catalog
+  names and nothing else; the flag works everywhere.
+- **`--bytes` is deliberately not implemented.** Records are the
+  coordinate system users and the window grammar already speak. A byte
+  escape hatch is easy to add later against
+  `prebuffer_range_with_progress`, and adding it now would mean two
+  coordinate systems on the same flag before anyone has asked for the
+  second.
+
+### Errors, and what they cost
+
+A malformed window fails before the catalog round-trip. An unknown facet
+stops the run rather than fetching the others and reporting success. A
+selection against a multi-profile dataset asks which profile rather than
+guessing — the same facet name means different bytes in different
+profiles, and picking one silently would be a guess presented as a
+result.
 
 ## Naming
 
@@ -340,18 +373,19 @@ is a later step gated on that.
 - **`degrades_to_full_download` still has no agreed behaviour.** See the
   remaining open question.
 
-### Suggested order
+### Order, as executed
 
-1. Extract `record_range_to_bytes`; add `prefetch`/`prefetch_plan` for
-   xvec only. End-to-end vertical slice, small.
-2. CLI `--facet` / `--window` / `--plan` against that slice.
-3. vvec index as required config + conformance check + whole-index
-   fetch.
-4. vvec windowed prefetch on top.
-5. Parquet mapping, then parquet differential fetch, as separate work.
+1. ~~Extract `record_range_to_bytes`; xvec prefetch.~~ Done.
+2. ~~vvec windowing through the offset index.~~ Done — the `IDXFOR__`
+   convention already existed, so there was no config surface to add.
+3. ~~CLI `--facet` / `--window` / `--plan` / `--profile`.~~ Done.
+4. Parquet mapping, then parquet differential fetch, as separate work.
 
-Step 1 is worth doing on its own regardless: it exercises the whole path
-and makes the vvec cost concrete before committing to it.
+What remains open is behaviour rather than plumbing: whether prefetch
+should have a background form, what a non-rangeable source should do
+beyond reporting the degrade, whether scattered intervals should be
+coalesced before fetching, and whether the vvec index should be cached
+on the facet handle rather than re-read per call.
 
 ## Open questions — the remaining ones
 
