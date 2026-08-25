@@ -394,6 +394,10 @@ enum DatasetsCmd {
         /// for `--facet`/`--window`/`--plan` on a multi-profile dataset.
         #[arg(long)]
         profile: Option<String>,
+        /// Accept fetching a whole facet when `--window` cannot be
+        /// resolved for its format (parquet; vvec with no index).
+        #[arg(long)]
+        allow_whole_facet: bool,
     },
 }
 
@@ -695,6 +699,7 @@ pub fn bin_main(argv: Vec<String>) {
                     window,
                     plan,
                     profile,
+                    allow_whole_facet,
                 } => crate::datasets::precache::run(crate::datasets::precache::PrecacheRequest {
                     dataset_spec: spec,
                     configdir,
@@ -705,6 +710,7 @@ pub fn bin_main(argv: Vec<String>) {
                     facets: facet,
                     window,
                     plan_only: plan,
+                    allow_whole_facet,
                 }),
             };
             if code != 0 {

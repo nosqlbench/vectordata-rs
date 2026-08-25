@@ -63,6 +63,14 @@ pub struct PrecacheRequest {
     pub window: Option<String>,
     /// Print what would be fetched and stop.
     pub plan_only: bool,
+    /// Accept fetching a whole facet when the window cannot be resolved
+    /// for its format.
+    ///
+    /// Off by default. Asking for a window and silently receiving a
+    /// terabyte is the surprise windowed precache exists to prevent, so
+    /// the fallback is something the caller says yes to rather than
+    /// something they discover afterwards.
+    pub allow_whole_facet: bool,
 }
 
 impl PrecacheRequest {
@@ -202,6 +210,7 @@ pub fn run(req: PrecacheRequest) -> i32 {
                     &req.facets,
                     window.as_ref(),
                     req.plan_only,
+                    req.allow_whole_facet,
                 );
             }
             eprintln!("Prebuffering {descriptor}:{profile_name}");
@@ -221,6 +230,7 @@ pub fn run(req: PrecacheRequest) -> i32 {
                     &req.facets,
                     window.as_ref(),
                     req.plan_only,
+                    req.allow_whole_facet,
                 );
             }
             eprintln!(
@@ -373,6 +383,7 @@ fn drive_selective(
     facets: &[String],
     window: Option<&crate::dataset::source::DSWindow>,
     plan_only: bool,
+    allow_whole_facet: bool,
 ) -> i32 {
     let manifest = view.facet_manifest();
     let selected: Vec<String> = if facets.is_empty() {
@@ -436,13 +447,48 @@ fn drive_selective(
         return 0;
     }
 
+    // Refuse the whole set before fetching any of it. Fetching the
+    // facets that can be windowed and then failing on one that cannot
+    // would leave the run half done for a reason the user could have
+    // been told up front.
+    let fallback = if allow_whole_facet {
+        crate::view::WholeFacetFallback::Allow
+    } else {
+        crate::view::WholeFacetFallback::Refuse
+    };
+    if !allow_whole_facet {
+        let refused: Vec<&String> = plans
+            .iter()
+            .filter(|(_, p)| p.degrades_to_full_download)
+            .map(|(n, _)| n)
+            .collect();
+        if !refused.is_empty() {
+            eprintln!(
+                "error: the window cannot be resolved for {}, so honouring it \
+                 means fetching {} whole.",
+                refused
+                    .iter()
+                    .map(|s| format!("'{s}'"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if refused.len() == 1 {
+                    "that facet"
+                } else {
+                    "those facets"
+                }
+            );
+            eprintln!("Pass --allow-whole-facet to accept that, or drop --window.");
+            return 2;
+        }
+    }
+
     for (name, plan) in &plans {
         if plan.is_resident() {
             eprintln!("  {name}: already resident");
             continue;
         }
         let mut ctx = LiveCtx::new(1, plan.bytes_to_fetch());
-        let result = view.prefetch_with_progress(name, window, &mut |p| {
+        let result = view.prefetch_with_progress(name, window, fallback, &mut |p| {
             // The prefetch callback carries transport progress; the
             // renderer speaks the per-facet shape, so adapt.
             ctx.on_progress(

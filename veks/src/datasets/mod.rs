@@ -309,6 +309,11 @@ pub enum DatasetsCommand {
         /// Print what would be fetched and stop.
         #[arg(long)]
         plan: bool,
+
+        /// Accept fetching a whole facet when `--window` cannot be
+        /// resolved for its format (parquet; vvec with no index).
+        #[arg(long)]
+        allow_whole_facet: bool,
     },
 }
 
@@ -644,6 +649,7 @@ pub fn run(args: DatasetsArgs) {
             facet,
             window,
             plan,
+            allow_whole_facet,
         } => {
             let catalog: Vec<String> = raw_catalog
                 .iter()
@@ -659,6 +665,7 @@ pub fn run(args: DatasetsArgs) {
                 facets: facet,
                 window,
                 plan_only: plan,
+                allow_whole_facet,
             });
         }
     }

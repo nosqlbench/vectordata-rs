@@ -712,16 +712,25 @@ pub trait TestDataView: Send + Sync {
             return Ok(plan);
         };
 
-        // An empty window means the whole facet.
-        let intervals: Vec<(u64, u64)> = if window.is_empty() {
-            vec![(0, u64::MAX)]
-        } else {
-            window
-                .0
-                .iter()
-                .map(|iv| (iv.min_incl, iv.max_excl))
-                .collect()
-        };
+        // No window is a request for the whole facet, and that is not a
+        // fallback from anything — it resolves to the whole byte range
+        // whatever the format, with no ordinal mapping needed. Routing
+        // it through the mapping would make an unmappable format look
+        // like it had degraded when the caller asked for everything in
+        // the first place.
+        if window.is_empty() {
+            plan.requested_ranges.push((0, facet_bytes));
+            plan.byte_ranges.push((0, facet_bytes));
+            if let Some(fill) = storage.range_fill(0, facet_bytes) {
+                plan.fills.push(fill);
+            }
+            return Ok(plan);
+        }
+        let intervals: Vec<(u64, u64)> = window
+            .0
+            .iter()
+            .map(|iv| (iv.min_incl, iv.max_excl))
+            .collect();
 
         for (start, end) in intervals {
             match record_range_to_bytes(&path, start, end, storage) {
@@ -772,9 +781,11 @@ pub trait TestDataView: Send + Sync {
         &self,
         facet: &str,
         window: &DSWindow,
+        fallback: WholeFacetFallback,
     ) -> Result<PrefetchHandle> {
         let storage = self.open_facet_storage(facet)?;
         let plan = self.prefetch_plan_on(&storage, facet, window)?;
+        check_fallback(facet, &plan, fallback)?;
 
         let state = std::sync::Arc::new(PrefetchState::default());
         let worker_state = state.clone();
@@ -834,8 +845,13 @@ pub trait TestDataView: Send + Sync {
     }
 
     /// Fetch `window` of `facet` and return when it is resident.
-    fn prefetch(&self, facet: &str, window: &DSWindow) -> Result<PrefetchReport> {
-        self.prefetch_with_progress(facet, window, &mut |_| {})
+    fn prefetch(
+        &self,
+        facet: &str,
+        window: &DSWindow,
+        fallback: WholeFacetFallback,
+    ) -> Result<PrefetchReport> {
+        self.prefetch_with_progress(facet, window, fallback, &mut |_| {})
     }
 
     /// Same, with chunk-level progress per range.
@@ -843,12 +859,14 @@ pub trait TestDataView: Send + Sync {
         &self,
         facet: &str,
         window: &DSWindow,
+        fallback: WholeFacetFallback,
         cb: &mut dyn FnMut(&crate::transport::DownloadProgress),
     ) -> Result<PrefetchReport> {
         // One handle for both the plan and the fetch, so the offset
         // index a vvec window needs is loaded once rather than twice.
         let storage = self.open_facet_storage(facet)?;
         let planned = self.prefetch_plan_on(&storage, facet, window)?;
+        check_fallback(facet, &planned, fallback)?;
 
         if planned.degrades_to_full_download {
             storage
@@ -1171,6 +1189,48 @@ impl PrefetchPlan {
     pub fn is_resident(&self) -> bool {
         !self.degrades_to_full_download && self.fills.iter().all(|f| f.is_resident())
     }
+}
+
+/// Whether a caller will accept the whole facet when the window it
+/// asked for cannot be resolved.
+///
+/// Some formats have no ordinal-to-byte mapping this layer can compute
+/// — parquet's row groups, a vvec with no offset index. Asking for
+/// records 5M..6M of one of those and quietly fetching a terabyte is
+/// the exact surprise windowed prefetch exists to prevent, so the
+/// fallback is **refused unless the caller says otherwise**.
+///
+/// This only concerns a window that was actually asked for. A prefetch
+/// with no window is a request for the whole facet, and fetching it is
+/// not a fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WholeFacetFallback {
+    /// An unresolvable window is an error. The default.
+    #[default]
+    Refuse,
+    /// Fetch the entire facet rather than failing. The caller has seen
+    /// the size — [`PrefetchPlan::facet_bytes`] — and accepted it.
+    Allow,
+}
+
+/// Refuse a plan that would fetch the whole facet, unless allowed.
+///
+/// A free function rather than a trait method: a static method on
+/// `TestDataView` would make the trait dyn-incompatible, and every
+/// caller in this crate holds it as `&dyn TestDataView`.
+///
+/// The message carries the size, because the decision the caller has to
+/// make is whether that size is acceptable.
+fn check_fallback(facet: &str, plan: &PrefetchPlan, fallback: WholeFacetFallback) -> Result<()> {
+    if plan.degrades_to_full_download && fallback == WholeFacetFallback::Refuse {
+        return Err(Error::Other(format!(
+            "facet '{facet}': the requested window cannot be resolved for this format, \
+             so honouring it means fetching the whole facet ({} bytes). Pass \
+             WholeFacetFallback::Allow to accept that.",
+            plan.facet_bytes
+        )));
+    }
+    Ok(())
 }
 
 /// A prefetch running on another thread.

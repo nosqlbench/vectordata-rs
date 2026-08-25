@@ -11,6 +11,7 @@
 //! would, and reports its cost before spending it.
 
 use std::io::Write;
+use vectordata::WholeFacetFallback;
 use vectordata::dataset::source::parse_window;
 
 fn write_fvec(path: &std::path::Path, dim: i32, records: usize) {
@@ -173,7 +174,11 @@ fn a_local_facet_costs_nothing_to_prefetch() {
 
     // And actually running it is a no-op that succeeds.
     let report = view
-        .prefetch("base_vectors", &parse_window("10..20").unwrap())
+        .prefetch(
+            "base_vectors",
+            &parse_window("10..20").unwrap(),
+            WholeFacetFallback::Refuse,
+        )
         .unwrap();
     assert_eq!(report.ranges_fetched, 1);
 }
@@ -476,7 +481,11 @@ fn a_background_prefetch_reports_its_plan_before_finishing() {
     let view = group.profile("default").unwrap();
 
     let handle = view
-        .prefetch_in_background("base_vectors", &parse_window("10..20").unwrap())
+        .prefetch_in_background(
+            "base_vectors",
+            &parse_window("10..20").unwrap(),
+            WholeFacetFallback::Refuse,
+        )
         .unwrap();
     assert_eq!(
         handle.plan().byte_ranges,
@@ -495,7 +504,11 @@ fn joining_a_background_prefetch_waits_for_it() {
     let view = group.profile("default").unwrap();
 
     let handle = view
-        .prefetch_in_background("base_vectors", &parse_window("0..100").unwrap())
+        .prefetch_in_background(
+            "base_vectors",
+            &parse_window("0..100").unwrap(),
+            WholeFacetFallback::Refuse,
+        )
         .unwrap();
     let report = handle.join().unwrap();
     assert_eq!(report.ranges_fetched, 1, "one range, fetched");
@@ -511,7 +524,11 @@ fn cancelling_stops_the_worker_and_keeps_what_it_fetched() {
     let view = group.profile("default").unwrap();
 
     let handle = view
-        .prefetch_in_background("base_vectors", &parse_window("0..100").unwrap())
+        .prefetch_in_background(
+            "base_vectors",
+            &parse_window("0..100").unwrap(),
+            WholeFacetFallback::Refuse,
+        )
         .unwrap();
     handle.cancel();
     assert!(handle.is_cancelled());
@@ -531,7 +548,11 @@ fn dropping_the_handle_detaches_without_blocking() {
 
     {
         let handle = view
-            .prefetch_in_background("base_vectors", &parse_window("0..50").unwrap())
+            .prefetch_in_background(
+                "base_vectors",
+                &parse_window("0..50").unwrap(),
+                WholeFacetFallback::Refuse,
+            )
             .unwrap();
         assert_eq!(handle.plan().requests(), 1);
         // Dropped here without joining.
@@ -541,10 +562,14 @@ fn dropping_the_handle_detaches_without_blocking() {
     assert_eq!(reader.count(), 100);
 }
 
-/// A background prefetch of a facet with no ordinal mapping still runs
-/// — it just fetches the whole thing, and says so in the plan first.
+/// **Fetching a whole facet is something the caller says yes to.**
+///
+/// A window that cannot be resolved for its format is refused by
+/// default: asking for records 2..4 and silently receiving the entire
+/// facet is the surprise this whole feature exists to prevent. The plan
+/// still reports it, so the caller can see the size and decide.
 #[test]
-fn a_degrading_facet_still_prefetches_in_the_background() {
+fn an_unresolvable_window_is_refused_unless_allowed() {
     let tmp = tempfile::tempdir().unwrap();
     let ds = tmp.path().join("ds");
     std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
@@ -560,15 +585,75 @@ profiles:
     std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
     let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     let view = group.profile("default").unwrap();
+    let window = parse_window("2..4").unwrap();
 
-    let handle = view
-        .prefetch_in_background("metadata_content", &parse_window("2..4").unwrap())
+    // Planning always tells you. It fetches nothing, so it needs no
+    // permission — finding out is how you decide.
+    let plan = view.prefetch_plan("metadata_content", &window).unwrap();
+    assert!(plan.degrades_to_full_download);
+    assert_eq!(plan.facet_bytes, 64);
+
+    // Fetching without permission is refused, and the message carries
+    // the size, because that is the decision being asked for.
+    let refused = view
+        .prefetch("metadata_content", &window, WholeFacetFallback::Refuse)
+        .expect_err("an unresolvable window must not quietly fetch everything");
+    assert!(refused.to_string().contains("whole facet"), "{refused}");
+    assert!(refused.to_string().contains("64"), "{refused}");
+
+    // Refusal is the default in every form.
+    assert!(
+        view.prefetch_in_background("metadata_content", &window, WholeFacetFallback::Refuse)
+            .is_err()
+    );
+    assert_eq!(WholeFacetFallback::default(), WholeFacetFallback::Refuse);
+
+    // With permission it proceeds.
+    view.prefetch("metadata_content", &window, WholeFacetFallback::Allow)
+        .unwrap();
+    view.prefetch_in_background("metadata_content", &window, WholeFacetFallback::Allow)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// **No window is a request, not a fallback.** Prefetching an
+/// unmappable facet with no window asks for the whole thing on purpose,
+/// so it needs no permission and reports no degrade.
+#[test]
+fn a_windowless_prefetch_of_an_unmappable_facet_needs_no_permission() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
+    write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 10);
+    std::fs::write(ds.join("profiles/default/m.parquet"), [0u8; 64]).unwrap();
+    let yaml = r#"
+name: windowless-degrade
+profiles:
+  default:
+    base_vectors: profiles/default/base_vectors.fvec
+    metadata_content: profiles/default/m.parquet
+"#;
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("").unwrap())
         .unwrap();
     assert!(
-        handle.plan().degrades_to_full_download,
-        "the caller learns this before the fetch starts"
+        !plan.degrades_to_full_download,
+        "asking for everything and getting everything is not a degrade"
     );
-    handle.join().unwrap();
+    assert_eq!(plan.byte_ranges, vec![(0, 64)]);
+
+    // And so it needs no permission.
+    view.prefetch(
+        "metadata_content",
+        &parse_window("").unwrap(),
+        WholeFacetFallback::Refuse,
+    )
+    .unwrap();
 }
 
 /// Several background prefetches can run at once against one view —
@@ -586,6 +671,7 @@ fn several_background_prefetches_run_concurrently() {
             view.prefetch_in_background(
                 "base_vectors",
                 &parse_window(&format!("{a}..{b}")).unwrap(),
+                WholeFacetFallback::Refuse,
             )
             .unwrap()
         })
@@ -662,6 +748,52 @@ fn an_unknown_facet_stops_the_run() {
     assert_eq!(run(req), 2);
 }
 
+/// The CLI gate: a window that cannot be resolved stops the run and
+/// names the flag, rather than fetching everything and reporting
+/// success.
+#[test]
+fn the_cli_refuses_a_whole_facet_fetch_without_the_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
+    write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 10);
+    std::fs::write(ds.join("profiles/default/m.parquet"), [0u8; 64]).unwrap();
+    let yaml = r#"
+name: cli-degrade
+profiles:
+  default:
+    base_vectors: profiles/default/base_vectors.fvec
+    metadata_content: profiles/default/m.parquet
+"#;
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+    let spec = ds.to_str().unwrap();
+
+    let refused = PrecacheRequest {
+        facets: vec!["metadata_content".to_string()],
+        window: Some("2..4".to_string()),
+        ..request(spec)
+    };
+    assert_eq!(run(refused), 2, "no flag, no whole-facet fetch");
+
+    let allowed = PrecacheRequest {
+        facets: vec!["metadata_content".to_string()],
+        window: Some("2..4".to_string()),
+        allow_whole_facet: true,
+        ..request(spec)
+    };
+    assert_eq!(run(allowed), 0);
+
+    // --plan is always allowed: it reports without fetching, which is
+    // how a user finds out the flag is needed.
+    let planned = PrecacheRequest {
+        facets: vec!["metadata_content".to_string()],
+        window: Some("2..4".to_string()),
+        plan_only: true,
+        ..request(spec)
+    };
+    assert_eq!(run(planned), 0);
+}
+
 /// A window selects a subset, so it needs one profile to resolve
 /// against — the same facet name means different bytes in different
 /// profiles, and picking one silently would be a guess presented as a
@@ -724,12 +856,11 @@ const REMOTE_CHUNK: u64 = 4 * 1024;
 /// run in parallel threads of one process — so a per-test override is
 /// a race, with the last writer deciding where everyone caches. One
 /// root, and a distinct dataset name per test, keeps them apart.
-static TEST_CACHE_DIR: std::sync::LazyLock<tempfile::TempDir> =
-    std::sync::LazyLock::new(|| {
-        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
-        std::fs::create_dir_all(&base).unwrap();
-        tempfile::tempdir_in(&base).expect("create test cache root")
-    });
+static TEST_CACHE_DIR: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::tempdir_in(&base).expect("create test cache root")
+});
 
 fn init_test_cache() {
     vectordata::settings::override_cache_dir_for_process(TEST_CACHE_DIR.path().to_path_buf());
@@ -792,7 +923,11 @@ fn a_remote_window_fetches_only_its_chunks() {
     );
 
     let handle = view
-        .prefetch_in_background("base_vectors", &parse_window("100..200").unwrap())
+        .prefetch_in_background(
+            "base_vectors",
+            &parse_window("100..200").unwrap(),
+            WholeFacetFallback::Refuse,
+        )
         .unwrap();
     handle.join().unwrap();
 
@@ -817,7 +952,11 @@ fn a_background_prefetch_advances_its_counters() {
     let view = group.profile("default").unwrap();
 
     let handle = view
-        .prefetch_in_background("base_vectors", &parse_window("0..2000").unwrap())
+        .prefetch_in_background(
+            "base_vectors",
+            &parse_window("0..2000").unwrap(),
+            WholeFacetFallback::Refuse,
+        )
         .unwrap();
     let expected = handle.plan().bytes_to_fetch();
     assert!(expected > 0);
@@ -842,8 +981,12 @@ fn reading_a_prefetched_window_fetches_nothing_further() {
     let group = vectordata::TestDataGroup::load(&spec).unwrap();
     let view = group.profile("default").unwrap();
 
-    view.prefetch("base_vectors", &parse_window("500..600").unwrap())
-        .unwrap();
+    view.prefetch(
+        "base_vectors",
+        &parse_window("500..600").unwrap(),
+        WholeFacetFallback::Refuse,
+    )
+    .unwrap();
 
     let before = view
         .open_facet_storage("base_vectors")

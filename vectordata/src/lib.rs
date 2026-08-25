@@ -208,7 +208,7 @@ pub use group::{TestDataGroup, PREBUFFER_LARGE_WARNING_BYTES};
 pub use model::FacetConfig;
 pub use view::{
     CacheStats, FacetDescriptor, FacetStorage, PrebufferProgress, PrefetchHandle, PrefetchPlan,
-    PrefetchReport, RangeFill, TestDataView, open_facet_typed,
+    PrefetchReport, RangeFill, TestDataView, WholeFacetFallback, open_facet_typed,
 };
 pub use io::{VectorReader, VvecReader, XvecReader, IndexedVvecReader, IoError};
 pub use access::AccessMode;
