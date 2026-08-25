@@ -324,6 +324,85 @@ pub fn read_passages(path: &Path) -> Result<Vec<PassageRow>, String> {
 /// Read one Utf8 column of any parquet table in row order (projected —
 /// other columns are not decoded). Used by embedding stages that must
 /// preserve the ordinal contract: element i is row i's value.
+/// Read a half-open row window `[start, end)` of a text column.
+///
+/// Only the row groups overlapping the window are decoded — the parquet
+/// footer carries per-group row counts, so the rest are skipped without
+/// being read. That is what makes embedding a corpus larger than memory
+/// possible: the caller works through it in windows instead of
+/// materializing every row up front.
+///
+/// `end` of `None` means "to the end of the file". A `start` at or past
+/// the end yields an empty result rather than an error, so a caller
+/// walking fixed-size windows can stop when one comes back empty.
+pub fn read_text_column_range(
+    path: &Path,
+    column: &str,
+    start: u64,
+    end: Option<u64>,
+) -> Result<Vec<String>, String> {
+    use parquet::arrow::ProjectionMask;
+    let file = File::open(path)
+        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("failed to read parquet {}: {}", path.display(), e))?;
+    let schema = builder.parquet_schema();
+    let indices: Vec<usize> = (0..schema.num_columns())
+        .filter(|&i| schema.column(i).name() == column)
+        .collect();
+    if indices.is_empty() {
+        return Err(format!("no column '{}' in {}", column, path.display()));
+    }
+    let mask = ProjectionMask::leaves(schema, indices);
+
+    // Pick the row groups the window touches, and remember where the
+    // first of them starts so absolute row numbers stay correct.
+    let mut selected: Vec<usize> = Vec::new();
+    let mut first_row_of_selection = 0u64;
+    let mut cursor = 0u64;
+    for (i, group) in builder.metadata().row_groups().iter().enumerate() {
+        let rows = group.num_rows().max(0) as u64;
+        let group_end = cursor + rows;
+        let after_start = group_end > start;
+        let before_end = end.is_none_or(|e| cursor < e);
+        if after_start && before_end {
+            if selected.is_empty() {
+                first_row_of_selection = cursor;
+            }
+            selected.push(i);
+        }
+        cursor = group_end;
+    }
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let reader = builder
+        .with_projection(mask)
+        .with_row_groups(selected)
+        .build()
+        .map_err(|e| format!("failed to build parquet reader: {}", e))?;
+
+    let mut values = Vec::new();
+    let mut row = first_row_of_selection;
+    'outer: for batch in reader {
+        let batch = batch.map_err(|e| format!("parquet read failed: {}", e))?;
+        let col = column_as::<StringArray>(&batch, column)?;
+        for i in 0..batch.num_rows() {
+            if let Some(e) = end
+                && row >= e
+            {
+                break 'outer;
+            }
+            if row >= start {
+                values.push(col.value(i).to_string());
+            }
+            row += 1;
+        }
+    }
+    Ok(values)
+}
+
 pub fn read_text_column(path: &Path, column: &str) -> Result<Vec<String>, String> {
     use parquet::arrow::ProjectionMask;
     let file = File::open(path)
@@ -441,6 +520,53 @@ mod tests {
                 text: format!("passage text {}", i),
             })
             .collect()
+    }
+
+    /// Windows must tile the file exactly: consecutive ranges concatenate
+    /// back to the whole column, with no row dropped at a boundary and
+    /// none read twice. An embed split across passes depends on this —
+    /// an off-by-one here silently shifts every vector after the seam
+    /// against the passage it is supposed to describe.
+    #[test]
+    fn text_column_windows_tile_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("passages.parquet");
+        let rows = sample_passages();
+        let mut w = PassageTableWriter::create(&path).unwrap();
+        for row in &rows {
+            w.push(row).unwrap();
+        }
+        w.finish().unwrap();
+
+        let whole = read_text_column(&path, "text").unwrap();
+        assert_eq!(whole.len(), rows.len());
+
+        // Uneven windows, including one that spans a row-group boundary
+        // (the writer flushes every 65_536 rows, so also exercise a size
+        // that does not divide the total).
+        for window in [1usize, 999, 4096, 10_000] {
+            let mut stitched: Vec<String> = Vec::new();
+            let mut start = 0u64;
+            loop {
+                let end = start + window as u64;
+                let part = read_text_column_range(&path, "text", start, Some(end)).unwrap();
+                if part.is_empty() {
+                    break;
+                }
+                stitched.extend(part);
+                start = end;
+            }
+            assert_eq!(stitched, whole, "window size {window} did not tile the file");
+        }
+
+        // Open-ended window reads to the end.
+        let tail = read_text_column_range(&path, "text", 9_990, None).unwrap();
+        assert_eq!(tail, whole[9_990..]);
+
+        // A window starting past the end is empty, not an error — that is
+        // how a caller walking fixed windows learns it is done.
+        assert!(read_text_column_range(&path, "text", 10_000, Some(10_100)).unwrap().is_empty());
+        assert!(read_text_column_range(&path, "text", 99_999, None).unwrap().is_empty());
     }
 
     #[test]

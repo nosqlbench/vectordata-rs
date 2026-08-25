@@ -143,16 +143,55 @@ bf16 on CUDA.
             Err(e) => return error_result(e, start),
         };
 
-        let texts = match veks_core::formats::passage_table::read_text_column(&source, &column) {
+        // A row window over the source. Embedding a corpus larger than
+        // memory means working through it in passes, and each pass is its
+        // own step with its own output and its own freshness — so an
+        // interrupted multi-day embed resumes at the pass boundary rather
+        // than from the beginning.
+        let (row_start, row_end) = match options.get("range") {
+            None => (0u64, None),
+            Some(spec) => match super::gen_extract::parse_range(spec) {
+                Ok(r) => (r.start as u64, r.end.map(|e| e as u64)),
+                Err(e) => return error_result(format!("invalid range '{}': {}", spec, e), start),
+            },
+        };
+        if let Some(end) = row_end
+            && end <= row_start
+        {
+            return error_result(
+                format!("empty range: start {} is not before end {}", row_start, end),
+                start,
+            );
+        }
+
+        let texts = match veks_core::formats::passage_table::read_text_column_range(
+            &source, &column, row_start, row_end,
+        ) {
             Ok(t) => t,
             Err(e) => return error_result(e, start),
         };
         if texts.is_empty() {
-            return error_result(format!("no rows in {}", source.display()), start);
+            return error_result(
+                match row_end {
+                    Some(end) => format!(
+                        "no rows in {} for range [{},{}) — the window starts past the end",
+                        source.display(),
+                        row_start,
+                        end
+                    ),
+                    None => format!("no rows in {}", source.display()),
+                },
+                start,
+            );
         }
         ctx.ui.log(&format!(
-            "embedding {} row(s) of {}:{} with {} (rev {}, {:?}x{}/{:?}, batch {}, max-length {})",
+            "embedding {} row(s){} of {}:{} with {} (rev {}, {:?}x{}/{:?}, batch {}, max-length {})",
             texts.len(),
+            match row_end {
+                Some(end) => format!(" [{},{})", row_start, end),
+                None if row_start > 0 => format!(" [{},end)", row_start),
+                None => String::new(),
+            },
             source.display(),
             column,
             model_id,
@@ -438,6 +477,18 @@ bf16 on CUDA.
                 required: false,
                 default: Some("main".to_string()),
                 description: "Model revision (pin a commit for strict reproducibility)".to_string(),
+                extended_description: None,
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "range".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: None,
+                description: "Half-open row window of the source to embed, e.g. \"[0,50M)\" \
+                              (default: all rows). Splits an embed too large for memory into \
+                              passes; row i of the output embeds source row range-start + i"
+                    .to_string(),
                 extended_description: None,
                 role: OptionRole::Config,
             },

@@ -39,6 +39,7 @@ time) at cuBLAS-peak 83–84% SM throughput (measured on Blackwell sm120).
 | `--source` | yes | Parquet file whose text column is embedded row-by-row |
 | `--output` | yes | Output path; the format follows the extension — `.fvecs` (or any xvec) writes natively, anything else writes a C-order f32 `.npy`. Row i embeds source row i either way |
 | `--column` | no | Source column holding the text (default: `text`) |
+| `--range` | no | Half-open row window of the source, e.g. `[0,50M)` (default: all rows). Row i of the output embeds source row `start + i` |
 | `--model` | no | HuggingFace model id (default: `Qwen/Qwen3-Embedding-0.6B`) |
 | `--revision` | no | Model revision (default: `main`; pin a commit sha for strict reproducibility) |
 | `--batch-size` | no | Sequences per forward pass (default: 128 — the GPU-tuned value; wall time is flat from 128 to 512 on the fused path) |
@@ -54,6 +55,18 @@ time) at cuBLAS-peak 83–84% SM throughput (measured on Blackwell sm120).
   to an identity symlink — removing both the conversion pass and a second
   full copy of the vectors (410 GB at 100M x 1024-d). `.npy` remains the
   default for anything else and is byte-for-byte the same embedding.
+- **Embedding a corpus larger than memory**: the source text for a window
+  is held in RAM while that window runs (roughly 1 KB per passage), so a
+  billion-row corpus is embedded in passes with `--range`. Only the
+  parquet row groups a window touches are decoded, and consecutive
+  windows tile the file exactly, so the `.fvecs` outputs concatenate into
+  one artifact — each record carries its own dimension prefix, so `cat`
+  is a valid join. Each pass is its own step with its own freshness, so
+  an interrupted multi-day embed resumes at a pass boundary.
+  Splitting changes how rows group into batches, so passes are
+  numerically equivalent to a single run within the usual bf16
+  reduction-reorder band (measured cosine ≥ 0.9998), not bit-identical
+  to it. Passes are individually reproducible.
 - Rows stream to the output as they complete rather than accumulating in
   memory: buffering 100M x 1024-d would need ~410 GB of RAM. Workers
   finish batches out of order, so completed rows are held only until the

@@ -1277,9 +1277,9 @@ impl CommandOp for GenerateSlabExtractOp {
 // ---- Range parsing ----------------------------------------------------------
 
 /// Parsed range with inclusive start and exclusive end.
-struct Range {
-    start: usize,
-    end: Option<usize>,
+pub(crate) struct Range {
+    pub(crate) start: usize,
+    pub(crate) end: Option<usize>,
 }
 
 /// Parse a number with optional unit suffix, returning usize.
@@ -1300,7 +1300,7 @@ fn parse_range_number(s: &str) -> Result<usize, String> {
 /// - `[..10k)` — first 10k elements
 /// - `[..10k]` — first 10,001 elements (inclusive end)
 /// - `(10k..]` — from 10,001 to end of file (exclusive start)
-fn parse_range(s: &str) -> Result<Range, String> {
+pub(crate) fn parse_range(s: &str) -> Result<Range, String> {
     let s = s.trim();
 
     // Detect bracket types for inclusive/exclusive semantics
