@@ -11,6 +11,7 @@
 //! describing available facets without materializing data.
 
 use crate::dataset::facet::StandardFacet;
+use crate::dataset::source::DSWindow;
 use crate::group::DataSource;
 use crate::io::IoError;
 use crate::io::{self, VectorReader, VvecElement, VvecReader};
@@ -166,39 +167,67 @@ pub(crate) fn facet_window_byte_range(
         return Ok(None);
     }
 
+    Ok(record_range_to_bytes(
+        &path_no_window,
+        win_start,
+        win_end,
+        storage,
+    ))
+}
+
+/// Map a record range to a byte range, for formats where that mapping
+/// is computable from the file alone.
+///
+/// Split out from [`facet_window_byte_range`] so the mapping can serve
+/// a window the *caller* named as well as one a profile declared. A
+/// profile window is a convenience — a name for a range someone will
+/// want repeatedly — not the only range anyone is allowed to ask for.
+///
+/// `None`, meaning "cannot window this, fetch it whole", for:
+///   - vvec, which needs its sibling offset index; that index is a
+///     per-facet artifact this layer does not yet carry
+///   - parquet, whose row-group structure means a record range snaps
+///     outward by an amount only the footer knows
+///   - unrecognized extensions, a corrupt header, or an empty range
+///
+/// The dim is read from the xvec header at byte 0 — a 4-byte fetch
+/// that pulls one chunk on remote storage, which is the same
+/// first-chunk read any reader does on first access.
+pub(crate) fn record_range_to_bytes(
+    path_no_window: &str,
+    win_start: u64,
+    win_end: u64,
+    storage: &FacetStorage,
+) -> Option<(u64, u64)> {
+    if win_end <= win_start {
+        return None;
+    }
+
     // Format guard: only uniform-stride xvec is record→byte
-    // computable from `4 + dim * elem_size`. vvec needs the per-
-    // record offset index; parquet has its own row-group/page
-    // structure; both fall back to unbounded prebuffer.
+    // computable from `4 + dim * elem_size`.
     let ext = path_no_window.rsplit('.').next().unwrap_or("");
     let elem_size = crate::io::infer_elem_size(ext);
     if elem_size == 0 || crate::io::is_vvec_ext(ext) {
-        return Ok(None);
+        return None;
     }
 
-    // Pull the 4-byte xvec dim header. `read_bytes(0, 4)` triggers
-    // a chunk-0 fetch on the chunked-HTTP / merkle paths if not
-    // already cached; cheap (~8 MiB on the wire vs the ~1.3 TiB
-    // a full prebuffer would have pulled).
-    let Ok(header) = storage.storage.read_bytes(0, 4) else {
-        return Ok(None);
-    };
+    let header = storage.storage.read_bytes(0, 4).ok()?;
     if header.len() != 4 {
-        return Ok(None);
+        return None;
     }
     let dim = i32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     if dim <= 0 || dim > 1_000_000 {
-        return Ok(None);
-    } // sanity vs corrupt header
+        return None; // sanity vs corrupt header
+    }
     let bpr = 4 + (dim as u64) * (elem_size as u64);
 
     let total = storage.total_size();
     let byte_start = win_start.saturating_mul(bpr).min(total);
     let byte_end = win_end.saturating_mul(bpr).min(total);
     if byte_start >= byte_end {
-        return Ok(None);
+        return None;
     }
-    Ok(Some((byte_start, byte_end)))
+    Some((byte_start, byte_end))
 }
 
 /// How many bytes a facet contributes to a precache plan.
@@ -619,6 +648,107 @@ pub trait TestDataView: Send + Sync {
     /// usually correct.
     #[doc(hidden)]
     fn open_facet_storage(&self, name: &str) -> Result<FacetStorage>;
+
+    // -- Prefetch --------------------------------------------------
+
+    /// What prefetching `window` on `facet` would cost, without
+    /// fetching any of it.
+    ///
+    /// `window` is in **record** coordinates and is the caller's to
+    /// choose. A profile's `window:` is a convenience — a name for a
+    /// range someone wants repeatedly — not a fence around which ranges
+    /// may be asked for.
+    fn prefetch_plan(&self, facet: &str, window: &DSWindow) -> Result<PrefetchPlan> {
+        let storage = self.open_facet_storage(facet)?;
+        let facet_bytes = storage.total_size();
+        let mut plan = PrefetchPlan {
+            facet_bytes,
+            ..PrefetchPlan::default()
+        };
+
+        // Where the bytes live, for the record→byte mapping. Absent a
+        // source path there is nothing to map against.
+        let desc = self.facet_manifest();
+        let path = desc
+            .get(facet)
+            .and_then(|d| d.source_path.as_deref())
+            .and_then(|raw| crate::dataset::source::parse_source_string(raw).ok())
+            .map(|p| p.path);
+        let Some(path) = path else {
+            plan.degrades_to_full_download = true;
+            return Ok(plan);
+        };
+
+        // An empty window means the whole facet.
+        let intervals: Vec<(u64, u64)> = if window.is_empty() {
+            vec![(0, u64::MAX)]
+        } else {
+            window
+                .0
+                .iter()
+                .map(|iv| (iv.min_incl, iv.max_excl))
+                .collect()
+        };
+
+        for (start, end) in intervals {
+            match record_range_to_bytes(&path, start, end, &storage) {
+                Some((bs, be)) => {
+                    plan.byte_ranges.push((bs, be));
+                    if let Some(fill) = storage.range_fill(bs, be) {
+                        plan.fills.push(fill);
+                    }
+                }
+                None => {
+                    // One unmappable interval makes the whole request a
+                    // full download; reporting a partial plan beside it
+                    // would understate what is about to happen.
+                    plan.degrades_to_full_download = true;
+                    plan.byte_ranges.clear();
+                    plan.fills.clear();
+                    return Ok(plan);
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Fetch `window` of `facet` and return when it is resident.
+    fn prefetch(&self, facet: &str, window: &DSWindow) -> Result<PrefetchReport> {
+        self.prefetch_with_progress(facet, window, &mut |_| {})
+    }
+
+    /// Same, with chunk-level progress per range.
+    fn prefetch_with_progress(
+        &self,
+        facet: &str,
+        window: &DSWindow,
+        cb: &mut dyn FnMut(&crate::transport::DownloadProgress),
+    ) -> Result<PrefetchReport> {
+        let storage = self.open_facet_storage(facet)?;
+        let planned = self.prefetch_plan(facet, window)?;
+
+        if planned.degrades_to_full_download {
+            storage
+                .prebuffer_with_progress(|p| cb(p))
+                .map_err(|e| Error::Other(e.to_string()))?;
+            return Ok(PrefetchReport {
+                planned,
+                ranges_fetched: 1,
+            });
+        }
+
+        let mut fetched = 0;
+        for (start, end) in &planned.byte_ranges {
+            storage
+                .prebuffer_range_with_progress(*start, *end, |p| cb(p))
+                .map_err(|e| Error::Other(e.to_string()))?;
+            fetched += 1;
+        }
+        Ok(PrefetchReport {
+            planned,
+            ranges_fetched: fetched,
+        })
+    }
 }
 
 /// Open a typed reader for a named facet on any [`TestDataView`].
@@ -735,6 +865,71 @@ impl RangeFill {
     pub fn is_resident(&self) -> bool {
         self.chunks_resident >= self.chunks
     }
+}
+
+/// What a prefetch would fetch, before any of it moves.
+///
+/// The unit of fetch is a chunk, not a byte, so a window's real cost is
+/// rarely its length: a 4 KiB window against 8 MiB chunks is 8 MiB, and
+/// a window whose chunks are resident is free. Both have to be visible
+/// up front, or a caller cannot tell an incremental warm-up from a full
+/// download wearing its clothes.
+#[derive(Debug, Clone, Default)]
+pub struct PrefetchPlan {
+    /// Byte ranges the requested window resolved to.
+    pub byte_ranges: Vec<(u64, u64)>,
+    /// Chunk-level cost of each range. Empty when the facet has no
+    /// chunks — local storage, which is free by definition.
+    pub fills: Vec<RangeFill>,
+    /// Set when the window could not be resolved and honouring the
+    /// request means fetching the whole facet: a format whose
+    /// record→byte mapping this layer cannot compute (vvec without its
+    /// index, parquet), or storage with no range capability.
+    pub degrades_to_full_download: bool,
+    /// Size of the facet, for reading the degrade case against.
+    pub facet_bytes: u64,
+}
+
+impl PrefetchPlan {
+    /// Bytes that will cross the network.
+    pub fn bytes_to_fetch(&self) -> u64 {
+        if self.degrades_to_full_download {
+            return self.facet_bytes;
+        }
+        self.fills.iter().map(|f| f.bytes_to_fetch()).sum()
+    }
+
+    /// Chunks that still have to be fetched.
+    pub fn chunks_to_fetch(&self) -> u32 {
+        self.fills.iter().map(|f| f.chunks_to_fetch()).sum()
+    }
+
+    /// Bytes fetched beyond what was asked for, because chunks are the
+    /// granularity. This is the number that tells a caller its
+    /// scattered single-record prefetches are really a full download.
+    pub fn overfetch_bytes(&self) -> u64 {
+        self.fills
+            .iter()
+            .zip(self.byte_ranges.iter())
+            .map(|(f, (s, e))| f.overfetch_bytes(*s, *e))
+            .sum()
+    }
+
+    /// Whether everything the window covers is already resident, so a
+    /// prefetch would do nothing.
+    pub fn is_resident(&self) -> bool {
+        !self.degrades_to_full_download && self.fills.iter().all(|f| f.is_resident())
+    }
+}
+
+/// What a prefetch actually did.
+#[derive(Debug, Clone, Default)]
+pub struct PrefetchReport {
+    /// The plan as it stood before fetching.
+    pub planned: PrefetchPlan,
+    /// Byte ranges handed to the transport. Fewer than the plan's when
+    /// ranges were merged.
+    pub ranges_fetched: usize,
 }
 
 /// Opaque handle to a facet's underlying storage. Returned by
