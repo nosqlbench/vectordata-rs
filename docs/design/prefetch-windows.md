@@ -297,22 +297,28 @@ consumer does — the reader's single contiguous window is a
 `WindowedVectorReader` limit, not a fetch limit, and prefetch has no
 such structure in the way.
 
-### Moderate — vvec
+### Done — vvec
 
-The index requirement makes this tractable, but it is not free:
+Smaller than estimated, because **the index convention already
+existed**. `IndexedVvecReader` has always looked for a sibling
+`IDXFOR__<name>.i64` / `.i32`, fetched it whole over HTTP, and fallen
+back to walking the file when absent. Nothing needed inventing; the
+offsets simply were not reachable outside the typed reader.
 
-- **Config**: a `index:` key on the facet, required for vvec, validated
-  at load. New surface in `dataset.yaml` and in the conformance check.
-- **Fetch**: pull the whole index before mapping. Needs somewhere to
-  live — it is a second file per facet, and the cache layout has to
-  hold it.
-- **Map**: read offsets, resolve the window, hand byte ranges to the
-  same chunk-range fetch xvec uses.
-- **Guard**: refuse to window a vvec facet with no `.mref`, since there
-  is no chunk bitmap to track partial state with.
+`io::load_offsets` exposes that same lookup untyped — the offsets are
+all a caller needs to turn ordinals into bytes, and nothing about them
+depends on the element type. `record_range_to_bytes` then maps a vvec
+window as `offsets[start]..offsets[end]`: exact, not estimated, and a
+window past the last record ends at the file.
 
-The mapping itself is trivial once the index is resident. The work is
-plumbing the index as a first-class per-facet artifact.
+There is no `index:` key and no new config surface, because the sibling
+naming convention already carries it. That also means there is nothing
+to migrate: a dataset that publishes the sidecar gets windowing, and one
+that does not falls back to the walk it always did.
+
+`PrefetchPlan.prerequisite_bytes` reports what reading the index cost,
+so a caller prefetching a hundred small vvec windows can see it is
+paying for the index each time.
 
 ### Deferred — parquet
 
@@ -322,12 +328,11 @@ is a later step gated on that.
 
 ### The honest risks
 
-- **The `dataset.yaml` index key is new required surface.** Making it
-  required means existing vvec facets that lack it become configuration
-  errors. That is the right call for a format that cannot be windowed
-  without one, but it is a breaking change to any dataset already
-  published without it, and it needs a migration story rather than a
-  hard failure on next load.
+- **The index is loaded per call, not held.** A second prefetch of the
+  same vvec facet re-reads it. Fine for a few large windows, wasteful
+  for many small ones. Caching it on the facet handle is the obvious
+  fix and is deliberately not done yet — it wants a real caller to size
+  the cache against.
 - **A vvec facet without `.mref` fetches whole.** Not a failure, and
   not a separate mode — just the absence of the chunk bitmap that
   partial fetch tracks state in. Worth reporting in the plan
