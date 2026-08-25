@@ -320,18 +320,66 @@ predicts is unreachable from one thread, and that the gain from ordering
 can be masked entirely by a host that cannot issue fast enough to expose
 it.
 
+### How accurate is any of this
+
+Scored across three devices and every block size from 512 B to 1 MiB, on
+throughput *and* latency, as mean absolute percentage error against the
+measured fio output. `cargo run -p veks-studies --bin veks-study`
+reproduces it.
+
+| Metric | Samples | MAPE | Worst | Bias |
+|---|---|---|---|---|
+| Throughput | 36 | **3.7%** | 14.6% | −0.1% |
+| Mean latency | 27 | **4.7%** | 17.9% | +2.8% |
+| p50 | 27 | 7.8% | 26.1% | +7.0% |
+| p95 | 27 | 7.3% | 23.4% | −6.5% |
+| p99 | 27 | 9.3% | 31.4% | −7.4% |
+
+Against the bars the literature states, like for like:
+
+| | Reported | This model |
+|---|---|---|
+| [MQSim](https://www.usenix.org/conference/fast18/presentation/tavakkol) (FAST '18), throughput vs 4 real SSDs | 6–18% | 3.7% MAPE / 14.6% worst |
+| [SimpleSSD](https://arxiv.org/pdf/1705.06419), worst-case throughput | 28% | 14.6% |
+| SimpleSSD, worst-case latency | 36% | 31.4% (p99) |
+| [Generative black-box models](https://arxiv.org/pdf/2307.02073) | 4–10% IOPS, 3–16% latency | 3.7% / 4.7% |
+
+**What that does and does not establish.** The device parameters were
+fitted to the random-read throughput curve, so agreement *there* is a fit
+rather than a test. Sequential throughput, the contention sweep and the
+latency distribution were not fitted to and are predictions. The NAND
+page-type spread and the disk's rotational-selection accuracy *were*
+fitted against measured percentiles, so the distribution shape is a
+calibrated output — though the read-variation draw is mean-preserving by
+construction, so it cannot have flattered the means.
+
+Two mechanisms were found by taking latency seriously, and neither would
+have surfaced from throughput alone:
+
+- **A die is busy for its own page read, not for the whole request.**
+  Holding it for the request's duration made a 32 KiB read occupy its die
+  eight times too long. It cost 2% on throughput and **51% on p99**, with
+  a +47% bias — the signature of a missing term rather than noise. Fixing
+  it took the SATA SSD's p99 error to 6%.
+- **Reordering has to be bounded.** A device that always serves the
+  cheapest request starves whatever it keeps passing over, driving a
+  competing random reader to zero — which the mixed-workload measurements
+  plainly do not show. Bounding deferral at 600 ms restores it, and that
+  figure was arrived at by fitting the contended sweep before being found
+  to match the longest completion latency fio recorded on the drive
+  (607.7 ms).
+
 ### What the model still does not represent
 
 Stated so that a reader does not assume otherwise from the surrounding
 detail:
 
-- **Garbage collection and steady-state flash.** Every device figure here
-  comes from a preconditioned but otherwise quiet drive. A drive under
-  sustained write load runs GC, and its write path degrades in ways none
-  of this captures.
-- **Write caching and volatile buffers.** Writes are modelled as reaching
-  the medium. A drive with a write buffer will beat this model on bursts
-  and match it on sustained load.
+- **The write path is unvalidated.** Garbage collection and a volatile
+  write buffer are both modelled, but the measured corpus contains no
+  random-write workload, so nothing about writes is checked against a
+  real drive. Write predictions are structurally reasonable and
+  numerically unverified — which is a weaker claim than the read-side
+  numbers above, and should not be quoted alongside them.
 - **Filesystem geometry.** Extent layout, fragmentation, journal traffic
   and metadata reads are absent; the address space is flat.
 - **The scheduler's own cost.** Ren et al. measure up to 63.4% throughput
