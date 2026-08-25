@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mxfile host="drawio" version="26.0.0">
   <diagram name="gsplat-dataflow">
-    <mxGraphModel dx="1400" dy="760" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1440" pageHeight="700" math="0" shadow="0">
+    <mxGraphModel dx="1400" dy="760" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1440" pageHeight="780" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
@@ -72,6 +72,9 @@
           </mxGeometry>
         </mxCell>
 
+        <mxCell id="n_variant" value="&lt;b&gt;This is the re-scan form&lt;/b&gt; (algo::gsplat::Gsplat): one pass per destination segment, so the source is swept P times and the tier moves A(P) = P·(1 − e&lt;sup&gt;−w/P&lt;/sup&gt;) bytes per live byte.&#xa;That is fine while P is small and ruinous when it is not — at a terabyte with 32 GiB it is thirty-odd sweeps. The ordering was never the problem; the re-reading was.&#xa;&#xa;&lt;b&gt;The staged form removes it&lt;/b&gt; (algo::staged::StagedSplat) by spilling into RAM-sized buckets, at a fixed 2·(stages + 1) sequential passes whatever P is. The two are level at four&#xa;segments — below that this diagram is the cheaper algorithm, because it never touches scratch. See &lt;b&gt;gsplat-staged-dataflow&lt;/b&gt; for the other one." style="text;html=1;align=left;verticalAlign=top;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="690" width="1380" height="80" as="geometry" />
+        </mxCell>
       </root>
     </mxGraphModel>
   </diagram>
