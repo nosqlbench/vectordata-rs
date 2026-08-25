@@ -746,9 +746,15 @@ pub fn simulate_io(
         crate::io::RunConfig {
             offered_depth,
             cache,
-            span_bytes: g.payload_bytes() * 2,
-            host: crate::io::hw::HostModel::DEFAULT,
-            seed: 0x51A7,
+            // A buffered rewrite gets kernel readahead; an unbuffered one
+            // does not, which is the difference the cache argument is
+            // really selecting between.
+            readahead: if cache.is_some() {
+                crate::io::Readahead::DEFAULT
+            } else {
+                crate::io::Readahead::OFF
+            },
+            ..crate::io::RunConfig::direct(offered_depth, g.payload_bytes() * 2)
         },
     )
 }
@@ -893,5 +899,54 @@ mod full_path {
             "ordering is worth far more than any page size: \
              {ordered_small:.3}s vs {random_small:.3}s"
         );
+    }
+}
+
+#[cfg(test)]
+mod ra_dump {
+    use super::*;
+    use crate::algo::{Rewrite, gsplat::Gsplat, naive::NaiveGather};
+    use crate::cache::CacheConfig;
+    use crate::io::hw::SPINNING_SATA_HW;
+    use crate::model::{Geometry, Map};
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn print_readahead_effect() {
+        let geo = Geometry {
+            records: 40_000,
+            record_bytes: 512,
+            container_bytes: 65_536,
+        };
+        let map = Map::shuffled(geo.records, 0xD1CE);
+        let ram = geo.payload_bytes() / 8;
+        let ordered = Gsplat::new().run(geo, &map, geo.payload_bytes() / 2).1;
+        let random = NaiveGather.run(geo, &map, geo.payload_bytes() / 2).1;
+
+        println!(
+            "\n  {:<10} {:>6} {:>9} {:>8} {:>8} {:>8} {:>8} {:>7}",
+            "trace", "page", "elapsed", "reqs", "hits", "ra reqs", "posn%", "util%"
+        );
+        for (label, trace) in [("ordered", &ordered), ("scattered", &random)] {
+            for page in [4_096u64, 65_536] {
+                let s = simulate_io(
+                    trace,
+                    &SPINNING_SATA_HW,
+                    Some(CacheConfig::new(ram, page)),
+                    32,
+                );
+                println!(
+                    "  {:<10} {:>6} {:>8.3}s {:>8} {:>8} {:>8} {:>7.0}% {:>6.0}%",
+                    label,
+                    page,
+                    s.elapsed_s,
+                    s.requests_completed,
+                    s.cache_hits,
+                    s.readahead_requests,
+                    s.positioning_fraction() * 100.0,
+                    s.bandwidth_utilization() * 100.0
+                );
+            }
+        }
     }
 }

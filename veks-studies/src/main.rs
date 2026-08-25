@@ -195,9 +195,18 @@ fn main() {
         "device", "IOPS", "bandwidth used", "limited by"
     );
     for (hardware, host) in [
-        (&veks_studies::io::hw::NVME_CONSUMER_HW, veks_studies::io::hw::HostModel::cores(8)),
-        (&veks_studies::io::hw::NVME_MODERN_HW, veks_studies::io::hw::HostModel::DEFAULT),
-        (&veks_studies::io::hw::NVME_MODERN_HW, veks_studies::io::hw::HostModel::cores(8)),
+        (
+            &veks_studies::io::hw::NVME_CONSUMER_HW,
+            veks_studies::io::hw::HostModel::cores(8),
+        ),
+        (
+            &veks_studies::io::hw::NVME_MODERN_HW,
+            veks_studies::io::hw::HostModel::DEFAULT,
+        ),
+        (
+            &veks_studies::io::hw::NVME_MODERN_HW,
+            veks_studies::io::hw::HostModel::cores(8),
+        ),
     ] {
         const SPAN: u64 = 5 * 1024 * 1024 * 1024;
         let mut sched = veks_studies::io::sched::Noop::default();
@@ -211,7 +220,11 @@ fn main() {
                 ..veks_studies::io::RunConfig::direct(256, SPAN)
             },
         );
-        let limit = if s.host_saturation() > 0.3 { "host CPU" } else { "device" };
+        let limit = if s.host_saturation() > 0.3 {
+            "host CPU"
+        } else {
+            "device"
+        };
         println!(
             "  {:<15} {:>12.0} {:>13.0}% {:>16}",
             format!("{} x{}", hardware.name, host.cores),

@@ -468,6 +468,21 @@ pub struct HostModel {
     pub per_request_s: f64,
     /// Cores issuing I/O.
     pub cores: usize,
+    /// Memory bandwidth available to this host, bytes per second.
+    ///
+    /// A storage model without this term is assuming memory is free, and
+    /// it is not: the cost model in `docs/sysref/splat/cost-model.md`
+    /// already carries a `N·R / BW_mem` term for the assemble memcpy that
+    /// the simulator did not implement.
+    pub memory_bandwidth: f64,
+    /// How many times each transferred byte crosses the memory bus.
+    ///
+    /// A byte arriving from storage is DMA-written to memory, read back
+    /// to be copied into a user buffer, written again, and read once more
+    /// when it is scattered into an output segment. Three to four touches
+    /// per byte is ordinary, and it means a 7 GB/s drive can generate
+    /// 25 GB/s of memory traffic — the whole budget of a DDR4 channel.
+    pub memory_touches_per_byte: f64,
 }
 
 impl HostModel {
@@ -477,18 +492,43 @@ impl HostModel {
     pub const DEFAULT: Self = HostModel {
         per_request_s: 1.7e-6,
         cores: 1,
+        // One DDR4-3200 channel pair, which is what a modest server gives
+        // a single socket.
+        memory_bandwidth: 40.0e9,
+        memory_touches_per_byte: 3.0,
     };
 
-    /// No host cost, for isolating device behaviour.
+    /// No host cost at all, for isolating device behaviour.
     pub const FREE: Self = HostModel {
         per_request_s: 0.0,
         cores: 1,
+        memory_bandwidth: f64::INFINITY,
+        memory_touches_per_byte: 0.0,
     };
 
     pub fn cores(n: usize) -> Self {
         HostModel {
-            per_request_s: Self::DEFAULT.per_request_s,
             cores: n.max(1),
+            ..Self::DEFAULT
+        }
+    }
+
+    /// Bytes per second of storage traffic this host's memory can carry,
+    /// given every byte is touched several times.
+    pub fn io_bandwidth_ceiling(&self) -> f64 {
+        if self.memory_touches_per_byte <= 0.0 {
+            f64::INFINITY
+        } else {
+            self.memory_bandwidth / self.memory_touches_per_byte
+        }
+    }
+
+    /// Seconds of memory time `bytes` of I/O traffic occupies.
+    pub fn memory_time_s(&self, bytes: u64) -> f64 {
+        if !self.memory_bandwidth.is_finite() || self.memory_bandwidth <= 0.0 {
+            0.0
+        } else {
+            bytes as f64 * self.memory_touches_per_byte / self.memory_bandwidth
         }
     }
 
@@ -498,6 +538,107 @@ impl HostModel {
             f64::INFINITY
         } else {
             self.cores as f64 / self.per_request_s
+        }
+    }
+}
+
+/// The link a device reaches the host through, and what else is on it.
+///
+/// A device's own `bus_rate` is its link. It is not the whole story:
+/// several devices commonly share one upstream port, and the aggregate
+/// is what binds. Eight drives that each claim 7 GB/s behind a single
+/// PCIe 4.0 x16 root port get about 3.5 GB/s apiece, and a per-device
+/// ceiling cannot express that.
+#[derive(Debug, Clone, Copy)]
+pub struct Fabric {
+    /// Usable bandwidth of the shared upstream link, bytes per second.
+    pub link_bytes_per_s: f64,
+    /// Devices contending for it.
+    pub devices: usize,
+}
+
+impl Fabric {
+    /// A device with the link to itself.
+    pub const DEDICATED: Self = Fabric {
+        link_bytes_per_s: f64::INFINITY,
+        devices: 1,
+    };
+
+    /// PCIe 4.0 x16, practical, shared by `devices`.
+    pub fn pcie4_x16(devices: usize) -> Self {
+        Fabric {
+            link_bytes_per_s: 28.0e9,
+            devices: devices.max(1),
+        }
+    }
+
+    /// PCIe 4.0 x4, practical, shared by `devices`.
+    pub fn pcie4_x4(devices: usize) -> Self {
+        Fabric {
+            link_bytes_per_s: 7.0e9,
+            devices: devices.max(1),
+        }
+    }
+
+    /// This device's share of the link.
+    pub fn share(&self) -> f64 {
+        self.link_bytes_per_s / self.devices.max(1) as f64
+    }
+}
+
+/// Where the issuing thread sits relative to the device.
+///
+/// A drive hangs off one socket's root complex. A thread on another
+/// socket reaches it across the interconnect: completions are routed
+/// further, and DMA lands in memory that is remote to whichever end
+/// wants it next. Neither effect is large per request; the bandwidth one
+/// is large in aggregate, because an inter-socket link carries a small
+/// fraction of what local memory does.
+///
+/// The measurements this crate calibrates against were taken on a single
+/// socket, so `LOCAL` is what they describe and anything else is
+/// extrapolation.
+#[derive(Debug, Clone, Copy)]
+pub struct Numa {
+    /// Whether the issuer shares a node with the device.
+    pub local: bool,
+    /// Extra per-request cost when it does not — completion routing and
+    /// remote DMA setup.
+    pub remote_latency_s: f64,
+    /// Share of local memory bandwidth available across the interconnect.
+    pub remote_bandwidth_fraction: f64,
+}
+
+impl Numa {
+    /// Issuer and device on the same node.
+    pub const LOCAL: Self = Numa {
+        local: true,
+        remote_latency_s: 0.0,
+        remote_bandwidth_fraction: 1.0,
+    };
+
+    /// Issuer on a different socket from the device.
+    pub const REMOTE: Self = Numa {
+        local: false,
+        // Completion interrupt and its cache traffic crossing the link.
+        remote_latency_s: 2.0e-6,
+        // An inter-socket link carries well under what local memory does.
+        remote_bandwidth_fraction: 0.55,
+    };
+
+    pub fn latency_penalty_s(&self) -> f64 {
+        if self.local {
+            0.0
+        } else {
+            self.remote_latency_s
+        }
+    }
+
+    pub fn bandwidth_factor(&self) -> f64 {
+        if self.local {
+            1.0
+        } else {
+            self.remote_bandwidth_fraction
         }
     }
 }

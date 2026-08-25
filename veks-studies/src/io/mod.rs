@@ -213,6 +213,10 @@ pub struct IoStats {
     pub bytes_transferred: u64,
     /// Requests the page cache served without reaching the device.
     pub cache_hits: u64,
+    /// Device requests issued speculatively by readahead.
+    pub readahead_requests: u64,
+    /// Logical accesses the issuers made.
+    pub accesses: u64,
     /// Time with at least one command in service.
     pub busy_s: f64,
     /// Time with at least one command actually moving bytes. The gap
@@ -225,6 +229,12 @@ pub struct IoStats {
     /// A large value here means the model is host-bound, not
     /// device-bound — the state Ren et al. report for modern NVMe.
     pub host_blocked_s: f64,
+    /// Time the issuer was blocked on memory bandwidth.
+    pub memory_blocked_s: f64,
+    /// The device's own ceiling, before the link, memory and interconnect
+    /// are taken into account. The gap between this and
+    /// `peak_bandwidth` is what the platform costs.
+    pub device_peak_bandwidth: f64,
     /// Integral of in-service command count over time, so mean queue
     /// occupancy is this divided by elapsed.
     pub service_occupancy_integral: f64,
@@ -286,6 +296,34 @@ impl IoStats {
         }
     }
 
+    /// How much of the device's own bandwidth the platform leaves
+    /// reachable. Below 1.0 the device is not the constraint.
+    pub fn platform_headroom(&self) -> f64 {
+        if self.device_peak_bandwidth <= 0.0 {
+            1.0
+        } else {
+            self.peak_bandwidth / self.device_peak_bandwidth
+        }
+    }
+
+    /// Logical accesses per second across all streams.
+    pub fn stream_access_rate(&self) -> f64 {
+        if self.elapsed_s <= 0.0 {
+            0.0
+        } else {
+            self.accesses as f64 / self.elapsed_s
+        }
+    }
+
+    /// Fraction of the run spent waiting on memory bandwidth.
+    pub fn memory_saturation(&self) -> f64 {
+        if self.elapsed_s <= 0.0 {
+            0.0
+        } else {
+            self.memory_blocked_s / self.elapsed_s
+        }
+    }
+
     /// Fraction of the run spent waiting on the host rather than the
     /// device.
     pub fn host_saturation(&self) -> f64 {
@@ -306,6 +344,79 @@ impl IoStats {
     }
 }
 
+/// Operating-system readahead.
+///
+/// The kernel does not fetch only what was asked for. On a stream it
+/// judges sequential it fetches ahead, doubling the window up to
+/// `max_bytes` (Linux's `ra_pages`, 128 KiB by default and 256 KiB after
+/// `POSIX_FADV_SEQUENTIAL`); on access it judges random it fetches the
+/// requested pages and nothing more.
+///
+/// **That asymmetry is the mechanism this whole family of algorithms
+/// trades on**, and a model without it cannot represent the advantage
+/// correctly. A fixed page size — which is what this simulator used
+/// before — gives an ordered reader and a scattered reader the same
+/// fetch granularity, which is exactly the distinction that matters.
+///
+/// Readahead also does two things a page size cannot. It **coalesces**:
+/// one window-sized request replaces many page faults, which is most of
+/// why sequential reading is fast. And it **wastes**: pages fetched on
+/// spec that are never asked for are bandwidth spent on a guess, which
+/// [`crate::cache::CacheStats::wasted_readahead_pages`] counts.
+#[derive(Debug, Clone, Copy)]
+pub struct Readahead {
+    pub enabled: bool,
+    /// Window a fresh sequential run starts at.
+    pub initial_bytes: u64,
+    /// Ceiling the window doubles toward.
+    pub max_bytes: u64,
+}
+
+impl Readahead {
+    /// Linux defaults: 128 KiB ceiling, ramping from 16 KiB.
+    pub const DEFAULT: Self = Readahead {
+        enabled: true,
+        initial_bytes: 16 * 1024,
+        max_bytes: 128 * 1024,
+    };
+
+    /// After `POSIX_FADV_SEQUENTIAL`, which doubles the ceiling.
+    pub const SEQUENTIAL_ADVICE: Self = Readahead {
+        enabled: true,
+        initial_bytes: 32 * 1024,
+        max_bytes: 256 * 1024,
+    };
+
+    /// `POSIX_FADV_RANDOM`, or `direct=1`: fetch exactly what was asked.
+    pub const OFF: Self = Readahead {
+        enabled: false,
+        initial_bytes: 0,
+        max_bytes: 0,
+    };
+}
+
+/// Per-stream readahead position.
+///
+/// Detection tolerates gaps. Linux does not require each read to begin
+/// exactly where the last ended: it maintains a readahead region and
+/// triggers the next fetch when a read crosses a marker inside it, so an
+/// ascending reader that *skips* — which is exactly what a pass of an
+/// ordered rewrite does — keeps its readahead. Requiring strict
+/// contiguity would switch readahead off for the very access pattern the
+/// algorithm produces, and make page size look far more important than
+/// it is.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReadaheadState {
+    /// Start of the region readahead is currently tracking.
+    region_start: u64,
+    /// How far ahead pages have already been brought in.
+    prefetched_to: u64,
+    /// Current window, doubling toward the ceiling while the pattern
+    /// holds.
+    window: u64,
+    active: bool,
+}
+
 /// How a run is configured.
 #[derive(Debug, Clone, Copy)]
 pub struct RunConfig {
@@ -317,6 +428,12 @@ pub struct RunConfig {
     pub span_bytes: u64,
     /// What it costs the host to issue an I/O.
     pub host: hw::HostModel,
+    /// The link this device reaches the host through, and what shares it.
+    pub fabric: hw::Fabric,
+    /// Where the issuing thread sits relative to the device.
+    pub numa: hw::Numa,
+    /// Operating-system readahead policy.
+    pub readahead: Readahead,
     pub seed: u64,
 }
 
@@ -328,7 +445,26 @@ impl RunConfig {
             cache: None,
             span_bytes,
             host: hw::HostModel::DEFAULT,
+            fabric: hw::Fabric::DEDICATED,
+            numa: hw::Numa::LOCAL,
+            // Unbuffered by default, matching how the fio corpus was
+            // captured: `direct=1` bypasses the page cache and with it
+            // readahead.
+            readahead: Readahead::OFF,
             seed: 0x5A17,
+        }
+    }
+
+    /// A buffered run: page cache with kernel-default readahead.
+    pub fn buffered(
+        offered_depth: usize,
+        span_bytes: u64,
+        cache: crate::cache::CacheConfig,
+    ) -> Self {
+        RunConfig {
+            cache: Some(cache),
+            readahead: Readahead::DEFAULT,
+            ..Self::direct(offered_depth, span_bytes)
         }
     }
 
@@ -400,6 +536,12 @@ impl<'a> Stream<'a> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamStats {
     pub label: &'static str,
+    /// Logical accesses the issuer made. Distinct from `completed`
+    /// because one access may be served from cache (no device request),
+    /// split into several (a scattered range), or cause extra device
+    /// work that nobody asked for (readahead).
+    pub accesses: u64,
+    /// Device requests completed on this stream's behalf.
     pub completed: u64,
     pub bytes: u64,
     pub cache_hits: u64,
@@ -429,6 +571,16 @@ impl StreamStats {
             0.0
         } else {
             self.total_latency_s / self.completed as f64
+        }
+    }
+
+    /// Logical accesses per second — the application's view, which
+    /// diverges from device IOPS as soon as a cache is involved.
+    pub fn access_rate(&self) -> f64 {
+        if self.elapsed_s <= 0.0 {
+            0.0
+        } else {
+            self.accesses as f64 / self.elapsed_s
         }
     }
 }
@@ -495,9 +647,21 @@ pub fn run_streams(
     let mut controller_free_at = 0.0f64;
     let mut next_id: u64 = 0;
 
-    let peak = hardware.peak_bandwidth();
+    // Three ceilings above the device's own: its share of the upstream
+    // link, what the host's memory can carry given every byte is touched
+    // several times, and whatever the interconnect leaves of that when
+    // the issuer is on another node.
+    let memory_ceiling = config.host.io_bandwidth_ceiling() * config.numa.bandwidth_factor();
+    let peak = hardware
+        .peak_bandwidth()
+        .min(config.fabric.share())
+        .min(memory_ceiling);
+    let numa_latency = config.numa.latency_penalty_s();
+    let mut ra_state = vec![ReadaheadState::default(); n];
+    let mut memory_free_at = 0.0f64;
     let mut stats = IoStats {
         peak_bandwidth: peak,
+        device_peak_bandwidth: hardware.peak_bandwidth(),
         ..IoStats::default()
     };
 
@@ -514,6 +678,7 @@ pub fn run_streams(
         }
 
         let mut host_blocked = false;
+        let mut memory_blocked = false;
         for (i, stream) in streams.iter_mut().enumerate() {
             while !exhausted[i] && outstanding[i] < stream.offered_depth {
                 // A rate-capped stream may simply not be allowed to
@@ -531,6 +696,11 @@ pub fn run_streams(
                 // Issuing an I/O costs the host CPU. Above roughly half a
                 // million operations per second this, and not the device,
                 // is what runs out.
+                //
+                // Every gate has to be checked *before* the issuer is
+                // asked for an access, because breaking out afterwards
+                // throws that access away. Doing it the other way round
+                // silently dropped every second access.
                 let core = host_free_at
                     .iter()
                     .enumerate()
@@ -541,46 +711,121 @@ pub fn run_streams(
                     host_blocked = true;
                     break;
                 }
-                host_free_at[core] = clock + config.host.per_request_s;
+                // A cache hit is a memcpy and copies cost memory time, so
+                // the memory subsystem gates submission too.
+                if cache.is_some() && memory_free_at > clock {
+                    memory_blocked = true;
+                    break;
+                }
                 let Some((offset, len, write)) = stream.issuer.next() else {
                     exhausted[i] = true;
                     break;
                 };
+                host_free_at[core] = clock + config.host.per_request_s;
+                per_stream[i].accesses += 1;
+                stats.accesses += 1;
 
                 if let Some(c) = cache.as_mut() {
+                    let page = c.stats().page_bytes;
+                    let issued_before = outstanding[i];
+                    // What the device has to fetch for this access, as
+                    // contiguous runs rather than page at a time.
+                    let runs = c.missing_runs(crate::cache::Region::Input, offset, len);
+
                     let before = c.stats();
                     c.access(crate::cache::Region::Input, offset, len, write);
                     let after = c.stats();
                     let hits = (after.read_hits + after.write_hits)
                         - (before.read_hits + before.write_hits);
-                    let misses = (after.read_misses + after.write_misses)
-                        - (before.read_misses + before.write_misses);
                     stats.cache_hits += hits;
                     per_stream[i].cache_hits += hits;
+
+                    memory_free_at = clock.max(memory_free_at) + config.host.memory_time_s(len);
+
                     if let Some(cap) = stream.rate_cap {
                         next_submit_at[i] = clock.max(next_submit_at[i]) + len as f64 / cap;
                     }
-                    if misses == 0 {
-                        // Served from memory; the device never sees it.
-                        per_stream[i].completed += 1;
-                        per_stream[i].bytes += len;
-                        continue;
+
+                    // Readahead runs on reads, and only where the access
+                    // pattern looks sequential.
+                    let mut prefetch: Option<(u64, u64)> = None;
+                    if config.readahead.enabled && !write {
+                        let ra = &mut ra_state[i];
+                        // Ascending and within reach of what readahead is
+                        // already tracking counts as sequential, gaps
+                        // included. Going backwards, or forwards past the
+                        // window, does not.
+                        let reach = ra.window.max(config.readahead.initial_bytes);
+                        let sequential = ra.active
+                            && offset >= ra.region_start
+                            && offset <= ra.prefetched_to + reach;
+
+                        if sequential {
+                            // Fire once per window, when the reader gets
+                            // within half a window of the end of what has
+                            // been fetched — Linux's async marker. Firing
+                            // on every read instead would issue one tiny
+                            // prefetch per read and coalesce nothing,
+                            // which is the opposite of the point.
+                            let next_window = if ra.window == 0 {
+                                config.readahead.initial_bytes
+                            } else {
+                                (ra.window * 2).min(config.readahead.max_bytes)
+                            };
+                            let marker = ra.prefetched_to.saturating_sub(ra.window / 2);
+                            if offset + len >= marker {
+                                ra.window = next_window;
+                                let from = ra.prefetched_to.max(offset + len);
+                                prefetch = Some((from, ra.window));
+                                ra.prefetched_to = from + ra.window;
+                            }
+                        } else {
+                            // Pattern broken: the kernel stops guessing
+                            // and reads only what was asked for.
+                            ra.active = true;
+                            ra.window = 0;
+                            ra.region_start = offset;
+                            ra.prefetched_to = offset + len;
+                        }
                     }
-                    let page = after.page_bytes;
-                    let first = offset / page;
-                    let last = (offset + len - 1) / page;
-                    for p in first..=last {
+
+                    for (start_page, count) in runs {
                         scheduler.push(Request {
                             id: next_id,
                             stream: i,
-                            offset: p * page,
-                            len: page,
+                            offset: start_page * page,
+                            len: count * page,
                             write,
                             submitted_at: clock,
                         });
                         next_id += 1;
                         outstanding[i] += 1;
                     }
+
+                    // The readahead itself: one request, however many
+                    // pages it covers. That coalescing is most of why a
+                    // sequential read is fast.
+                    if let Some((from, bytes)) = prefetch {
+                        let fetched = c.prefetch(crate::cache::Region::Input, from, bytes);
+                        if fetched > 0 {
+                            scheduler.push(Request {
+                                id: next_id,
+                                stream: i,
+                                offset: from - (from % page),
+                                len: fetched * page,
+                                write: false,
+                                submitted_at: clock,
+                            });
+                            next_id += 1;
+                            outstanding[i] += 1;
+                            stats.readahead_requests += 1;
+                        }
+                    }
+
+                    // A pure hit reaches no device, so nothing completes
+                    // for it later; it is counted as an access above and
+                    // deliberately not as a device request.
+                    let _ = issued_before;
                     continue;
                 }
 
@@ -619,6 +864,7 @@ pub fn run_streams(
             let controller_wait = (controller_free_at - clock).max(0.0);
             controller_free_at = clock + controller_wait + hardware.command_time_s();
             let positioning = controller_wait
+                + numa_latency
                 + hardware.access_time_at_depth(
                     head,
                     req.offset,
@@ -663,7 +909,13 @@ pub fn run_streams(
                 continue;
             }
             if host_ready > clock && host_ready.is_finite() {
+                stats.host_blocked_s += host_ready - clock;
                 clock = host_ready;
+                continue;
+            }
+            if memory_free_at > clock && memory_free_at.is_finite() {
+                stats.memory_blocked_s += memory_free_at - clock;
+                clock = memory_free_at;
                 continue;
             }
             break;
@@ -718,6 +970,9 @@ pub fn run_streams(
                 dt = dt.min(next_core - clock);
             }
         }
+        if memory_blocked && memory_free_at > clock {
+            dt = dt.min(memory_free_at - clock);
+        }
         if !dt.is_finite() || dt <= 0.0 {
             dt = 1e-12;
         }
@@ -733,6 +988,9 @@ pub fn run_streams(
         }
         if host_blocked {
             stats.host_blocked_s += dt;
+        }
+        if memory_blocked {
+            stats.memory_blocked_s += dt;
         }
         stats.service_occupancy_integral += serving.len() as f64 * dt;
         clock += dt;
@@ -1166,11 +1424,8 @@ mod tests {
         // first pass is resident.
         let mut issuer = SequentialAccess::new(1 << 20, 4_096, 4_000, false);
         let config = RunConfig {
-            offered_depth: 10,
-            cache: Some(crate::cache::CacheConfig::new(8 << 20, 4_096)),
-            span_bytes: SPAN,
-            host: hw::HostModel::DEFAULT,
             seed: 1,
+            ..RunConfig::buffered(10, SPAN, crate::cache::CacheConfig::new(8 << 20, 4_096))
         };
         let stats = run(&hw::SPINNING_SATA_HW, &mut sched, &mut issuer, config);
 
@@ -1430,6 +1685,441 @@ mod modern {
                 "{}: uncapped sequential should collapse the reader by far more than \
                  an order of magnitude, got {collapse:.0}×",
                 hardware.name
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod platform {
+    use super::*;
+    use crate::cache::CacheConfig;
+
+    const SPAN: u64 = 1 << 30;
+
+    fn ordered(config: RunConfig, hardware: &Hardware, n: u64) -> IoStats {
+        let mut sched = sched::Noop::default();
+        let mut issuer = SequentialAccess::new(SPAN, 4_096, n, false);
+        run(hardware, &mut sched, &mut issuer, config)
+    }
+
+    fn scattered(config: RunConfig, hardware: &Hardware, n: u64) -> IoStats {
+        let mut sched = sched::Noop::default();
+        let mut issuer = RandomAccess::new(SPAN, 4_096, n, 0x9E37);
+        run(hardware, &mut sched, &mut issuer, config)
+    }
+
+    fn buffered(ra: Readahead) -> RunConfig {
+        RunConfig {
+            readahead: ra,
+            ..RunConfig::buffered(32, SPAN, CacheConfig::new(8 << 20, 4_096))
+        }
+    }
+
+    // ---- Readahead ----------------------------------------------------
+
+    /// **Readahead is asymmetric, and that asymmetry is the point.** It
+    /// engages for an ascending reader and disengages for a scattered
+    /// one, so the two do not merely differ in locality — they get
+    /// different fetch granularity from the kernel.
+    #[test]
+    fn readahead_engages_for_ordered_access_and_not_for_scattered() {
+        let cfg = buffered(Readahead::DEFAULT);
+        let o = ordered(cfg, &hw::SPINNING_SATA_HW, 20_000);
+        let s = scattered(cfg, &hw::SPINNING_SATA_HW, 2_000);
+
+        let ordered_share = o.readahead_requests as f64 / o.requests_completed.max(1) as f64;
+        let scattered_share = s.readahead_requests as f64 / s.requests_completed.max(1) as f64;
+        assert!(
+            ordered_share > 0.5,
+            "most of an ordered reader's device traffic should be readahead, got {ordered_share:.2}"
+        );
+        assert!(
+            scattered_share < 0.05,
+            "a scattered reader should get essentially none, got {scattered_share:.2}"
+        );
+    }
+
+    /// Readahead coalesces: one window-sized request replaces many page
+    /// faults. Without it an ordered reader issues one request per page.
+    #[test]
+    fn readahead_coalesces_an_ordered_reader() {
+        let with = ordered(buffered(Readahead::DEFAULT), &hw::SPINNING_SATA_HW, 20_000);
+        let without = ordered(buffered(Readahead::OFF), &hw::SPINNING_SATA_HW, 20_000);
+
+        assert!(
+            with.requests_completed < without.requests_completed / 4,
+            "readahead should collapse the request count: {} vs {}",
+            with.requests_completed,
+            without.requests_completed
+        );
+        // It need not collapse the *time*. Contiguous 4 KiB reads on a
+        // disk cost almost nothing extra even issued one at a time, so
+        // there is little for coalescing to recover. What readahead buys
+        // is spent where a per-request cost binds — see
+        // `readahead_pays_where_per_request_cost_binds`.
+        assert!(with.elapsed_s <= without.elapsed_s * 1.05);
+    }
+
+    /// Where coalescing actually pays: a device fast enough that the
+    /// per-request cost is the constraint. Turning thousands of page
+    /// faults into dozens of window fetches takes the host out of the
+    /// way.
+    #[test]
+    fn readahead_pays_where_per_request_cost_binds() {
+        let at = |ra: Readahead| {
+            let mut sched = sched::Noop::default();
+            let mut issuer = SequentialAccess::new(SPAN, 4_096, 200_000, false);
+            run(
+                &hw::NVME_MODERN_HW,
+                &mut sched,
+                &mut issuer,
+                RunConfig {
+                    readahead: ra,
+                    host: hw::HostModel::DEFAULT,
+                    ..RunConfig::buffered(32, SPAN, CacheConfig::new(256 << 20, 4_096))
+                },
+            )
+        };
+        let without = at(Readahead::OFF);
+        let with = at(Readahead::DEFAULT);
+        assert!(
+            with.stream_access_rate() > without.stream_access_rate() * 2.0,
+            "coalescing should lift the application rate: {:.0} vs {:.0} accesses/s",
+            with.stream_access_rate(),
+            without.stream_access_rate()
+        );
+    }
+
+    /// `POSIX_FADV_SEQUENTIAL` doubles the ceiling, and the model should
+    /// show the larger window doing fewer, bigger fetches.
+    #[test]
+    fn sequential_advice_widens_the_window() {
+        let normal = ordered(buffered(Readahead::DEFAULT), &hw::SPINNING_SATA_HW, 40_000);
+        let advised = ordered(
+            buffered(Readahead::SEQUENTIAL_ADVICE),
+            &hw::SPINNING_SATA_HW,
+            40_000,
+        );
+        assert!(
+            advised.readahead_requests < normal.readahead_requests,
+            "wider windows mean fewer of them: {} vs {}",
+            advised.readahead_requests,
+            normal.readahead_requests
+        );
+    }
+
+    /// **The correction readahead forces.** Without it, page size is the
+    /// only fetch-granularity knob and an ordered reader looks barely
+    /// better than a scattered one. With it, the kernel gives the ordered
+    /// reader 128 KiB requests and the scattered reader nothing, and the
+    /// gap widens by more than an order of magnitude.
+    ///
+    /// A model without readahead understates what ordering is worth.
+    #[test]
+    fn readahead_rescues_ascending_access_that_skips() {
+        // A pass of an ordered rewrite does not read every record: it
+        // ascends and skips. Fully contiguous access is cheap with or
+        // without readahead, so it is this pattern that shows what
+        // readahead is for.
+        let strided = |ra: Readahead| {
+            let mut sched = sched::Noop::default();
+            let accesses: Vec<(u64, u64, bool)> =
+                (0..8_000u64).map(|i| (i * 4_096 * 4, 512, false)).collect();
+            let mut issuer = Recorded::new(accesses);
+            run(
+                &hw::SPINNING_SATA_HW,
+                &mut sched,
+                &mut issuer,
+                RunConfig {
+                    readahead: ra,
+                    ..RunConfig::buffered(32, SPAN, CacheConfig::new(8 << 20, 4_096))
+                },
+            )
+        };
+        let without = strided(Readahead::OFF);
+        let with = strided(Readahead::DEFAULT);
+
+        assert!(
+            with.requests_completed < without.requests_completed / 3,
+            "readahead should coalesce a skipping ascent: {} vs {} requests",
+            with.requests_completed,
+            without.requests_completed
+        );
+        // The price is real and this is where it shows: readahead fills
+        // the gaps the reader was skipping, so it moves more bytes for
+        // the same time. On seek-bound media that trade is roughly
+        // neutral; it is bad whenever bandwidth is the constraint.
+        assert!(
+            with.bytes_transferred > without.bytes_transferred * 2,
+            "readahead should move materially more bytes: {} vs {}",
+            with.bytes_transferred,
+            without.bytes_transferred
+        );
+        assert!(with.readahead_requests > 0);
+    }
+
+    // ---- Memory bandwidth ---------------------------------------------
+
+    /// Memory is a ceiling on storage throughput, because every byte that
+    /// arrives is touched several times before anyone uses it.
+    #[test]
+    fn memory_bandwidth_caps_device_throughput() {
+        let plenty = hw::HostModel {
+            memory_bandwidth: 200.0e9,
+            ..hw::HostModel::cores(16)
+        };
+        let scarce = hw::HostModel {
+            memory_bandwidth: 6.0e9,
+            ..hw::HostModel::cores(16)
+        };
+
+        let at = |host: hw::HostModel| {
+            let mut sched = sched::Noop::default();
+            let mut issuer = SequentialAccess::new(SPAN, 1 << 20, 3_000, false);
+            run(
+                &hw::NVME_MODERN_HW,
+                &mut sched,
+                &mut issuer,
+                RunConfig {
+                    host,
+                    ..RunConfig::direct(64, SPAN)
+                },
+            )
+        };
+
+        let fast = at(plenty);
+        let slow = at(scarce);
+        assert!(
+            slow.throughput() < fast.throughput() / 2.0,
+            "scarce memory should halve storage throughput: {:.1} vs {:.1} GB/s",
+            slow.throughput() / 1e9,
+            fast.throughput() / 1e9
+        );
+        assert!(
+            slow.platform_headroom() < 0.5,
+            "and the platform, not the device, should be the constraint"
+        );
+        assert!(fast.platform_headroom() > 0.9);
+    }
+
+    /// A cache hit is a memcpy. It is far cheaper than a device read, but
+    /// it is not free, and a model that treats it as free will predict
+    /// unreachable throughput for a well-cached workload.
+    #[test]
+    fn cache_hits_consume_memory_bandwidth() {
+        let hot = CacheConfig::new(64 << 20, 4_096);
+        let at = |bw: f64| {
+            let mut sched = sched::Noop::default();
+            // A small region read repeatedly, so almost everything hits.
+            let mut issuer = SequentialAccess::new(1 << 20, 4_096, 20_000, false);
+            run(
+                &hw::NVME_MODERN_HW,
+                &mut sched,
+                &mut issuer,
+                RunConfig {
+                    host: hw::HostModel {
+                        memory_bandwidth: bw,
+                        ..hw::HostModel::cores(16)
+                    },
+                    ..RunConfig::buffered(32, SPAN, hot)
+                },
+            )
+        };
+        let fast = at(200.0e9);
+        let slow = at(2.0e9);
+        assert!(
+            fast.cache_hits > 15_000,
+            "the workload must actually be hitting: {} hits, {} device requests",
+            fast.cache_hits,
+            fast.requests_completed
+        );
+        assert!(
+            slow.elapsed_s > fast.elapsed_s * 2.0,
+            "hits should cost memory time: {:.4}s vs {:.4}s",
+            slow.elapsed_s,
+            fast.elapsed_s
+        );
+        assert!(slow.memory_saturation() > 0.5);
+    }
+
+    // ---- PCIe fabric ---------------------------------------------------
+
+    /// A device's own link is not the whole story. Eight drives behind
+    /// one root port share it, and the per-device ceiling cannot say so.
+    #[test]
+    fn sharing_an_upstream_link_divides_it() {
+        let at = |fabric: hw::Fabric| {
+            let mut sched = sched::Noop::default();
+            let mut issuer = SequentialAccess::new(SPAN, 1 << 20, 2_000, false);
+            run(
+                &hw::NVME_MODERN_HW,
+                &mut sched,
+                &mut issuer,
+                RunConfig {
+                    fabric,
+                    host: hw::HostModel {
+                        memory_bandwidth: 400.0e9,
+                        ..hw::HostModel::cores(16)
+                    },
+                    ..RunConfig::direct(64, SPAN)
+                },
+            )
+        };
+
+        let alone = at(hw::Fabric::DEDICATED);
+        let shared = at(hw::Fabric::pcie4_x16(8));
+        assert!(
+            shared.throughput() < alone.throughput() / 1.5,
+            "eight drives on one x16 link should each get much less: {:.1} vs {:.1} GB/s",
+            shared.throughput() / 1e9,
+            alone.throughput() / 1e9
+        );
+        // 28 GB/s over 8 devices is 3.5 GB/s apiece.
+        assert!((shared.throughput() - 3.5e9).abs() / 3.5e9 < 0.15);
+    }
+
+    // ---- NUMA -----------------------------------------------------------
+
+    /// Issuing from the wrong socket costs latency per request and a
+    /// large share of memory bandwidth. Neither is visible in a
+    /// single-socket measurement, which is what every device figure this
+    /// crate calibrates against happens to be.
+    #[test]
+    fn a_remote_node_costs_both_latency_and_bandwidth() {
+        let at = |numa: hw::Numa| {
+            let mut sched = sched::Noop::default();
+            let mut issuer = RandomAccess::new(SPAN, 4_096, 40_000, 0x9E37);
+            run(
+                &hw::NVME_MODERN_HW,
+                &mut sched,
+                &mut issuer,
+                RunConfig {
+                    numa,
+                    host: hw::HostModel::cores(16),
+                    ..RunConfig::direct(128, SPAN)
+                },
+            )
+        };
+
+        let local = at(hw::Numa::LOCAL);
+        let remote = at(hw::Numa::REMOTE);
+
+        // Latency always costs something, but concurrency hides most of
+        // it — the same mechanism that erodes the case for ordering.
+        assert!(
+            remote.mean_latency_s() > local.mean_latency_s(),
+            "remote issue must cost latency"
+        );
+        assert!(
+            remote.iops() < local.iops(),
+            "and some throughput: {:.0} vs {:.0} IOPS",
+            remote.iops(),
+            local.iops()
+        );
+        assert!(
+            remote.iops() > local.iops() * 0.9,
+            "but at depth 128 the latency is largely hidden, so the loss should be \
+             small — it is the bandwidth that bites, and only near the ceiling"
+        );
+        // With ample memory the interconnect share still exceeds what the
+        // device can produce, so the platform ceiling has not moved at
+        // all. That is the point: NUMA is invisible until bandwidth is
+        // the constraint, which the next test arranges.
+        assert_eq!(remote.platform_headroom(), local.platform_headroom());
+    }
+
+    /// Where being on the wrong node actually hurts: a bandwidth-hungry
+    /// stream, where the interconnect and not the request rate is what
+    /// runs out.
+    #[test]
+    fn a_remote_node_bites_when_bandwidth_is_the_constraint() {
+        let at = |numa: hw::Numa| {
+            let mut sched = sched::Noop::default();
+            let mut issuer = SequentialAccess::new(SPAN, 1 << 20, 3_000, false);
+            run(
+                &hw::NVME_MODERN_HW,
+                &mut sched,
+                &mut issuer,
+                RunConfig {
+                    numa,
+                    host: hw::HostModel {
+                        // One channel pair, which is what a socket on a
+                        // two-socket box commonly has to itself.
+                        memory_bandwidth: 24.0e9,
+                        ..hw::HostModel::cores(16)
+                    },
+                    ..RunConfig::direct(64, SPAN)
+                },
+            )
+        };
+        let local = at(hw::Numa::LOCAL);
+        let remote = at(hw::Numa::REMOTE);
+        assert!(
+            remote.throughput() < local.throughput() * 0.75,
+            "a streaming reader should lose a quarter or more across the interconnect: \
+             {:.1} vs {:.1} GB/s",
+            remote.throughput() / 1e9,
+            local.throughput() / 1e9
+        );
+    }
+
+    /// The historical fits are unaffected by any of this, because the
+    /// defaults describe the single-socket, dedicated-link, unbuffered
+    /// conditions those measurements were taken under.
+    #[test]
+    fn the_defaults_leave_the_calibrated_fits_alone() {
+        for hardware in hw::HISTORICAL_HARDWARE {
+            let s = fio_like(hardware, 4_096, 2_000);
+            assert!(
+                (s.platform_headroom() - 1.0).abs() < 1e-9,
+                "{}: the platform should not bind for a 2016 device",
+                hardware.name
+            );
+            assert_eq!(s.readahead_requests, 0, "direct I/O has no readahead");
+            assert!(s.memory_saturation() < 0.01);
+        }
+    }
+}
+
+#[cfg(test)]
+mod accounting {
+    use super::*;
+    use crate::cache::CacheConfig;
+
+    /// Every access an issuer makes must be accounted for exactly once,
+    /// whether the device served it or the cache did. A run that silently
+    /// drops accesses would make every throughput figure derived from it
+    /// meaningless.
+    #[test]
+    fn every_issued_access_is_accounted_for() {
+        const SPAN: u64 = 1 << 30;
+        for (label, cache, ra) in [
+            ("direct", None, Readahead::OFF),
+            (
+                "buffered",
+                Some(CacheConfig::new(64 << 20, 4_096)),
+                Readahead::DEFAULT,
+            ),
+        ] {
+            let accesses = 5_000u64;
+            let mut sched = sched::Noop::default();
+            let mut issuer = SequentialAccess::new(1 << 20, 4_096, accesses, false);
+            let r = run_streams(
+                &hw::NVME_MODERN_HW,
+                &mut sched,
+                &mut [Stream::new("main", &mut issuer, 32)],
+                RunConfig {
+                    cache,
+                    readahead: ra,
+                    host: hw::HostModel::cores(8),
+                    ..RunConfig::direct(32, SPAN)
+                },
+            );
+            assert_eq!(
+                r.stream("main").accesses,
+                accesses,
+                "{label}: accesses went missing"
             );
         }
     }

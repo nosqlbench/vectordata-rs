@@ -107,6 +107,12 @@ pub struct CacheStats {
     pub evictions: u64,
     /// Distinct pages faulted in — the cold-cache lower bound on misses.
     pub compulsory_misses: u64,
+    /// Pages brought in speculatively by readahead.
+    pub readahead_pages: u64,
+    /// Readahead pages that were subsequently asked for. The difference
+    /// between this and `readahead_pages` is bandwidth spent on data
+    /// nobody wanted — the cost of guessing.
+    pub readahead_hits: u64,
     pub page_bytes: u64,
     pub capacity_pages: u64,
 }
@@ -131,6 +137,20 @@ impl CacheStats {
     pub fn capacity_misses(&self) -> u64 {
         self.read_misses.saturating_sub(self.compulsory_misses)
     }
+
+    /// Pages readahead fetched that were never asked for.
+    pub fn wasted_readahead_pages(&self) -> u64 {
+        self.readahead_pages.saturating_sub(self.readahead_hits)
+    }
+
+    /// Share of readahead that paid for itself.
+    pub fn readahead_precision(&self) -> f64 {
+        if self.readahead_pages == 0 {
+            0.0
+        } else {
+            self.readahead_hits as f64 / self.readahead_pages as f64
+        }
+    }
 }
 
 const NONE: u32 = u32::MAX;
@@ -143,6 +163,8 @@ pub struct PageCache {
     /// Pages ever faulted in, for separating compulsory from capacity
     /// misses.
     ever_seen: Vec<u64>,
+    /// Pages that arrived speculatively and have not yet been asked for.
+    speculative: Vec<u64>,
     /// Which page occupies each slot.
     slot_page: Vec<u64>,
     /// Which slot holds each resident page. Sized to the page space
@@ -172,6 +194,7 @@ impl PageCache {
             config,
             resident: vec![0u64; total_pages.div_ceil(64)],
             ever_seen: vec![0u64; total_pages.div_ceil(64)],
+            speculative: vec![0u64; total_pages.div_ceil(64)],
             slot_page: vec![0; capacity],
             page_slot: vec![NONE; total_pages],
             prev: vec![NONE; capacity],
@@ -243,6 +266,10 @@ impl PageCache {
             let slot = self.page_slot[page as usize];
             self.unlink(slot);
             self.push_front(slot);
+            if Self::bit(&self.speculative, page) {
+                Self::set_bit(&mut self.speculative, page, false);
+                self.stats.readahead_hits += 1;
+            }
             if write {
                 self.stats.write_hits += 1
             } else {
@@ -286,6 +313,112 @@ impl PageCache {
         Self::set_bit(&mut self.resident, page, true);
         self.push_front(slot);
         false
+    }
+
+    /// Bring a page in speculatively.
+    ///
+    /// Unlike [`Self::access`] this is nobody's request: it does not
+    /// count as a hit or a miss, because the cost of fetching it is
+    /// charged to the readahead request the caller issues. What it does
+    /// record is that the page arrived on spec, so that a later hit on
+    /// it can be credited to readahead and an eviction without a hit can
+    /// be counted as waste.
+    fn insert_speculative(&mut self, page: u64) -> bool {
+        if Self::bit(&self.resident, page) {
+            return false;
+        }
+        if self.stats.capacity_pages == 0 {
+            return false;
+        }
+        Self::set_bit(&mut self.ever_seen, page, true);
+
+        let slot = if self.used < self.slot_page.len() {
+            let s = self.used as u32;
+            self.used += 1;
+            s
+        } else {
+            let victim = self.tail;
+            let old = self.slot_page[victim as usize];
+            Self::set_bit(&mut self.resident, old, false);
+            Self::set_bit(&mut self.speculative, old, false);
+            self.page_slot[old as usize] = NONE;
+            self.stats.evictions += 1;
+            self.unlink(victim);
+            victim
+        };
+
+        self.slot_page[slot as usize] = page;
+        self.page_slot[page as usize] = slot;
+        Self::set_bit(&mut self.resident, page, true);
+        Self::set_bit(&mut self.speculative, page, true);
+        self.push_front(slot);
+        self.stats.readahead_pages += 1;
+        true
+    }
+
+    /// Prefetch the pages covering a byte range, returning how many were
+    /// not already resident — that is, how much the readahead request
+    /// actually has to move.
+    pub fn prefetch(&mut self, region: Region, offset: u64, len: u64) -> u64 {
+        if len == 0 {
+            return 0;
+        }
+        let page_bytes = self.config.page_bytes;
+        let base = match region {
+            Region::Input => 0,
+            Region::Output => self.input_pages,
+        };
+        let first = base + offset / page_bytes;
+        let last = base + (offset + len - 1) / page_bytes;
+        let total = (self.resident.len() * 64) as u64;
+        let mut fetched = 0;
+        for page in first..=last.min(total.saturating_sub(1)) {
+            if self.insert_speculative(page) {
+                fetched += 1;
+            }
+        }
+        fetched
+    }
+
+    /// Which pages covering a range are absent, as contiguous runs of
+    /// `(page_index, count)`.
+    ///
+    /// Runs matter: a request spanning several missing pages is one I/O,
+    /// not one per page, and treating it otherwise inflates the operation
+    /// count of every large read.
+    pub fn missing_runs(&self, region: Region, offset: u64, len: u64) -> Vec<(u64, u64)> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let page_bytes = self.config.page_bytes;
+        let base = match region {
+            Region::Input => 0,
+            Region::Output => self.input_pages,
+        };
+        let first = base + offset / page_bytes;
+        let last = base + (offset + len - 1) / page_bytes;
+
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for page in first..=last {
+            if Self::bit(&self.resident, page) {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((start, count)) if *start + *count == page => *count += 1,
+                _ => runs.push((page, 1)),
+            }
+        }
+        runs
+    }
+
+    /// Byte offset of a page within its region.
+    pub fn page_offset(&self, page: u64) -> u64 {
+        let local = if page >= self.input_pages {
+            page - self.input_pages
+        } else {
+            page
+        };
+        local * self.config.page_bytes
     }
 
     /// Touch every page covering `[offset, offset + len)` in `region`.
