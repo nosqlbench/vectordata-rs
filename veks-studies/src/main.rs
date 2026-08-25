@@ -94,6 +94,7 @@ fn usage() -> String {
          \n\
          COMMANDS\n  \
            sweep <axis>   vary one parameter and show how the metrics move\n  \
+           study <name>   walk a parameter axis at terabyte scale; `all` for every one\n  \
            validate       score the storage model against measurement\n  \
            devices        list the modelled devices\n  \
            report         the full standing report\n  \
@@ -103,6 +104,10 @@ fn usage() -> String {
     );
     for (name, description) in Axis::all() {
         s.push_str(&format!("  {name:<12} {description}\n"));
+    }
+    s.push_str("\nSTUDIES — the terabyte-scale manifold, where staging becomes necessary\n");
+    for study in veks_studies::manifold::ALL {
+        s.push_str(&format!("  {:<12} {}\n", study.name, study.headline));
     }
     s.push_str(
         "\nOPTIONS\n  \
@@ -124,9 +129,43 @@ fn usage() -> String {
            veks-study sweep record --device nvme-consumer --depth 128\n  \
            veks-study sweep budget --records 200000 --record 512 --vs prev\n  \
            veks-study sweep readahead --record 512\n  \
+           veks-study study frontier\n  \
+           veks-study study all\n  \
            veks-study validate\n",
     );
     s
+}
+
+/// `study <name>` — one of the terabyte-scale parameter walks, or every
+/// one of them. These are the runs that answer "when is a staged rewrite
+/// not optional", which the small sweeps cannot reach.
+fn run_study(args: &Args) {
+    use veks_studies::manifold;
+
+    let Some(name) = args.positional.get(1) else {
+        println!("\n  studies\n");
+        for study in manifold::ALL {
+            println!("  {:<12} {}", study.name, study.headline);
+        }
+        println!("\n  `veks-study study all` runs every one.\n");
+        return;
+    };
+
+    if name == "all" {
+        print!("{}", manifold::render_all());
+        return;
+    }
+
+    match manifold::find(name) {
+        Some(study) => print!("{}", study.render()),
+        None => {
+            eprintln!("unknown study `{name}`. Known studies:");
+            for study in manifold::ALL {
+                eprintln!("  {:<12} {}", study.name, study.headline);
+            }
+            std::process::exit(2);
+        }
+    }
 }
 
 fn devices() -> String {
@@ -295,6 +334,7 @@ fn main() {
             println!();
         }
         "devices" => println!("{}", devices()),
+        "study" => run_study(&args),
         "report" => report(),
         _ => print!("{}", usage()),
     }

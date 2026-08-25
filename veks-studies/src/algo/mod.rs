@@ -7,6 +7,7 @@
 
 pub mod gsplat;
 pub mod naive;
+pub mod staged;
 
 use crate::model::{Geometry, Map, Sink, Trace};
 

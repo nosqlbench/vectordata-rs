@@ -45,6 +45,21 @@ use crate::model::{Op, Trace};
 pub enum Region {
     Input,
     Output,
+    /// Scratch the rewrite writes and reads back — the bucket streams a
+    /// staged rewrite spills into. It is a real extent on the same
+    /// volume, so it contends for cache and for the device exactly as the
+    /// other two do.
+    Spill,
+}
+
+impl Region {
+    fn index(self) -> usize {
+        match self {
+            Region::Input => 0,
+            Region::Output => 1,
+            Region::Spill => 2,
+        }
+    }
 }
 
 /// How much memory the cache may use, and at what granularity.
@@ -112,6 +127,17 @@ pub struct CacheStats {
     pub write_hits: u64,
     pub write_misses: u64,
     pub evictions: u64,
+    /// Dirty pages written back to the device: by the background
+    /// flusher, by expiry, or because a dirty page reached the cold end
+    /// of the LRU and had to be cleaned before its frame could be reused.
+    pub writebacks: u64,
+    /// Writebacks forced by eviction rather than by the flusher. These
+    /// are the expensive ones: they happen on the allocation path, in
+    /// whatever order the LRU produces, rather than in a batch the
+    /// flusher could have sorted.
+    pub eviction_writebacks: u64,
+    /// High-water mark of dirty pages held in the cache.
+    pub peak_dirty_pages: u64,
     /// Distinct pages faulted in — the cold-cache lower bound on misses.
     pub compulsory_misses: u64,
     /// Pages brought in speculatively by readahead.
@@ -172,6 +198,16 @@ pub struct PageCache {
     ever_seen: Vec<u64>,
     /// Pages that arrived speculatively and have not yet been asked for.
     speculative: Vec<u64>,
+    /// Pages modified in memory and not yet written back.
+    dirty: Vec<u64>,
+    /// Dirty pages in the order they were first dirtied, with the time
+    /// each was dirtied — what the periodic flusher walks to find the
+    /// ones older than `dirty_expire_centisecs`.
+    dirty_queue: std::collections::VecDeque<(u64, f64)>,
+    dirty_pages: u64,
+    /// Pages the caller must write back before the run can proceed,
+    /// drained by [`Self::take_writebacks`].
+    pending_writeback: Vec<u64>,
     /// Which page occupies each slot.
     slot_page: Vec<u64>,
     /// Which slot holds each resident page. Sized to the page space
@@ -183,7 +219,8 @@ pub struct PageCache {
     head: u32,
     tail: u32,
     used: usize,
-    input_pages: u64,
+    /// First page index of each region, indexed by `Region::index`.
+    region_base: [u64; 3],
     stats: CacheStats,
 }
 
@@ -191,10 +228,23 @@ impl PageCache {
     /// Build a cache over an address space of `input_bytes` of source
     /// followed by `output_bytes` of destination.
     pub fn new(config: CacheConfig, input_bytes: u64, output_bytes: u64) -> Self {
+        Self::with_spill(config, input_bytes, output_bytes, 0)
+    }
+
+    /// A cache over three extents: source, output, and the spill scratch a
+    /// staged rewrite uses.
+    pub fn with_spill(
+        config: CacheConfig,
+        input_bytes: u64,
+        output_bytes: u64,
+        spill_bytes: u64,
+    ) -> Self {
         let page_bytes = config.page_bytes.max(1);
         let input_pages = input_bytes.div_ceil(page_bytes);
         let output_pages = output_bytes.div_ceil(page_bytes);
-        let total_pages = (input_pages + output_pages) as usize;
+        let spill_pages = spill_bytes.div_ceil(page_bytes);
+        let region_base = [0, input_pages, input_pages + output_pages];
+        let total_pages = (input_pages + output_pages + spill_pages) as usize;
         let capacity = config.capacity_pages().min(total_pages);
 
         PageCache {
@@ -202,6 +252,10 @@ impl PageCache {
             resident: vec![0u64; total_pages.div_ceil(64)],
             ever_seen: vec![0u64; total_pages.div_ceil(64)],
             speculative: vec![0u64; total_pages.div_ceil(64)],
+            dirty: vec![0u64; total_pages.div_ceil(64)],
+            dirty_queue: std::collections::VecDeque::new(),
+            dirty_pages: 0,
+            pending_writeback: Vec::new(),
             slot_page: vec![0; capacity],
             page_slot: vec![NONE; total_pages],
             prev: vec![NONE; capacity],
@@ -209,7 +263,7 @@ impl PageCache {
             head: NONE,
             tail: NONE,
             used: 0,
-            input_pages,
+            region_base,
             stats: CacheStats {
                 page_bytes,
                 capacity_pages: capacity as u64,
@@ -266,7 +320,7 @@ impl PageCache {
     }
 
     /// Touch one page. Returns true on a hit.
-    fn touch_page(&mut self, page: u64, write: bool) -> bool {
+    fn touch_page(&mut self, page: u64, write: bool, now: f64) -> bool {
         let counts_for_residency = !write || self.config.writes_occupy;
 
         if Self::bit(&self.resident, page) {
@@ -278,7 +332,8 @@ impl PageCache {
                 self.stats.readahead_hits += 1;
             }
             if write {
-                self.stats.write_hits += 1
+                self.stats.write_hits += 1;
+                self.mark_dirty(page, now);
             } else {
                 self.stats.read_hits += 1
             }
@@ -306,20 +361,181 @@ impl PageCache {
             self.used += 1;
             s
         } else {
-            let victim = self.tail;
-            let old = self.slot_page[victim as usize];
-            Self::set_bit(&mut self.resident, old, false);
-            self.page_slot[old as usize] = NONE;
-            self.stats.evictions += 1;
-            self.unlink(victim);
-            victim
+            self.evict_tail()
         };
 
         self.slot_page[slot as usize] = page;
         self.page_slot[page as usize] = slot;
         Self::set_bit(&mut self.resident, page, true);
         self.push_front(slot);
+        if write {
+            self.mark_dirty(page, now);
+        }
         false
+    }
+
+    /// Evict the coldest page and return its freed slot.
+    ///
+    /// **A dirty page cannot simply be dropped.** Its frame is only
+    /// reusable once its contents have reached the device, so evicting
+    /// one turns into a write on the allocation path — issued in LRU
+    /// order, which is not an order the device likes, and issued while
+    /// something is waiting for the frame. This is precisely the cost
+    /// the background flusher exists to avoid, and counting it
+    /// separately from flusher writebacks is what makes the difference
+    /// visible.
+    fn evict_tail(&mut self) -> u32 {
+        let victim = self.tail;
+        let old = self.slot_page[victim as usize];
+        if Self::bit(&self.dirty, old) {
+            self.clean_page(old);
+            self.stats.eviction_writebacks += 1;
+            self.stats.writebacks += 1;
+            self.pending_writeback.push(old);
+        }
+        Self::set_bit(&mut self.resident, old, false);
+        Self::set_bit(&mut self.speculative, old, false);
+        self.page_slot[old as usize] = NONE;
+        self.stats.evictions += 1;
+        self.unlink(victim);
+        victim
+    }
+
+    /// Mark a resident page modified in memory.
+    fn mark_dirty(&mut self, page: u64, now: f64) {
+        if Self::bit(&self.dirty, page) {
+            return;
+        }
+        Self::set_bit(&mut self.dirty, page, true);
+        self.dirty_pages += 1;
+        self.stats.peak_dirty_pages = self.stats.peak_dirty_pages.max(self.dirty_pages);
+        self.dirty_queue.push_back((page, now));
+    }
+
+    /// Clear a page's dirty bit, without deciding who writes it back.
+    fn clean_page(&mut self, page: u64) {
+        if !Self::bit(&self.dirty, page) {
+            return;
+        }
+        Self::set_bit(&mut self.dirty, page, false);
+        self.dirty_pages = self.dirty_pages.saturating_sub(1);
+    }
+
+    /// Pages currently dirty in memory.
+    pub fn dirty_pages(&self) -> u64 {
+        self.dirty_pages
+    }
+
+    /// Bytes currently dirty in memory — what `balance_dirty_pages`
+    /// compares against its thresholds.
+    pub fn dirty_bytes(&self) -> u64 {
+        self.dirty_pages * self.config.page_bytes
+    }
+
+    /// Take the pages that must be written back before their frames can
+    /// be reused. These are already marked clean; the caller owes the
+    /// device write.
+    pub fn take_writebacks(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_writeback)
+    }
+
+    /// Hand the flusher dirty pages as **coalesced runs**, bounded both
+    /// by how many pages it may take and by how many device requests
+    /// those pages are allowed to become.
+    ///
+    /// Both bounds are real. Linux's flusher works in batches
+    /// (`nr_to_write`, typically 1024 pages) and its submissions share
+    /// the device queue with everything else, so a batch that fragments
+    /// into a thousand separate writes is not one it can issue at once.
+    /// Pages that do not fit inside `max_runs` are handed back — marked
+    /// dirty again, at the front of the queue — rather than silently
+    /// dropped, because a page the flusher declined to write is still
+    /// dirty and still has to go somewhere.
+    ///
+    /// The asymmetry this produces is the point. A sequential writer's
+    /// dirty pages are contiguous, so a thousand of them coalesce into
+    /// one request and the whole batch goes at once. A scattered
+    /// writer's are not, so the same thousand pages need a thousand
+    /// requests, the run cap bites, and the drain rate collapses to what
+    /// the device can do with small scattered writes.
+    pub fn flush_dirty_runs(
+        &mut self,
+        max_pages: usize,
+        max_runs: usize,
+        older_than: Option<f64>,
+    ) -> Vec<(u64, u64)> {
+        if max_pages == 0 || max_runs == 0 {
+            return Vec::new();
+        }
+        let mut pages = self.flush_dirty(max_pages, older_than);
+        if pages.is_empty() {
+            return Vec::new();
+        }
+        pages.sort_unstable();
+
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut taken = 0usize;
+        for (index, page) in pages.iter().copied().enumerate() {
+            match runs.last_mut() {
+                Some((start, count)) if *start + *count == page => *count += 1,
+                _ => {
+                    if runs.len() == max_runs {
+                        // Everything from here on is handed back.
+                        for &page in &pages[index..] {
+                            self.redirty(page);
+                        }
+                        return runs;
+                    }
+                    runs.push((page, 1));
+                }
+            }
+            taken = index + 1;
+        }
+        let _ = taken;
+        runs
+    }
+
+    /// Put a page back on the dirty list — the flusher looked at it and
+    /// could not take it.
+    fn redirty(&mut self, page: u64) {
+        if Self::bit(&self.dirty, page) || !Self::bit(&self.resident, page) {
+            return;
+        }
+        Self::set_bit(&mut self.dirty, page, true);
+        self.dirty_pages += 1;
+        self.stats.writebacks = self.stats.writebacks.saturating_sub(1);
+        self.dirty_queue.push_front((page, 0.0));
+    }
+
+    /// Hand the flusher up to `limit` dirty pages, oldest first,
+    /// optionally only those dirtied before `older_than`.
+    ///
+    /// Two callers want this and they want different things from it. The
+    /// periodic `kupdate` flusher passes an age, because its job is to
+    /// bound how long data sits unwritten
+    /// (`dirty_expire_centisecs`, 30 s). Background writeback passes
+    /// none, because its job is to get the dirty total back under the
+    /// threshold and it does not care how old the pages are.
+    pub fn flush_dirty(&mut self, limit: usize, older_than: Option<f64>) -> Vec<u64> {
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(&(page, dirtied_at)) = self.dirty_queue.front() else {
+                break;
+            };
+            if let Some(cutoff) = older_than
+                && dirtied_at > cutoff
+            {
+                break;
+            }
+            self.dirty_queue.pop_front();
+            // The page may have been cleaned by an eviction already.
+            if Self::bit(&self.dirty, page) {
+                self.clean_page(page);
+                self.stats.writebacks += 1;
+                out.push(page);
+            }
+        }
+        out
     }
 
     /// Bring a page in speculatively.
@@ -344,14 +560,7 @@ impl PageCache {
             self.used += 1;
             s
         } else {
-            let victim = self.tail;
-            let old = self.slot_page[victim as usize];
-            Self::set_bit(&mut self.resident, old, false);
-            Self::set_bit(&mut self.speculative, old, false);
-            self.page_slot[old as usize] = NONE;
-            self.stats.evictions += 1;
-            self.unlink(victim);
-            victim
+            self.evict_tail()
         };
 
         self.slot_page[slot as usize] = page;
@@ -371,10 +580,7 @@ impl PageCache {
             return 0;
         }
         let page_bytes = self.config.page_bytes;
-        let base = match region {
-            Region::Input => 0,
-            Region::Output => self.input_pages,
-        };
+        let base = self.region_base[region.index()];
         let first = base + offset / page_bytes;
         let last = base + (offset + len - 1) / page_bytes;
         let total = (self.resident.len() * 64) as u64;
@@ -398,10 +604,7 @@ impl PageCache {
             return Vec::new();
         }
         let page_bytes = self.config.page_bytes;
-        let base = match region {
-            Region::Input => 0,
-            Region::Output => self.input_pages,
-        };
+        let base = self.region_base[region.index()];
         let first = base + offset / page_bytes;
         let last = base + (offset + len - 1) / page_bytes;
 
@@ -420,29 +623,37 @@ impl PageCache {
 
     /// Byte offset of a page within its region.
     pub fn page_offset(&self, page: u64) -> u64 {
-        let local = if page >= self.input_pages {
-            page - self.input_pages
-        } else {
-            page
-        };
-        local * self.config.page_bytes
+        let base = self
+            .region_base
+            .iter()
+            .copied()
+            .filter(|b| *b <= page)
+            .max()
+            .unwrap_or(0);
+        (page - base) * self.config.page_bytes
     }
 
     /// Touch every page covering `[offset, offset + len)` in `region`.
-    pub fn access(&mut self, region: Region, offset: u64, len: u64, write: bool) {
+    ///
+    /// `now` timestamps any page this dirties, so the flusher can later
+    /// find the ones that have aged past `dirty_expire_centisecs`.
+    pub fn access_at(&mut self, region: Region, offset: u64, len: u64, write: bool, now: f64) {
         if len == 0 {
             return;
         }
         let page_bytes = self.config.page_bytes;
-        let base = match region {
-            Region::Input => 0,
-            Region::Output => self.input_pages,
-        };
+        let base = self.region_base[region.index()];
         let first = base + offset / page_bytes;
         let last = base + (offset + len - 1) / page_bytes;
         for page in first..=last {
-            self.touch_page(page, write);
+            self.touch_page(page, write, now);
         }
+    }
+
+    /// The same, on a run with no clock — every page dirtied is stamped
+    /// at time zero, so an expiry-driven flush treats them all as due.
+    pub fn access(&mut self, region: Region, offset: u64, len: u64, write: bool) {
+        self.access_at(region, offset, len, write, 0.0);
     }
 }
 

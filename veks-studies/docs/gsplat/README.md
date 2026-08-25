@@ -247,10 +247,21 @@ Skip it when:
 
 - **The collection fits in memory.** Read it, permute in place, write
   it. gsplat's floor of two segments already degenerates toward this.
-- **Records are much smaller than a container.**
-  When `R << W`, a random read costs the same as a sequential one — the
-  container dominates either way — and direct indexed lookup through
-  the host's cache beats pass orchestration.
+- **Records are already large relative to what the tier fetches
+  efficiently.** The quantity that decides this is
+  `penalty(R) = BW_seq / (R · IOPS(R))` — how much slower fetching
+  records where they lie is than streaming. Once it falls below 2, no
+  budget can win, because a rewrite always makes at least two passes.
+  On current NVMe at realistic concurrency that happens by about 16 KiB.
+  See [cost-model.md](./cost-model.md#where-ordering-starts-to-pay).
+
+  This condition used to read the other way round — "skip it when
+  records are much smaller than a container" — on the reasoning that a
+  random read and a sequential one cost the same per container fetch.
+  The premise is right and the conclusion inverted: a scattered reader
+  needs one fetch per record where an ordered reader needs one per `w`,
+  and `w = W/R` is largest exactly when `R << W`. Small records are the
+  case ordering serves *best*.
 - **The map is the identity or already ascending.** A selection list in
   source order is a streaming filter, not a permutation: read and write
   both sequentially in one pass, skipping **L** and **A** entirely.

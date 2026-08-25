@@ -24,9 +24,21 @@ pub enum Op {
     Scatter { local: u64 },
     /// A contiguous range of output was written, in records.
     WriteRange { first_slot: u64, records: u64 },
+    /// A run of records was appended to a spill bucket's stream.
+    ///
+    /// Spilling is what separates a staged rewrite from one that
+    /// re-reads: instead of sweeping the source once per destination
+    /// segment, a single sweep routes every record into the bucket it
+    /// belongs to, and each bucket is buffered so its writes are large.
+    SpillWrite { bucket: u64, records: u64 },
+    /// A run of records was read back from a spill bucket's stream.
+    SpillRead { bucket: u64, records: u64 },
     /// A durability barrier was taken.
     Barrier,
 }
+
+/// Bytes of destination ordinal carried with each spilled record.
+pub const SPILL_TAG_BYTES: u64 = 8;
 
 /// An ordered log of operations plus the geometry they ran against.
 #[derive(Debug, Clone)]
@@ -125,6 +137,14 @@ impl Trace {
                         m.write_ranges += 1;
                         m.records_written += records;
                     }
+                    Op::SpillWrite { records, .. } => {
+                        m.spill_runs += 1;
+                        m.records_spilled += records;
+                    }
+                    Op::SpillRead { records, .. } => {
+                        m.spill_runs += 1;
+                        m.records_unspilled += records;
+                    }
                     Op::Barrier => m.barriers += 1,
                     Op::PassStart { .. } => {}
                 }
@@ -154,6 +174,12 @@ pub struct Metrics {
     pub scatters: u64,
     pub write_ranges: u64,
     pub records_written: u64,
+    /// Contiguous runs written to or read back from spill buckets.
+    pub spill_runs: u64,
+    /// Records routed into spill buckets.
+    pub records_spilled: u64,
+    /// Records read back out of spill buckets.
+    pub records_unspilled: u64,
     pub barriers: u64,
     pub peak_resident_bytes: u64,
 }
@@ -174,9 +200,19 @@ impl Metrics {
         self.container_touches * self.geometry.container_bytes
     }
 
-    /// Bytes written, which is the live output exactly once.
+    /// Bytes written to the output, which is the live payload exactly
+    /// once. Spill traffic is counted separately by [`Self::spill_bytes`]
+    /// so that a staged rewrite's scratch is never mistaken for output.
     pub fn bytes_written(&self) -> u64 {
         self.records_written * self.geometry.record_bytes
+    }
+
+    /// Bytes moved to and from the spill extent. A spilled record carries
+    /// its destination ordinal alongside its payload, which is the cost
+    /// of not having to consult the map again on the way back.
+    pub fn spill_bytes(&self) -> u64 {
+        (self.records_spilled + self.records_unspilled)
+            * (self.geometry.record_bytes + SPILL_TAG_BYTES)
     }
 
     /// Measured read amplification: tier bytes moved per live byte.

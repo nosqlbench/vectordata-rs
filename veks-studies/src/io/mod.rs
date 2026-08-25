@@ -70,6 +70,9 @@
 pub mod hw;
 pub mod latency;
 pub mod sched;
+pub mod writeback;
+
+pub use writeback::Writeback;
 
 use hw::{Hardware, ServicePolicy};
 use rand::{Rng, SeedableRng};
@@ -86,6 +89,15 @@ pub struct Request {
     pub len: u64,
     pub write: bool,
     pub submitted_at: f64,
+    /// Work the kernel issued on its own account rather than on a
+    /// stream's — writeback of dirty pages.
+    ///
+    /// It occupies the device and consumes bandwidth like anything else,
+    /// but it belongs to no stream's queue depth and no stream's latency
+    /// distribution: nobody is waiting on it. Attributing it to a stream
+    /// would let its completion decrement a depth its submission never
+    /// raised.
+    pub kernel: bool,
 }
 
 /// A request the device has accepted and is working on.
@@ -139,6 +151,14 @@ impl RandomAccess {
             block_bytes_max: block_bytes,
             remaining: count,
             write: false,
+        }
+    }
+
+    /// The same, writing rather than reading.
+    pub fn writes(span_bytes: u64, block_bytes: u64, count: u64, seed: u64) -> Self {
+        RandomAccess {
+            write: true,
+            ..RandomAccess::new(span_bytes, block_bytes, count, seed)
         }
     }
 
@@ -250,6 +270,27 @@ pub struct IoStats {
     pub host_blocked_s: f64,
     /// Time the issuer was blocked on memory bandwidth.
     pub memory_blocked_s: f64,
+    /// Request-seconds spent waiting for the block scheduler's lock,
+    /// summed over requests. Several requests wait at once, so this can
+    /// exceed the elapsed time; it is a queueing measure, not a
+    /// utilization. For utilization use [`Self::scheduler_utilization`].
+    pub scheduler_blocked_s: f64,
+    /// Wall-clock seconds the scheduler's lock was held.
+    ///
+    /// Zero under `none`. Under `mq-deadline` or `bfq` this approaching
+    /// the elapsed time is the whole explanation for their measured
+    /// ceilings — a run that is slow with this near 100% is slow because
+    /// of the scheduler and not because of the device.
+    pub scheduler_busy_s: f64,
+    /// Time a writer spent asleep in `balance_dirty_pages`.
+    pub writeback_throttled_s: f64,
+    /// Dirty pages the flusher wrote back.
+    pub flusher_writebacks: u64,
+    /// Dirty pages written back because their frame was needed — the
+    /// expensive kind, issued in LRU order on the allocation path.
+    pub eviction_writebacks: u64,
+    /// High-water mark of dirty bytes held in the page cache.
+    pub peak_dirty_bytes: u64,
     /// The device's own ceiling, before the link, memory and interconnect
     /// are taken into account. The gap between this and
     /// `peak_bandwidth` is what the platform costs.
@@ -343,6 +384,17 @@ impl IoStats {
         }
     }
 
+    /// Share of the run during which the block scheduler's lock was
+    /// held. At 1.0 the scheduler is the bottleneck and no device or
+    /// queue-depth change will help.
+    pub fn scheduler_utilization(&self) -> f64 {
+        if self.elapsed_s == 0.0 {
+            0.0
+        } else {
+            self.scheduler_busy_s / self.elapsed_s
+        }
+    }
+
     /// Fraction of the run spent waiting on the host rather than the
     /// device.
     pub fn host_saturation(&self) -> f64 {
@@ -407,11 +459,54 @@ impl Readahead {
     };
 
     /// `POSIX_FADV_RANDOM`, or `direct=1`: fetch exactly what was asked.
+    ///
+    /// This is not merely "readahead off" — it is the *fix* for a
+    /// scattered workload. See [`Self::initial_size`]: with readahead in
+    /// its default state a cold random read pulls four pages instead of
+    /// one, so turning it off is worth a 4x reduction in bytes moved on
+    /// exactly the access pattern that can least afford them.
     pub const OFF: Self = Readahead {
         enabled: false,
         initial_bytes: 0,
         max_bytes: 0,
     };
+
+    /// Bytes the kernel fetches for a read it does **not** recognize as
+    /// sequential — Linux's `get_init_ra_size`.
+    ///
+    /// This is the mechanism by which readahead makes a random workload
+    /// slower rather than merely failing to help it. `ondemand_readahead`
+    /// treats a miss outside the tracked region as the start of a new
+    /// region and seeds it optimistically: the request size is rounded up
+    /// to a power of two and then multiplied, so a 4 KiB read against a
+    /// 128 KiB ceiling fetches 16 KiB. Three of those four pages are
+    /// speculative, and on a uniformly scattered stream essentially none
+    /// of them is ever used.
+    ///
+    /// ```text
+    ///   newsize = roundup_pow2(request)
+    ///   if newsize <= max/32   newsize *= 4
+    ///   elif newsize <= max/4  newsize *= 2
+    ///   else                   newsize  = max
+    /// ```
+    ///
+    /// Source: `mm/readahead.c`, `get_init_ra_size` — unchanged in shape
+    /// since 2.6.23. It is also why `POSIX_FADV_RANDOM`, which sets
+    /// `ra_pages` to zero, is the documented remedy.
+    pub fn initial_size(&self, request_bytes: u64) -> u64 {
+        if !self.enabled || self.max_bytes == 0 {
+            return request_bytes;
+        }
+        let rounded = request_bytes.max(1).next_power_of_two();
+        let seeded = if rounded <= self.max_bytes / 32 {
+            rounded * 4
+        } else if rounded <= self.max_bytes / 4 {
+            rounded * 2
+        } else {
+            self.max_bytes
+        };
+        seeded.min(self.max_bytes).max(request_bytes)
+    }
 }
 
 /// Per-stream readahead position.
@@ -453,6 +548,10 @@ pub struct RunConfig {
     pub numa: hw::Numa,
     /// Operating-system readahead policy.
     pub readahead: Readahead,
+    /// Dirty-page thresholds and the pacing they drive. Only meaningful
+    /// with a cache — `direct=1` writes are never buffered and so are
+    /// never paced.
+    pub writeback: Writeback,
     pub seed: u64,
 }
 
@@ -470,6 +569,7 @@ impl RunConfig {
             // captured: `direct=1` bypasses the page cache and with it
             // readahead.
             readahead: Readahead::OFF,
+            writeback: Writeback::OFF,
             seed: 0x5A17,
         }
     }
@@ -483,6 +583,7 @@ impl RunConfig {
         RunConfig {
             cache: Some(cache),
             readahead: Readahead::DEFAULT,
+            writeback: Writeback::DEFAULT,
             ..Self::direct(offered_depth, span_bytes)
         }
     }
@@ -634,6 +735,22 @@ impl RunResult {
     }
 }
 
+/// Run a workload under a named Linux block scheduler.
+///
+/// The scheduler is not a detail of the harness — it changes the
+/// achievable throughput by more than a factor of two on a modern NVMe
+/// (see [`sched::LinuxScheduler`]), so a result reported without saying
+/// which one was in force is not reproducible.
+pub fn run_under(
+    hardware: &Hardware,
+    scheduler: sched::LinuxScheduler,
+    issuer: &mut dyn Issuer,
+    config: RunConfig,
+) -> IoStats {
+    let mut built = scheduler.build();
+    run(hardware, built.as_mut(), issuer, config)
+}
+
 /// Run a workload against a device and report what the clock said.
 pub fn run(
     hardware: &Hardware,
@@ -684,6 +801,10 @@ pub fn run_streams(
     let mut die_busy = vec![false; hardware.dies.max(1)];
     let mut host_free_at = vec![0.0f64; config.host.cores.max(1)];
     let mut controller_free_at = 0.0f64;
+    // The block scheduler's own serialized cost. `none` has none; the
+    // ones that keep sorted structures under a lock have a real one, and
+    // it is what produces their measured throughput ceilings.
+    let mut scheduler_free_at = 0.0f64;
     let mut next_id: u64 = 0;
 
     // Three ceilings above the device's own: its share of the upstream
@@ -698,6 +819,22 @@ pub fn run_streams(
     let numa_latency = config.numa.latency_penalty_s();
     let mut ra_state = vec![ReadaheadState::default(); n];
     let mut memory_free_at = 0.0f64;
+    // Writeback pacing. A buffered writer is not stopped by the device;
+    // it is stopped by `balance_dirty_pages` deciding it has run too far
+    // ahead of what writeback has drained. `throttled_until` is when
+    // each stream's sleep ends.
+    let mut throttled_until = vec![0.0f64; n];
+    // An access pulled from an issuer that a gate then refused. Holding
+    // it rather than dropping it is what lets a gate be checked *after*
+    // the pull, which some gates need: whether an access reaches the
+    // device at all depends on what the access is.
+    let mut pending: Vec<Option<(u64, u64, bool)>> = vec![None; n];
+    // Writeback the kernel has issued and not yet completed. It belongs
+    // to no stream, so it needs its own count — and the run is not over
+    // until it reaches zero.
+    let mut kernel_outstanding: usize = 0;
+    let mut flusher = writeback::FlusherState::default();
+    let cache_ram = config.cache.map(|c| c.ram_bytes).unwrap_or(0);
     let mut stats = IoStats {
         peak_bandwidth: peak,
         device_peak_bandwidth: hardware.peak_bandwidth(),
@@ -709,15 +846,32 @@ pub fn run_streams(
         let mut blocked = false;
         // Once every foreground stream is finished the measurement is
         // over, whatever the background streams still have queued.
-        let foreground_done = (0..n)
+        let streams_done = (0..n)
             .filter(|&i| !streams[i].looping)
             .all(|i| exhausted[i] && outstanding[i] == 0);
-        if foreground_done && (0..n).any(|i| !streams[i].looping) {
+        // **A buffered rewrite is not finished when its last write
+        // returns.** The bytes are in memory; the job is done when they
+        // are on the device. Every algorithm here takes that barrier
+        // explicitly (`Op::Barrier`), so the run has to as well — and
+        // without it a buffered writer reports the time it took to fill
+        // the page cache, which is a measurement of memory.
+        let dirty_left = if config.writeback.enabled {
+            cache.as_ref().map(|c| c.dirty_pages()).unwrap_or(0)
+        } else {
+            0
+        };
+        let draining = streams_done && (0..n).any(|i| !streams[i].looping);
+        // Background streams may still be running — they are there as
+        // interference, and the measurement is over when the foreground
+        // is. What the foreground has to wait for is its own dirty pages
+        // and the writeback already in flight for them.
+        if draining && dirty_left == 0 && kernel_outstanding == 0 {
             break;
         }
 
         let mut host_blocked = false;
         let mut memory_blocked = false;
+        let mut writeback_blocked = false;
         for (i, stream) in streams.iter_mut().enumerate() {
             while !exhausted[i] && outstanding[i] < stream.offered_depth {
                 // A rate-capped stream may simply not be allowed to
@@ -728,10 +882,7 @@ pub fn run_streams(
                 // The device holds a finite number of commands. Wanting
                 // to submit when none are free is queue saturation, and
                 // it is the issuer that waits.
-                if serving.len() + scheduler.len() >= hardware.queue_slots {
-                    blocked = true;
-                    break;
-                }
+                //
                 // Issuing an I/O costs the host CPU. Above roughly half a
                 // million operations per second this, and not the device,
                 // is what runs out.
@@ -756,10 +907,59 @@ pub fn run_streams(
                     memory_blocked = true;
                     break;
                 }
-                let Some((offset, len, write)) = stream.issuer.next() else {
+                // `balance_dirty_pages`: a buffered writer that has run
+                // too far ahead of writeback is put to sleep. Like every
+                // other gate this is checked before the issuer is asked
+                // for an access, or the access is thrown away.
+                if throttled_until[i] > clock {
+                    writeback_blocked = true;
+                    break;
+                }
+                let Some((offset, len, write)) = pending[i].take().or_else(|| stream.issuer.next())
+                else {
                     exhausted[i] = true;
                     break;
                 };
+
+                // The device holds a finite number of commands, and
+                // wanting to submit when none are free is queue
+                // saturation. But a **buffered full-page write** issues
+                // no command at all — it dirties a page and returns — so
+                // a full queue is not its problem, and what stops it is
+                // `balance_dirty_pages` instead. Conflating the two
+                // would let queue saturation do the throttle's job and
+                // hide the mechanism entirely.
+                //
+                // This gate has to run after the pull, because whether
+                // an access reaches the device depends on what it is.
+                // The access is therefore held rather than dropped —
+                // checking gates before the pull and breaking out
+                // afterwards is what silently discarded every second
+                // access once before.
+                // Buffering a write is only possible where writeback
+                // exists to drain it. With `Writeback::OFF` — `O_DIRECT`,
+                // or the unbuffered runs the fio corpus was captured
+                // under — a write is the application's own I/O and goes
+                // to the device now.
+                // And only where the cache accepts written pages at all:
+                // `writes_occupy` is precisely the statement that a write
+                // lands in the page cache rather than going straight
+                // through, so a configuration that says otherwise must
+                // not have its writes quietly swallowed.
+                let page_bytes = cache.as_ref().map(|c| c.stats().page_bytes).unwrap_or(0);
+                let buffered_write = cache.is_some()
+                    && config.writeback.enabled
+                    && config.cache.is_some_and(|c| c.writes_occupy)
+                    && write
+                    && page_bytes > 0
+                    && offset % page_bytes == 0
+                    && len % page_bytes == 0;
+                if !buffered_write && serving.len() + scheduler.len() >= hardware.queue_slots {
+                    pending[i] = Some((offset, len, write));
+                    blocked = true;
+                    break;
+                }
+
                 host_free_at[core] = clock + config.host.per_request_s;
                 per_stream[i].accesses += 1;
                 stats.accesses += 1;
@@ -780,6 +980,28 @@ pub fn run_streams(
                     per_stream[i].cache_hits += hits;
 
                     memory_free_at = clock.max(memory_free_at) + config.host.memory_time_s(len);
+
+                    // Dirtying a page puts the writer under the pacing
+                    // loop. The drain rate it is paced against is the
+                    // device's write bandwidth, which is how a device's
+                    // weakness reaches the application as a rate rather
+                    // than as a latency on any single call.
+                    if write && config.writeback.enabled && cache_ram > 0 {
+                        let dirty = c.dirty_bytes();
+                        stats.peak_dirty_bytes = stats.peak_dirty_bytes.max(dirty);
+                        let pause = config.writeback.pause_seconds(
+                            dirty,
+                            cache_ram,
+                            len,
+                            hardware.write_bandwidth,
+                        );
+                        if pause > 0.0 {
+                            throttled_until[i] = clock + pause;
+                            flusher.throttled_s += pause;
+                            flusher.pauses += 1;
+                            stats.writeback_throttled_s += pause;
+                        }
+                    }
 
                     if let Some(cap) = stream.rate_cap {
                         next_submit_at[i] = clock.max(next_submit_at[i]) + len as f64 / cap;
@@ -819,26 +1041,50 @@ pub fn run_streams(
                                 ra.prefetched_to = from + ra.window;
                             }
                         } else {
-                            // Pattern broken: the kernel stops guessing
-                            // and reads only what was asked for.
+                            // Pattern broken — and this is where a
+                            // scattered reader is actively harmed rather
+                            // than merely unhelped. The kernel treats the
+                            // miss as the start of a new region and seeds
+                            // it optimistically, so the read pulls
+                            // `get_init_ra_size(len)` bytes instead of
+                            // `len`. On a stream with no locality those
+                            // extra pages are pure waste, charged to the
+                            // same bandwidth and the same queue the
+                            // useful bytes need.
+                            let seeded = config.readahead.initial_size(len);
                             ra.active = true;
                             ra.window = 0;
                             ra.region_start = offset;
-                            ra.prefetched_to = offset + len;
+                            ra.prefetched_to = offset + seeded;
+                            if seeded > len {
+                                prefetch = Some((offset + len, seeded - len));
+                            }
                         }
                     }
 
-                    for (start_page, count) in runs {
-                        scheduler.push(Request {
-                            id: next_id,
-                            stream: i,
-                            offset: start_page * page,
-                            len: count * page,
-                            write,
-                            submitted_at: clock,
-                        });
-                        next_id += 1;
-                        outstanding[i] += 1;
+                    // A buffered **write** does not reach the device at
+                    // all: it dirties a page and returns, and the page is
+                    // written back later by the flusher or by whoever
+                    // needs its frame. The one exception is a write that
+                    // does not cover a whole page — the rest of that page
+                    // has to be fetched before it can be modified, which
+                    // is the read-modify-write a sub-block scatter pays.
+                    if !buffered_write {
+                        for (start_page, count) in runs {
+                            scheduler.push(Request {
+                                id: next_id,
+                                stream: i,
+                                offset: start_page * page,
+                                len: count * page,
+                                // A read-modify-write fetches; the store
+                                // itself happens in memory.
+                                write: false,
+                                submitted_at: clock,
+                                kernel: false,
+                            });
+                            next_id += 1;
+                            outstanding[i] += 1;
+                        }
                     }
 
                     // The readahead itself: one request, however many
@@ -854,6 +1100,7 @@ pub fn run_streams(
                                 len: fetched * page,
                                 write: false,
                                 submitted_at: clock,
+                                kernel: false,
                             });
                             next_id += 1;
                             outstanding[i] += 1;
@@ -875,12 +1122,100 @@ pub fn run_streams(
                     len,
                     write,
                     submitted_at: clock,
+                    kernel: false,
                 });
                 next_id += 1;
                 outstanding[i] += 1;
                 if let Some(cap) = stream.rate_cap {
                     next_submit_at[i] = clock.max(next_submit_at[i]) + len as f64 / cap;
                 }
+            }
+        }
+
+        // ---- Writeback ---------------------------------------------------
+        // Two sources of writeback, and they cost differently. Pages
+        // whose frames were needed had to be cleaned on the allocation
+        // path, in LRU order. Pages the flusher chose were chosen in the
+        // order they were dirtied, which for a sequential writer is
+        // address order — the flusher's whole advantage.
+        if let Some(c) = cache.as_mut()
+            && config.writeback.enabled
+            && cache_ram > 0
+        {
+            let page_bytes = c.stats().page_bytes;
+            let mut to_write: Vec<u64> = c.take_writebacks();
+            stats.eviction_writebacks += to_write.len() as u64;
+
+            // The flusher shares the device queue with everyone else and
+            // does not get to own it: Linux bounds writeback's in-flight
+            // work so foreground I/O still gets through. That bound is on
+            // *requests*, not pages — a sequential writer's batch is one
+            // request however many pages it covers, and a scattered
+            // writer's is one per page, which is exactly where the two
+            // part company.
+            let queue_room = hardware
+                .queue_slots
+                .saturating_sub(serving.len() + scheduler.len());
+            // Half the free slots, but never zero while there is room at
+            // all — a device with a shallow queue would otherwise leave
+            // the flusher unable to make progress.
+            let run_budget = if queue_room == 0 {
+                0
+            } else {
+                (queue_room / 2).max(1)
+            };
+
+            let dirty = c.dirty_bytes();
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            if run_budget > 0 {
+                if draining || config.writeback.flusher_wanted(dirty, cache_ram) {
+                    runs = c.flush_dirty_runs(config.writeback.batch_pages, run_budget, None);
+                } else if flusher.timer_due(clock, &config.writeback) {
+                    // The periodic flusher, whose job is age rather than
+                    // volume: anything dirtied more than
+                    // `dirty_expire_centisecs` ago goes now.
+                    flusher.last_wake_s = clock;
+                    runs = c.flush_dirty_runs(
+                        config.writeback.batch_pages,
+                        run_budget,
+                        Some(clock - config.writeback.expire_s),
+                    );
+                }
+            }
+            let flushed: u64 = runs.iter().map(|(_, count)| *count).sum();
+            stats.flusher_writebacks += flushed;
+            flusher.flushed_pages += flushed;
+
+            // Pages cleaned on the eviction path go out as they came,
+            // one run at a time — nobody sorted them.
+            to_write.sort_unstable();
+            let mut run: Option<(u64, u64)> = None;
+            for page in to_write {
+                match run {
+                    Some((start, count)) if start + count == page => run = Some((start, count + 1)),
+                    Some(pair) => {
+                        runs.push(pair);
+                        run = Some((page, 1));
+                    }
+                    None => run = Some((page, 1)),
+                }
+            }
+            if let Some(pair) = run {
+                runs.push(pair);
+            }
+
+            for (start, count) in runs {
+                scheduler.push(Request {
+                    id: next_id,
+                    stream: 0,
+                    offset: start * page_bytes,
+                    len: count * page_bytes,
+                    write: true,
+                    submitted_at: clock,
+                    kernel: true,
+                });
+                next_id += 1;
+                kernel_outstanding += 1;
             }
         }
 
@@ -906,6 +1241,23 @@ pub fn run_streams(
                 ),
             };
             let Some(req) = picked else { break };
+            // Dispatching through the scheduler is serialized: one
+            // request at a time gets through its lock, whatever the core
+            // count. This is the term that caps mq-deadline and bfq well
+            // below the device.
+            // The scheduler's lock and the device's controller are
+            // separate resources that pipeline, so the dispatch rate is
+            // bounded by whichever is slower rather than by their sum.
+            let dispatch_cost = scheduler.dispatch_cost_s();
+            let scheduler_wait = if dispatch_cost > 0.0 {
+                let wait = (scheduler_free_at - clock).max(0.0);
+                scheduler_free_at = clock + wait + dispatch_cost;
+                stats.scheduler_blocked_s += wait;
+                stats.scheduler_busy_s += dispatch_cost;
+                wait + dispatch_cost
+            } else {
+                0.0
+            };
             let controller_wait = (controller_free_at - clock).max(0.0);
             controller_free_at = clock + controller_wait + hardware.command_time_s();
             let variation = if req.write {
@@ -915,7 +1267,8 @@ pub fn run_streams(
                     .read_variation
                     .draw(rng.random::<f64>(), rng.random::<f64>())
             };
-            let positioning = controller_wait
+            let positioning = scheduler_wait
+                + controller_wait
                 + numa_latency
                 + hardware.access_time_full(
                     head,
@@ -973,6 +1326,26 @@ pub fn run_streams(
             if memory_free_at > clock && memory_free_at.is_finite() {
                 stats.memory_blocked_s += memory_free_at - clock;
                 clock = memory_free_at;
+                continue;
+            }
+            // Every writer is asleep in `balance_dirty_pages`. The clock
+            // moves to the first wake-up; the device is idle in the
+            // meantime, which is exactly what the throttle intends.
+            let wake = (0..n)
+                .filter(|&i| !exhausted[i] && throttled_until[i] > clock)
+                .map(|i| throttled_until[i])
+                .fold(f64::INFINITY, f64::min);
+            if wake.is_finite() {
+                clock = wake;
+                continue;
+            }
+            // Nothing is in flight and no clock is holding anything back,
+            // yet a stream still has accesses left. A buffered writer is
+            // exactly this: its writes land in memory and produce no
+            // device work at all, so an empty device says nothing about
+            // whether it is finished. Go round again — submission is
+            // ungated and will make progress.
+            if (0..n).any(|i| !streams[i].looping && !exhausted[i]) {
                 continue;
             }
             break;
@@ -1089,6 +1462,18 @@ pub fn run_streams(
         if memory_blocked && memory_free_at > clock {
             dt = dt.min(memory_free_at - clock);
         }
+        // A throttled writer wakes on its own schedule, and the device
+        // may finish everything it has before then — so the step has to
+        // stop at the wake-up, or the writer resumes late.
+        if writeback_blocked {
+            let wake = (0..n)
+                .filter(|&i| !exhausted[i] && throttled_until[i] > clock)
+                .map(|i| throttled_until[i])
+                .fold(f64::INFINITY, f64::min);
+            if wake.is_finite() {
+                dt = dt.min(wake - clock);
+            }
+        }
         if !dt.is_finite() || dt <= 0.0 {
             dt = 1e-12;
         }
@@ -1187,15 +1572,20 @@ pub fn run_streams(
                 continue;
             }
             let latency = clock - s.req.submitted_at;
+            scheduler.release(s.req.write, latency);
             stats.requests_completed += 1;
             stats.total_latency_s += latency;
             stats.max_latency_s = stats.max_latency_s.max(latency);
             hist.record(latency);
-            stream_hist[s.req.stream].record(latency);
-            per_stream[s.req.stream].completed += 1;
-            per_stream[s.req.stream].bytes += s.req.len;
-            per_stream[s.req.stream].total_latency_s += latency;
-            outstanding[s.req.stream] -= 1;
+            if s.req.kernel {
+                kernel_outstanding = kernel_outstanding.saturating_sub(1);
+            } else {
+                stream_hist[s.req.stream].record(latency);
+                per_stream[s.req.stream].completed += 1;
+                per_stream[s.req.stream].bytes += s.req.len;
+                per_stream[s.req.stream].total_latency_s += latency;
+                outstanding[s.req.stream] -= 1;
+            }
             serving[idx].acked = true;
         }
 
@@ -1214,17 +1604,22 @@ pub fn run_streams(
                 }
                 if !s.acked {
                     let latency = clock - s.req.submitted_at;
+                    scheduler.release(s.req.write, latency);
                     stats.requests_completed += 1;
                     stats.total_latency_s += latency;
                     stats.max_latency_s = stats.max_latency_s.max(latency);
 
                     let sidx = s.req.stream;
                     hist.record(latency);
-                    stream_hist[sidx].record(latency);
-                    per_stream[sidx].completed += 1;
-                    per_stream[sidx].bytes += s.req.len;
-                    per_stream[sidx].total_latency_s += latency;
-                    outstanding[sidx] -= 1;
+                    if s.req.kernel {
+                        kernel_outstanding = kernel_outstanding.saturating_sub(1);
+                    } else {
+                        stream_hist[sidx].record(latency);
+                        per_stream[sidx].completed += 1;
+                        per_stream[sidx].bytes += s.req.len;
+                        per_stream[sidx].total_latency_s += latency;
+                        outstanding[sidx] -= 1;
+                    }
                 }
                 serving.swap_remove(i);
             } else {
@@ -1924,26 +2319,84 @@ mod platform {
 
     // ---- Readahead ----------------------------------------------------
 
-    /// **Readahead is asymmetric, and that asymmetry is the point.** It
-    /// engages for an ascending reader and disengages for a scattered
-    /// one, so the two do not merely differ in locality — they get
-    /// different fetch granularity from the kernel.
+    /// **Readahead is asymmetric, and the asymmetry runs both ways.**
+    ///
+    /// For an ascending reader it coalesces: one window-sized request
+    /// replaces many page faults, and most of the device traffic is
+    /// prefetch that gets used. For a scattered reader it does not simply
+    /// stand down — every miss outside the tracked region is treated as
+    /// the start of a new one and seeded at `get_init_ra_size`, so the
+    /// reader gets a prefetch alongside each fault and none of it is ever
+    /// hit. Same mechanism, opposite sign.
     #[test]
-    fn readahead_engages_for_ordered_access_and_not_for_scattered() {
+    fn readahead_helps_an_ordered_reader_and_taxes_a_scattered_one() {
         let cfg = buffered(Readahead::DEFAULT);
         let o = ordered(cfg, &hw::SPINNING_SATA_HW, 20_000);
         let s = scattered(cfg, &hw::SPINNING_SATA_HW, 2_000);
 
         let ordered_share = o.readahead_requests as f64 / o.requests_completed.max(1) as f64;
-        let scattered_share = s.readahead_requests as f64 / s.requests_completed.max(1) as f64;
         assert!(
             ordered_share > 0.5,
             "most of an ordered reader's device traffic should be readahead, got {ordered_share:.2}"
         );
         assert!(
-            scattered_share < 0.05,
-            "a scattered reader should get essentially none, got {scattered_share:.2}"
+            s.readahead_requests > 0,
+            "a scattered reader is seeded on every miss, not left alone"
         );
+
+        // And the seeded pages are wasted: turning readahead off moves
+        // strictly fewer bytes for the same accesses.
+        let off = scattered(buffered(Readahead::OFF), &hw::SPINNING_SATA_HW, 2_000);
+        assert!(
+            off.bytes_transferred < s.bytes_transferred,
+            "POSIX_FADV_RANDOM should move fewer bytes: {} against {}",
+            off.bytes_transferred,
+            s.bytes_transferred
+        );
+        assert!(
+            s.bytes_transferred as f64 / off.bytes_transferred as f64 > 2.0,
+            "and by a wide margin — the seed is four pages against one: {:.1}x",
+            s.bytes_transferred as f64 / off.bytes_transferred as f64
+        );
+    }
+
+    /// **The tax, priced.** For a scattered reader, readahead is not
+    /// neutral — it costs time as well as bytes, because the speculative
+    /// pages consume the same bandwidth and the same queue slots the
+    /// useful ones need. This is why the remedy is `POSIX_FADV_RANDOM`
+    /// (or `O_DIRECT`), and why an algorithm that cannot avoid scattered
+    /// access has to give up the page cache to stop paying for it.
+    #[test]
+    fn readahead_makes_a_scattered_reader_slower_not_merely_no_faster() {
+        for hardware in [&hw::SPINNING_SATA_HW, &hw::NVME_CONSUMER_HW] {
+            let on = scattered(buffered(Readahead::DEFAULT), hardware, 4_000);
+            let off = scattered(buffered(Readahead::OFF), hardware, 4_000);
+            assert!(
+                on.elapsed_s > off.elapsed_s,
+                "{}: readahead should cost a scattered reader time,                  got {:.3}s on against {:.3}s off",
+                hardware.name,
+                on.elapsed_s,
+                off.elapsed_s
+            );
+        }
+    }
+
+    /// The initial seed follows Linux's formula exactly, which is what
+    /// makes the tax above a citation rather than a guess.
+    #[test]
+    fn the_initial_readahead_size_follows_get_init_ra_size() {
+        let ra = Readahead::DEFAULT; // 128 KiB ceiling
+        // 4 KiB rounds to 4 KiB, which is max/32, so it quadruples.
+        assert_eq!(ra.initial_size(4_096), 16_384);
+        // 8 KiB is above max/32 but at or below max/4, so it doubles.
+        assert_eq!(ra.initial_size(8_192), 16_384);
+        assert_eq!(ra.initial_size(32_768), 65_536);
+        // Past max/4 it saturates at the ceiling.
+        assert_eq!(ra.initial_size(65_536), 131_072);
+        // And a request larger than the ceiling is never shrunk.
+        assert_eq!(ra.initial_size(1 << 20), 1 << 20);
+        // With readahead off, exactly what was asked for.
+        assert_eq!(Readahead::OFF.initial_size(4_096), 4_096);
     }
 
     /// Readahead coalesces: one window-sized request replaces many page
@@ -2588,6 +3041,449 @@ mod write_path {
         assert!(
             at(4.0) < at(1.0),
             "garbage collection must show up as read interference"
+        );
+    }
+}
+
+#[cfg(test)]
+mod kernel {
+    //! The kernel's own machinery: which block scheduler is in force,
+    //! and how dirty pages are paced back to the device.
+    //!
+    //! Both of these are configuration a benchmark usually forgets to
+    //! state, and both move the answer by more than the algorithm being
+    //! benchmarked often does.
+
+    use super::*;
+    use crate::cache::CacheConfig;
+    use crate::io::sched::{Bfq, Kyber, LinuxScheduler, MqDeadline};
+
+    const SPAN: u64 = 512 << 20;
+
+    fn random_reads(n: u64) -> RandomAccess {
+        RandomAccess::new(SPAN, 4_096, n, 0xD15C)
+    }
+
+    // ---- Schedulers ---------------------------------------------------
+
+    /// **The measured ceilings, reproduced.** Ren et al. (ICPE '24)
+    /// report peak single-SSD throughput of 785.7 KIOPS under `none` and
+    /// `kyber`, 569.2 under `mq-deadline` and 315.3 under `bfq`, and
+    /// attribute the shortfall to lock contention rather than to policy.
+    /// Modelling that as a serialized per-dispatch cost reproduces the
+    /// ranking and the ratios.
+    #[test]
+    fn the_scheduler_ceilings_match_the_published_measurements() {
+        let mut results = Vec::new();
+        for scheduler in LinuxScheduler::ALL {
+            let mut issuer = random_reads(60_000);
+            let stats = run_under(
+                &hw::NVME_MODERN_HW,
+                scheduler,
+                &mut issuer,
+                RunConfig {
+                    host: hw::HostModel::cores(16),
+                    ..RunConfig::direct(256, SPAN)
+                },
+            );
+            results.push((scheduler, stats.requests_completed as f64 / stats.elapsed_s));
+        }
+
+        let iops = |s: LinuxScheduler| {
+            results
+                .iter()
+                .find(|(k, _)| *k == s)
+                .map(|(_, v)| *v)
+                .unwrap()
+        };
+        let none = iops(LinuxScheduler::None);
+        let kyber = iops(LinuxScheduler::Kyber);
+        let deadline = iops(LinuxScheduler::MqDeadline);
+        let bfq = iops(LinuxScheduler::Bfq);
+
+        assert!(
+            deadline < none * 0.95,
+            "mq-deadline should fall short of none: {deadline:.0} against {none:.0}"
+        );
+        assert!(
+            bfq < deadline,
+            "and bfq should fall further: {bfq:.0} against {deadline:.0}"
+        );
+        assert!(
+            kyber > none * 0.9,
+            "kyber should stay close to none: {kyber:.0} against {none:.0}"
+        );
+
+        // The ceilings themselves, where the device is fast enough to
+        // expose them.
+        assert!(
+            (deadline - LinuxScheduler::MqDeadline.measured_ceiling_iops()).abs()
+                / LinuxScheduler::MqDeadline.measured_ceiling_iops()
+                < 0.15,
+            "mq-deadline should land near its 569.2 KIOPS ceiling, got {deadline:.0}"
+        );
+        assert!(
+            (bfq - LinuxScheduler::Bfq.measured_ceiling_iops()).abs()
+                / LinuxScheduler::Bfq.measured_ceiling_iops()
+                < 0.15,
+            "bfq should land near its 315.3 KIOPS ceiling, got {bfq:.0}"
+        );
+    }
+
+    /// The ceiling is a *serialized* cost, so adding cores does not lift
+    /// it — which is the observation that told the paper's authors it was
+    /// lock contention rather than CPU cost per request.
+    #[test]
+    fn the_scheduler_ceiling_does_not_move_with_core_count() {
+        let at = |cores: usize| {
+            let mut issuer = random_reads(40_000);
+            let stats = run_under(
+                &hw::NVME_MODERN_HW,
+                LinuxScheduler::Bfq,
+                &mut issuer,
+                RunConfig {
+                    host: hw::HostModel::cores(cores),
+                    ..RunConfig::direct(256, SPAN)
+                },
+            );
+            stats.requests_completed as f64 / stats.elapsed_s
+        };
+        let few = at(4);
+        let many = at(32);
+        assert!(
+            (many / few - 1.0).abs() < 0.1,
+            "eight times the cores should not move a lock-bound ceiling: \
+             {few:.0} against {many:.0}"
+        );
+    }
+
+    /// And the time shows up where it can be seen, rather than being
+    /// silently folded into the device's latency.
+    #[test]
+    fn scheduler_time_is_reported_separately() {
+        let mut issuer = random_reads(20_000);
+        let bfq = run_under(
+            &hw::NVME_MODERN_HW,
+            LinuxScheduler::Bfq,
+            &mut issuer,
+            RunConfig::direct(256, SPAN),
+        );
+        let mut issuer = random_reads(20_000);
+        let none = run_under(
+            &hw::NVME_MODERN_HW,
+            LinuxScheduler::None,
+            &mut issuer,
+            RunConfig::direct(256, SPAN),
+        );
+        assert!(bfq.scheduler_blocked_s > 0.0);
+        assert_eq!(none.scheduler_blocked_s, 0.0);
+    }
+
+    /// **Sorting only pays once.** `mq-deadline` orders requests before
+    /// the device sees them, which is worth real time against a device
+    /// that serves them in arrival order — and worth nothing against one
+    /// that reorders on its own, because the work has already been done
+    /// by the time the scheduler could do it.
+    ///
+    /// Both halves matter. The first is why the scheduler exists; the
+    /// second is why "use `none`" became the advice for NVMe, and it is
+    /// advice about *devices that reorder*, not about flash as such.
+    #[test]
+    fn scheduler_sorting_pays_only_where_the_device_does_not_reorder() {
+        let at = |scheduler: LinuxScheduler, hardware: &hw::Hardware| {
+            let mut issuer = RandomAccess::new(SPAN, 4_096, 4_000, 0xB0B);
+            run_under(
+                hardware,
+                scheduler,
+                &mut issuer,
+                RunConfig::direct(64, SPAN),
+            )
+            .elapsed_s
+        };
+
+        // A drive that serves in arrival order: sorting is the whole
+        // difference between a sweep and a sequence of random seeks.
+        let fifo = hw::Hardware {
+            policy: hw::ServicePolicy::Fifo,
+            ..hw::SPINNING_SATA_HW
+        };
+        let sorted = at(LinuxScheduler::MqDeadline, &fifo);
+        let unsorted = at(LinuxScheduler::None, &fifo);
+        assert!(
+            sorted < unsorted,
+            "sorting should pay against a FIFO device: {sorted:.3}s against {unsorted:.3}s"
+        );
+
+        // The same drive with native reordering: the device has already
+        // taken the win, and the scheduler's sort is redundant.
+        let native_sorted = at(LinuxScheduler::MqDeadline, &hw::SPINNING_SATA_HW);
+        let native_unsorted = at(LinuxScheduler::None, &hw::SPINNING_SATA_HW);
+        assert!(
+            native_sorted >= native_unsorted * 0.97,
+            "against a reordering device the scheduler adds nothing: \
+             {native_sorted:.3}s against {native_unsorted:.3}s"
+        );
+        assert!(
+            native_unsorted < unsorted,
+            "and the device's own reordering is what produced the win: \
+             {native_unsorted:.3}s against {unsorted:.3}s"
+        );
+    }
+
+    /// Kyber's mechanism is depth limiting, not reordering: its token
+    /// pools bound how much of each direction is in flight, and the
+    /// bounds are the kernel's.
+    #[test]
+    fn kyber_bounds_what_is_in_flight_per_direction() {
+        let mut kyber = Kyber::default();
+        assert_eq!(kyber.tokens(false), Kyber::MAX_READ_TOKENS);
+        assert_eq!(kyber.tokens(true), Kyber::MAX_WRITE_TOKENS);
+
+        // **One direction alone is never squeezed.** Reads missing their
+        // target with no writes to protect leaves the pool at its cap —
+        // there is nobody being starved, so nothing to make room for.
+        for _ in 0..200 {
+            kyber.observe(false, kyber.read_target_s * 100.0);
+        }
+        assert_eq!(
+            kyber.tokens(false),
+            Kyber::MAX_READ_TOKENS,
+            "with no other direction to protect, Kyber does not throttle"
+        );
+
+        // Writes well inside their target while reads miss theirs badly:
+        // now the writes give ground, which is the whole rule.
+        let mut mixed = Kyber::default();
+        for _ in 0..200 {
+            mixed.observe(false, mixed.read_target_s * 50.0);
+            mixed.observe(true, mixed.write_target_s / 100.0);
+        }
+        assert!(
+            mixed.tokens(true) < Kyber::MAX_WRITE_TOKENS,
+            "the well-served direction yields depth to the starved one"
+        );
+        assert_eq!(
+            mixed.tokens(false),
+            Kyber::MAX_READ_TOKENS,
+            "and the starved one keeps all of its own"
+        );
+
+        // It never shrinks below one, or nothing would ever issue.
+        for _ in 0..10_000 {
+            mixed.observe(false, mixed.read_target_s * 50.0);
+            mixed.observe(true, mixed.write_target_s / 100.0);
+        }
+        assert_eq!(mixed.tokens(true), Kyber::MIN_TOKENS);
+    }
+
+    /// `mq-deadline`'s defaults are the kernel's, and the asymmetry
+    /// between them is the policy: a reader is usually waiting on its
+    /// result and a writer usually is not.
+    #[test]
+    fn mq_deadline_carries_the_kernel_defaults() {
+        let d = MqDeadline::default();
+        assert_eq!(d.read_expire_s, 0.5);
+        assert_eq!(d.write_expire_s, 5.0);
+        assert_eq!(d.fifo_batch, 16);
+        assert_eq!(d.writes_starved, 2);
+        assert_eq!(d.read_expire_s * 10.0, d.write_expire_s);
+    }
+
+    /// BFQ gives each stream exclusive access for a bounded budget, so a
+    /// background flood cannot monopolise the queue ahead of a
+    /// foreground reader. That is what it trades its throughput for.
+    #[test]
+    fn bfq_shares_the_device_between_streams() {
+        let mut foreground = RandomAccess::new(SPAN, 4_096, 3_000, 1);
+        let mut background = RandomAccess::new(SPAN, 4_096, 60_000, 2);
+        let mut streams = [
+            Stream::new("foreground", &mut foreground, 4),
+            Stream::new("background", &mut background, 128),
+        ];
+        let mut bfq = Bfq::default();
+        let result = run_streams(
+            &hw::NVME_CONSUMER_HW,
+            &mut bfq,
+            &mut streams,
+            RunConfig::direct(128, SPAN),
+        );
+        let fg = result.stream("foreground");
+        assert!(
+            fg.completed > 0,
+            "a budget-fair scheduler must not starve the foreground"
+        );
+        assert!(
+            fg.mean_latency_s() < result.stream("background").mean_latency_s() * 4.0,
+            "and the foreground's latency should stay in the same class"
+        );
+    }
+
+    // ---- Writeback ----------------------------------------------------
+
+    fn sequential_writes(n: u64, block: u64) -> SequentialAccess {
+        SequentialAccess::new(SPAN, block, n, true)
+    }
+
+    /// **A buffered writer cannot outrun the device for long.** It runs
+    /// at memory speed until the dirty total reaches the setpoint, and
+    /// from there `balance_dirty_pages` paces it to what writeback
+    /// drains. The page cache decides how long the illusion lasts, not
+    /// whether it ends.
+    #[test]
+    fn a_buffered_writer_is_paced_to_the_drain_rate() {
+        let ram = 64 << 20;
+        let cache = CacheConfig::new(ram, 4_096);
+        let mut issuer = sequential_writes(200_000, 4_096);
+        let stats = run(
+            &hw::SATA_SSD_HW,
+            &mut sched::Noop::default(),
+            &mut issuer,
+            RunConfig::buffered(32, SPAN, cache),
+        );
+        assert!(
+            stats.writeback_throttled_s > 0.0,
+            "a writer this far past the threshold should have been paused"
+        );
+        let achieved = stats.bytes_transferred as f64 / stats.elapsed_s;
+        assert!(
+            achieved <= hw::SATA_SSD_HW.write_bandwidth * 1.2,
+            "sustained {achieved:.0} B/s should not exceed the device's \
+             write bandwidth {:.0} B/s",
+            hw::SATA_SSD_HW.write_bandwidth
+        );
+    }
+
+    /// **Buffering moves the waiting; it does not move the work.**
+    ///
+    /// The same bytes reach the device either way, because the data has
+    /// to land somewhere. What buffering changes is *when* the writer
+    /// waits — in `balance_dirty_pages` rather than in the write call —
+    /// and what coalescing the flusher can do on the way out. Comparing
+    /// the two is how you tell an improvement from a deferral.
+    #[test]
+    fn buffering_moves_the_waiting_rather_than_the_work() {
+        let cache = CacheConfig::new(64 << 20, 4_096);
+        let at = |writeback: Writeback| {
+            let mut issuer = sequential_writes(100_000, 4_096);
+            run(
+                &hw::SATA_SSD_HW,
+                &mut sched::Noop::default(),
+                &mut issuer,
+                RunConfig {
+                    writeback,
+                    ..RunConfig::buffered(32, SPAN, cache)
+                },
+            )
+        };
+        let buffered = at(Writeback::DEFAULT);
+        let direct = at(Writeback::OFF);
+
+        assert!(
+            buffered.writeback_throttled_s > 0.0,
+            "the buffered writer should have been paced"
+        );
+        assert_eq!(
+            direct.writeback_throttled_s, 0.0,
+            "and the direct one never is — it waits on the device instead"
+        );
+        assert_eq!(
+            direct.peak_dirty_bytes, 0,
+            "a direct write dirties nothing; there is no backlog to hold"
+        );
+        assert!(
+            buffered.peak_dirty_bytes > 0,
+            "and a buffered one always has some"
+        );
+
+        // The same payload lands on the device either way.
+        let ratio = buffered.bytes_transferred as f64 / direct.bytes_transferred as f64;
+        assert!(
+            (ratio - 1.0).abs() < 0.02,
+            "the bytes are the same: {} buffered against {} direct",
+            buffered.bytes_transferred,
+            direct.bytes_transferred
+        );
+        // What differs is how many commands carried them: the flusher
+        // coalesces a sequential writer's pages into large extents, which
+        // a direct writer issuing 4 KiB at a time cannot do.
+        assert!(
+            buffered.requests_completed * 100 < direct.requests_completed,
+            "coalescing should collapse the command count: {} against {}",
+            buffered.requests_completed,
+            direct.requests_completed
+        );
+    }
+
+    /// **Dirty pages are not free to evict.** A frame holding unwritten
+    /// data cannot be handed to a new page until its contents reach the
+    /// device, so a cache under pressure turns evictions into writes —
+    /// issued on the allocation path, in LRU order, which is the order
+    /// the flusher exists to avoid.
+    #[test]
+    fn evicting_a_dirty_page_costs_a_write() {
+        // A cache far smaller than what is written, so every frame is
+        // reused many times over.
+        let cache = CacheConfig::new(2 << 20, 4_096);
+        let mut issuer = RandomAccess::writes(SPAN, 4_096, 20_000, 0xE71C7);
+        let stats = run(
+            &hw::NVME_CONSUMER_HW,
+            &mut sched::Noop::default(),
+            &mut issuer,
+            RunConfig {
+                // The flusher off, so the only way a page gets written is
+                // by being evicted — which isolates the mechanism.
+                writeback: Writeback {
+                    background_ratio: 0.99,
+                    ratio: 0.999,
+                    ..Writeback::DEFAULT
+                },
+                ..RunConfig::buffered(32, SPAN, cache)
+            },
+        );
+        assert!(
+            stats.eviction_writebacks > 0,
+            "a cache this small must be cleaning dirty pages to make room"
+        );
+        assert!(
+            stats.eviction_writebacks > stats.flusher_writebacks,
+            "and with the thresholds this high, most pages went out the \
+             expensive way: {} by eviction against {} by the flusher",
+            stats.eviction_writebacks,
+            stats.flusher_writebacks
+        );
+    }
+
+    /// With the flusher enabled the same workload gets its pages written
+    /// by the flusher instead, and the eviction path is left alone. Which
+    /// path a page takes is what the thresholds decide.
+    #[test]
+    fn the_flusher_takes_the_pages_the_eviction_path_would_have() {
+        let cache = CacheConfig::new(8 << 20, 4_096);
+        let at = |writeback: Writeback| {
+            let mut issuer = RandomAccess::writes(SPAN, 4_096, 20_000, 0xF105);
+            run(
+                &hw::NVME_CONSUMER_HW,
+                &mut sched::Noop::default(),
+                &mut issuer,
+                RunConfig {
+                    writeback,
+                    ..RunConfig::buffered(32, SPAN, cache)
+                },
+            )
+        };
+        let flushing = at(Writeback::SHALLOW);
+        let hoarding = at(Writeback {
+            background_ratio: 0.99,
+            ratio: 0.999,
+            ..Writeback::DEFAULT
+        });
+        assert!(flushing.flusher_writebacks > 0);
+        assert!(
+            flushing.eviction_writebacks < hoarding.eviction_writebacks,
+            "flushing early should leave fewer dirty pages to trip over: \
+             {} against {}",
+            flushing.eviction_writebacks,
+            hoarding.eviction_writebacks
         );
     }
 }

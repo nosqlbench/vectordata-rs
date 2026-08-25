@@ -41,10 +41,11 @@ Every stage one request passes through, and what can stop it at each:
 
 ```
 veks-study sweep <axis> [options]   # vary one parameter, see the deltas
+veks-study study <name>             # a terabyte-scale parameter walk; `all` for every one
 veks-study validate                 # the scorecard below
 veks-study devices                  # what is modelled
 veks-study report                   # the full standing report
-veks-study help                     # axes and options
+veks-study help                     # axes, studies and options
 ```
 
 Sweeps vary exactly one parameter, hold the rest fixed, print what they
@@ -68,6 +69,45 @@ $ veks-study sweep depth --device nvme-modern --cores 8
 Axes: `block`, `depth`, `device`, `cores`, `page`, `ram`, `readahead`,
 `numa`, `fabric`, `record`, `budget`. `--vs first|prev|none` chooses what
 the deltas are measured against.
+
+### Studies — where a staged rewrite becomes necessary
+
+Sweeps run at tens of thousands of records, which finishes in seconds by
+any method and never presses against a ceiling. The **studies** ask the
+question that scale cannot: at a terabyte and a billion ordinals, with
+memory a small fraction of the payload, which strategies finish and
+which do not.
+
+```
+veks-study study scale        # ordinal count, a million to a billion
+veks-study study memory       # memory as a fraction of the payload
+veks-study study record       # record size — where the boundary actually is
+veks-study study strategies   # all four strategies, per device
+veks-study study pegged       # which resources saturate, and how many at once
+veks-study study bounds       # D_max, the knee n*, utilization
+veks-study study depth        # issue depth against the knee
+veks-study study fanout       # container size, fan-out, stage count
+veks-study study readahead    # why block readahead taxes a scattered rewrite
+veks-study study scheduler    # what the Linux block scheduler costs
+veks-study study writeback    # dirty-page pacing and the eviction path
+veks-study study frontier     # the boundary itself
+```
+
+Four strategies are priced, not two:
+
+| Strategy | Reads | Writes | Cost |
+|---|---|---|---|
+| naive gather | random, one command per record | coalesced | `N` commands, `⌈R/B⌉·B` bytes each |
+| naive scatter | streamed | random; a partial block costs a read-modify-write | `N` commands, bytes twice |
+| ordered rescan | ascending, but the source is swept once per segment | coalesced | `A(P)` read passes, `A(P) = P·(1−e^{−w/P})` |
+| **gsplat staged** | ascending, **once** | coalesced, via a spill extent | `ceil(log_f(segments)) + 1` sequential passes each way |
+
+The distinction between the last two is the finding the studies keep
+returning to. Ordering the reads is not what scales — **staging** is.
+A re-scan's cost grows with `payload/M`; a staged rewrite's grows with
+`log_f(payload/M)` where `f = M/W` is the fan-out, a quarter of a million
+for a 32 GiB budget and 128 KiB containers. A terabyte and a petabyte
+both need exactly one distribution stage.
 
 ## Reproducing everything here
 
@@ -210,12 +250,47 @@ Stated because a model that hides these is not worth using.
   trades scatter for bias monotonically, with no optimum. The value is a
   judgement.
 
+## What the kernel does to the rewrite
+
+Three parts of the operating system move the answer by more than the
+algorithm often does, so all three are modelled rather than assumed away.
+
+**Block scheduler.** `none`, `mq-deadline`, `kyber` and `bfq`, each with
+its real policy and its measured cost. Ren et al. (ICPE '24) find the
+cost is lock contention rather than policy, so it is modelled as a
+serialized per-dispatch time: against a 785.7 KIOPS device, `mq-deadline`
+reproduces at 567k against its published 569.2k and `bfq` at 315k against
+315.3k. `kyber`'s token rule is the paper's — a direction's depth is cut
+only when it is well served *and the other direction is starved* — not a
+latency clamp, which would be a much harsher algorithm.
+
+**Writeback pacing.** Dirty pages, the two thresholds
+(`dirty_background_ratio` 10%, `dirty_ratio` 20%), the expiry and timer
+(30 s, 5 s), and the IO-less throttle that sleeps a writer rather than
+making it submit writeback itself — cubic position ratio, 200 ms maximum
+pause. A buffered rewrite is not finished when its last write returns, so
+runs drain to durability before the clock stops.
+
+**Page-cache eviction of dirty pages.** A frame holding unwritten data
+cannot be reused until its contents reach the device, so eviction turns
+into a write on the allocation path, one page at a time, in LRU order.
+Which path a page takes — flusher or eviction — is counted separately,
+and the split is a mechanism-level statement about the rewrite: a naive
+gather's scattered *reads* claim the frames holding output pages the
+flusher has not written yet, so its writeback fragments even though its
+writes are perfectly ordered. Scattered reads cost twice.
+
+**Readahead**, likewise, is not neutral on a scattered stream. A miss the
+kernel does not recognize as sequential starts a new region seeded at
+`get_init_ra_size` — a 4 KiB fault fetches 16 KiB against a 128 KiB
+ceiling — so readahead is a subsidy for one access pattern and a tax on
+the other. `POSIX_FADV_RANDOM` is the documented remedy and the model
+reproduces why.
+
 ## What is not modelled at all
 
 - Filesystem geometry — extents, fragmentation, journal traffic,
   metadata. The address space is flat.
-- The I/O scheduler's own CPU cost. Ren et al. measure up to 63.4%
-  throughput overhead from Linux schedulers; the ones here are free.
 - Tail latency beyond p99.9.
 - Multi-device striping. One device, with the upstream link represented
   only as a share.
@@ -238,7 +313,10 @@ Which source grounds which parameter:
 |---|---|
 | Every device curve, latency distribution and contention point | [perfscripts](https://github.com/jshook/perfscripts) fio corpus |
 | Host cost per request, by API | [Didona et al., SYSTOR '22](https://atlarge-research.com/pdfs/2022-systor-apis.pdf) — libaio 144.9 KIOPS/core, io_uring 171.5, SPDK 305.9 |
-| Modern NVMe regime, CPU-bound finding, scheduler overhead | [Ren et al., ICPE '24](https://dl.acm.org/doi/10.1145/3629526.3645053) ([artifact](https://zenodo.org/records/10599514)) |
+| Modern NVMe regime, CPU-bound finding, per-scheduler ceilings and the Kyber token rule | [Ren, Doekemeijer, Tehrany & Trivedi, ICPE '24](https://dl.acm.org/doi/10.1145/3629526.3645053) ([artifact](https://zenodo.org/records/10599514)) — none/kyber 785.7 KIOPS, mq-deadline 569.2, bfq 315.3; up to 78.0% of cycles under lock |
+| Dirty-page thresholds, expiry and flusher timing | [`Documentation/admin-guide/sysctl/vm.rst`](https://docs.kernel.org/admin-guide/sysctl/vm.html) — 10%/20%, 30 s, 5 s |
+| The IO-less writeback throttle: setpoint, position ratio, 200 ms pause cap | [Wu Fengguang, *No-I/O dirty throttling*, LWN 456904 (2011)](https://lwn.net/Articles/456904/) |
+| Initial readahead size on a non-sequential miss | `linux/mm/readahead.c`, `get_init_ra_size` |
 | NAND page-type read latency, program latency bands | [Device-Level Optimization Techniques for SSDs](https://arxiv.org/abs/2507.10573) — MLC read 40–110 µs, program 0.4–1.5 ms |
 | Per-page-type modelling precedent, accuracy bars | [MQSim](https://www.usenix.org/conference/fast18/presentation/tavakkol) · [SimpleSSD](https://arxiv.org/pdf/1705.06419) |
 | Read-retry as the latency tail mechanism | [Park et al.](https://arxiv.org/pdf/2104.09611) |

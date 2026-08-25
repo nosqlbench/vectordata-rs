@@ -251,12 +251,18 @@ pub const SPINNING_SATA_MODEL: DeviceModel = DeviceModel {
     latency_s: 3.74e-3,
     transfer_bytes_per_s: 195.0e6,
     queue_depth: 1.0,
+    // A disk's controller is electronic and fast; what limits a disk is
+    // the head, which is modelled separately as positioning. This ceiling
+    // never binds in `iops()` — concurrency over service time binds first
+    // at 266 — but it is read directly as a command-processing rate by
+    // the service-demand model, where leaving it at a positioning-derived
+    // 300 charged ordered reads a mechanical cost they do not pay.
     // SATA NCQ accepts 32, and the drive does use it to reorder seeks —
     // but reordering shortens seeks, it does not add heads, so offered
     // depth converts to throughput only weakly. Modelled as no useful
     // gain past what the sweep already measured.
     native_queue_depth: 1.0,
-    iops_ceiling: 300.0,
+    iops_ceiling: 100_000.0,
     bw_ceiling: 201.0e6,
 };
 
@@ -312,6 +318,20 @@ pub const NVME_MODERN_MODEL: DeviceModel = DeviceModel {
 };
 
 pub const ALL_MODELS: &[DeviceModel] = &[SPINNING_SATA_MODEL, SATA_SSD_MODEL, NVME_CONSUMER_MODEL];
+
+/// The measured corpus plus the projected modern drive.
+///
+/// [`ALL_MODELS`] is deliberately only what was swept, so validation
+/// never scores itself against a projection. The studies want the modern
+/// drive as well, because the interesting question about a boundary is
+/// which way newer hardware moves it — and the answer is only meaningful
+/// if the projection is labelled as one.
+pub const ALL_MODELS_WITH_MODERN: &[DeviceModel] = &[
+    SPINNING_SATA_MODEL,
+    SATA_SSD_MODEL,
+    NVME_CONSUMER_MODEL,
+    NVME_MODERN_MODEL,
+];
 
 /// Pair each model with the sweep it claims to explain.
 pub fn paired() -> Vec<(DeviceModel, &'static Regime)> {

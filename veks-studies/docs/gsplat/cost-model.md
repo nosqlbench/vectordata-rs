@@ -102,9 +102,25 @@ permutation (`N = N_src`):
 The naive baseline's amplification is fixed and small — `⌈R/B⌉·B / R`,
 around 2 for a 4 KiB record — because random access defeats prefetching
 entirely, so the tier fetches only the blocks the record occupies.
-**Naive moves less data; gsplat moves it in a better order.** That is
-the whole trade, and it makes the pass count the term that decides
-whether gsplat is a win.
+**Naive moves less data only when `P > B/R`.** Its amplification is
+fixed at `⌈R/B⌉·B / R`; gsplat's is `A(P)`, bounded by `min(P, w)`. Which
+is smaller depends on the pass count and the record size together, and
+below the crossover gsplat moves less data *as well as* moving it in a
+better order.
+
+Measured at page granularity with 512 B records in 4 KiB pages — so
+`B/R = 8` — naive sits flat at 8× while gsplat runs 2.0× at two passes
+and 6.4× at sixteen:
+
+| passes | naive | gsplat |
+|---|---|---|
+| 2 | 8.0× | **2.0×** |
+| 4 | 8.0× | **3.6×** |
+| 8 | 8.0× | **5.3×** |
+| 16 | 8.0× | **6.4×** |
+
+The pass count is still the term that decides whether gsplat wins. It is
+not true that it wins only on ordering.
 
 `A(P)` is the upper bracket, realized when the tier prefetches
 aggressively. If it does not, gsplat's read volume falls to the same
@@ -671,12 +687,56 @@ gsplat's 24. The gap closes with a **two-level** variant:
 ```
 
 Total ≈ 4 data-equivalents *independent of `P`*, paid for with one
-data-sized scratch area and `P` write buffers. Worth building when
-rewrites routinely land in the sparse regime; unnecessary while they
-fit in a handful of passes.
+data-sized scratch area and `P` write buffers.
+
+### Where the two-level variant starts to pay
+
+The hedge above — "unnecessary while they fit in a handful of passes" —
+holds, and the handful is **four**.
+
+The arithmetic is one line. The two-level form moves the payload four
+times whatever `P` is; the single-level form moves it `A(P) + 1` times.
+They are level at `A(P) = 3`, and while `P ≪ w` the amplification is
+very close to `P` itself, so the crossover lands at three or four
+segments:
+
+| segments `P` | `A(P)` | single-level | two-level |
+|---|---|---|---|
+| 2 | 2.0 | 3 data-equivalents | 4 |
+| 3 | 3.0 | 4 | 4 |
+| 4 | 4.0 | 5 | 4 |
+| 16 | 16.0 | 17 | 4 |
+| 256 | 100.7 | 102 | 4 |
+| 1024 | 120.3 | 121 | 4 |
+
+`veks-studies` measures the crossover at **exactly four segments**, and
+finds it in the same place on every device modelled — which is what it
+should be, since both arms are sequential there and the comparison is
+between two byte counts rather than between two access patterns
+(`scale::crossover::staging_overtakes_the_rescan_at_about_four_segments`,
+`…::the_crossover_is_the_same_on_every_device`).
+
+Two consequences worth stating plainly:
+
+- **Below four segments, the single-level form is genuinely better.** It
+  never touches scratch. A claim that staging always wins would be
+  false, and the cost model should not make it.
+- **Above four segments there is no upper end to the gap.** The
+  single-level cost keeps climbing with `P`; the two-level cost does
+  not move at all until `P` exceeds the fan-out `f = M/W` and buys
+  another stage, and `f` is a quarter of a million for a 32 GiB budget
+  with 128 KiB containers. At a terabyte with 32 GiB of memory the
+  measured spread is 9.8 h against 41.9 m; at 1 GiB of memory it is
+  21.2 h against the same 41.9 m.
+
+The number of stages is `ceil(log_f(P))`, so the growth in `P` is
+logarithmic and the base is enormous. A terabyte and a petabyte both
+need exactly one distribution stage.
 
 Reference: A. Aggarwal and J. S. Vitter, "The Input/Output Complexity
-of Sorting and Related Problems," *Commun. ACM* 31(9), 1988.
+of Sorting and Related Problems," *Commun. ACM* 31(9), 1988. The
+`Θ((N/B)·log_(M/B)(N/B))` bound is what the two-level form realizes;
+`log_(M/B)` is the `log_f` above.
 
 Back to the overview: [README.md](./README.md).
 

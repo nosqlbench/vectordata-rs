@@ -697,24 +697,85 @@ mod dump {
 /// would on a volume holding both.
 pub fn accesses_of(trace: &crate::model::Trace) -> Vec<(u64, u64, bool)> {
     use crate::model::Op;
+    use crate::model::trace::SPILL_TAG_BYTES;
+    use std::collections::HashMap;
+
     let g = trace.geometry;
     let payload = g.payload_bytes();
-    trace
-        .ops
-        .iter()
-        .filter_map(|op| match *op {
-            Op::ReadRecord { ordinal } => Some((ordinal * g.record_bytes, g.record_bytes, false)),
+    // Source, then output above it, then the spill scratch above that.
+    // Three extents on one volume, so every access contends with every
+    // other for bandwidth, for queue slots, and for cache residency.
+    let spill_base = payload * 2;
+    let spill_record = g.record_bytes + SPILL_TAG_BYTES;
+    // A bucket owns a region of the scratch and appends within it, so its
+    // stream is sequential even though the buckets interleave.
+    let bucket_capacity = spill_bucket_capacity(trace) * spill_record;
+    let mut cursor: HashMap<u64, u64> = HashMap::new();
+    let mut out = Vec::with_capacity(trace.ops.len());
+
+    for op in &trace.ops {
+        match *op {
+            Op::ReadRecord { ordinal } => {
+                out.push((ordinal * g.record_bytes, g.record_bytes, false))
+            }
             Op::WriteRange {
                 first_slot,
                 records,
-            } => Some((
+            } => out.push((
                 payload + first_slot * g.record_bytes,
                 records * g.record_bytes,
                 true,
             )),
+            Op::SpillWrite { bucket, records } => {
+                let len = records * spill_record;
+                let at = cursor.entry(bucket).or_insert(0);
+                out.push((spill_base + bucket * bucket_capacity + *at, len, true));
+                *at += len;
+            }
+            Op::SpillRead { bucket, records } => {
+                // A bucket is read back from the start of its region.
+                out.push((
+                    spill_base + bucket * bucket_capacity,
+                    records * spill_record,
+                    false,
+                ));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Records the largest spill bucket holds, which sets how much scratch
+/// each bucket's region has to reserve.
+fn spill_bucket_capacity(trace: &crate::model::Trace) -> u64 {
+    use crate::model::Op;
+    use std::collections::HashMap;
+    let mut per_bucket: HashMap<u64, u64> = HashMap::new();
+    for op in &trace.ops {
+        if let Op::SpillWrite { bucket, records } = *op {
+            *per_bucket.entry(bucket).or_insert(0) += records;
+        }
+    }
+    per_bucket.values().copied().max().unwrap_or(0).max(1)
+}
+
+/// Bytes of scratch a trace's spill extent needs, so the simulated span
+/// covers it.
+pub fn spill_extent_bytes(trace: &crate::model::Trace) -> u64 {
+    use crate::model::Op;
+    use crate::model::trace::SPILL_TAG_BYTES;
+    use std::collections::HashSet;
+    let buckets: HashSet<u64> = trace
+        .ops
+        .iter()
+        .filter_map(|op| match *op {
+            Op::SpillWrite { bucket, .. } => Some(bucket),
             _ => None,
         })
-        .collect()
+        .collect();
+    let highest = buckets.iter().copied().max().map(|b| b + 1).unwrap_or(0);
+    highest * spill_bucket_capacity(trace) * (trace.geometry.record_bytes + SPILL_TAG_BYTES)
 }
 
 /// Cost a trace by simulating the whole storage path.
@@ -754,7 +815,19 @@ pub fn simulate_io(
             } else {
                 crate::io::Readahead::OFF
             },
-            ..crate::io::RunConfig::direct(offered_depth, g.payload_bytes() * 2)
+            // Buffered means buffered on both sides: a write that lands
+            // in the page cache is paced back to the device by
+            // `balance_dirty_pages`, and the run is not over until it has
+            // drained.
+            writeback: if cache.is_some() {
+                crate::io::Writeback::DEFAULT
+            } else {
+                crate::io::Writeback::OFF
+            },
+            ..crate::io::RunConfig::direct(
+                offered_depth,
+                g.payload_bytes() * 2 + spill_extent_bytes(trace),
+            )
         },
     )
 }
@@ -845,19 +918,28 @@ mod full_path {
         );
     }
 
-    /// **Ordering is the lever; page size is not.**
+    /// **Ordering is the lever; page size is not — for the reader that
+    /// ordered its accesses.**
     ///
     /// The cost model treats the fetch granularity `W` as central, and on
     /// a bytes-moved basis it is — a bigger page drags in more
     /// neighbours. But time is not bytes. Once access ascends, small
     /// contiguous reads cost a disk almost nothing extra, because there
     /// is no seek between them; enlarging the page changes the request
-    /// count without changing the time. Scattered access is where page
-    /// size bites, and there it bites the wrong way: every fault drags in
-    /// bytes that get discarded.
+    /// count without changing the time.
     ///
-    /// So the container size is a second-order knob. What the algorithm
-    /// buys is the ordering itself.
+    /// For a scattered reader the same knob is **first-order**, and its
+    /// sign depends on the device and the working set: a larger page
+    /// drags in more discarded bytes and seeds a larger readahead, but it
+    /// also serves more records per positioning event and leaves more
+    /// behind in cache. Which term wins is an empirical question, not one
+    /// the model should assume — so what is asserted here is that the
+    /// knob *matters* to the scattered reader and does not to the ordered
+    /// one, and that ordering beats every setting of it.
+    ///
+    /// The unambiguous readahead result is isolated where it can be
+    /// stated cleanly, at a fixed page size:
+    /// [`crate::io`]'s `readahead_makes_a_scattered_reader_slower_not_merely_no_faster`.
     #[test]
     fn ordering_is_the_lever_and_page_size_is_not() {
         let geo = Geometry {
@@ -888,16 +970,19 @@ mod full_path {
         let random_small = at(&random, 4_096);
         let random_large = at(&random, 65_536);
         assert!(
-            (random_large - random_small).abs() / random_small < 0.15,
-            "nor a scattered one: {random_small:.3}s vs {random_large:.3}s"
+            (random_large - random_small).abs() / random_small > 0.25,
+            "page size should move a scattered reader materially: \
+             {random_small:.3}s at 4 KiB against {random_large:.3}s at 64 KiB"
         );
 
         // Against which: ordering the same accesses is worth an order of
-        // magnitude. The two knobs are not in the same class.
+        // magnitude, and it beats the *best* page size the scattered
+        // reader can be given. The two knobs are not in the same class.
         assert!(
-            random_small > ordered_small * 8.0,
-            "ordering is worth far more than any page size: \
-             {ordered_small:.3}s vs {random_small:.3}s"
+            random_small.min(random_large) > ordered_small.max(ordered_large) * 8.0,
+            "ordering should beat the best scattered configuration by 8x: \
+             ordered {ordered_small:.3}s/{ordered_large:.3}s against \
+             scattered {random_small:.3}s/{random_large:.3}s"
         );
     }
 }

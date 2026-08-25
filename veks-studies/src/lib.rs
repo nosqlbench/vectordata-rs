@@ -150,11 +150,15 @@
 pub mod algo;
 pub mod cache;
 pub mod check;
+pub mod claims;
 pub mod device;
 pub mod io;
+pub mod manifold;
 pub mod model;
 pub mod price;
+pub mod queueing;
 pub mod regime;
+pub mod scale;
 pub mod study;
 pub mod sweep;
 pub mod validate;

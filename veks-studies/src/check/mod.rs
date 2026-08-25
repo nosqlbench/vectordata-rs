@@ -33,8 +33,68 @@ pub fn check_all(trace: &Trace, map: &Map, budget_bytes: u64) -> Vec<Violation> 
     v.extend(single_read(trace, map));
     v.extend(monotone_access(trace));
     v.extend(single_write(trace, map));
+    v.extend(one_range_per_pass(trace));
     v.extend(bounded_memory(trace, budget_bytes));
     v
+}
+
+/// Check the invariants a **staged** rewrite claims.
+///
+/// It keeps single read, single write, monotone access and bounded
+/// memory. What it does not keep is one output range per pass: its final
+/// pass emits one range per bucket, which is still contiguous and still
+/// disjoint but is many ranges rather than one. In exchange it claims
+/// something the re-scan form cannot — that spill is balanced, every
+/// record routed out being read back exactly once.
+pub fn check_staged(trace: &Trace, map: &Map, budget_bytes: u64) -> Vec<Violation> {
+    let mut v = Vec::new();
+    v.extend(single_read(trace, map));
+    v.extend(monotone_access(trace));
+    v.extend(single_write(trace, map));
+    v.extend(balanced_spill(trace));
+    v.extend(bounded_memory(trace, budget_bytes));
+    v
+}
+
+/// **Balanced spill.** Everything routed into the scratch extent comes
+/// back out of it exactly once. An imbalance means a stage either lost
+/// records or re-read them, and either would make the staged cost a
+/// fiction.
+pub fn balanced_spill(trace: &Trace) -> Vec<Violation> {
+    let m = trace.metrics();
+    if m.records_spilled != m.records_unspilled {
+        return vec![Violation {
+            invariant: "balanced spill",
+            detail: format!(
+                "{} records spilled but {} read back",
+                m.records_spilled, m.records_unspilled
+            ),
+        }];
+    }
+    Vec::new()
+}
+
+/// **One range per pass.** The re-scan form fills a whole segment before
+/// writing it, so each pass emits exactly one contiguous output range.
+/// This is a claim about that structure, not about correctness — a
+/// staged rewrite writes one range per bucket instead and is no less
+/// correct for it.
+pub fn one_range_per_pass(trace: &Trace) -> Vec<Violation> {
+    use crate::model::Op;
+    let mut out = Vec::new();
+    for (pass, ops) in trace.passes().into_iter().enumerate() {
+        let ranges = ops
+            .iter()
+            .filter(|op| matches!(op, Op::WriteRange { .. }))
+            .count();
+        if ranges > 1 {
+            out.push(Violation {
+                invariant: "one range per pass",
+                detail: format!("pass {pass} wrote {ranges} ranges, not one"),
+            });
+        }
+    }
+    out
 }
 
 /// **Single read.** Every mapped source record is read exactly once
@@ -88,15 +148,19 @@ pub fn monotone_access(trace: &Trace) -> Vec<Violation> {
     out
 }
 
-/// **Single write.** Every output byte is written exactly once, and each
-/// pass writes one contiguous range.
+/// **Single write.** Every output byte is written exactly once, by
+/// contiguous ranges.
+///
+/// How *many* ranges is a separate question — see [`one_range_per_pass`]
+/// — because a rewrite that emits one range per bucket covers the output
+/// just as exactly as one that emits a range per pass.
 pub fn single_write(trace: &Trace, map: &Map) -> Vec<Violation> {
     use crate::model::Op;
 
     let mut covered = vec![0u32; map.0.len()];
     let mut out = Vec::new();
 
-    for (pass, ops) in trace.passes().into_iter().enumerate() {
+    for ops in trace.passes() {
         let ranges: Vec<(u64, u64)> = ops
             .iter()
             .filter_map(|op| match op {
@@ -107,12 +171,6 @@ pub fn single_write(trace: &Trace, map: &Map) -> Vec<Violation> {
                 _ => None,
             })
             .collect();
-        if ranges.len() > 1 {
-            out.push(Violation {
-                invariant: "single write",
-                detail: format!("pass {pass} wrote {} ranges, not one", ranges.len()),
-            });
-        }
         for (first, count) in ranges {
             for slot in first..first + count {
                 if let Some(c) = covered.get_mut(slot as usize) {
