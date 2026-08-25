@@ -168,6 +168,21 @@ the HDD tolerates 179 passes before ordering stops paying, and the NVMe
 tolerates 3. The full table is in the [gsplat cost
 model](../../gsplat/cost-model.md#where-ordering-starts-to-pay).
 
+**`penalty` depends on I/O concurrency, and both figures above are at
+`iodepth=10`**, because that is what the source measurements used. Each
+outstanding request hides another's access latency, so the advantage
+ordering has to sell shrinks as the queue deepens. On a current NVMe
+drive the 4 KiB penalty falls from 134 at one outstanding request to
+**1.4 at 128** — and since SPLAT always makes at least two passes, a
+penalty below 2 means **no memory budget makes it pay**. The spinning
+disk is untouched by this: one head cannot be parallelised.
+
+The practical reading for this project is that SPLAT's case rests on
+seek-bound media, small records, or modest issue concurrency — and that a
+deeply-pipelined reader on current flash is already buying what ordering
+would have sold it. See [How the line moves with
+concurrency](../../gsplat/cost-model.md#how-the-line-moves-with-concurrency).
+
 **What the device is actually doing.** An event-driven model of the
 storage path (`veks-studies/src/io/`) reproduces these sweeps to within
 5% on the HDD without computing a throughput anywhere, and reports where
@@ -278,12 +293,17 @@ which drops `A` from 23.5 to 7.8 — a 3× cut in total I/O from one
 `--resources mem=230G`, and on the HDD a drop from 5.9 days to under a
 day.
 
-**On NVMe this case never pays, at any budget this node can offer.**
-`penalty(4100 B)` is 3.6 there, so SPLAT would need `P ≤ 3`, meaning
-`M > 1.85 TB / 3.6 ≈ 481 GiB` — more than the 655 GiB node has left
-after page cache. The 4100-byte record is simply too close to an
+**On NVMe this case never pays, at any budget this node has.**
+`penalty(4100 B)` is 3.6 at `iodepth=10`, so SPLAT would need `P ≤ 3`,
+meaning `M > 1.85 TB / 3.6 ≈ 481 GiB` — more than the 655 GiB node has
+left after page cache. The 4100-byte record is simply too close to an
 efficient block for a fast NVMe drive: at that size it already reads at
 490 MB/s against 1427 MB/s sequential.
+
+On a *current* drive at realistic concurrency it does not merely fail to
+pay at this node's budget — it cannot pay at any budget, because the
+penalty falls under the two-pass floor. If the passage spine lands on
+modern NVMe and the reader issues deep, SPLAT is the wrong tool for it.
 
 Two ways out, both of which move the record size rather than the budget:
 storing 1024-d as f16 halves `R` to 2052 B and roughly doubles the

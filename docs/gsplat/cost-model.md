@@ -232,6 +232,28 @@ scattered one by about as little. Ordering the same accesses is worth
 more than 8×. The container size is worth tuning; the ordering is worth
 having.
 
+### The host is a bottleneck too
+
+[Ren et al.](https://dl.acm.org/doi/10.1145/3629526.3645053) find that
+with high-performance NVMe SSDs the **CPU saturates before the device
+does** at 4 KiB — 100% utilized while the drive is not — and that Linux
+I/O schedulers add up to 63.4% throughput overhead on top. A storage cost
+model with no host-side term is modelling the wrong constraint above
+roughly half a million operations per second.
+
+Charging ~1.7 µs of CPU per request reproduces it. On the modern drive:
+
+| Configuration | 4 KiB IOPS | Device bandwidth used | Limited by |
+|---|---|---|---|
+| 2016 NVMe, 8 cores | 123,953 | 34% | device |
+| Modern NVMe, 1 core | 587,743 | 34% | **host CPU** |
+| Modern NVMe, 8 cores | 1,177,742 | 69% | device |
+
+For a rewrite this matters directly: it means the throughput a plan
+predicts is unreachable from one thread, and that the gain from ordering
+can be masked entirely by a host that cannot issue fast enough to expose
+it.
+
 ### Concurrency is a correctness concern, not a tuning knob
 
 The same result set measures a random reader running alongside a
@@ -247,13 +269,24 @@ sequential writer does not slow a concurrent reader down, it removes it
 from the schedule. **Transfer must rate-limit its output stream against
 its input stream**, or the cost model above does not describe the run.
 
-The simulator reproduces the direction of this everywhere and roughly the
-magnitude on the spinning disk, but understates it badly on flash — 2×
-against a measured 178× on NVMe. Fair bandwidth sharing lets a small read
-complete quickly, and real devices evidently do not schedule anything
-like that fairly once a bulk stream saturates them. Take the measured
-numbers as the estimate and the simulated one as a floor; the design
-conclusion is the same either way.
+**Why it happens** is die-level blocking, not bandwidth sharing. A flash
+write occupies its die for the whole program operation — roughly an order
+of magnitude longer than a read — and a read that lands on that die waits
+for it, however idle the rest of the device is. Reads also queue behind
+writes at the shared channel controller. The literature puts the
+resulting tail cost at [up to 20× from read-after-write
+serialization](https://people.ucsc.edu/~hlitz/papers/rail.pdf), with
+five-nines read latency reaching 4.5 ms under only 20% sporadic writes.
+
+Modelling that explicitly — dies with address affinity, held for the
+duration of a program — brings the simulator within range of the
+measurement. Reproducing the `mixed` job faithfully (random reader at
+8–16 KiB alongside a rate-capped sequential reader and writer), simulated
+random-read IOPS land within about 30% of measured at every capped point,
+and the uncapped collapse comes out roughly half as severe as measured
+rather than two orders of magnitude too mild. An earlier version of this
+model shared bandwidth fairly and produced 2× where the measurement shows
+178×; that was a missing mechanism, not a tuning error.
 
 ## Worked examples
 
@@ -335,8 +368,18 @@ how much data there is. And since `P ≈ payload / M`:
 ```
 
 `penalty(R) = BW_seq / (R · IOPS(R))` is the ratio of streaming
-throughput to the throughput of fetching records where they lie. For a
-143 GiB payload, using the measured device models:
+throughput to the throughput of fetching records where they lie.
+
+**`penalty` is also a function of concurrency, and the table below is a
+statement about one particular depth.** Random access loses to streaming
+because every request pays an access latency that a stream does not, and
+concurrency hides latency: with `k` requests outstanding, the latency is
+amortised `k` ways. Every figure in the next table is derived from the
+perfscripts corpus, which was captured at `iodepth=10`. See [How the line
+moves with concurrency](#how-the-line-moves-with-concurrency) — it moves
+a long way.
+
+For a 143 GiB payload at `iodepth=10`, using the measured device models:
 
 | `R` | \_\_\_\_\_\_ spinning disk \_\_\_\_\_\_ | | \_\_\_\_\_\_ SATA SSD \_\_\_\_\_\_ | | \_\_\_\_\_\_ NVMe \_\_\_\_\_\_ | |
 |---|---|---|---|---|---|---|
@@ -375,6 +418,54 @@ the line."** Three readings of the table are worth keeping:
   itself — at which point the rewrite fits in memory and the question is
   moot. That is the real boundary of the technique on flash, and it is a
   statement about record size, not about the device.
+
+## How the line moves with concurrency
+
+The table above holds `k = 10` fixed because its source data did. That is
+not a safe thing to leave implicit. The
+[MQSSD model](https://arxiv.org/abs/2507.06349) (Ransom, Lim &
+Mitzenmacher, 2025), which extends the external-memory model by making
+concurrency a first-class parameter, reports that on a current drive the
+random-to-sequential **read** ratio falls to **1.3–1.5× at `k = 128`**,
+against 38–57× for writes at `k = 1`. Concurrency, not ordering, is doing
+most of the work available on modern flash.
+
+Modelling a current drive — calibrated to ~1M 4 KiB IOPS and 7 GB/s
+sequential from [Ren et al., ICPE '24](https://dl.acm.org/doi/10.1145/3629526.3645053),
+and to the MQSSD ratio band — the line moves like this for a 4 KiB record
+against a 143 GiB payload:
+
+| Offered depth | 2016 NVMe penalty | min `M` | Modern NVMe penalty | min `M` |
+|---|---|---|---|---|
+| 1 | 35.7 | 4.0 GiB | 133.7 | 1.1 GiB |
+| 4 | 8.9 | 16.0 GiB | 33.4 | 4.3 GiB |
+| 10 | 3.6 | 40.1 GiB | 13.4 | 10.7 GiB |
+| 32 | 3.4 | 41.5 GiB | 4.2 | 34.2 GiB |
+| 64 | 3.4 | 41.5 GiB | **2.1** | 68.4 GiB |
+| 128 | 3.4 | 41.5 GiB | **1.4** | 100.4 GiB |
+
+**The conclusion this changes.** A rewrite always makes at least two
+passes. Once the penalty drops below 2, no budget can win, because the
+floor of the pass count is already above the number it has to beat. On a
+current NVMe drive at `k ≥ 64`, ordering a 4 KiB-record rewrite **cannot
+pay at any memory budget**. The 2016 drive never reaches that point
+because its command rate binds first and pins its penalty at 3.4.
+
+This does not retire the technique; it narrows where it applies:
+
+- **Seek-bound media are unaffected.** A disk's penalty at 4 KiB is 179
+  and concurrency cannot fix a single head.
+- **Small records are unaffected.** At 128 B the penalty stays above 8 on
+  every device at every depth modelled, because the record is far below
+  what any of them serves efficiently.
+- **Low-concurrency pipelines are unaffected.** A single-threaded reader
+  sees a penalty of 134 on the same modern drive that offers 1.4 at
+  `k = 128`. If a rewrite is not issuing deep, it is in the regime where
+  ordering pays — and if it is, it may not need ordering at all.
+
+The honest summary is that **ordering and concurrency are substitutes**.
+Both exist to stop the device idling between requests. Spend whichever is
+cheaper to obtain.
 
 ### D — the same rewrite on object storage
 
