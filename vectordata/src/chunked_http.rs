@@ -138,7 +138,9 @@ impl ChunkStore {
         // bytes are actually zero.
         let file_existed = cache_path.exists();
         let file_size_matches = file_existed
-            && std::fs::metadata(&cache_path).map(|m| m.len() == total_size).unwrap_or(false);
+            && std::fs::metadata(&cache_path)
+                .map(|m| m.len() == total_size)
+                .unwrap_or(false);
         let reset_bitmap = !file_existed || !file_size_matches;
         let f = std::fs::OpenOptions::new()
             .create(true)
@@ -173,9 +175,8 @@ impl ChunkStore {
             let _ = std::fs::remove_file(&chunks_path);
             vec![0u8; total_chunks as usize]
         } else if chunks_path.exists() {
-            load_bitmap(&chunks_path, total_chunks as usize).unwrap_or_else(|_| {
-                vec![0u8; total_chunks as usize]
-            })
+            load_bitmap(&chunks_path, total_chunks as usize)
+                .unwrap_or_else(|_| vec![0u8; total_chunks as usize])
         } else {
             vec![0u8; total_chunks as usize]
         };
@@ -197,21 +198,34 @@ impl ChunkStore {
         })
     }
 
-    pub(crate) fn cache_path(&self) -> &Path { &self.cache_path }
-    pub(crate) fn total_size(&self) -> u64 { self.total_size }
-    pub(crate) fn total_chunks(&self) -> u32 { self.total_chunks }
-    pub(crate) fn chunk_size(&self) -> u64 { self.chunk_size }
+    pub(crate) fn cache_path(&self) -> &Path {
+        &self.cache_path
+    }
+    pub(crate) fn total_size(&self) -> u64 {
+        self.total_size
+    }
+    pub(crate) fn total_chunks(&self) -> u32 {
+        self.total_chunks
+    }
+    pub(crate) fn chunk_size(&self) -> u64 {
+        self.chunk_size
+    }
 
     /// Whether every chunk has been downloaded. Lock-free —
     /// `Acquire` ordering ensures we observe the data-file
     /// writes that preceded any "valid" store.
     pub(crate) fn is_complete(&self) -> bool {
-        self.chunk_state.iter().all(|b| b.load(Ordering::Acquire) != 0)
+        self.chunk_state
+            .iter()
+            .all(|b| b.load(Ordering::Acquire) != 0)
     }
 
     /// Number of chunks currently marked valid.
     pub(crate) fn valid_count(&self) -> u32 {
-        self.chunk_state.iter().filter(|b| b.load(Ordering::Acquire) != 0).count() as u32
+        self.chunk_state
+            .iter()
+            .filter(|b| b.load(Ordering::Acquire) != 0)
+            .count() as u32
     }
 
     /// Snapshot the bitmap into an owned `Vec<u8>` suitable for
@@ -221,7 +235,8 @@ impl ChunkStore {
     /// and the next finish will overwrite it with a fresher
     /// snapshot.
     fn snapshot_bitmap(&self) -> Vec<u8> {
-        self.chunk_state.iter()
+        self.chunk_state
+            .iter()
             .map(|b| b.load(Ordering::Acquire))
             .collect()
     }
@@ -230,12 +245,20 @@ impl ChunkStore {
     /// chunks needed to satisfy the range. Returns the assembled
     /// bytes from the local cache file.
     pub(crate) fn read(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
-        if len == 0 { return Ok(Vec::new()); }
-        let end = offset.checked_add(len)
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset
+            .checked_add(len)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read range overflow"))?;
         if end > self.total_size {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                format!("read past end: offset={offset} len={len} size={}", self.total_size)));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "read past end: offset={offset} len={len} size={}",
+                    self.total_size
+                ),
+            ));
         }
         let first = (offset / self.chunk_size) as u32;
         let last = ((end - 1) / self.chunk_size) as u32;
@@ -261,7 +284,8 @@ impl ChunkStore {
     /// fetches one of those chunks first, the queue's worker
     /// observes it as valid and skips re-fetching.
     pub(crate) fn prebuffer_with_progress<F>(&self, cb: F) -> io::Result<()>
-    where F: FnMut(&DownloadProgress)
+    where
+        F: FnMut(&DownloadProgress),
     {
         self.prebuffer_chunk_range(0, self.total_chunks, cb)
     }
@@ -278,7 +302,8 @@ impl ChunkStore {
         byte_end: u64,
         cb: F,
     ) -> io::Result<()>
-    where F: FnMut(&DownloadProgress)
+    where
+        F: FnMut(&DownloadProgress),
     {
         let end = byte_end.min(self.total_size);
         if byte_start >= end {
@@ -299,10 +324,10 @@ impl ChunkStore {
     /// size (otherwise a 100k-window profile's meter would top out
     /// at 0.1% even after the entire window is resident).
     fn prebuffer_chunk_range<F>(&self, first: u32, exclusive: u32, mut cb: F) -> io::Result<()>
-    where F: FnMut(&DownloadProgress)
+    where
+        F: FnMut(&DownloadProgress),
     {
-        const PROGRESS_TICK: std::time::Duration =
-            std::time::Duration::from_millis(250);
+        const PROGRESS_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
         let exclusive = exclusive.min(self.total_chunks);
         if first >= exclusive {
@@ -325,7 +350,9 @@ impl ChunkStore {
         }
         progress.add_downloaded_bytes(already_valid);
         cb(&progress);
-        if pending.is_empty() { return Ok(()); }
+        if pending.is_empty() {
+            return Ok(());
+        }
 
         // The worker-pool / queue / abort / completion mechanics are owned
         // by `drain_parallel` (shared with the merkle-verified
@@ -401,9 +428,13 @@ impl ChunkStore {
                 if self.chunk_state[*chunk_idx as usize].load(Ordering::Acquire) != 0 {
                     break;
                 }
-                if !in_flight.contains_key(chunk_idx) { break; }
-                in_flight = cv.wait_timeout(in_flight, std::time::Duration::from_millis(50))
-                    .unwrap().0;
+                if !in_flight.contains_key(chunk_idx) {
+                    break;
+                }
+                in_flight = cv
+                    .wait_timeout(in_flight, std::time::Duration::from_millis(50))
+                    .unwrap()
+                    .0;
             }
         }
 
@@ -413,7 +444,9 @@ impl ChunkStore {
             // waiters, even on error — otherwise stuck waiters
             // would block forever on a chunk we abandoned.
             let cv = self.in_flight.lock().unwrap().remove(&i);
-            if let Some(cv) = cv { cv.notify_all(); }
+            if let Some(cv) = cv {
+                cv.notify_all();
+            }
             r?;
         }
         Ok(())
@@ -444,10 +477,16 @@ impl ChunkStore {
             Some(cv) => {
                 let mut in_flight = self.in_flight.lock().unwrap();
                 loop {
-                    if self.chunk_state[i as usize].load(Ordering::Acquire) != 0 { break; }
-                    if !in_flight.contains_key(&i) { break; }
-                    in_flight = cv.wait_timeout(in_flight, std::time::Duration::from_millis(50))
-                        .unwrap().0;
+                    if self.chunk_state[i as usize].load(Ordering::Acquire) != 0 {
+                        break;
+                    }
+                    if !in_flight.contains_key(&i) {
+                        break;
+                    }
+                    in_flight = cv
+                        .wait_timeout(in_flight, std::time::Duration::from_millis(50))
+                        .unwrap()
+                        .0;
                 }
                 Ok(())
             }
@@ -455,7 +494,9 @@ impl ChunkStore {
             None => {
                 let r = self.fetch_and_write_chunk(i);
                 let cv = self.in_flight.lock().unwrap().remove(&i);
-                if let Some(cv) = cv { cv.notify_all(); }
+                if let Some(cv) = cv {
+                    cv.notify_all();
+                }
                 r
             }
         }
@@ -476,16 +517,25 @@ impl ChunkStore {
         log::warn!(
             "{} does not advertise byte-range support; downloading the entire file \
              ({} bytes) before the first read can be served (FullTransfer)",
-            self.transport.url(), self.total_size,
+            self.transport.url(),
+            self.total_size,
         );
         self.retry_policy.execute(|| {
             // Restart from offset 0 on every attempt — positional
             // writes make partial previous attempts harmless.
-            let mut w = PositionalWriter { file: &self.cache_file, pos: 0 };
+            let mut w = PositionalWriter {
+                file: &self.cache_file,
+                pos: 0,
+            };
             let n = self.transport.fetch_full_to(&mut w)?;
             if n != self.total_size {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                    format!("full transfer short read: expected {} bytes, got {n}", self.total_size)));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "full transfer short read: expected {} bytes, got {n}",
+                        self.total_size
+                    ),
+                ));
             }
             Ok(())
         })?;
@@ -501,7 +551,9 @@ impl ChunkStore {
         Ok(())
     }
 
-    fn chunk_start(&self, i: u32) -> u64 { i as u64 * self.chunk_size }
+    fn chunk_start(&self, i: u32) -> u64 {
+        i as u64 * self.chunk_size
+    }
     fn chunk_len(&self, i: u32) -> u64 {
         let start = self.chunk_start(i);
         (self.total_size - start).min(self.chunk_size)
@@ -525,10 +577,14 @@ impl ChunkStore {
         // Retry transient fetch failures with backoff — a flaky connection on
         // one chunk of a concurrent prebuffer is recovered in place rather
         // than failing the whole download (parity with the `.mref` path).
-        let bytes = self.retry_policy.execute(|| self.transport.fetch_range(start, len))?;
+        let bytes = self
+            .retry_policy
+            .execute(|| self.transport.fetch_range(start, len))?;
         if bytes.len() as u64 != len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                format!("chunk {i} short read: expected {len}, got {}", bytes.len())));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("chunk {i} short read: expected {len}, got {}", bytes.len()),
+            ));
         }
         // Ordering matters for crash safety:
         // 1. Write the chunk bytes to disk + fsync.
@@ -581,7 +637,9 @@ impl std::io::Write for PositionalWriter<'_> {
         self.pos += buf.len() as u64;
         Ok(buf.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn chunks_sidecar_path(cache_path: &Path) -> PathBuf {
@@ -593,8 +651,14 @@ fn chunks_sidecar_path(cache_path: &Path) -> PathBuf {
 fn load_bitmap(path: &Path, expected_chunks: usize) -> io::Result<Vec<u8>> {
     let bytes = std::fs::read(path)?;
     if bytes.len() != expected_chunks {
-        return Err(io::Error::new(io::ErrorKind::InvalidData,
-            format!("bitmap size {} != expected {}", bytes.len(), expected_chunks)));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "bitmap size {} != expected {}",
+                bytes.len(),
+                expected_chunks
+            ),
+        ));
     }
     Ok(bytes)
 }
@@ -645,8 +709,12 @@ mod tests {
             let e = s + len as usize;
             Ok(self.data[s..e].to_vec())
         }
-        fn content_length(&self) -> io::Result<u64> { Ok(self.data.len() as u64) }
-        fn supports_range(&self) -> bool { true }
+        fn content_length(&self) -> io::Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+        fn supports_range(&self) -> bool {
+            true
+        }
     }
 
     /// The chunk-shape math: chunk_len of the last chunk is the
@@ -688,8 +756,15 @@ mod tests {
         assert!(!chunks_sidecar_path(&path).exists());
         let transport = HttpTransport::new(url::Url::parse("http://example.com/x").unwrap());
         let store = ChunkStore::open(transport, total, path).unwrap();
-        assert!(!store.is_complete(), "full-size file without a sidecar must not be trusted as complete");
-        assert_eq!(store.valid_count(), 0, "no chunk is proven valid without a sidecar");
+        assert!(
+            !store.is_complete(),
+            "full-size file without a sidecar must not be trusted as complete"
+        );
+        assert_eq!(
+            store.valid_count(),
+            0,
+            "no chunk is proven valid without a sidecar"
+        );
     }
 
     /// Sidecar bitmap round-trip — write a partial bitmap,

@@ -24,9 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::merkle::{MerkleRef, MerkleState};
-use crate::transport::{
-    ChunkRequest, ChunkedTransport, DownloadProgress, RetryPolicy,
-};
+use crate::transport::{ChunkRequest, ChunkedTransport, DownloadProgress, RetryPolicy};
 
 /// Read the configured parallel-chunk-download worker count. Both
 /// `Storage::Cached` (mref-backed) and `Storage::Http` (chunked-only)
@@ -68,8 +66,10 @@ impl std::fmt::Display for InsufficientCacheSpace {
             "not enough free space in cache directory {}: need {} ({} B) but only {} ({} B) available. \
              Free up space, or point the cache elsewhere (set `cache_dir` in settings or VECTORDATA_HOME).",
             self.cache_dir.display(),
-            fmt_gib(self.needed), self.needed,
-            fmt_gib(self.available), self.available,
+            fmt_gib(self.needed),
+            self.needed,
+            fmt_gib(self.available),
+            self.available,
         )
     }
 }
@@ -83,8 +83,11 @@ fn fmt_gib(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     const GIB: f64 = MIB * 1024.0;
     let b = bytes as f64;
-    if b >= GIB { format!("{:.1} GiB", b / GIB) }
-    else { format!("{:.1} MiB", b / MIB) }
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else {
+        format!("{:.1} MiB", b / MIB)
+    }
 }
 
 /// Fail fast when the configured cache directory cannot hold `needed`
@@ -193,17 +196,27 @@ pub(crate) struct CacheFile {
 
 impl CacheFile {
     pub(crate) fn new(file: File) -> Self {
-        #[cfg(unix)]      { CacheFile { file } }
-        #[cfg(not(unix))] { CacheFile { file: Mutex::new(file) } }
+        #[cfg(unix)]
+        {
+            CacheFile { file }
+        }
+        #[cfg(not(unix))]
+        {
+            CacheFile {
+                file: Mutex::new(file),
+            }
+        }
     }
 
     /// Read exactly `buf.len()` bytes from `offset`.
     pub(crate) fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::FileExt;
             self.file.read_exact_at(buf, offset)
         }
-        #[cfg(not(unix))] {
+        #[cfg(not(unix))]
+        {
             use std::io::{Read, Seek};
             let mut f = self.file.lock().unwrap();
             f.seek(SeekFrom::Start(offset))?;
@@ -213,11 +226,13 @@ impl CacheFile {
 
     /// Write exactly `buf.len()` bytes at `offset`.
     pub(crate) fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::FileExt;
             self.file.write_all_at(buf, offset)
         }
-        #[cfg(not(unix))] {
+        #[cfg(not(unix))]
+        {
             use std::io::{Seek, Write};
             let mut f = self.file.lock().unwrap();
             f.seek(SeekFrom::Start(offset))?;
@@ -227,11 +242,16 @@ impl CacheFile {
 
     /// Flush data bytes (not metadata) to disk — `fdatasync` semantics.
     pub(crate) fn sync_data(&self) -> io::Result<()> {
-        #[cfg(unix)]      { self.file.sync_data() }
-        #[cfg(not(unix))] { self.file.lock().unwrap().sync_data() }
+        #[cfg(unix)]
+        {
+            self.file.sync_data()
+        }
+        #[cfg(not(unix))]
+        {
+            self.file.lock().unwrap().sync_data()
+        }
     }
 }
-
 
 /// Hex-encode a 32-byte hash for diagnostic messages. Avoids pulling in
 /// the `hex` crate as a runtime dep just for one error string.
@@ -355,11 +375,17 @@ impl CachedChannel {
                     for i in 0..shape.total_chunks {
                         let start = shape.chunk_start(i);
                         let len = shape.chunk_len(i);
-                        if start + len > file_len { break; }
+                        if start + len > file_len {
+                            break;
+                        }
                         use std::io::{Read, Seek};
-                        if f.seek(SeekFrom::Start(start)).is_err() { break; }
+                        if f.seek(SeekFrom::Start(start)).is_err() {
+                            break;
+                        }
                         let chunk_buf = &mut buf[..len as usize];
-                        if f.read_exact(chunk_buf).is_err() { break; }
+                        if f.read_exact(chunk_buf).is_err() {
+                            break;
+                        }
                         if reference.verify_chunk(i, chunk_buf) {
                             state.mark_valid(i);
                             verified += 1;
@@ -367,7 +393,9 @@ impl CachedChannel {
                     }
                     log::info!(
                         "{}: recovered {}/{} chunks from existing cache file",
-                        name, verified, shape.total_chunks
+                        name,
+                        verified,
+                        shape.total_chunks
                     );
                 }
             }
@@ -490,8 +518,10 @@ impl CachedChannel {
                 if !in_flight.contains_key(chunk_idx) {
                     break; // Worker finished — re-check state
                 }
-                in_flight = cv.wait_timeout(in_flight,
-                    std::time::Duration::from_millis(50)).unwrap().0;
+                in_flight = cv
+                    .wait_timeout(in_flight, std::time::Duration::from_millis(50))
+                    .unwrap()
+                    .0;
             }
         }
 
@@ -555,10 +585,8 @@ impl CachedChannel {
     where
         F: FnMut(&DownloadProgress),
     {
-        const STATE_SAVE_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(1000);
-        const PROGRESS_TICK: std::time::Duration =
-            std::time::Duration::from_millis(250);
+        const STATE_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+        const PROGRESS_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
         // The worker-pool / queue / abort / completion mechanics are owned
         // by `drain_parallel`; a fixed pool (not one-thread-per-chunk) is
@@ -575,9 +603,10 @@ impl CachedChannel {
             PROGRESS_TICK,
             |req: &ChunkRequest| -> io::Result<()> {
                 // ── 1. Fetch (with retry) ──────────
-                let data = match self.retry_policy.execute(|| {
-                    self.transport.fetch_range(req.start, req.len)
-                }) {
+                let data = match self
+                    .retry_policy
+                    .execute(|| self.transport.fetch_range(req.start, req.len))
+                {
                     Ok(d) => d,
                     Err(e) => {
                         progress.mark_failed();
@@ -592,8 +621,12 @@ impl CachedChannel {
                     self.drop_in_flight(req.index);
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("chunk {} failed integrity verification \
-                                 (SHA-256 mismatch)", req.index)));
+                        format!(
+                            "chunk {} failed integrity verification \
+                                 (SHA-256 mismatch)",
+                            req.index
+                        ),
+                    ));
                 }
 
                 // ── 3. Write to cache file ─────────
@@ -661,7 +694,9 @@ impl CachedChannel {
             let mut inf = self.in_flight.lock().unwrap();
             inf.remove(&chunk_index)
         };
-        if let Some(cv) = cv { cv.notify_all(); }
+        if let Some(cv) = cv {
+            cv.notify_all();
+        }
     }
 
     /// Eagerly download and verify all unverified chunks.
@@ -719,9 +754,7 @@ impl CachedChannel {
             .filter(|i| !self.state.is_valid(*i))
             .collect();
         // Total bytes in the range (for the "already complete" cb).
-        let range_bytes: u64 = (first_chunk..=last_chunk)
-            .map(|i| shape.chunk_len(i))
-            .sum();
+        let range_bytes: u64 = (first_chunk..=last_chunk).map(|i| shape.chunk_len(i)).sum();
         self.prebuffer_chunks_with_progress(candidates, range_bytes, callback)
     }
 
@@ -868,7 +901,12 @@ mod tests {
             if e > self.data.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    format!("range [{}, {}) exceeds content length {}", s, e, self.data.len()),
+                    format!(
+                        "range [{}, {}) exceeds content length {}",
+                        s,
+                        e,
+                        self.data.len()
+                    ),
                 ));
             }
             Ok(self.data[s..e].to_vec())
@@ -884,10 +922,7 @@ mod tests {
     }
 
     /// Create test data, merkle ref, and a CachedChannel in a temp dir.
-    fn setup_cached_channel(
-        data: &[u8],
-        chunk_size: u64,
-    ) -> (tempfile::TempDir, CachedChannel) {
+    fn setup_cached_channel(data: &[u8], chunk_size: u64) -> (tempfile::TempDir, CachedChannel) {
         let dir = tempfile::tempdir().unwrap();
         let mref = MerkleRef::from_content(data, chunk_size);
         let transport = Arc::new(MemoryTransport::new(data.to_vec()));
@@ -932,9 +967,8 @@ mod tests {
         // Phase 1: open channel, download first two chunks, then drop
         {
             let transport = Arc::new(MemoryTransport::new(data.clone()));
-            let channel = CachedChannel::open(
-                transport, mref.clone(), dir.path(), "resume.dat",
-            ).unwrap();
+            let channel =
+                CachedChannel::open(transport, mref.clone(), dir.path(), "resume.dat").unwrap();
 
             // Read from the first two chunks to trigger download
             let chunk0 = channel.read(0, 256).unwrap();
@@ -950,9 +984,8 @@ mod tests {
         // Phase 2: reopen — should resume from checkpoint
         {
             let transport = Arc::new(MemoryTransport::new(data.clone()));
-            let channel = CachedChannel::open(
-                transport, mref.clone(), dir.path(), "resume.dat",
-            ).unwrap();
+            let channel =
+                CachedChannel::open(transport, mref.clone(), dir.path(), "resume.dat").unwrap();
 
             // Should already have 2 valid chunks from the previous session
             assert_eq!(channel.valid_count(), 2);
@@ -1004,7 +1037,8 @@ mod tests {
     impl LatencyTransport {
         fn new(data: Vec<u8>, latency_ms: u64) -> Self {
             Self {
-                data, latency_ms,
+                data,
+                latency_ms,
                 fetch_calls: std::sync::atomic::AtomicU64::new(0),
                 bytes_served: std::sync::atomic::AtomicU64::new(0),
             }
@@ -1013,20 +1047,29 @@ mod tests {
 
     impl ChunkedTransport for LatencyTransport {
         fn fetch_range(&self, start: u64, len: u64) -> io::Result<Vec<u8>> {
-            self.fetch_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.fetch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.latency_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(self.latency_ms));
             }
             let s = start as usize;
             let e = s + len as usize;
             if e > self.data.len() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "range past EOF"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "range past EOF",
+                ));
             }
-            self.bytes_served.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+            self.bytes_served
+                .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
             Ok(self.data[s..e].to_vec())
         }
-        fn content_length(&self) -> io::Result<u64> { Ok(self.data.len() as u64) }
-        fn supports_range(&self) -> bool { true }
+        fn content_length(&self) -> io::Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+        fn supports_range(&self) -> bool {
+            true
+        }
     }
 
     /// Stress-test the in-flight dedup invariant under concurrent
@@ -1048,7 +1091,8 @@ mod tests {
         let channel = std::sync::Arc::new(
             CachedChannel::open(transport, mref.clone(), dir.path(), "concurrent.dat")
                 .unwrap()
-                .with_concurrency(8));
+                .with_concurrency(8),
+        );
 
         // Spawn 8 reader threads + 1 precache thread, all racing
         // to drive the same set of chunks resident.
@@ -1068,13 +1112,19 @@ mod tests {
                 ch.precache().expect("precache should succeed");
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
 
         // All chunks must be valid; no duplicate transport calls.
         assert!(channel.is_complete());
-        let fetches = inspect.fetch_calls.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(fetches, n_chunks as u64,
-            "in-flight dedup invariant violated: {fetches} fetches for {n_chunks} chunks");
+        let fetches = inspect
+            .fetch_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            fetches, n_chunks as u64,
+            "in-flight dedup invariant violated: {fetches} fetches for {n_chunks} chunks"
+        );
     }
 
     /// Throughput probe across concurrency levels. Prints a single
@@ -1094,8 +1144,10 @@ mod tests {
 
         println!();
         println!("=== precache throughput (200 MiB, 200×1 MiB chunks) ===");
-        println!("{:<18} {:>12} {:>14} {:>14} {:>12}",
-            "latency_ms x conc", "fetch calls", "wall_ms", "MB/s", "dup_calls");
+        println!(
+            "{:<18} {:>12} {:>14} {:>14} {:>12}",
+            "latency_ms x conc", "fetch calls", "wall_ms", "MB/s", "dup_calls"
+        );
 
         for &latency_ms in &[5u64, 50, 200] {
             for &concurrency in &[1usize, 4, 8, 16, 32, 64] {
@@ -1103,29 +1155,37 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let transport = Arc::new(LatencyTransport::new(data.clone(), latency_ms));
                 let inspect = transport.clone();
-                let channel = CachedChannel::open(
-                    transport, mref.clone(), dir.path(), "bench.dat",
-                ).unwrap()
-                 .with_concurrency(concurrency);
+                let channel = CachedChannel::open(transport, mref.clone(), dir.path(), "bench.dat")
+                    .unwrap()
+                    .with_concurrency(concurrency);
 
                 let start = std::time::Instant::now();
                 channel.precache().unwrap();
                 let elapsed = start.elapsed();
 
-                let fetches = inspect.fetch_calls.load(std::sync::atomic::Ordering::Relaxed);
+                let fetches = inspect
+                    .fetch_calls
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let dup = fetches.saturating_sub(n_chunks as u64);
-                let mb_per_s = (data_size as f64 / (1024.0 * 1024.0))
-                    / elapsed.as_secs_f64();
+                let mb_per_s = (data_size as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
 
-                println!("{:>5}ms x {:>2}     {:>12} {:>14} {:>14.1} {:>12}",
-                    latency_ms, concurrency,
-                    fetches, elapsed.as_millis(), mb_per_s, dup);
+                println!(
+                    "{:>5}ms x {:>2}     {:>12} {:>14} {:>14.1} {:>12}",
+                    latency_ms,
+                    concurrency,
+                    fetches,
+                    elapsed.as_millis(),
+                    mb_per_s,
+                    dup
+                );
 
                 // Invariant: in-flight dedup must prevent duplicate
                 // fetches. Even a single-threaded sequential
                 // precache should issue exactly n_chunks calls.
-                assert_eq!(fetches, n_chunks as u64,
-                    "duplicate fetches detected at conc={concurrency}");
+                assert_eq!(
+                    fetches, n_chunks as u64,
+                    "duplicate fetches detected at conc={concurrency}"
+                );
             }
         }
         println!();
@@ -1160,9 +1220,9 @@ mod tests {
         // First open: populate cache against the original ref.
         {
             let transport = Arc::new(MemoryTransport::new(original.clone()));
-            let channel = CachedChannel::open(
-                transport, original_ref.clone(), dir.path(), "asset.dat",
-            ).unwrap();
+            let channel =
+                CachedChannel::open(transport, original_ref.clone(), dir.path(), "asset.dat")
+                    .unwrap();
             channel.precache().unwrap();
             assert!(channel.is_complete());
         }
@@ -1175,16 +1235,20 @@ mod tests {
         assert_ne!(original_ref.root_hash(), replaced_ref.root_hash());
 
         let transport = Arc::new(MemoryTransport::new(replaced));
-        let err = match CachedChannel::open(
-            transport, replaced_ref, dir.path(), "asset.dat",
-        ) {
+        let err = match CachedChannel::open(transport, replaced_ref, dir.path(), "asset.dat") {
             Ok(_) => panic!("expected stale-cache error, got Ok"),
             Err(e) => e,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let msg = err.to_string();
-        assert!(msg.contains("stale"), "expected stale-cache phrasing: {msg}");
-        assert!(msg.contains("Delete"), "expected actionable Delete hint: {msg}");
+        assert!(
+            msg.contains("stale"),
+            "expected stale-cache phrasing: {msg}"
+        );
+        assert!(
+            msg.contains("Delete"),
+            "expected actionable Delete hint: {msg}"
+        );
     }
 
     /// Reopening a cache dir with the *same* upstream merkle ref must
@@ -1198,16 +1262,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let transport = Arc::new(MemoryTransport::new(data.clone()));
-            let channel = CachedChannel::open(
-                transport, mref.clone(), dir.path(), "asset.dat",
-            ).unwrap();
+            let channel =
+                CachedChannel::open(transport, mref.clone(), dir.path(), "asset.dat").unwrap();
             channel.precache().unwrap();
         }
         let transport = Arc::new(MemoryTransport::new(data.clone()));
-        let channel = CachedChannel::open(
-            transport, mref, dir.path(), "asset.dat",
-        ).unwrap();
-        assert!(channel.is_complete(), "matching reopen should resume from valid state");
+        let channel = CachedChannel::open(transport, mref, dir.path(), "asset.dat").unwrap();
+        assert!(
+            channel.is_complete(),
+            "matching reopen should resume from valid state"
+        );
     }
 
     /// The capacity decision rejects only a *known* shortfall, passes
@@ -1228,16 +1292,28 @@ mod tests {
         // Genuine shortfall — rejected, carrying the numbers needed
         // for the operator-facing message.
         let err = capacity_verdict(dir, 100, Some(40)).unwrap_err();
-        assert_eq!(err, InsufficientCacheSpace {
-            cache_dir: dir.to_path_buf(),
-            needed: 100,
-            available: 40,
-        });
+        assert_eq!(
+            err,
+            InsufficientCacheSpace {
+                cache_dir: dir.to_path_buf(),
+                needed: 100,
+                available: 40,
+            }
+        );
         // The message names the directory and both magnitudes.
         let msg = err.to_string();
-        assert!(msg.contains("/cache/root"), "message must name the cache dir: {msg}");
-        assert!(msg.contains("100"), "message must state bytes needed: {msg}");
-        assert!(msg.contains("40"), "message must state bytes available: {msg}");
+        assert!(
+            msg.contains("/cache/root"),
+            "message must name the cache dir: {msg}"
+        );
+        assert!(
+            msg.contains("100"),
+            "message must state bytes needed: {msg}"
+        );
+        assert!(
+            msg.contains("40"),
+            "message must state bytes available: {msg}"
+        );
     }
 
     /// `ensure_cache_capacity` short-circuits to Ok when nothing needs
@@ -1256,15 +1332,19 @@ mod tests {
     fn available_space_measures_existing_ancestor() {
         let tmp = tempfile::tempdir().unwrap();
         let existing = available_space(tmp.path());
-        assert!(existing.is_some_and(|b| b > 0),
-            "an existing dir must report some free space");
+        assert!(
+            existing.is_some_and(|b| b > 0),
+            "an existing dir must report some free space"
+        );
 
         // A nested path that doesn't exist yet still measures (walks
         // up to `tmp`, which shares the filesystem).
         let nested = tmp.path().join("not/created/yet/cache");
         assert!(!nested.exists());
         let via_ancestor = available_space(&nested);
-        assert!(via_ancestor.is_some_and(|b| b > 0),
-            "a not-yet-created cache path must measure via its ancestor");
+        assert!(
+            via_ancestor.is_some_and(|b| b > 0),
+            "a not-yet-created cache path must measure via its ancestor"
+        );
     }
 }

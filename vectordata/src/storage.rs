@@ -19,8 +19,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, OnceLock};
 
 use memmap2::Mmap;
 use url::Url;
@@ -91,8 +91,11 @@ pub(crate) enum Storage {
 ///
 /// Entries are stored as `Weak<Storage>` so a `Storage` is freed
 /// once every reader against it drops. The next open re-creates it.
-fn registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Storage>>> {
-    static REGISTRY: OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Storage>>>> = OnceLock::new();
+fn registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Storage>>> {
+    static REGISTRY: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Storage>>>,
+    > = OnceLock::new();
     REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -110,8 +113,10 @@ struct OpenInFlight {
     notify: std::sync::Condvar,
 }
 
-fn in_flight_opens() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<OpenInFlight>>> {
-    static MAP: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<OpenInFlight>>>> = OnceLock::new();
+fn in_flight_opens()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<OpenInFlight>>> {
+    static MAP: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<OpenInFlight>>>> =
+        OnceLock::new();
     MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -217,7 +222,11 @@ pub(crate) fn layout_for_url(url: &Url) -> io::Result<LayoutChoice> {
         Some((p, b)) if !b.is_empty() => (p, b),
         _ => ("", raw_path),
     };
-    let basename = if basename.is_empty() { "data" } else { basename };
+    let basename = if basename.is_empty() {
+        "data"
+    } else {
+        basename
+    };
     let mut dataset_dir = cache_root.join(authority);
     if !parent.is_empty() {
         for segment in parent.split('/') {
@@ -296,8 +305,7 @@ impl Storage {
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
         let dataset_dir = layout::dataset_cache_dir(&cache_root, dataset_name);
         // Pre-flight: surface OriginMismatch before anything else.
-        layout::verify_or_record_origin(&dataset_dir, catalog_source)
-            .map_err(io::Error::from)?;
+        layout::verify_or_record_origin(&dataset_dir, catalog_source).map_err(io::Error::from)?;
         let layout = LayoutChoice {
             dataset_dir,
             file_relpath: file_relpath.to_string(),
@@ -315,7 +323,12 @@ impl Storage {
         let key = registry_key(source);
 
         // Fast path: already in registry, still alive.
-        if let Some(arc) = registry().lock().unwrap().get(&key).and_then(|w| w.upgrade()) {
+        if let Some(arc) = registry()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|w| w.upgrade())
+        {
             return Ok(arc);
         }
 
@@ -351,7 +364,12 @@ impl Storage {
         let opened: io::Result<Arc<Storage>> = (|| {
             // Recheck registry: another thread may have inserted
             // and dropped between our fast-path check and now.
-            if let Some(arc) = registry().lock().unwrap().get(&key).and_then(|w| w.upgrade()) {
+            if let Some(arc) = registry()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .and_then(|w| w.upgrade())
+            {
                 return Ok(arc);
             }
             let storage = if crate::transport::is_remote_url(source) {
@@ -359,8 +377,12 @@ impl Storage {
                 // virtual-hosted HTTPS form here — the rest of the
                 // transport pipeline never sees s3-scheme URLs.
                 let translated = crate::transport::normalize_remote_url(source);
-                let url = Url::parse(translated.as_ref())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL '{source}' (translated to '{translated}'): {e}")))?;
+                let url = Url::parse(translated.as_ref()).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid URL '{source}' (translated to '{translated}'): {e}"),
+                    )
+                })?;
                 Self::open_url_uncached(url, layout_override)?
             } else {
                 // `file://` URIs and bare paths both open as local
@@ -373,7 +395,10 @@ impl Storage {
                 Self::open_path_uncached(Path::new(local.as_ref()))?
             };
             let arc = Arc::new(storage);
-            registry().lock().unwrap().insert(key.clone(), Arc::downgrade(&arc));
+            registry()
+                .lock()
+                .unwrap()
+                .insert(key.clone(), Arc::downgrade(&arc));
             Ok(arc)
         })();
 
@@ -394,10 +419,12 @@ impl Storage {
 
     /// Open a local file by mmap, returned via the shared registry.
     pub(crate) fn open_path(path: &Path) -> io::Result<Arc<Self>> {
-        Self::open(path.to_str().ok_or_else(|| io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("non-UTF8 path: {}", path.display()),
-        ))?)
+        Self::open(path.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("non-UTF8 path: {}", path.display()),
+            )
+        })?)
     }
 
     /// Crate-internal: build a fresh local-file `Storage::Mmap` (no
@@ -433,17 +460,27 @@ impl Storage {
     pub(crate) fn open_url_cached(url: Url, layout: &LayoutChoice) -> io::Result<Self> {
         let client = crate::transport::shared_client_for(url.as_str());
         let mref_url_str = format!("{}.mref", url.as_str());
-        let mref_url = Url::parse(&mref_url_str)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid mref URL: {e}")))?;
+        let mref_url = Url::parse(&mref_url_str).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid mref URL: {e}"),
+            )
+        })?;
         // Same read-side auth as every data fetch — without it, a
         // token-protected server 401s the `.mref` probe and every
         // open silently falls back to the unverified chunked-HTTP
         // path even though a merkle reference is published.
-        let resp = crate::transport::apply_read_auth(client.get(mref_url.clone()), Some(&mref_url)).send()
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("mref fetch: {e}")))?
+        let resp = crate::transport::apply_read_auth(client.get(mref_url.clone()), Some(&mref_url))
+            .send()
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::ConnectionRefused, format!("mref fetch: {e}"))
+            })?
             .error_for_status()
-            .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("no .mref for {url}: {e}")))?;
-        let mref_bytes = resp.bytes()
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::NotFound, format!("no .mref for {url}: {e}"))
+            })?;
+        let mref_bytes = resp
+            .bytes()
             .map_err(|e| io::Error::other(format!("mref read: {e}")))?;
         let reference = MerkleRef::from_bytes(&mref_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("mref parse: {e}")))?;
@@ -461,10 +498,10 @@ impl Storage {
         let mmap = OnceLock::new();
         if channel.is_complete()
             && let Ok(file) = std::fs::File::open(channel.cache_path())
-                && let Ok(m) = unsafe { Mmap::map(&file) }
-            {
-                let _ = mmap.set(m);
-            }
+            && let Ok(m) = unsafe { Mmap::map(&file) }
+        {
+            let _ = mmap.set(m);
+        }
 
         Ok(Storage::Cached { channel, mmap })
     }
@@ -489,7 +526,8 @@ impl Storage {
         let total_size = ChunkedTransportExt::content_length_for(&transport)?;
 
         let chunks = Arc::new(crate::chunked_http::ChunkStore::open(
-            transport, total_size, cache_path)?);
+            transport, total_size, cache_path,
+        )?);
 
         let mmap = OnceLock::new();
         if chunks.is_complete()
@@ -502,18 +540,22 @@ impl Storage {
         Ok(Storage::Http { chunks, mmap })
     }
 
-
     /// Read `len` bytes at `offset`. Always succeeds for an in-bounds
     /// range — slow-path downloads chunks first if necessary.
     pub(crate) fn read_bytes(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
-        if len == 0 { return Ok(Vec::new()); }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
         match self {
             Storage::Mmap(m) => {
-                let end = offset.checked_add(len)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read range overflow"))?;
+                let end = offset.checked_add(len).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "read range overflow")
+                })?;
                 if end > m.len() as u64 {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                        format!("read past end: offset={offset} len={len} size={}", m.len())));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("read past end: offset={offset} len={len} size={}", m.len()),
+                    ));
                 }
                 Ok(m[offset as usize..end as usize].to_vec())
             }
@@ -525,8 +567,13 @@ impl Storage {
                 if let Some(m) = mmap.get() {
                     let end = (offset + len) as usize;
                     if end > m.len() {
-                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                            format!("read past end of HTTP cache mmap: offset={offset} len={len} size={}", m.len())));
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "read past end of HTTP cache mmap: offset={offset} len={len} size={}",
+                                m.len()
+                            ),
+                        ));
                     }
                     return Ok(m[offset as usize..end].to_vec());
                 }
@@ -536,7 +583,8 @@ impl Storage {
                 // file, promote to mmap so the next read takes
                 // the zero-copy path.
                 let bytes = chunks.read(offset, len)?;
-                if mmap.get().is_none() && chunks.is_complete()
+                if mmap.get().is_none()
+                    && chunks.is_complete()
                     && let Ok(file) = std::fs::File::open(chunks.cache_path())
                     && let Ok(m) = unsafe { Mmap::map(&file) }
                 {
@@ -548,18 +596,24 @@ impl Storage {
                 if let Some(m) = mmap.get() {
                     let end = (offset + len) as usize;
                     if end > m.len() {
-                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                            format!("read past end of cache mmap: offset={offset} len={len} size={}", m.len())));
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "read past end of cache mmap: offset={offset} len={len} size={}",
+                                m.len()
+                            ),
+                        ));
                     }
                     return Ok(m[offset as usize..end].to_vec());
                 }
                 let bytes = channel.read(offset, len)?;
-                if mmap.get().is_none() && channel.is_complete()
+                if mmap.get().is_none()
+                    && channel.is_complete()
                     && let Ok(file) = std::fs::File::open(channel.cache_path())
-                        && let Ok(m) = unsafe { Mmap::map(&file) }
-                    {
-                        let _ = mmap.set(m);
-                    }
+                    && let Ok(m) = unsafe { Mmap::map(&file) }
+                {
+                    let _ = mmap.set(m);
+                }
                 Ok(bytes)
             }
         }
@@ -730,15 +784,16 @@ impl Storage {
         match self {
             Storage::Mmap(_) => Ok(()),
             Storage::Http { chunks, mmap } => {
-                if mmap.get().is_some() { return Ok(()); }
+                if mmap.get().is_some() {
+                    return Ok(());
+                }
                 chunks.prebuffer_with_progress(cb)?;
                 if !chunks.is_complete() {
-                    return Err(io::Error::other(
-                        format!(
-                            "HTTP precache did not complete: {}/{} chunks downloaded",
-                            chunks.valid_count(), chunks.total_chunks(),
-                        ),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "HTTP precache did not complete: {}/{} chunks downloaded",
+                        chunks.valid_count(),
+                        chunks.total_chunks(),
+                    )));
                 }
                 if mmap.get().is_none() {
                     let file = std::fs::File::open(chunks.cache_path())?;
@@ -756,11 +811,9 @@ impl Storage {
                 if !channel.is_complete() {
                     let valid = channel.valid_count();
                     let total = channel.total_chunks();
-                    return Err(io::Error::other(
-                        format!(
-                            "precache did not complete: {valid}/{total} chunks verified"
-                        ),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "precache did not complete: {valid}/{total} chunks verified"
+                    )));
                 }
                 // Promotion is part of the contract: after Ok(())
                 // every read on *this* Storage takes the zero-copy
@@ -847,19 +900,27 @@ impl Storage {
         // `m` is bound only inside the `#[cfg(unix)]` block — leading
         // underscore keeps the non-Unix build clean of "unused
         // variable" warnings.
-        let Some(_m) = self.promoted_mmap() else { return; };
-        if byte_start >= byte_end { return; }
+        let Some(_m) = self.promoted_mmap() else {
+            return;
+        };
+        if byte_start >= byte_end {
+            return;
+        }
 
         #[cfg(unix)]
         unsafe {
             let m = _m;
             let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-            if page == 0 { return; }
+            if page == 0 {
+                return;
+            }
             let start = byte_start as usize;
             let end = (byte_end as usize).min(m.len());
             let aligned_start = (start + page - 1) & !(page - 1);
             let aligned_end = end & !(page - 1);
-            if aligned_end <= aligned_start { return; }
+            if aligned_end <= aligned_start {
+                return;
+            }
             libc::madvise(
                 m.as_ptr().add(aligned_start) as *mut libc::c_void,
                 aligned_end - aligned_start,
@@ -881,10 +942,14 @@ impl Storage {
         byte_end: u64,
         bytes_paged: Option<&AtomicU64>,
     ) {
-        let Some(m) = self.promoted_mmap() else { return; };
+        let Some(m) = self.promoted_mmap() else {
+            return;
+        };
         let start = byte_start as usize;
         let end = (byte_end as usize).min(m.len());
-        if end <= start { return; }
+        if end <= start {
+            return;
+        }
         #[cfg(unix)]
         {
             let _ = m.advise_range(memmap2::Advice::WillNeed, start, end - start);
@@ -893,7 +958,9 @@ impl Storage {
         let data = &m[start..end];
         let page_size = 4096;
         for offset in (0..data.len()).step_by(page_size) {
-            unsafe { std::ptr::read_volatile(&data[offset]); }
+            unsafe {
+                std::ptr::read_volatile(&data[offset]);
+            }
             if let Some(counter) = bytes_paged {
                 counter.fetch_add(page_size as u64, std::sync::atomic::Ordering::Relaxed);
             }
@@ -923,8 +990,9 @@ impl Storage {
     pub(crate) fn local_path(&self) -> Option<std::path::PathBuf> {
         match self {
             Storage::Cached { channel, .. } => Some(channel.cache_path().to_path_buf()),
-            Storage::Http { chunks, .. } if chunks.cache_path().is_file() =>
-                Some(chunks.cache_path().to_path_buf()),
+            Storage::Http { chunks, .. } if chunks.cache_path().is_file() => {
+                Some(chunks.cache_path().to_path_buf())
+            }
             _ => None,
         }
     }
@@ -960,14 +1028,19 @@ impl Storage {
 impl std::fmt::Debug for Storage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Storage::Mmap(m) => f.debug_struct("Storage::Mmap").field("size", &m.len()).finish(),
-            Storage::Http { chunks, mmap } => f.debug_struct("Storage::Http")
+            Storage::Mmap(m) => f
+                .debug_struct("Storage::Mmap")
+                .field("size", &m.len())
+                .finish(),
+            Storage::Http { chunks, mmap } => f
+                .debug_struct("Storage::Http")
                 .field("size", &chunks.total_size())
                 .field("chunks_valid", &chunks.valid_count())
                 .field("chunks_total", &chunks.total_chunks())
                 .field("promoted", &mmap.get().is_some())
                 .finish(),
-            Storage::Cached { channel, mmap } => f.debug_struct("Storage::Cached")
+            Storage::Cached { channel, mmap } => f
+                .debug_struct("Storage::Cached")
                 .field("size", &channel.content_size())
                 .field("complete", &channel.is_complete())
                 .field("promoted", &mmap.get().is_some())
@@ -994,17 +1067,18 @@ impl std::fmt::Debug for Storage {
 /// One `Mutex` lock per call until promoted; one extra disk
 /// `.mrkl` read per call until promoted *and* the in-memory state
 /// is incomplete. After promotion, all calls are O(1) atomic-load.
-fn try_promote_cached(
-    channel: &CachedChannel,
-    mmap: &OnceLock<Mmap>,
-) {
-    if mmap.get().is_some() { return; }
+fn try_promote_cached(channel: &CachedChannel, mmap: &OnceLock<Mmap>) {
+    if mmap.get().is_some() {
+        return;
+    }
     let in_memory_complete = channel.is_complete();
     let on_disk_complete = !in_memory_complete
         && crate::merkle::MerkleState::load(channel.state_path())
             .map(|s| s.is_complete())
             .unwrap_or(false);
-    if !(in_memory_complete || on_disk_complete) { return; }
+    if !(in_memory_complete || on_disk_complete) {
+        return;
+    }
     if let Ok(file) = std::fs::File::open(channel.cache_path())
         && let Ok(m) = unsafe { Mmap::map(&file) }
     {
@@ -1024,19 +1098,19 @@ fn try_promote_cached(
 /// which is the only safe signal when partial-fill cache files
 /// may exist on disk (a sparse file with holes still reports
 /// `total_size` from the filesystem).
-fn try_promote_http(
-    chunks: &crate::chunked_http::ChunkStore,
-    mmap: &OnceLock<Mmap>,
-) {
-    if mmap.get().is_some() { return; }
-    if !chunks.is_complete() { return; }
+fn try_promote_http(chunks: &crate::chunked_http::ChunkStore, mmap: &OnceLock<Mmap>) {
+    if mmap.get().is_some() {
+        return;
+    }
+    if !chunks.is_complete() {
+        return;
+    }
     if let Ok(file) = std::fs::File::open(chunks.cache_path())
         && let Ok(m) = unsafe { Mmap::map(&file) }
     {
         let _ = mmap.set(m);
     }
 }
-
 
 /// Helper to call `ChunkedTransport::content_length` without exposing
 /// the trait through the public surface.
