@@ -52,7 +52,8 @@
 //! `Θ((N/B)·log_{M/B}(N/B))`, *Communications of the ACM* 31(9), 1988.
 
 use crate::device::{
-    ALL_MODELS_WITH_MODERN, NVME_CONSUMER_MODEL, NVME_MODERN_MODEL, SPINNING_SATA_MODEL,
+    ALL_MODELS_WITH_MODERN, DeviceModel, NVME_CONSUMER_MODEL, NVME_MODERN_MODEL,
+    SPINNING_SATA_MODEL,
 };
 use crate::io::hw::HostModel;
 use crate::queueing;
@@ -131,6 +132,11 @@ pub const ALL: &[Study] = &[
         name: "writeback",
         headline: "dirty-page pacing, and why a buffered scatter cannot be saved",
         run: writeback_study,
+    },
+    Study {
+        name: "corners",
+        headline: "corner cases, with each delta attributed to one factor",
+        run: corners_study,
     },
     Study {
         name: "frontier",
@@ -848,7 +854,254 @@ fn writeback_study() -> String {
     s
 }
 
-// ── 12 · the frontier ────────────────────────────────────────────────
+// ── 12 · corner cases, differentially ────────────────────────────────
+
+/// One named configuration at the edge of the parameter space.
+struct Corner {
+    name: &'static str,
+    /// What makes it a corner.
+    note: &'static str,
+    workload: Workload,
+    device: &'static DeviceModel,
+}
+
+/// The baseline every differential is measured against: a terabyte of
+/// kilobyte records with memory at 3% of it, on a 2016 consumer NVMe.
+/// Nothing about it is extreme, which is the point — the corners are
+/// what happens when one thing about it is.
+fn baseline_corner() -> Corner {
+    Corner {
+        name: "baseline",
+        note: "1 TiB, 1 KiB records, 32 GiB, 128 KiB containers",
+        workload: terabyte(1_024, 32 << 30),
+        device: &NVME_CONSUMER_MODEL,
+    }
+}
+
+/// One-factor-at-a-time perturbations of the baseline. Each changes
+/// exactly one thing, so the delta it produces is attributable.
+fn corners() -> Vec<Corner> {
+    let base = baseline_corner().workload;
+    vec![
+        baseline_corner(),
+        Corner {
+            name: "fits in memory",
+            note: "budget = payload; segments = 1",
+            workload: Workload {
+                budget_bytes: base.payload_bytes(),
+                ..base
+            },
+            device: &NVME_CONSUMER_MODEL,
+        },
+        Corner {
+            name: "memory starved",
+            note: "budget 1 GiB; 1000 segments",
+            workload: Workload {
+                budget_bytes: 1 << 30,
+                ..base
+            },
+            device: &NVME_CONSUMER_MODEL,
+        },
+        Corner {
+            name: "sub-block records",
+            note: "128 B records; 8.6 G ordinals, 32x read waste",
+            workload: terabyte(128, 32 << 30),
+            device: &NVME_CONSUMER_MODEL,
+        },
+        Corner {
+            name: "record = block",
+            note: "4 KiB records; no padding, fewest ordinals",
+            workload: terabyte(4_096, 32 << 30),
+            device: &NVME_CONSUMER_MODEL,
+        },
+        Corner {
+            name: "huge records",
+            note: "64 KiB records; 16 M ordinals",
+            workload: terabyte(65_536, 32 << 30),
+            device: &NVME_CONSUMER_MODEL,
+        },
+        Corner {
+            name: "seek-bound device",
+            note: "spinning SATA; positioning dominates",
+            workload: base,
+            device: &SPINNING_SATA_MODEL,
+        },
+        Corner {
+            name: "fastest device",
+            note: "modern NVMe; command rate and bandwidth both high",
+            workload: base,
+            device: &NVME_MODERN_MODEL,
+        },
+        Corner {
+            name: "container = block",
+            note: "4 KiB containers; w = 4, no coalescing left",
+            workload: Workload {
+                container_bytes: 4_096,
+                ..base
+            },
+            device: &NVME_CONSUMER_MODEL,
+        },
+        Corner {
+            name: "fan-out squeezed",
+            note: "256 MiB containers on a 1 GiB budget: f = 4, so 1000 \
+                   segments need five stages",
+            workload: Workload {
+                container_bytes: 256 << 20,
+                budget_bytes: 1 << 30,
+                ..base
+            },
+            device: &NVME_CONSUMER_MODEL,
+        },
+        Corner {
+            name: "depth 1",
+            note: "one request in flight; concurrency-limited",
+            workload: Workload { depth: 1.0, ..base },
+            device: &NVME_CONSUMER_MODEL,
+        },
+        Corner {
+            name: "depth 4096",
+            note: "far past the knee; capacity-limited",
+            workload: Workload {
+                depth: 4096.0,
+                ..base
+            },
+            device: &NVME_CONSUMER_MODEL,
+        },
+        Corner {
+            name: "worst case",
+            note: "128 B records, 1 GiB budget, seek-bound disk",
+            workload: Workload {
+                budget_bytes: 1 << 30,
+                ..terabyte(128, 32 << 30)
+            },
+            device: &SPINNING_SATA_MODEL,
+        },
+        Corner {
+            name: "best case for naive",
+            note: "64 KiB records, generous memory, fastest device",
+            workload: Workload {
+                budget_bytes: 512 << 30,
+                ..terabyte(65_536, 32 << 30)
+            },
+            device: &NVME_MODERN_MODEL,
+        },
+    ]
+}
+
+fn corners_study() -> String {
+    let mut s = String::new();
+    heading(
+        &mut s,
+        "Study 13 — corner cases, differentially",
+        "The single-axis walks above show shape. This shows *attribution*:\n\
+         one factor changed at a time from a fixed baseline, so each delta\n\
+         belongs to exactly one parameter.",
+    );
+
+    let host = HostModel::cores(8);
+    let base = baseline_corner();
+    let base_costs = compare(&base.workload, base.device, &host);
+    let base_naive = best_naive(&base_costs).seconds;
+    let base_staged = pick(&base_costs, Strategy::Splat).seconds;
+    let base_gain = base_naive / base_staged;
+
+    // (a) Absolute: what each corner costs and who wins there.
+    let _ = writeln!(s, "\n  (a) Absolute — every corner, all four strategies.\n");
+    let _ = writeln!(
+        s,
+        "  {:<20} {:>9} {:>9} {:>9} {:>9} {:>8}  winner",
+        "corner", "gather", "scatter", "rescan", "staged", "gain"
+    );
+    for corner in corners() {
+        let costs = compare(&corner.workload, corner.device, &host);
+        let naive = best_naive(&costs).seconds;
+        let staged = pick(&costs, Strategy::Splat).seconds;
+        let best = costs
+            .iter()
+            .min_by(|a, b| a.seconds.partial_cmp(&b.seconds).unwrap())
+            .expect("four strategies");
+        let _ = writeln!(
+            s,
+            "  {:<20} {:>9} {:>9} {:>9} {:>9} {:>7.1}x  {}",
+            corner.name,
+            human_time(pick(&costs, Strategy::Gather).seconds),
+            human_time(pick(&costs, Strategy::Scatter).seconds),
+            human_time(pick(&costs, Strategy::OrderedScan).seconds),
+            human_time(staged),
+            naive / staged,
+            best.strategy.label()
+        );
+    }
+
+    // (b) Differential: the delta each single factor produced.
+    let _ = writeln!(
+        s,
+        "\n  (b) Differential — change against the baseline, one factor at a time.\n"
+    );
+    let _ = writeln!(
+        s,
+        "  {:<20} {:>9} {:>7} {:>9} {:>9} {:>8} {:>8}  naive pegs",
+        "corner", "segments", "stages", "d naive", "d staged", "gain", "d gain"
+    );
+    for corner in corners() {
+        let costs = compare(&corner.workload, corner.device, &host);
+        let naive = best_naive(&costs).seconds;
+        let staged = pick(&costs, Strategy::Splat).seconds;
+        let gain = naive / staged;
+        let _ = writeln!(
+            s,
+            "  {:<20} {:>9} {:>7} {:>9} {:>9} {:>7.1}x {:>8}  {}",
+            corner.name,
+            human_count(corner.workload.segments()),
+            corner.workload.stages(),
+            ratio(naive / base_naive),
+            ratio(staged / base_staged),
+            gain,
+            ratio(gain / base_gain),
+            pegged_list(best_naive(&costs))
+        );
+    }
+
+    let _ = writeln!(s, "\n  What each corner changes:\n");
+    for corner in corners() {
+        let _ = writeln!(s, "    {:<20} {}", corner.name, corner.note);
+    }
+
+    let _ = writeln!(
+        s,
+        "\n  Read column `d gain` as \"how much more (or less) staging is\n  \
+           worth here than at the baseline\". Three groups fall out:\n\n  \
+           * Factors that make staging matter more — smaller records, a\n    \
+             seek-bound device, less memory. All three raise the naive\n    \
+             cost without touching the staged one.\n  \
+           * Factors that make it matter less — a record that fills a\n    \
+             block, a device whose command rate is high enough to absorb\n    \
+             the ordinals, memory enough to hold the payload. Two of\n    \
+             those three describe a job that was never in trouble.\n  \
+           * Factors that move both together — issue depth, container\n    \
+             size below the point where fan-out collapses. These change\n    \
+             absolute times and leave the decision alone."
+    );
+    s
+}
+
+/// A multiplicative change, rendered so the direction is legible at a
+/// glance: `3.2x` for an increase, `/3.2` for a decrease, `—` for no
+/// meaningful change.
+fn ratio(r: f64) -> String {
+    if !r.is_finite() {
+        return "—".to_string();
+    }
+    if (r - 1.0).abs() < 0.02 {
+        "—".to_string()
+    } else if r >= 1.0 {
+        format!("{r:.1}x")
+    } else {
+        format!("/{:.1}", 1.0 / r)
+    }
+}
+
+// ── 13 · the frontier ────────────────────────────────────────────────
 
 fn frontier_study() -> String {
     let mut s = String::new();
@@ -926,7 +1179,7 @@ fn frontier_study() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{DeviceModel, SATA_SSD_MODEL};
+    use crate::device::SATA_SSD_MODEL;
     use crate::queueing::Resource;
 
     /// Every study runs and produces output. This is the smoke test that
@@ -1120,6 +1373,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The corner set has to straddle the decision.** A study whose
+    /// every configuration favours the same strategy is an advertisement,
+    /// not a study. This asserts the corners actually bracket the
+    /// boundary — some of them are won by a naive gather.
+    #[test]
+    fn the_corner_set_contains_configurations_that_naive_wins() {
+        let host = HostModel::cores(8);
+        let mut staged_wins = 0;
+        let mut naive_wins = 0;
+        for corner in corners() {
+            let costs = compare(&corner.workload, corner.device, &host);
+            if pick(&costs, Strategy::Splat).seconds < best_naive(&costs).seconds {
+                staged_wins += 1;
+            } else {
+                naive_wins += 1;
+            }
+        }
+        assert!(
+            staged_wins >= 8,
+            "only {staged_wins} corners favour staging"
+        );
+        assert!(
+            naive_wins >= 2,
+            "a corner set with no naive wins is not bracketing anything"
+        );
+    }
+
+    /// **Squeezing the fan-out is the one way to make staging expensive.**
+    ///
+    /// Everything else that hurts a naive rewrite leaves the staged one
+    /// alone. This is the exception, and it is worth knowing because it
+    /// is entirely a configuration choice: a container so large that
+    /// memory holds few buffers forces `ceil(log_f(segments))` upward, and
+    /// each stage is a whole extra pass over the payload in both
+    /// directions.
+    #[test]
+    fn only_a_collapsed_fan_out_makes_the_staged_form_expensive() {
+        let host = HostModel::cores(8);
+        let base = terabyte(1_024, 32 << 30);
+        let baseline = pick(
+            &compare(&base, &NVME_CONSUMER_MODEL, &host),
+            Strategy::Splat,
+        )
+        .seconds;
+
+        // Memory, record size and device all leave the staged cost alone
+        // or improve it; none of them multiplies it.
+        for altered in [
+            Workload {
+                budget_bytes: 1 << 30,
+                ..base
+            },
+            terabyte(128, 32 << 30),
+            terabyte(65_536, 32 << 30),
+        ] {
+            let staged = pick(
+                &compare(&altered, &NVME_CONSUMER_MODEL, &host),
+                Strategy::Splat,
+            )
+            .seconds;
+            assert!(
+                staged <= baseline * 1.05,
+                "staged cost should not rise: {} against {}",
+                human_time(staged),
+                human_time(baseline)
+            );
+        }
+
+        // A collapsed fan-out does multiply it, and by the stage count.
+        let squeezed = Workload {
+            container_bytes: 256 << 20,
+            budget_bytes: 1 << 30,
+            ..base
+        };
+        assert_eq!(
+            squeezed.fanout(),
+            4,
+            "a 1 GiB budget holds four 256 MiB buffers"
+        );
+        assert_eq!(
+            squeezed.stages(),
+            5,
+            "and 1000 segments then need five stages"
+        );
+        let staged = pick(
+            &compare(&squeezed, &NVME_CONSUMER_MODEL, &host),
+            Strategy::Splat,
+        )
+        .seconds;
+        assert!(
+            staged > baseline * 2.0,
+            "five stages against one should cost about threefold: {} against {}",
+            human_time(staged),
+            human_time(baseline)
+        );
     }
 
     /// **A scattered reader evicts the writer's dirty pages.**
