@@ -1551,7 +1551,7 @@ fn a_catalog_dataset_selects_its_profile_by_flag_or_suffix() {
     // what distinguishes them.
     use vectordata::catalog::resolver::Catalog;
     use vectordata::catalog::sources::CatalogSources;
-    let sources = CatalogSources::new().add_catalogs(&[catalog.clone()]);
+    let sources = CatalogSources::new().add_catalogs(std::slice::from_ref(&catalog));
     let group = Catalog::of(&sources)
         .open("windowed")
         .expect("the catalog resolves the dataset");
