@@ -1,72 +1,101 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mxfile host="drawio" version="26.0.0">
   <diagram name="layers">
-    <mxGraphModel dx="1400" dy="900" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="900" math="0" shadow="0">
+    <mxGraphModel dx="1400" dy="900" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1440" pageHeight="900" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
 
-        <mxCell id="title" value="veks-studies — two models, joined by a trace" style="text;html=1;align=left;verticalAlign=middle;fontSize=20;fontStyle=1;fontColor=#333333;" vertex="1" parent="1">
-          <mxGeometry x="40" y="20" width="700" height="34" as="geometry" />
+        <mxCell id="title" value="veks-studies — three models, joined by a trace and a workload" style="text;html=1;align=left;verticalAlign=middle;fontSize=20;fontStyle=1;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="40" y="18" width="800" height="34" as="geometry" />
         </mxCell>
-        <mxCell id="subtitle" value="The algorithm model never touches a device. The storage model never knows which algorithm produced its work." style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
-          <mxGeometry x="40" y="56" width="900" height="20" as="geometry" />
+        <mxCell id="subtitle" value="The algorithm model never touches a device. The storage model never knows which algorithm produced its work. The analytic model prices what no trace can hold." style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="52" width="1100" height="20" as="geometry" />
         </mxCell>
 
         <mxCell id="hdr_a" value="ALGORITHM MODEL" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="40" y="110" width="300" height="20" as="geometry" />
+          <mxGeometry x="40" y="98" width="300" height="20" as="geometry" />
         </mxCell>
         <mxCell id="hdr_b" value="STORAGE MODEL" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#d79b00;" vertex="1" parent="1">
-          <mxGeometry x="640" y="110" width="300" height="20" as="geometry" />
+          <mxGeometry x="650" y="98" width="300" height="20" as="geometry" />
         </mxCell>
         <mxCell id="hdr_c" value="EVIDENCE" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="1080" y="110" width="300" height="20" as="geometry" />
+          <mxGeometry x="1120" y="98" width="300" height="20" as="geometry" />
         </mxCell>
 
-        <mxCell id="geom" value="&lt;b&gt;Geometry + Map&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;records, record bytes,&#xa;container bytes, a permutation&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="40" y="150" width="230" height="70" as="geometry" />
+        <mxCell id="geom" value="&lt;b&gt;Geometry + Map&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;records, record bytes, container bytes,&#xa;a closed transform over the ordinals&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="130" width="250" height="70" as="geometry" />
         </mxCell>
-        <mxCell id="algo" value="&lt;b&gt;Rewrite&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;gsplat · naive gather · naive scatter&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="40" y="270" width="230" height="70" as="geometry" />
+        <mxCell id="algo" value="&lt;b&gt;Rewrite — four arms&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;naive gather · naive scatter&#xa;ordered rescan (sweeps once per segment)&#xa;&lt;b&gt;gsplat staged&lt;/b&gt; (sweeps once, spills)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="250" width="250" height="90" as="geometry" />
         </mxCell>
-        <mxCell id="trace" value="&lt;b&gt;Trace&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;every read, scatter and write&#xa;as a virtual operation&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="340" y="270" width="230" height="70" as="geometry" />
+
+        <mxCell id="checks" value="&lt;b&gt;Invariant checks&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;single read · monotone access · single write&#xa;bounded memory · balanced spill · determinism&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="350" y="130" width="250" height="70" as="geometry" />
         </mxCell>
-        <mxCell id="checks" value="&lt;b&gt;Invariant checks&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;read once · monotone · single write&#xa;bounded memory · deterministic&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="340" y="150" width="230" height="70" as="geometry" />
+        <mxCell id="trace" value="&lt;b&gt;Trace&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;ReadRecord · Scatter · WriteRange&#xa;SpillWrite · SpillRead · Barrier&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="350" y="250" width="250" height="90" as="geometry" />
         </mxCell>
         <mxCell id="amp" value="&lt;b&gt;Amplification sweep&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;measured A against the formula&#xa;A(P) = P·(1 − e&lt;sup&gt;−w/P&lt;/sup&gt;)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="340" y="390" width="230" height="70" as="geometry" />
+          <mxGeometry x="350" y="390" width="250" height="70" as="geometry" />
         </mxCell>
 
-        <mxCell id="path" value="&lt;b&gt;Discrete-event storage path&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;host CPU · page cache · readahead&#xa;scheduler · queue · controller · dies&#xa;positioning · transfer · programming&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
-          <mxGeometry x="660" y="300" width="270" height="110" as="geometry" />
-        </mxCell>
-        <mxCell id="hw" value="&lt;b&gt;Hardware&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;geometry, rates, ceilings, dies&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
-          <mxGeometry x="660" y="150" width="125" height="80" as="geometry" />
+        <mxCell id="hw" value="&lt;b&gt;Hardware&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;rates, ceilings, dies&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="650" y="130" width="135" height="70" as="geometry" />
         </mxCell>
         <mxCell id="plat" value="&lt;b&gt;Platform&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;cores · memory&#xa;PCIe share · NUMA&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
-          <mxGeometry x="805" y="150" width="125" height="80" as="geometry" />
+          <mxGeometry x="800" y="130" width="135" height="70" as="geometry" />
         </mxCell>
-        <mxCell id="out" value="&lt;b&gt;Time, and where it went&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;IOPS · bandwidth utilization&#xa;positioning fraction · latency histogram&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
-          <mxGeometry x="660" y="480" width="270" height="80" as="geometry" />
+        <mxCell id="kernel" value="&lt;b&gt;Kernel&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;block scheduler — none · mq-deadline · kyber · bfq&#xa;page cache + readahead · dirty-page writeback&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="650" y="250" width="285" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="path" value="&lt;b&gt;Discrete-event storage path&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;host CPU · queue slots · controller · dies&#xa;positioning · shared transfer · programming&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="650" y="370" width="285" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="out" value="&lt;b&gt;Time, and where it went&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;IOPS · bandwidth utilization · positioning fraction&#xa;scheduler lock · writeback throttle · latency histogram&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="650" y="500" width="285" height="80" as="geometry" />
         </mxCell>
 
-        <mxCell id="fio" value="&lt;b&gt;perfscripts fio corpus&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;3 devices · 512 B–16 MiB&#xa;random, sequential, mixed&#xa;IOPS, bandwidth, clat percentiles&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="1080" y="150" width="260" height="90" as="geometry" />
+        <mxCell id="fio" value="&lt;b&gt;perfscripts fio corpus&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;3 devices · 512 B–16 MiB&#xa;random, sequential, mixed&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="130" width="270" height="70" as="geometry" />
         </mxCell>
         <mxCell id="regime" value="&lt;b&gt;Regimes&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;measurement transcribed in&#xa;the units fio reported it&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="1080" y="290" width="260" height="70" as="geometry" />
+          <mxGeometry x="1120" y="250" width="270" height="70" as="geometry" />
         </mxCell>
-        <mxCell id="score" value="&lt;b&gt;Scorecard&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;MAPE, worst case and signed bias&#xa;per metric, against published bars&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="1080" y="540" width="260" height="80" as="geometry" />
+        <mxCell id="pub" value="&lt;b&gt;Published ceilings&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;Ren et al. ICPE '24 — mq-deadline 569.2k,&#xa;bfq 315.3k IOPS. A second, independent axis.&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="370" width="270" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="score" value="&lt;b&gt;Scorecard&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;MAPE, worst case, signed bias per metric&#xa;throughput 3.9% · mean latency 4.4%&#xa;mq-deadline −0.4% · bfq −0.2%&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="500" width="270" height="80" as="geometry" />
         </mxCell>
 
-        <mxCell id="note_sep" value="The trace is the seam. An algorithm cannot see a device, and a device&#xa;cannot see an algorithm — so a change to one cannot quietly alter the other." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;fontStyle=2;" vertex="1" parent="1">
-          <mxGeometry x="40" y="560" width="560" height="50" as="geometry" />
+        <mxCell id="hdr_d" value="ANALYTIC MODEL — above the scale a trace can hold" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="60" y="640" width="500" height="20" as="geometry" />
         </mxCell>
-        <mxCell id="note_fit" value="Device parameters are fitted here. Everything to its left is a prediction." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;fontStyle=2;" vertex="1" parent="1">
-          <mxGeometry x="1080" y="380" width="280" height="40" as="geometry" />
+        <mxCell id="work" value="&lt;b&gt;Workload&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;10⁹ ordinals · 1 TiB · budget&#xa;container · block · depth&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="40" y="672" width="250" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="demand" value="&lt;b&gt;Service demands&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;seconds per record on each of&#xa;controller · bandwidth · host cpu · media&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="350" y="672" width="250" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="bounds" value="&lt;b&gt;Operational bounds&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;X(n) ≤ min(n/D_total, 1/D_max)&#xa;R(n) ≥ max(D_total, n·D_max)&#xa;U_k = X·D_k&#xa;n* = D_total/D_max&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="650" y="672" width="285" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="studies" value="&lt;b&gt;Manifold studies&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;13 named parameter walks, each reporting&#xa;time, transform rate and &lt;i&gt;every&lt;/i&gt; pegged resource&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="672" width="390" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="note_sep" value="The trace is the seam. An algorithm cannot see a device, and a device cannot&#xa;see an algorithm — so a change to one cannot quietly alter the other." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="60" y="480" width="540" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="note_scale" value="A trace of 10⁹ operations is 24 GB, so above roughly 10⁷ records the analytic path&#xa;prices instead. It is not a separate theory: the two are differenced wherever both&#xa;can run, and the arms must agree on the advantage within a stated factor." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="60" y="540" width="580" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="note_fit" value="Device parameters are fitted here.&#xa;Everything to its left is a prediction." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="330" width="280" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="note_pegged" value="More than one resource can read 100%. When two do, no amount of tuning&#xa;helps and only a strategy that places different demands will." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="650" y="776" width="740" height="34" as="geometry" />
         </mxCell>
 
         <mxCell id="a1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#6c8ebf;" edge="1" parent="1" source="geom" target="algo">
@@ -81,13 +110,16 @@
         <mxCell id="a4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#82b366;" edge="1" parent="1" source="trace" target="amp">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="a5" value="replayed" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#d79b00;fontSize=11;" edge="1" parent="1" source="trace" target="path">
+        <mxCell id="a5" value="replayed" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#d79b00;fontSize=11;" edge="1" parent="1" source="trace" target="kernel">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="a6" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00;" edge="1" parent="1" source="hw" target="path">
+        <mxCell id="a6" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00;" edge="1" parent="1" source="hw" target="kernel">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="a7" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00;" edge="1" parent="1" source="plat" target="path">
+        <mxCell id="a7" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00;" edge="1" parent="1" source="plat" target="kernel">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a13" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00;" edge="1" parent="1" source="kernel" target="path">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="a8" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#d6b656;" edge="1" parent="1" source="path" target="out">
@@ -96,9 +128,9 @@
         <mxCell id="a9" value="calibrates" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#82b366;fontSize=11;verticalAlign=bottom;" edge="1" parent="1" source="regime" target="hw">
           <mxGeometry relative="1" as="geometry">
             <Array as="points">
-              <mxPoint x="1010" y="325" />
-              <mxPoint x="1010" y="126" />
-              <mxPoint x="722" y="126" />
+              <mxPoint x="1050" y="285" />
+              <mxPoint x="1050" y="114" />
+              <mxPoint x="717" y="114" />
             </Array>
           </mxGeometry>
         </mxCell>
@@ -108,7 +140,28 @@
         <mxCell id="a11" value="scored against" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#82b366;fontSize=11;" edge="1" parent="1" source="out" target="score">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="a12" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#82b366;dashed=1;" edge="1" parent="1" source="regime" target="score">
+        <mxCell id="a12" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#82b366;dashed=1;" edge="1" parent="1" source="pub" target="score">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="b1" value="same problem,&#xa;priced not traced" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#b85450;dashed=1;fontSize=11;fontColor=#b85450;" edge="1" parent="1" source="geom" target="work">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="18" y="165" />
+              <mxPoint x="18" y="712" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="b2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#b85450;fontSize=11;" edge="1" parent="1" source="work" target="demand">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="b3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#b85450;" edge="1" parent="1" source="demand" target="bounds">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="b4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#b85450;" edge="1" parent="1" source="bounds" target="studies">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="b5" value="differenced where both can run" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#b85450;dashed=1;fontSize=11;" edge="1" parent="1" source="out" target="bounds">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
 
