@@ -75,19 +75,71 @@ pub trait VvecElement: Copy + Send + Sync + 'static {
     fn from_le_bytes(bytes: &[u8]) -> Self;
 }
 
-impl VvecElement for u8  { const ELEM_SIZE: usize = 1; fn from_le_bytes(b: &[u8]) -> Self { b[0] } }
-impl VvecElement for i8  { const ELEM_SIZE: usize = 1; fn from_le_bytes(b: &[u8]) -> Self { b[0] as i8 } }
-impl VvecElement for u16 { const ELEM_SIZE: usize = 2; fn from_le_bytes(b: &[u8]) -> Self { LittleEndian::read_u16(b) } }
-impl VvecElement for i16 { const ELEM_SIZE: usize = 2; fn from_le_bytes(b: &[u8]) -> Self { LittleEndian::read_i16(b) } }
-impl VvecElement for u32 { const ELEM_SIZE: usize = 4; fn from_le_bytes(b: &[u8]) -> Self { LittleEndian::read_u32(b) } }
-impl VvecElement for i32 { const ELEM_SIZE: usize = 4; fn from_le_bytes(b: &[u8]) -> Self { LittleEndian::read_i32(b) } }
-impl VvecElement for f32 { const ELEM_SIZE: usize = 4; fn from_le_bytes(b: &[u8]) -> Self { LittleEndian::read_f32(b) } }
-impl VvecElement for u64 { const ELEM_SIZE: usize = 8; fn from_le_bytes(b: &[u8]) -> Self { LittleEndian::read_u64(b) } }
-impl VvecElement for i64 { const ELEM_SIZE: usize = 8; fn from_le_bytes(b: &[u8]) -> Self { LittleEndian::read_i64(b) } }
-impl VvecElement for f64 { const ELEM_SIZE: usize = 8; fn from_le_bytes(b: &[u8]) -> Self { LittleEndian::read_f64(b) } }
+impl VvecElement for u8 {
+    const ELEM_SIZE: usize = 1;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        b[0]
+    }
+}
+impl VvecElement for i8 {
+    const ELEM_SIZE: usize = 1;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        b[0] as i8
+    }
+}
+impl VvecElement for u16 {
+    const ELEM_SIZE: usize = 2;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_u16(b)
+    }
+}
+impl VvecElement for i16 {
+    const ELEM_SIZE: usize = 2;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_i16(b)
+    }
+}
+impl VvecElement for u32 {
+    const ELEM_SIZE: usize = 4;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_u32(b)
+    }
+}
+impl VvecElement for i32 {
+    const ELEM_SIZE: usize = 4;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_i32(b)
+    }
+}
+impl VvecElement for f32 {
+    const ELEM_SIZE: usize = 4;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_f32(b)
+    }
+}
+impl VvecElement for u64 {
+    const ELEM_SIZE: usize = 8;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_u64(b)
+    }
+}
+impl VvecElement for i64 {
+    const ELEM_SIZE: usize = 8;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_i64(b)
+    }
+}
+impl VvecElement for f64 {
+    const ELEM_SIZE: usize = 8;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_f64(b)
+    }
+}
 impl VvecElement for half::f16 {
     const ELEM_SIZE: usize = 2;
-    fn from_le_bytes(b: &[u8]) -> Self { half::f16::from_le_bytes([b[0], b[1]]) }
+    fn from_le_bytes(b: &[u8]) -> Self {
+        half::f16::from_le_bytes([b[0], b[1]])
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -118,12 +170,16 @@ pub trait VectorReader<T>: Send + Sync {
     /// Force-download the underlying storage into the local cache so
     /// subsequent reads are zero-copy. No-op for local files and for
     /// non-cacheable HTTP. Idempotent.
-    fn precache(&self) -> io::Result<()> { Ok(()) }
+    fn precache(&self) -> io::Result<()> {
+        Ok(())
+    }
 
     /// Whether all bytes are locally accessible. `true` for local
     /// files, `true` for cached storage once every chunk is verified,
     /// `false` for direct HTTP.
-    fn is_complete(&self) -> bool { true }
+    fn is_complete(&self) -> bool {
+        true
+    }
 }
 
 /// Random-access reader for variable-length vector record files.
@@ -137,12 +193,19 @@ pub trait VvecReader<T: VvecElement>: Send + Sync {
     /// Read the record at the given ordinal as a Vec of typed elements.
     fn get(&self, index: usize) -> Result<Vec<T>, IoError> {
         let bytes = self.get_bytes(index)?;
-        Ok(bytes.chunks_exact(T::ELEM_SIZE).map(T::from_le_bytes).collect())
+        Ok(bytes
+            .chunks_exact(T::ELEM_SIZE)
+            .map(T::from_le_bytes)
+            .collect())
     }
     /// See [`VectorReader::precache`].
-    fn precache(&self) -> io::Result<()> { Ok(()) }
+    fn precache(&self) -> io::Result<()> {
+        Ok(())
+    }
     /// See [`VectorReader::is_complete`].
-    fn is_complete(&self) -> bool { true }
+    fn is_complete(&self) -> bool {
+        true
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -154,23 +217,19 @@ pub(crate) fn infer_elem_size(ext: &str) -> usize {
     match ext.to_lowercase().as_str() {
         // 4-byte
         "fvec" | "fvecs" | "f32vec" | "f32vecs" | "ivec" | "ivecs" | "i32vec" | "i32vecs"
-        | "u32vec" | "u32vecs" | "fvvec" | "fvvecs" | "ivvec" | "ivvecs"
-        | "f32vvec" | "f32vvecs" | "i32vvec" | "i32vvecs" | "u32vvec" | "u32vvecs"
-        | "u32" | "i32" => 4,
+        | "u32vec" | "u32vecs" | "fvvec" | "fvvecs" | "ivvec" | "ivvecs" | "f32vvec"
+        | "f32vvecs" | "i32vvec" | "i32vvecs" | "u32vvec" | "u32vvecs" | "u32" | "i32" => 4,
         // 8-byte
-        "dvec" | "dvecs" | "f64vec" | "f64vecs" | "dvvec" | "dvvecs"
-        | "i64vec" | "i64vecs" | "u64vec" | "u64vecs"
-        | "f64vvec" | "f64vvecs" | "i64vvec" | "i64vvecs" | "u64vvec" | "u64vvecs"
-        | "u64" | "i64" => 8,
+        "dvec" | "dvecs" | "f64vec" | "f64vecs" | "dvvec" | "dvvecs" | "i64vec" | "i64vecs"
+        | "u64vec" | "u64vecs" | "f64vvec" | "f64vvecs" | "i64vvec" | "i64vvecs" | "u64vvec"
+        | "u64vvecs" | "u64" | "i64" => 8,
         // 2-byte
         "mvec" | "mvecs" | "f16vec" | "f16vecs" | "svec" | "svecs" | "i16vec" | "i16vecs"
-        | "u16vec" | "u16vecs" | "mvvec" | "mvvecs" | "svvec" | "svvecs"
-        | "f16vvec" | "f16vvecs" | "i16vvec" | "i16vvecs" | "u16vvec" | "u16vvecs"
-        | "u16" | "i16" => 2,
+        | "u16vec" | "u16vecs" | "mvvec" | "mvvecs" | "svvec" | "svvecs" | "f16vvec"
+        | "f16vvecs" | "i16vvec" | "i16vvecs" | "u16vvec" | "u16vvecs" | "u16" | "i16" => 2,
         // 1-byte
-        "bvec" | "bvecs" | "u8vec" | "u8vecs" | "i8vec" | "i8vecs"
-        | "bvvec" | "bvvecs" | "u8vvec" | "u8vvecs" | "i8vvec" | "i8vvecs"
-        | "u8" | "i8" => 1,
+        "bvec" | "bvecs" | "u8vec" | "u8vecs" | "i8vec" | "i8vecs" | "bvvec" | "bvvecs"
+        | "u8vvec" | "u8vvecs" | "i8vvec" | "i8vvecs" | "u8" | "i8" => 1,
         _ => 0,
     }
 }
@@ -188,7 +247,8 @@ fn validate_element_for_source(source: &str) -> Result<(), IoError> {
     let size = infer_elem_size(ext);
     if size == 0 {
         return Err(IoError::InvalidFormat(format!(
-            "cannot infer element size from extension '.{ext}'")));
+            "cannot infer element size from extension '.{ext}'"
+        )));
     }
     Ok(())
 }
@@ -231,24 +291,41 @@ impl<T> std::fmt::Debug for XvecReader<T> {
 impl<T> XvecReader<T> {
     // ---- shape accessors that don't need a VvecElement bound ----
 
-    pub fn dim(&self) -> usize { self.dim }
-    pub fn count(&self) -> usize { self.count }
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+    pub fn count(&self) -> usize {
+        self.count
+    }
     /// Byte size of each record (4-byte dim header + `dim * ELEM_SIZE`).
-    pub fn entry_size(&self) -> usize { self.entry_size }
+    pub fn entry_size(&self) -> usize {
+        self.entry_size
+    }
 
     // ---- storage advice / reclaim API (no T bound) ----
 
     /// Drive the underlying storage to fully resident state. No-op
     /// for local files and for non-cacheable HTTP.
-    pub fn precache(&self) -> io::Result<()> { self.storage.precache() }
+    pub fn precache(&self) -> io::Result<()> {
+        self.storage.precache()
+    }
 
     pub fn prebuffer_with_progress<F>(&self, cb: F) -> io::Result<()>
-    where F: FnMut(&crate::transport::DownloadProgress)
-    { self.storage.prebuffer_with_progress(cb) }
+    where
+        F: FnMut(&crate::transport::DownloadProgress),
+    {
+        self.storage.prebuffer_with_progress(cb)
+    }
 
-    pub fn is_complete(&self) -> bool { self.storage.is_complete() }
-    pub fn advise_sequential(&self) { self.storage.advise_sequential() }
-    pub fn advise_random(&self)     { self.storage.advise_random() }
+    pub fn is_complete(&self) -> bool {
+        self.storage.is_complete()
+    }
+    pub fn advise_sequential(&self) {
+        self.storage.advise_sequential()
+    }
+    pub fn advise_random(&self) {
+        self.storage.advise_random()
+    }
 
     pub fn prefetch_range(&self, start: usize, end: usize) {
         let bs = (start * self.entry_size) as u64;
@@ -262,12 +339,7 @@ impl<T> XvecReader<T> {
         self.storage.release_range_bytes(bs, be);
     }
 
-    pub fn prefetch_pages(
-        &self,
-        start: usize,
-        end: usize,
-        bytes_paged: Option<&AtomicU64>,
-    ) {
+    pub fn prefetch_pages(&self, start: usize, end: usize, bytes_paged: Option<&AtomicU64>) {
         let bs = (start * self.entry_size) as u64;
         let be = (end.min(self.count) * self.entry_size) as u64;
         self.storage.prefetch_pages_bytes(bs, be, bytes_paged);
@@ -301,15 +373,25 @@ impl<T: VvecElement> XvecReader<T> {
     pub(crate) fn from_storage(storage: Arc<Storage>) -> Result<Self, IoError> {
         let total_size = storage.total_size();
         if total_size == 0 {
-            return Ok(Self { storage, dim: DIM_UNDEFINED, count: 0, entry_size: 0, _phantom: PhantomData });
+            return Ok(Self {
+                storage,
+                dim: DIM_UNDEFINED,
+                count: 0,
+                entry_size: 0,
+                _phantom: PhantomData,
+            });
         }
         if total_size < 4 {
-            return Err(IoError::InvalidFormat("file too short for dim header".into()));
+            return Err(IoError::InvalidFormat(
+                "file too short for dim header".into(),
+            ));
         }
         let header = storage.read_bytes(0, 4)?;
         let dim_i32 = LittleEndian::read_i32(&header);
         if dim_i32 <= 0 {
-            return Err(IoError::InvalidFormat(format!("invalid dimension {dim_i32}")));
+            return Err(IoError::InvalidFormat(format!(
+                "invalid dimension {dim_i32}"
+            )));
         }
         let dim = dim_i32 as usize;
         let entry_size = 4 + dim * T::ELEM_SIZE;
@@ -320,9 +402,14 @@ impl<T: VvecElement> XvecReader<T> {
             )));
         }
         let count = (total_size / entry_size as u64) as usize;
-        Ok(Self { storage, dim, count, entry_size, _phantom: PhantomData })
+        Ok(Self {
+            storage,
+            dim,
+            count,
+            entry_size,
+            _phantom: PhantomData,
+        })
     }
-
 }
 
 impl XvecReader<f32> {
@@ -337,11 +424,11 @@ impl XvecReader<f32> {
     #[inline]
     pub fn get_slice(&self, index: usize) -> &[f32] {
         let data_start = index * self.entry_size + 4;
-        let base = self.storage.mmap_base()
+        let base = self
+            .storage
+            .mmap_base()
             .expect("XvecReader::<f32>::get_slice requires mmap-backed storage");
-        unsafe {
-            core::slice::from_raw_parts(base.add(data_start) as *const f32, self.dim)
-        }
+        unsafe { core::slice::from_raw_parts(base.add(data_start) as *const f32, self.dim) }
     }
 }
 
@@ -352,12 +439,12 @@ macro_rules! impl_get_slice {
             #[inline]
             pub fn get_slice(&self, index: usize) -> &[$t] {
                 let data_start = index * self.entry_size + 4;
-                let base = self.storage.mmap_base()
-                    .expect(concat!("XvecReader::<", stringify!($t),
-                                     ">::get_slice requires mmap-backed storage"));
-                unsafe {
-                    core::slice::from_raw_parts(base.add(data_start) as *const $t, self.dim)
-                }
+                let base = self.storage.mmap_base().expect(concat!(
+                    "XvecReader::<",
+                    stringify!($t),
+                    ">::get_slice requires mmap-backed storage"
+                ));
+                unsafe { core::slice::from_raw_parts(base.add(data_start) as *const $t, self.dim) }
             }
         }
     };
@@ -369,8 +456,12 @@ impl_get_slice!(u8);
 impl_get_slice!(i16);
 
 impl<T: VvecElement> VectorReader<T> for XvecReader<T> {
-    fn dim(&self) -> usize { self.dim }
-    fn count(&self) -> usize { self.count }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn count(&self) -> usize {
+        self.count
+    }
 
     fn get(&self, index: usize) -> Result<Vec<T>, IoError> {
         if index >= self.count {
@@ -379,14 +470,22 @@ impl<T: VvecElement> VectorReader<T> for XvecReader<T> {
         let data_start = (index * self.entry_size + 4) as u64;
         let data_len = (self.dim * T::ELEM_SIZE) as u64;
         if let Some(slice) = self.storage.mmap_slice(data_start, data_len) {
-            return Ok(slice.chunks_exact(T::ELEM_SIZE).map(T::from_le_bytes).collect());
+            return Ok(slice
+                .chunks_exact(T::ELEM_SIZE)
+                .map(T::from_le_bytes)
+                .collect());
         }
         let bytes = self.storage.read_bytes(data_start, data_len)?;
-        Ok(bytes.chunks_exact(T::ELEM_SIZE).map(T::from_le_bytes).collect())
+        Ok(bytes
+            .chunks_exact(T::ELEM_SIZE)
+            .map(T::from_le_bytes)
+            .collect())
     }
 
     fn get_slice(&self, index: usize) -> Option<&[T]> {
-        if index >= self.count { return None; }
+        if index >= self.count {
+            return None;
+        }
         let data_start = (index * self.entry_size + 4) as u64;
         let data_len = (self.dim * T::ELEM_SIZE) as u64;
         let bytes = self.storage.mmap_slice(data_start, data_len)?;
@@ -399,14 +498,22 @@ impl<T: VvecElement> VectorReader<T> for XvecReader<T> {
         // 8). For 8-byte types, the leading dim header forces all
         // records to start at offsets that are 4-aligned, not 8-
         // aligned — so we conservatively bail out on 8-byte types.
-        if T::ELEM_SIZE > 4 { return None; }
+        if T::ELEM_SIZE > 4 {
+            return None;
+        }
         let ptr = bytes.as_ptr() as *const T;
-        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) { return None; }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
         Some(unsafe { core::slice::from_raw_parts(ptr, self.dim) })
     }
 
-    fn precache(&self) -> io::Result<()> { self.storage.precache() }
-    fn is_complete(&self) -> bool { self.storage.is_complete() }
+    fn precache(&self) -> io::Result<()> {
+        self.storage.precache()
+    }
+    fn is_complete(&self) -> bool {
+        self.storage.is_complete()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -448,11 +555,18 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         if inferred != 0 && inferred != T::ELEM_SIZE {
             return Err(IoError::InvalidFormat(format!(
                 "extension '.{ext}' implies {inferred}-byte elements but type {} requires {}",
-                std::any::type_name::<T>(), T::ELEM_SIZE)));
+                std::any::type_name::<T>(),
+                T::ELEM_SIZE
+            )));
         }
         let storage = Storage::open_path(path)?;
         let offsets = load_or_build_local_offsets(path, &storage, T::ELEM_SIZE)?;
-        Ok(Self { storage, offsets, elem_size: T::ELEM_SIZE, _phantom: PhantomData })
+        Ok(Self {
+            storage,
+            offsets,
+            elem_size: T::ELEM_SIZE,
+            _phantom: PhantomData,
+        })
     }
 
     /// Open from a path or URL string. Auto-dispatches transport.
@@ -461,16 +575,20 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         let elem_size = infer_elem_size(ext);
         if elem_size == 0 {
             return Err(IoError::InvalidFormat(format!(
-                "cannot infer element size from extension '.{ext}'")));
+                "cannot infer element size from extension '.{ext}'"
+            )));
         }
         if elem_size != T::ELEM_SIZE {
             return Err(IoError::InvalidFormat(format!(
                 "extension '.{ext}' implies {elem_size}-byte elements but type {} requires {}",
-                std::any::type_name::<T>(), T::ELEM_SIZE)));
+                std::any::type_name::<T>(),
+                T::ELEM_SIZE
+            )));
         }
         if !is_vvec_ext(ext) && ext != "ivec" {
             return Err(IoError::InvalidFormat(format!(
-                "extension '.{ext}' is not a variable-length format; use XvecReader for uniform-stride files")));
+                "extension '.{ext}' is not a variable-length format; use XvecReader for uniform-stride files"
+            )));
         }
 
         // `s3://` URLs are remote and get dispatched through the
@@ -486,10 +604,17 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         } else {
             load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
         };
-        Ok(Self { storage, offsets, elem_size, _phantom: PhantomData })
+        Ok(Self {
+            storage,
+            offsets,
+            elem_size,
+            _phantom: PhantomData,
+        })
     }
 
-    pub fn count(&self) -> usize { self.offsets.len() }
+    pub fn count(&self) -> usize {
+        self.offsets.len()
+    }
 
     pub fn dim_at(&self, index: usize) -> Result<usize, IoError> {
         if index >= self.offsets.len() {
@@ -513,12 +638,16 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         let dim = self.dim_at(index)?;
         let body_start = offset + 4;
         let body_len = (dim * self.elem_size) as u64;
-        self.storage.read_bytes(body_start, body_len).map_err(IoError::Io)
+        self.storage
+            .read_bytes(body_start, body_len)
+            .map_err(IoError::Io)
     }
 
     /// Zero-copy access to record bytes when storage is mmap-backed.
     pub fn get_raw(&self, index: usize) -> Option<&[u8]> {
-        if index >= self.offsets.len() { return None; }
+        if index >= self.offsets.len() {
+            return None;
+        }
         let offset = self.offsets[index];
         let dim_bytes = self.storage.mmap_slice(offset, 4)?;
         let dim = LittleEndian::read_i32(dim_bytes) as usize;
@@ -527,22 +656,38 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         self.storage.mmap_slice(body_start, body_len)
     }
 
-    pub fn precache(&self) -> io::Result<()> { self.storage.precache() }
-    pub fn is_complete(&self) -> bool { self.storage.is_complete() }
+    pub fn precache(&self) -> io::Result<()> {
+        self.storage.precache()
+    }
+    pub fn is_complete(&self) -> bool {
+        self.storage.is_complete()
+    }
 }
 
 impl IndexedVvecReader<i32> {
     /// Read a record as `Vec<i32>`. Convenience alias for the
     /// trait-method `get(index)`.
-    pub fn get_i32(&self, index: usize) -> Result<Vec<i32>, IoError> { self.get(index) }
+    pub fn get_i32(&self, index: usize) -> Result<Vec<i32>, IoError> {
+        self.get(index)
+    }
 }
 
 impl<T: VvecElement> VvecReader<T> for IndexedVvecReader<T> {
-    fn count(&self) -> usize { self.offsets.len() }
-    fn dim_at(&self, index: usize) -> Result<usize, IoError> { self.dim_at(index) }
-    fn get_bytes(&self, index: usize) -> Result<Vec<u8>, IoError> { self.get_bytes(index) }
-    fn precache(&self) -> io::Result<()> { self.storage.precache() }
-    fn is_complete(&self) -> bool { self.storage.is_complete() }
+    fn count(&self) -> usize {
+        self.offsets.len()
+    }
+    fn dim_at(&self, index: usize) -> Result<usize, IoError> {
+        self.dim_at(index)
+    }
+    fn get_bytes(&self, index: usize) -> Result<Vec<u8>, IoError> {
+        self.get_bytes(index)
+    }
+    fn precache(&self) -> io::Result<()> {
+        self.storage.precache()
+    }
+    fn is_complete(&self) -> bool {
+        self.storage.is_complete()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -595,7 +740,12 @@ impl<'a, T: VvecElement> StreamReclaim<'a, T> {
         reader.advise_sequential();
         let entry_size = reader.entry_size().max(1);
         let reclaim_window_records = (reclaim_bytes / entry_size).max(1024);
-        Self { reader, last_released: start, end, reclaim_window_records }
+        Self {
+            reader,
+            last_released: start,
+            end,
+            reclaim_window_records,
+        }
     }
 
     /// Call after touching index `i`. Releases the trailing window
@@ -648,7 +798,8 @@ pub fn open_vvec_untyped(source: &str) -> Result<Box<dyn VvecReader<u8>>, IoErro
     let elem_size = infer_elem_size(ext);
     if elem_size == 0 {
         return Err(IoError::InvalidFormat(format!(
-            "cannot infer element size from extension '.{ext}'")));
+            "cannot infer element size from extension '.{ext}'"
+        )));
     }
     let is_remote = crate::transport::is_remote_url(source);
     let storage = Storage::open(source)?;
@@ -659,7 +810,10 @@ pub fn open_vvec_untyped(source: &str) -> Result<Box<dyn VvecReader<u8>>, IoErro
         load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
     };
     Ok(Box::new(IndexedVvecReader::<u8> {
-        storage, offsets, elem_size, _phantom: PhantomData,
+        storage,
+        offsets,
+        elem_size,
+        _phantom: PhantomData,
     }))
 }
 
@@ -678,7 +832,8 @@ fn load_or_build_local_offsets(
         return Ok(cached);
     }
     // Build by walking the mmap (local storage always has mmap).
-    let bytes = storage.mmap_slice(0, total_size)
+    let bytes = storage
+        .mmap_slice(0, total_size)
         .ok_or_else(|| IoError::InvalidFormat("local storage missing mmap".into()))?;
     let offsets = walk_offsets(bytes, elem_size)?;
     let _ = write_index(&index_path, &offsets, total_size); // best-effort
@@ -691,15 +846,18 @@ fn load_or_fetch_remote_offsets(
     elem_size: usize,
 ) -> Result<Vec<u64>, IoError> {
     // Try sibling IDXFOR__ index URLs (i64 then i32).
-    let url = Url::parse(data_url)
-        .map_err(|e| IoError::InvalidFormat(format!("invalid URL: {e}")))?;
-    let data_name = url.path_segments()
+    let url =
+        Url::parse(data_url).map_err(|e| IoError::InvalidFormat(format!("invalid URL: {e}")))?;
+    let data_name = url
+        .path_segments()
         .and_then(|mut s| s.next_back())
         .unwrap_or("")
         .to_string();
     let mut base = url.clone();
     if base.path_segments_mut().is_ok() {
-        let _ = base.path_segments_mut().map(|mut s| { s.pop(); });
+        let _ = base.path_segments_mut().map(|mut s| {
+            s.pop();
+        });
     }
     let base_str = base.as_str().trim_end_matches('/').to_string();
     let candidates = [
@@ -738,7 +896,11 @@ fn load_or_fetch_remote_offsets(
     // Persist so the walk is paid once per cache lifetime. Best-
     // effort: a read-only cache directory only costs us the rebuild.
     if let Some(cp) = &cache_path {
-        let _ = write_index(&index_path_for(cp, storage.total_size()), &offsets, storage.total_size());
+        let _ = write_index(
+            &index_path_for(cp, storage.total_size()),
+            &offsets,
+            storage.total_size(),
+        );
     }
     Ok(offsets)
 }
@@ -753,14 +915,16 @@ fn walk_offsets(mmap: &[u8], elem_size: usize) -> Result<Vec<u64>, IoError> {
         let dim = LittleEndian::read_i32(&mmap[o..o + 4]);
         if dim < 0 {
             return Err(IoError::InvalidFormat(format!(
-                "negative dimension {dim} at offset {offset}")));
+                "negative dimension {dim} at offset {offset}"
+            )));
         }
         offset += 4 + dim as u64 * elem_size as u64;
     }
     if offset != file_size {
         return Err(IoError::InvalidFormat(format!(
             "file does not end at a record boundary: {} bytes remaining at offset {offset}",
-            file_size - offset)));
+            file_size - offset
+        )));
     }
     Ok(offsets)
 }
@@ -775,24 +939,28 @@ fn walk_offsets_via_storage(storage: &Storage, elem_size: usize) -> Result<Vec<u
         let dim = LittleEndian::read_i32(&header);
         if dim < 0 {
             return Err(IoError::InvalidFormat(format!(
-                "negative dimension {dim} at offset {offset}")));
+                "negative dimension {dim} at offset {offset}"
+            )));
         }
         offset += 4 + dim as u64 * elem_size as u64;
     }
     if offset != total_size {
         return Err(IoError::InvalidFormat(format!(
             "file does not end at a record boundary: {} bytes remaining at offset {offset}",
-            total_size - offset)));
+            total_size - offset
+        )));
     }
     Ok(offsets)
 }
 
 fn parse_index_bytes(bytes: &[u8], ext: &str) -> Vec<u64> {
     match ext {
-        "i32" => bytes.chunks_exact(4)
+        "i32" => bytes
+            .chunks_exact(4)
             .map(|c| LittleEndian::read_i32(c) as u64)
             .collect(),
-        "i64" => bytes.chunks_exact(8)
+        "i64" => bytes
+            .chunks_exact(8)
             .map(|c| LittleEndian::read_i64(c) as u64)
             .collect(),
         _ => Vec::new(),
@@ -801,20 +969,36 @@ fn parse_index_bytes(bytes: &[u8], ext: &str) -> Vec<u64> {
 
 fn index_path_for(data_path: &Path, file_size: u64) -> std::path::PathBuf {
     let parent = data_path.parent().unwrap_or(Path::new("."));
-    let name = data_path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
-    let ext = if file_size <= i32::MAX as u64 { "i32" } else { "i64" };
+    let name = data_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("data");
+    let ext = if file_size <= i32::MAX as u64 {
+        "i32"
+    } else {
+        "i64"
+    };
     parent.join(format!("IDXFOR__{name}.{ext}"))
 }
 
 fn load_local_index(index_path: &Path, data_path: &Path) -> Result<Option<Vec<u64>>, IoError> {
-    if !index_path.is_file() { return Ok(None); }
-    let data_mtime = std::fs::metadata(data_path)?.modified()
+    if !index_path.is_file() {
+        return Ok(None);
+    }
+    let data_mtime = std::fs::metadata(data_path)?
+        .modified()
         .map_err(|e| IoError::InvalidFormat(format!("mtime: {e}")))?;
-    let index_mtime = std::fs::metadata(index_path)?.modified()
+    let index_mtime = std::fs::metadata(index_path)?
+        .modified()
         .map_err(|e| IoError::InvalidFormat(format!("mtime: {e}")))?;
-    if index_mtime < data_mtime { return Ok(None); }
+    if index_mtime < data_mtime {
+        return Ok(None);
+    }
     let data = std::fs::read(index_path)?;
-    let ext = index_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ext = index_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
     Ok(Some(parse_index_bytes(&data, ext)))
 }
 
@@ -822,9 +1006,13 @@ fn write_index(index_path: &Path, offsets: &[u64], file_size: u64) -> Result<(),
     use std::io::Write;
     let mut f = File::create(index_path)?;
     if file_size <= i32::MAX as u64 {
-        for &o in offsets { f.write_all(&(o as i32).to_le_bytes())?; }
+        for &o in offsets {
+            f.write_all(&(o as i32).to_le_bytes())?;
+        }
     } else {
-        for &o in offsets { f.write_all(&(o as i64).to_le_bytes())?; }
+        for &o in offsets {
+            f.write_all(&(o as i64).to_le_bytes())?;
+        }
     }
     Ok(())
 }
@@ -836,7 +1024,9 @@ fn write_index(index_path: &Path, offsets: &[u64], file_size: u64) -> Result<(),
 pub fn remove_vvec_index(data_path: &Path) {
     let parent = data_path.parent().unwrap_or(Path::new("."));
     let name = data_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name.is_empty() { return; }
+    if name.is_empty() {
+        return;
+    }
     for ext in &["i32", "i64"] {
         let idx = parent.join(format!("IDXFOR__{name}.{ext}"));
         if idx.exists() {
