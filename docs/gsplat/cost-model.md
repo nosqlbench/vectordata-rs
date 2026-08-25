@@ -224,13 +224,79 @@ no position to pay for. Flash gains from ordering only through
 command-rate ceiling, which is what the 33% on NVMe is — never through
 locality.
 
-**Page size is second-order.** On a bytes-moved basis a larger container
-is the lever, and `A(P)` treats it that way. In time it is not: once
-access ascends, small contiguous reads cost a disk almost nothing extra,
-so a sixteenfold page change moves an ordered run by under 15% — and a
-scattered one by about as little. Ordering the same accesses is worth
-more than 8×. The container size is worth tuning; the ordering is worth
-having.
+**Page size is second-order — but not for the reason first given here.**
+An earlier version of this section reached that conclusion from a model
+with no readahead in it, where page size was the only fetch-granularity
+knob there was. That made the finding an artifact of the model.
+
+With readahead modelled the conclusion survives and the mechanism
+changes: **the kernel's readahead window, not the page size, sets the
+fetch granularity for an ordered reader.** A sixteenfold page change
+moves an ordered run by about 2%, because in both cases readahead is
+issuing 128 KiB requests — 159 of them for 5,000 pages at 4 KiB, and 157
+at 64 KiB. Ordering the same accesses is worth more than 300× on a disk.
+Tune the container if you like; the ordering is the whole of it.
+
+### Readahead is asymmetric, and that is the point
+
+The kernel does not fetch only what was asked for. On a stream it judges
+sequential it fetches ahead, doubling the window to `ra_pages` (128 KiB,
+256 KiB after `POSIX_FADV_SEQUENTIAL`); on access it judges random it
+fetches the requested pages and stops. Simulated, over the same device:
+
+| Reader | Share of device traffic that is readahead | Positioning | Bandwidth used |
+|---|---|---|---|
+| Ascending | > 50% | 9% | 91% |
+| Scattered | < 5% | 99% | 1% |
+
+Two consequences worth separating.
+
+**Readahead coalesces**, replacing many page faults with one window
+fetch. That is what it is for, and it collapses an ordered reader's
+request count by more than 4×.
+
+**Readahead is a guess, and guesses cost bytes.** On an ascending reader
+that *skips* — which is what a pass of an ordered rewrite does — it fills
+the gaps the reader was deliberately stepping over, moving more than
+twice the bytes. On seek-bound media that trade is roughly neutral,
+because the skipped pages were nearly free to pass over anyway. Where
+bandwidth is the constraint it is a straight loss. The window is
+therefore worth advising *down*, not up, for a sparse-regime pass —
+the opposite of the `advise_sequential()` guidance elsewhere in these
+documents, which is correct only in the dense regime.
+
+Coalescing pays where a per-request cost binds: on a modern drive with
+one core issuing, readahead more than doubles the achievable application
+rate, because the host was the constraint and there are now far fewer
+requests to pay for.
+
+### What else the platform costs
+
+Three ceilings sit above the device's own, and none of them is visible in
+a single-device, single-socket benchmark:
+
+- **Memory bandwidth.** Every byte that arrives from storage is touched
+  several times — DMA in, copy to a user buffer, scatter into an output
+  segment — so a 7 GB/s drive can generate 25 GB/s of memory traffic.
+  Modelled at three touches per byte, a host with 6 GB/s of memory
+  bandwidth cuts a modern drive's usable throughput by more than half.
+  **Cache hits are not free either**: a hit is a memcpy, and a workload
+  served almost entirely from cache can be entirely memory-bound.
+- **The upstream link.** A device's `bus_rate` is its own link, not the
+  aggregate. Eight drives behind one PCIe 4.0 x16 root port get about
+  3.5 GB/s apiece however fast each of them is on its own.
+- **NUMA.** Issuing from the wrong socket costs a per-request latency and
+  a large share of memory bandwidth. The first is **largely hidden by
+  concurrency** — at 128 outstanding requests it costs a few percent —
+  which is the same mechanism that erodes the case for ordering. The
+  second is not hidden at all: a streaming reader on a socket with one
+  channel pair loses more than a quarter of its throughput across the
+  interconnect. NUMA is invisible until bandwidth is the constraint, and
+  then it is most of the problem.
+
+Every device figure quoted in this document was measured on a single
+socket with a dedicated link, so all of it describes the `LOCAL`,
+`DEDICATED` case and anything else is extrapolation.
 
 ### The host is a bottleneck too
 
@@ -253,6 +319,29 @@ For a rewrite this matters directly: it means the throughput a plan
 predicts is unreachable from one thread, and that the gain from ordering
 can be masked entirely by a host that cannot issue fast enough to expose
 it.
+
+### What the model still does not represent
+
+Stated so that a reader does not assume otherwise from the surrounding
+detail:
+
+- **Garbage collection and steady-state flash.** Every device figure here
+  comes from a preconditioned but otherwise quiet drive. A drive under
+  sustained write load runs GC, and its write path degrades in ways none
+  of this captures.
+- **Write caching and volatile buffers.** Writes are modelled as reaching
+  the medium. A drive with a write buffer will beat this model on bursts
+  and match it on sustained load.
+- **Filesystem geometry.** Extent layout, fragmentation, journal traffic
+  and metadata reads are absent; the address space is flat.
+- **The scheduler's own cost.** Ren et al. measure up to 63.4% throughput
+  overhead from Linux I/O schedulers; the schedulers modelled here are
+  free.
+- **Tail latency.** Everything reported is a mean or a rate. The
+  read-after-write serialisation that dominates p99.99 is present as a
+  mechanism but is not characterised.
+- **Multi-device striping.** One device at a time, with the upstream link
+  represented only as a share.
 
 ### Concurrency is a correctness concern, not a tuning knob
 

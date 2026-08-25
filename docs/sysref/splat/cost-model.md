@@ -16,7 +16,7 @@ scale. Canonical spec:
 | `S` | records per segment = `max(M / R, 1)` | — |
 | `P` | passes = `max(ceil(N / S), 2)` | 2 … 100s |
 | `B` | page / minimum transfer unit | 4 KiB |
-| `W` | readahead window (device fetch granularity) | 128 KiB; 256 KiB after `FADV_SEQUENTIAL` |
+| `W` | readahead window (kernel fetch granularity) | 128 KiB; 256 KiB after `FADV_SEQUENTIAL` |
 | `w` | records per window = `W / R` | 31 at R=4100, W=128 KiB |
 | `BW` | sequential bandwidth | 196 MB/s HDD, 1427 MB/s NVMe (measured) |
 | `IOPS` | random IOPS at the achieved queue depth | 266 HDD, 122k NVMe at 4 KiB, QD10 (measured) |
@@ -122,6 +122,15 @@ naive and SPLAT is then strictly better. `advise_sequential()` on the
 source reader (see [04-assemble.md](./04-assemble.md)) pushes toward
 the upper bracket by design — correct in the dense regime, costly in
 the sparse one, where it doubles `W` and therefore `A`.
+
+Simulating the kernel's readahead rather than assuming a fixed fetch
+size confirms the asymmetry the algorithm depends on: an ascending
+reader gets readahead on more than half its device traffic, a scattered
+one on under 5% of it. It also sharpens the caution above. Readahead
+fills the gaps a sparse-regime pass is deliberately skipping, moving more
+than twice the bytes; on seek-bound media that is roughly neutral, and
+wherever bandwidth binds it is a straight loss. **In the sparse regime
+the window is worth advising down, not up.**
 
 ## Time model
 
