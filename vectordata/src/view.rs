@@ -10,12 +10,12 @@
 //! The [`FacetDescriptor`] type supports discover-then-load patterns by
 //! describing available facets without materializing data.
 
+use crate::dataset::facet::StandardFacet;
 use crate::group::DataSource;
-use crate::io::{self, VectorReader, VvecReader, VvecElement};
+use crate::io::IoError;
+use crate::io::{self, VectorReader, VvecElement, VvecReader};
 use crate::model::{FacetConfig, ProfileConfig};
 use crate::{Error, Result};
-use crate::dataset::facet::StandardFacet;
-use crate::io::IoError;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,10 +39,16 @@ fn is_absolute_url(s: &str) -> bool {
 /// "scheme not supported" error instead.
 fn has_absolute_uri_scheme(s: &str) -> bool {
     let mut chars = s.chars();
-    let Some(first) = chars.next() else { return false };
-    if !first.is_ascii_alphabetic() { return false; }
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
     let scheme_end = s.find("://").unwrap_or(usize::MAX);
-    if scheme_end == usize::MAX { return false; }
+    if scheme_end == usize::MAX {
+        return false;
+    }
     s[1..scheme_end]
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
@@ -92,7 +98,9 @@ fn parse_window_first(s: &str) -> Option<(usize, usize)> {
     let iv = dsw.0.into_iter().next()?;
     let start = iv.min_incl as usize;
     let end = iv.max_excl as usize;
-    if end < start { return None; }
+    if end < start {
+        return None;
+    }
     Some((start, end))
 }
 
@@ -135,17 +143,18 @@ pub(crate) fn facet_window_byte_range(
     // the source string takes precedence, else the explicit `window:`
     // field. The suffix-free path is retained for the format guard.
     let parsed = crate::dataset::source::parse_source_string(raw_source).ok()?;
-    let (path_no_window, win_start, win_end): (String, u64, u64) =
-        if !parsed.window.is_empty() {
-            let iv = &parsed.window.0[0];
-            (parsed.path, iv.min_incl, iv.max_excl)
-        } else if let Some((s, e)) = explicit_window.and_then(parse_window_first) {
-            (parsed.path, s as u64, e as u64)
-        } else {
-            return None;
-        };
+    let (path_no_window, win_start, win_end): (String, u64, u64) = if !parsed.window.is_empty() {
+        let iv = &parsed.window.0[0];
+        (parsed.path, iv.min_incl, iv.max_excl)
+    } else if let Some((s, e)) = explicit_window.and_then(parse_window_first) {
+        (parsed.path, s as u64, e as u64)
+    } else {
+        return None;
+    };
 
-    if win_end <= win_start { return None; }
+    if win_end <= win_start {
+        return None;
+    }
 
     // Format guard: only uniform-stride xvec is record→byte
     // computable from `4 + dim * elem_size`. vvec needs the per-
@@ -162,15 +171,21 @@ pub(crate) fn facet_window_byte_range(
     // already cached; cheap (~8 MiB on the wire vs the ~1.3 TiB
     // a full prebuffer would have pulled).
     let header = storage.storage.read_bytes(0, 4).ok()?;
-    if header.len() != 4 { return None; }
+    if header.len() != 4 {
+        return None;
+    }
     let dim = i32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-    if dim <= 0 || dim > 1_000_000 { return None; } // sanity vs corrupt header
+    if dim <= 0 || dim > 1_000_000 {
+        return None;
+    } // sanity vs corrupt header
     let bpr = 4 + (dim as u64) * (elem_size as u64);
 
     let total = storage.total_size();
     let byte_start = win_start.saturating_mul(bpr).min(total);
     let byte_end = win_end.saturating_mul(bpr).min(total);
-    if byte_start >= byte_end { return None; }
+    if byte_start >= byte_end {
+        return None;
+    }
     Some((byte_start, byte_end))
 }
 
@@ -192,7 +207,9 @@ pub(crate) fn facet_download_bytes(
     explicit_window: Option<&str>,
     storage: &FacetStorage,
 ) -> u64 {
-    if storage.is_local() { return 0; }
+    if storage.is_local() {
+        return 0;
+    }
     let Some(raw_source) = raw_source else {
         return storage.total_size();
     };
@@ -223,13 +240,21 @@ impl<T> WindowedVectorReader<T> {
         let s = start.min(total);
         let e = end.min(total);
         let len = e.saturating_sub(s);
-        WindowedVectorReader { inner, start: s, len }
+        WindowedVectorReader {
+            inner,
+            start: s,
+            len,
+        }
     }
 }
 
 impl<T: Send + Sync> VectorReader<T> for WindowedVectorReader<T> {
-    fn dim(&self) -> usize { self.inner.dim() }
-    fn count(&self) -> usize { self.len }
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+    fn count(&self) -> usize {
+        self.len
+    }
     fn get(&self, index: usize) -> std::result::Result<Vec<T>, IoError> {
         if index >= self.len {
             return Err(IoError::InvalidFormat(format!(
@@ -402,7 +427,10 @@ pub trait TestDataView: Send + Sync {
     /// `cb` is taken by `&mut dyn` rather than as a generic parameter
     /// so this trait remains dyn-compatible (consumers receive
     /// `Arc<dyn TestDataView>` from the catalog API).
-    fn prebuffer_all_with_progress(&self, cb: &mut dyn FnMut(&str, &PrebufferProgress)) -> Result<()> {
+    fn prebuffer_all_with_progress(
+        &self,
+        cb: &mut dyn FnMut(&str, &PrebufferProgress),
+    ) -> Result<()> {
         use std::cell::{Cell, RefCell};
 
         // Fail fast on capacity *before* a single chunk is fetched:
@@ -418,7 +446,9 @@ pub trait TestDataView: Send + Sync {
         // free; the `.mref`/header round trips are simply paid now.
         let mut bytes_to_fetch: u64 = 0;
         for (name, desc) in self.facet_manifest() {
-            if self.facet_element_type(&name).is_err() { continue; }
+            if self.facet_element_type(&name).is_err() {
+                continue;
+            }
             // Open failures are not diagnosed here — the download loop
             // re-opens the same facet and surfaces the real error with
             // its own context. Skipping only under-counts the tally.
@@ -426,7 +456,10 @@ pub trait TestDataView: Send + Sync {
                 && !storage.is_local()
             {
                 let download = facet_download_bytes(
-                    desc.source_path.as_deref(), desc.window.as_deref(), &storage);
+                    desc.source_path.as_deref(),
+                    desc.window.as_deref(),
+                    &storage,
+                );
                 let resident = storage.allocated_cache_bytes();
                 bytes_to_fetch += download.saturating_sub(resident);
             }
@@ -438,7 +471,9 @@ pub trait TestDataView: Send + Sync {
             // Skip facets with unrecognised extensions (e.g., layout
             // sidecars) — they're not data facets the typed reader
             // API would touch.
-            if self.facet_element_type(&name).is_err() { continue; }
+            if self.facet_element_type(&name).is_err() {
+                continue;
+            }
 
             // Pre-open notification: the renderer flips to this
             // facet's status line *before* `open_facet_storage`
@@ -456,7 +491,8 @@ pub trait TestDataView: Send + Sync {
                 cb(&name, &p);
             }
 
-            let storage = self.open_facet_storage(&name)
+            let storage = self
+                .open_facet_storage(&name)
                 .map_err(|e| Error::Other(format!("open '{name}' for precache: {e}")))?;
 
             // Honor the facet's window for precache: if the profile
@@ -470,9 +506,10 @@ pub trait TestDataView: Send + Sync {
             // index at this layer), and parquet (different format
             // model entirely) — those fall back to the unbounded
             // prebuffer below.
-            let window_bytes = desc.source_path.as_deref()
-                .and_then(|src| facet_window_byte_range(
-                    src, desc.window.as_deref(), &storage));
+            let window_bytes = desc
+                .source_path
+                .as_deref()
+                .and_then(|src| facet_window_byte_range(src, desc.window.as_deref(), &storage));
             let total_for_display = match window_bytes {
                 Some((s, e)) => e - s,
                 None => storage.total_size(),
@@ -500,8 +537,7 @@ pub trait TestDataView: Send + Sync {
             // RefCell holds a reborrow of `cb` so we can also call
             // `cb` again after the storage call returns (for
             // already-resident facets that fired no inner updates).
-            let cb_cell: RefCell<&mut dyn FnMut(&str, &PrebufferProgress)>
-                = RefCell::new(&mut *cb);
+            let cb_cell: RefCell<&mut dyn FnMut(&str, &PrebufferProgress)> = RefCell::new(&mut *cb);
             let fired = Cell::new(false);
             let name_str = name.to_string();
             let forward = |p: &crate::transport::DownloadProgress| {
@@ -515,8 +551,9 @@ pub trait TestDataView: Send + Sync {
                 fired.set(true);
             };
             let result = match window_bytes {
-                Some((byte_start, byte_end)) => storage
-                    .prebuffer_range_with_progress(byte_start, byte_end, forward),
+                Some((byte_start, byte_end)) => {
+                    storage.prebuffer_range_with_progress(byte_start, byte_end, forward)
+                }
                 None => storage.prebuffer_with_progress(forward),
             };
             result.map_err(|e| Error::Other(format!("precache '{name}': {e}")))?;
@@ -569,11 +606,15 @@ pub trait TestDataView: Send + Sync {
 pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
     view: &dyn TestDataView,
     facet_name: &str,
-) -> std::result::Result<crate::typed_access::TypedReader<T>, crate::typed_access::TypedAccessError> {
-    let source = view.facet_source(facet_name)
-        .ok_or_else(|| crate::typed_access::TypedAccessError::Io(
-            format!("facet '{facet_name}' not declared by this view")))?;
-    let native = view.facet_element_type(facet_name)
+) -> std::result::Result<crate::typed_access::TypedReader<T>, crate::typed_access::TypedAccessError>
+{
+    let source = view.facet_source(facet_name).ok_or_else(|| {
+        crate::typed_access::TypedAccessError::Io(format!(
+            "facet '{facet_name}' not declared by this view"
+        ))
+    })?;
+    let native = view
+        .facet_element_type(facet_name)
         .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
     crate::typed_access::TypedReader::<T>::open_auto(&source, native)
 }
@@ -637,10 +678,15 @@ impl FacetStorage {
     /// `Ok(())`, every read on every reader against this source
     /// (this `FacetStorage` and any other) takes the zero-copy
     /// path on next access.
-    pub fn precache(&self) -> std::io::Result<()> { self.storage.precache() }
+    pub fn precache(&self) -> std::io::Result<()> {
+        self.storage.precache()
+    }
     pub fn prebuffer_with_progress<F>(&self, cb: F) -> std::io::Result<()>
-    where F: FnMut(&crate::transport::DownloadProgress)
-    { self.storage.prebuffer_with_progress(cb) }
+    where
+        F: FnMut(&crate::transport::DownloadProgress),
+    {
+        self.storage.prebuffer_with_progress(cb)
+    }
 
     /// Same as [`Self::prebuffer_with_progress`] but only fetches
     /// chunks covering `[byte_start, byte_end)`. Used by windowed
@@ -654,11 +700,21 @@ impl FacetStorage {
         byte_end: u64,
         cb: F,
     ) -> std::io::Result<()>
-    where F: FnMut(&crate::transport::DownloadProgress)
-    { self.storage.prebuffer_range_with_progress(byte_start, byte_end, cb) }
-    pub fn is_complete(&self) -> bool { self.storage.is_complete() }
-    pub fn is_local(&self) -> bool { self.storage.is_local() }
-    pub fn total_size(&self) -> u64 { self.storage.total_size() }
+    where
+        F: FnMut(&crate::transport::DownloadProgress),
+    {
+        self.storage
+            .prebuffer_range_with_progress(byte_start, byte_end, cb)
+    }
+    pub fn is_complete(&self) -> bool {
+        self.storage.is_complete()
+    }
+    pub fn is_local(&self) -> bool {
+        self.storage.is_local()
+    }
+    pub fn total_size(&self) -> u64 {
+        self.storage.total_size()
+    }
 
     /// Path to the local file that backs this facet, when one
     /// exists. `Some` for `Storage::Cached` (the cache file under
@@ -790,7 +846,9 @@ impl GenericTestDataView {
         // most efficient open is a direct mmap. Same semantic as a
         // fully-precached remote facet.
         if is_local_facet_source(source_str) {
-            return Ok(ResourceLocation::FileSystem(PathBuf::from(file_uri_to_path(source_str))));
+            return Ok(ResourceLocation::FileSystem(PathBuf::from(
+                file_uri_to_path(source_str),
+            )));
         }
         // Any other absolute URI scheme (e.g. `s3://`) — pass
         // through verbatim. We can't open it (no transport here),
@@ -843,16 +901,17 @@ impl GenericTestDataView {
             match crate::dataset::source::parse_source_string(raw) {
                 Ok(parsed) if !parsed.window.is_empty() => {
                     let iv = &parsed.window.0[0];
-                    (parsed.path, Some((iv.min_incl as usize, iv.max_excl as usize)))
+                    (
+                        parsed.path,
+                        Some((iv.min_incl as usize, iv.max_excl as usize)),
+                    )
                 }
                 _ => (raw.to_string(), None),
             };
         let resolved = self.resolve_path_str(&path_str)?;
         let reader = io::open_vec::<T>(&resolved)?;
 
-        let window = window_from_suffix.or_else(|| {
-            facet.window().and_then(parse_window_first)
-        });
+        let window = window_from_suffix.or_else(|| facet.window().and_then(parse_window_first));
         if let Some((start, end)) = window {
             return Ok(Arc::new(WindowedVectorReader::new(reader, start, end)));
         }
@@ -930,18 +989,66 @@ impl GenericTestDataView {
         let mut manifest = HashMap::new();
 
         let standard_facets: &[(&str, Option<&FacetConfig>, StandardFacet)] = &[
-            ("base_vectors", self.config.base_vectors.as_ref(), StandardFacet::BaseVectors),
-            ("query_vectors", self.config.query_vectors.as_ref(), StandardFacet::QueryVectors),
-            ("neighbor_indices", self.config.neighbor_indices.as_ref(), StandardFacet::NeighborIndices),
-            ("neighbor_distances", self.config.neighbor_distances.as_ref(), StandardFacet::NeighborDistances),
-            ("metadata_content", self.config.metadata_content.as_ref(), StandardFacet::MetadataContent),
-            ("metadata_predicates", self.config.metadata_predicates.as_ref(), StandardFacet::MetadataPredicates),
-            ("predicate_results", self.config.predicate_results.as_ref(), StandardFacet::MetadataResults),
-            ("metadata_layout", self.config.metadata_layout.as_ref(), StandardFacet::MetadataLayout),
-            ("prefiltered_neighbor_indices", self.config.prefiltered_neighbor_indices.as_ref(), StandardFacet::PrefilteredNeighborIndices),
-            ("prefiltered_neighbor_distances", self.config.prefiltered_neighbor_distances.as_ref(), StandardFacet::PrefilteredNeighborDistances),
-            ("postfiltered_neighbor_indices", self.config.postfiltered_neighbor_indices.as_ref(), StandardFacet::PostfilteredNeighborIndices),
-            ("postfiltered_neighbor_distances", self.config.postfiltered_neighbor_distances.as_ref(), StandardFacet::PostfilteredNeighborDistances),
+            (
+                "base_vectors",
+                self.config.base_vectors.as_ref(),
+                StandardFacet::BaseVectors,
+            ),
+            (
+                "query_vectors",
+                self.config.query_vectors.as_ref(),
+                StandardFacet::QueryVectors,
+            ),
+            (
+                "neighbor_indices",
+                self.config.neighbor_indices.as_ref(),
+                StandardFacet::NeighborIndices,
+            ),
+            (
+                "neighbor_distances",
+                self.config.neighbor_distances.as_ref(),
+                StandardFacet::NeighborDistances,
+            ),
+            (
+                "metadata_content",
+                self.config.metadata_content.as_ref(),
+                StandardFacet::MetadataContent,
+            ),
+            (
+                "metadata_predicates",
+                self.config.metadata_predicates.as_ref(),
+                StandardFacet::MetadataPredicates,
+            ),
+            (
+                "predicate_results",
+                self.config.predicate_results.as_ref(),
+                StandardFacet::MetadataResults,
+            ),
+            (
+                "metadata_layout",
+                self.config.metadata_layout.as_ref(),
+                StandardFacet::MetadataLayout,
+            ),
+            (
+                "prefiltered_neighbor_indices",
+                self.config.prefiltered_neighbor_indices.as_ref(),
+                StandardFacet::PrefilteredNeighborIndices,
+            ),
+            (
+                "prefiltered_neighbor_distances",
+                self.config.prefiltered_neighbor_distances.as_ref(),
+                StandardFacet::PrefilteredNeighborDistances,
+            ),
+            (
+                "postfiltered_neighbor_indices",
+                self.config.postfiltered_neighbor_indices.as_ref(),
+                StandardFacet::PostfilteredNeighborIndices,
+            ),
+            (
+                "postfiltered_neighbor_distances",
+                self.config.postfiltered_neighbor_distances.as_ref(),
+                StandardFacet::PostfilteredNeighborDistances,
+            ),
         ];
 
         for (name, facet_opt, kind) in standard_facets {
@@ -978,15 +1085,17 @@ impl GenericTestDataView {
             "metadata_layout" => self.config.metadata_layout.as_ref(),
             // Canonical pre-filter keys + legacy `filtered_*` aliases
             // (legacy on-disk files carry pre-filter shape).
-            "prefiltered_neighbor_indices" | "filtered_neighbor_indices" =>
-                self.config.prefiltered_neighbor_indices.as_ref(),
-            "prefiltered_neighbor_distances" | "filtered_neighbor_distances" =>
-                self.config.prefiltered_neighbor_distances.as_ref(),
+            "prefiltered_neighbor_indices" | "filtered_neighbor_indices" => {
+                self.config.prefiltered_neighbor_indices.as_ref()
+            }
+            "prefiltered_neighbor_distances" | "filtered_neighbor_distances" => {
+                self.config.prefiltered_neighbor_distances.as_ref()
+            }
             // Canonical post-filter keys.
-            "postfiltered_neighbor_indices" =>
-                self.config.postfiltered_neighbor_indices.as_ref(),
-            "postfiltered_neighbor_distances" =>
-                self.config.postfiltered_neighbor_distances.as_ref(),
+            "postfiltered_neighbor_indices" => self.config.postfiltered_neighbor_indices.as_ref(),
+            "postfiltered_neighbor_distances" => {
+                self.config.postfiltered_neighbor_distances.as_ref()
+            }
             _ => None,
         }
     }
@@ -1006,11 +1115,15 @@ impl GenericTestDataView {
     pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
         &self,
         name: &str,
-    ) -> std::result::Result<crate::typed_access::TypedReader<T>, crate::typed_access::TypedAccessError> {
-        let facet = self.facet_config_by_name(name)
-            .ok_or_else(|| crate::typed_access::TypedAccessError::Io(
-                format!("facet '{}' not found", name)))?;
-        let resource = self.resolve_resource(facet)
+    ) -> std::result::Result<
+        crate::typed_access::TypedReader<T>,
+        crate::typed_access::TypedAccessError,
+    > {
+        let facet = self.facet_config_by_name(name).ok_or_else(|| {
+            crate::typed_access::TypedAccessError::Io(format!("facet '{}' not found", name))
+        })?;
+        let resource = self
+            .resolve_resource(facet)
             .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
         match resource {
             ResourceLocation::FileSystem(path) => {
@@ -1058,14 +1171,22 @@ impl GenericTestDataView {
         home_norm: &str,
     ) -> Result<()> {
         for (other_name, desc) in self.facet_manifest() {
-            if other_name == facet_name { continue; }
-            let Some(raw) = desc.source_path.as_deref() else { continue; };
+            if other_name == facet_name {
+                continue;
+            }
+            let Some(raw) = desc.source_path.as_deref() else {
+                continue;
+            };
             let other_path = match crate::dataset::source::parse_source_string(raw) {
                 Ok(parsed) => parsed.path,
                 Err(_) => raw.to_string(),
             };
-            let Ok(other_resolved) = self.resolve_path_str(&other_path) else { continue; };
-            if other_resolved == resolved { continue; }
+            let Ok(other_resolved) = self.resolve_path_str(&other_path) else {
+                continue;
+            };
+            if other_resolved == resolved {
+                continue;
+            }
             if facet_cache_relpath(&other_resolved, home_norm) == relpath {
                 return Err(Error::Other(format!(
                     "cache filename collision in dataset '{}': facets '{facet_name}'                      ({resolved}) and '{other_name}' ({other_resolved}) both cache as                      '{relpath}'. Rename one of the source files (or move it under the                      dataset's home URL) so each facet has a distinct filename.",
@@ -1091,7 +1212,10 @@ impl TestDataView for GenericTestDataView {
     }
 
     fn neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
-        self.open_uniform(self.config.neighbor_distances.as_ref(), "neighbor_distances")
+        self.open_uniform(
+            self.config.neighbor_distances.as_ref(),
+            "neighbor_distances",
+        )
     }
 
     fn prefiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>> {
@@ -1170,7 +1294,8 @@ impl TestDataView for GenericTestDataView {
     }
 
     fn facet_element_type(&self, name: &str) -> Result<crate::typed_access::ElementType> {
-        let facet = self.facet_config_by_name(name)
+        let facet = self
+            .facet_config_by_name(name)
             .ok_or_else(|| Error::MissingFacet(name.to_string()))?;
         // Strip the `[start..end)` window suffix before inspecting
         // the extension — otherwise "base.fvec[0..1000)" splits at the
@@ -1183,9 +1308,8 @@ impl TestDataView for GenericTestDataView {
             Ok(parsed) => parsed.path,
             Err(_) => raw.to_string(),
         };
-        crate::typed_access::ElementType::from_extension(
-            source.rsplit('.').next().unwrap_or("")
-        ).ok_or_else(|| Error::Other(format!("unknown element type for facet '{name}'")))
+        crate::typed_access::ElementType::from_extension(source.rsplit('.').next().unwrap_or(""))
+            .ok_or_else(|| Error::Other(format!("unknown element type for facet '{name}'")))
     }
 
     fn base_count(&self) -> Option<u64> {
@@ -1210,7 +1334,8 @@ impl TestDataView for GenericTestDataView {
     }
 
     fn open_facet_storage(&self, name: &str) -> Result<FacetStorage> {
-        let facet = self.facet_config_by_name(name)
+        let facet = self
+            .facet_config_by_name(name)
             .ok_or_else(|| Error::MissingFacet(name.to_string()))?;
         // Strip any window suffix from the source so Storage opens
         // the underlying file/url, not a half-parsed token.
@@ -1248,9 +1373,7 @@ impl TestDataView for GenericTestDataView {
                 };
                 let file_relpath = facet_cache_relpath(&resolved, &home_norm);
                 self.reject_relpath_collisions(name, &resolved, file_relpath, &home_norm)?;
-                crate::storage::Storage::open_layered(
-                    &resolved, ds_name, file_relpath, home,
-                )
+                crate::storage::Storage::open_layered(&resolved, ds_name, file_relpath, home)
             }
             _ => crate::storage::Storage::open(&resolved),
         }
@@ -1258,7 +1381,6 @@ impl TestDataView for GenericTestDataView {
         Ok(FacetStorage::new(storage))
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1289,7 +1411,10 @@ mod tests {
     #[test]
     fn file_uri_to_path_strips_scheme_and_host() {
         assert_eq!(file_uri_to_path("file:///abs/path.fvec"), "/abs/path.fvec");
-        assert_eq!(file_uri_to_path("file://localhost/abs/path.fvec"), "/abs/path.fvec");
+        assert_eq!(
+            file_uri_to_path("file://localhost/abs/path.fvec"),
+            "/abs/path.fvec"
+        );
         assert_eq!(file_uri_to_path("/abs/path.fvec"), "/abs/path.fvec");
         assert_eq!(file_uri_to_path("relative/path.fvec"), "relative/path.fvec");
     }
@@ -1306,32 +1431,48 @@ mod tests {
 
         fn empty_profile() -> crate::model::ProfileConfig {
             crate::model::ProfileConfig {
-                base_count: None, maxk: None, partition: false,
-                base_vectors: None, base_content: None,
-                query_vectors: None, query_terms: None, query_filters: None,
-                neighbor_indices: None, neighbor_distances: None,
-                prefiltered_neighbor_indices: None, prefiltered_neighbor_distances: None,
-                postfiltered_neighbor_indices: None, postfiltered_neighbor_distances: None,
-                metadata_content: None, metadata_predicates: None,
-                predicate_results: None, metadata_layout: None,
+                base_count: None,
+                maxk: None,
+                partition: false,
+                base_vectors: None,
+                base_content: None,
+                query_vectors: None,
+                query_terms: None,
+                query_filters: None,
+                neighbor_indices: None,
+                neighbor_distances: None,
+                prefiltered_neighbor_indices: None,
+                prefiltered_neighbor_distances: None,
+                postfiltered_neighbor_indices: None,
+                postfiltered_neighbor_distances: None,
+                metadata_content: None,
+                metadata_predicates: None,
+                predicate_results: None,
+                metadata_layout: None,
             }
         }
 
         let mut profile = empty_profile();
-        profile.base_vectors = Some(FacetConfig::Simple("file:///tank/share/base.fvec".to_string()));
+        profile.base_vectors = Some(FacetConfig::Simple(
+            "file:///tank/share/base.fvec".to_string(),
+        ));
         profile.query_vectors = Some(FacetConfig::Simple("/tank/share/query.fvec".to_string()));
 
         let base_url = Url::parse("https://catalog.example.com/datasets/x/").unwrap();
         let view = GenericTestDataView::new(DataSource::Http(base_url), profile);
 
         let bv = view.config.base_vectors.as_ref().unwrap();
-        let q  = view.config.query_vectors.as_ref().unwrap();
+        let q = view.config.query_vectors.as_ref().unwrap();
         match view.resolve_resource(bv).unwrap() {
-            ResourceLocation::FileSystem(p) => assert_eq!(p, PathBuf::from("/tank/share/base.fvec")),
+            ResourceLocation::FileSystem(p) => {
+                assert_eq!(p, PathBuf::from("/tank/share/base.fvec"))
+            }
             ResourceLocation::Http(u) => panic!("expected FileSystem, got Http({u})"),
         }
         match view.resolve_resource(q).unwrap() {
-            ResourceLocation::FileSystem(p) => assert_eq!(p, PathBuf::from("/tank/share/query.fvec")),
+            ResourceLocation::FileSystem(p) => {
+                assert_eq!(p, PathBuf::from("/tank/share/query.fvec"))
+            }
             ResourceLocation::Http(u) => panic!("expected FileSystem, got Http({u})"),
         }
 

@@ -25,8 +25,8 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
 use serde::de::{self, Visitor};
+use serde::{Deserialize, Serialize};
 
 /// Data source with optional namespace and window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -117,22 +117,22 @@ pub fn format_count_with_suffix(n: u64) -> String {
 
     let all_scales: &[(u64, &str)] = &[
         (1_000_000_000_000, "t"),
-        (1u64 << 40,        "ti"),
-        (1_000_000_000,     "g"),
-        (1u64 << 30,        "gi"),
-        (1_000_000,         "m"),
-        (1u64 << 20,        "mi"),
-        (1_000,             "k"),
-        (1u64 << 10,        "ki"),
+        (1u64 << 40, "ti"),
+        (1_000_000_000, "g"),
+        (1u64 << 30, "gi"),
+        (1_000_000, "m"),
+        (1u64 << 20, "mi"),
+        (1_000, "k"),
+        (1u64 << 10, "ki"),
     ];
 
     let remainder_scales: &[(u64, &str)] = &[
         (1_000_000_000, "g"),
-        (1u64 << 30,    "gi"),
-        (1_000_000,     "m"),
-        (1u64 << 20,    "mi"),
-        (1_000,         "k"),
-        (1u64 << 10,    "ki"),
+        (1u64 << 30, "gi"),
+        (1_000_000, "m"),
+        (1u64 << 20, "mi"),
+        (1_000, "k"),
+        (1u64 << 10, "ki"),
     ];
 
     let mut best: Option<String> = None;
@@ -149,13 +149,17 @@ pub fn format_count_with_suffix(n: u64) -> String {
         } else {
             let mut rem_str = String::new();
             for &(rd, rs) in remainder_scales {
-                if rd >= divisor { continue; }
+                if rd >= divisor {
+                    continue;
+                }
                 if remainder >= rd && remainder.is_multiple_of(rd) {
                     rem_str = format!("{}{}", remainder / rd, rs);
                     break;
                 }
             }
-            if rem_str.is_empty() { continue; }
+            if rem_str.is_empty() {
+                continue;
+            }
             format!("{}{}{}", quotient, suffix, rem_str)
         };
 
@@ -256,13 +260,17 @@ pub fn parse_number_with_suffix_unit(s: &str) -> Result<(u64, u64), String> {
 fn try_parse_compound(s: &str) -> Option<(u64, u64)> {
     // Must have at least two terms (digit-suffix-digit pattern)
     let bytes = s.as_bytes();
-    if bytes.len() < 4 { return None; }
+    if bytes.len() < 4 {
+        return None;
+    }
 
     // Check: does the string have digits, then alpha, then digits again?
-    let has_compound = bytes.windows(2).any(|w| {
-        w[0].is_ascii_alphabetic() && w[1].is_ascii_digit()
-    });
-    if !has_compound { return None; }
+    let has_compound = bytes
+        .windows(2)
+        .any(|w| w[0].is_ascii_alphabetic() && w[1].is_ascii_digit());
+    if !has_compound {
+        return None;
+    }
 
     // Split into terms: scan for transitions from alpha to digit
     let mut terms: Vec<&str> = Vec::new();
@@ -275,7 +283,9 @@ fn try_parse_compound(s: &str) -> Option<(u64, u64)> {
     }
     terms.push(&s[term_start..]);
 
-    if terms.len() < 2 { return None; }
+    if terms.len() < 2 {
+        return None;
+    }
 
     // Parse each term as a simple number+suffix
     let mut total = 0u64;
@@ -394,8 +404,10 @@ pub fn parse_window(s: &str) -> Result<DSWindow, String> {
         s
     };
 
-    let intervals: Result<Vec<DSInterval>, String> =
-        inner.split(',').map(|part| parse_interval(part.trim())).collect();
+    let intervals: Result<Vec<DSInterval>, String> = inner
+        .split(',')
+        .map(|part| parse_interval(part.trim()))
+        .collect();
     Ok(DSWindow(intervals?))
 }
 
@@ -472,7 +484,11 @@ fn split_namespace(s: &str) -> (&str, Option<String>) {
         let after = &s[colon_pos + 1..];
         // Only treat as namespace if there's a dot before the colon (extension)
         // and the part after colon is non-empty and doesn't look like a path
-        if before.contains('.') && !after.is_empty() && !after.contains('/') && !after.contains('\\') {
+        if before.contains('.')
+            && !after.is_empty()
+            && !after.contains('/')
+            && !after.contains('\\')
+        {
             return (before, Some(after.to_string()));
         }
     }
@@ -679,11 +695,23 @@ mod tests {
         // Bare digits → granularity 1 (exact).
         assert_eq!(parse_number_with_suffix_unit("1000").unwrap(), (1000, 1));
         // A spelled unit → that unit's multiplier.
-        assert_eq!(parse_number_with_suffix_unit("118MB").unwrap(), (118_000_000, 1_000_000));
-        assert_eq!(parse_number_with_suffix_unit("12g").unwrap(), (12_000_000_000, 1_000_000_000));
-        assert_eq!(parse_number_with_suffix_unit("5KiB").unwrap(), (5_120, 1_024));
+        assert_eq!(
+            parse_number_with_suffix_unit("118MB").unwrap(),
+            (118_000_000, 1_000_000)
+        );
+        assert_eq!(
+            parse_number_with_suffix_unit("12g").unwrap(),
+            (12_000_000_000, 1_000_000_000)
+        );
+        assert_eq!(
+            parse_number_with_suffix_unit("5KiB").unwrap(),
+            (5_120, 1_024)
+        );
         // Compound → the smallest term's unit is the granularity.
-        assert_eq!(parse_number_with_suffix_unit("1g24m").unwrap(), (1_024_000_000, 1_000_000));
+        assert_eq!(
+            parse_number_with_suffix_unit("1g24m").unwrap(),
+            (1_024_000_000, 1_000_000)
+        );
     }
 
     #[test]

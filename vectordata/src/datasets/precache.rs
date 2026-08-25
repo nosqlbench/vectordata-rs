@@ -67,15 +67,18 @@ pub fn run(
         }
     };
     if let Some(override_) = cache_dir {
-        eprintln!("note: --cache-dir {} is recorded but the active cache root is {}",
+        eprintln!(
+            "note: --cache-dir {} is recorded but the active cache root is {}",
             override_.display(),
-            configured.as_deref().map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(unconfigured)".to_string()));
+            configured
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(unconfigured)".to_string())
+        );
     }
 
-    let (resolution, profile_sel) = match resolve_spec(
-        dataset_spec, configdir, extra_catalogs, at,
-    ) {
+    let (resolution, profile_sel) = match resolve_spec(dataset_spec, configdir, extra_catalogs, at)
+    {
         Some(r) => r,
         None => return 1,
     };
@@ -119,8 +122,7 @@ pub fn run(
                 Some(v) => v,
                 None => {
                     eprintln!("Profile '{profile_name}' not found at {descriptor}.");
-                    eprintln!("Available profiles: {}",
-                        group.profile_names().join(", "));
+                    eprintln!("Available profiles: {}", group.profile_names().join(", "));
                     return 1;
                 }
             };
@@ -129,8 +131,10 @@ pub fn run(
         }
         ProfileSelection::AllProfiles => {
             let names = group.profile_names();
-            eprintln!("Prebuffering {descriptor} — all profiles ({})",
-                names.join(", "));
+            eprintln!(
+                "Prebuffering {descriptor} — all profiles ({})",
+                names.join(", ")
+            );
             drive_prebuffer_all(&group)
         }
     }
@@ -144,7 +148,10 @@ enum Resolved {
     /// the catalog's own embedded layout *is* the dataset
     /// description, and `Catalog::open` synthesises the group from
     /// it).
-    CatalogEntry { catalog: Catalog, name: String },
+    CatalogEntry {
+        catalog: Catalog,
+        name: String,
+    },
     Local(String),
     Url(String),
 }
@@ -172,8 +179,10 @@ fn resolve_spec(
     {
         (dataset_spec, ProfileSelection::AllProfiles)
     } else if let Some(pos) = dataset_spec.find(':') {
-        (&dataset_spec[..pos],
-         ProfileSelection::Named(dataset_spec[pos + 1..].to_string()))
+        (
+            &dataset_spec[..pos],
+            ProfileSelection::Named(dataset_spec[pos + 1..].to_string()),
+        )
     } else {
         (dataset_spec, ProfileSelection::AllProfiles)
     };
@@ -188,8 +197,10 @@ fn resolve_spec(
 
     let sources = build_sources(configdir, extra_catalogs, at);
     if sources.is_empty() {
-        eprintln!("'{}' is not a local path, not a URL, and no catalog is configured.",
-            head);
+        eprintln!(
+            "'{}' is not a local path, not a URL, and no catalog is configured.",
+            head
+        );
         eprintln!("Add a catalog with:");
         eprintln!("  vectordata config catalog add <URL-or-path>");
         eprintln!("Or use --catalog/--at for one-off access.");
@@ -205,11 +216,15 @@ fn resolve_spec(
         }
     };
     if let ProfileSelection::Named(ref p) = profile_sel
-        && entry.layout.profiles.profile(p).is_none() {
-            eprintln!("Profile '{p}' not found in dataset '{}'. Available: {}",
-                entry.name, entry.profile_names().join(", "));
-            return None;
-        }
+        && entry.layout.profiles.profile(p).is_none()
+    {
+        eprintln!(
+            "Profile '{p}' not found in dataset '{}'. Available: {}",
+            entry.name,
+            entry.profile_names().join(", ")
+        );
+        return None;
+    }
     let name = entry.name.clone();
     Some((Resolved::CatalogEntry { catalog, name }, profile_sel))
 }
@@ -222,10 +237,13 @@ fn drive_prebuffer(view: &dyn TestDataView) -> i32 {
         println!("Precache: profile declared no facets.");
         return 0;
     }
-    eprintln!("Prebuffering {} facet(s), {} to download. ({} streams × {} HTTP runtimes)",
-        plan.facets.len(), fmt_bytes(plan.total_bytes),
+    eprintln!(
+        "Prebuffering {} facet(s), {} to download. ({} streams × {} HTTP runtimes)",
+        plan.facets.len(),
+        fmt_bytes(plan.total_bytes),
         crate::cache::download_concurrency(),
-        crate::transport::http_runtimes());
+        crate::transport::http_runtimes()
+    );
     let mut ctx = LiveCtx::new(plan.facets.len(), plan.total_bytes);
     let result = view.prebuffer_all_with_progress(&mut |facet, p| ctx.on_progress(facet, p));
     ctx.finalize(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
@@ -251,15 +269,22 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup) -> i32 {
         return 0;
     }
     if total_bytes >= crate::PREBUFFER_LARGE_WARNING_BYTES {
-        eprintln!("warning: precache announced {} across all profiles \
+        eprintln!(
+            "warning: precache announced {} across all profiles \
                    (above the {} advisory threshold).",
             fmt_bytes(total_bytes),
-            fmt_bytes(crate::PREBUFFER_LARGE_WARNING_BYTES));
-        eprintln!("Continuing — pass an explicit `dataset:profile` to limit \
-                   which profiles are downloaded.");
+            fmt_bytes(crate::PREBUFFER_LARGE_WARNING_BYTES)
+        );
+        eprintln!(
+            "Continuing — pass an explicit `dataset:profile` to limit \
+                   which profiles are downloaded."
+        );
     }
-    eprintln!("Prebuffering {} facet(s) across all profiles, {} to download.",
-        all_facets.len(), fmt_bytes(total_bytes));
+    eprintln!(
+        "Prebuffering {} facet(s) across all profiles, {} to download.",
+        all_facets.len(),
+        fmt_bytes(total_bytes)
+    );
 
     let mut ctx = LiveCtx::new(all_facets.len(), total_bytes);
     let result = group.prebuffer_all_profiles_with_progress(
@@ -292,7 +317,9 @@ fn plan_prebuffer(view: &dyn TestDataView) -> PrebufferPlan {
     let mut facets = Vec::new();
     let mut total_bytes = 0u64;
     for (name, desc) in view.facet_manifest() {
-        if view.facet_element_type(&name).is_err() { continue; }
+        if view.facet_element_type(&name).is_err() {
+            continue;
+        }
         if let Ok(storage) = view.open_facet_storage(&name) {
             // Windowed facets contribute their window size, not the
             // shared base file's full size — otherwise a sized
@@ -301,11 +328,19 @@ fn plan_prebuffer(view: &dyn TestDataView) -> PrebufferPlan {
             // pulls a fraction. `facet_download_bytes` handles the
             // local/remote and windowed/full split in one call.
             total_bytes += crate::view::facet_download_bytes(
-                desc.source_path.as_deref(), desc.window.as_deref(), &storage);
-            facets.push(FacetPlanRow { qualified_name: name });
+                desc.source_path.as_deref(),
+                desc.window.as_deref(),
+                &storage,
+            );
+            facets.push(FacetPlanRow {
+                qualified_name: name,
+            });
         }
     }
-    PrebufferPlan { facets, total_bytes }
+    PrebufferPlan {
+        facets,
+        total_bytes,
+    }
 }
 
 /// In-place stderr renderer for precache progress.
@@ -334,8 +369,7 @@ impl LiveCtx {
             bytes_per_facet: std::collections::HashMap::new(),
             current_facet: String::new(),
             facet_index: 0,
-            last_render: std::time::Instant::now()
-                - std::time::Duration::from_secs(1),
+            last_render: std::time::Instant::now() - std::time::Duration::from_secs(1),
             started: std::time::Instant::now(),
         }
     }
@@ -345,8 +379,7 @@ impl LiveCtx {
             self.flush_facet_summary();
             self.current_facet = facet.to_string();
             self.facet_index += 1;
-            self.last_render = std::time::Instant::now()
-                - std::time::Duration::from_secs(1);
+            self.last_render = std::time::Instant::now() - std::time::Duration::from_secs(1);
             // Print the in-place line immediately on facet switch
             // so users see the meter flip to the new facet *before*
             // the .mref network round trip completes.
@@ -359,7 +392,8 @@ impl LiveCtx {
         // those — otherwise the post-open size briefly appears as
         // a "regression" (0 bytes verified out of N total bytes).
         if p.total_bytes > 0 {
-            self.bytes_per_facet.insert(facet.to_string(), p.verified_bytes);
+            self.bytes_per_facet
+                .insert(facet.to_string(), p.verified_bytes);
         }
         if self.last_render.elapsed().as_millis() >= 250 {
             self.render(facet, p);
@@ -374,10 +408,12 @@ impl LiveCtx {
             // Pre-open — `.mref` fetch in flight, size still unknown.
             "opening…".to_string()
         } else {
-            format!("{}% ({}/{})",
+            format!(
+                "{}% ({}/{})",
                 pct(p.verified_bytes, p.total_bytes),
                 fmt_bytes(p.verified_bytes),
-                fmt_bytes(p.total_bytes))
+                fmt_bytes(p.total_bytes)
+            )
         };
         // Throughput + ETA. Held back until we've been downloading
         // long enough for the rate to be meaningful — the first
@@ -390,30 +426,47 @@ impl LiveCtx {
             let rate = aggregate_done as f64 / elapsed;
             let remaining = self.total_bytes - aggregate_done;
             let eta_secs = (remaining as f64 / rate.max(1.0)) as u64;
-            format!(" \u{2022} {}/s \u{2022} ETA {}",
-                fmt_bytes(rate as u64), fmt_duration(eta_secs))
+            format!(
+                " \u{2022} {}/s \u{2022} ETA {}",
+                fmt_bytes(rate as u64),
+                fmt_duration(eta_secs)
+            )
         } else {
             String::new()
         };
         use std::io::Write;
         eprint!(
             "\r  [{}/{}] {}: {} \u{2022} total {}% ({}/{}){}\u{1b}[K",
-            self.facet_index, self.facet_count, facet,
+            self.facet_index,
+            self.facet_count,
+            facet,
             facet_state,
-            pct_total, fmt_bytes(aggregate_done), fmt_bytes(self.total_bytes),
-            trailing);
+            pct_total,
+            fmt_bytes(aggregate_done),
+            fmt_bytes(self.total_bytes),
+            trailing
+        );
         let _ = std::io::stderr().flush();
     }
 
     /// Print a permanent "✓" line for the just-finished facet,
     /// erasing the in-place progress line first.
     fn flush_facet_summary(&self) {
-        if self.current_facet.is_empty() { return; }
-        let bytes = self.bytes_per_facet.get(&self.current_facet)
-            .copied().unwrap_or(0);
-        eprintln!("\r  [{}/{}] {} \u{2713} {}\u{1b}[K",
-            self.facet_index, self.facet_count, self.current_facet,
-            fmt_bytes(bytes));
+        if self.current_facet.is_empty() {
+            return;
+        }
+        let bytes = self
+            .bytes_per_facet
+            .get(&self.current_facet)
+            .copied()
+            .unwrap_or(0);
+        eprintln!(
+            "\r  [{}/{}] {} \u{2713} {}\u{1b}[K",
+            self.facet_index,
+            self.facet_count,
+            self.current_facet,
+            fmt_bytes(bytes)
+        );
     }
 
     pub(super) fn finalize<T, E: std::fmt::Display>(&self, result: &Result<T, E>) {
@@ -422,9 +475,13 @@ impl LiveCtx {
         let done: u64 = self.bytes_per_facet.values().sum();
         match result {
             Ok(_) => {
-                eprintln!("Precache done: {} facet(s), {} in {:.1}s ({}/s).",
-                    self.facet_count, fmt_bytes(done), elapsed,
-                    fmt_bytes((done as f64 / elapsed.max(0.001)) as u64));
+                eprintln!(
+                    "Precache done: {} facet(s), {} in {:.1}s ({}/s).",
+                    self.facet_count,
+                    fmt_bytes(done),
+                    elapsed,
+                    fmt_bytes((done as f64 / elapsed.max(0.001)) as u64)
+                );
             }
             Err(e) => {
                 eprintln!("Precache: failed — {e}");
@@ -434,7 +491,9 @@ impl LiveCtx {
 }
 
 pub(super) fn pct(done: u64, total: u64) -> u32 {
-    if total == 0 { return 100; }
+    if total == 0 {
+        return 100;
+    }
     ((done as u128 * 100) / total as u128) as u32
 }
 
@@ -443,11 +502,17 @@ pub(super) fn fmt_bytes(bytes: u64) -> String {
     const MIB: u64 = 1024 * KIB;
     const GIB: u64 = 1024 * MIB;
     const TIB: u64 = 1024 * GIB;
-    if bytes >= TIB { format!("{:.1} TiB", bytes as f64 / TIB as f64) }
-    else if bytes >= GIB { format!("{:.1} GiB", bytes as f64 / GIB as f64) }
-    else if bytes >= MIB { format!("{:.1} MiB", bytes as f64 / MIB as f64) }
-    else if bytes >= KIB { format!("{:.1} KiB", bytes as f64 / KIB as f64) }
-    else { format!("{} B", bytes) }
+    if bytes >= TIB {
+        format!("{:.1} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 /// Format a duration in seconds as a compact human string. Picks
@@ -459,8 +524,13 @@ pub(super) fn fmt_duration(secs: u64) -> String {
     const M: u64 = 60;
     const H: u64 = 60 * M;
     const D: u64 = 24 * H;
-    if secs < M { format!("{secs}s") }
-    else if secs < H { format!("{}m {:02}s", secs / M, secs % M) }
-    else if secs < D { format!("{}h {:02}m", secs / H, (secs % H) / M) }
-    else             { format!("{}d {:02}h", secs / D, (secs % D) / H) }
+    if secs < M {
+        format!("{secs}s")
+    } else if secs < H {
+        format!("{}m {:02}s", secs / M, secs % M)
+    } else if secs < D {
+        format!("{}h {:02}m", secs / H, (secs % H) / M)
+    } else {
+        format!("{}d {:02}h", secs / D, (secs % D) / H)
+    }
 }
