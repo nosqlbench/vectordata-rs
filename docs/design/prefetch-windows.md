@@ -183,10 +183,13 @@ index is the only way to map an ordinal to a byte. Three rules:
    *prerequisite* incremental buys little while doubling the number of
    partial-fetch state machines to reason about.
 
-**And the vvec data file must be merkle-published.** Not for integrity —
-for download-state management. Windowed fetch needs a chunk bitmap to
-know what is already resident, and that is what the merkle path
-provides. A vvec facet without `.mref` cannot be windowed.
+**And the vvec data file should be merkle-published.** Merkle mode
+carries integrity *and* download-state management — one mechanism, two
+benefits, no reason to separate them or to treat either as the "real"
+motivation. A facet published with `.mref` gets a chunk bitmap, and a
+chunk bitmap is what windowed fetch needs to know what is already
+resident. A vvec facet without one simply has no partial state to track,
+so it fetches whole.
 
 ### parquet — deferred
 
@@ -282,14 +285,17 @@ sized honestly.
 | malformed vs absent | **landed** |
 | record→byte for xvec | exists, welded to config resolution |
 
-**Remaining: one extraction and one entry point.** `facet_window_byte_range`
-splits at its "Format guard" comment — above resolves *where the window
-comes from*, below maps records→bytes given `(path, start, end,
-storage)`. Pull the lower half out as `record_range_to_bytes` and both
-callers work: config-derived windows as today, caller-supplied windows
-for prefetch. No new logic, roughly thirty lines moved.
+**Done.** `record_range_to_bytes` is extracted and both callers use it;
+`TestDataView` has `prefetch_plan`, `prefetch` and
+`prefetch_with_progress` taking a `DSWindow` in record coordinates.
+Seven integration tests cover the ad-hoc path, multi-interval windows,
+empty-window-means-everything, clamping past the end, the degrade
+report, and parity between an ad-hoc window and a declared one.
 
-That is a small, low-risk change, and it is the whole xvec path.
+Multi-interval windows resolve every interval here, which no other
+consumer does — the reader's single contiguous window is a
+`WindowedVectorReader` limit, not a fetch limit, and prefetch has no
+such structure in the way.
 
 ### Moderate — vvec
 
@@ -322,10 +328,10 @@ is a later step gated on that.
   without one, but it is a breaking change to any dataset already
   published without it, and it needs a migration story rather than a
   hard failure on next load.
-- **`.mref` becomes load-bearing for vvec.** Requiring merkle for
-  download-state management is a sound reason, but it means a vvec
-  dataset published without `.mref` silently loses windowing. That
-  should be a stated diagnostic, not an inferred capability.
+- **A vvec facet without `.mref` fetches whole.** Not a failure, and
+  not a separate mode — just the absence of the chunk bitmap that
+  partial fetch tracks state in. Worth reporting in the plan
+  (`degrades_to_full_download`) so it is visible rather than inferred.
 - **`degrades_to_full_download` still has no agreed behaviour.** See the
   remaining open question.
 
@@ -349,21 +355,16 @@ its index and `.mref`, index fetched whole, parquet deferred) and the
 plan accessors, both above. The comma hazard is fixed and committed.
 
 
-**1. Does a runtime prefetch window belong in `dataset.yaml`?**
+**1. Resolved — profile windows are conveniences, not fences.**
 
-The standing rule is that CLI flags and `dataset.yaml` keys are
-congruent mirrors — every knob reachable from both. But a prefetch
-window is an *argument*, not a knob: "fetch records 5M..6M right now" is
-not a property of the dataset, and `dataset.yaml` already uses `window:`
-to mean something different and permanent (this profile *is* that
-window).
+A profile's `window:` qualifies a range someone wants repeatedly, with
+the finesse of a name and a stable definition. It is not the set of
+ranges anyone is permitted to ask for. The API takes a caller-supplied
+window directly, and the two paths resolve through the same mapping.
 
-My reading is that the congruence rule applies to prefetch *policy* —
-chunk granularity, download concurrency, whether opening a facet warms
-its first N chunks — and those should be mirrored. The window itself
-should be CLI-and-API only. But this is exactly the kind of call I
-should not make silently, because it is a stated rule and I am proposing
-an exception to it.
+This dissolves the congruence question rather than answering it: the
+YAML key remains the knob it always was, and an ad-hoc window is an
+argument. Nothing is mirrored because nothing new is configured.
 
 **2. Blocking, background, or both?**
 
