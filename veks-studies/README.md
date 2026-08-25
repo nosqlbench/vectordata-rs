@@ -12,15 +12,16 @@ known to be wrong.
 
 ## What this is
 
-Two layers, and the distinction matters.
+Three layers, and the distinctions matter.
 
 ![Layer overview](docs/gsplat/veks-sim-layers.svg)
 
 **A model of the algorithm.** `algo`, `model`, `check` and `study`
-simulate the rewrite itself — every read, scatter and write recorded as a
-virtual operation in a trace. Nothing here touches a device. It exists so
-that claims in `docs/gsplat/` can fail a test: that every mapped record
-is read exactly once, that reads ascend within a pass, that resident
+simulate the rewrite itself — every read, scatter, spill and write
+recorded as a virtual operation in a trace. Nothing here touches a
+device. It exists so that claims in `docs/gsplat/` can fail a test: that
+every mapped record is read exactly once, that reads ascend within a
+pass, that everything spilled is read back exactly once, that resident
 memory stays inside its budget, that container touches follow
 `A(P) = P · (1 − exp(−w / P))`.
 
@@ -28,12 +29,22 @@ memory stays inside its budget, that container touches follow
 turn a trace into a time. This is a discrete-event simulator: it advances
 a clock through positioning, transfer and programming against a shared
 bandwidth ceiling, a finite command queue, a serial controller, dies with
-address affinity, and a page cache with kernel-style readahead. **It
-contains no throughput formula.** Throughput is what falls out.
+address affinity, a page cache with kernel-style readahead and dirty-page
+writeback, and a block scheduler that costs what the measured ones cost.
+**It contains no throughput formula.** Throughput is what falls out.
 
-`validate` scores the second layer against measurement.
+**A model of the cost at scale.** `scale`, `queueing` and `manifold`
+price a workload no trace can hold. A billion-operation trace is 24 GB,
+so above roughly 10⁷ records the strategies are priced as service demands
+per record and bounded by operational analysis instead. This is not a
+separate theory: the two are differenced wherever both can run.
 
-Every stage one request passes through, and what can stop it at each:
+`validate` scores the second layer against measurement — twice, against
+two unrelated sources.
+
+Every stage one access passes through, and what can stop it at each.
+Reads and writes take different routes, and that difference is most of
+the story:
 
 ![Storage request path](docs/gsplat/veks-sim-request-path.svg)
 

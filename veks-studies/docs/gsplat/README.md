@@ -168,6 +168,22 @@ algorithm is shaped the way it is.
 embeds the diagram, so opening it in draw.io recovers the editable
 original.*
 
+### The staged form
+
+The diagram above is the **re-scan** form: one pass per destination
+segment, so the source is swept `P` times. That is fine while `P` is
+small and ruinous when it is not. The staged form spills into RAM-sized
+buckets instead, sweeping the source exactly once whatever `P` is:
+
+<img src="gsplat-staged-dataflow.drawio.svg" width="100%" alt="The staged gsplat dataflow. A memory lane holds bucket buffers, the closed transform and a segment buffer; a storage lane holds source records, a spill extent and output records. Stage 1 sweeps the source once into the bucket buffers and flushes each buffer as a sequential append into its region of the spill extent. Stage 2 reads one bucket straight through into the segment buffer, permutes it in memory, and writes it out as one contiguous range." />
+
+*Source: [`gsplat-staged-dataflow.drawio`](./gsplat-staged-dataflow.drawio).*
+
+The two are level at four segments — below that the re-scan form is
+genuinely cheaper, because it never touches scratch. Above it the gap
+has no upper end. The measured comparison is in
+[../findings.md](../findings.md).
+
 Read it by lanes rather than by boxes. Everything scattered — building
 the plan, sorting it, transposing records into the buffer — happens in
 the **memory** lane. The **storage** lane sees only a window read, an
