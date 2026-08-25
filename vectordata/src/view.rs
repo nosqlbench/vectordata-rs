@@ -167,12 +167,10 @@ pub(crate) fn facet_window_byte_range(
         return Ok(None);
     }
 
-    Ok(record_range_to_bytes(
-        &path_no_window,
-        win_start,
-        win_end,
-        storage,
-    ))
+    Ok(
+        record_range_to_bytes(&path_no_window, win_start, win_end, storage)
+            .map(|m| (m.byte_start, m.byte_end)),
+    )
 }
 
 /// Map a record range to a byte range, for formats where that mapping
@@ -183,32 +181,47 @@ pub(crate) fn facet_window_byte_range(
 /// profile window is a convenience — a name for a range someone will
 /// want repeatedly — not the only range anyone is allowed to ask for.
 ///
-/// `None`, meaning "cannot window this, fetch it whole", for:
-///   - vvec, which needs its sibling offset index; that index is a
-///     per-facet artifact this layer does not yet carry
-///   - parquet, whose row-group structure means a record range snaps
-///     outward by an amount only the footer knows
-///   - unrecognized extensions, a corrupt header, or an empty range
+/// Two mappings, by format:
+///   - **xvec** (uniform stride): `4 + dim × elem_size`, with `dim`
+///     read from the header at byte 0. That read pulls one chunk on
+///     remote storage, which is the same first-chunk read any reader
+///     does on first access.
+///   - **vvec** (variable length): the sibling `IDXFOR__` offset index,
+///     loaded whole. Record `i` begins at `offsets[i]`, so a window is
+///     `offsets[start]` to `offsets[end]` — exact, not approximate.
 ///
-/// The dim is read from the xvec header at byte 0 — a 4-byte fetch
-/// that pulls one chunk on remote storage, which is the same
-/// first-chunk read any reader does on first access.
+/// `None`, meaning "cannot window this, fetch it whole", for parquet
+/// (whose row-group structure means a record range snaps outward by an
+/// amount only the footer knows), unrecognized extensions, a corrupt
+/// header, an index that cannot be loaded, or an empty range.
+/// A record range resolved to bytes, and what resolving it cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MappedRange {
+    pub byte_start: u64,
+    pub byte_end: u64,
+    /// Bytes that had to be read before the mapping could be computed
+    /// at all — the offset index, for variable-length formats. Zero
+    /// where the stride is computable from the header.
+    pub prerequisite_bytes: u64,
+}
+
 pub(crate) fn record_range_to_bytes(
     path_no_window: &str,
     win_start: u64,
     win_end: u64,
     storage: &FacetStorage,
-) -> Option<(u64, u64)> {
+) -> Option<MappedRange> {
     if win_end <= win_start {
         return None;
     }
 
-    // Format guard: only uniform-stride xvec is record→byte
-    // computable from `4 + dim * elem_size`.
     let ext = path_no_window.rsplit('.').next().unwrap_or("");
     let elem_size = crate::io::infer_elem_size(ext);
-    if elem_size == 0 || crate::io::is_vvec_ext(ext) {
+    if elem_size == 0 {
         return None;
+    }
+    if crate::io::is_vvec_ext(ext) {
+        return vvec_range_to_bytes(path_no_window, win_start, win_end, storage, elem_size);
     }
 
     let header = storage.storage.read_bytes(0, 4).ok()?;
@@ -227,7 +240,13 @@ pub(crate) fn record_range_to_bytes(
     if byte_start >= byte_end {
         return None;
     }
-    Some((byte_start, byte_end))
+    // A uniform-stride mapping costs a 4-byte header read, which every
+    // reader pays on first access anyway — nothing to report.
+    Some(MappedRange {
+        byte_start,
+        byte_end,
+        prerequisite_bytes: 0,
+    })
 }
 
 /// How many bytes a facet contributes to a precache plan.
@@ -692,9 +711,10 @@ pub trait TestDataView: Send + Sync {
 
         for (start, end) in intervals {
             match record_range_to_bytes(&path, start, end, &storage) {
-                Some((bs, be)) => {
-                    plan.byte_ranges.push((bs, be));
-                    if let Some(fill) = storage.range_fill(bs, be) {
+                Some(m) => {
+                    plan.prerequisite_bytes = plan.prerequisite_bytes.max(m.prerequisite_bytes);
+                    plan.byte_ranges.push((m.byte_start, m.byte_end));
+                    if let Some(fill) = storage.range_fill(m.byte_start, m.byte_end) {
                         plan.fills.push(fill);
                     }
                 }
@@ -867,6 +887,51 @@ impl RangeFill {
     }
 }
 
+/// Map a record range to a byte range for a variable-length facet,
+/// through its offset index.
+///
+/// The index is loaded **whole**. It is flat and small relative to the
+/// data it describes, and making the prerequisite itself incremental
+/// would double the number of partial-fetch state machines to reason
+/// about for a fraction of the bytes. Loading it is the one cost a vvec
+/// window pays that an xvec window does not, and the plan reports it.
+fn vvec_range_to_bytes(
+    path_no_window: &str,
+    win_start: u64,
+    win_end: u64,
+    storage: &FacetStorage,
+    elem_size: usize,
+) -> Option<MappedRange> {
+    let offsets = crate::io::load_offsets(path_no_window, &storage.storage, elem_size).ok()?;
+    if offsets.is_empty() {
+        return None;
+    }
+    let total = storage.total_size();
+    let count = offsets.len() as u64;
+
+    let start_idx = win_start.min(count);
+    if start_idx >= count {
+        return None;
+    }
+    let byte_start = offsets[start_idx as usize];
+    // A window running past the last record ends at the file, not at a
+    // record that does not exist.
+    let byte_end = if win_end >= count {
+        total
+    } else {
+        offsets[win_end as usize]
+    };
+    if byte_end <= byte_start {
+        return None;
+    }
+    Some(MappedRange {
+        byte_start,
+        byte_end,
+        // The index had to be read whole to answer this at all.
+        prerequisite_bytes: (offsets.len() * std::mem::size_of::<u64>()) as u64,
+    })
+}
+
 /// What a prefetch would fetch, before any of it moves.
 ///
 /// The unit of fetch is a chunk, not a byte, so a window's real cost is
@@ -881,6 +946,15 @@ pub struct PrefetchPlan {
     /// Chunk-level cost of each range. Empty when the facet has no
     /// chunks — local storage, which is free by definition.
     pub fills: Vec<RangeFill>,
+    /// Bytes that had to be read before the window could be resolved at
+    /// all — the offset index, for variable-length formats. Zero for
+    /// uniform-stride formats, whose stride comes from a header read
+    /// every reader pays anyway.
+    ///
+    /// A second prefetch of the same facet pays this again: the index
+    /// is loaded per call rather than held. Worth knowing before
+    /// prefetching a vvec facet in a tight loop.
+    pub prerequisite_bytes: u64,
     /// Set when the window could not be resolved and honouring the
     /// request means fetching the whole facet: a format whose
     /// record→byte mapping this layer cannot compute (vvec without its

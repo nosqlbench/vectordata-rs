@@ -821,6 +821,32 @@ pub fn open_vvec_untyped(source: &str) -> Result<Box<dyn VvecReader<u8>>, IoErro
 // Offset-index management (private)
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Load the record-offset index for a variable-length file, without
+/// needing the element type.
+///
+/// The offsets are the only thing a caller needs to turn an ordinal
+/// range into a byte range, and nothing about them depends on `T` —
+/// only the walk fallback does, and only to compute a stride it should
+/// not be computing in the first place. Exposing them untyped is what
+/// lets the prefetch path window a vvec facet without opening a typed
+/// reader for a format whose element type it does not care about.
+///
+/// This is the same lookup [`IndexedVvecReader::open`] performs, in the
+/// same order, so a windowed prefetch and a subsequent read agree about
+/// where record `i` begins.
+pub(crate) fn load_offsets(
+    source: &str,
+    storage: &Storage,
+    elem_size: usize,
+) -> Result<Vec<u64>, IoError> {
+    if crate::transport::is_remote_url(source) {
+        let translated = crate::transport::normalize_remote_url(source);
+        load_or_fetch_remote_offsets(translated.as_ref(), storage, elem_size)
+    } else {
+        load_or_build_local_offsets(Path::new(source), storage, elem_size)
+    }
+}
+
 fn load_or_build_local_offsets(
     data_path: &Path,
     storage: &Storage,

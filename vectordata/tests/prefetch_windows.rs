@@ -134,6 +134,194 @@ fn a_window_past_the_end_clamps_to_the_facet() {
     assert_eq!(plan.byte_ranges, vec![(90 * BPR, 100 * BPR)]);
 }
 
+/// Write a variable-length file: each record is a 4-byte dim followed
+/// by `dim` i32 elements, so record sizes differ and no stride exists.
+fn write_ivvec(path: &std::path::Path, dims: &[i32]) -> Vec<u64> {
+    let mut offsets = Vec::new();
+    let mut f = std::fs::File::create(path).unwrap();
+    let mut at = 0u64;
+    for &d in dims {
+        offsets.push(at);
+        f.write_all(&d.to_le_bytes()).unwrap();
+        for e in 0..d {
+            f.write_all(&e.to_le_bytes()).unwrap();
+        }
+        at += 4 + (d as u64) * 4;
+    }
+    offsets
+}
+
+/// **A vvec window resolves through its offset index.**
+///
+/// Variable-length records have no stride, so the only way an ordinal
+/// becomes a byte offset is the index. Once it is loaded the mapping is
+/// exact — `offsets[start]` to `offsets[end]`, not an estimate that a
+/// reader then has to correct.
+#[test]
+fn a_vvec_window_resolves_through_its_offset_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
+    write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 10);
+
+    // Deliberately ragged: every record a different length.
+    let dims = [1, 7, 3, 9, 2, 5, 4, 8];
+    let offsets = write_ivvec(&ds.join("profiles/default/meta.ivvec"), &dims);
+
+    let yaml = r#"
+name: prefetch-vvec
+profiles:
+  default:
+    base_vectors: profiles/default/base_vectors.fvec
+    metadata_content: profiles/default/meta.ivvec
+"#;
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("2..5").unwrap())
+        .unwrap();
+    assert!(
+        !plan.degrades_to_full_download,
+        "an indexed vvec facet is windowable"
+    );
+    assert_eq!(
+        plan.byte_ranges,
+        vec![(offsets[2], offsets[5])],
+        "records 2..5 are exactly offsets[2]..offsets[5]"
+    );
+}
+
+/// **The index cost is reported, not hidden.** A vvec window cannot be
+/// resolved without reading the whole offset index, and that read is
+/// real work a caller should be able to see before it decides to
+/// prefetch a hundred small windows one at a time.
+#[test]
+fn a_vvec_plan_reports_the_index_it_had_to_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
+    write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 10);
+    let dims = [1, 7, 3, 9, 2, 5, 4, 8];
+    write_ivvec(&ds.join("profiles/default/meta.ivvec"), &dims);
+
+    let yaml = r#"
+name: prefetch-vvec-cost
+profiles:
+  default:
+    base_vectors: profiles/default/base_vectors.fvec
+    metadata_content: profiles/default/meta.ivvec
+"#;
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let vvec_plan = view
+        .prefetch_plan("metadata_content", &parse_window("2..5").unwrap())
+        .unwrap();
+    assert_eq!(
+        vvec_plan.prerequisite_bytes,
+        (dims.len() * 8) as u64,
+        "one u64 offset per record had to be read to resolve the window"
+    );
+
+    // A uniform-stride facet pays nothing: its stride comes from a
+    // header read every reader does on first access anyway.
+    let xvec_plan = view
+        .prefetch_plan("base_vectors", &parse_window("2..5").unwrap())
+        .unwrap();
+    assert_eq!(xvec_plan.prerequisite_bytes, 0);
+}
+
+/// A vvec window running past the last record ends at the file, not at
+/// a record that does not exist.
+#[test]
+fn a_vvec_window_past_the_end_ends_at_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
+    write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 10);
+    let dims = [1, 7, 3, 9];
+    let offsets = write_ivvec(&ds.join("profiles/default/meta.ivvec"), &dims);
+    let file_len = std::fs::metadata(ds.join("profiles/default/meta.ivvec"))
+        .unwrap()
+        .len();
+
+    let yaml = r#"
+name: prefetch-vvec-tail
+profiles:
+  default:
+    base_vectors: profiles/default/base_vectors.fvec
+    metadata_content: profiles/default/meta.ivvec
+"#;
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("2..99").unwrap())
+        .unwrap();
+    assert_eq!(plan.byte_ranges, vec![(offsets[2], file_len)]);
+}
+
+/// The window a prefetch resolves and the bytes a reader actually
+/// touches have to be the same bytes — otherwise a prefetch warms one
+/// range and the reader faults in another, which looks like the
+/// prefetch silently did nothing.
+#[test]
+fn a_vvec_prefetch_covers_every_byte_the_reader_reads() {
+    use vectordata::IndexedVvecReader;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
+    write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 10);
+    let dims = [3, 1, 8, 2, 6, 4];
+    let offsets = write_ivvec(&ds.join("profiles/default/meta.ivvec"), &dims);
+    let vv = ds.join("profiles/default/meta.ivvec");
+
+    let yaml = r#"
+name: prefetch-vvec-parity
+profiles:
+  default:
+    base_vectors: profiles/default/base_vectors.fvec
+    metadata_content: profiles/default/meta.ivvec
+"#;
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("1..4").unwrap())
+        .unwrap();
+    let (start, end) = plan.byte_ranges[0];
+
+    let reader: IndexedVvecReader<i32> = IndexedVvecReader::open(vv.to_str().unwrap()).unwrap();
+
+    // Every byte of every record in the window must lie inside the
+    // range the prefetch resolved — a record whose tail falls outside
+    // it would fault in a chunk the prefetch never asked for.
+    for i in 1..4usize {
+        let dim = reader.dim_at(i).unwrap();
+        let record_start = offsets[i];
+        let record_end = record_start + 4 + (dim as u64) * 4;
+        assert!(
+            record_start >= start && record_end <= end,
+            "record {i} spans [{record_start}, {record_end}) but the prefetch \
+             resolved [{start}, {end})"
+        );
+        assert_eq!(reader.get_bytes(i).unwrap().len(), dim * 4);
+    }
+
+    // And it must not overreach: record 4 is outside the window, so its
+    // first byte must be at or after the end of the range.
+    assert!(
+        offsets[4] >= end,
+        "the range should stop at record 4, not include it"
+    );
+}
+
 /// **The degrade case has to be visible.** A format whose record→byte
 /// mapping this layer cannot compute does not silently prefetch a
 /// wrong range or quietly do nothing — it reports that honouring the
@@ -145,17 +333,17 @@ fn an_unmappable_format_reports_that_it_degrades() {
     std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
     write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 10);
 
-    // A vvec facet: variable-length, so the stride is not computable
-    // without the sibling offset index.
-    let vv = ds.join("profiles/default/metadata_content.vvec");
-    std::fs::write(&vv, [0u8; 64]).unwrap();
+    // A parquet facet: row-group structure, so a record range snaps
+    // outward by an amount only the footer knows. Deferred by design.
+    let pq = ds.join("profiles/default/metadata_content.parquet");
+    std::fs::write(&pq, [0u8; 64]).unwrap();
 
     let yaml = r#"
 name: prefetch-degrade
 profiles:
   default:
     base_vectors: profiles/default/base_vectors.fvec
-    metadata_content: profiles/default/metadata_content.vvec
+    metadata_content: profiles/default/metadata_content.parquet
 "#;
     std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
     let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
@@ -166,7 +354,7 @@ profiles:
         .unwrap();
     assert!(
         plan.degrades_to_full_download,
-        "vvec has no computable stride at this layer and must say so"
+        "parquet ordinal windowing is deferred and must say so"
     );
     assert!(
         plan.byte_ranges.is_empty(),
