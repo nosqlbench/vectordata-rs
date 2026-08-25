@@ -418,7 +418,7 @@ profiles:
         .unwrap();
     assert!(
         plan.degrades_to_full_download,
-        "parquet ordinal windowing is deferred and must say so"
+        "parquet ordinal windowing is excluded by design and must say so"
     );
     assert!(
         plan.byte_ranges.is_empty(),
