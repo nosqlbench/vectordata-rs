@@ -240,6 +240,9 @@ fn main() {
         veks_studies::device::render_crossover_table(143 * (1u64 << 30))
     );
 
+    println!("\n\n=== validation against measurement ===");
+    print!("{}", veks_studies::validate::render(&veks_studies::validate::score_all()));
+
     println!("\n\n=== and how that line moves with concurrency ===");
     print!(
         "{}",

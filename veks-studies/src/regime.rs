@@ -647,6 +647,250 @@ pub const NVME_CONSUMER: Regime = Regime {
 /// Every regime, for sweeps.
 pub const ALL: &[Regime] = &[SPINNING_SATA, SATA_SSD, NVME_CONSUMER];
 
+/// One measured latency distribution: what fio's `clat` reported for a
+/// device at a block size, in microseconds.
+///
+/// Throughput alone is a weak check — two models can agree on operations
+/// per second while disagreeing entirely about what any single request
+/// experienced. The storage-simulation literature validates against
+/// latency for that reason, and these are the numbers to validate
+/// against.
+#[derive(Debug, Clone, Copy)]
+pub struct LatencyPoint {
+    pub block_bytes: u64,
+    pub mean_us: f64,
+    pub p50_us: f64,
+    pub p95_us: f64,
+    pub p99_us: f64,
+}
+
+impl LatencyPoint {
+    /// How heavy the measured tail is.
+    pub fn tail_ratio(&self) -> f64 {
+        if self.p50_us <= 0.0 {
+            0.0
+        } else {
+            self.p99_us / self.p50_us
+        }
+    }
+}
+
+pub const MEASURED_LATENCY: &[(&str, &[LatencyPoint])] = &[
+    (
+        "spinning-sata",
+        &[
+            LatencyPoint {
+                block_bytes: 512,
+                mean_us: 39125.7,
+                p50_us: 25000.0,
+                p95_us: 120000.0,
+                p99_us: 198000.0,
+            },
+            LatencyPoint {
+                block_bytes: 1024,
+                mean_us: 37341.9,
+                p50_us: 24000.0,
+                p95_us: 116000.0,
+                p99_us: 182000.0,
+            },
+            LatencyPoint {
+                block_bytes: 2048,
+                mean_us: 37387.0,
+                p50_us: 24000.0,
+                p95_us: 115000.0,
+                p99_us: 186000.0,
+            },
+            LatencyPoint {
+                block_bytes: 4096,
+                mean_us: 37485.8,
+                p50_us: 24000.0,
+                p95_us: 115000.0,
+                p99_us: 184000.0,
+            },
+            LatencyPoint {
+                block_bytes: 8192,
+                mean_us: 38154.0,
+                p50_us: 25000.0,
+                p95_us: 117000.0,
+                p99_us: 186000.0,
+            },
+            LatencyPoint {
+                block_bytes: 16384,
+                mean_us: 37856.3,
+                p50_us: 24000.0,
+                p95_us: 117000.0,
+                p99_us: 190000.0,
+            },
+            LatencyPoint {
+                block_bytes: 32768,
+                mean_us: 38963.6,
+                p50_us: 25000.0,
+                p95_us: 120000.0,
+                p99_us: 188000.0,
+            },
+            LatencyPoint {
+                block_bytes: 65536,
+                mean_us: 40548.9,
+                p50_us: 26000.0,
+                p95_us: 128000.0,
+                p99_us: 202000.0,
+            },
+            LatencyPoint {
+                block_bytes: 131072,
+                mean_us: 44276.4,
+                p50_us: 28000.0,
+                p95_us: 137000.0,
+                p99_us: 221000.0,
+            },
+        ],
+    ),
+    (
+        "sata-ssd",
+        &[
+            LatencyPoint {
+                block_bytes: 512,
+                mean_us: 126.0,
+                p50_us: 108.0,
+                p95_us: 225.0,
+                p99_us: 306.0,
+            },
+            LatencyPoint {
+                block_bytes: 1024,
+                mean_us: 121.7,
+                p50_us: 108.0,
+                p95_us: 193.0,
+                p99_us: 247.0,
+            },
+            LatencyPoint {
+                block_bytes: 2048,
+                mean_us: 121.5,
+                p50_us: 111.0,
+                p95_us: 183.0,
+                p99_us: 225.0,
+            },
+            LatencyPoint {
+                block_bytes: 4096,
+                mean_us: 129.3,
+                p50_us: 120.0,
+                p95_us: 187.0,
+                p99_us: 223.0,
+            },
+            LatencyPoint {
+                block_bytes: 8192,
+                mean_us: 185.0,
+                p50_us: 177.0,
+                p95_us: 258.0,
+                p99_us: 310.0,
+            },
+            LatencyPoint {
+                block_bytes: 16384,
+                mean_us: 312.3,
+                p50_us: 314.0,
+                p95_us: 346.0,
+                p99_us: 378.0,
+            },
+            LatencyPoint {
+                block_bytes: 32768,
+                mean_us: 599.3,
+                p50_us: 596.0,
+                p95_us: 604.0,
+                p99_us: 604.0,
+            },
+            LatencyPoint {
+                block_bytes: 65536,
+                mean_us: 1174.2,
+                p50_us: 1176.0,
+                p95_us: 1176.0,
+                p99_us: 1176.0,
+            },
+            LatencyPoint {
+                block_bytes: 131072,
+                mean_us: 2324.3,
+                p50_us: 2320.0,
+                p95_us: 2320.0,
+                p99_us: 2320.0,
+            },
+        ],
+    ),
+    (
+        "nvme-consumer",
+        &[
+            LatencyPoint {
+                block_bytes: 512,
+                mean_us: 78.3,
+                p50_us: 71.0,
+                p95_us: 131.0,
+                p99_us: 177.0,
+            },
+            LatencyPoint {
+                block_bytes: 1024,
+                mean_us: 81.8,
+                p50_us: 71.0,
+                p95_us: 145.0,
+                p99_us: 213.0,
+            },
+            LatencyPoint {
+                block_bytes: 2048,
+                mean_us: 81.3,
+                p50_us: 72.0,
+                p95_us: 141.0,
+                p99_us: 195.0,
+            },
+            LatencyPoint {
+                block_bytes: 4096,
+                mean_us: 79.4,
+                p50_us: 72.0,
+                p95_us: 129.0,
+                p99_us: 171.0,
+            },
+            LatencyPoint {
+                block_bytes: 8192,
+                mean_us: 93.4,
+                p50_us: 83.0,
+                p95_us: 155.0,
+                p99_us: 205.0,
+            },
+            LatencyPoint {
+                block_bytes: 16384,
+                mean_us: 134.5,
+                p50_us: 120.0,
+                p95_us: 231.0,
+                p99_us: 306.0,
+            },
+            LatencyPoint {
+                block_bytes: 32768,
+                mean_us: 206.8,
+                p50_us: 183.0,
+                p95_us: 374.0,
+                p99_us: 486.0,
+            },
+            LatencyPoint {
+                block_bytes: 65536,
+                mean_us: 392.7,
+                p50_us: 410.0,
+                p95_us: 596.0,
+                p99_us: 740.0,
+            },
+            LatencyPoint {
+                block_bytes: 131072,
+                mean_us: 743.7,
+                p50_us: 716.0,
+                p95_us: 1144.0,
+                p99_us: 1160.0,
+            },
+        ],
+    ),
+];
+
+/// Measured latency for one device, if it was captured.
+pub fn measured_latency(device: &str) -> &'static [LatencyPoint] {
+    MEASURED_LATENCY
+        .iter()
+        .find(|(name, _)| *name == device)
+        .map(|(_, points)| *points)
+        .unwrap_or(&[])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

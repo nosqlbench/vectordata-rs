@@ -182,6 +182,77 @@ impl ConcurrencyScaling {
     }
 }
 
+/// How a single read's service time varies.
+///
+/// A flash read is not one fixed cost. Within a wordline the pages
+/// programmed at different bit significances read at different speeds —
+/// on MLC the upper page takes markedly longer than the lower — and a
+/// small share of reads need a retry at a shifted reference voltage.
+/// Neither is unusual or a defect; both are how the medium works.
+///
+/// SSD simulators represent this: MQSim and SimpleSSD both carry
+/// per-page-type NAND read, program and erase latencies taken from
+/// datasheets. The same parameters here are fitted to the measured
+/// latency distributions instead, because the datasheets for these
+/// particular drives are not public — which is worth stating plainly,
+/// since it makes the *distribution* a calibrated output rather than an
+/// independent prediction. The mean throughput it produces is not
+/// fitted, and remains a prediction.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadVariation {
+    /// Share of reads and their multiplier on the base access latency,
+    /// as page types within a wordline.
+    pub page_types: &'static [(f64, f64)],
+    /// Share of reads needing a retry.
+    pub retry_share: f64,
+    /// What a retry costs, as a multiplier.
+    pub retry_multiplier: f64,
+}
+
+impl ReadVariation {
+    /// Every read costs the same — right for rotating media, whose
+    /// variation is positional and modelled elsewhere.
+    pub const NONE: Self = ReadVariation {
+        page_types: &[(1.0, 1.0)],
+        retry_share: 0.0,
+        retry_multiplier: 1.0,
+    };
+
+    /// Draw a multiplier for one read.
+    ///
+    /// **Mean-preserving.** The draw is normalised so its expectation is
+    /// exactly 1, which means adding variation changes the shape of the
+    /// latency distribution without moving the mean — and therefore
+    /// without disturbing the throughput fit, which was calibrated
+    /// before any of this existed and should not be quietly re-tuned by
+    /// a distribution parameter.
+    pub fn draw(&self, u: f64, v: f64) -> f64 {
+        self.draw_raw(u, v) / self.mean_multiplier().max(1e-12)
+    }
+
+    fn draw_raw(&self, u: f64, v: f64) -> f64 {
+        let mut acc = 0.0;
+        let mut base = 1.0;
+        for &(share, multiplier) in self.page_types {
+            acc += share;
+            if u <= acc {
+                base = multiplier;
+                break;
+            }
+        }
+        if v < self.retry_share {
+            base *= self.retry_multiplier;
+        }
+        base
+    }
+
+    /// Mean multiplier, for checking the fit does not shift the mean.
+    pub fn mean_multiplier(&self) -> f64 {
+        let base: f64 = self.page_types.iter().map(|(s, m)| s * m).sum();
+        base * (1.0 - self.retry_share) + base * self.retry_multiplier * self.retry_share
+    }
+}
+
 /// A device, specified physically.
 #[derive(Debug, Clone, Copy)]
 pub struct Hardware {
@@ -211,6 +282,44 @@ pub struct Hardware {
     pub program_time_s: f64,
     /// Residual per-request cost dependence on concurrency.
     pub concurrency: ConcurrencyScaling,
+    /// Per-read service-time variation.
+    pub read_variation: ReadVariation,
+    /// How well the device can predict rotational position when choosing
+    /// what to serve next, from 0 (seek distance only) to 1 (perfect
+    /// rotational position ordering).
+    ///
+    /// This is the parameter that separates *how much* a device reorders
+    /// from *how well*. Fitting a disk with only a window size forces a
+    /// choice between the two: a narrow window matches throughput and
+    /// produces far too tight a latency distribution, while a wide one
+    /// matches the measured tail and overshoots throughput by a fifth.
+    /// Real firmware commits to requests some way ahead and knows the
+    /// platter's phase only approximately, so it reorders widely and
+    /// chooses imperfectly — which widens the distribution without
+    /// delivering the throughput perfect selection would.
+    pub rotational_awareness: f64,
+    /// How long the device will defer a command before serving it
+    /// regardless of cost. Bounds the starvation aggressive reordering
+    /// otherwise causes.
+    pub command_expiry_s: f64,
+    /// Volatile write buffer. A write lands here and is acknowledged
+    /// immediately; the medium catches up afterwards.
+    ///
+    /// **Not validated.** The perfscripts corpus has no random-write
+    /// workload, so everything about the write path here is asserted from
+    /// device datasheets and general knowledge rather than checked
+    /// against measurement. Treat write predictions as structurally
+    /// reasonable and numerically unverified.
+    pub write_buffer_bytes: u64,
+    /// Extra medium writes per logical write once garbage collection is
+    /// running — write amplification.
+    ///
+    /// **Not validated**, for the same reason. A drive at steady state
+    /// under sustained writes rewrites live data to reclaim blocks, and
+    /// that work competes for the same dies. A value of 1.0 models a
+    /// fresh or lightly-used drive, which is what a benchmark measures
+    /// and not what a long-running import experiences.
+    pub write_amplification: f64,
     /// Commands per second the controller can *start*, whatever their
     /// size and however many channels are idle. This is a serial
     /// resource, so it is what flattens the small-block end of every
@@ -275,8 +384,18 @@ impl Hardware {
     }
 
     /// Extra die occupancy a write incurs beyond its transfer.
+    ///
+    /// Garbage collection is folded in as a multiplier: at steady state a
+    /// logical write costs several medium writes, and they occupy the
+    /// same dies. Setting [`Self::write_amplification`] above 1 is how a
+    /// drive that has been written to for a long time differs from the
+    /// fresh one a benchmark measures.
     pub fn write_occupancy_s(&self, write: bool) -> f64 {
-        if write { self.program_time_s } else { 0.0 }
+        if write {
+            self.program_time_s * self.write_amplification.max(1.0)
+        } else {
+            0.0
+        }
     }
 
     /// Sequential throughput: no seeking, no rotational waiting, so the
@@ -291,9 +410,69 @@ impl Hardware {
 
     /// The same, with the residual concurrency effect applied.
     pub fn access_time_at_depth(&self, head: u64, offset: u64, now: f64, in_flight: usize) -> f64 {
+        self.access_time_full(head, offset, now, in_flight, 1.0)
+    }
+
+    /// What the device *believes* a request will cost when choosing what
+    /// to serve next, as distinct from what it will actually cost.
+    ///
+    /// Selection uses this; service uses [`Self::access_time_full`]. The
+    /// gap between them is the firmware's imperfect knowledge, and it is
+    /// why aggressive reordering does not deliver proportional
+    /// throughput.
+    pub fn selection_cost_s(&self, head: u64, offset: u64, now: f64) -> f64 {
+        match self.positioning {
+            Positioning::Flat { .. } => 0.0,
+            Positioning::Rotational { rotation_s, .. } => {
+                let truth = self
+                    .positioning
+                    .access_time_s(head, offset, now, self.media_rate);
+                if self.rotational_awareness >= 1.0 {
+                    return truth;
+                }
+                // The phase-independent estimate: seek plus the average
+                // wait, which is what firmware knows when it cannot
+                // resolve where the platter actually is.
+                let blind = self.mean_access_over_a_revolution(head, offset, now);
+                let _ = rotation_s;
+                truth * self.rotational_awareness + blind * (1.0 - self.rotational_awareness)
+            }
+        }
+    }
+
+    fn mean_access_over_a_revolution(&self, head: u64, offset: u64, now: f64) -> f64 {
+        match self.positioning {
+            Positioning::Flat { .. } => 0.0,
+            Positioning::Rotational { rotation_s, .. } => {
+                let samples = 8;
+                let total: f64 = (0..samples)
+                    .map(|i| {
+                        self.positioning.access_time_s(
+                            head,
+                            offset,
+                            now + i as f64 * rotation_s / samples as f64,
+                            self.media_rate,
+                        )
+                    })
+                    .sum();
+                total / samples as f64
+            }
+        }
+    }
+
+    /// The same, with a drawn per-read variation multiplier applied.
+    pub fn access_time_full(
+        &self,
+        head: u64,
+        offset: u64,
+        now: f64,
+        in_flight: usize,
+        variation: f64,
+    ) -> f64 {
         self.positioning
             .access_time_s(head, offset, now, self.media_rate)
             * self.concurrency.factor(in_flight)
+            * variation
     }
 
     /// Seconds of the controller's serial attention each command needs.
@@ -322,8 +501,33 @@ pub const SPINNING_SATA_HW: Hardware = Hardware {
     die_stripe_bytes: 1 << 20,
     program_time_s: 0.0,
     concurrency: ConcurrencyScaling::NONE,
+    // A disk's read variation is positional — seek distance and
+    // rotational phase — and is generated by the geometry model rather
+    // than drawn.
+    read_variation: ReadVariation::NONE,
+    // Fitted against the measured latency *distribution*, not just its
+    // mean: 0.12 reproduces throughput to 2%, the median to 6% and the
+    // 99th percentile to 5%. Perfect selection at the same window
+    // overshoots throughput by a fifth and understates the tail by half,
+    // which is what a single-knob model is forced into.
+    rotational_awareness: 0.12,
+    // Bounded deferral. Without it, sweeping with a 32-deep window drives
+    // a competing random reader to zero against a sequential stream —
+    // which the mixed-workload measurements plainly do not show.
+    //
+    // 600 ms was chosen by fitting the contended sweep, and then found to
+    // agree with the longest completion latency fio recorded on this
+    // drive (607.7 ms). Two independent routes to the same number is
+    // better evidence than either alone.
+    command_expiry_s: 600.0e-3,
+    // A disk's track buffer is small and does not change its economics.
+    write_buffer_bytes: 64 << 20,
+    write_amplification: 1.0,
     max_command_rate: 100_000.0,
-    reorder_window: 4,
+    // Wide, because a drive with 32 NCQ slots really does consider all of
+    // them; the throughput this would otherwise imply is held back by
+    // `rotational_awareness` rather than by pretending the queue is short.
+    reorder_window: 32,
     positioning: Positioning::Rotational {
         track_to_track_s: 1.5e-3,
         full_stroke_s: 17.0e-3,
@@ -354,6 +558,15 @@ pub const SATA_SSD_HW: Hardware = Hardware {
     // ~1.3 ms TLC program, an order of magnitude past the read latency.
     program_time_s: 1.3e-3,
     concurrency: ConcurrencyScaling::NONE,
+    read_variation: ReadVariation {
+        page_types: &[(0.5, 0.9), (0.36, 1.15), (0.14, 1.7)],
+        retry_share: 0.008,
+        retry_multiplier: 2.2,
+    },
+    rotational_awareness: 1.0,
+    command_expiry_s: f64::INFINITY,
+    write_buffer_bytes: 512 << 20,
+    write_amplification: 1.0,
     max_command_rate: 80_000.0,
     reorder_window: 1,
     positioning: Positioning::Flat {
@@ -376,6 +589,15 @@ pub const NVME_CONSUMER_HW: Hardware = Hardware {
     die_stripe_bytes: 131_072,
     program_time_s: 700.0e-6,
     concurrency: ConcurrencyScaling::NONE,
+    read_variation: ReadVariation {
+        page_types: &[(0.45, 0.85), (0.40, 1.05), (0.13, 1.9), (0.02, 3.0)],
+        retry_share: 0.008,
+        retry_multiplier: 2.4,
+    },
+    rotational_awareness: 1.0,
+    command_expiry_s: f64::INFINITY,
+    write_buffer_bytes: 512 << 20,
+    write_amplification: 1.0,
     max_command_rate: 124_000.0,
     reorder_window: 1,
     positioning: Positioning::Flat {
@@ -423,6 +645,15 @@ pub const NVME_MODERN_HW: Hardware = Hardware {
     // too coarse and large requests cannot reach the bus ceiling.
     die_stripe_bytes: 65_536,
     program_time_s: 350.0e-6,
+    read_variation: ReadVariation {
+        page_types: &[(0.5, 0.85), (0.35, 1.05), (0.15, 1.6)],
+        retry_share: 0.01,
+        retry_multiplier: 2.0,
+    },
+    rotational_awareness: 1.0,
+    command_expiry_s: f64::INFINITY,
+    write_buffer_bytes: 512 << 20,
+    write_amplification: 1.0,
     // The only device here with a fitted concurrency curve, because it is
     // the only one for which published queue-depth behaviour exists.
     concurrency: ConcurrencyScaling {

@@ -56,6 +56,20 @@ pub trait Scheduler {
         self.pop_best_within_where(window, cost, &|_| true)
     }
 
+    /// Take the oldest request that has waited beyond `expiry`, if any.
+    ///
+    /// Reordering without a bound starves whatever it keeps passing over.
+    /// Real firmware will not do that indefinitely — a command that has
+    /// waited long enough goes next whatever it costs — and without this
+    /// an aggressive reorder policy drives a competing random reader to
+    /// zero, which is not what the mixed-workload measurements show.
+    fn pop_oldest_beyond(
+        &mut self,
+        now: f64,
+        expiry: f64,
+        allowed: &dyn Fn(&Request) -> bool,
+    ) -> Option<Request>;
+
     /// The same, restricted to requests the device can accept right now.
     fn pop_best_within_where(
         &mut self,
@@ -89,6 +103,22 @@ impl Scheduler for Noop {
 
     fn pop_first_where(&mut self, allowed: &dyn Fn(&Request) -> bool) -> Option<Request> {
         let idx = self.queue.iter().position(allowed)?;
+        self.queue.remove(idx)
+    }
+
+    fn pop_oldest_beyond(
+        &mut self,
+        now: f64,
+        expiry: f64,
+        allowed: &dyn Fn(&Request) -> bool,
+    ) -> Option<Request> {
+        let idx = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| allowed(r) && now - r.submitted_at >= expiry)
+            .min_by(|(_, a), (_, b)| a.submitted_at.partial_cmp(&b.submitted_at).unwrap())
+            .map(|(i, _)| i)?;
         self.queue.remove(idx)
     }
 
@@ -191,6 +221,24 @@ impl Scheduler for Elevator {
         Some(req)
     }
 
+    fn pop_oldest_beyond(
+        &mut self,
+        now: f64,
+        expiry: f64,
+        allowed: &dyn Fn(&Request) -> bool,
+    ) -> Option<Request> {
+        let idx = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| allowed(r) && now - r.submitted_at >= expiry)
+            .min_by(|(_, a), (_, b)| a.submitted_at.partial_cmp(&b.submitted_at).unwrap())
+            .map(|(i, _)| i)?;
+        let req = self.queue.swap_remove(idx);
+        self.position = req.offset + req.len;
+        Some(req)
+    }
+
     fn pop_best_within_where(
         &mut self,
         window: usize,
@@ -252,6 +300,15 @@ impl Scheduler for Deadline {
 
     fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    fn pop_oldest_beyond(
+        &mut self,
+        now: f64,
+        expiry: f64,
+        allowed: &dyn Fn(&Request) -> bool,
+    ) -> Option<Request> {
+        self.inner.pop_oldest_beyond(now, expiry, allowed)
     }
 
     fn pop_first_where(&mut self, allowed: &dyn Fn(&Request) -> bool) -> Option<Request> {

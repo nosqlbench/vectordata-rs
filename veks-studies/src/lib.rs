@@ -42,6 +42,7 @@ pub mod model;
 pub mod price;
 pub mod regime;
 pub mod study;
+pub mod validate;
 
 pub use algo::{Rewrite, gsplat::Gsplat, naive::NaiveGather, naive::NaiveScatter};
 pub use model::{Geometry, Map, Metrics, Trace};
