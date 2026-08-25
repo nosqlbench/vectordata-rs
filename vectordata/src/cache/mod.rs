@@ -829,6 +829,23 @@ impl CachedChannel {
         self.state.valid_count()
     }
 
+    /// Verified chunks within `[first, last]` inclusive.
+    ///
+    /// A whole-file [`Self::valid_count`] cannot answer "is *this
+    /// window* already warm" — a file 90% resident says nothing about
+    /// whether the 10% you are about to read is the missing part. A
+    /// prefetch plan that reports bytes-to-fetch from the whole-file
+    /// count is wrong in both directions, so range residency is its own
+    /// question.
+    pub fn valid_count_in_range(&self, first: u32, last: u32) -> u32 {
+        let total = self.total_chunks();
+        if total == 0 || first > last || first >= total {
+            return 0;
+        }
+        let last = last.min(total - 1);
+        (first..=last).filter(|i| self.state.is_valid(*i)).count() as u32
+    }
+
     /// Total number of chunks.
     pub fn total_chunks(&self) -> u32 {
         self.reference.shape().total_chunks

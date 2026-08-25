@@ -207,7 +207,7 @@ pub mod cache_admin {
 pub use group::{TestDataGroup, PREBUFFER_LARGE_WARNING_BYTES};
 pub use model::FacetConfig;
 pub use view::{
-    CacheStats, FacetDescriptor, FacetStorage, PrebufferProgress, TestDataView,
+    CacheStats, FacetDescriptor, FacetStorage, PrebufferProgress, RangeFill, TestDataView,
     open_facet_typed,
 };
 pub use io::{VectorReader, VvecReader, XvecReader, IndexedVvecReader, IoError};

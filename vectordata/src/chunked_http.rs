@@ -228,6 +228,22 @@ impl ChunkStore {
             .count() as u32
     }
 
+    /// Chunks marked valid within `[first, last]` inclusive.
+    ///
+    /// The range form is what a prefetch plan needs: whole-file fill
+    /// says nothing about whether the particular window about to be
+    /// read is the resident part or the missing one.
+    pub(crate) fn valid_count_in_range(&self, first: u32, last: u32) -> u32 {
+        if first > last || first as usize >= self.chunk_state.len() {
+            return 0;
+        }
+        let last = (last as usize).min(self.chunk_state.len() - 1);
+        self.chunk_state[first as usize..=last]
+            .iter()
+            .filter(|b| b.load(Ordering::Acquire) != 0)
+            .count() as u32
+    }
+
     /// Snapshot the bitmap into an owned `Vec<u8>` suitable for
     /// writing to the sidecar. The bitmap may race with
     /// concurrent fetch completions; that's fine — whichever

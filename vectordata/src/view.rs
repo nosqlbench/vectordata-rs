@@ -685,6 +685,58 @@ pub struct CacheStats {
     pub is_complete: bool,
 }
 
+/// What fetching a byte range would actually cost.
+///
+/// Returned by [`FacetStorage::range_fill`]. The unit of fetch is a
+/// chunk, not a byte, so a range's real cost is rarely the range's
+/// length: a 4 KiB window against 8 MiB chunks is 8 MiB, and a window
+/// whose chunks are already resident is free. Both facts have to be
+/// visible *before* the fetch, or a caller cannot tell an incremental
+/// warm-up from a full download wearing one's clothes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeFill {
+    /// First chunk covering the range.
+    pub first_chunk: u32,
+    /// Last chunk covering the range, inclusive.
+    pub last_chunk: u32,
+    /// Transfer-chunk size in bytes.
+    pub chunk_size: u64,
+    /// Chunks covering the range.
+    pub chunks: u32,
+    /// Of those, how many are already resident. These cost nothing.
+    pub chunks_resident: u32,
+    /// Byte range the fetch actually spans once widened to chunk
+    /// boundaries — always a superset of what was asked for.
+    pub aligned_start: u64,
+    pub aligned_end: u64,
+}
+
+impl RangeFill {
+    /// Chunks that still have to be fetched.
+    pub fn chunks_to_fetch(&self) -> u32 {
+        self.chunks.saturating_sub(self.chunks_resident)
+    }
+
+    /// Bytes that will cross the network, at chunk granularity.
+    pub fn bytes_to_fetch(&self) -> u64 {
+        self.chunks_to_fetch() as u64 * self.chunk_size
+    }
+
+    /// Bytes fetched beyond the requested range because chunks are the
+    /// granularity. This is the number that tells a caller its
+    /// scattered single-record prefetches are really a full download.
+    pub fn overfetch_bytes(&self, requested_start: u64, requested_end: u64) -> u64 {
+        let requested = requested_end.saturating_sub(requested_start);
+        let spanned = self.aligned_end.saturating_sub(self.aligned_start);
+        spanned.saturating_sub(requested)
+    }
+
+    /// Whether every chunk covering the range is already resident.
+    pub fn is_resident(&self) -> bool {
+        self.chunks_resident >= self.chunks
+    }
+}
+
 /// Opaque handle to a facet's underlying storage. Returned by
 /// [`TestDataView::open_facet_storage`] and consumed by the default
 /// `prebuffer_all` implementation. There is no public API for
@@ -788,6 +840,27 @@ impl FacetStorage {
     /// paths, so progress UIs work no matter which transport the
     /// open resolved to. Returns `None` only for local mmap storage,
     /// which is always fully resident.
+    /// What fetching `[byte_start, byte_end)` would cost, without
+    /// fetching any of it.
+    ///
+    /// `None` for storage with no chunks — a local mmap is resident by
+    /// definition and a fully-downloaded cache file has nothing left to
+    /// plan. Callers should treat `None` as "free".
+    pub fn range_fill(&self, byte_start: u64, byte_end: u64) -> Option<RangeFill> {
+        let (first, last, chunk_size, resident) = self.storage.range_fill(byte_start, byte_end)?;
+        let aligned_start = first as u64 * chunk_size;
+        let aligned_end = ((last as u64 + 1) * chunk_size).min(self.total_size());
+        Some(RangeFill {
+            first_chunk: first,
+            last_chunk: last,
+            chunk_size,
+            chunks: last - first + 1,
+            chunks_resident: resident,
+            aligned_start,
+            aligned_end,
+        })
+    }
+
     pub fn cache_stats(&self) -> Option<CacheStats> {
         self.storage.fill_stats().map(
             |(valid_chunks, total_chunks, chunk_size, content_size, is_complete)| CacheStats {

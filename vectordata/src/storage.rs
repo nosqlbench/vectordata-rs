@@ -1004,6 +1004,29 @@ impl Storage {
     /// no-`.mref` download must see the same fill progress as a
     /// `.mref` one. `None` for local mmap, which is always fully
     /// resident and has no fill state to report.
+    /// Chunk-level residency for a byte range, or `None` when the
+    /// storage has no chunks — local mmap is always fully resident and
+    /// a range question about it has no meaning beyond "yes".
+    ///
+    /// Returns `(first_chunk, last_chunk, chunk_size, resident_chunks)`
+    /// with both chunk indices inclusive. The caller turns that into
+    /// bytes; this layer does not know what the range was *for*.
+    pub(crate) fn range_fill(
+        &self,
+        byte_start: u64,
+        byte_end: u64,
+    ) -> Option<(u32, u32, u64, u32)> {
+        let (_, total_chunks, chunk_size, content_size, _) = self.fill_stats()?;
+        let (first, last) =
+            chunk_span(byte_start, byte_end, chunk_size, total_chunks, content_size)?;
+        let resident = match self {
+            Storage::Mmap(_) => return None,
+            Storage::Http { chunks, .. } => chunks.valid_count_in_range(first, last),
+            Storage::Cached { channel, .. } => channel.valid_count_in_range(first, last),
+        };
+        Some((first, last, chunk_size, resident))
+    }
+
     pub(crate) fn fill_stats(&self) -> Option<(u32, u32, u64, u64, bool)> {
         match self {
             Storage::Mmap(_) => None,
@@ -1119,5 +1142,93 @@ impl ChunkedTransportExt {
     fn content_length_for(t: &HttpTransport) -> io::Result<u64> {
         use crate::transport::ChunkedTransport;
         t.content_length()
+    }
+}
+
+/// Chunks covering `[byte_start, byte_end)`, inclusive at both ends.
+///
+/// Pure arithmetic, separated from storage so the off-by-ones can be
+/// tested without a server. Getting these wrong does not fail loudly —
+/// it fetches a window adjacent to the one asked for, and the reader
+/// then faults in the right chunks anyway, so the only visible symptom
+/// is a prefetch that silently did nothing useful.
+///
+/// `None` when there is nothing to span: no chunks, a zero chunk size,
+/// an empty or inverted range, or a range starting past the content.
+pub(crate) fn chunk_span(
+    byte_start: u64,
+    byte_end: u64,
+    chunk_size: u64,
+    total_chunks: u32,
+    content_size: u64,
+) -> Option<(u32, u32)> {
+    if chunk_size == 0 || total_chunks == 0 || byte_end <= byte_start {
+        return None;
+    }
+    if byte_start >= content_size {
+        return None;
+    }
+    let end = byte_end.min(content_size);
+    let first = (byte_start / chunk_size) as u32;
+    let last = (((end - 1) / chunk_size) as u32).min(total_chunks - 1);
+    if first > last {
+        return None;
+    }
+    Some((first, last))
+}
+
+#[cfg(test)]
+mod chunk_span_tests {
+    use super::chunk_span;
+
+    /// 10 chunks of 100 bytes over a 1000-byte file.
+    const CS: u64 = 100;
+    const N: u32 = 10;
+    const SIZE: u64 = 1000;
+
+    fn span(start: u64, end: u64) -> Option<(u32, u32)> {
+        chunk_span(start, end, CS, N, SIZE)
+    }
+
+    #[test]
+    fn a_range_inside_one_chunk_spans_that_chunk() {
+        assert_eq!(span(0, 1), Some((0, 0)));
+        assert_eq!(span(0, 100), Some((0, 0)), "exactly one chunk, not two");
+        assert_eq!(span(99, 100), Some((0, 0)));
+        assert_eq!(span(100, 101), Some((1, 1)));
+    }
+
+    /// The end is exclusive, so a range ending on a boundary must not
+    /// drag in the chunk that starts there. This is the off-by-one that
+    /// turns every prefetch into one chunk more than it needed.
+    #[test]
+    fn an_exclusive_end_on_a_boundary_does_not_span_the_next_chunk() {
+        assert_eq!(span(0, 200), Some((0, 1)));
+        assert_eq!(span(0, 201), Some((0, 2)));
+        assert_eq!(span(150, 250), Some((1, 2)));
+    }
+
+    #[test]
+    fn a_range_is_clamped_to_the_content() {
+        assert_eq!(span(0, SIZE), Some((0, 9)));
+        assert_eq!(span(0, SIZE * 4), Some((0, 9)), "past the end clamps");
+        assert_eq!(span(950, u64::MAX), Some((9, 9)));
+    }
+
+    #[test]
+    fn degenerate_ranges_span_nothing() {
+        assert_eq!(span(5, 5), None, "empty");
+        assert_eq!(span(9, 4), None, "inverted");
+        assert_eq!(span(SIZE, SIZE + 10), None, "starts past the content");
+        assert_eq!(chunk_span(0, 10, 0, N, SIZE), None, "zero chunk size");
+        assert_eq!(chunk_span(0, 10, CS, 0, SIZE), None, "no chunks");
+    }
+
+    /// A final short chunk is still a chunk.
+    #[test]
+    fn a_ragged_tail_chunk_is_spanned() {
+        // 250 bytes in 100-byte chunks = 3 chunks, the last holding 50.
+        assert_eq!(chunk_span(200, 250, CS, 3, 250), Some((2, 2)));
+        assert_eq!(chunk_span(0, 250, CS, 3, 250), Some((0, 2)));
     }
 }
