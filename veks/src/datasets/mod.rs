@@ -295,6 +295,20 @@ pub enum DatasetsCommand {
         /// Override cache directory location
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+
+        /// Fetch only these facets. Repeatable. Default: every facet
+        /// the profile declares.
+        #[arg(long)]
+        facet: Vec<String>,
+
+        /// Fetch only these records, e.g. `0..1M` or `[0..1K, 5K..6K]`.
+        /// Default: the whole facet. Needs a single profile.
+        #[arg(long)]
+        window: Option<String>,
+
+        /// Print what would be fetched and stop.
+        #[arg(long)]
+        plan: bool,
     },
 }
 
@@ -627,16 +641,25 @@ pub fn run(args: DatasetsArgs) {
             catalog: raw_catalog,
             at,
             cache_dir,
+            facet,
+            window,
+            plan,
         } => {
             let catalog: Vec<String> = raw_catalog
                 .iter()
                 .map(|v| resolve_catalog_value(v))
                 .collect();
-            let ds = match profile {
-                Some(p) => format!("{}:{}", dataset.split(':').next().unwrap_or(&dataset), p),
-                None => dataset,
-            };
-            precache::run(&ds, &configdir, &catalog, &at, cache_dir.as_deref());
+            precache::run(precache::PrecacheRequest {
+                dataset_spec: dataset,
+                configdir,
+                extra_catalogs: catalog,
+                at,
+                cache_dir,
+                profile,
+                facets: facet,
+                window,
+                plan_only: plan,
+            });
         }
     }
 }

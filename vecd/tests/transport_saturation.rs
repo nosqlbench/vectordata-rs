@@ -489,7 +489,9 @@ fn download_saturates_beyond_one_capped_connection() {
         unsafe { std::env::set_var("VECTORDATA_DOWNLOAD_CONCURRENCY", concurrency.to_string()) };
         let url = format!("{}datasets/{ns}/dataset.yaml", proxy.base_url());
         let t = Instant::now();
-        let code = vectordata::datasets::precache::run(&url, "", &[], &[], None);
+        let code = vectordata::datasets::precache::run(
+            vectordata::datasets::precache::PrecacheRequest::all(&url, ""),
+        );
         assert_eq!(code, 0, "precache of {ns} failed");
         t.elapsed()
     };
@@ -590,7 +592,9 @@ fn vecd_rate_limits_distinguish_per_connection_from_per_client() {
             let url = format!("{base}datasets/{ns}/dataset.yaml");
             let t = Instant::now();
             assert_eq!(
-                vectordata::datasets::precache::run(&url, "", &[], &[], None),
+                vectordata::datasets::precache::run(
+                    vectordata::datasets::precache::PrecacheRequest::all(&url, ""),
+                ),
                 0,
                 "precache of {ns} failed"
             );

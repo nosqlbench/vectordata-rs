@@ -405,3 +405,107 @@ profiles:
         "a window someone typed and a window someone declared are the same window"
     );
 }
+
+// ─── The precache driver ───────────────────────────────────────────
+
+use vectordata::datasets::precache::{PrecacheRequest, run};
+
+fn request(spec: &str) -> PrecacheRequest {
+    PrecacheRequest {
+        dataset_spec: spec.to_string(),
+        ..PrecacheRequest::default()
+    }
+}
+
+/// A windowless run is the original behaviour, not a special case of
+/// the windowed one — every caller that predates windows keeps working.
+#[test]
+fn a_windowless_run_still_precaches_everything() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group_dir = tmp.path().join("ds");
+    dataset(tmp.path());
+    assert_eq!(run(request(group_dir.to_str().unwrap())), 0);
+}
+
+/// `--plan` reports without fetching, and reports success.
+#[test]
+fn plan_only_reports_and_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path());
+    let ds = tmp.path().join("ds");
+    let req = PrecacheRequest {
+        plan_only: true,
+        ..request(ds.to_str().unwrap())
+    };
+    assert_eq!(run(req), 0);
+}
+
+/// **A malformed window fails before anything is opened.** Discovering
+/// it after a catalog round-trip wastes the user's time for no reason,
+/// and the message has to name the separator.
+#[test]
+fn a_malformed_window_fails_early_with_a_usable_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path());
+    let ds = tmp.path().join("ds");
+    let req = PrecacheRequest {
+        window: Some("0,1000".to_string()),
+        plan_only: true,
+        ..request(ds.to_str().unwrap())
+    };
+    assert_eq!(run(req), 2, "a bad window is a usage error, not a failure");
+}
+
+/// Naming a facet that does not exist stops the run rather than
+/// quietly fetching the ones that do and reporting success.
+#[test]
+fn an_unknown_facet_stops_the_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path());
+    let ds = tmp.path().join("ds");
+    let req = PrecacheRequest {
+        facets: vec!["not_a_facet".to_string()],
+        plan_only: true,
+        ..request(ds.to_str().unwrap())
+    };
+    assert_eq!(run(req), 2);
+}
+
+/// A window selects a subset, so it needs one profile to resolve
+/// against — the same facet name means different bytes in different
+/// profiles, and picking one silently would be a guess presented as a
+/// result.
+#[test]
+fn a_window_against_several_profiles_asks_which_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
+    write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 100);
+    let yaml = r#"
+name: multi
+profiles:
+  default:
+    base_vectors: profiles/default/base_vectors.fvec
+  other:
+    base_vectors: profiles/default/base_vectors.fvec[0..10)
+"#;
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+
+    let ambiguous = PrecacheRequest {
+        window: Some("0..10".to_string()),
+        plan_only: true,
+        ..request(ds.to_str().unwrap())
+    };
+    assert_eq!(run(ambiguous), 2, "two profiles, no way to choose");
+
+    // Naming the profile resolves it. A local path cannot carry a
+    // `:profile` suffix — resolve_spec reads anything with a `/` as
+    // naming every profile — so the field is the only way to say it.
+    let named = PrecacheRequest {
+        window: Some("0..10".to_string()),
+        plan_only: true,
+        profile: Some("default".to_string()),
+        ..request(ds.to_str().unwrap())
+    };
+    assert_eq!(run(named), 0);
+}

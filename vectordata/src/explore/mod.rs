@@ -417,13 +417,10 @@ fn run_precache(specifier: &str, pause: bool) {
     // own bytes and need to be precached explicitly — but that's
     // what the picker rows are for: the user highlights the partition
     // profile and runs precache against it directly.
-    let code = crate::datasets::precache::run(
+    let code = crate::datasets::precache::run(crate::datasets::precache::PrecacheRequest::all(
         specifier,
         &crate::catalog::sources::config_dir(),
-        &[],
-        &[],
-        None,
-    );
+    ));
     if code != 0 {
         eprintln!("(precache exited with status {code})");
     }

@@ -27,11 +27,61 @@
 //! size upfront, then streams chunk-level updates from
 //! [`crate::view::TestDataView::prebuffer_all_with_progress`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::build_sources;
 use crate::catalog::resolver::Catalog;
 use crate::{PrebufferProgress, TestDataView};
+
+/// Everything a precache run needs.
+///
+/// A struct rather than a widening positional list: the call already
+/// carried five arguments before windows and facet selection, and four
+/// call sites had to be edited in lockstep every time one was added.
+#[derive(Debug, Clone, Default)]
+pub struct PrecacheRequest {
+    /// `name`, `name:profile`, a local path, a `dataset.yaml`, or a URL.
+    pub dataset_spec: String,
+    pub configdir: String,
+    pub extra_catalogs: Vec<String>,
+    pub at: Vec<String>,
+    /// Recorded and reported; the active cache root comes from settings.
+    pub cache_dir: Option<PathBuf>,
+    /// Profile to use, when the spec does not name one.
+    ///
+    /// Its own field rather than a `spec:profile` suffix because that
+    /// suffix cannot work for a local path: `resolve_spec` treats
+    /// anything containing `/` as naming every profile, so a directory
+    /// has no way to spell a profile inside the spec at all.
+    pub profile: Option<String>,
+    /// Facets to fetch. Empty means every facet the profile declares —
+    /// which is what precache has always done.
+    pub facets: Vec<String>,
+    /// Record window, in the dataset-source window grammar. `None`
+    /// means the whole facet, so a windowless run is the original
+    /// behaviour rather than a special case of it.
+    pub window: Option<String>,
+    /// Print what would be fetched and stop.
+    pub plan_only: bool,
+}
+
+impl PrecacheRequest {
+    /// The plain form: everything, no window. What every caller that
+    /// predates windowed precache wants.
+    pub fn all(dataset_spec: &str, configdir: &str) -> Self {
+        PrecacheRequest {
+            dataset_spec: dataset_spec.to_string(),
+            configdir: configdir.to_string(),
+            ..PrecacheRequest::default()
+        }
+    }
+
+    /// Whether this run selects a subset — of facets, of records, or
+    /// only wants to be told what it would do.
+    fn is_selective(&self) -> bool {
+        !self.facets.is_empty() || self.window.is_some() || self.plan_only
+    }
+}
 
 /// Entry point.
 ///
@@ -48,13 +98,27 @@ use crate::{PrebufferProgress, TestDataView};
 /// [`crate::settings::cache_dir`].
 ///
 /// Returns a process exit code (0 = success).
-pub fn run(
-    dataset_spec: &str,
-    configdir: &str,
-    extra_catalogs: &[String],
-    at: &[String],
-    cache_dir: Option<&Path>,
-) -> i32 {
+pub fn run(req: PrecacheRequest) -> i32 {
+    let dataset_spec = req.dataset_spec.as_str();
+    let configdir = req.configdir.as_str();
+    let extra_catalogs = req.extra_catalogs.as_slice();
+    let at = req.at.as_slice();
+    let cache_dir = req.cache_dir.as_deref();
+
+    // A window has to parse before anything is opened or downloaded.
+    // Discovering it is malformed after the catalog round-trip wastes
+    // the user's time for no reason.
+    let window = match req.window.as_deref() {
+        Some(w) => match crate::dataset::source::parse_window(w) {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                eprintln!("error: --window '{w}': {e}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+
     let configured = match crate::settings::cache_dir() {
         Ok(p) => Some(p),
         Err(e) => {
@@ -77,10 +141,15 @@ pub fn run(
         );
     }
 
-    let (resolution, profile_sel) = match resolve_spec(dataset_spec, configdir, extra_catalogs, at)
+    let (resolution, spec_profile) = match resolve_spec(dataset_spec, configdir, extra_catalogs, at)
     {
         Some(r) => r,
         None => return 1,
+    };
+    // An explicit --profile outranks whatever the spec implied.
+    let profile_sel = match req.profile.as_deref() {
+        Some(p) => ProfileSelection::Named(p.to_string()),
+        None => spec_profile,
     };
 
     // Open through whichever path knows how to materialise this
@@ -126,8 +195,42 @@ pub fn run(
                     return 1;
                 }
             };
+            if req.is_selective() {
+                return drive_selective(
+                    &*view,
+                    &format!("{descriptor}:{profile_name}"),
+                    &req.facets,
+                    window.as_ref(),
+                    req.plan_only,
+                );
+            }
             eprintln!("Prebuffering {descriptor}:{profile_name}");
             drive_prebuffer(&*view)
+        }
+        ProfileSelection::AllProfiles if req.is_selective() => {
+            // A facet or window selection needs one profile to resolve
+            // against — the same facet name means different bytes in
+            // different profiles, and silently picking one would be a
+            // guess presented as a result.
+            let names = group.profile_names();
+            if names.len() == 1 {
+                let view = group.profile(&names[0]).expect("profile just listed");
+                return drive_selective(
+                    &*view,
+                    &format!("{descriptor}:{}", names[0]),
+                    &req.facets,
+                    window.as_ref(),
+                    req.plan_only,
+                );
+            }
+            eprintln!(
+                "error: --facet/--window/--plan need a single profile, but \
+                 '{descriptor}' has {}: {}",
+                names.len(),
+                names.join(", ")
+            );
+            eprintln!("Choose one with `--profile <name>`.");
+            2
         }
         ProfileSelection::AllProfiles => {
             let names = group.profile_names();
@@ -254,6 +357,156 @@ fn drive_prebuffer(view: &dyn TestDataView) -> i32 {
     let result = view.prebuffer_all_with_progress(&mut |facet, p| ctx.on_progress(facet, p));
     ctx.finalize(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
     if result.is_err() { 1 } else { 0 }
+}
+
+/// Fetch a chosen window of chosen facets, or just say what that would
+/// cost.
+///
+/// The plan is always printed, whether or not the fetch follows. What a
+/// prefetch is about to do is the thing worth knowing: the unit of
+/// fetch is a chunk, so a small window can be a large download, and a
+/// window whose chunks are already resident is free. Printing the plan
+/// only under `--plan` would hide that from every run that did not ask.
+fn drive_selective(
+    view: &dyn TestDataView,
+    label: &str,
+    facets: &[String],
+    window: Option<&crate::dataset::source::DSWindow>,
+    plan_only: bool,
+) -> i32 {
+    let manifest = view.facet_manifest();
+    let selected: Vec<String> = if facets.is_empty() {
+        let mut names: Vec<String> = manifest.keys().cloned().collect();
+        names.sort();
+        names
+    } else {
+        // Name a facet that does not exist and the run stops, rather
+        // than quietly fetching the ones that do and reporting success.
+        let mut missing: Vec<&String> = facets
+            .iter()
+            .filter(|f| !manifest.contains_key(f.as_str()))
+            .collect();
+        if !missing.is_empty() {
+            missing.sort();
+            let mut known: Vec<&String> = manifest.keys().collect();
+            known.sort();
+            eprintln!(
+                "error: no such facet(s): {}",
+                missing
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            eprintln!(
+                "This profile declares: {}",
+                known
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return 2;
+        }
+        facets.to_vec()
+    };
+
+    let empty = crate::dataset::source::DSWindow(Vec::new());
+    let window = window.unwrap_or(&empty);
+    let window_label = if window.is_empty() {
+        "whole facet".to_string()
+    } else {
+        format!("records {window}")
+    };
+    eprintln!("Precache {label} — {window_label}");
+
+    let mut plans = Vec::new();
+    for name in &selected {
+        match view.prefetch_plan(name, window) {
+            Ok(plan) => plans.push((name.clone(), plan)),
+            Err(e) => {
+                eprintln!("error: facet '{name}': {e}");
+                return 1;
+            }
+        }
+    }
+
+    print!("{}", render_plan(&plans));
+    if plan_only {
+        return 0;
+    }
+
+    for (name, plan) in &plans {
+        if plan.is_resident() {
+            eprintln!("  {name}: already resident");
+            continue;
+        }
+        let mut ctx = LiveCtx::new(1, plan.bytes_to_fetch());
+        let result = view.prefetch_with_progress(name, window, &mut |p| {
+            // The prefetch callback carries transport progress; the
+            // renderer speaks the per-facet shape, so adapt.
+            ctx.on_progress(
+                name,
+                &PrebufferProgress {
+                    verified_chunks: p.completed_chunks(),
+                    total_chunks: p.total_chunks(),
+                    verified_bytes: p.downloaded_bytes(),
+                    total_bytes: p.total_bytes(),
+                },
+            );
+        });
+        ctx.finalize(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+        if let Err(e) = result {
+            eprintln!("error: facet '{name}': {e}");
+            return 1;
+        }
+    }
+    0
+}
+
+/// Render one row per facet: what was asked for, what it costs, and
+/// what is already there.
+fn render_plan(plans: &[(String, crate::PrefetchPlan)]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "\n  {:<28} {:>10} {:>10} {:>10} {:>10}  note",
+        "facet", "to fetch", "overfetch", "resident", "index"
+    );
+    let mut total = 0u64;
+    for (name, plan) in plans {
+        total += plan.bytes_to_fetch();
+        let resident = plan.fills.iter().map(|f| f.chunks_resident).sum::<u32>();
+        let chunks = plan.fills.iter().map(|f| f.chunks).sum::<u32>();
+        let note = if plan.degrades_to_full_download {
+            "no ordinal mapping — whole facet"
+        } else if plan.is_resident() {
+            "already resident"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            s,
+            "  {:<28} {:>10} {:>10} {:>10} {:>10}  {}",
+            name,
+            fmt_bytes(plan.bytes_to_fetch()),
+            fmt_bytes(plan.overfetch_bytes()),
+            if chunks == 0 {
+                "local".to_string()
+            } else {
+                format!("{resident}/{chunks}")
+            },
+            if plan.prerequisite_bytes == 0 {
+                "—".to_string()
+            } else {
+                fmt_bytes(plan.prerequisite_bytes)
+            },
+            note
+        );
+    }
+    let _ = writeln!(s, "\n  {} to fetch\n", fmt_bytes(total));
+    s
 }
 
 fn drive_prebuffer_all(group: &crate::TestDataGroup) -> i32 {

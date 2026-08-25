@@ -9,19 +9,12 @@
 //! `vectordata datasets precache …` and `veks datasets precache …`
 //! produce identical behaviour.
 
-use std::path::Path;
+pub use vectordata::datasets::precache::PrecacheRequest;
 
 /// Entry point for `veks datasets precache`. Exits the process
 /// with the code returned by the shared implementation.
-pub fn run(
-    dataset_spec: &str,
-    configdir: &str,
-    extra_catalogs: &[String],
-    at: &[String],
-    cache_dir: Option<&Path>,
-) {
-    let code =
-        vectordata::datasets::precache::run(dataset_spec, configdir, extra_catalogs, at, cache_dir);
+pub fn run(request: PrecacheRequest) {
+    let code = vectordata::datasets::precache::run(request);
     if code != 0 {
         std::process::exit(code);
     }

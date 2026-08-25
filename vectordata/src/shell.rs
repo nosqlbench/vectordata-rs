@@ -379,6 +379,21 @@ enum DatasetsCmd {
         /// active cache root still comes from `settings.yaml`).
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+        /// Fetch only these facets. Repeatable. Default: every facet
+        /// the profile declares.
+        #[arg(long)]
+        facet: Vec<String>,
+        /// Fetch only these records, e.g. `0..1M` or `[0..1K, 5K..6K]`.
+        /// Default: the whole facet. Needs a single profile.
+        #[arg(long)]
+        window: Option<String>,
+        /// Print what would be fetched and stop.
+        #[arg(long)]
+        plan: bool,
+        /// Profile to use, when the spec does not name one. Required
+        /// for `--facet`/`--window`/`--plan` on a multi-profile dataset.
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -676,13 +691,21 @@ pub fn bin_main(argv: Vec<String>) {
                     catalog,
                     at,
                     cache_dir,
-                } => crate::datasets::precache::run(
-                    &spec,
-                    &configdir,
-                    &catalog,
-                    &at,
-                    cache_dir.as_deref(),
-                ),
+                    facet,
+                    window,
+                    plan,
+                    profile,
+                } => crate::datasets::precache::run(crate::datasets::precache::PrecacheRequest {
+                    dataset_spec: spec,
+                    configdir,
+                    extra_catalogs: catalog,
+                    at,
+                    cache_dir,
+                    profile,
+                    facets: facet,
+                    window,
+                    plan_only: plan,
+                }),
             };
             if code != 0 {
                 std::process::exit(code);
