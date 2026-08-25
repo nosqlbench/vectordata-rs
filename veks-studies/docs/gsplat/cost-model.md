@@ -692,6 +692,9 @@ read from a source, the text says so at the point it is used.
 |---|---|
 | [perfscripts](https://github.com/jshook/perfscripts) | Every figure for the three historical devices: random-read sweeps 512 B–16 MiB, sequential read and write, the mixed reader/writer contention sweep, and the latency distributions validated against |
 | [Ren et al., ICPE '24 — *BFQ, Multiqueue-Deadline, or Kyber?*](https://dl.acm.org/doi/10.1145/3629526.3645053) ([artifact](https://zenodo.org/records/10599514)) | The modern NVMe regime (~1M 4 KiB IOPS, 7 GB/s sequential, 68 µs read latency); the finding that the CPU saturates before the device; the 63.4% scheduler-overhead figure |
+| [Didona et al., SYSTOR '22 — *Understanding Modern Storage APIs*](https://atlarge-research.com/pdfs/2022-systor-apis.pdf) | Per-request host cost by API: libaio 144.9 KIOPS on one core, io_uring 171.5, io_uring polled 173.0, SPDK 305.9 — a 3.3–6.9 µs spread that is a property of the API and kernel, not the drive |
+| Device teardowns (950 PRO UBX controller, 850 PRO MEX) | Die counts and controller reach: eight channels with eight-way interleaving; MLC V-NAND in both drives |
+| [SNIA SSS Performance Test Specification](https://www.snia.org/tech_activities/standards/curr_standards/pts) | The device-level measurement methodology, including the preconditioning this model does not represent |
 
 ### Models and mechanisms
 
@@ -702,6 +705,9 @@ read from a source, the text says so at the point it is used.
 | [Jung et al. — *SimpleSSD*](https://arxiv.org/pdf/1705.06419) | The same parameterisation; the 28% throughput / 36% latency worst-case bars |
 | [Lebrecht, Dingle & Knottenbelt, QEST '09 — *Zoned Disk Drives with I/O Request Reordering*](http://www.doc.ic.ac.uk/~wjk/publications/lebrecht-dingle-knottenbelt-qest-2009.pdf) | Reordering on rotating media as a modelled phenomenon; the basis for separating a device's selection cost from its service cost |
 | [RAIL — *Predictable, Low Tail Latency for NVMe Flash*](https://people.ucsc.edu/~hlitz/papers/rail.pdf) | Die-level read/write blocking and read-after-write serialisation, the mechanism behind the write-starvation figures |
+| [Device-Level Optimization Techniques for SSDs: A Survey](https://arxiv.org/abs/2507.10573) | NAND timing by cell type — MLC reads 40–110 µs and programs 0.4–1.5 ms, TLC reads 66–170 µs — with LSB pages needing one sensing pass and MSB pages more. Grounds the read-latency spread and corroborates the program rates |
+| [Park et al., *Reducing SSD Read Latency by Optimizing Read-Retry*](https://arxiv.org/pdf/2104.09611) | Read-retry at shifted reference voltages, the mechanism behind the modelled latency tail |
+| [Schindler & Ganger, *Automated Disk Drive Characterization* (DIXtrac), CMU-CS-99-176](https://www.pdl.cmu.edu/PDL-FTP/DriveChar/cs-99-176.pdf) | Over 100 extracted per-drive parameters including mechanical timings — the reference standard against which the class-typical seek figures used here are an admitted shortcut |
 | [Aggarwal & Vitter, CACM 31(9), 1988](https://dl.acm.org/doi/10.1145/48529.48535) | The external-memory sorting and permutation bounds this cost model extends |
 
 ### Judging a simulator

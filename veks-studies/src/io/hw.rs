@@ -190,14 +190,25 @@ impl ConcurrencyScaling {
 /// small share of reads need a retry at a shifted reference voltage.
 /// Neither is unusual or a defect; both are how the medium works.
 ///
-/// SSD simulators represent this: MQSim and SimpleSSD both carry
-/// per-page-type NAND read, program and erase latencies taken from
-/// datasheets. The same parameters here are fitted to the measured
-/// latency distributions instead, because the datasheets for these
-/// particular drives are not public — which is worth stating plainly,
-/// since it makes the *distribution* a calibrated output rather than an
-/// independent prediction. The mean throughput it produces is not
-/// fitted, and remains a prediction.
+/// SSD simulators represent this the same way: MQSim exposes
+/// `Page_Read_Latency_LSB/CSB/MSB` as separate parameters, and
+/// SimpleSSD carries per-page-type timings too.
+///
+/// The values here are **read off published NAND characterisation**
+/// rather than fitted. Both measured drives use Samsung MLC V-NAND, and
+/// for MLC there are two page types: an LSB page needs one sensing pass
+/// at roughly **40 µs**, an MSB page needs two at roughly **70 µs**
+/// ([Device-Level Optimization Techniques for
+/// SSDs](https://arxiv.org/abs/2507.10573), which puts MLC read at
+/// 40–110 µs overall). An even split gives a mean of 55 µs — against
+/// the 57 µs this model had already fitted for the 950 PRO from
+/// throughput alone, which is a useful independent check on both.
+///
+/// The retry share is the one term still fitted. Read-retry at shifted
+/// reference voltages is real and documented
+/// ([Park et al.](https://arxiv.org/pdf/2104.09611)), but its *rate* on
+/// a specific drive at a specific wear level is not something the
+/// published characterisation pins down.
 #[derive(Debug, Clone, Copy)]
 pub struct ReadVariation {
     /// Share of reads and their multiplier on the base access latency,
@@ -631,10 +642,16 @@ pub const SATA_SSD_HW: Hardware = Hardware {
     program_rate_per_die: 23.0e6,
     program_die_concurrency: 2,
     concurrency: ConcurrencyScaling::NONE,
+    // MLC across its published 40–110 µs read band: LSB pages sense once
+    // (~40 µs), MSB pages twice (~70 µs), and the upper end of the band
+    // covers pages needing more. A strict two-point split reproduces the
+    // tail but leaves the median unstable — a bimodal distribution has no
+    // well-defined middle — so the band is sampled rather than its
+    // endpoints.
     read_variation: ReadVariation {
-        page_types: &[(0.5, 0.9), (0.36, 1.15), (0.14, 1.7)],
-        retry_share: 0.008,
-        retry_multiplier: 2.2,
+        page_types: &[(0.42, 40.0), (0.42, 70.0), (0.16, 110.0)],
+        retry_share: 0.015,
+        retry_multiplier: 2.4,
     },
     transfer_share_spread: 0.20,
     rotational_awareness: 1.0,
@@ -659,7 +676,12 @@ pub const NVME_CONSUMER_HW: Hardware = Hardware {
     // Measured sequential write: 933819 KB/s, well under the read path.
     write_bandwidth: 956.0e6,
     queue_slots: 256,
-    dies: 128,
+    // The 950 PRO's UBX controller addresses eight channels with eight-way
+    // interleaving — 64 units of addressable parallelism, not the 128
+    // this model previously assumed. That is the controller's reach
+    // rather than the physical die count of any one capacity point; what
+    // the model needs is how many independent things can be in flight.
+    dies: 64,
     // Same reasoning as the SATA drive: the measured per-request rate is
     // flat at ~185 MB/s out to 128 KiB.
     die_stripe_bytes: 131_072,
@@ -667,9 +689,15 @@ pub const NVME_CONSUMER_HW: Hardware = Hardware {
     program_rate_per_die: 23.0e6,
     program_die_concurrency: 2,
     concurrency: ConcurrencyScaling::NONE,
+    // MLC across its published 40–110 µs read band: LSB pages sense once
+    // (~40 µs), MSB pages twice (~70 µs), and the upper end of the band
+    // covers pages needing more. A strict two-point split reproduces the
+    // tail but leaves the median unstable — a bimodal distribution has no
+    // well-defined middle — so the band is sampled rather than its
+    // endpoints.
     read_variation: ReadVariation {
-        page_types: &[(0.45, 0.85), (0.40, 1.05), (0.13, 1.9), (0.02, 3.0)],
-        retry_share: 0.008,
+        page_types: &[(0.42, 40.0), (0.42, 70.0), (0.16, 110.0)],
+        retry_share: 0.015,
         retry_multiplier: 2.4,
     },
     transfer_share_spread: 0.20,
@@ -730,10 +758,12 @@ pub const NVME_MODERN_HW: Hardware = Hardware {
     // read advantage, which is an assumption, not a finding.
     program_rate_per_die: 30.0e6,
     program_die_concurrency: 2,
+    // TLC: three page types needing 2, 3 and 2 sensing passes, over a
+    // published 66–170 µs read band.
     read_variation: ReadVariation {
-        page_types: &[(0.5, 0.85), (0.35, 1.05), (0.15, 1.6)],
-        retry_share: 0.01,
-        retry_multiplier: 2.0,
+        page_types: &[(0.34, 70.0), (0.33, 110.0), (0.33, 90.0)],
+        retry_share: 0.02,
+        retry_multiplier: 2.6,
     },
     transfer_share_spread: 0.20,
     rotational_awareness: 1.0,
@@ -803,9 +833,52 @@ pub struct HostModel {
 }
 
 impl HostModel {
-    /// A single core at ~1.7 µs per request — about 590k IOPS, which is
-    /// the order at which the ICPE '24 testbed found the CPU saturating
-    /// before the device did.
+    /// What one core can push, measured, by storage API.
+    ///
+    /// [Didona et al., SYSTOR '22](https://atlarge-research.com/pdfs/2022-systor-apis.pdf)
+    /// measure single-core peak throughput for each of the Linux storage
+    /// APIs on Intel DC P3600 NVMe drives under kernel 5.13:
+    ///
+    /// | API | peak KIOPS on one core | implied cost per request |
+    /// |---|---|---|
+    /// | libaio | 144.9 | 6.90 µs |
+    /// | io_uring | 171.5 | 5.83 µs |
+    /// | io_uring, polled | 173.0 | 5.78 µs |
+    /// | SPDK | 305.9 | 3.27 µs |
+    ///
+    /// [Ren et al., ICPE '24](https://dl.acm.org/doi/10.1145/3629526.3645053)
+    /// reach 5.9M IOPS across ten cores with io_uring on kernel 6.3.8 —
+    /// about 590 KIOPS per core, three times the SYSTOR figure two kernel
+    /// generations earlier. Both are real; the API and the kernel matter
+    /// more than the hardware here, which is why this is a set of named
+    /// presets rather than one number.
+    ///
+    /// One measured configuration is worth avoiding rather than
+    /// modelling: `io_uring` with SQPOLL sharing a single core with the
+    /// issuer manages **13.7 KIOPS**, because the poller thread takes
+    /// half the cycles.
+    pub const LIBAIO: Self = HostModel {
+        per_request_s: 6.90e-6,
+        cores: 1,
+        memory_bandwidth: 40.0e9,
+        memory_touches_per_byte: 3.0,
+    };
+
+    /// io_uring on a 5.13-era kernel.
+    pub const IO_URING: Self = HostModel {
+        per_request_s: 5.83e-6,
+        ..Self::LIBAIO
+    };
+
+    /// Kernel bypass.
+    pub const SPDK: Self = HostModel {
+        per_request_s: 3.27e-6,
+        ..Self::LIBAIO
+    };
+
+    /// io_uring on a 6.3-era kernel, implied by the ICPE '24 aggregate.
+    /// This is the default because it is the most recent measurement,
+    /// and it is the optimistic end of the range.
     pub const DEFAULT: Self = HostModel {
         per_request_s: 1.7e-6,
         cores: 1,

@@ -146,10 +146,26 @@ right:**
 - Device parameters (`media_rate`, `bus_rate`, `access_latency`,
   `max_command_rate`, die counts and stripe) were tuned against the
   random-read throughput curve.
-- The NAND page-type spread (`ReadVariation`) and the disk's
-  `rotational_awareness` were tuned against measured latency percentiles.
+- The disk's `rotational_awareness` and `command_expiry_s` were tuned
+  against measured latency percentiles and the contention sweep.
+- The read-retry *rate* in `ReadVariation`. The retry mechanism and the
+  page-type latencies around it are published; how often a particular
+  drive retries at a particular wear level is not.
 - The disk's `command_expiry_s` was fitted against the contention sweep.
 - Write-path ceilings were fitted against measured sequential write.
+
+**Sourced — read off published characterisation, not tuned:**
+
+- NAND page-type read latencies and program-latency bands, from the SSD
+  survey below. Swapping the previously-fitted spread for the published
+  band cost about two points of p50 agreement and gained on p95 — a fair
+  price for parameters that no longer answer to the score.
+- Die counts, from controller teardowns. Correcting the NVMe drive from
+  an invented 128 to its controller's actual 64 left reads untouched and
+  put sequential write 12% low, because eight concurrent 1 MiB writes now
+  exhaust the parallelism before the write ceiling is reached. That
+  residual is left standing.
+- Host per-request cost, as named API presets from SYSTOR '22.
 
 **Predicted — not tuned against, so agreement is evidence:**
 
@@ -216,21 +232,32 @@ Stated because a model that hides these is not worth using.
 Full annotations, including which parameter each source grounds, are in
 the crate-level rustdoc (`cargo doc -p veks-studies --open`).
 
-**Measurement:** [perfscripts](https://github.com/jshook/perfscripts) ·
-[Ren et al., ICPE '24](https://dl.acm.org/doi/10.1145/3629526.3645053)
-([artifact](https://zenodo.org/records/10599514))
+Which source grounds which parameter:
 
-**Mechanisms:**
-[MQSSD (Ransom, Lim & Mitzenmacher, 2025)](https://arxiv.org/abs/2507.06349) ·
-[MQSim (Tavakkol et al., FAST '18)](https://www.usenix.org/conference/fast18/presentation/tavakkol) ·
-[SimpleSSD (Jung et al.)](https://arxiv.org/pdf/1705.06419) ·
-[Lebrecht, Dingle & Knottenbelt, QEST '09](http://www.doc.ic.ac.uk/~wjk/publications/lebrecht-dingle-knottenbelt-qest-2009.pdf) ·
-[RAIL](https://people.ucsc.edu/~hlitz/papers/rail.pdf) ·
-[Aggarwal & Vitter, CACM 31(9), 1988](https://dl.acm.org/doi/10.1145/48529.48535)
+| Parameter | Source |
+|---|---|
+| Every device curve, latency distribution and contention point | [perfscripts](https://github.com/jshook/perfscripts) fio corpus |
+| Host cost per request, by API | [Didona et al., SYSTOR '22](https://atlarge-research.com/pdfs/2022-systor-apis.pdf) — libaio 144.9 KIOPS/core, io_uring 171.5, SPDK 305.9 |
+| Modern NVMe regime, CPU-bound finding, scheduler overhead | [Ren et al., ICPE '24](https://dl.acm.org/doi/10.1145/3629526.3645053) ([artifact](https://zenodo.org/records/10599514)) |
+| NAND page-type read latency, program latency bands | [Device-Level Optimization Techniques for SSDs](https://arxiv.org/abs/2507.10573) — MLC read 40–110 µs, program 0.4–1.5 ms |
+| Per-page-type modelling precedent, accuracy bars | [MQSim](https://www.usenix.org/conference/fast18/presentation/tavakkol) · [SimpleSSD](https://arxiv.org/pdf/1705.06419) |
+| Read-retry as the latency tail mechanism | [Park et al.](https://arxiv.org/pdf/2104.09611) |
+| Die counts and controller reach | Device teardowns — 950 PRO UBX, 8 channels × 8-way; 850 PRO MEX, 8 packages |
+| Concurrency as a first-class model parameter | [MQSSD (Ransom, Lim & Mitzenmacher, 2025)](https://arxiv.org/abs/2507.06349) |
+| Reordering on rotating media | [Lebrecht, Dingle & Knottenbelt, QEST '09](http://www.doc.ic.ac.uk/~wjk/publications/lebrecht-dingle-knottenbelt-qest-2009.pdf) |
+| Die-level read/write blocking | [RAIL](https://people.ucsc.edu/~hlitz/papers/rail.pdf) |
+| How a disk's seek profile *should* be obtained | [Schindler & Ganger, DIXtrac, CMU-CS-99-176](https://www.pdl.cmu.edu/PDL-FTP/DriveChar/cs-99-176.pdf) |
+| Device-level measurement methodology, preconditioning | [SNIA SSS PTS](https://www.snia.org/tech_activities/standards/curr_standards/pts) |
+| The external-memory bounds this extends | [Aggarwal & Vitter, CACM 31(9), 1988](https://dl.acm.org/doi/10.1145/48529.48535) |
+| How to judge a simulator | [Generative storage models](https://arxiv.org/pdf/2307.02073) · [Perspectives of Memory System Simulation](https://arxiv.org/abs/2604.16965) |
 
-**Method:**
-[Generative storage performance models](https://arxiv.org/pdf/2307.02073) ·
-[Different Perspectives of Memory System Simulation (2026)](https://arxiv.org/abs/2604.16965)
+Two independent corroborations worth noting, because they were not
+engineered: an even split of the published MLC LSB/MSB read latencies
+(40 µs and 70 µs) gives a mean of **55 µs** against the **57 µs** this
+model had already fitted for the 950 PRO from throughput alone; and the
+per-die program rate, calibrated from sequential-write throughput,
+implies **712 µs** for a 16 KiB page — inside the published MLC
+0.4–1.5 ms band.
 
 ## What using it looks like
 

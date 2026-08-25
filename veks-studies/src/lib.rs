@@ -57,6 +57,17 @@
 //!   Grounds [`io::hw::NVME_MODERN_HW`] and [`io::hw::HostModel`].
 //!   Artifact: <https://zenodo.org/records/10599514>.
 //!
+//! - **[Didona et al., SYSTOR '22](https://atlarge-research.com/pdfs/2022-systor-apis.pdf)**,
+//!   *Understanding Modern Storage APIs* — single-core peak throughput
+//!   for each Linux storage API on Intel DC P3600 NVMe under kernel 5.13:
+//!   libaio 144.9 KIOPS, io_uring 171.5, io_uring polled 173.0, SPDK
+//!   305.9. Grounds the [`io::hw::HostModel`] presets, and shows the
+//!   per-request cost is an API-and-kernel property spanning 3.3–6.9 µs.
+//! - **Device teardowns** — the Samsung 950 PRO's UBX controller
+//!   addresses eight channels with eight-way interleaving, and the 850
+//!   PRO's MEX drives eight NAND packages. Both drives use MLC V-NAND.
+//!   Grounds the die counts and the choice of MLC page-type timings.
+//!
 //! ## Models — the mechanisms
 //!
 //! - **[MQSSD](https://arxiv.org/abs/2507.06349)** (Ransom, Lim &
@@ -69,9 +80,30 @@
 //!   (Tavakkol et al., FAST '18) and
 //!   **[SimpleSSD](https://arxiv.org/pdf/1705.06419)** (Jung et al.) —
 //!   the established SSD simulators. Both parameterise NAND read,
-//!   program and erase latencies per page type, which is what
-//!   [`io::hw::ReadVariation`] represents; their reported accuracies are
-//!   the bars [`validate`] measures against.
+//!   program and erase latencies per page type — MQSim exposes
+//!   `Page_Read_Latency_LSB/CSB/MSB` and `Page_Program_Latency_*`
+//!   directly — which is the precedent [`io::hw::ReadVariation`] follows.
+//!   Their reported accuracies are the bars [`validate`] measures against.
+//! - **[Device-Level Optimization Techniques for Solid-State Drives: A
+//!   Survey](https://arxiv.org/abs/2507.10573)** (2025) — NAND timing by
+//!   cell type: MLC reads 40–110 µs and programs 0.4–1.5 ms, TLC reads
+//!   66–170 µs and programs 0.8–2 ms, with LSB pages needing one sensing
+//!   pass and MSB pages more. Grounds [`io::hw::ReadVariation`] and
+//!   corroborates the per-die program rates, which were calibrated from
+//!   sequential-write throughput and land at ~712 µs for a 16 KiB page —
+//!   inside the published MLC band.
+//! - **[Park et al., *Reducing SSD Read Latency by Optimizing
+//!   Read-Retry*](https://arxiv.org/pdf/2104.09611)** — read-retry at
+//!   shifted reference voltages, the mechanism behind the tail term in
+//!   [`io::hw::ReadVariation`]. Its *rate* on a given drive at a given
+//!   wear level is the one part still fitted.
+//! - **[Schindler & Ganger, *Automated Disk Drive Characterization*,
+//!   CMU-CS-99-176](https://www.pdl.cmu.edu/PDL-FTP/DriveChar/cs-99-176.pdf)**
+//!   — DIXtrac extracts over 100 performance-critical parameters per
+//!   drive, including mechanical timings and command overheads. The
+//!   reference for how a disk's seek and rotation profile should be
+//!   obtained, against which the class-typical figures in
+//!   [`io::hw::SPINNING_SATA_HW`] are an admitted shortcut.
 //! - **[Lebrecht, Dingle & Knottenbelt, QEST '09](http://www.doc.ic.ac.uk/~wjk/publications/lebrecht-dingle-knottenbelt-qest-2009.pdf)**,
 //!   *A Performance Model of Zoned Disk Drives with I/O Request
 //!   Reordering* — reordering on rotating media as a modelled
@@ -98,6 +130,12 @@
 //!   source. The reason [`validate`] scores end-to-end latency and
 //!   throughput rather than the internal counters this crate also
 //!   produces.
+//!
+//! - **[SNIA Solid State Storage Performance Test
+//!   Specification](https://www.snia.org/tech_activities/standards/curr_standards/pts)**
+//!   — the industry-standard methodology for device-level SSD
+//!   measurement, including the preconditioning this model does not
+//!   represent, plus a public results database.
 //!
 //! ## Workload data not yet used
 //!
