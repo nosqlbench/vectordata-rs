@@ -232,7 +232,13 @@ fn resolve_spec(
 // ─── Drivers ─────────────────────────────────────────────────────────
 
 fn drive_prebuffer(view: &dyn TestDataView) -> i32 {
-    let plan = plan_prebuffer(view);
+    let plan = match plan_prebuffer(view) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Precache: {e}");
+            return 1;
+        }
+    };
     if plan.facets.is_empty() {
         println!("Precache: profile declared no facets.");
         return 0;
@@ -255,7 +261,13 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup) -> i32 {
     let mut total_bytes = 0u64;
     for profile_name in group.profile_names() {
         if let Some(view) = group.profile(&profile_name) {
-            let plan = plan_prebuffer(&*view);
+            let plan = match plan_prebuffer(&*view) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Precache: profile '{profile_name}': {e}");
+                    return 1;
+                }
+            };
             total_bytes += plan.total_bytes;
             for row in plan.facets {
                 all_facets.push(FacetPlanRow {
@@ -313,7 +325,13 @@ struct PrebufferPlan {
     total_bytes: u64,
 }
 
-fn plan_prebuffer(view: &dyn TestDataView) -> PrebufferPlan {
+/// Size a prebuffer before any of it runs.
+///
+/// Fails rather than guessing when a facet's window cannot be
+/// interpreted. Reporting the whole file for a malformed window would
+/// announce a terabyte, download it, and only then fail on the read —
+/// the plan is the last cheap place to catch it.
+fn plan_prebuffer(view: &dyn TestDataView) -> crate::Result<PrebufferPlan> {
     let mut facets = Vec::new();
     let mut total_bytes = 0u64;
     for (name, desc) in view.facet_manifest() {
@@ -331,16 +349,17 @@ fn plan_prebuffer(view: &dyn TestDataView) -> PrebufferPlan {
                 desc.source_path.as_deref(),
                 desc.window.as_deref(),
                 &storage,
-            );
+            )
+            .map_err(|e| crate::Error::Other(format!("facet '{name}': {e}")))?;
             facets.push(FacetPlanRow {
                 qualified_name: name,
             });
         }
     }
-    PrebufferPlan {
+    Ok(PrebufferPlan {
         facets,
         total_bytes,
-    }
+    })
 }
 
 /// In-place stderr renderer for precache progress.

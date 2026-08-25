@@ -137,23 +137,33 @@ pub(crate) fn facet_window_byte_range(
     raw_source: &str,
     explicit_window: Option<&str>,
     storage: &FacetStorage,
-) -> Option<(u64, u64)> {
+) -> Result<Option<(u64, u64)>> {
     // Resolve the window from whichever encoding the facet config
     // carries, mirroring `open_uniform`: the `[start..end)` suffix on
     // the source string takes precedence, else the explicit `window:`
     // field. The suffix-free path is retained for the format guard.
-    let parsed = crate::dataset::source::parse_source_string(raw_source).ok()?;
+    // A malformed window is an error, not an absent window. Conflating
+    // them is what let `base.fvec[0,1000)` fall through to an unbounded
+    // prebuffer and download a whole terabyte in silence.
+    let parsed = crate::dataset::source::parse_source_string(raw_source)
+        .map_err(|e| Error::Other(format!("source '{raw_source}' has a malformed window: {e}")))?;
     let (path_no_window, win_start, win_end): (String, u64, u64) = if !parsed.window.is_empty() {
         let iv = &parsed.window.0[0];
         (parsed.path, iv.min_incl, iv.max_excl)
-    } else if let Some((s, e)) = explicit_window.and_then(parse_window_first) {
-        (parsed.path, s as u64, e as u64)
+    } else if let Some(w) = explicit_window {
+        let dsw = crate::dataset::source::parse_window(w)
+            .map_err(|e| Error::Other(format!("window '{w}' is malformed: {e}")))?;
+        match dsw.0.first() {
+            Some(iv) => (parsed.path, iv.min_incl, iv.max_excl),
+            None => return Ok(None),
+        }
     } else {
-        return None;
+        return Ok(None);
     };
 
+    // Empty intervals no longer parse, so this is belt-and-braces.
     if win_end <= win_start {
-        return None;
+        return Ok(None);
     }
 
     // Format guard: only uniform-stride xvec is record→byte
@@ -163,20 +173,22 @@ pub(crate) fn facet_window_byte_range(
     let ext = path_no_window.rsplit('.').next().unwrap_or("");
     let elem_size = crate::io::infer_elem_size(ext);
     if elem_size == 0 || crate::io::is_vvec_ext(ext) {
-        return None;
+        return Ok(None);
     }
 
     // Pull the 4-byte xvec dim header. `read_bytes(0, 4)` triggers
     // a chunk-0 fetch on the chunked-HTTP / merkle paths if not
     // already cached; cheap (~8 MiB on the wire vs the ~1.3 TiB
     // a full prebuffer would have pulled).
-    let header = storage.storage.read_bytes(0, 4).ok()?;
+    let Ok(header) = storage.storage.read_bytes(0, 4) else {
+        return Ok(None);
+    };
     if header.len() != 4 {
-        return None;
+        return Ok(None);
     }
     let dim = i32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     if dim <= 0 || dim > 1_000_000 {
-        return None;
+        return Ok(None);
     } // sanity vs corrupt header
     let bpr = 4 + (dim as u64) * (elem_size as u64);
 
@@ -184,9 +196,9 @@ pub(crate) fn facet_window_byte_range(
     let byte_start = win_start.saturating_mul(bpr).min(total);
     let byte_end = win_end.saturating_mul(bpr).min(total);
     if byte_start >= byte_end {
-        return None;
+        return Ok(None);
     }
-    Some((byte_start, byte_end))
+    Ok(Some((byte_start, byte_end)))
 }
 
 /// How many bytes a facet contributes to a precache plan.
@@ -206,17 +218,42 @@ pub(crate) fn facet_download_bytes(
     raw_source: Option<&str>,
     explicit_window: Option<&str>,
     storage: &FacetStorage,
-) -> u64 {
+) -> Result<u64> {
+    // Check the window before the local short-circuit. A malformed
+    // window is a configuration error whether or not the bytes happen
+    // to be on this disk already, and sizing it as "0, nothing to
+    // download" would hide it until read time.
+    if let Some(src) = raw_source {
+        validate_window_spec(src, explicit_window)?;
+    }
     if storage.is_local() {
-        return 0;
+        return Ok(0);
     }
     let Some(raw_source) = raw_source else {
-        return storage.total_size();
+        return Ok(storage.total_size());
     };
-    match facet_window_byte_range(raw_source, explicit_window, storage) {
-        Some((start, end)) => end - start,
-        None => storage.total_size(),
+    match facet_window_byte_range(raw_source, explicit_window, storage)? {
+        Some((start, end)) => Ok(end - start),
+        None => Ok(storage.total_size()),
     }
+}
+
+/// Parse-check a facet's window without touching storage.
+///
+/// Split out from [`facet_window_byte_range`] so a window can be
+/// rejected before any I/O and regardless of whether the facet is
+/// local — the two encodings are checked exactly as that function
+/// reads them.
+pub(crate) fn validate_window_spec(raw_source: &str, explicit_window: Option<&str>) -> Result<()> {
+    let parsed = crate::dataset::source::parse_source_string(raw_source)
+        .map_err(|e| Error::Other(format!("source '{raw_source}' has a malformed window: {e}")))?;
+    if parsed.window.is_empty()
+        && let Some(w) = explicit_window
+    {
+        crate::dataset::source::parse_window(w)
+            .map_err(|e| Error::Other(format!("window '{w}' is malformed: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Reader wrapper that clips access to a sub-range of the underlying
@@ -459,7 +496,7 @@ pub trait TestDataView: Send + Sync {
                     desc.source_path.as_deref(),
                     desc.window.as_deref(),
                     &storage,
-                );
+                )?;
                 let resident = storage.allocated_cache_bytes();
                 bytes_to_fetch += download.saturating_sub(resident);
             }
@@ -506,10 +543,10 @@ pub trait TestDataView: Send + Sync {
             // index at this layer), and parquet (different format
             // model entirely) — those fall back to the unbounded
             // prebuffer below.
-            let window_bytes = desc
-                .source_path
-                .as_deref()
-                .and_then(|src| facet_window_byte_range(src, desc.window.as_deref(), &storage));
+            let window_bytes = match desc.source_path.as_deref() {
+                Some(src) => facet_window_byte_range(src, desc.window.as_deref(), &storage)?,
+                None => None,
+            };
             let total_for_display = match window_bytes {
                 Some((s, e)) => e - s,
                 None => storage.total_size(),
@@ -897,6 +934,13 @@ impl GenericTestDataView {
         // explicit field. Either path produces the same windowed
         // reader behind the trait.
         let raw = facet.source();
+        // A source string only fails to parse when it *looks* like it
+        // carries a `[..]` window suffix and that suffix is malformed —
+        // a plain path always parses with an empty window. So an error
+        // here is a broken window, not a broken path, and treating the
+        // whole string as a filename turns "your window is malformed"
+        // into "no such file: base.fvec[0,1000)". Surface the real
+        // reason instead.
         let (path_str, window_from_suffix): (String, Option<(usize, usize)>) =
             match crate::dataset::source::parse_source_string(raw) {
                 Ok(parsed) if !parsed.window.is_empty() => {
@@ -906,7 +950,12 @@ impl GenericTestDataView {
                         Some((iv.min_incl as usize, iv.max_excl as usize)),
                     )
                 }
-                _ => (raw.to_string(), None),
+                Ok(parsed) => (parsed.path, None),
+                Err(e) => {
+                    return Err(Error::Other(format!(
+                        "facet '{name}': source '{raw}' has a malformed window: {e}"
+                    )));
+                }
             };
         let resolved = self.resolve_path_str(&path_str)?;
         let reader = io::open_vec::<T>(&resolved)?;
@@ -1515,28 +1564,61 @@ mod tests {
         // Suffix form: `base.fvec[1..3)`.
         let suffixed = format!("{src}[1..3)");
         assert_eq!(
-            facet_window_byte_range(&suffixed, None, &storage),
+            facet_window_byte_range(&suffixed, None, &storage).unwrap(),
             Some((bpr, 3 * bpr)),
             "suffix-encoded window must bound the byte range",
         );
         // Explicit-field form: suffix-free source + `window: \"1..3\"`.
         assert_eq!(
-            facet_window_byte_range(&src, Some("1..3"), &storage),
+            facet_window_byte_range(&src, Some("1..3"), &storage).unwrap(),
             Some((bpr, 3 * bpr)),
             "explicit window: field must bound the byte range identically to the suffix",
         );
         // The suffix wins when both are present (matches `open_uniform`).
         assert_eq!(
-            facet_window_byte_range(&suffixed, Some("0..4"), &storage),
+            facet_window_byte_range(&suffixed, Some("0..4"), &storage).unwrap(),
             Some((bpr, 3 * bpr)),
             "path suffix takes precedence over the explicit window: field",
         );
         // No window in either encoding → unbounded (None), so the
         // caller falls back to a full prebuffer.
         assert_eq!(
-            facet_window_byte_range(&src, None, &storage),
+            facet_window_byte_range(&src, None, &storage).unwrap(),
             None,
             "no window in either encoding must fall through to a full download",
+        );
+    }
+
+    /// **A malformed window is an error, not an absent one.**
+    ///
+    /// Returning `None` here is what a facet with no window returns, and
+    /// the caller reads that as "fetch the whole file". Conflating the
+    /// two is how `base.fvec[0,1000)` came to download a terabyte in
+    /// silence: the reader clipped to zero records, the precache path
+    /// saw no window, and neither said why.
+    #[test]
+    fn a_malformed_window_is_an_error_not_an_absent_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, storage) = fvec_storage(tmp.path(), 2, 4);
+        let src = path.to_string_lossy().to_string();
+
+        let err = facet_window_byte_range(&format!("{src}[0,1000)"), None, &storage)
+            .expect_err("a comma-for-`..` window must not read as 'no window'");
+        assert!(
+            err.to_string().contains("malformed window"),
+            "the error should say what is wrong: {err}"
+        );
+
+        let err = facet_window_byte_range(&src, Some("0,1000"), &storage)
+            .expect_err("the explicit window: field must be checked too");
+        assert!(err.to_string().contains("malformed"), "{err}");
+
+        // And the download-size helper propagates rather than quietly
+        // reporting the whole file — that number is what the precache
+        // plan prints before it starts fetching.
+        assert!(
+            facet_download_bytes(Some(&format!("{src}[0,1000)")), None, &storage).is_err(),
+            "a plan built on a malformed window must fail, not size the whole file"
         );
     }
 }

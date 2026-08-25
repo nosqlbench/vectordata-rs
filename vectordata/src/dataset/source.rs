@@ -333,6 +333,22 @@ fn try_parse_compound(s: &str) -> Option<(u64, u64)> {
 /// - `"[..10k)"` → `[0, 10_000)` — first 10k elements (exclusive end)
 /// - `"(10k..]"` → `[10_001, MAX)` — all but the first 10,001 (exclusive start)
 /// - `"[..]"` → `[0, MAX)` — all elements
+///
+/// # Empty intervals are rejected
+///
+/// An interval that selects nothing is always a mistake, and accepting
+/// one silently is worse than refusing it. The case that matters is a
+/// comma where `..` belongs: `,` separates *intervals* and `..`
+/// separates *bounds*, so `"0,1000"` parses as two intervals — a bare
+/// number being shorthand for `0..N`, the first is `[0..0)`.
+///
+/// That used to be accepted, and the two consumers of a window then
+/// disagreed about it: the reader built a `WindowedVectorReader` of
+/// length zero and reported no records, while the precache path saw a
+/// degenerate range, gave up on windowing, and downloaded the entire
+/// file. A dataset written `base.fvec[0,1000)` — which is how anyone
+/// used to slice notation would write it — got an empty view and a
+/// full-size download, in silence.
 fn parse_interval(s: &str) -> Result<DSInterval, String> {
     let s = s.trim();
 
@@ -377,15 +393,41 @@ fn parse_interval(s: &str) -> Result<DSInterval, String> {
             max_excl = max_excl.checked_add(1).ok_or("end overflow")?;
         }
 
-        Ok(DSInterval { min_incl, max_excl })
+        check_non_empty(DSInterval { min_incl, max_excl }, s)
     } else {
         // Single number = shorthand for 0..N
         let max_excl = parse_number_with_suffix(inner)?;
-        Ok(DSInterval {
-            min_incl: 0,
-            max_excl,
-        })
+        check_non_empty(
+            DSInterval {
+                min_incl: 0,
+                max_excl,
+            },
+            s,
+        )
     }
+}
+
+/// Reject an interval that selects nothing, naming the likely cause.
+///
+/// The hint fires when the offending text carries no `..`, because that
+/// is the comma-for-`..` mistake and the message is useless without
+/// saying so.
+fn check_non_empty(iv: DSInterval, raw: &str) -> Result<DSInterval, String> {
+    if iv.max_excl > iv.min_incl {
+        return Ok(iv);
+    }
+    if !raw.contains("..") {
+        return Err(format!(
+            "interval '{raw}' selects no records: a bare number means 0..N, so \
+             '{raw}' is [0..{}). Bounds are separated by '..' and intervals by \
+             ',' — did you mean a '..' here?",
+            iv.max_excl
+        ));
+    }
+    Err(format!(
+        "interval '{raw}' selects no records: end ({}) must exceed start ({})",
+        iv.max_excl, iv.min_incl
+    ))
 }
 
 /// Parse a window specification from a string.
@@ -877,6 +919,65 @@ mod tests {
         assert_eq!(w.0[0].max_excl, 1000);
         assert_eq!(w.0[1].min_incl, 2000);
         assert_eq!(w.0[1].max_excl, 3000);
+    }
+
+    /// **The comma-for-`..` hazard.** `,` separates intervals and `..`
+    /// separates bounds, so `"0,1000"` is two intervals, not one — and
+    /// because a bare number means `0..N`, the first of them is empty.
+    ///
+    /// Accepting that used to split the two consumers of a window: the
+    /// reader clipped to zero records and the precache path gave up on
+    /// windowing and fetched the whole file. Neither said anything.
+    #[test]
+    fn comma_where_dotdot_belongs_is_rejected() {
+        let err = parse_window("0,1000").unwrap_err();
+        assert!(err.contains("selects no records"), "{err}");
+        assert!(
+            err.contains(".."),
+            "the message must name the separator: {err}"
+        );
+
+        // The same mistake inside the source-string suffix sugar.
+        let err = parse_source_string("base.fvec[0,1000)").unwrap_err();
+        assert!(err.contains("selects no records"), "{err}");
+
+        // And the spelling that was meant still works.
+        let ok = parse_source_string("base.fvec[0..1000)").unwrap();
+        assert_eq!(ok.path, "base.fvec");
+        assert_eq!(ok.window.0.len(), 1);
+        assert_eq!(
+            ok.window.0[0],
+            DSInterval {
+                min_incl: 0,
+                max_excl: 1000
+            }
+        );
+    }
+
+    /// Any interval that selects nothing is refused, however it is
+    /// spelled — a window naming no records is always a mistake, and
+    /// the degenerate first interval above is only the common way to
+    /// write one by accident.
+    #[test]
+    fn empty_intervals_are_rejected_however_spelled() {
+        for spec in ["0", "5..5", "[5..5)", "(5..5]", "1000..10", "[..0)"] {
+            assert!(
+                parse_interval(spec).is_err(),
+                "'{spec}' selects nothing and should be refused"
+            );
+        }
+        // Adjacent non-empty forms still parse.
+        for spec in ["1", "5..6", "[5..6)", "(4..5]", "[..1)"] {
+            assert!(parse_interval(spec).is_ok(), "'{spec}' should still parse");
+        }
+    }
+
+    /// A genuine multi-interval window is unaffected — the rejection is
+    /// of empty intervals, not of the list form.
+    #[test]
+    fn multi_interval_windows_still_parse() {
+        let w = parse_window("[0..1K, 2K..3K]").unwrap();
+        assert_eq!(w.0.len(), 2);
     }
 
     #[test]
