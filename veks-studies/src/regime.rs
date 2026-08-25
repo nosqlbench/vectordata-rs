@@ -5,10 +5,15 @@
 //!
 //! The cost model's device constants used to be asserted from memory.
 //! These are not: every number below is transcribed from an fio run in
-//! the `perfscripts` historic result set
-//! (<https://github.com/jshook/perfscripts>), which sweeps random reads
-//! across block sizes from 512 B to 16 MiB and measures sequential read
-//! and write separately.
+//! the [perfscripts](https://github.com/jshook/perfscripts) historic
+//! result set, which sweeps random reads across block sizes from 512 B to
+//! 16 MiB, measures sequential read and write separately, and runs a
+//! mixed reader/writer contention sweep. Run conditions are
+//! `direct=1, ioengine=libaio, iodepth=10, size=5G, time_based,
+//! runtime=1m`; every conclusion drawn from these numbers inherits those
+//! conditions, and in particular the fixed queue depth. See
+//! [the crate bibliography](crate#sources) for everything else this
+//! simulator is grounded on.
 //!
 //! Values are stored **in the units fio reported them**, so each literal
 //! can be checked against its source file by eye; conversion to bytes
@@ -647,8 +652,20 @@ pub const NVME_CONSUMER: Regime = Regime {
 /// Every regime, for sweeps.
 pub const ALL: &[Regime] = &[SPINNING_SATA, SATA_SSD, NVME_CONSUMER];
 
-/// One measured latency distribution: what fio's `clat` reported for a
-/// device at a block size, in microseconds.
+/// One measured latency distribution for a device at a block size, in
+/// microseconds, on a **submission-to-completion** basis.
+///
+/// fio separates `slat` (time spent submitting) from `clat` (time from
+/// submitted to completed) and reports `lat` as their sum. A simulator
+/// that timestamps a request when it is created and again when it
+/// finishes is measuring `lat`, so comparing it against `clat` — as an
+/// earlier version of this did — understates the target by a couple of
+/// percent and shows up as a systematic positive bias in every latency
+/// metric.
+///
+/// The mean here is fio's `lat` mean directly. The percentiles are its
+/// `clat` percentiles plus the mean `slat`, because fio reports
+/// percentiles only for `clat`.
 ///
 /// Throughput alone is a weak check — two models can agree on operations
 /// per second while disagreeing entirely about what any single request
@@ -681,66 +698,66 @@ pub const MEASURED_LATENCY: &[(&str, &[LatencyPoint])] = &[
         &[
             LatencyPoint {
                 block_bytes: 512,
-                mean_us: 39125.7,
-                p50_us: 25000.0,
-                p95_us: 120000.0,
-                p99_us: 198000.0,
+                mean_us: 39128.8,
+                p50_us: 25003.0,
+                p95_us: 120003.0,
+                p99_us: 198003.0,
             },
             LatencyPoint {
                 block_bytes: 1024,
-                mean_us: 37341.9,
-                p50_us: 24000.0,
-                p95_us: 116000.0,
-                p99_us: 182000.0,
+                mean_us: 37344.9,
+                p50_us: 24002.9,
+                p95_us: 116002.9,
+                p99_us: 182002.9,
             },
             LatencyPoint {
                 block_bytes: 2048,
-                mean_us: 37387.0,
-                p50_us: 24000.0,
-                p95_us: 115000.0,
-                p99_us: 186000.0,
+                mean_us: 37390.1,
+                p50_us: 24003.0,
+                p95_us: 115003.0,
+                p99_us: 186003.0,
             },
             LatencyPoint {
                 block_bytes: 4096,
-                mean_us: 37485.8,
-                p50_us: 24000.0,
-                p95_us: 115000.0,
-                p99_us: 184000.0,
+                mean_us: 37488.8,
+                p50_us: 24002.9,
+                p95_us: 115002.9,
+                p99_us: 184002.9,
             },
             LatencyPoint {
                 block_bytes: 8192,
-                mean_us: 38154.0,
-                p50_us: 25000.0,
-                p95_us: 117000.0,
-                p99_us: 186000.0,
+                mean_us: 38157.2,
+                p50_us: 25003.1,
+                p95_us: 117003.1,
+                p99_us: 186003.1,
             },
             LatencyPoint {
                 block_bytes: 16384,
-                mean_us: 37856.3,
-                p50_us: 24000.0,
-                p95_us: 117000.0,
-                p99_us: 190000.0,
+                mean_us: 37859.7,
+                p50_us: 24003.3,
+                p95_us: 117003.3,
+                p99_us: 190003.3,
             },
             LatencyPoint {
                 block_bytes: 32768,
-                mean_us: 38963.6,
-                p50_us: 25000.0,
-                p95_us: 120000.0,
-                p99_us: 188000.0,
+                mean_us: 38967.7,
+                p50_us: 25004.0,
+                p95_us: 120004.0,
+                p99_us: 188004.0,
             },
             LatencyPoint {
                 block_bytes: 65536,
-                mean_us: 40548.9,
-                p50_us: 26000.0,
-                p95_us: 128000.0,
-                p99_us: 202000.0,
+                mean_us: 40553.7,
+                p50_us: 26004.7,
+                p95_us: 128004.7,
+                p99_us: 202004.7,
             },
             LatencyPoint {
                 block_bytes: 131072,
-                mean_us: 44276.4,
-                p50_us: 28000.0,
-                p95_us: 137000.0,
-                p99_us: 221000.0,
+                mean_us: 44283.3,
+                p50_us: 28006.7,
+                p95_us: 137006.7,
+                p99_us: 221006.7,
             },
         ],
     ),
@@ -749,66 +766,66 @@ pub const MEASURED_LATENCY: &[(&str, &[LatencyPoint])] = &[
         &[
             LatencyPoint {
                 block_bytes: 512,
-                mean_us: 126.0,
-                p50_us: 108.0,
-                p95_us: 225.0,
-                p99_us: 306.0,
+                mean_us: 128.8,
+                p50_us: 110.7,
+                p95_us: 227.7,
+                p99_us: 308.7,
             },
             LatencyPoint {
                 block_bytes: 1024,
-                mean_us: 121.7,
-                p50_us: 108.0,
-                p95_us: 193.0,
-                p99_us: 247.0,
+                mean_us: 124.5,
+                p50_us: 110.8,
+                p95_us: 195.8,
+                p99_us: 249.8,
             },
             LatencyPoint {
                 block_bytes: 2048,
-                mean_us: 121.5,
-                p50_us: 111.0,
-                p95_us: 183.0,
-                p99_us: 225.0,
+                mean_us: 124.5,
+                p50_us: 113.9,
+                p95_us: 185.9,
+                p99_us: 227.9,
             },
             LatencyPoint {
                 block_bytes: 4096,
-                mean_us: 129.3,
-                p50_us: 120.0,
-                p95_us: 187.0,
-                p99_us: 223.0,
+                mean_us: 132.0,
+                p50_us: 122.7,
+                p95_us: 189.7,
+                p99_us: 225.7,
             },
             LatencyPoint {
                 block_bytes: 8192,
-                mean_us: 185.0,
-                p50_us: 177.0,
-                p95_us: 258.0,
-                p99_us: 310.0,
+                mean_us: 187.9,
+                p50_us: 179.8,
+                p95_us: 260.8,
+                p99_us: 312.8,
             },
             LatencyPoint {
                 block_bytes: 16384,
-                mean_us: 312.3,
-                p50_us: 314.0,
-                p95_us: 346.0,
-                p99_us: 378.0,
+                mean_us: 315.2,
+                p50_us: 316.8,
+                p95_us: 348.8,
+                p99_us: 380.8,
             },
             LatencyPoint {
                 block_bytes: 32768,
-                mean_us: 599.3,
-                p50_us: 596.0,
-                p95_us: 604.0,
-                p99_us: 604.0,
+                mean_us: 602.5,
+                p50_us: 599.2,
+                p95_us: 607.2,
+                p99_us: 607.2,
             },
             LatencyPoint {
                 block_bytes: 65536,
-                mean_us: 1174.2,
-                p50_us: 1176.0,
-                p95_us: 1176.0,
-                p99_us: 1176.0,
+                mean_us: 1178.4,
+                p50_us: 1180.1,
+                p95_us: 1180.1,
+                p99_us: 1180.1,
             },
             LatencyPoint {
                 block_bytes: 131072,
-                mean_us: 2324.3,
-                p50_us: 2320.0,
-                p95_us: 2320.0,
-                p99_us: 2320.0,
+                mean_us: 2330.3,
+                p50_us: 2325.9,
+                p95_us: 2325.9,
+                p99_us: 2325.9,
             },
         ],
     ),
@@ -817,66 +834,66 @@ pub const MEASURED_LATENCY: &[(&str, &[LatencyPoint])] = &[
         &[
             LatencyPoint {
                 block_bytes: 512,
-                mean_us: 78.3,
-                p50_us: 71.0,
-                p95_us: 131.0,
-                p99_us: 177.0,
+                mean_us: 80.2,
+                p50_us: 72.8,
+                p95_us: 132.8,
+                p99_us: 178.8,
             },
             LatencyPoint {
                 block_bytes: 1024,
-                mean_us: 81.8,
-                p50_us: 71.0,
-                p95_us: 145.0,
-                p99_us: 213.0,
+                mean_us: 83.7,
+                p50_us: 72.8,
+                p95_us: 146.8,
+                p99_us: 214.8,
             },
             LatencyPoint {
                 block_bytes: 2048,
-                mean_us: 81.3,
-                p50_us: 72.0,
-                p95_us: 141.0,
-                p99_us: 195.0,
+                mean_us: 83.2,
+                p50_us: 73.8,
+                p95_us: 142.8,
+                p99_us: 196.8,
             },
             LatencyPoint {
                 block_bytes: 4096,
-                mean_us: 79.4,
-                p50_us: 72.0,
-                p95_us: 129.0,
-                p99_us: 171.0,
+                mean_us: 81.4,
+                p50_us: 73.9,
+                p95_us: 130.9,
+                p99_us: 172.9,
             },
             LatencyPoint {
                 block_bytes: 8192,
-                mean_us: 93.4,
-                p50_us: 83.0,
-                p95_us: 155.0,
-                p99_us: 205.0,
+                mean_us: 95.6,
+                p50_us: 85.1,
+                p95_us: 157.1,
+                p99_us: 207.1,
             },
             LatencyPoint {
                 block_bytes: 16384,
-                mean_us: 134.5,
-                p50_us: 120.0,
-                p95_us: 231.0,
-                p99_us: 306.0,
+                mean_us: 136.7,
+                p50_us: 122.2,
+                p95_us: 233.2,
+                p99_us: 308.2,
             },
             LatencyPoint {
                 block_bytes: 32768,
-                mean_us: 206.8,
-                p50_us: 183.0,
-                p95_us: 374.0,
-                p99_us: 486.0,
+                mean_us: 209.5,
+                p50_us: 185.7,
+                p95_us: 376.7,
+                p99_us: 488.7,
             },
             LatencyPoint {
                 block_bytes: 65536,
-                mean_us: 392.7,
-                p50_us: 410.0,
-                p95_us: 596.0,
-                p99_us: 740.0,
+                mean_us: 396.4,
+                p50_us: 413.6,
+                p95_us: 599.6,
+                p99_us: 743.6,
             },
             LatencyPoint {
                 block_bytes: 131072,
-                mean_us: 743.7,
-                p50_us: 716.0,
-                p95_us: 1144.0,
-                p99_us: 1160.0,
+                mean_us: 749.1,
+                p50_us: 721.4,
+                p95_us: 1149.3,
+                p99_us: 1165.3,
             },
         ],
     ),

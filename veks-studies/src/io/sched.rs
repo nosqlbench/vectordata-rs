@@ -11,6 +11,14 @@
 //! and hand them over in an order the device would not have chosen for
 //! itself.
 //!
+//! The schedulers here are simplified forms of the ones Linux ships —
+//! `none`, an elevator, and a deadline-bounded elevator answering to
+//! `mq-deadline`. [Ren et al. (ICPE '24)](https://dl.acm.org/doi/10.1145/3629526.3645053)
+//! characterise the real ones on modern NVMe and find they can cost up
+//! to 63.4% of throughput while cutting P99 latency by 99.3% under
+//! interference. **That cost is not modelled here**: these schedulers are
+//! free, so the model understates what running one actually takes.
+//!
 //! That second queue only does anything when the issuer wants more
 //! outstanding than the device will accept. Below that point requests
 //! pass straight through and the scheduler is a formality — which is

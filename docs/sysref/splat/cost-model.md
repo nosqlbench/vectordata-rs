@@ -175,7 +175,7 @@ form. A gather costs `N / IOPS(R)`; SPLAT costs `P` scans, or
 For `R = 4100 B`, `penalty` is 179 on the HDD and 3.6 on this NVMe — so
 the HDD tolerates 179 passes before ordering stops paying, and the NVMe
 tolerates 3. The full table is in the [gsplat cost
-model](../../gsplat/cost-model.md#where-ordering-starts-to-pay).
+model](../../../veks-studies/docs/gsplat/cost-model.md#where-ordering-starts-to-pay).
 
 **`penalty` depends on I/O concurrency, and both figures above are at
 `iodepth=10`**, because that is what the source measurements used. Each
@@ -190,7 +190,7 @@ The practical reading for this project is that SPLAT's case rests on
 seek-bound media, small records, or modest issue concurrency — and that a
 deeply-pipelined reader on current flash is already buying what ordering
 would have sold it. See [How the line moves with
-concurrency](../../gsplat/cost-model.md#how-the-line-moves-with-concurrency).
+concurrency](../../../veks-studies/docs/gsplat/cost-model.md#how-the-line-moves-with-concurrency).
 
 **What the device is actually doing.** An event-driven model of the
 storage path (`veks-studies/src/io/`) reproduces these sweeps to within
@@ -278,7 +278,7 @@ result:
 80× on the HDD and 1.7× on the NVMe, from one configuration change.
 Equivalently: ordering pays once `M > payload / penalty(R)`, which here
 is 143 GiB / 9.2 ≈ 15.6 GiB. See the [gsplat cost
-model](../../gsplat/cost-model.md#where-ordering-starts-to-pay) for the
+model](../../../veks-studies/docs/gsplat/cost-model.md#where-ordering-starts-to-pay) for the
 derivation and the full table.
 
 ### C — S2OA passage spine: 450M × 1024-d f32
@@ -380,3 +380,21 @@ and the segment size above. `advise_sequential()` on the source reader
 is at the head of the fvec and mvec extractors.
 
 Back to the overview: [README.md](./README.md).
+
+## References
+
+Device figures and mechanisms in this document come from the sources
+catalogued in the [gsplat cost model](../../../veks-studies/docs/gsplat/cost-model.md#references).
+The ones this document depends on most directly:
+
+- [perfscripts](https://github.com/jshook/perfscripts) — the fio corpus
+  behind every HDD and NVMe figure quoted here, measured at `direct=1`,
+  `iodepth=10`. The queue depth matters: see the concurrency caveat
+  above.
+- [Ransom, Lim & Mitzenmacher, 2025](https://arxiv.org/abs/2507.06349) —
+  the concurrency dependence that determines whether SPLAT pays on
+  current hardware, and the reason the 4100-byte passage-spine case does
+  not.
+- [Tavakkol et al., FAST '18 (MQSim)](https://www.usenix.org/conference/fast18/presentation/tavakkol)
+  and [Jung et al. (SimpleSSD)](https://arxiv.org/pdf/1705.06419) — the
+  accuracy bars the simulator backing these numbers is measured against.

@@ -154,8 +154,11 @@ concrete thing ordering buys.
 
 The figures below are transcribed from fio sweeps in the
 [perfscripts](https://github.com/jshook/perfscripts) result set
-(`direct=1`, `iodepth=10`, 60 s, block sizes 512 B–16 MiB), not
-estimated. `W` is read off the curve as the smallest block at which
+(`direct=1`, `ioengine=libaio`, `iodepth=10`, `size=5G`, `time_based`,
+`runtime=1m`, block sizes 512 B–16 MiB), not estimated. **Every
+conclusion below inherits those run conditions**, the fixed queue depth
+most of all — see [How the line moves with
+concurrency](#how-the-line-moves-with-concurrency). `W` is read off the curve as the smallest block at which
 random reads reach 95% of sequential throughput.
 
 | Device | Seq read | Random 4 KiB | Penalty | `W` measured | Access latency |
@@ -186,6 +189,8 @@ constants:
 | Object storage | 1–8 MiB effective | 20–100 ms, **priced per request** | request count and price, not time |
 
 ### What a simulated device path shows
+
+![Storage request path](veks-sim-request-path.svg)
 
 The expressions above price a request stream. They cannot say what
 fraction of a device's time becomes useful work, because that is a
@@ -329,11 +334,13 @@ reproduces it.
 
 | Metric | Samples | MAPE | Worst | Bias |
 |---|---|---|---|---|
-| Throughput | 36 | **3.7%** | 14.6% | −0.1% |
-| Mean latency | 27 | **4.7%** | 17.9% | +2.8% |
-| p50 | 27 | 7.8% | 26.1% | +7.0% |
-| p95 | 27 | 7.3% | 23.4% | −6.5% |
-| p99 | 27 | 9.3% | 31.4% | −7.4% |
+| Read throughput | 36 | **3.7%** | 14.6% | −0.1% |
+| Mean latency | 27 | **4.1%** | 17.1% | +1.7% |
+| p50 | 27 | 6.6% | 24.2% | +5.8% |
+| p95 | 27 | 8.7% | 22.3% | −5.4% |
+| p99 | 27 | 11.0% | 30.3% | −5.8% |
+| Sequential write throughput | 3 | **0.2%** | 0.5% | +0.2% |
+| Sequential write latency | 3 | **0.7%** | 1.3% | −0.7% |
 
 Against the bars the literature states, like for like:
 
@@ -341,7 +348,7 @@ Against the bars the literature states, like for like:
 |---|---|---|
 | [MQSim](https://www.usenix.org/conference/fast18/presentation/tavakkol) (FAST '18), throughput vs 4 real SSDs | 6–18% | 3.7% MAPE / 14.6% worst |
 | [SimpleSSD](https://arxiv.org/pdf/1705.06419), worst-case throughput | 28% | 14.6% |
-| SimpleSSD, worst-case latency | 36% | 31.4% (p99) |
+| SimpleSSD, worst-case latency | 36% | 30.3% (p99) |
 | [Generative black-box models](https://arxiv.org/pdf/2307.02073) | 4–10% IOPS, 3–16% latency | 3.7% / 4.7% |
 
 **What that does and does not establish.** The device parameters were
@@ -353,8 +360,13 @@ fitted against measured percentiles, so the distribution shape is a
 calibrated output — though the read-variation draw is mean-preserving by
 construction, so it cannot have flattered the means.
 
-Two mechanisms were found by taking latency seriously, and neither would
-have surfaced from throughput alone:
+Latency is compared on fio's `lat` basis — submission to completion —
+not `clat`. Comparing a simulator that timestamps at creation against
+`clat` understates the target by a couple of percent and shows up as a
+positive bias in every latency metric.
+
+Four mechanisms were found by taking latency and the write path
+seriously, and none would have surfaced from read throughput alone:
 
 - **A die is busy for its own page read, not for the whole request.**
   Holding it for the request's duration made a 32 KiB read occupy its die
@@ -368,18 +380,25 @@ have surfaced from throughput alone:
   figure was arrived at by fitting the contended sweep before being found
   to match the longest completion latency fio recorded on the drive
   (607.7 ms).
+- **Programming is charged by the byte, not per request.** A flat
+  per-request program cost makes large writes far too cheap and
+  overstated NVMe sequential write throughput by 57%.
+- **A disk has no separate write path, and giving it one is actively
+  harmful.** A write ceiling even slightly below the media rate
+  desynchronises sequential writes from the platter — each block finishes
+  a fraction after its successor's sector has passed, so the head waits
+  almost a full revolution — and halves modelled sequential write
+  throughput.
 
 ### What the model still does not represent
 
 Stated so that a reader does not assume otherwise from the surrounding
 detail:
 
-- **The write path is unvalidated.** Garbage collection and a volatile
-  write buffer are both modelled, but the measured corpus contains no
-  random-write workload, so nothing about writes is checked against a
-  real drive. Write predictions are structurally reasonable and
-  numerically unverified — which is a weaker claim than the read-side
-  numbers above, and should not be quoted alongside them.
+- **Random writes and garbage collection.** Sequential write *is* now
+  validated, to 0.2%, but the corpus has no random-write job. Write
+  amplification and the volatile write buffer are modelled and behave in
+  the right direction; neither is checked against a measurement.
 - **Filesystem geometry.** Extent layout, fragmentation, journal traffic
   and metadata reads are absent; the address space is flat.
 - **The scheduler's own cost.** Ren et al. measure up to 63.4% throughput
@@ -660,3 +679,45 @@ Reference: A. Aggarwal and J. S. Vitter, "The Input/Output Complexity
 of Sorting and Related Problems," *Commun. ACM* 31(9), 1988.
 
 Back to the overview: [README.md](./README.md).
+
+## References
+
+Every device constant, mechanism and accuracy claim in this document
+traces to one of the following. Where a parameter was fitted rather than
+read from a source, the text says so at the point it is used.
+
+### Measurement
+
+| Source | What it grounds here |
+|---|---|
+| [perfscripts](https://github.com/jshook/perfscripts) | Every figure for the three historical devices: random-read sweeps 512 B–16 MiB, sequential read and write, the mixed reader/writer contention sweep, and the latency distributions validated against |
+| [Ren et al., ICPE '24 — *BFQ, Multiqueue-Deadline, or Kyber?*](https://dl.acm.org/doi/10.1145/3629526.3645053) ([artifact](https://zenodo.org/records/10599514)) | The modern NVMe regime (~1M 4 KiB IOPS, 7 GB/s sequential, 68 µs read latency); the finding that the CPU saturates before the device; the 63.4% scheduler-overhead figure |
+
+### Models and mechanisms
+
+| Source | What it grounds here |
+|---|---|
+| [Ransom, Lim & Mitzenmacher, 2025 — *Multi-Queue SSD I/O Modeling*](https://arxiv.org/abs/2507.06349) | Concurrency as a first-class model parameter; the 1.3–1.5× random-to-sequential read ratio at k=128 that drives [How the line moves with concurrency](#how-the-line-moves-with-concurrency) |
+| [Tavakkol et al., FAST '18 — *MQSim*](https://www.usenix.org/conference/fast18/presentation/tavakkol) | Per-page-type NAND latency parameterisation; the 6–18% accuracy bar |
+| [Jung et al. — *SimpleSSD*](https://arxiv.org/pdf/1705.06419) | The same parameterisation; the 28% throughput / 36% latency worst-case bars |
+| [Lebrecht, Dingle & Knottenbelt, QEST '09 — *Zoned Disk Drives with I/O Request Reordering*](http://www.doc.ic.ac.uk/~wjk/publications/lebrecht-dingle-knottenbelt-qest-2009.pdf) | Reordering on rotating media as a modelled phenomenon; the basis for separating a device's selection cost from its service cost |
+| [RAIL — *Predictable, Low Tail Latency for NVMe Flash*](https://people.ucsc.edu/~hlitz/papers/rail.pdf) | Die-level read/write blocking and read-after-write serialisation, the mechanism behind the write-starvation figures |
+| [Aggarwal & Vitter, CACM 31(9), 1988](https://dl.acm.org/doi/10.1145/48529.48535) | The external-memory sorting and permutation bounds this cost model extends |
+
+### Judging a simulator
+
+| Source | What it grounds here |
+|---|---|
+| [Performance Modeling of Data Storage Systems using Generative Models](https://arxiv.org/pdf/2307.02073) | The 4–10% IOPS / 3–16% latency bar for black-box storage models |
+| [Different Perspectives of Memory System Simulation, 2026](https://arxiv.org/abs/2604.16965) | Why accuracy is reported end-to-end rather than from internal simulator counters: application-level performance is frequently decoupled from them |
+
+### Workload data not used
+
+Named so the gap stays visible. The
+[SNIA IOTTA repository](https://iotta.snia.org/), the
+[Alibaba block traces](https://github.com/alibaba/block-traces) and the
+[Meta CacheLib traces](https://github.com/cacheMon/cache_dataset) are
+real request streams this model could be driven by and currently is not.
+Every workload behind the numbers above is either synthetic or generated
+from an algorithm's own trace, which means the model is validated against
+real *devices* but not against real *workloads*.

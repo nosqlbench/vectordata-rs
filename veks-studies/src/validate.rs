@@ -40,8 +40,12 @@
 //!   `rotational_awareness` were both fitted against measured
 //!   percentiles. Those are calibrated outputs. The *means* they produce
 //!   are not — read variation is mean-preserving by construction.
-//! - **Nothing here validates the write path.** The corpus has no
-//!   random-write workload, so write modelling is asserted, not checked.
+//! - **The write path is validated only sequentially.** The corpus has a
+//!   sequential-write job for every device — 1 MiB blocks at
+//!   `iodepth=10`, with throughput and latency — and
+//!   [`score_sequential_write`] checks against it. There is no
+//!   random-write workload anywhere in the corpus, so garbage collection
+//!   and write amplification remain asserted rather than measured.
 
 use crate::io::{self, hw::Hardware};
 use crate::regime::{self, Regime};
@@ -179,6 +183,61 @@ pub fn score_device(hardware: &Hardware, regime: &Regime) -> Scorecard {
         p95: Score::from("p95", &p95),
         p99: Score::from("p99", &p99),
         tail_ratio: Score::from("p99/p50", &tails),
+    }
+}
+
+/// Sequential-write agreement, which the corpus does cover.
+///
+/// fio's `seqwrite` job is 1 MiB blocks at `iodepth=10` and reports both
+/// bandwidth and latency, so the write path is not wholly unchecked —
+/// only its random and garbage-collecting behaviour is.
+pub fn score_sequential_write() -> Scorecard {
+    let mut throughput = Vec::new();
+    let mut mean_lat = Vec::new();
+
+    // Measured `lat` means from the seqwrite runs, microseconds.
+    let measured_latency_us: &[(&str, f64)] = &[
+        ("spinning-sata", 52_460.0),
+        ("sata-ssd", 19_502.8),
+        ("nvme-consumer", 10_962.3),
+    ];
+
+    for (hardware, regime) in io::hw::HISTORICAL_HARDWARE.iter().zip(regime::ALL.iter()) {
+        const SPAN: u64 = 5 * 1024 * 1024 * 1024;
+        let n = if hardware.name == "spinning-sata" {
+            400
+        } else {
+            2_000
+        };
+        let mut scheduler = io::sched::Noop::default();
+        let mut issuer = io::SequentialAccess::new(SPAN, 1 << 20, n, true);
+        let result = io::run_streams(
+            hardware,
+            &mut scheduler,
+            &mut [io::Stream::new("main", &mut issuer, 10)],
+            io::RunConfig::direct(10, SPAN),
+        );
+
+        throughput.push((
+            result.total.throughput(),
+            regime.seq_write.bytes_per_s() as f64,
+        ));
+        if let Some((_, measured)) = measured_latency_us
+            .iter()
+            .find(|(n, _)| *n == hardware.name)
+        {
+            mean_lat.push((result.latency.summary().micros().mean, *measured));
+        }
+    }
+
+    Scorecard {
+        subject: "sequential write".to_string(),
+        throughput: Score::from("write throughput", &throughput),
+        mean_latency: Score::from("write latency", &mean_lat),
+        p50: Score::default(),
+        p95: Score::default(),
+        p99: Score::default(),
+        tail_ratio: Score::default(),
     }
 }
 
@@ -346,6 +405,40 @@ mod tests {
         );
     }
 
+    /// **The write path, which used to be unvalidated.** The corpus has
+    /// a sequential-write job for every device, and reproducing all three
+    /// took two mechanisms that a read-only check would never have
+    /// demanded: programming charged by the byte rather than per request,
+    /// and a write-path bandwidth ceiling separate from the read one.
+    #[test]
+    fn sequential_write_is_reproduced() {
+        let card = score_sequential_write();
+        assert!(
+            card.throughput.mape < 0.03,
+            "write throughput MAPE {:.1}%",
+            card.throughput.mape * 100.0
+        );
+        assert!(
+            card.mean_latency.mape < 0.03,
+            "write latency MAPE {:.1}%",
+            card.mean_latency.mape * 100.0
+        );
+    }
+
+    /// A disk must have no separate write path. Giving it one even
+    /// slightly below its media rate desynchronises sequential writes
+    /// from the platter and halves its throughput — the head finishes
+    /// each block a fraction after the next sector has passed.
+    #[test]
+    fn a_disk_writes_at_its_media_rate() {
+        let hw = io::hw::SPINNING_SATA_HW;
+        assert!(
+            !hw.write_bandwidth.is_finite(),
+            "a disk should carry no write ceiling at all"
+        );
+        assert_eq!(hw.program_rate_per_die, 0.0, "and no program phase");
+    }
+
     /// The median is the part of a distribution a mean-matching model can
     /// still get badly wrong, so it gets its own bar.
     #[test]
@@ -410,5 +503,213 @@ mod report {
     #[ignore = "diagnostic report"]
     fn print_validation_report() {
         print!("{}", render(&score_all()));
+    }
+}
+
+#[cfg(test)]
+mod per_block {
+    use super::*;
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn print_per_block_errors() {
+        for (hardware, regime) in io::hw::HISTORICAL_HARDWARE
+            .iter()
+            .zip(regime::ALL.iter())
+            .filter(|(h, _)| h.name != "spinning-sata")
+        {
+            println!("\n### {}", hardware.name);
+            println!(
+                "  {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}",
+                "block", "iops%", "mean%", "p50%", "p95%", "p99%"
+            );
+            let latency = regime::measured_latency(hardware.name);
+            for point in regime
+                .random_read
+                .iter()
+                .filter(|p| p.block_bytes <= 1 << 20)
+            {
+                let Some(m) = latency.iter().find(|l| l.block_bytes == point.block_bytes) else {
+                    continue;
+                };
+                let r = io::fio_like_detailed(hardware, point.block_bytes, 8_000);
+                let s = r.latency.summary().micros();
+                let e = |sim: f64, meas: f64| (sim - meas) / meas * 100.0;
+                println!(
+                    "  {:>8} {:>+7.1} {:>+7.1} {:>+7.1} {:>+7.1} {:>+7.1}",
+                    point.block_bytes,
+                    e(r.total.iops(), point.iops as f64),
+                    e(s.mean, m.mean_us),
+                    e(s.p50, m.p50_us),
+                    e(s.p95, m.p95_us),
+                    e(s.p99, m.p99_us)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bus_sweep {
+    use super::*;
+    use crate::regime::NVME_CONSUMER;
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn sweep_nvme_bus_rate() {
+        println!(
+            "\n  {:>8} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "bus MB/s", "iops", "mean", "p50", "p95", "p99"
+        );
+        for bus in [1_500.0f64, 1_600.0, 1_700.0, 1_750.0, 1_800.0, 1_900.0] {
+            let hardware = io::hw::Hardware {
+                bus_rate: bus * 1e6,
+                ..io::hw::NVME_CONSUMER_HW
+            };
+            let card = score_device(&hardware, &NVME_CONSUMER);
+            println!(
+                "  {:>8.0} {:>8.1}% {:>8.1}% {:>8.1}% {:>8.1}% {:>8.1}%",
+                bus,
+                card.throughput.mape * 100.0,
+                card.mean_latency.mape * 100.0,
+                card.p50.mape * 100.0,
+                card.p95.mape * 100.0,
+                card.p99.mape * 100.0
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod spread_sweep {
+    use super::*;
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn sweep_transfer_share_spread() {
+        println!(
+            "\n  {:>7} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "spread", "iops", "p50", "p95", "p99", "p99 bias"
+        );
+        for spread in [0.0f64, 0.10, 0.18, 0.25, 0.35, 0.45] {
+            let cards: Vec<Scorecard> = io::hw::HISTORICAL_HARDWARE
+                .iter()
+                .zip(regime::ALL.iter())
+                .map(|(h, r)| {
+                    let hardware = io::hw::Hardware {
+                        transfer_share_spread: if h.dies > 1 { spread } else { 0.0 },
+                        ..*h
+                    };
+                    score_device(&hardware, r)
+                })
+                .collect();
+            let t = overall(&cards);
+            println!(
+                "  {:>7.2} {:>8.1}% {:>8.1}% {:>8.1}% {:>8.1}% {:>+8.1}%",
+                spread,
+                t.throughput.mape * 100.0,
+                t.p50.mape * 100.0,
+                t.p95.mape * 100.0,
+                t.p99.mape * 100.0,
+                t.p99.bias * 100.0
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod write_report {
+    use super::*;
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn print_sequential_write() {
+        let targets: &[(&str, f64, f64)] = &[
+            ("spinning-sata", 195_143.0 * 1024.0, 52_460.0),
+            ("sata-ssd", 524_907.0 * 1024.0, 19_502.8),
+            ("nvme-consumer", 933_819.0 * 1024.0, 10_962.3),
+        ];
+        for (hardware, (_, bw, lat)) in io::hw::HISTORICAL_HARDWARE.iter().zip(targets) {
+            const SPAN: u64 = 5 * 1024 * 1024 * 1024;
+            let n = if hardware.name == "spinning-sata" {
+                400
+            } else {
+                2_000
+            };
+            let mut sched = io::sched::Noop::default();
+            let mut issuer = io::SequentialAccess::new(SPAN, 1 << 20, n, true);
+            let r = io::run_streams(
+                hardware,
+                &mut sched,
+                &mut [io::Stream::new("main", &mut issuer, 10)],
+                io::RunConfig::direct(10, SPAN),
+            );
+            println!(
+                "  {:<16} {:>7.0} vs {:>7.0} MB/s ({:+.0}%)   {:>8.0} vs {:>8.0} us ({:+.0}%)",
+                hardware.name,
+                r.total.throughput() / 1e6,
+                bw / 1e6,
+                (r.total.throughput() - bw) / bw * 100.0,
+                r.latency.summary().micros().mean,
+                lat,
+                (r.latency.summary().micros().mean - lat) / lat * 100.0
+            );
+        }
+        let card = score_sequential_write();
+        for score in [card.throughput, card.mean_latency] {
+            println!(
+                "  {:<18} {:>3} samples  MAPE {:>6.1}%  worst {:>6.1}%  bias {:>+6.1}%",
+                score.name,
+                score.samples,
+                score.mape * 100.0,
+                score.worst * 100.0,
+                score.bias * 100.0
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod program_sweep {
+    use super::*;
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn sweep_program_rate() {
+        let targets: &[(&str, f64)] = &[
+            ("spinning-sata", 195_143.0 * 1024.0),
+            ("sata-ssd", 524_907.0 * 1024.0),
+            ("nvme-consumer", 933_819.0 * 1024.0),
+        ];
+        for hardware in io::hw::HISTORICAL_HARDWARE {
+            let target = targets.iter().find(|(n, _)| *n == hardware.name).unwrap().1;
+            println!("\n### {} target {:.0} MB/s", hardware.name, target / 1e6);
+            for rate in [3.0f64, 5.0, 7.0, 9.0, 12.0, 16.0, 22.0] {
+                let hw2 = io::hw::Hardware {
+                    program_rate_per_die: rate * 1e6,
+                    ..*hardware
+                };
+                const SPAN: u64 = 5 * 1024 * 1024 * 1024;
+                let n = if hardware.name == "spinning-sata" {
+                    400
+                } else {
+                    1_500
+                };
+                let mut sched = io::sched::Noop::default();
+                let mut issuer = io::SequentialAccess::new(SPAN, 1 << 20, n, true);
+                let r = io::run_streams(
+                    &hw2,
+                    &mut sched,
+                    &mut [io::Stream::new("main", &mut issuer, 10)],
+                    io::RunConfig::direct(10, SPAN),
+                );
+                println!(
+                    "  {:>6.0} MB/s/die -> {:>7.0} MB/s  ({:+.0}%)",
+                    rate,
+                    r.total.throughput() / 1e6,
+                    (r.total.throughput() - target) / target * 100.0
+                );
+            }
+        }
     }
 }

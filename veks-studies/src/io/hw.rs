@@ -262,6 +262,19 @@ pub struct Hardware {
     /// What the interconnect sustains, bytes per second. The lower of
     /// this and `media_rate × dies` is the real ceiling.
     pub bus_rate: f64,
+    /// Aggregate write bandwidth, which on flash is well below the read
+    /// ceiling.
+    ///
+    /// Getting sequential write throughput right by lowering the per-die
+    /// program rate instead is a trap: it reproduces the number, but only
+    /// by having an implausible number of programs in flight at once,
+    /// and those hold dies that a concurrent reader needs. The model then
+    /// starves the reader an order of magnitude harder than the mixed
+    /// measurements show. Separating the two lets each be set from what
+    /// actually determines it — a write-path ceiling from measured
+    /// sequential write, and a per-die program rate from NAND page
+    /// timings.
+    pub write_bandwidth: f64,
     /// Commands the device will accept and hold.
     pub queue_slots: usize,
     /// Independent units that can each work on one command at a time.
@@ -275,15 +288,52 @@ pub struct Hardware {
     pub dies: usize,
     /// Address interleave across dies.
     pub die_stripe_bytes: u64,
-    /// How long a die is occupied programming a written page, on top of
-    /// the transfer. Flash programming is roughly an order of magnitude
-    /// slower than reading and cannot be interrupted, which is why a
-    /// writer can lock a reader out of a die.
-    pub program_time_s: f64,
+    /// Bytes per second one die can program.
+    ///
+    /// Programming is the write path's real cost and it is *rate*, not a
+    /// fixed delay: a die programming 128 KiB is busy eight times as long
+    /// as one programming 16 KiB. Modelling it as a flat per-request
+    /// constant makes large writes far too cheap — it overstated
+    /// sequential write throughput by 57% on NVMe until this replaced it.
+    ///
+    /// Per-die program bandwidth is roughly an order of magnitude below
+    /// read bandwidth, which is why a writer can lock a reader out of a
+    /// die for so long. The values here are derived from each device's
+    /// measured sequential-write throughput divided by the dies a
+    /// streaming writer keeps engaged.
+    pub program_rate_per_die: f64,
+    /// How many dies one write programs at once.
+    ///
+    /// Programming is pipelined: the controller feeds pages to dies in
+    /// sequence rather than firing every die a request spans
+    /// simultaneously, and NAND program-suspend lets reads slip in
+    /// between pages. This bounds how many dies a single write can hold
+    /// against a concurrent reader — the parameter that decides how hard
+    /// a writer starves one.
+    pub program_die_concurrency: usize,
     /// Residual per-request cost dependence on concurrency.
     pub concurrency: ConcurrencyScaling,
     /// Per-read service-time variation.
     pub read_variation: ReadVariation,
+    /// How unevenly concurrent transfers share the device's bandwidth,
+    /// as the half-width of a uniform weight around 1.
+    ///
+    /// Perfect processor-sharing — every in-flight request progressing at
+    /// exactly the same rate — is a convenient assumption and a wrong
+    /// one. A real controller interleaves channels unevenly, so some
+    /// requests finish ahead of others that started with them. The
+    /// aggregate is unaffected, because the weights are normalised; what
+    /// changes is the spread, and at block sizes where transfer dominates
+    /// the access latency this is the *only* thing that can produce any
+    /// spread at all. Without it a model reports a suspiciously tight
+    /// distribution for large reads: median too high, tails too light.
+    /// Set modestly rather than optimally: raising it monotonically
+    /// trades scatter for bias — at 0 the 99th percentile carries a
+    /// systematic −7.7% understatement, at 0.45 that falls to −1.3% but
+    /// the mean absolute error rises from 9.5% to 14.2%. There is no
+    /// optimum, only a judgement, and the value here is not strongly
+    /// determined by anything.
+    pub transfer_share_spread: f64,
     /// How well the device can predict rotational position when choosing
     /// what to serve next, from 0 (seek distance only) to 1 (perfect
     /// rotational position ordering).
@@ -385,17 +435,20 @@ impl Hardware {
 
     /// Extra die occupancy a write incurs beyond its transfer.
     ///
+    /// Proportional to the bytes each die has to program, so a large
+    /// write occupies its dies for correspondingly longer.
+    ///
     /// Garbage collection is folded in as a multiplier: at steady state a
     /// logical write costs several medium writes, and they occupy the
     /// same dies. Setting [`Self::write_amplification`] above 1 is how a
     /// drive that has been written to for a long time differs from the
     /// fresh one a benchmark measures.
-    pub fn write_occupancy_s(&self, write: bool) -> f64 {
-        if write {
-            self.program_time_s * self.write_amplification.max(1.0)
-        } else {
-            0.0
+    pub fn write_occupancy_s(&self, write: bool, len: u64) -> f64 {
+        if !write || self.program_rate_per_die <= 0.0 {
+            return 0.0;
         }
+        let per_die = len as f64 / self.dies_spanned(len) as f64;
+        per_die / self.program_rate_per_die * self.write_amplification.max(1.0)
     }
 
     /// Sequential throughput: no seeking, no rotational waiting, so the
@@ -496,15 +549,30 @@ pub const SPINNING_SATA_HW: Hardware = Hardware {
     name: "spinning-sata",
     media_rate: 201.0e6,
     bus_rate: 600.0e6,
+    // None: a disk has no separate write path, and giving it one is
+    // actively harmful. A write ceiling even slightly below the media
+    // rate desynchronises sequential writes from the platter — each
+    // block finishes a hair after its successor's sector has passed, so
+    // the head waits almost a full revolution — and halves the modelled
+    // sequential write throughput.
+    write_bandwidth: f64::INFINITY,
     queue_slots: 32,
     dies: 1,
     die_stripe_bytes: 1 << 20,
-    program_time_s: 0.0,
+    // Zero, and deliberately: a disk has no program phase. The head
+    // writes the data as it passes under it, so the transfer *is* the
+    // write. Charging a separate programming cost on top halves the
+    // modelled sequential write throughput.
+    program_rate_per_die: 0.0,
+    program_die_concurrency: 1,
     concurrency: ConcurrencyScaling::NONE,
     // A disk's read variation is positional — seek distance and
     // rotational phase — and is generated by the geometry model rather
     // than drawn.
     read_variation: ReadVariation::NONE,
+    // A disk transfers one request at a time, so there is no sharing to
+    // be uneven about.
+    transfer_share_spread: 0.0,
     // Fitted against the measured latency *distribution*, not just its
     // mean: 0.12 reproduces throughput to 2%, the median to 6% and the
     // 99th percentile to 5%. Perfect selection at the same window
@@ -544,6 +612,10 @@ pub const SATA_SSD_HW: Hardware = Hardware {
     name: "sata-ssd",
     media_rate: 75.0e6,
     bus_rate: 568.0e6,
+    // Calibrated to reproduce the measured 538 MB/s sequential write.
+    // Slightly above that figure because the model keeps marginally
+    // fewer requests in the transfer phase than the offered depth.
+    write_bandwidth: 600.0e6,
     queue_slots: 32,
     // 8 channels of 4 dies is typical for a drive of this generation.
     // 8 channels of 8 dies. The count matters even when requests are far
@@ -555,14 +627,16 @@ pub const SATA_SSD_HW: Hardware = Hardware {
     // roughly constant ~75 MB/s from 4 KiB to 64 KiB, so this controller
     // does not split one command across dies until it is large.
     die_stripe_bytes: 65_536,
-    // ~1.3 ms TLC program, an order of magnitude past the read latency.
-    program_time_s: 1.3e-3,
+    // A 16 KiB page in roughly 700 µs, which is ordinary MLC.
+    program_rate_per_die: 23.0e6,
+    program_die_concurrency: 2,
     concurrency: ConcurrencyScaling::NONE,
     read_variation: ReadVariation {
         page_types: &[(0.5, 0.9), (0.36, 1.15), (0.14, 1.7)],
         retry_share: 0.008,
         retry_multiplier: 2.2,
     },
+    transfer_share_spread: 0.20,
     rotational_awareness: 1.0,
     command_expiry_s: f64::INFINITY,
     write_buffer_bytes: 512 << 20,
@@ -582,18 +656,23 @@ pub const NVME_CONSUMER_HW: Hardware = Hardware {
     name: "nvme-consumer",
     media_rate: 190.0e6,
     bus_rate: 1_500.0e6,
+    // Measured sequential write: 933819 KB/s, well under the read path.
+    write_bandwidth: 956.0e6,
     queue_slots: 256,
     dies: 128,
     // Same reasoning as the SATA drive: the measured per-request rate is
     // flat at ~185 MB/s out to 128 KiB.
     die_stripe_bytes: 131_072,
-    program_time_s: 700.0e-6,
+    // A 16 KiB page in roughly 700 µs, which is ordinary MLC.
+    program_rate_per_die: 23.0e6,
+    program_die_concurrency: 2,
     concurrency: ConcurrencyScaling::NONE,
     read_variation: ReadVariation {
         page_types: &[(0.45, 0.85), (0.40, 1.05), (0.13, 1.9), (0.02, 3.0)],
         retry_share: 0.008,
         retry_multiplier: 2.4,
     },
+    transfer_share_spread: 0.20,
     rotational_awareness: 1.0,
     command_expiry_s: f64::INFINITY,
     write_buffer_bytes: 512 << 20,
@@ -636,6 +715,8 @@ pub const NVME_MODERN_HW: Hardware = Hardware {
     media_rate: 400.0e6,
     // PCIe 4.0 x4, practical.
     bus_rate: 7_000.0e6,
+    // **Not measured** — a current drive's specified sequential write.
+    write_bandwidth: 5_000.0e6,
     queue_slots: 1_024,
     dies: 128,
     // An effective interleave, not a physical page stripe: chosen so
@@ -644,12 +725,17 @@ pub const NVME_MODERN_HW: Hardware = Hardware {
     // latency stops being hidden, costing 20% of sequential throughput;
     // too coarse and large requests cannot reach the bus ceiling.
     die_stripe_bytes: 65_536,
-    program_time_s: 350.0e-6,
+    // **Not calibrated** — no write measurement exists for a device of
+    // this class here. Scaled from the 2016 drive in proportion to its
+    // read advantage, which is an assumption, not a finding.
+    program_rate_per_die: 30.0e6,
+    program_die_concurrency: 2,
     read_variation: ReadVariation {
         page_types: &[(0.5, 0.85), (0.35, 1.05), (0.15, 1.6)],
         retry_share: 0.01,
         retry_multiplier: 2.0,
     },
+    transfer_share_spread: 0.20,
     rotational_awareness: 1.0,
     command_expiry_s: f64::INFINITY,
     write_buffer_bytes: 512 << 20,

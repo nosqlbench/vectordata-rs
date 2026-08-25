@@ -8,6 +8,12 @@
 //! as a column that does not line up, which is the whole point: the
 //! documents assert `A(P) = P · (1 − exp(−w / P))` and nothing but a
 //! measurement can contradict them.
+//!
+//! The analysis these sweeps test extends the external-memory model of
+//! [Aggarwal & Vitter (CACM 31(9), 1988)](https://dl.acm.org/doi/10.1145/48529.48535),
+//! which established the sorting and permutation I/O bounds this family
+//! of algorithms lives inside. Device figures come from the corpus named
+//! in [the crate bibliography](crate#sources).
 
 use crate::algo::{Rewrite, gsplat::Gsplat, naive::NaiveGather};
 use crate::model::{Geometry, Map, Metrics};

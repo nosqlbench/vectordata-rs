@@ -32,6 +32,15 @@
 //!   page-aligned device requests, and hits never reach the device at
 //!   all.
 //!
+//! Sources for the mechanisms modelled here are listed in
+//! [the crate bibliography](crate#sources). The two that most shape this
+//! module: die-level read/write blocking, which
+//! [RAIL](https://people.ucsc.edu/~hlitz/papers/rail.pdf) measures as
+//! read-after-write serialisation costing up to 20× at the tail; and
+//! request reordering on rotating media, modelled as a performance
+//! phenomenon by
+//! [Lebrecht, Dingle & Knottenbelt (QEST '09)](http://www.doc.ic.ac.uk/~wjk/publications/lebrecht-dingle-knottenbelt-qest-2009.pdf).
+//!
 //! **Fit, and one known divergence.** Against the perfscripts random-read
 //! sweeps the simulator lands within 5% on the spinning disk, 9% on the
 //! SATA SSD and 17% on the NVMe drive for every block size up to 1 MiB,
@@ -89,6 +98,12 @@ struct InService {
     bytes_remaining: f64,
     /// Extra die occupancy after the transfer — flash programming.
     program_remaining: f64,
+    /// This request's weight in the bandwidth share.
+    share_weight: f64,
+    /// Whether this request has been acknowledged to the issuer. A write
+    /// is acknowledged once its data is in the drive's buffer, while the
+    /// dies behind it are still programming.
+    acked: bool,
     first_die: usize,
     die_count: usize,
     /// Whether this request has finished with its dies. Reads let go
@@ -659,6 +674,9 @@ pub fn run_streams(
         })
         .collect();
 
+    // Scratch for the bandwidth allocation, reused rather than allocated
+    // per step.
+    let mut rates: Vec<f64> = Vec::with_capacity(hardware.dies);
     let mut hist = latency::LatencyHistogram::new();
     let mut stream_hist: Vec<latency::LatencyHistogram> =
         (0..n).map(|_| latency::LatencyHistogram::new()).collect();
@@ -916,7 +934,10 @@ pub fn run_streams(
                 req,
                 positioning_remaining: positioning,
                 bytes_remaining: req.len as f64,
-                program_remaining: hardware.write_occupancy_s(req.write),
+                program_remaining: hardware.write_occupancy_s(req.write, req.len),
+                share_weight: 1.0
+                    + hardware.transfer_share_spread * (rng.random::<f64>() * 2.0 - 1.0),
+                acked: false,
                 first_die,
                 die_count,
                 dies_released: false,
@@ -961,27 +982,86 @@ pub fn run_streams(
             .iter()
             .filter(|s| s.positioning_remaining <= 0.0 && s.bytes_remaining > 1e-6)
             .count();
-        // Each transferring request takes an equal share of the device's
-        // bandwidth, capped by what its own dies can supply.
-        let share = if transferring == 0 {
-            0.0
+        // Transfers share the device's bandwidth in proportion to their
+        // weights, capped by what each one's own dies can supply. The
+        // weights sum out, so the aggregate matches an equal split and
+        // only the spread differs.
+        //
+        // Bandwidth a capped request cannot use is handed back and shared
+        // among the rest — weighted water-filling. Without that step a
+        // request whose cap is below its nominal share silently wastes
+        // the difference, and the device reports less aggregate
+        // throughput than it has.
+        rates.clear();
+        rates.resize(serving.len(), 0.0);
+        // Writes share a ceiling of their own, below the read path's.
+        let writes_transferring = serving
+            .iter()
+            .filter(|s| s.req.write && s.positioning_remaining <= 0.0 && s.bytes_remaining > 1e-6)
+            .count();
+        let write_cap = if writes_transferring == 0 {
+            f64::INFINITY
         } else {
-            peak / transferring as f64
+            hardware.write_bandwidth / writes_transferring as f64
         };
-        let rate_of = |s: &InService| -> f64 {
-            if s.positioning_remaining > 0.0 || s.bytes_remaining <= 1e-6 {
-                0.0
+        let cap_of = |s: &InService| -> f64 {
+            let base = hardware.request_rate(s.req.len);
+            if s.req.write {
+                base.min(write_cap)
             } else {
-                share.min(hardware.request_rate(s.req.len))
+                base
             }
         };
+        {
+            let mut remaining = peak;
+            let mut settled = vec![false; serving.len()];
+            for _ in 0..4 {
+                let open_weight: f64 = serving
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| {
+                        !settled[*i] && s.positioning_remaining <= 0.0 && s.bytes_remaining > 1e-6
+                    })
+                    .map(|(_, s)| s.share_weight)
+                    .sum();
+                if open_weight <= 0.0 || remaining <= 0.0 {
+                    break;
+                }
+                let mut capped_any = false;
+                for (i, s) in serving.iter().enumerate() {
+                    if settled[i] || s.positioning_remaining > 0.0 || s.bytes_remaining <= 1e-6 {
+                        continue;
+                    }
+                    let nominal = remaining * s.share_weight / open_weight;
+                    let cap = cap_of(s);
+                    if nominal >= cap {
+                        rates[i] = cap;
+                        settled[i] = true;
+                        capped_any = true;
+                    } else {
+                        rates[i] = nominal;
+                    }
+                }
+                if !capped_any {
+                    break;
+                }
+                remaining = peak
+                    - rates
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| settled[*i])
+                        .map(|(_, r)| *r)
+                        .sum::<f64>();
+            }
+        }
+        let rate_of = |i: usize| -> f64 { rates.get(i).copied().unwrap_or(0.0) };
 
         let mut dt = f64::INFINITY;
-        for s in &serving {
+        for (i, s) in serving.iter().enumerate() {
             if s.positioning_remaining > 0.0 {
                 dt = dt.min(s.positioning_remaining);
             } else if s.bytes_remaining > 1e-6 {
-                let r = rate_of(s);
+                let r = rate_of(i);
                 if r > 0.0 {
                     dt = dt.min(s.bytes_remaining / r);
                 }
@@ -1016,7 +1096,7 @@ pub fn run_streams(
         stats.busy_s += dt;
         if transferring > 0 {
             stats.transferring_s += dt;
-            let moved: f64 = serving.iter().map(rate_of).sum::<f64>() * dt;
+            let moved: f64 = (0..serving.len()).map(rate_of).sum::<f64>() * dt;
             stats.bytes_transferred += moved.round() as u64;
         }
         if blocked {
@@ -1031,11 +1111,11 @@ pub fn run_streams(
         stats.service_occupancy_integral += serving.len() as f64 * dt;
         clock += dt;
 
-        for s in serving.iter_mut() {
+        for (i, s) in serving.iter_mut().enumerate() {
             if s.positioning_remaining > 0.0 {
                 s.positioning_remaining -= dt;
             } else if s.bytes_remaining > 1e-6 {
-                s.bytes_remaining -= rate_of(s) * dt;
+                s.bytes_remaining -= rates[i] * dt;
             } else {
                 s.program_remaining -= dt;
             }
@@ -1058,13 +1138,65 @@ pub fn run_streams(
         // anyone else until the request is done.
         if !hardware.positioning.is_positional() {
             for s in serving.iter_mut() {
-                if s.positioning_remaining <= 0.0 && !s.dies_released && !s.req.write {
+                if s.positioning_remaining > 0.0 || s.dies_released {
+                    continue;
+                }
+                if !s.req.write {
+                    // A read is finished with its dies once the array read
+                    // completes; the data streams out from there.
                     for i in 0..s.die_count {
                         die_busy[(s.first_die + i) % hardware.dies.max(1)] = false;
                     }
                     s.dies_released = true;
+                } else if s.bytes_remaining <= 1e-6
+                    && s.die_count > hardware.program_die_concurrency
+                {
+                    // A write's programming is *pipelined*: the controller
+                    // feeds pages to dies in sequence rather than firing
+                    // every die at once, and NAND program-suspend lets a
+                    // read slip in between pages. So a programming write
+                    // holds one die, not all of the ones it spans.
+                    //
+                    // Holding all of them makes a rate-capped writer block
+                    // a concurrent reader an order of magnitude harder
+                    // than the mixed-workload measurements show.
+                    for i in hardware.program_die_concurrency..s.die_count {
+                        die_busy[(s.first_die + i) % hardware.dies.max(1)] = false;
+                    }
+                    s.die_count = hardware.program_die_concurrency;
                 }
             }
+        }
+
+        // ---- Acknowledgement ---------------------------------------------
+        // A write is done from the issuer's point of view once its data
+        // has landed in the drive's volatile buffer. The dies behind it
+        // are still programming, and stay held — which is how a writer
+        // interferes with a concurrent reader without also having to be
+        // slow itself.
+        //
+        // Without this split, a 1 MiB write appears to take as long as
+        // its programming does, and both sequential write throughput and
+        // the contention balance come out wrong in opposite directions.
+        for idx in 0..serving.len() {
+            let s = serving[idx];
+            if s.acked || s.positioning_remaining > 0.0 || s.bytes_remaining > 1e-6 {
+                continue;
+            }
+            if !s.req.write || s.program_remaining <= 0.0 {
+                continue;
+            }
+            let latency = clock - s.req.submitted_at;
+            stats.requests_completed += 1;
+            stats.total_latency_s += latency;
+            stats.max_latency_s = stats.max_latency_s.max(latency);
+            hist.record(latency);
+            stream_hist[s.req.stream].record(latency);
+            per_stream[s.req.stream].completed += 1;
+            per_stream[s.req.stream].bytes += s.req.len;
+            per_stream[s.req.stream].total_latency_s += latency;
+            outstanding[s.req.stream] -= 1;
+            serving[idx].acked = true;
         }
 
         // ---- Completion -------------------------------------------------
@@ -1080,18 +1212,20 @@ pub fn run_streams(
                         die_busy[(s.first_die + i) % hardware.dies.max(1)] = false;
                     }
                 }
-                stats.requests_completed += 1;
-                let latency = clock - s.req.submitted_at;
-                stats.total_latency_s += latency;
-                stats.max_latency_s = stats.max_latency_s.max(latency);
+                if !s.acked {
+                    let latency = clock - s.req.submitted_at;
+                    stats.requests_completed += 1;
+                    stats.total_latency_s += latency;
+                    stats.max_latency_s = stats.max_latency_s.max(latency);
 
-                let sidx = s.req.stream;
-                hist.record(latency);
-                stream_hist[sidx].record(latency);
-                per_stream[sidx].completed += 1;
-                per_stream[sidx].bytes += s.req.len;
-                per_stream[sidx].total_latency_s += latency;
-                outstanding[sidx] -= 1;
+                    let sidx = s.req.stream;
+                    hist.record(latency);
+                    stream_hist[sidx].record(latency);
+                    per_stream[sidx].completed += 1;
+                    per_stream[sidx].bytes += s.req.len;
+                    per_stream[sidx].total_latency_s += latency;
+                    outstanding[sidx] -= 1;
+                }
                 serving.swap_remove(i);
             } else {
                 i += 1;

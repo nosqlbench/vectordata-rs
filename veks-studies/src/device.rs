@@ -35,6 +35,10 @@
 //! curve is flat in IOPS rather than flat in bandwidth, and why ordering
 //! is worth so much more there.
 //!
+//! Parameters here are fitted to the perfscripts sweeps; the modern
+//! device is calibrated to published figures instead. Both are named in
+//! [the crate bibliography](crate#sources).
+//!
 //! Where the model and the measurement disagree, [`FitReport`] says so
 //! rather than the parameters being bent until they agree. See
 //! [`NVME_CONSUMER_MODEL`] for the one place that matters.

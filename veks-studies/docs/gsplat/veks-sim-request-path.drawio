@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="request-path">
+    <mxGraphModel dx="1200" dy="1400" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1000" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="veks-studies — what one I/O request passes through" style="text;html=1;align=left;verticalAlign=middle;fontSize=20;fontStyle=1;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="700" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="No throughput formula anywhere. A clock is advanced through these stages and throughput is whatever comes out." style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="58" width="800" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="rail_host" value="HOST" style="text;html=1;align=center;verticalAlign=middle;horizontal=0;fontColor=#6c8ebf;fontStyle=1;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="176" y="140" width="30" height="290" as="geometry" />
+        </mxCell>
+        <mxCell id="rail_dev" value="DEVICE" style="text;html=1;align=center;verticalAlign=middle;horizontal=0;fontColor=#d79b00;fontStyle=1;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="176" y="530" width="30" height="750" as="geometry" />
+        </mxCell>
+
+        <mxCell id="issuer" value="&lt;b&gt;Issuer&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;synthetic workload, or an&#xa;algorithm's replayed trace&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="140" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="cpu" value="&lt;b&gt;Host CPU&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;a core is occupied per request&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="250" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="cache" value="&lt;b&gt;Page cache + readahead&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;LRU over a residency bitmask&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="360" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="sched" value="&lt;b&gt;OS scheduler&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;noop · elevator · deadline&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="530" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="queue" value="&lt;b&gt;Queue slots&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;what the device will hold&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="640" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="ctrl" value="&lt;b&gt;Controller&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;serial command rate&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="750" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="die" value="&lt;b&gt;Die selection&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;by address, not by what is free&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="860" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="posn" value="&lt;b&gt;Positioning&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;seek + rotation, or NAND read&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="970" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="xfer" value="&lt;b&gt;Transfer&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;shared bandwidth, water-filled&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="1100" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="prog" value="&lt;b&gt;Program&lt;/b&gt; &lt;font style=&quot;font-size:11px;&quot;&gt;(writes)&lt;/font&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;dies stay held; reads behind it wait&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="1210" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="done" value="&lt;b&gt;Completion&lt;/b&gt;&lt;br/&gt;&lt;font style=&quot;font-size:11px;&quot;&gt;latency recorded into a histogram&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="270" y="1320" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n_cpu" value="Blocks when every core is busy.&#xa;Above ~500k IOPS this, and not&#xa;the device, is the constraint." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="600" y="250" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="n_cache" value="A hit never becomes a request.&#xa;Readahead fires once per window&#xa;on a marker — and only when the&#xa;pattern looks sequential." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="600" y="358" width="260" height="74" as="geometry" />
+        </mxCell>
+        <mxCell id="n_queue" value="Full ⇒ the issuer waits.&#xa;This is queue saturation." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="600" y="640" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="n_ctrl" value="Flattens the small-block end&#xa;of every flash curve." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="600" y="750" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="n_die" value="A busy die blocks the request&#xa;that lands on it, however idle&#xa;the rest of the device is." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="600" y="860" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="n_posn" value="Consumes no bandwidth.&#xa;On a disk under scattered 4 KiB&#xa;reads this is 99% of busy time." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="600" y="970" width="260" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="ceilbox" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="590" y="1090" width="270" height="190" as="geometry" />
+        </mxCell>
+        <mxCell id="ceiltitle" value="&lt;b&gt;Whichever ceiling is lowest&lt;/b&gt;" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="606" y="1100" width="250" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="ceillist" value="· media rate × dies spanned&#xa;· the device's own bus&#xa;· its share of the upstream link&#xa;· host memory bandwidth ÷ touches&#xa;· the interconnect, if remote&#xa;· a separate write-path ceiling" style="text;html=1;align=left;verticalAlign=top;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="606" y="1128" width="250" height="140" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#6c8ebf;" edge="1" parent="1" source="issuer" target="cpu">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#6c8ebf;" edge="1" parent="1" source="cpu" target="cache">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="miss" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#9673a6;fontSize=11;" edge="1" parent="1" source="cache" target="sched">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00;" edge="1" parent="1" source="sched" target="queue">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00;" edge="1" parent="1" source="queue" target="ctrl">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00;" edge="1" parent="1" source="ctrl" target="die">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00;" edge="1" parent="1" source="die" target="posn">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#d6b656;" edge="1" parent="1" source="posn" target="xfer">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" value="writes" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#b85450;fontSize=11;" edge="1" parent="1" source="xfer" target="prog">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#82b366;" edge="1" parent="1" source="prog" target="done">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_hit" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#9673a6;dashed=1;fontSize=11;fontColor=#9673a6;verticalAlign=bottom;" edge="1" parent="1" source="cache" target="done">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="130" y="395" />
+              <mxPoint x="130" y="1355" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="e_ack" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;strokeColor=#b85450;dashed=1;fontSize=11;fontColor=#b85450;" edge="1" parent="1" source="xfer" target="done">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="920" y="1135" />
+              <mxPoint x="920" y="1360" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="lbl_hit" value="hit — never&#xa;reaches the&#xa;device" style="text;html=1;align=center;verticalAlign=middle;fontSize=11;fontColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="40" y="820" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="lbl_ack" value="a write is acknowledged once&#xa;it is buffered, while its dies&#xa;keep programming" style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="950" y="1180" width="230" height="60" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

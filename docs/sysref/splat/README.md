@@ -17,7 +17,7 @@ Canonical specification:
 [09-algorithms.md §9.4](../09-algorithms.md#94-splat-io-sympathetic-ordinal-rewrite).
 Runtime-agnostic statement of the same algorithm, with the host
 primitives it needs and no dependence on this system's formats or
-resource plumbing: [gsplat](../../gsplat/README.md).
+resource plumbing: [gsplat](../../../veks-studies/docs/gsplat/README.md).
 
 ## When it runs
 

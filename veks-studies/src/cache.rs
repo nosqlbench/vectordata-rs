@@ -24,6 +24,13 @@
 //! happens. How much memory that takes, and how sharply the benefit
 //! falls off, is what the cache simulation is for.
 //!
+//! Readahead policy — which lives in [`crate::io::Readahead`] and drives
+//! this cache — follows Linux's: a window that doubles toward `ra_pages`
+//! (128 KiB by default, 256 KiB after `POSIX_FADV_SEQUENTIAL`) and fires
+//! once per window when a read crosses an async marker. See
+//! [the crate bibliography](crate#sources) for what grounds the rest of
+//! the storage path.
+//!
 //! Residency is a bitmask over the address space — one bit per page —
 //! and recency is an intrusive list over cache slots, so both membership
 //! and eviction are constant-time and the whole thing stays cheap enough
