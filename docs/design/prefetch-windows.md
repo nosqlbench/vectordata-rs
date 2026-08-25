@@ -405,21 +405,30 @@ This dissolves the congruence question rather than answering it: the
 YAML key remains the knob it always was, and an ad-hoc window is an
 argument. Nothing is mirrored because nothing new is configured.
 
-**2. Blocking, background, or both?**
+**2. Resolved — both.**
 
-Everything above is blocking: `prefetch` returns when the window is
-resident. That is really "precache a window", and "prefetch" usually
-implies fire-and-forget. A background form —
+`prefetch` blocks; `prefetch_in_background` returns a `PrefetchHandle`.
 
-```rust
-fn prefetch_async(&self, facet: &str, window: &DSWindow) -> PrefetchHandle;
-```
+The plan is computed **synchronously** either way, so a caller learns
+the cost before committing and the `Err` from starting a background
+prefetch is a planning failure rather than a fetch one. Only the
+fetching moves off-thread, which is the part a scan wants to overlap
+with.
 
-— is more useful for the actual use case (warm ahead of a scan while the
-scan runs) but adds a lifetime, a cancellation story, and a failure
-channel that nobody is waiting on. I would ship blocking first and add
-the background form only if a real caller needs it. Tell me if you want
-both from the start.
+The three things I said this would cost, and what they turned out to be:
+
+- **Lifetime**: none. The plan needs the view, but the fetch needs only
+  an owned `FacetStorage`, which is `Send`. Nothing borrows.
+- **Cancellation**: granular to a range. A fetch in flight runs to
+  completion, because the transport cannot abandon one part-way and
+  leave the chunk bitmap honest. With one large range `cancel()`
+  cancels nothing; with many small ones it stops promptly. Ranges
+  already fetched stay cached — a cancelled prefetch is partial work,
+  not undone work.
+- **A failure channel nobody is waiting on**: the worker logs whether
+  or not anybody joins, and `join()` returns it. Dropping the handle
+  detaches rather than blocking or aborting; the bytes still land,
+  which is what a caller who has moved on wants.
 
 **3. What should a window against a non-rangeable source do?**
 
