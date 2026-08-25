@@ -464,6 +464,139 @@ profiles:
     );
 }
 
+// ─── Background prefetch ───────────────────────────────────────────
+
+/// The plan is available immediately, before any fetching — that is the
+/// point of computing it on the calling thread. A caller can look at the
+/// cost and cancel before the worker has done anything.
+#[test]
+fn a_background_prefetch_reports_its_plan_before_finishing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    let handle = view
+        .prefetch_in_background("base_vectors", &parse_window("10..20").unwrap())
+        .unwrap();
+    assert_eq!(
+        handle.plan().byte_ranges,
+        vec![(10 * BPR, 20 * BPR)],
+        "the plan is known before the fetch is"
+    );
+    let report = handle.join().unwrap();
+    assert_eq!(report.planned.byte_ranges, vec![(10 * BPR, 20 * BPR)]);
+}
+
+/// Joining waits, and a local facet finishes with nothing to do.
+#[test]
+fn joining_a_background_prefetch_waits_for_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    let handle = view
+        .prefetch_in_background("base_vectors", &parse_window("0..100").unwrap())
+        .unwrap();
+    let report = handle.join().unwrap();
+    assert_eq!(report.ranges_fetched, 1, "one range, fetched");
+}
+
+/// **Cancellation is granular to a range, and partial work survives.**
+/// A cancelled prefetch is work not finished, not work undone — the
+/// ranges already fetched stay in the cache.
+#[test]
+fn cancelling_stops_the_worker_and_keeps_what_it_fetched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    let handle = view
+        .prefetch_in_background("base_vectors", &parse_window("0..100").unwrap())
+        .unwrap();
+    handle.cancel();
+    assert!(handle.is_cancelled());
+    // Joining a cancelled prefetch is not an error: stopping early is
+    // what was asked for.
+    let report = handle.join().unwrap();
+    assert!(report.ranges_fetched <= 1);
+}
+
+/// Dropping the handle detaches rather than blocking or aborting. The
+/// bytes still land, which is what a caller who has moved on wants.
+#[test]
+fn dropping_the_handle_detaches_without_blocking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    {
+        let handle = view
+            .prefetch_in_background("base_vectors", &parse_window("0..50").unwrap())
+            .unwrap();
+        assert_eq!(handle.plan().requests(), 1);
+        // Dropped here without joining.
+    }
+    // The view is still usable and the facet still reads correctly.
+    let reader = view.base_vectors().unwrap();
+    assert_eq!(reader.count(), 100);
+}
+
+/// A background prefetch of a facet with no ordinal mapping still runs
+/// — it just fetches the whole thing, and says so in the plan first.
+#[test]
+fn a_degrading_facet_still_prefetches_in_the_background() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
+    write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 10);
+    std::fs::write(ds.join("profiles/default/m.parquet"), [0u8; 64]).unwrap();
+    let yaml = r#"
+name: bg-degrade
+profiles:
+  default:
+    base_vectors: profiles/default/base_vectors.fvec
+    metadata_content: profiles/default/m.parquet
+"#;
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let handle = view
+        .prefetch_in_background("metadata_content", &parse_window("2..4").unwrap())
+        .unwrap();
+    assert!(
+        handle.plan().degrades_to_full_download,
+        "the caller learns this before the fetch starts"
+    );
+    handle.join().unwrap();
+}
+
+/// Several background prefetches can run at once against one view —
+/// each holds its own facet handle, so nothing is shared that would
+/// need locking.
+#[test]
+fn several_background_prefetches_run_concurrently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    let handles: Vec<_> = [(0u64, 20u64), (30, 50), (60, 90)]
+        .iter()
+        .map(|(a, b)| {
+            view.prefetch_in_background(
+                "base_vectors",
+                &parse_window(&format!("{a}..{b}")).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+
+    for h in handles {
+        let report = h.join().unwrap();
+        assert_eq!(report.ranges_fetched, 1);
+    }
+}
+
 // ─── The precache driver ───────────────────────────────────────────
 
 use vectordata::datasets::precache::{PrecacheRequest, run};
@@ -566,4 +699,176 @@ profiles:
         ..request(ds.to_str().unwrap())
     };
     assert_eq!(run(named), 0);
+}
+
+// ─── Against a real remote facet ───────────────────────────────────
+//
+// Every test above runs against local storage, where a fetch is a
+// no-op. That exercises the plumbing but not the machinery: nothing
+// downloads, no counter advances, and cancellation has nothing to
+// cancel. These run over HTTP with a published `.mref`, so the chunk
+// bitmap is real and the numbers mean something.
+
+mod support;
+
+use support::testserver::TestServer;
+use vectordata::merkle::MerkleRef;
+
+/// Small enough that a modest fixture spans many chunks, so a window
+/// covers some of them and not others.
+const REMOTE_CHUNK: u64 = 4 * 1024;
+
+/// One cache root for the whole binary.
+///
+/// `override_cache_dir_for_process` is process-wide, and these tests
+/// run in parallel threads of one process — so a per-test override is
+/// a race, with the last writer deciding where everyone caches. One
+/// root, and a distinct dataset name per test, keeps them apart.
+static TEST_CACHE_DIR: std::sync::LazyLock<tempfile::TempDir> =
+    std::sync::LazyLock::new(|| {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(&base).expect("create test cache root")
+    });
+
+fn init_test_cache() {
+    vectordata::settings::override_cache_dir_for_process(TEST_CACHE_DIR.path().to_path_buf());
+}
+
+/// Publish an fvec over HTTP with a `.mref`, and return a local
+/// `dataset.yaml` pointing at it.
+///
+/// `name` must be unique per test: it becomes the cache subdirectory,
+/// and two datasets sharing one while fetching from different servers
+/// is a collision the cache correctly refuses.
+fn remote_dataset(dir: &std::path::Path, name: &str) -> (TestServer, String) {
+    init_test_cache();
+    let published = dir.join("pub");
+    std::fs::create_dir_all(&published).unwrap();
+
+    // 4000 records of dim 16 → 68 bytes each, ~265 KiB, ~65 chunks.
+    let data = published.join("base.fvec");
+    write_fvec(&data, 16, 4000);
+    let content = std::fs::read(&data).unwrap();
+    MerkleRef::from_content(&content, REMOTE_CHUNK)
+        .save(&published.join("base.fvec.mref"))
+        .unwrap();
+
+    let server = TestServer::start(&published).unwrap();
+    let yaml = format!(
+        "name: {name}\nprofiles:\n  default:\n    base_vectors: {}base.fvec\n",
+        server.base_url()
+    );
+    let local_ds = dir.join(name);
+    std::fs::create_dir_all(&local_ds).unwrap();
+    std::fs::write(local_ds.join("dataset.yaml"), yaml).unwrap();
+    (server, local_ds.to_string_lossy().to_string())
+}
+
+/// **A window fetches its chunks and not the file.** This is the whole
+/// claim, and it needs remote storage to mean anything: on a local
+/// facet every plan reports zero and proves nothing.
+#[test]
+fn a_remote_window_fetches_only_its_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_server, spec) = remote_dataset(tmp.path(), "prefetch-window-chunks");
+    let group = vectordata::TestDataGroup::load(&spec).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("base_vectors", &parse_window("100..200").unwrap())
+        .unwrap();
+    assert!(!plan.fills.is_empty(), "remote storage has chunk fills");
+    assert!(
+        plan.bytes_to_fetch() > 0,
+        "nothing is resident yet, so there is work to do"
+    );
+    assert!(
+        plan.bytes_to_fetch() < plan.facet_bytes,
+        "a 100-record window must cost less than the whole {} byte facet, \
+         got {}",
+        plan.facet_bytes,
+        plan.bytes_to_fetch()
+    );
+
+    let handle = view
+        .prefetch_in_background("base_vectors", &parse_window("100..200").unwrap())
+        .unwrap();
+    handle.join().unwrap();
+
+    // Asking again now costs nothing: the chunks are resident.
+    let after = view
+        .prefetch_plan("base_vectors", &parse_window("100..200").unwrap())
+        .unwrap();
+    assert!(
+        after.is_resident(),
+        "the window the prefetch just fetched must read as resident"
+    );
+    assert_eq!(after.bytes_to_fetch(), 0);
+}
+
+/// The background worker's counters advance against a real download,
+/// and the handle reports done when it is.
+#[test]
+fn a_background_prefetch_advances_its_counters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_server, spec) = remote_dataset(tmp.path(), "prefetch-counters");
+    let group = vectordata::TestDataGroup::load(&spec).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let handle = view
+        .prefetch_in_background("base_vectors", &parse_window("0..2000").unwrap())
+        .unwrap();
+    let expected = handle.plan().bytes_to_fetch();
+    assert!(expected > 0);
+
+    let report = handle.join().unwrap();
+    assert_eq!(report.ranges_fetched, 1);
+
+    // What the plan said it would fetch is now resident.
+    let after = view
+        .prefetch_plan("base_vectors", &parse_window("0..2000").unwrap())
+        .unwrap();
+    assert!(after.is_resident());
+}
+
+/// **A prefetched window makes the reader's own reads free.** The
+/// point of prefetch is that the chunks the reader wants are already
+/// there — so a read after a prefetch must not fetch anything more.
+#[test]
+fn reading_a_prefetched_window_fetches_nothing_further() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_server, spec) = remote_dataset(tmp.path(), "prefetch-read-after");
+    let group = vectordata::TestDataGroup::load(&spec).unwrap();
+    let view = group.profile("default").unwrap();
+
+    view.prefetch("base_vectors", &parse_window("500..600").unwrap())
+        .unwrap();
+
+    let before = view
+        .open_facet_storage("base_vectors")
+        .unwrap()
+        .cache_stats()
+        .map(|c| c.valid_chunks)
+        .unwrap_or(0);
+
+    // Read inside the prefetched window.
+    let reader = view.base_vectors().unwrap();
+    for i in 500..600 {
+        let v = reader.get(i).unwrap();
+        assert_eq!(v.len(), 16);
+        // This file's write_fvec stores element (r, d) as r + d.
+        assert_eq!(v[0], i as f32, "record {i} decodes correctly");
+    }
+
+    let after = view
+        .open_facet_storage("base_vectors")
+        .unwrap()
+        .cache_stats()
+        .map(|c| c.valid_chunks)
+        .unwrap_or(0);
+    assert_eq!(
+        before, after,
+        "reading inside a prefetched window must not fetch another chunk"
+    );
 }

@@ -755,6 +755,84 @@ pub trait TestDataView: Send + Sync {
         Ok(plan)
     }
 
+    /// Start fetching `window` of `facet` on another thread.
+    ///
+    /// The plan is computed before this returns — planning needs the
+    /// view, and a caller deserves the cost before committing — so the
+    /// `Err` here is a planning failure. Fetch failures arrive through
+    /// [`PrefetchHandle::join`], and are logged regardless so an
+    /// unwatched prefetch cannot fail silently.
+    ///
+    /// This is the form for warming ahead of a scan: start it, keep
+    /// reading, and let the bytes arrive underneath. Reads that
+    /// overtake the prefetch are not wrong, only slower — they fault in
+    /// the chunk themselves, and the prefetch skips what is already
+    /// resident.
+    fn prefetch_in_background(
+        &self,
+        facet: &str,
+        window: &DSWindow,
+    ) -> Result<PrefetchHandle> {
+        let storage = self.open_facet_storage(facet)?;
+        let plan = self.prefetch_plan_on(&storage, facet, window)?;
+
+        let state = std::sync::Arc::new(PrefetchState::default());
+        let worker_state = state.clone();
+        let ranges = plan.byte_ranges.clone();
+        let degrades = plan.degrades_to_full_download;
+        let name = facet.to_string();
+
+        let thread = std::thread::Builder::new()
+            .name(format!("prefetch:{name}"))
+            .spawn(move || {
+                use std::sync::atomic::Ordering;
+                let record = |e: std::io::Error| {
+                    log::warn!("prefetch of '{name}' failed: {e}");
+                    *worker_state.error.lock().unwrap() = Some(e.to_string());
+                };
+
+                let outcome = if degrades {
+                    storage.prebuffer_with_progress(|p| {
+                        worker_state
+                            .bytes_fetched
+                            .store(p.downloaded_bytes(), Ordering::Relaxed);
+                    })
+                } else {
+                    let mut acc = 0u64;
+                    let mut result = Ok(());
+                    for (start, end) in ranges {
+                        if worker_state.cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        result = storage.prebuffer_range_with_progress(start, end, |p| {
+                            worker_state
+                                .bytes_fetched
+                                .store(acc + p.downloaded_bytes(), Ordering::Relaxed);
+                        });
+                        if result.is_err() {
+                            break;
+                        }
+                        acc = worker_state.bytes_fetched.load(Ordering::Relaxed);
+                        worker_state.ranges_fetched.fetch_add(1, Ordering::Relaxed);
+                    }
+                    result
+                };
+                if let Err(e) = outcome {
+                    record(e);
+                }
+                // Set last, and with Release, so a caller that sees
+                // `is_done()` also sees the error and the counters.
+                worker_state.done.store(true, Ordering::Release);
+            })
+            .map_err(|e| Error::Other(format!("could not start prefetch thread: {e}")))?;
+
+        Ok(PrefetchHandle {
+            plan,
+            state,
+            thread: Some(thread),
+        })
+    }
+
     /// Fetch `window` of `facet` and return when it is resident.
     fn prefetch(&self, facet: &str, window: &DSWindow) -> Result<PrefetchReport> {
         self.prefetch_with_progress(facet, window, &mut |_| {})
@@ -1092,6 +1170,96 @@ impl PrefetchPlan {
     /// prefetch would do nothing.
     pub fn is_resident(&self) -> bool {
         !self.degrades_to_full_download && self.fills.iter().all(|f| f.is_resident())
+    }
+}
+
+/// A prefetch running on another thread.
+///
+/// The **plan is computed synchronously**, before this is returned, so
+/// a caller learns the cost up front and can decide not to proceed.
+/// Only the fetching moves off-thread — which is the part that takes
+/// time and the part a scan wants to overlap with.
+///
+/// Dropping the handle **detaches**: the fetch keeps running and its
+/// bytes land in the cache, which is what a caller who has moved on
+/// still wants. A failure is logged by the worker whether or not
+/// anybody joins, so an unwatched prefetch cannot fail silently.
+pub struct PrefetchHandle {
+    plan: PrefetchPlan,
+    state: std::sync::Arc<PrefetchState>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Default)]
+struct PrefetchState {
+    cancelled: std::sync::atomic::AtomicBool,
+    done: std::sync::atomic::AtomicBool,
+    bytes_fetched: std::sync::atomic::AtomicU64,
+    ranges_fetched: std::sync::atomic::AtomicUsize,
+    error: std::sync::Mutex<Option<String>>,
+}
+
+impl PrefetchHandle {
+    /// What this prefetch set out to do. Available immediately.
+    pub fn plan(&self) -> &PrefetchPlan {
+        &self.plan
+    }
+
+    /// Whether the worker has finished — successfully, in error, or by
+    /// cancellation.
+    pub fn is_done(&self) -> bool {
+        self.state.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Bytes fetched so far.
+    pub fn bytes_fetched(&self) -> u64 {
+        self.state
+            .bytes_fetched
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Ranges completed so far, of [`PrefetchPlan::requests`].
+    pub fn ranges_fetched(&self) -> usize {
+        self.state
+            .ranges_fetched
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Ask the worker to stop.
+    ///
+    /// **Granular to a range**, not to a byte: a fetch already in
+    /// flight runs to completion, because the transport has no way to
+    /// abandon one part-way and leave the chunk bitmap honest. With one
+    /// large range this cancels nothing; with many small ones it stops
+    /// promptly. Ranges already fetched stay in the cache — a cancelled
+    /// prefetch is partial work, not undone work.
+    pub fn cancel(&self) {
+        self.state
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait for the fetch and report what it did.
+    pub fn join(mut self) -> Result<PrefetchReport> {
+        if let Some(t) = self.thread.take() {
+            // A worker panic is a bug here, not a fetch failure; say so
+            // rather than reporting it as an I/O error.
+            t.join()
+                .map_err(|_| Error::Other("prefetch worker panicked".into()))?;
+        }
+        if let Some(e) = self.state.error.lock().unwrap().take() {
+            return Err(Error::Other(e));
+        }
+        Ok(PrefetchReport {
+            planned: self.plan.clone(),
+            ranges_fetched: self.ranges_fetched(),
+        })
     }
 }
 
