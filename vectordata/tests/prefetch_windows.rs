@@ -1474,3 +1474,130 @@ fn a_server_without_range_support_plans_the_whole_facet() {
     )
     .unwrap();
 }
+
+// ─── Catalog-resolved profile selection ────────────────────────────
+
+/// A local catalog declaring one dataset with two profiles over the
+/// same fvec, so selecting between them changes which window resolves
+/// against which facet.
+fn catalog_fixture(dir: &std::path::Path) -> String {
+    let root = dir.join("cat");
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    write_fvec(&root.join("data/base.fvec"), 4, 100);
+    write_fvec(&root.join("data/small.fvec"), 4, 20);
+    let yaml = r#"
+"windowed:default":
+  base: data/base.fvec
+
+"windowed:small":
+  base: data/small.fvec
+"#;
+    std::fs::write(root.join("knn_entries.yaml"), yaml).unwrap();
+    root.to_string_lossy().to_string()
+}
+
+/// **Profile selection works for a catalog-resolved dataset, by both
+/// routes.**
+///
+/// A catalog name has no `/`, so unlike a local path it *can* carry a
+/// `:profile` suffix — `resolve_spec` reads anything with a slash as
+/// naming every profile. Both routes have to reach the same place, or
+/// the flag and the suffix mean different things depending on how the
+/// dataset was named.
+#[test]
+fn a_catalog_dataset_selects_its_profile_by_flag_or_suffix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = catalog_fixture(tmp.path());
+
+    let base = |spec: &str| PrecacheRequest {
+        dataset_spec: spec.to_string(),
+        extra_catalogs: vec![catalog.clone()],
+        window: Some("0..10".to_string()),
+        plan_only: true,
+        ..PrecacheRequest::default()
+    };
+
+    // Two profiles and no way to choose: refused rather than guessed.
+    assert_eq!(
+        run(base("windowed")),
+        2,
+        "a windowed selection across two profiles must ask which one"
+    );
+
+    // The flag resolves it.
+    assert_eq!(
+        run(PrecacheRequest {
+            profile: Some("small".to_string()),
+            ..base("windowed")
+        }),
+        0
+    );
+
+    // And so does the suffix, which a catalog name can carry.
+    assert_eq!(run(base("windowed:small")), 0);
+
+    // A profile that does not exist fails rather than falling back.
+    assert_eq!(
+        run(PrecacheRequest {
+            profile: Some("nonexistent".to_string()),
+            ..base("windowed")
+        }),
+        1
+    );
+
+    // Exit codes alone would not prove the *right* profile was picked:
+    // both succeed, so both could be resolving the same one. The two
+    // profiles point at different files, so the plan's facet size is
+    // what distinguishes them.
+    use vectordata::catalog::resolver::Catalog;
+    use vectordata::catalog::sources::CatalogSources;
+    let sources = CatalogSources::new().add_catalogs(&[catalog.clone()]);
+    let group = Catalog::of(&sources)
+        .open("windowed")
+        .expect("the catalog resolves the dataset");
+    let window = parse_window("0..10").unwrap();
+
+    let big = group
+        .profile("default")
+        .expect("default profile")
+        .prefetch_plan("base_vectors", &window)
+        .unwrap();
+    let small = group
+        .profile("small")
+        .expect("small profile")
+        .prefetch_plan("base_vectors", &window)
+        .unwrap();
+
+    assert_eq!(big.facet_bytes, 100 * 20, "default is the 100-record file");
+    assert_eq!(small.facet_bytes, 20 * 20, "small is the 20-record file");
+    assert_ne!(
+        big.facet_bytes, small.facet_bytes,
+        "the profiles must resolve to different facets, or selecting \
+         between them proves nothing"
+    );
+    // The same window resolves to the same bytes in both, since the
+    // stride is the same — what differs is what lies beyond it.
+    assert_eq!(big.requested_ranges, small.requested_ranges);
+}
+
+/// The flag outranks the suffix when both are given, so a caller
+/// scripting over a `name:profile` spec can override it without
+/// rewriting the string.
+#[test]
+fn an_explicit_profile_flag_outranks_the_spec_suffix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = catalog_fixture(tmp.path());
+
+    // The suffix says `default` (100 records); the flag says `small`
+    // (20). A window of 0..15 fits `small` and the run must succeed
+    // against it.
+    let req = PrecacheRequest {
+        dataset_spec: "windowed:default".to_string(),
+        extra_catalogs: vec![catalog],
+        profile: Some("small".to_string()),
+        window: Some("0..15".to_string()),
+        plan_only: true,
+        ..PrecacheRequest::default()
+    };
+    assert_eq!(run(req), 0);
+}
