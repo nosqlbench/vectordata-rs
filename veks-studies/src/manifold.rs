@@ -1199,6 +1199,83 @@ mod tests {
         }
     }
 
+    /// **Rendering bugs do not fail loudly.** A study that prints wrong
+    /// numbers still renders, still avoids NaN, and still passes a
+    /// length check — the smoke test above would not have caught either
+    /// of the two rendering defects this crate actually shipped: study
+    /// headings drifting out of registry order, and `human_bytes`
+    /// printing every container below 1 MiB as "0M".
+    ///
+    /// So the rendering layer gets assertions of its own.
+    #[test]
+    fn study_headings_match_their_registry_order() {
+        for (index, study) in ALL.iter().enumerate() {
+            let expected = format!("Study {} — ", index + 1);
+            let out = study.render();
+            assert!(
+                out.contains(&expected),
+                "study '{}' is number {} in the registry but its heading does not \
+                 say so; first line was: {:?}",
+                study.name,
+                index + 1,
+                out.lines().find(|l| !l.trim().is_empty())
+            );
+        }
+    }
+
+    /// Sizes must render in a unit that distinguishes them. Rounding a
+    /// range of container sizes to the same string makes a table that
+    /// looks filled in and says nothing.
+    #[test]
+    fn byte_rendering_distinguishes_the_sizes_studies_use() {
+        use crate::scale::human_bytes;
+        let rendered: Vec<String> = [
+            16u64 << 10,
+            64 << 10,
+            128 << 10,
+            1 << 20,
+            16 << 20,
+            256 << 20,
+        ]
+        .iter()
+        .map(|b| human_bytes(*b))
+        .collect();
+        let unique: std::collections::HashSet<&String> = rendered.iter().collect();
+        assert_eq!(
+            unique.len(),
+            rendered.len(),
+            "container sizes must render distinctly, got {rendered:?}"
+        );
+        assert!(!rendered.iter().any(|r| r == "0M"), "{rendered:?}");
+    }
+
+    /// A study that compares strategies must represent every arm it
+    /// priced — a table silently missing one reads as a complete
+    /// comparison when it is not.
+    ///
+    /// Matched on the distinguishing word rather than the full label,
+    /// because the corner table abbreviates its headers for width:
+    /// `gather scatter rescan staged`. The claim is that each arm
+    /// appears, not that every table spells it the same way.
+    #[test]
+    fn strategy_tables_represent_every_arm() {
+        for name in ["strategies", "pegged", "bounds", "corners"] {
+            let out = find(name).expect("study exists").render();
+            for strategy in Strategy::ALL {
+                let token = strategy
+                    .label()
+                    .split_whitespace()
+                    .next_back()
+                    .expect("labels are non-empty");
+                assert!(
+                    out.contains(token),
+                    "study '{name}' does not represent the '{}' arm (looked for '{token}')",
+                    strategy.label()
+                );
+            }
+        }
+    }
+
     #[test]
     fn studies_are_addressable_by_name() {
         for study in ALL {

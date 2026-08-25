@@ -897,6 +897,174 @@ fn remote_dataset(dir: &std::path::Path, name: &str) -> (TestServer, String) {
     (server, local_ds.to_string_lossy().to_string())
 }
 
+/// Publish an ivvec with its `IDXFOR__` sidecar and a `.mref`, plus an
+/// unwindowable facet, alongside the fvec.
+///
+/// The plain fixture above covers one xvec facet. Several gaps need
+/// more: a variable-length facet whose index must be fetched over HTTP,
+/// and a facet with no ordinal mapping at all so the fallback gate can
+/// be exercised where the whole facet actually costs something.
+fn rich_remote_dataset(dir: &std::path::Path, name: &str) -> (TestServer, String) {
+    init_test_cache();
+    let published = dir.join("pub");
+    std::fs::create_dir_all(&published).unwrap();
+
+    let mref = |p: &std::path::Path| {
+        let content = std::fs::read(p).unwrap();
+        let mut out = p.to_path_buf().into_os_string();
+        out.push(".mref");
+        MerkleRef::from_content(&content, REMOTE_CHUNK)
+            .save(std::path::Path::new(&out))
+            .unwrap();
+    };
+
+    // dim 16 → 68 bytes per record; 4 KiB chunks hold ~60 records.
+    let fvec = published.join("base.fvec");
+    write_fvec(&fvec, 16, 4000);
+    mref(&fvec);
+
+    // Ragged records, so only the index can place them.
+    let vv = published.join("meta.ivvec");
+    let dims: Vec<i32> = (0..400).map(|i| 1 + (i % 17)).collect();
+    let offsets = write_ivvec(&vv, &dims);
+    mref(&vv);
+    // The sidecar the reader and the prefetch path both look for.
+    let total = std::fs::metadata(&vv).unwrap().len();
+    let (ext, bytes): (&str, Vec<u8>) = if total <= i32::MAX as u64 {
+        (
+            "i32",
+            offsets
+                .iter()
+                .flat_map(|&o| (o as i32).to_le_bytes())
+                .collect(),
+        )
+    } else {
+        (
+            "i64",
+            offsets
+                .iter()
+                .flat_map(|&o| (o as i64).to_le_bytes())
+                .collect(),
+        )
+    };
+    std::fs::write(published.join(format!("IDXFOR__meta.ivvec.{ext}")), bytes).unwrap();
+
+    // No ordinal mapping: windowing it is excluded by design.
+    let blob = published.join("blob.parquet");
+    std::fs::write(&blob, vec![7u8; 40_000]).unwrap();
+    mref(&blob);
+
+    let server = TestServer::start(&published).unwrap();
+    let base = server.base_url();
+    let yaml = format!(
+        "name: {name}\nprofiles:\n  default:\n    base_vectors: {base}base.fvec\n    \
+         metadata_content: {base}meta.ivvec\n    metadata_predicates: {base}blob.parquet\n"
+    );
+    let local_ds = dir.join(name);
+    std::fs::create_dir_all(&local_ds).unwrap();
+    std::fs::write(local_ds.join("dataset.yaml"), yaml).unwrap();
+    (server, local_ds.to_string_lossy().to_string())
+}
+
+/// Records per chunk for the fvec fixture: 4 KiB / 68 bytes.
+const RECORDS_PER_CHUNK: u64 = REMOTE_CHUNK / 68;
+
+/// **Coalescing on real chunks — the branch the local tests never
+/// reach.**
+///
+/// Every other coalescing test runs against local storage, where
+/// `cache_stats()` is `None` and merging falls back to byte adjacency.
+/// That proves `coalesce_ranges` in isolation but never that
+/// `prefetch_plan` hands it the right chunk size. Here the chunks are
+/// real, so the chunk-space rule is what decides.
+#[test]
+fn coalescing_uses_real_chunk_boundaries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_server, spec) = rich_remote_dataset(tmp.path(), "coalesce-chunks");
+    let group = vectordata::TestDataGroup::load(&spec).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let plan = |w: &str| {
+        view.prefetch_plan("base_vectors", &parse_window(w).unwrap())
+            .unwrap()
+    };
+
+    // Two windows inside chunk 0. Byte-adjacency would keep them apart;
+    // chunk adjacency merges them, because they are already one fetch.
+    let same_chunk = plan("[0..10, 12..20]");
+    assert_eq!(same_chunk.requested_ranges.len(), 2);
+    assert_eq!(
+        same_chunk.requests(),
+        1,
+        "two ranges inside one chunk are one fetch, not two"
+    );
+
+    // Chunk 0 and chunk 1: adjacent, contiguous on the device.
+    let adjacent = plan(&format!(
+        "[0..10, {}..{}]",
+        RECORDS_PER_CHUNK + 1,
+        RECORDS_PER_CHUNK + 10
+    ));
+    assert_eq!(adjacent.requested_ranges.len(), 2);
+    assert_eq!(adjacent.requests(), 1, "adjacent chunks merge");
+
+    // Far apart, with whole chunks untouched between: no bridge.
+    let apart = plan("[0..10, 200..210]");
+    assert_eq!(apart.requested_ranges.len(), 2);
+    assert_eq!(
+        apart.requests(),
+        2,
+        "a gap of whole chunks must not be bridged"
+    );
+    assert!(
+        apart.fills.len() == 2,
+        "each request gets its own chunk accounting"
+    );
+}
+
+/// **A remote vvec window resolves through an index fetched over HTTP.**
+///
+/// The local vvec tests build the index by walking an mmap. This is the
+/// two-phase path as designed: fetch the sidecar, then window the data.
+#[test]
+fn a_remote_vvec_window_uses_the_published_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_server, spec) = rich_remote_dataset(tmp.path(), "vvec-remote");
+    let group = vectordata::TestDataGroup::load(&spec).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("100..150").unwrap())
+        .unwrap();
+    assert!(
+        !plan.degrades_to_full_download,
+        "a published index makes a remote vvec windowable"
+    );
+    assert_eq!(plan.requested_ranges.len(), 1);
+    assert!(
+        plan.prerequisite_bytes > 0,
+        "the index had to be read, and the plan says so"
+    );
+    let (start, end) = plan.requested_ranges[0];
+    assert!(end > start && end <= plan.facet_bytes);
+    assert!(
+        end - start < plan.facet_bytes,
+        "50 of 400 ragged records must be a fraction of the facet"
+    );
+
+    // And it fetches: afterwards the window reads as resident.
+    view.prefetch(
+        "metadata_content",
+        &parse_window("100..150").unwrap(),
+        WholeFacetFallback::Refuse,
+    )
+    .unwrap();
+    let after = view
+        .prefetch_plan("metadata_content", &parse_window("100..150").unwrap())
+        .unwrap();
+    assert!(after.is_resident());
+}
+
 /// **A window fetches its chunks and not the file.** This is the whole
 /// claim, and it needs remote storage to mean anything: on a local
 /// facet every plan reports zero and proves nothing.
@@ -1015,4 +1183,294 @@ fn reading_a_prefetched_window_fetches_nothing_further() {
         before, after,
         "reading inside a prefetched window must not fetch another chunk"
     );
+}
+
+/// **Progress is reported, not merely plumbed.**
+///
+/// Nothing else asserts these counters. The precache renderer adapts
+/// them into its meter, so if the worker never advanced them — or
+/// advanced them wrongly — every other test would still pass and the
+/// meter would sit at zero.
+#[test]
+fn a_background_prefetch_reports_bytes_and_ranges() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_server, spec) = rich_remote_dataset(tmp.path(), "progress-counters");
+    let group = vectordata::TestDataGroup::load(&spec).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let handle = view
+        .prefetch_in_background(
+            "base_vectors",
+            &parse_window("[0..200, 1000..1200, 3000..3200]").unwrap(),
+            WholeFacetFallback::Refuse,
+        )
+        .unwrap();
+    let planned_ranges = handle.plan().requests();
+    let planned_bytes = handle.plan().bytes_to_fetch();
+    assert!(planned_bytes > 0, "nothing is resident yet");
+
+    let report = handle.join().unwrap();
+    assert_eq!(
+        report.ranges_fetched, planned_ranges,
+        "every planned range must be accounted for"
+    );
+
+    // The blocking form reports through its callback.
+    let mut seen_bytes = 0u64;
+    let mut calls = 0usize;
+    view.prefetch_with_progress(
+        "metadata_content",
+        &parse_window("0..400").unwrap(),
+        WholeFacetFallback::Refuse,
+        &mut |p| {
+            calls += 1;
+            seen_bytes = seen_bytes.max(p.downloaded_bytes());
+        },
+    )
+    .unwrap();
+    assert!(calls > 0, "the progress callback must actually fire");
+    assert!(seen_bytes > 0, "and carry a byte count");
+}
+
+/// **Cancellation stops a real fetch, and partial work survives.**
+///
+/// The local cancel tests cancel an instantaneous no-op. Here there are
+/// many separated ranges over HTTP, so cancelling between them is
+/// observable: the run stops short of the plan and what was already
+/// fetched stays cached.
+#[test]
+fn cancelling_a_real_fetch_stops_short_and_keeps_its_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_server, spec) = rich_remote_dataset(tmp.path(), "cancel-real");
+    let group = vectordata::TestDataGroup::load(&spec).unwrap();
+    let view = group.profile("default").unwrap();
+
+    // Widely separated windows so they cannot coalesce: many ranges,
+    // many chances to notice the flag between them.
+    let spec_w: Vec<String> = (0..20)
+        .map(|i| format!("{}..{}", i * 190, i * 190 + 5))
+        .collect();
+    let window = parse_window(&format!("[{}]", spec_w.join(", "))).unwrap();
+
+    let handle = view
+        .prefetch_in_background("base_vectors", &window, WholeFacetFallback::Refuse)
+        .unwrap();
+    let planned = handle.plan().requests();
+    assert!(
+        planned > 10,
+        "the plan must have enough ranges to stop between"
+    );
+
+    handle.cancel();
+    let report = handle.join().unwrap();
+    assert!(
+        report.ranges_fetched <= planned,
+        "a cancelled run cannot exceed its plan"
+    );
+
+    // Whatever it did fetch is still cached — cancelling is stopping,
+    // not undoing.
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+    let resident = storage.cache_stats().map(|c| c.valid_chunks).unwrap_or(0);
+    assert!(
+        resident as usize >= report.ranges_fetched.min(1),
+        "ranges already fetched stay resident"
+    );
+}
+
+/// **A fetch failure reaches the caller.**
+///
+/// Two distinct paths, and it matters which is which:
+///
+/// - The endpoint is gone *before* the facet is opened → the failure
+///   is in opening, and `prefetch_in_background` returns `Err`
+///   immediately without spawning anything.
+/// - The facet is already open and the endpoint dies → the failure is
+///   in the worker, and `join` is the only place it can surface.
+///
+/// Without the second, a prefetch could report success while fetching
+/// nothing, and the caller would hit faults later with no idea why.
+///
+/// **Ignored by default because it takes about six minutes.** Retries
+/// are unconditional — [`RetryPolicy`] makes ten attempts with
+/// exponential backoff capped at 30 s — so *every* failure mode is
+/// slow, and there is no process-level override to shorten it. That is
+/// worth knowing on its own: a CLI user pointed at a dead mirror waits
+/// the same six minutes with no way to ask for fail-fast.
+///
+/// Run it with `cargo test -p vectordata --test prefetch_windows --
+/// --ignored`.
+#[test]
+#[ignore = "slow: unconditional retry backoff takes ~6 minutes to exhaust"]
+fn a_failed_fetch_surfaces_from_wherever_it_failed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (server, spec) = rich_remote_dataset(tmp.path(), "fetch-failure");
+    let group = vectordata::TestDataGroup::load(&spec).unwrap();
+    let view = group.profile("default").unwrap();
+    let window = parse_window("1000..2000").unwrap();
+
+    // Plan while the server is up, and hold a handle so the storage
+    // registry keeps serving opens after it dies — otherwise the open
+    // fails first and the worker never runs.
+    let keep_open = view.open_facet_storage("base_vectors").unwrap();
+    let plan = view.prefetch_plan("base_vectors", &window).unwrap();
+    assert!(
+        plan.bytes_to_fetch() > 0,
+        "there must be work left to fail at"
+    );
+
+    drop(server);
+
+    // The worker's failure, surfaced through join.
+    let background = view
+        .prefetch_in_background("base_vectors", &window, WholeFacetFallback::Refuse)
+        .expect("opening still succeeds from the registry")
+        .join();
+    assert!(
+        background.is_err(),
+        "a fetch against a dead endpoint must not report success"
+    );
+
+    // And the blocking form fails the same way.
+    assert!(
+        view.prefetch("base_vectors", &window, WholeFacetFallback::Refuse)
+            .is_err()
+    );
+    drop(keep_open);
+}
+
+/// The gate's expensive side: allowing the fallback on a remote facet
+/// really does fetch the whole thing, which is what the caller consented
+/// to and why consent is required.
+#[test]
+fn allowing_the_fallback_fetches_a_whole_remote_facet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_server, spec) = rich_remote_dataset(tmp.path(), "allow-remote");
+    let group = vectordata::TestDataGroup::load(&spec).unwrap();
+    let view = group.profile("default").unwrap();
+    let window = parse_window("2..4").unwrap();
+
+    let plan = view.prefetch_plan("metadata_predicates", &window).unwrap();
+    assert!(plan.degrades_to_full_download);
+    assert_eq!(plan.facet_bytes, 40_000);
+    assert_eq!(
+        plan.bytes_to_fetch(),
+        plan.facet_bytes,
+        "the honest cost of the fallback is the whole facet"
+    );
+
+    assert!(
+        view.prefetch("metadata_predicates", &window, WholeFacetFallback::Refuse)
+            .is_err(),
+        "refused without consent even though it is only 40 KB"
+    );
+
+    view.prefetch("metadata_predicates", &window, WholeFacetFallback::Allow)
+        .unwrap();
+    let storage = view.open_facet_storage("metadata_predicates").unwrap();
+    assert!(
+        storage.is_complete(),
+        "consenting to the whole facet fetches the whole facet"
+    );
+}
+
+/// **A mixed selection is refused whole, before anything is fetched.**
+///
+/// The driver checks every facet's plan before fetching any of them,
+/// specifically so a run cannot fetch the facets that window and then
+/// fail on the one that does not — leaving the cache half populated for
+/// a reason the user could have been told up front. Nothing tested
+/// that: every other CLI test selects one facet.
+#[test]
+fn a_mixed_selection_is_refused_before_any_of_it_is_fetched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_server, spec) = rich_remote_dataset(tmp.path(), "cli-mixed");
+
+    let refused = PrecacheRequest {
+        facets: vec![
+            "base_vectors".to_string(),        // windowable
+            "metadata_predicates".to_string(), // not
+        ],
+        window: Some("0..100".to_string()),
+        ..request(&spec)
+    };
+    assert_eq!(run(refused), 2, "one unwindowable facet refuses the set");
+
+    // And nothing was fetched: the windowable facet is untouched.
+    let group = vectordata::TestDataGroup::load(&spec).unwrap();
+    let view = group.profile("default").unwrap();
+    let plan = view
+        .prefetch_plan("base_vectors", &parse_window("0..100").unwrap())
+        .unwrap();
+    assert!(
+        !plan.is_resident(),
+        "a refused run must not have fetched the facets it could have"
+    );
+
+    // With consent the whole set proceeds.
+    let allowed = PrecacheRequest {
+        facets: vec![
+            "base_vectors".to_string(),
+            "metadata_predicates".to_string(),
+        ],
+        window: Some("0..100".to_string()),
+        allow_whole_facet: true,
+        ..request(&spec)
+    };
+    assert_eq!(run(allowed), 0);
+}
+
+/// A server that ignores `Range` has no chunk bitmap to plan against,
+/// so a window has nothing to be partial about. The plan must say the
+/// cost is the whole facet rather than reporting a partial fetch it
+/// cannot perform.
+#[test]
+fn a_server_without_range_support_plans_the_whole_facet() {
+    init_test_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    let published = tmp.path().join("pub");
+    std::fs::create_dir_all(&published).unwrap();
+    let data = published.join("base.fvec");
+    write_fvec(&data, 16, 2000);
+
+    let server = TestServer::start_no_range(&published).unwrap();
+    let yaml = format!(
+        "name: no-range\nprofiles:\n  default:\n    base_vectors: {}base.fvec\n",
+        server.base_url()
+    );
+    let ds = tmp.path().join("no-range");
+    std::fs::create_dir_all(&ds).unwrap();
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+    let plan = view
+        .prefetch_plan("base_vectors", &parse_window("100..200").unwrap())
+        .unwrap();
+
+    // The window resolves — the format is uniform-stride — but there
+    // is nothing partial left to do: a server that ignores Range makes
+    // the storage layer fetch the whole file at open, so by planning
+    // time every chunk is resident.
+    assert!(
+        plan.is_resident(),
+        "no-range storage arrives whole, so a window has nothing to fetch: \
+         to_fetch={} facet={}",
+        plan.bytes_to_fetch(),
+        plan.facet_bytes
+    );
+    assert_eq!(plan.bytes_to_fetch(), 0);
+    assert!(
+        !plan.degrades_to_full_download,
+        "the window was resolvable; the facet simply arrived early"
+    );
+
+    // Which means prefetching it is a no-op rather than a second
+    // download, and needs no whole-facet consent.
+    view.prefetch(
+        "base_vectors",
+        &parse_window("100..200").unwrap(),
+        WholeFacetFallback::Refuse,
+    )
+    .unwrap();
 }

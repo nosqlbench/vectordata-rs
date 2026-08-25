@@ -2543,6 +2543,36 @@ mod tests {
         );
     }
 
+    /// **The cache is safe to race.** Two threads asking at once may
+    /// both load — wasteful, never wrong — but every caller must come
+    /// away with the *same* allocation, or "cached on the handle" is a
+    /// claim that quietly does not hold under concurrency.
+    #[test]
+    fn concurrent_asks_all_see_one_allocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, storage) = ivvec_storage(tmp.path(), &[3, 1, 8, 2, 5, 9]);
+        let src = path.to_string_lossy().to_string();
+        let storage = std::sync::Arc::new(storage);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let storage = storage.clone();
+                let src = src.clone();
+                std::thread::spawn(move || storage.offsets(&src, 4).expect("offsets load"))
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = &results[0];
+        for (i, r) in results.iter().enumerate() {
+            assert!(
+                std::sync::Arc::ptr_eq(first, r),
+                "thread {i} got a different allocation; the cache did not settle"
+            );
+        }
+        assert_eq!(first.len(), 6);
+    }
+
     /// Separate handles are separate caches — the point of putting the
     /// cache on the handle. A caller wanting reuse holds one; a caller
     /// that does not pays per handle and nothing leaks.
