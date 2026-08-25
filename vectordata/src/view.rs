@@ -679,6 +679,20 @@ pub trait TestDataView: Send + Sync {
     /// may be asked for.
     fn prefetch_plan(&self, facet: &str, window: &DSWindow) -> Result<PrefetchPlan> {
         let storage = self.open_facet_storage(facet)?;
+        self.prefetch_plan_on(&storage, facet, window)
+    }
+
+    /// The same, against a handle the caller already holds.
+    ///
+    /// Reusing one handle is what makes the offset-index cache pay: a
+    /// plan and the fetch that follows it both need the index, and
+    /// opening a handle each would load it twice.
+    fn prefetch_plan_on(
+        &self,
+        storage: &FacetStorage,
+        facet: &str,
+        window: &DSWindow,
+    ) -> Result<PrefetchPlan> {
         let facet_bytes = storage.total_size();
         let mut plan = PrefetchPlan {
             facet_bytes,
@@ -710,7 +724,7 @@ pub trait TestDataView: Send + Sync {
         };
 
         for (start, end) in intervals {
-            match record_range_to_bytes(&path, start, end, &storage) {
+            match record_range_to_bytes(&path, start, end, storage) {
                 Some(m) => {
                     plan.prerequisite_bytes = plan.prerequisite_bytes.max(m.prerequisite_bytes);
                     plan.byte_ranges.push((m.byte_start, m.byte_end));
@@ -744,8 +758,10 @@ pub trait TestDataView: Send + Sync {
         window: &DSWindow,
         cb: &mut dyn FnMut(&crate::transport::DownloadProgress),
     ) -> Result<PrefetchReport> {
+        // One handle for both the plan and the fetch, so the offset
+        // index a vvec window needs is loaded once rather than twice.
         let storage = self.open_facet_storage(facet)?;
-        let planned = self.prefetch_plan(facet, window)?;
+        let planned = self.prefetch_plan_on(&storage, facet, window)?;
 
         if planned.degrades_to_full_download {
             storage
@@ -890,11 +906,12 @@ impl RangeFill {
 /// Map a record range to a byte range for a variable-length facet,
 /// through its offset index.
 ///
-/// The index is loaded **whole**. It is flat and small relative to the
-/// data it describes, and making the prerequisite itself incremental
-/// would double the number of partial-fetch state machines to reason
-/// about for a fraction of the bytes. Loading it is the one cost a vvec
-/// window pays that an xvec window does not, and the plan reports it.
+/// The index is loaded **whole**, and cached on the facet handle. Flat
+/// and small relative to the data it describes, so making the
+/// prerequisite itself incremental would double the number of
+/// partial-fetch state machines to reason about for a fraction of the
+/// bytes. Loading it is the one cost a vvec window pays that an xvec
+/// window does not, and the plan reports it.
 fn vvec_range_to_bytes(
     path_no_window: &str,
     win_start: u64,
@@ -902,7 +919,7 @@ fn vvec_range_to_bytes(
     storage: &FacetStorage,
     elem_size: usize,
 ) -> Option<MappedRange> {
-    let offsets = crate::io::load_offsets(path_no_window, &storage.storage, elem_size).ok()?;
+    let offsets = storage.offsets(path_no_window, elem_size)?;
     if offsets.is_empty() {
         return None;
     }
@@ -951,9 +968,12 @@ pub struct PrefetchPlan {
     /// uniform-stride formats, whose stride comes from a header read
     /// every reader pays anyway.
     ///
-    /// A second prefetch of the same facet pays this again: the index
-    /// is loaded per call rather than held. Worth knowing before
-    /// prefetching a vvec facet in a tight loop.
+    /// Reported whether or not it was paid this time: the index is
+    /// cached on the facet handle, so a plan and the fetch that follows
+    /// it load it once between them, and repeated asks against a handle
+    /// a caller keeps are free. The number is what the mapping *needs*,
+    /// which is what makes one large window cheaper than a hundred
+    /// small ones across freshly-opened handles.
     pub prerequisite_bytes: u64,
     /// Set when the window could not be resolved and honouring the
     /// request means fetching the whole facet: a format whose
@@ -1014,11 +1034,62 @@ pub struct PrefetchReport {
 /// `open_facet_typed`.
 pub struct FacetStorage {
     storage: std::sync::Arc<crate::storage::Storage>,
+    /// Record offsets for variable-length facets, loaded once per
+    /// handle.
+    ///
+    /// Deliberately per-handle rather than process-wide. The index is
+    /// eight bytes per record — 8 GB at a billion — so a global cache
+    /// would be an unbounded one, and the point at which it should be
+    /// dropped is a question only the caller can answer. Holding a
+    /// handle is how a caller says "I am going to ask about this facet
+    /// repeatedly"; dropping it is how they say they are done.
+    offsets: std::sync::OnceLock<CachedOffsets>,
+}
+
+/// A loaded offset index, with the element width it was loaded for.
+///
+/// The width is carried so a handle reused across element types cannot
+/// silently answer with offsets computed for a different stride — that
+/// would resolve a window to plausible, wrong bytes.
+#[derive(Debug)]
+struct CachedOffsets {
+    elem_size: usize,
+    offsets: std::sync::Arc<Vec<u64>>,
 }
 
 impl FacetStorage {
     pub(crate) fn new(storage: std::sync::Arc<crate::storage::Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            offsets: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The record-offset index for a variable-length facet, loaded on
+    /// first use and reused for the life of this handle.
+    ///
+    /// `None` when the index cannot be loaded, or when this handle
+    /// already holds offsets for a different element width — see
+    /// [`CachedOffsets`].
+    pub(crate) fn offsets(
+        &self,
+        source: &str,
+        elem_size: usize,
+    ) -> Option<std::sync::Arc<Vec<u64>>> {
+        if let Some(cached) = self.offsets.get() {
+            return (cached.elem_size == elem_size).then(|| cached.offsets.clone());
+        }
+        let loaded = crate::io::load_offsets(source, &self.storage, elem_size).ok()?;
+        // A race here means two loads and one winner, which is wasteful
+        // but never wrong — both produce the same offsets. Return what
+        // is *cached* rather than what this call built, so every caller
+        // observes the same allocation.
+        let _ = self.offsets.set(CachedOffsets {
+            elem_size,
+            offsets: std::sync::Arc::new(loaded),
+        });
+        let winner = self.offsets.get()?;
+        (winner.elem_size == elem_size).then(|| winner.offsets.clone())
     }
 
     /// Read the first `len` bytes of the facet (clamped to its size).
