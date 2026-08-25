@@ -1,0 +1,4 @@
+verified_count:_base.fvec: '2000'
+verified_count:_query.fvec: '50'
+verified_count:base.fvec: '2000'
+verified_count:query.fvec: '50'

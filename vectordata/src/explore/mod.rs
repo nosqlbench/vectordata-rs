@@ -12,9 +12,9 @@
 //! The source argument accepts either a local file path or a
 //! `dataset:profile:facet` specifier from the catalog.
 
-pub mod shared;
 mod dataset_picker;
 pub(crate) mod palette;
+pub mod shared;
 mod unified;
 
 /// Resolve the configured cache directory or exit the process with a
@@ -116,25 +116,41 @@ pub(crate) fn resolve_palette_curve(
 ) -> (palette::Palette, palette::Curve) {
     let parse_p = |s: &str, origin: &str| {
         palette::Palette::parse(s).or_else(|| {
-            eprintln!("warning: unknown palette '{s}' ({origin}); valid: {}. Using standard.",
-                palette::ALL_PALETTES.iter().map(|p| p.name()).collect::<Vec<_>>().join(", "));
+            eprintln!(
+                "warning: unknown palette '{s}' ({origin}); valid: {}. Using standard.",
+                palette::ALL_PALETTES
+                    .iter()
+                    .map(|p| p.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             None
         })
     };
     let parse_c = |s: &str, origin: &str| {
         palette::Curve::parse(s).or_else(|| {
-            eprintln!("warning: unknown curve '{s}' ({origin}); valid: {}. Using standard.",
-                palette::ALL_CURVES.iter().map(|c| c.name()).collect::<Vec<_>>().join(", "));
+            eprintln!(
+                "warning: unknown curve '{s}' ({origin}); valid: {}. Using standard.",
+                palette::ALL_CURVES
+                    .iter()
+                    .map(|c| c.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             None
         })
     };
-    let p = flag_palette.and_then(|s| parse_p(s, "--palette"))
-        .or_else(|| crate::settings::setting_value("palette")
-            .and_then(|s| parse_p(&s, "settings.yaml")))
+    let p = flag_palette
+        .and_then(|s| parse_p(s, "--palette"))
+        .or_else(|| {
+            crate::settings::setting_value("palette").and_then(|s| parse_p(&s, "settings.yaml"))
+        })
         .unwrap_or_default();
-    let c = flag_curve.and_then(|s| parse_c(s, "--curve"))
-        .or_else(|| crate::settings::setting_value("curve")
-            .and_then(|s| parse_c(&s, "settings.yaml")))
+    let c = flag_curve
+        .and_then(|s| parse_c(s, "--curve"))
+        .or_else(|| {
+            crate::settings::setting_value("curve").and_then(|s| parse_c(&s, "settings.yaml"))
+        })
         .unwrap_or_default();
     (p, c)
 }
@@ -180,13 +196,19 @@ pub struct ExploreArgs {
 ///
 /// When `--profile` is given with `--dataset`, it's appended as `dataset:profile`.
 /// If the dataset already contains a `:`, the explicit `--profile` overrides it.
-fn resolve_input(dataset: Option<String>, source: Option<String>, profile: Option<String>) -> Option<String> {
+fn resolve_input(
+    dataset: Option<String>,
+    source: Option<String>,
+    profile: Option<String>,
+) -> Option<String> {
     let base = match (dataset, source) {
         (Some(ds), None) => ds,
         (None, Some(src)) => src,
         (None, None) => return None,
         (Some(_), Some(_)) => {
-            eprintln!("vectordata explore: --dataset and --source are mutually exclusive — pass only one");
+            eprintln!(
+                "vectordata explore: --dataset and --source are mutually exclusive — pass only one"
+            );
             std::process::exit(2);
         }
     };
@@ -226,7 +248,16 @@ pub fn run(args: ExploreArgs) -> i32 {
         original_hook(info);
     }));
 
-    let ExploreArgs { dataset, source, profile, sample, seed, sample_mode, palette: palette_flag, curve: curve_flag } = args;
+    let ExploreArgs {
+        dataset,
+        source,
+        profile,
+        sample,
+        seed,
+        sample_mode,
+        palette: palette_flag,
+        curve: curve_flag,
+    } = args;
     // Resolve the theme once for the whole session — the picker's
     // chrome and the explorer's data colors derive from the same
     // (palette, curve) pair.
@@ -239,7 +270,14 @@ pub fn run(args: ExploreArgs) -> i32 {
     if dataset.is_some() || source.is_some() {
         let src = resolve_input(dataset, source, profile)
             .expect("guarded above: at least one of --dataset/--source is set here");
-        return match unified::run_interactive_explore(&src, sample, seed, sample_mode, resolved_palette, resolved_curve) {
+        return match unified::run_interactive_explore(
+            &src,
+            sample,
+            seed,
+            sample_mode,
+            resolved_palette,
+            resolved_curve,
+        ) {
             unified::ExploreExit::Quit | unified::ExploreExit::Back => 0,
         };
     }
@@ -265,7 +303,14 @@ pub fn run(args: ExploreArgs) -> i32 {
                     // Interactive viewer — `pause` is irrelevant; the
                     // viewer owns the terminal until the user exits it.
                     let _ = pause;
-                    match unified::run_interactive_explore(specifier, sample, seed, sample_mode, resolved_palette, resolved_curve) {
+                    match unified::run_interactive_explore(
+                        specifier,
+                        sample,
+                        seed,
+                        sample_mode,
+                        resolved_palette,
+                        resolved_curve,
+                    ) {
                         unified::ExploreExit::Quit => ActionFlow::Exit,
                         unified::ExploreExit::Back => ActionFlow::Stay,
                     }
@@ -299,7 +344,9 @@ pub fn run(args: ExploreArgs) -> i32 {
         match dataset_picker::run_picker(dispatch, start_in_settings) {
             PickerOutcome::Done => return 0,
             PickerOutcome::Failed => return 1,
-            PickerOutcome::Reload => { start_in_settings = true; }
+            PickerOutcome::Reload => {
+                start_in_settings = true;
+            }
         }
     }
 }
@@ -314,7 +361,9 @@ fn run_locate(specifier: &str, pause: bool) {
     for line in locate_lines(specifier, &cache_dir_or_exit()) {
         println!("{line}");
     }
-    if pause { pause_for_keypress(); }
+    if pause {
+        pause_for_keypress();
+    }
 }
 
 /// Pure body of [`run_locate`].
@@ -378,7 +427,9 @@ fn run_precache(specifier: &str, pause: bool) {
     if code != 0 {
         eprintln!("(precache exited with status {code})");
     }
-    if pause { pause_for_keypress(); }
+    if pause {
+        pause_for_keypress();
+    }
 }
 
 fn run_purge(specifier: &str, pause: bool) {
@@ -395,7 +446,9 @@ fn run_purge(specifier: &str, pause: bool) {
         Some(e) => e.clone(),
         None => {
             eprintln!("error: dataset '{dataset}' not found in any configured catalog");
-            if pause { pause_for_keypress(); }
+            if pause {
+                pause_for_keypress();
+            }
             return;
         }
     };
@@ -410,25 +463,34 @@ fn run_purge(specifier: &str, pause: bool) {
     if removed.is_empty() {
         println!("No cached entries found for '{dataset}'.");
     } else {
-        println!("Purged {} cache entr{} for '{dataset}' ({}):",
+        println!(
+            "Purged {} cache entr{} for '{dataset}' ({}):",
             removed.len(),
             if removed.len() == 1 { "y" } else { "ies" },
-            format_bytes_short(freed));
+            format_bytes_short(freed)
+        );
         for path in &removed {
             println!("  - {}", path.display());
         }
     }
-    if pause { pause_for_keypress(); }
+    if pause {
+        pause_for_keypress();
+    }
 }
 
 pub(crate) fn format_bytes_short(n: u64) -> String {
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
     const KIB: u64 = 1 << 10;
-    if n >= GIB { format!("{:.1} GiB", n as f64 / GIB as f64) }
-    else if n >= MIB { format!("{:.1} MiB", n as f64 / MIB as f64) }
-    else if n >= KIB { format!("{:.1} KiB", n as f64 / KIB as f64) }
-    else { format!("{n} B") }
+    if n >= GIB {
+        format!("{:.1} GiB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.1} MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.1} KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{n} B")
+    }
 }
 
 fn run_ping(specifier: &str, pause: bool) {
@@ -442,7 +504,9 @@ fn run_ping(specifier: &str, pause: bool) {
     if code != 0 {
         eprintln!("(ping exited with status {code})");
     }
-    if pause { pause_for_keypress(); }
+    if pause {
+        pause_for_keypress();
+    }
 }
 
 // `run_pipeline_command` lived here as `#[allow(dead_code)]`
@@ -468,15 +532,24 @@ mod tests {
         let cached = tmp.path().join("ds-a");
         std::fs::create_dir_all(&cached).unwrap();
 
-        assert_eq!(locate_lines("ds-a:default", tmp.path()), vec![
-            "# location of ds-a on local system:".to_string(),
-            cached.display().to_string(),
-        ]);
+        assert_eq!(
+            locate_lines("ds-a:default", tmp.path()),
+            vec![
+                "# location of ds-a on local system:".to_string(),
+                cached.display().to_string(),
+            ]
+        );
         // Profile suffix is irrelevant — the cache is dataset-keyed.
-        assert_eq!(locate_lines("ds-a:100k", tmp.path())[1], cached.display().to_string());
-        assert_eq!(locate_lines("ds-b:default", tmp.path()), vec![
-            "# location of ds-b on local system:".to_string(),
-            "# ds-b: not cached".to_string(),
-        ]);
+        assert_eq!(
+            locate_lines("ds-a:100k", tmp.path())[1],
+            cached.display().to_string()
+        );
+        assert_eq!(
+            locate_lines("ds-b:default", tmp.path()),
+            vec![
+                "# location of ds-b on local system:".to_string(),
+                "# ds-b: not cached".to_string(),
+            ]
+        );
     }
 }

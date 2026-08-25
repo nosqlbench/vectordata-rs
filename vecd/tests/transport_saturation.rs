@@ -25,7 +25,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,7 @@ use vecd::server::{self, AppState};
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use vectordata::push::transport::TransportOptions;
-use vectordata::push::{execute, ChecksumPolicy, Options};
+use vectordata::push::{ChecksumPolicy, Options, execute};
 
 // ───────────────────────── in-process vecd ─────────────────────────
 
@@ -59,7 +59,10 @@ impl Vecd {
         let (addr_tx, addr_rx) = mpsc::channel();
         let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
         let thread = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 addr_tx.send(listener.local_addr().unwrap()).unwrap();
@@ -71,7 +74,11 @@ impl Vecd {
             });
         });
         let addr = addr_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        Vecd { addr, shutdown: Some(sd_tx), thread: Some(thread) }
+        Vecd {
+            addr,
+            shutdown: Some(sd_tx),
+            thread: Some(thread),
+        }
     }
 }
 impl Drop for Vecd {
@@ -143,7 +150,12 @@ impl ThrottleProxy {
                 }
             }
         });
-        ThrottleProxy { addr, uploaded, downloaded, stop }
+        ThrottleProxy {
+            addr,
+            uploaded,
+            downloaded,
+            stop,
+        }
     }
 
     fn base_url(&self) -> String {
@@ -169,11 +181,17 @@ fn handle_conn(
     downloaded: Arc<AtomicU64>,
     conn_index: usize,
 ) {
-    let Ok(backend) = TcpStream::connect(cfg.backend) else { return };
+    let Ok(backend) = TcpStream::connect(cfg.backend) else {
+        return;
+    };
     client.set_nodelay(true).ok();
     backend.set_nodelay(true).ok();
 
-    let drop_after = if conn_index == 0 { cfg.drop_first_after } else { 0 };
+    let drop_after = if conn_index == 0 {
+        cfg.drop_first_after
+    } else {
+        0
+    };
 
     // client → backend (upload): counted, and optionally drop-after.
     let c2b_client = client.try_clone().unwrap();
@@ -204,7 +222,13 @@ const BURST_BYTES: u64 = 256 * 1024;
 /// **token bucket** (refill = `rate`, capacity = [`BURST_BYTES`]). If `counter`
 /// is set, every relayed byte is tallied. If `drop_after > 0`, the copy stops
 /// (closing both halves) once that many bytes have been relayed.
-fn pipe(mut from: TcpStream, mut to: TcpStream, rate: u64, counter: Option<Arc<AtomicU64>>, drop_after: u64) {
+fn pipe(
+    mut from: TcpStream,
+    mut to: TcpStream,
+    rate: u64,
+    counter: Option<Arc<AtomicU64>>,
+    drop_after: u64,
+) {
     let mut buf = vec![0u8; 64 * 1024];
     // Token bucket: `tokens` is available byte-budget, refilled at `rate` and
     // capped at `BURST_BYTES`, so idle time accrues at most one burst. May go
@@ -322,7 +346,11 @@ fn push_opts(src: &std::path::Path, to: String, token: &str, concurrency: u32) -
         abort_incomplete: false,
         concurrency,
         files: None,
-        transport: TransportOptions { token: Some(token.to_string()), profile: None, endpoint_url: None },
+        transport: TransportOptions {
+            token: Some(token.to_string()),
+            profile: None,
+            endpoint_url: None,
+        },
         cmd: "push".into(),
         actor: "sat".into(),
     }
@@ -333,12 +361,34 @@ fn build_db() -> (Db, String) {
     let dbdir = tempfile::tempdir().unwrap();
     let mut db = Db::init(&dbdir.path().join("vecd.db")).unwrap();
     std::mem::forget(dbdir); // keep the DB dir alive for the test process
-    admin::add_backend(&mut db, "store", "mem", "mem:saturation", None, None, None, true).unwrap();
+    admin::add_backend(
+        &mut db,
+        "store",
+        "mem",
+        "mem:saturation",
+        None,
+        None,
+        None,
+        true,
+    )
+    .unwrap();
     admin::add_user(&mut db, "alice", Level::User, None, None).unwrap();
-    admin::add_namespace(&mut db, "datasets", "alice", Some("store"), true, Listable::Grantees, None, None).unwrap();
+    admin::add_namespace(
+        &mut db,
+        "datasets",
+        "alice",
+        Some("store"),
+        true,
+        Listable::Grantees,
+        None,
+        None,
+    )
+    .unwrap();
     admin::bind(&mut db, "alice", "curate", "datasets").unwrap();
     admin::bind(&mut db, "PUBLIC", "reader", "datasets").unwrap();
-    let token = admin::create_token(&mut db, "alice", "key", Some("30d"), None).unwrap().plaintext;
+    let token = admin::create_token(&mut db, "alice", "key", Some("30d"), None)
+        .unwrap()
+        .plaintext;
     (db, token)
 }
 
@@ -383,25 +433,39 @@ fn upload_saturates_beyond_one_capped_connection() {
 
     // Sequential: one connection, capped at PER_CONN_BPS.
     let t0 = Instant::now();
-    execute(&push_opts(seq_src.path(), format!("{}datasets/seq/", proxy.base_url()), &token, 1))
-        .expect("sequential push");
+    execute(&push_opts(
+        seq_src.path(),
+        format!("{}datasets/seq/", proxy.base_url()),
+        &token,
+        1,
+    ))
+    .expect("sequential push");
     let seq = t0.elapsed();
 
     // Parallel: STREAMS connections, each capped — aggregate should scale.
     let t1 = Instant::now();
-    execute(&push_opts(par_src.path(), format!("{}datasets/par/", proxy.base_url()), &token, STREAMS))
-        .expect("parallel push");
+    execute(&push_opts(
+        par_src.path(),
+        format!("{}datasets/par/", proxy.base_url()),
+        &token,
+        STREAMS,
+    ))
+    .expect("parallel push");
     let par = t1.elapsed();
 
     let speedup = secs(seq) / secs(par);
     eprintln!(
         "upload: seq={:.2}s par(x{})={:.2}s speedup={:.1}x",
-        secs(seq), STREAMS, secs(par), speedup
+        secs(seq),
+        STREAMS,
+        secs(par),
+        speedup
     );
     assert!(
         speedup >= 2.0,
         "parallel upload must scale beyond one capped connection (got {speedup:.1}x: seq {:.2}s, par {:.2}s)",
-        secs(seq), secs(par)
+        secs(seq),
+        secs(par)
     );
 }
 
@@ -430,19 +494,30 @@ fn download_saturates_beyond_one_capped_connection() {
         t.elapsed()
     };
 
-    for (mode, label) in [(FacetMode::Mref, "mref/Cached"), (FacetMode::Http, "http/ChunkStore")] {
+    for (mode, label) in [
+        (FacetMode::Mref, "mref/Cached"),
+        (FacetMode::Http, "http/ChunkStore"),
+    ] {
         // Push the same dataset to two namespaces so each download is a fresh
         // (uncached) fetch — a fresh source dir per push (the `.publish_url`
         // binding is per-source). A `_h` suffix keeps the Http run's
         // namespaces (and client cache keys) distinct from the mref run's.
-        let suffix = match mode { FacetMode::Mref => "", FacetMode::Http => "_h" };
+        let suffix = match mode {
+            FacetMode::Mref => "",
+            FacetMode::Http => "_h",
+        };
         let seq_ns = format!("dl_seq{suffix}");
         let par_ns = format!("dl_par{suffix}");
         for ns in [&seq_ns, &par_ns] {
             let s = tempfile::tempdir().unwrap();
             write_dataset(s.path(), &data, mode);
-            execute(&push_opts(s.path(), format!("{}datasets/{ns}/", proxy.base_url()), &token, STREAMS))
-                .expect("seed push");
+            execute(&push_opts(
+                s.path(),
+                format!("{}datasets/{ns}/", proxy.base_url()),
+                &token,
+                STREAMS,
+            ))
+            .expect("seed push");
         }
 
         let before = proxy.downloaded_bytes();
@@ -453,13 +528,18 @@ fn download_saturates_beyond_one_capped_connection() {
         let speedup = secs(seq) / secs(par);
         eprintln!(
             "download[{label}]: seq={:.2}s par(x{})={:.2}s speedup={:.1}x  (proxy relayed {} MiB downstream)",
-            secs(seq), STREAMS, secs(par), speedup, relayed / (1024 * 1024)
+            secs(seq),
+            STREAMS,
+            secs(par),
+            speedup,
+            relayed / (1024 * 1024)
         );
         assert!(
             speedup >= 2.0,
             "[{label}] parallel download must scale beyond one capped connection \
              (got {speedup:.1}x: seq {:.2}s, par {:.2}s)",
-            secs(seq), secs(par)
+            secs(seq),
+            secs(par)
         );
     }
 
@@ -493,13 +573,20 @@ fn vecd_rate_limits_distinguish_per_connection_from_per_client() {
         for ns in ["rl_seq", "rl_par"] {
             let s = tempfile::tempdir().unwrap();
             write_dataset(s.path(), &data, FacetMode::Mref);
-            execute(&push_opts(s.path(), format!("{base}datasets/{ns}/"), &token, STREAMS))
-                .expect("seed push");
+            execute(&push_opts(
+                s.path(),
+                format!("{base}datasets/{ns}/"),
+                &token,
+                STREAMS,
+            ))
+            .expect("seed push");
         }
         let home = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("VECTORDATA_HOME", home.path()) };
         let precache = |ns: &str, concurrency: u32| -> Duration {
-            unsafe { std::env::set_var("VECTORDATA_DOWNLOAD_CONCURRENCY", concurrency.to_string()) };
+            unsafe {
+                std::env::set_var("VECTORDATA_DOWNLOAD_CONCURRENCY", concurrency.to_string())
+            };
             let url = format!("{base}datasets/{ns}/dataset.yaml");
             let t = Instant::now();
             assert_eq!(
@@ -518,8 +605,14 @@ fn vecd_rate_limits_distinguish_per_connection_from_per_client() {
         secs(seq) / secs(par)
     };
 
-    let per_connection = measure(RateLimits { connection_download: CAP, ..Default::default() });
-    let per_client = measure(RateLimits { client_download: CAP, ..Default::default() });
+    let per_connection = measure(RateLimits {
+        connection_download: CAP,
+        ..Default::default()
+    });
+    let per_client = measure(RateLimits {
+        client_download: CAP,
+        ..Default::default()
+    });
 
     eprintln!(
         "vecd rate-limit: per-connection cap → speedup={per_connection:.1}x (concurrency helps); \
@@ -549,8 +642,13 @@ fn resume_resends_only_unacked_chunks_after_a_drop() {
     let src = tempfile::tempdir().unwrap();
     write_dataset(src.path(), &data, FacetMode::Mref);
 
-    execute(&push_opts(src.path(), format!("{}datasets/resumed/", proxy.base_url()), &token, STREAMS))
-        .expect("push survives a mid-flight connection drop");
+    execute(&push_opts(
+        src.path(),
+        format!("{}datasets/resumed/", proxy.base_url()),
+        &token,
+        STREAMS,
+    ))
+    .expect("push survives a mid-flight connection drop");
 
     // Re-sends are bounded: the object plus a small overhead (the dropped
     // chunk re-sent, control files, headers) — NOT a whole second copy.

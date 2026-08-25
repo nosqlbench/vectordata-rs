@@ -20,9 +20,11 @@ pub fn run(
     at: &[String],
     cache_dir: Option<&Path>,
 ) {
-    let code = vectordata::datasets::precache::run(
-        dataset_spec, configdir, extra_catalogs, at, cache_dir);
-    if code != 0 { std::process::exit(code); }
+    let code =
+        vectordata::datasets::precache::run(dataset_spec, configdir, extra_catalogs, at, cache_dir);
+    if code != 0 {
+        std::process::exit(code);
+    }
 }
 
 #[cfg(test)]
@@ -43,17 +45,21 @@ mod tests {
             buf.extend(&3.0f32.to_le_bytes());
             buf.extend(&4.0f32.to_le_bytes());
             buf
-        }).unwrap();
-        std::fs::write(ws.join("dataset.yaml"), "\
+        })
+        .unwrap();
+        std::fs::write(
+            ws.join("dataset.yaml"),
+            "\
 name: test
 profiles:
   default:
     base_vectors: base.fvec
-").unwrap();
+",
+        )
+        .unwrap();
 
-        let group = vectordata::TestDataGroup::load(
-            ws.join("dataset.yaml").to_str().unwrap(),
-        ).unwrap();
+        let group =
+            vectordata::TestDataGroup::load(ws.join("dataset.yaml").to_str().unwrap()).unwrap();
         let view = group.profile("default").unwrap();
         view.prebuffer_all().unwrap();
 

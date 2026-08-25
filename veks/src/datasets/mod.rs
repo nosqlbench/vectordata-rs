@@ -23,7 +23,6 @@ pub use vectordata::datasets::ping;
 
 use std::path::PathBuf;
 
-
 /// Browse, search, and manage datasets
 #[derive(veks_completion_derive::VeksCli)]
 #[command(disable_help_subcommand = true)]
@@ -71,7 +70,6 @@ pub enum DatasetsCommand {
         select: Option<String>,
 
         // -- Filter predicates --
-
         /// Filter by dataset name (exact match, substring, regex, or glob)
         #[arg(long, short = 'd')]
         dataset: Option<String>,
@@ -390,38 +388,89 @@ pub fn run(args: DatasetsArgs) {
                 return;
             }
             // Resolve numbered catalog shortcuts
-            let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
+            let catalog: Vec<String> = raw_catalog
+                .iter()
+                .map(|v| resolve_catalog_value(v))
+                .collect();
 
             // Normalize glob patterns to regex (--dataset takes precedence)
             let name_filter = dataset.or(matching_name);
             let name = name_filter.map(|p| filter::normalize_match_pattern(&p, "--dataset"));
-            let desc = matching_desc.map(|p| filter::normalize_match_pattern(&p, "--matching-desc"));
-            let profile_pat = matching_profile.map(|p| filter::normalize_match_pattern(&p, "--matching-profile"));
+            let desc =
+                matching_desc.map(|p| filter::normalize_match_pattern(&p, "--matching-desc"));
+            let profile_pat =
+                matching_profile.map(|p| filter::normalize_match_pattern(&p, "--matching-profile"));
 
             let filter = filter::DatasetFilter {
                 name,
                 facet,
                 metric,
                 desc,
-                min_count: min_count.as_deref().map(filter::parse_size).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-min-count: {}", e); std::process::exit(1); }),
-                max_count: max_count.as_deref().map(filter::parse_size).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-max-count: {}", e); std::process::exit(1); }),
-                count: count.as_deref().map(filter::parse_size).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-count: {}", e); std::process::exit(1); }),
+                min_count: min_count
+                    .as_deref()
+                    .map(filter::parse_size)
+                    .transpose()
+                    .unwrap_or_else(|e| {
+                        eprintln!("ERROR: --with-min-count: {}", e);
+                        std::process::exit(1);
+                    }),
+                max_count: max_count
+                    .as_deref()
+                    .map(filter::parse_size)
+                    .transpose()
+                    .unwrap_or_else(|e| {
+                        eprintln!("ERROR: --with-max-count: {}", e);
+                        std::process::exit(1);
+                    }),
+                count: count
+                    .as_deref()
+                    .map(filter::parse_size)
+                    .transpose()
+                    .unwrap_or_else(|e| {
+                        eprintln!("ERROR: --with-count: {}", e);
+                        std::process::exit(1);
+                    }),
                 min_dim,
                 max_dim,
                 dim,
                 vtype,
-                min_data: min_data.as_deref().map(filter::parse_bytes).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-min-data: {}", e); std::process::exit(1); }),
-                max_data: max_data.as_deref().map(filter::parse_bytes).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-max-data: {}", e); std::process::exit(1); }),
-                data: data.as_deref().map(filter::parse_bytes_with_unit).transpose()
-                    .unwrap_or_else(|e| { eprintln!("ERROR: --with-data: {}", e); std::process::exit(1); }),
+                min_data: min_data
+                    .as_deref()
+                    .map(filter::parse_bytes)
+                    .transpose()
+                    .unwrap_or_else(|e| {
+                        eprintln!("ERROR: --with-min-data: {}", e);
+                        std::process::exit(1);
+                    }),
+                max_data: max_data
+                    .as_deref()
+                    .map(filter::parse_bytes)
+                    .transpose()
+                    .unwrap_or_else(|e| {
+                        eprintln!("ERROR: --with-max-data: {}", e);
+                        std::process::exit(1);
+                    }),
+                data: data
+                    .as_deref()
+                    .map(filter::parse_bytes_with_unit)
+                    .transpose()
+                    .unwrap_or_else(|e| {
+                        eprintln!("ERROR: --with-data: {}", e);
+                        std::process::exit(1);
+                    }),
             };
             let profile_view = filter::ProfileView::new(profile_pat);
-            list::run(&configdir, &catalog, &at, &output_format, verbose, group_by.as_deref(), &filter, &profile_view, select.as_deref());
+            list::run(
+                &configdir,
+                &catalog,
+                &at,
+                &output_format,
+                verbose,
+                group_by.as_deref(),
+                &filter,
+                &profile_view,
+                select.as_deref(),
+            );
         }
         DatasetsCommand::Curlify { path, output } => {
             curlify::run(&path, output.as_deref());
@@ -429,14 +478,26 @@ pub fn run(args: DatasetsArgs) {
         DatasetsCommand::Config { command } => {
             run_config_command(command);
         }
-        DatasetsCommand::CacheStatus { dataset, all, verbose, tree, configdir, catalog: raw_catalog, at } => {
-            let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
+        DatasetsCommand::CacheStatus {
+            dataset,
+            all,
+            verbose,
+            tree,
+            configdir,
+            catalog: raw_catalog,
+            at,
+        } => {
+            let catalog: Vec<String> = raw_catalog
+                .iter()
+                .map(|v| resolve_catalog_value(v))
+                .collect();
             if all {
                 cache::run_cache_status_all(verbose, &configdir, &catalog, &at);
             } else if let Some(ds) = dataset {
                 cache::run_cache_status(&ds, verbose, &configdir, &catalog, &at);
                 if tree {
-                    let cache_dir = crate::pipeline::commands::config::configured_cache_dir_or_exit();
+                    let cache_dir =
+                        crate::pipeline::commands::config::configured_cache_dir_or_exit();
                     let ds_cache = cache_dir.join(&ds);
                     if ds_cache.is_dir() {
                         println!();
@@ -449,7 +510,11 @@ pub fn run(args: DatasetsArgs) {
                 std::process::exit(1);
             }
         }
-        DatasetsCommand::Ping { at, dataset, profile } => {
+        DatasetsCommand::Ping {
+            at,
+            dataset,
+            profile,
+        } => {
             // Ping now goes through the unified resolver; --at pins the
             // search to that catalog, otherwise every configured one is
             // in play and the dataset is looked up against the union.
@@ -461,18 +526,27 @@ pub fn run(args: DatasetsArgs) {
             };
             let catalog = crate::catalog::resolver::Catalog::of(&sources);
             let code = ping::run_via_catalog(&catalog, &dataset, &profile);
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
-        DatasetsCommand::DropCache { datasets, yes, verbose, cache_dir } => {
+        DatasetsCommand::DropCache {
+            datasets,
+            yes,
+            verbose,
+            cache_dir,
+        } => {
             drop_cache::run(&datasets, cache_dir.as_deref(), yes, verbose);
         }
         DatasetsCommand::PruneLegacyCache { dry_run, cache_dir } => {
             let cache_dir = cache_dir
                 .unwrap_or_else(crate::pipeline::commands::config::configured_cache_dir_or_exit);
             if dry_run {
-                println!("Scanning {} for pre-cutover cache directories \
+                println!(
+                    "Scanning {} for pre-cutover cache directories \
                     (blobs/, http/, <host>[:<port>]/)...",
-                    cache_dir.display());
+                    cache_dir.display()
+                );
                 let mut would_remove = Vec::new();
                 if let Ok(entries) = std::fs::read_dir(&cache_dir) {
                     for e in entries.flatten() {
@@ -488,19 +562,28 @@ pub fn run(args: DatasetsArgs) {
                     println!("No legacy cache directories found.");
                 } else {
                     println!("Would remove {} legacy dir(s):", would_remove.len());
-                    for name in &would_remove { println!("  {}", name); }
+                    for name in &would_remove {
+                        println!("  {}", name);
+                    }
                     println!("\nRun without --dry-run to delete.");
                 }
             } else {
                 match vectordata::cache_admin::prune_legacy_layout(&cache_dir) {
                     Ok(removed) if removed.is_empty() => {
-                        println!("No legacy cache directories found in {}.",
-                            cache_dir.display());
+                        println!(
+                            "No legacy cache directories found in {}.",
+                            cache_dir.display()
+                        );
                     }
                     Ok(removed) => {
-                        println!("Removed {} legacy cache dir(s) from {}:",
-                            removed.len(), cache_dir.display());
-                        for name in &removed { println!("  {}", name); }
+                        println!(
+                            "Removed {} legacy cache dir(s) from {}:",
+                            removed.len(),
+                            cache_dir.display()
+                        );
+                        for name in &removed {
+                            println!("  {}", name);
+                        }
                     }
                     Err(e) => {
                         eprintln!("Error pruning cache: {}", e);
@@ -510,16 +593,45 @@ pub fn run(args: DatasetsArgs) {
             }
         }
         DatasetsCommand::Derive {
-            dataset, profile, output, name, force, configdir, catalog: raw_catalog, at,
+            dataset,
+            profile,
+            output,
+            name,
+            force,
+            configdir,
+            catalog: raw_catalog,
+            at,
         } => {
-            let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
+            let catalog: Vec<String> = raw_catalog
+                .iter()
+                .map(|v| resolve_catalog_value(v))
+                .collect();
             let code = vectordata::datasets::derive::run(
-                &dataset, &profile, &output, &configdir, &catalog, &at,
-                name.as_deref(), force);
-            if code != 0 { std::process::exit(code); }
+                &dataset,
+                &profile,
+                &output,
+                &configdir,
+                &catalog,
+                &at,
+                name.as_deref(),
+                force,
+            );
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
-        DatasetsCommand::Precache { dataset, profile, configdir, catalog: raw_catalog, at, cache_dir } => {
-            let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
+        DatasetsCommand::Precache {
+            dataset,
+            profile,
+            configdir,
+            catalog: raw_catalog,
+            at,
+            cache_dir,
+        } => {
+            let catalog: Vec<String> = raw_catalog
+                .iter()
+                .map(|v| resolve_catalog_value(v))
+                .collect();
             let ds = match profile {
                 Some(p) => format!("{}:{}", dataset.split(':').next().unwrap_or(&dataset), p),
                 None => dataset,
@@ -539,7 +651,9 @@ fn run_config_command(command: ConfigSubcommand) {
             None => vectordata::config::show(),
             Some("cache") => vectordata::config::get_cache(),
             Some(other) => {
-                eprintln!("unknown config key '{other}' (try `config get cache`, or `config get` for all)");
+                eprintln!(
+                    "unknown config key '{other}' (try `config get cache`, or `config get` for all)"
+                );
                 2
             }
         },
@@ -552,22 +666,30 @@ fn run_config_command(command: ConfigSubcommand) {
         },
         ConfigSubcommand::Mounts { all } => vectordata::config::list_mounts(all),
         ConfigSubcommand::Catalog { command } => match command {
-            ConfigCatalogSubcommand::Add { source } => vectordata::config::add_catalog(&source, None),
+            ConfigCatalogSubcommand::Add { source } => {
+                vectordata::config::add_catalog(&source, None)
+            }
             ConfigCatalogSubcommand::Remove { source, index } => match (source, index) {
                 (Some(s), _) => vectordata::config::remove_catalog(
-                    vectordata::config::RemoveCatalogSpec::Source(&s)),
+                    vectordata::config::RemoveCatalogSpec::Source(&s),
+                ),
                 (None, Some(n)) => vectordata::config::remove_catalog(
-                    vectordata::config::RemoveCatalogSpec::Index(n)),
+                    vectordata::config::RemoveCatalogSpec::Index(n),
+                ),
                 (None, None) => {
                     eprintln!("Error: specify a catalog URL/path or --index <N>");
-                    eprintln!("  Use `veks datasets config catalog list` to see available indices.");
+                    eprintln!(
+                        "  Use `veks datasets config catalog list` to see available indices."
+                    );
                     1
                 }
             },
             ConfigCatalogSubcommand::List => vectordata::config::list_catalogs(),
         },
     };
-    if code != 0 { std::process::exit(code); }
+    if code != 0 {
+        std::process::exit(code);
+    }
 }
 
 /// Resolve a `--at`/`--catalog` value: a positive integer is a
@@ -578,4 +700,3 @@ fn run_config_command(command: ConfigSubcommand) {
 /// resolve again idempotently, so dispatch-side use here is belt and
 /// braces, not load-bearing.
 pub use vectordata::catalog::sources::resolve_catalog_value;
-

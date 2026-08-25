@@ -14,12 +14,12 @@
 
 use std::path::PathBuf;
 
-use veks_completion::cli as vcli;
 use veks_completion::VeksCli;
+use veks_completion::cli as vcli;
 
 use crate::cache_admin::{
-    CacheEntry, CacheListing, PruneFilter, is_legacy_layout_dir,
-    list_entries, prune_by_filter, prune_legacy_layout,
+    CacheEntry, CacheListing, PruneFilter, is_legacy_layout_dir, list_entries, prune_by_filter,
+    prune_legacy_layout,
 };
 
 /// Compose a richer --version string from the build.rs-emitted
@@ -111,7 +111,8 @@ enum Cmd {
     ///
     /// With `--shell <name>`, emits the raw completion script for that
     /// shell (bash / zsh / fish / elvish / powershell).
-    #[command(long_about = "Print or activate tab-completion for the current shell.\n\
+    #[command(
+        long_about = "Print or activate tab-completion for the current shell.\n\
         \n\
         To activate for the current session:\n    \
         eval \"$(vectordata completions)\"\n\
@@ -123,7 +124,8 @@ enum Cmd {
         echo 'eval \"$(vectordata completions)\"' >> ~/.zshrc\n\
         \n\
         To emit a raw script for a specific shell:\n    \
-        vectordata completions --shell bash > /etc/bash_completion.d/vectordata\n")]
+        vectordata completions --shell bash > /etc/bash_completion.d/vectordata\n"
+    )]
     Completions {
         /// Emit the raw completion script for this shell instead of
         /// the auto-detected wrapper.
@@ -475,21 +477,36 @@ fn complete_push_to(partial: &str, _ctx: &[&str]) -> Vec<String> {
 /// `vectordata-cache` directory on each rw-mounted filesystem — so
 /// the completion shows exactly the places `auto` could pick.
 fn complete_config_set(partial: &str, ctx: &[&str]) -> Vec<String> {
-    let positionals: Vec<&str> =
-        ctx.iter().copied().filter(|w| !w.starts_with('-')).collect();
+    let positionals: Vec<&str> = ctx
+        .iter()
+        .copied()
+        .filter(|w| !w.starts_with('-'))
+        .collect();
     let mut out: Vec<String> = match positionals.first() {
-        None => vec!["cache".to_string(), "palette".to_string(), "curve".to_string(),
-                     "update_check".to_string()],
-        Some(&"palette") =>
-            crate::config::ui_palette_names().iter().map(|s| s.to_string()).collect(),
-        Some(&"curve") =>
-            crate::config::ui_curve_names().iter().map(|s| s.to_string()).collect(),
+        None => vec![
+            "cache".to_string(),
+            "palette".to_string(),
+            "curve".to_string(),
+            "update_check".to_string(),
+        ],
+        Some(&"palette") => crate::config::ui_palette_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        Some(&"curve") => crate::config::ui_curve_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         Some(&"update_check") => vec!["on".to_string(), "off".to_string()],
         Some(&"cache") => {
             let mut vals = vec!["auto".to_string()];
             if let Some(home) = std::env::var_os("HOME") {
-                vals.push(std::path::PathBuf::from(home)
-                    .join(".cache/vectordata").display().to_string());
+                vals.push(
+                    std::path::PathBuf::from(home)
+                        .join(".cache/vectordata")
+                        .display()
+                        .to_string(),
+                );
             }
             for m in crate::mounts::enumerate() {
                 if m.writable && m.path != "/" {
@@ -508,7 +525,8 @@ fn complete_config_set(partial: &str, ctx: &[&str]) -> Vec<String> {
 /// Tab-completion for `config get <key>` — the same key set as
 /// `config set`.
 fn complete_config_get(partial: &str, _ctx: &[&str]) -> Vec<String> {
-    ["cache", "palette", "curve", "update_check"].iter()
+    ["cache", "palette", "curve", "update_check"]
+        .iter()
         .filter(|k| partial.is_empty() || k.starts_with(partial))
         .map(|k| k.to_string())
         .collect()
@@ -522,10 +540,19 @@ fn complete_config_get(partial: &str, _ctx: &[&str]) -> Vec<String> {
 fn completion_resolvers() -> std::collections::BTreeMap<String, veks_completion::ValueProvider> {
     let mut resolvers = crate::datasets::dyncomp::datasets_resolvers();
     // `--to` (push destination): suggest namespace URLs on the logged-in endpoint.
-    resolvers.insert("--to".to_string(), veks_completion::fn_provider(complete_push_to));
+    resolvers.insert(
+        "--to".to_string(),
+        veks_completion::fn_provider(complete_push_to),
+    );
     // Positional completion, keyed by subcommand path.
-    resolvers.insert("config set".to_string(), veks_completion::fn_provider(complete_config_set));
-    resolvers.insert("config get".to_string(), veks_completion::fn_provider(complete_config_get));
+    resolvers.insert(
+        "config set".to_string(),
+        veks_completion::fn_provider(complete_config_set),
+    );
+    resolvers.insert(
+        "config get".to_string(),
+        veks_completion::fn_provider(complete_config_get),
+    );
     resolvers
 }
 
@@ -585,43 +612,81 @@ pub fn bin_main(argv: Vec<String>) {
             CacheCmd::PruneLegacy { dry_run, cache_dir } => {
                 cmd_cache_prune_legacy(cache_dir, dry_run)
             }
-            CacheCmd::Prune { dataset, dry_run, cache_dir } => {
-                cmd_cache_prune(cache_dir, dataset, dry_run)
-            }
+            CacheCmd::Prune {
+                dataset,
+                dry_run,
+                cache_dir,
+            } => cmd_cache_prune(cache_dir, dataset, dry_run),
         },
-        Cmd::Datasets { command, configdir: _, catalog: _, at: _ } => {
+        Cmd::Datasets {
+            command,
+            configdir: _,
+            catalog: _,
+            at: _,
+        } => {
             // No subcommand → describe the subcommands, nothing
             // else. The interactive surface is `vectordata explore`;
             // launching a TUI from a bare noun command was a
             // surprise, not a feature.
             let Some(command) = command else {
-                print!("{}", vcli::render_help_for(&spec, &["datasets".to_string()]));
+                print!(
+                    "{}",
+                    vcli::render_help_for(&spec, &["datasets".to_string()])
+                );
                 println!();
                 println!("For interactive browsing and visualization, use: vectordata explore");
                 std::process::exit(0);
             };
             let code = match command {
-                DatasetsCmd::List(args) =>
-                    crate::datasets::list::run_args(args),
-                DatasetsCmd::Ping { args, configdir, catalog } =>
-                    crate::datasets::ping::run_args(args, &configdir, &catalog, &[]),
-                DatasetsCmd::Describe { args, configdir, catalog } =>
-                    crate::datasets::describe::run_args(args, &configdir, &catalog, &[]),
-                DatasetsCmd::Curlify(args) =>
-                    crate::datasets::curlify::run_args(args),
-                DatasetsCmd::Push(args) =>
-                    crate::push::run(args),
+                DatasetsCmd::List(args) => crate::datasets::list::run_args(args),
+                DatasetsCmd::Ping {
+                    args,
+                    configdir,
+                    catalog,
+                } => crate::datasets::ping::run_args(args, &configdir, &catalog, &[]),
+                DatasetsCmd::Describe {
+                    args,
+                    configdir,
+                    catalog,
+                } => crate::datasets::describe::run_args(args, &configdir, &catalog, &[]),
+                DatasetsCmd::Curlify(args) => crate::datasets::curlify::run_args(args),
+                DatasetsCmd::Push(args) => crate::push::run(args),
                 DatasetsCmd::Derive {
-                    dataset, profile, output, name, force, configdir, catalog, at,
+                    dataset,
+                    profile,
+                    output,
+                    name,
+                    force,
+                    configdir,
+                    catalog,
+                    at,
                 } => crate::datasets::derive::run(
-                    &dataset, &profile, &output, &configdir, &catalog, &at,
-                    name.as_deref(), force),
-                DatasetsCmd::Precache { spec, configdir, catalog, at, cache_dir } => {
-                    crate::datasets::precache::run(
-                        &spec, &configdir, &catalog, &at, cache_dir.as_deref())
-                }
+                    &dataset,
+                    &profile,
+                    &output,
+                    &configdir,
+                    &catalog,
+                    &at,
+                    name.as_deref(),
+                    force,
+                ),
+                DatasetsCmd::Precache {
+                    spec,
+                    configdir,
+                    catalog,
+                    at,
+                    cache_dir,
+                } => crate::datasets::precache::run(
+                    &spec,
+                    &configdir,
+                    &catalog,
+                    &at,
+                    cache_dir.as_deref(),
+                ),
             };
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Cmd::Config { command } => {
             let code = match command {
@@ -631,7 +696,9 @@ pub fn bin_main(argv: Vec<String>) {
                     Some(k @ ("palette" | "curve")) => crate::config::get_ui_setting(k),
                     Some("update_check") => crate::config::get_update_check(),
                     Some(other) => {
-                        eprintln!("unknown config key '{other}' (keys: cache, palette, curve, update_check; or `config get` for all)");
+                        eprintln!(
+                            "unknown config key '{other}' (keys: cache, palette, curve, update_check; or `config get` for all)"
+                        );
                         2
                     }
                 },
@@ -640,21 +707,32 @@ pub fn bin_main(argv: Vec<String>) {
                     k @ ("palette" | "curve") => crate::config::set_ui_setting(k, &value),
                     "update_check" => crate::config::set_update_check(&value),
                     other => {
-                        eprintln!("unknown config key '{other}' (settable keys: cache, palette, curve, update_check)");
+                        eprintln!(
+                            "unknown config key '{other}' (settable keys: cache, palette, curve, update_check)"
+                        );
                         2
                     }
                 },
                 ConfigCmd::Mounts { all } => crate::config::list_mounts(all),
                 ConfigCmd::Catalog { command } => match command {
-                    CatalogCmd::Add { source, name, no_verify, trust_self_signed } =>
-                        crate::config::add_catalog_ex(
-                            &source, name.as_deref(), no_verify, trust_self_signed,
-                        ),
+                    CatalogCmd::Add {
+                        source,
+                        name,
+                        no_verify,
+                        trust_self_signed,
+                    } => crate::config::add_catalog_ex(
+                        &source,
+                        name.as_deref(),
+                        no_verify,
+                        trust_self_signed,
+                    ),
                     CatalogCmd::Remove { source, at } => match (source, at) {
                         (Some(s), _) => crate::config::remove_catalog(
-                            crate::config::RemoveCatalogSpec::Source(&s)),
+                            crate::config::RemoveCatalogSpec::Source(&s),
+                        ),
                         (None, Some(n)) => crate::config::remove_catalog(
-                            crate::config::RemoveCatalogSpec::Index(n)),
+                            crate::config::RemoveCatalogSpec::Index(n),
+                        ),
                         (None, None) => {
                             eprintln!("Specify a catalog URL/path or --at <index>.");
                             eprintln!("Use `vectordata config catalog list` to see indices.");
@@ -664,17 +742,30 @@ pub fn bin_main(argv: Vec<String>) {
                     CatalogCmd::List => crate::config::list_catalogs(),
                 },
             };
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Cmd::Completions { shell } => cmd_completions(shell),
-        Cmd::Login { url, user, token, password, expires, list } => {
+        Cmd::Login {
+            url,
+            user,
+            token,
+            password,
+            expires,
+            list,
+        } => {
             let code = if list {
                 crate::client_cli::list_logins()
             } else if let Some(url) = url {
                 // Accept a URL or a configured catalog name/index.
                 let url = endpoint_or_exit(Some(url));
                 let code = crate::client_cli::login(
-                    &url, user.as_deref(), token.as_deref(), password.as_deref(), expires.as_deref(),
+                    &url,
+                    user.as_deref(),
+                    token.as_deref(),
+                    password.as_deref(),
+                    expires.as_deref(),
                 );
                 // After a successful login, offer (interactively) to register the
                 // endpoint's namespaces as catalogs so `datasets list` reflects them.
@@ -687,45 +778,75 @@ pub fn bin_main(argv: Vec<String>) {
                 eprintln!("login needs a <url> (or --list)");
                 2
             };
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Cmd::Logout { url } => {
             let code = crate::client_cli::logout(&endpoint_or_exit(url));
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Cmd::Whoami { url } => {
             let code = crate::client_cli::ping(&endpoint_or_exit(url), false);
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Cmd::Ping { url } => {
             let code = crate::client_cli::ping(&endpoint_or_exit(url), true);
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Cmd::Token { command } => {
             let code = match command {
-                TokenCmd::Issue { url, description, profile, expires } => {
-                    crate::client_cli::token_issue(&endpoint_or_exit(url), &description, profile.as_deref(), expires.as_deref())
+                TokenCmd::Issue {
+                    url,
+                    description,
+                    profile,
+                    expires,
+                } => crate::client_cli::token_issue(
+                    &endpoint_or_exit(url),
+                    &description,
+                    profile.as_deref(),
+                    expires.as_deref(),
+                ),
+                TokenCmd::Revoke { url, id } => {
+                    crate::client_cli::token_revoke(&endpoint_or_exit(url), id)
                 }
-                TokenCmd::Revoke { url, id } => crate::client_cli::token_revoke(&endpoint_or_exit(url), id),
             };
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
-        Cmd::Backup { url, to, incremental } => {
+        Cmd::Backup {
+            url,
+            to,
+            incremental,
+        } => {
             // `url` (the source endpoint) accepts a URL or catalog name/index.
             let url = endpoint_or_exit(Some(url));
             let code = crate::client_cli::backup(&url, &to, incremental);
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Cmd::Restore { src, to } => {
             // `to` (the target endpoint) accepts a URL or catalog name/index.
             let to = endpoint_or_exit(Some(to));
             let code = crate::client_cli::restore(&src, &to);
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         #[cfg(feature = "explore")]
         Cmd::Explore(args) => {
             let code = crate::explore::run(args);
-            if code != 0 { std::process::exit(code); }
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
     }
 }
@@ -771,7 +892,9 @@ fn cmd_completions(shell: Option<String>) {
 /// with a printable error if neither is set so users see actionable
 /// guidance (e.g. the `veks datasets config set cache` hint).
 fn resolve_cache_dir(override_: Option<PathBuf>) -> PathBuf {
-    if let Some(p) = override_ { return p; }
+    if let Some(p) = override_ {
+        return p;
+    }
     match crate::settings::cache_dir() {
         Ok(p) => p,
         Err(e) => {
@@ -785,29 +908,35 @@ fn cmd_cache_list(cache_dir: Option<PathBuf>, verbose: bool) {
     let root = resolve_cache_dir(cache_dir);
     let listing = match list_entries(&root) {
         Ok(l) => l,
-        Err(e) => { eprintln!("error scanning {}: {}", root.display(), e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("error scanning {}: {}", root.display(), e);
+            std::process::exit(1);
+        }
     };
     print_listing(&root, &listing, verbose);
 }
 
-fn cmd_cache_prune(
-    cache_dir: Option<PathBuf>,
-    dataset: Option<String>,
-    dry_run: bool,
-) {
+fn cmd_cache_prune(cache_dir: Option<PathBuf>, dataset: Option<String>, dry_run: bool) {
     let filter = PruneFilter { dataset };
     if filter.is_empty() {
-        eprintln!("error: refusing to prune with no filter — pass --dataset \
-            with a name or glob pattern.");
-        eprintln!("(To wipe every cached dataset, remove `<cache_root>` by \
+        eprintln!(
+            "error: refusing to prune with no filter — pass --dataset \
+            with a name or glob pattern."
+        );
+        eprintln!(
+            "(To wipe every cached dataset, remove `<cache_root>` by \
             hand. To clean up pre-cutover detritus, run \
-            `vectordata cache prune-legacy`.)");
+            `vectordata cache prune-legacy`.)"
+        );
         std::process::exit(2);
     }
     let root = resolve_cache_dir(cache_dir);
     let report = match prune_by_filter(&root, &filter, dry_run) {
         Ok(r) => r,
-        Err(e) => { eprintln!("error pruning {}: {}", root.display(), e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("error pruning {}: {}", root.display(), e);
+            std::process::exit(1);
+        }
     };
 
     if report.matched.is_empty() {
@@ -817,11 +946,15 @@ fn cmd_cache_prune(
 
     println!("Cache directory: {}", root.display());
     let verb = if dry_run { "Would remove" } else { "Removed" };
-    println!("{verb} {} entry/entries, freeing {}:",
+    println!(
+        "{verb} {} entry/entries, freeing {}:",
         report.matched.len(),
-        fmt_size(report.matched.iter().map(|e| e.size_bytes).sum::<u64>()));
+        fmt_size(report.matched.iter().map(|e| e.size_bytes).sum::<u64>())
+    );
     for entry in &report.matched {
-        let rel = entry.path.strip_prefix(&root)
+        let rel = entry
+            .path
+            .strip_prefix(&root)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| entry.path.display().to_string());
         let origin = entry.origin_url.as_deref().unwrap_or("<unknown origin>");
@@ -850,9 +983,14 @@ fn cmd_cache_prune_legacy(cache_dir: Option<PathBuf>, dry_run: bool) {
         if would_remove.is_empty() {
             println!("No legacy cache directories found in {}.", root.display());
         } else {
-            println!("Would remove {} legacy dir(s) from {}:",
-                would_remove.len(), root.display());
-            for n in &would_remove { println!("  {}", n); }
+            println!(
+                "Would remove {} legacy dir(s) from {}:",
+                would_remove.len(),
+                root.display()
+            );
+            for n in &would_remove {
+                println!("  {}", n);
+            }
             println!("\nRun without --dry-run to delete.");
         }
         return;
@@ -862,11 +1000,19 @@ fn cmd_cache_prune_legacy(cache_dir: Option<PathBuf>, dry_run: bool) {
             println!("No legacy cache directories found in {}.", root.display());
         }
         Ok(removed) => {
-            println!("Removed {} legacy cache dir(s) from {}:",
-                removed.len(), root.display());
-            for n in &removed { println!("  {}", n); }
+            println!(
+                "Removed {} legacy cache dir(s) from {}:",
+                removed.len(),
+                root.display()
+            );
+            for n in &removed {
+                println!("  {}", n);
+            }
         }
-        Err(e) => { eprintln!("error pruning {}: {}", root.display(), e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("error pruning {}: {}", root.display(), e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -906,8 +1052,10 @@ fn print_listing(root: &std::path::Path, l: &CacheListing, verbose: bool) {
         println!();
     }
 
-    if l.datasets.is_empty() && l.url_derived.is_empty()
-        && l.legacy.is_empty() && l.other.is_empty()
+    if l.datasets.is_empty()
+        && l.url_derived.is_empty()
+        && l.legacy.is_empty()
+        && l.other.is_empty()
     {
         println!("(empty)");
     }
@@ -915,23 +1063,33 @@ fn print_listing(root: &std::path::Path, l: &CacheListing, verbose: bool) {
 
 /// Two-column path/size rows for the catalog/legacy/other categories.
 fn print_simple_rows(rows: &[CacheEntry], root: &std::path::Path) {
-    let name_w = rows.iter()
+    let name_w = rows
+        .iter()
         .map(|e| rel_name(&e.path, root).len())
-        .max().unwrap_or(20).max(20);
+        .max()
+        .unwrap_or(20)
+        .max(20);
     for e in rows {
         let name = rel_name(&e.path, root);
-        println!("  {:<name_w$}  {:>12}  ({} file{})",
-            name, fmt_size(e.size_bytes),
-            e.file_count, if e.file_count == 1 { "" } else { "s" });
+        println!(
+            "  {:<name_w$}  {:>12}  ({} file{})",
+            name,
+            fmt_size(e.size_bytes),
+            e.file_count,
+            if e.file_count == 1 { "" } else { "s" }
+        );
     }
 }
 
 /// Default dataset listing: one row per dataset, name + size +
 /// file count + origin host.
 fn print_dataset_rows(rows: &[CacheEntry], root: &std::path::Path) {
-    let name_w = rows.iter()
+    let name_w = rows
+        .iter()
         .map(|e| rel_name(&e.path, root).len())
-        .max().unwrap_or(20).max(20);
+        .max()
+        .unwrap_or(20)
+        .max(20);
     for e in rows {
         let name = rel_name(&e.path, root);
         let host = e.origin_host.as_deref().unwrap_or("");
@@ -940,10 +1098,14 @@ fn print_dataset_rows(rows: &[CacheEntry], root: &std::path::Path) {
         } else {
             format!("  from {host}")
         };
-        println!("  {:<name_w$}  {:>12}  ({} file{}){}",
-            name, fmt_size(e.size_bytes),
-            e.file_count, if e.file_count == 1 { "" } else { "s" },
-            host_note);
+        println!(
+            "  {:<name_w$}  {:>12}  ({} file{}){}",
+            name,
+            fmt_size(e.size_bytes),
+            e.file_count,
+            if e.file_count == 1 { "" } else { "s" },
+            host_note
+        );
     }
 }
 
@@ -952,9 +1114,13 @@ fn print_dataset_rows_verbose(rows: &[CacheEntry], root: &std::path::Path) {
     for e in rows {
         let rel = rel_name(&e.path, root);
         let origin = e.origin_url.as_deref().unwrap_or("<unknown origin>");
-        println!("  {:>12}  {} ({} file{})",
-            fmt_size(e.size_bytes), rel,
-            e.file_count, if e.file_count == 1 { "" } else { "s" });
+        println!(
+            "  {:>12}  {} ({} file{})",
+            fmt_size(e.size_bytes),
+            rel,
+            e.file_count,
+            if e.file_count == 1 { "" } else { "s" }
+        );
         println!("              origin: {}", origin);
     }
 }
@@ -970,11 +1136,17 @@ fn fmt_size(bytes: u64) -> String {
     const MIB: u64 = 1024 * KIB;
     const GIB: u64 = 1024 * MIB;
     const TIB: u64 = 1024 * GIB;
-    if bytes >= TIB { format!("{:.1} TiB", bytes as f64 / TIB as f64) }
-    else if bytes >= GIB { format!("{:.1} GiB", bytes as f64 / GIB as f64) }
-    else if bytes >= MIB { format!("{:.1} MiB", bytes as f64 / MIB as f64) }
-    else if bytes >= KIB { format!("{:.1} KiB", bytes as f64 / KIB as f64) }
-    else { format!("{} B", bytes) }
+    if bytes >= TIB {
+        format!("{:.1} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 #[cfg(test)]
@@ -990,31 +1162,34 @@ mod tests {
     #[test]
     fn completion_resolvers_cover_datasets_and_local_surfaces() {
         let keys: Vec<String> = completion_resolvers().into_keys().collect();
-        assert_eq!(keys, vec![
-            "--at".to_string(),
-            "--dataset".to_string(),
-            "--matching-name".to_string(),
-            "--matching-profile".to_string(),
-            "--profile".to_string(),
-            "--select".to_string(),
-            "--to".to_string(),
-            "--with-count".to_string(),
-            "--with-data".to_string(),
-            "--with-dim".to_string(),
-            "--with-facet".to_string(),
-            "--with-max-count".to_string(),
-            "--with-max-data".to_string(),
-            "--with-max-dim".to_string(),
-            "--with-metric".to_string(),
-            "--with-min-count".to_string(),
-            "--with-min-data".to_string(),
-            "--with-min-dim".to_string(),
-            "--with-vtype".to_string(),
-            "config get".to_string(),
-            "config set".to_string(),
-            "datasets describe".to_string(),
-            "datasets ping".to_string(),
-            "datasets precache".to_string(),
-        ]);
+        assert_eq!(
+            keys,
+            vec![
+                "--at".to_string(),
+                "--dataset".to_string(),
+                "--matching-name".to_string(),
+                "--matching-profile".to_string(),
+                "--profile".to_string(),
+                "--select".to_string(),
+                "--to".to_string(),
+                "--with-count".to_string(),
+                "--with-data".to_string(),
+                "--with-dim".to_string(),
+                "--with-facet".to_string(),
+                "--with-max-count".to_string(),
+                "--with-max-data".to_string(),
+                "--with-max-dim".to_string(),
+                "--with-metric".to_string(),
+                "--with-min-count".to_string(),
+                "--with-min-data".to_string(),
+                "--with-min-dim".to_string(),
+                "--with-vtype".to_string(),
+                "config get".to_string(),
+                "config set".to_string(),
+                "datasets describe".to_string(),
+                "datasets ping".to_string(),
+                "datasets precache".to_string(),
+            ]
+        );
     }
 }
