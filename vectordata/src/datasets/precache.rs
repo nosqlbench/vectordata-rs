@@ -269,6 +269,48 @@ enum Resolved {
     Url(String),
 }
 
+/// Split a spec into the part that names a dataset and the profile
+/// selection it implies.
+///
+/// Pure, so the punctuation rules can be tested on any platform —
+/// they are exactly the kind that look obvious and are wrong somewhere
+/// else.
+///
+/// The order matters:
+///
+/// 1. A **URL** is unambiguous.
+/// 2. A **path that exists** is a path, whatever punctuation it
+///    contains. This is what makes Windows work: a spec there looks
+///    like `C:\\data\\ds`, and splitting on the first colon would take
+///    the drive letter for a dataset name and the rest for a profile.
+///    That is how `precache -d C:\\data\\ds` came to report that
+///    *'C' is not a local path*.
+/// 3. A **separator** means it was meant as a path even if it does not
+///    exist, so the diagnostic names the path rather than hunting a
+///    catalog for a fragment of it. Backslash counts, not only slash.
+/// 4. Otherwise a **colon** separates a catalog name from a profile.
+///
+/// A local path still cannot carry a `:profile` suffix on any platform
+/// — use the `--profile` flag, which is why it exists.
+fn classify_spec(dataset_spec: &str) -> (&str, ProfileSelection) {
+    if dataset_spec.starts_with("http://") || dataset_spec.starts_with("https://") {
+        return (dataset_spec, ProfileSelection::AllProfiles);
+    }
+    if Path::new(dataset_spec).exists() {
+        return (dataset_spec, ProfileSelection::AllProfiles);
+    }
+    if dataset_spec.contains('/') || dataset_spec.contains('\\') {
+        return (dataset_spec, ProfileSelection::AllProfiles);
+    }
+    match dataset_spec.find(':') {
+        Some(pos) => (
+            &dataset_spec[..pos],
+            ProfileSelection::Named(dataset_spec[pos + 1..].to_string()),
+        ),
+        None => (dataset_spec, ProfileSelection::AllProfiles),
+    }
+}
+
 /// Whether the user named a specific profile or asked for all of
 /// them. A bare `dataset` spec (no `:profile` suffix) selects all
 /// profiles; an explicit `dataset:profile` selects just that one.
@@ -286,19 +328,7 @@ fn resolve_spec(
     extra_catalogs: &[String],
     at: &[String],
 ) -> Option<(Resolved, ProfileSelection)> {
-    let (head, profile_sel) = if dataset_spec.contains('/')
-        || dataset_spec.starts_with("http://")
-        || dataset_spec.starts_with("https://")
-    {
-        (dataset_spec, ProfileSelection::AllProfiles)
-    } else if let Some(pos) = dataset_spec.find(':') {
-        (
-            &dataset_spec[..pos],
-            ProfileSelection::Named(dataset_spec[pos + 1..].to_string()),
-        )
-    } else {
-        (dataset_spec, ProfileSelection::AllProfiles)
-    };
+    let (head, profile_sel) = classify_spec(dataset_spec);
 
     if head.starts_with("http://") || head.starts_with("https://") {
         return Some((Resolved::Url(head.to_string()), profile_sel));
@@ -856,5 +886,91 @@ pub(super) fn fmt_duration(secs: u64) -> String {
         format!("{}h {:02}m", secs / H, (secs % H) / M)
     } else {
         format!("{}d {:02}h", secs / D, (secs % D) / H)
+    }
+}
+
+#[cfg(test)]
+mod spec_classification {
+    use super::*;
+
+    fn named(sel: &ProfileSelection) -> Option<&str> {
+        match sel {
+            ProfileSelection::Named(p) => Some(p.as_str()),
+            ProfileSelection::AllProfiles => None,
+        }
+    }
+
+    /// **A Windows drive letter is not a dataset name.**
+    ///
+    /// `C:\data\ds` has no forward slash, so the colon rule used to
+    /// claim the drive letter as the dataset and the rest as a profile
+    /// — `precache -d C:\data\ds` reported that *'C' is not a local
+    /// path*. Six CI tests failed on Windows and nowhere else.
+    #[test]
+    fn a_windows_path_is_not_split_at_its_drive_letter() {
+        for spec in [
+            r"C:\data\ds",
+            r"D:\a\b\c",
+            r"C:\Users\runner\AppData\Local\Temp\x\ds",
+        ] {
+            let (head, sel) = classify_spec(spec);
+            assert_eq!(head, spec, "the whole path is the spec: {spec}");
+            assert_eq!(named(&sel), None, "a drive letter is not a profile: {spec}");
+        }
+    }
+
+    /// A UNC path has no drive letter but is still a path.
+    #[test]
+    fn a_unc_path_is_a_path() {
+        let (head, sel) = classify_spec(r"\\server\share\ds");
+        assert_eq!(head, r"\\server\share\ds");
+        assert_eq!(named(&sel), None);
+    }
+
+    /// The catalog form still splits — that is the whole reason the
+    /// colon rule exists, and it must survive the fix.
+    #[test]
+    fn a_catalog_name_still_carries_its_profile() {
+        let (head, sel) = classify_spec("glove-100:default");
+        assert_eq!(head, "glove-100");
+        assert_eq!(named(&sel), Some("default"));
+
+        let (head, sel) = classify_spec("glove-100");
+        assert_eq!(head, "glove-100");
+        assert_eq!(named(&sel), None);
+    }
+
+    /// URLs are taken whole, colons and all.
+    #[test]
+    fn a_url_is_never_split() {
+        for spec in [
+            "https://example.com/data/ds",
+            "http://example.com:8080/data/ds",
+        ] {
+            let (head, sel) = classify_spec(spec);
+            assert_eq!(head, spec);
+            assert_eq!(named(&sel), None, "a port is not a profile: {spec}");
+        }
+    }
+
+    /// A posix path is unchanged, whether or not it exists.
+    #[test]
+    fn a_posix_path_is_a_path() {
+        for spec in ["/tmp/ds", "./ds", "some/dir/ds"] {
+            let (head, sel) = classify_spec(spec);
+            assert_eq!(head, spec);
+            assert_eq!(named(&sel), None);
+        }
+    }
+
+    /// An existing path wins over every punctuation rule — the case
+    /// that makes a real Windows spec resolve.
+    #[test]
+    fn an_existing_path_is_taken_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = tmp.path().to_str().unwrap();
+        let (head, sel) = classify_spec(spec);
+        assert_eq!(head, spec);
+        assert_eq!(named(&sel), None);
     }
 }
