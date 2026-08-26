@@ -1631,3 +1631,123 @@ fn arc_clone_of_reader_shares_storage() {
     // Promotion observed through the *other* clone — same Storage.
     assert!(r1.is_complete());
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// IDXFOR sentinel layout — the reader surface, on both transports
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Write the sidecar in the **end-sentinel** layout: every record start
+/// followed by the payload size.
+///
+/// This is what nbdatatools publishes, so it is what a reader meets in
+/// the field. `write_idxfor` above writes the starts-only layout this
+/// crate's own rebuild produces; both sit next to real data.
+fn write_idxfor_sentinel(data_path: &Path, offsets: &[u64]) {
+    let total: u64 = std::fs::metadata(data_path).unwrap().len();
+    let mut entries = offsets.to_vec();
+    entries.push(total);
+    write_idxfor_entries(data_path, &entries, total);
+}
+
+/// Write arbitrary entries as the sidecar, choosing the width the
+/// payload size calls for (the same rule the reader probes by).
+fn write_idxfor_entries(data_path: &Path, entries: &[u64], total: u64) {
+    let dir = data_path.parent().unwrap();
+    let name = data_path.file_name().unwrap().to_str().unwrap();
+    let (ext, bytes) = if total <= i32::MAX as u64 {
+        ("i32", entries.iter().flat_map(|&o| (o as i32).to_le_bytes()).collect::<Vec<u8>>())
+    } else {
+        ("i64", entries.iter().flat_map(|&o| (o as i64).to_le_bytes()).collect::<Vec<u8>>())
+    };
+    std::fs::write(dir.join(format!("IDXFOR__{name}.{ext}")), bytes).unwrap();
+}
+
+/// **A sentinel entry is not a record.**
+///
+/// The trailing payload-size entry exists so a consumer can take every
+/// extent as `offsets[i+1] - offsets[i]` without a special case for the
+/// last record. Counted as a record it becomes a phantom starting at
+/// EOF: `count()` overstates by one, and reading it asks the storage
+/// for a record that begins where the file ends.
+#[test]
+fn vvec_local_sentinel_sidecar_describes_n_records() {
+    let tmp = make_tmp();
+    let path = tmp.path().join("predicates.ivvec");
+    let offsets = write_ivvec(&path, 60);
+    write_idxfor_sentinel(&path, &offsets);
+
+    let reader = IndexedVvecReader::<i32>::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(reader.count(), 60, "the sentinel is not a 61st record");
+
+    // The last real record reads correctly — dim (59 % 5) + 1 = 5.
+    let last = <IndexedVvecReader<i32> as VvecReader<i32>>::get(&reader, 59).unwrap();
+    assert_eq!(last, vec![5900, 5901, 5902, 5903, 5904]);
+    assert_eq!(reader.dim_at(59).unwrap(), 5);
+
+    // And one past it is out of bounds rather than an empty phantom.
+    assert!(
+        <IndexedVvecReader<i32> as VvecReader<i32>>::get(&reader, 60).is_err(),
+        "reading past the last record must fail, not return the sentinel"
+    );
+}
+
+/// The same file described by either layout must read identically.
+/// Nothing about a record changes because of how its index was
+/// published.
+#[test]
+fn vvec_sentinel_and_starts_only_sidecars_agree() {
+    let starts_dir = make_tmp();
+    let sent_dir = make_tmp();
+    let a = starts_dir.path().join("predicates.ivvec");
+    let b = sent_dir.path().join("predicates.ivvec");
+    let offsets = write_ivvec(&a, 47);
+    let offsets_b = write_ivvec(&b, 47);
+    assert_eq!(offsets, offsets_b, "fixtures must be byte-identical");
+    write_idxfor(&a, &offsets);
+    write_idxfor_sentinel(&b, &offsets);
+
+    let starts = IndexedVvecReader::<i32>::open(a.to_str().unwrap()).unwrap();
+    let sentinel = IndexedVvecReader::<i32>::open(b.to_str().unwrap()).unwrap();
+    assert_eq!(starts.count(), sentinel.count());
+    for i in 0..starts.count() {
+        let l = <IndexedVvecReader<i32> as VvecReader<i32>>::get(&starts, i).unwrap();
+        let r = <IndexedVvecReader<i32> as VvecReader<i32>>::get(&sentinel, i).unwrap();
+        assert_eq!(l, r, "record {i} differs by sidecar layout");
+    }
+}
+
+/// **The remote sidecar goes through a different parse call site.**
+///
+/// A local sidecar is read from disk and sized by the data file's
+/// metadata; a remote one is fetched over HTTP and sized by the
+/// storage's content length. The sentinel has to be recognised on both
+/// — and the remote path is the one a published dataset actually
+/// exercises.
+#[test]
+fn vvec_remote_sentinel_sidecar_describes_n_records() {
+    let tmp = make_tmp();
+    let path = tmp.path().join("predicates.ivvec");
+    let offsets = write_ivvec(&path, 60);
+    write_idxfor_sentinel(&path, &offsets);
+    write_mref(&path);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+    let url = format!("{}predicates.ivvec", server.base_url());
+
+    let remote = IndexedVvecReader::<i32>::open(&url).unwrap();
+    assert_eq!(
+        remote.count(), 60,
+        "the fetched sidecar's sentinel must be dropped like a local one"
+    );
+
+    let local = IndexedVvecReader::<i32>::open(path.to_str().unwrap()).unwrap();
+    for &i in &[0usize, 1, 5, 13, 42, 59] {
+        let l = <IndexedVvecReader<i32> as VvecReader<i32>>::get(&local, i).unwrap();
+        let r = <IndexedVvecReader<i32> as VvecReader<i32>>::get(&remote, i).unwrap();
+        assert_eq!(l, r, "record {i} differs over HTTP");
+    }
+    assert!(
+        <IndexedVvecReader<i32> as VvecReader<i32>>::get(&remote, 60).is_err(),
+        "the sentinel must not be readable as a record over HTTP either"
+    );
+}
