@@ -1,6 +1,6 @@
 [package]
 name = "veks-studies"
-version = "0.1.0"
+version = "1.8.0"
 edition = "2024"
 description = "Executable models of the SPLAT family — virtualized stores, traced operations, and measured cost against the published formulas"
 license = "Apache-2.0"
