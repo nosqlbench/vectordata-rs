@@ -95,6 +95,14 @@ bf16 on CUDA.
         }
     }
 
+    /// Verified against every `options.*("...")` read in `execute`.
+    /// This step runs for hours and its `range` option is what bounds the
+    /// work, so a silently-ignored option here is expensive in a way it is
+    /// not for a command that finishes in seconds.
+    fn options_declared_complete(&self) -> bool {
+        true
+    }
+
     fn describe_resources(&self) -> Vec<ResourceDesc> {
         vec![
             ResourceDesc {
@@ -164,13 +172,20 @@ bf16 on CUDA.
             );
         }
 
-        let texts = match veks_core::formats::passage_table::read_text_column_range(
-            &source, &column, row_start, row_end,
+        // Row count first, from footer metadata alone — the sink needs the
+        // exact figure up front (an npy header encodes it) and the progress
+        // bar needs a total. Text itself is streamed below rather than
+        // collected: at the ~944 B/row measured on real passage tables a
+        // 50M-row window is ~47 GB resident and a 532M-row one is ~500 GB,
+        // so collecting made the window a memory decision and put an
+        // unbounded allocation one mis-set option away.
+        let n_texts = match veks_core::formats::passage_table::count_text_rows_range(
+            &source, row_start, row_end,
         ) {
-            Ok(t) => t,
+            Ok(n) => n as usize,
             Err(e) => return error_result(e, start),
         };
-        if texts.is_empty() {
+        if n_texts == 0 {
             return error_result(
                 match row_end {
                     Some(end) => format!(
@@ -186,7 +201,7 @@ bf16 on CUDA.
         }
         ctx.ui.log(&format!(
             "embedding {} row(s){} of {}:{} with {} (rev {}, {:?}x{}/{:?}, batch {}, max-length {})",
-            texts.len(),
+            n_texts,
             match row_end {
                 Some(end) => format!(" [{},{})", row_start, end),
                 None if row_start > 0 => format!(" [{},end)", row_start),
@@ -206,13 +221,13 @@ bf16 on CUDA.
         // (CPU-only build, `device: cpu` from a stale recipe) — the GPU
         // path is ~3 orders of magnitude faster. Warn with the arithmetic
         // up front instead of letting a silent multi-hour grind start.
-        if devices.iter().all(|d| !d.is_cuda()) && texts.len() > 10_000 {
+        if devices.iter().all(|d| !d.is_cuda()) && n_texts > 10_000 {
             ctx.ui.log(&format!(
                 "WARNING: embedding {} row(s) on CPU — expect hours (CPU runs at roughly \
                  single-digit rows/s vs ~2,500/s measured on a 2-GPU host). If this host \
                  has GPUs, build with --features embed-cuda-flash and use device: auto; \
                  otherwise consider running this step on a GPU node.",
-                texts.len()
+                n_texts
             ));
         }
 
@@ -282,7 +297,6 @@ bf16 on CUDA.
         // joins (the producer also checks an abort flag between chunks).
         const TOKENIZE_CHUNK: usize = 65_536;
         type Batch = (Vec<usize>, Vec<Vec<u32>>);
-        let n_texts = texts.len();
         let pb = ctx.ui.bar_with_unit(n_texts as u64, "embed", "psg");
         let hidden = config.hidden_size;
         // Rows stream to disk as they complete. Workers finish batches out
@@ -309,13 +323,36 @@ bf16 on CUDA.
         let (rtx, rrx) =
             std::sync::mpsc::channel::<Result<(Vec<usize>, Vec<Vec<f32>>), String>>();
         std::thread::scope(|scope| {
-            let (tokenizer, texts, abort, brx) = (&tokenizer, &texts, &abort, &brx);
+            let (tokenizer, abort, brx) = (&tokenizer, &abort, &brx);
+            let (src, col) = (source.clone(), column.clone());
             scope.spawn(move || {
+                // Text is pulled a chunk at a time and dropped once
+                // tokenized, so resident text is TOKENIZE_CHUNK rows
+                // (~62 MB here) regardless of how many rows the window
+                // covers. The window is a work-partitioning choice now,
+                // not a memory one.
+                let mut reader = match veks_core::formats::passage_table::TextColumnReader::open(
+                    &src, &col, row_start, row_end,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = btx.send(Err(e));
+                        return;
+                    }
+                };
                 let mut base = 0usize;
-                for chunk in texts.chunks(TOKENIZE_CHUNK) {
+                loop {
                     if abort.load(std::sync::atomic::Ordering::Relaxed) {
                         return;
                     }
+                    let chunk = match reader.next_chunk(TOKENIZE_CHUNK) {
+                        Ok(c) if c.is_empty() => return,
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = btx.send(Err(e));
+                            return;
+                        }
+                    };
                     let inputs: Vec<&str> = chunk.iter().map(String::as_str).collect();
                     let rows: Vec<Vec<u32>> = match tokenizer.encode_batch(inputs, false) {
                         Ok(encs) => encs
