@@ -1798,3 +1798,84 @@ fn a_starts_only_sidecar_still_describes_every_record() {
     assert_eq!(plan.byte_ranges, vec![(starts[38], total)]);
     assert_eq!(plan.prerequisite_bytes, 40 * 8);
 }
+
+/// **Planning must not perform the transfer it is pricing.**
+///
+/// A remote vvec with no published `IDXFOR__` sidecar has only one
+/// remaining way to learn its record boundaries: walk the file record
+/// by record. Over HTTP that walk touches every chunk — so a call
+/// documented as reporting cost *before* anything moves would move the
+/// entire facet, and the whole-facet consent gate would then fire after
+/// the bytes had already arrived. The window has to degrade instead and
+/// let the caller decide.
+#[test]
+fn planning_a_remote_vvec_without_a_sidecar_downloads_nothing() {
+    init_test_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    let published = tmp.path().join("pub");
+    std::fs::create_dir_all(&published).unwrap();
+
+    let vv = published.join("meta.ivvec");
+    let dims: Vec<i32> = (0..2000).map(|i| 1 + (i % 23)).collect();
+    write_ivvec(&vv, &dims);
+    let content = std::fs::read(&vv).unwrap();
+    MerkleRef::from_content(&content, REMOTE_CHUNK)
+        .save(&published.join("meta.ivvec.mref"))
+        .unwrap();
+    // Deliberately no IDXFOR__meta.ivvec.* published.
+
+    let server = TestServer::start(&published).unwrap();
+    let yaml = format!(
+        "name: no-sidecar\nprofiles:\n  default:\n    metadata_content: {}meta.ivvec\n",
+        server.base_url()
+    );
+    let ds = tmp.path().join("no-sidecar");
+    std::fs::create_dir_all(&ds).unwrap();
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("100..200").unwrap())
+        .unwrap();
+
+    assert!(
+        plan.degrades_to_full_download,
+        "with no published index the window cannot be placed without \
+         reading the whole file, which is what a degrade means"
+    );
+    assert!(
+        !plan.is_resident(),
+        "planning fetched the facet it was asked to price: to_fetch={} facet={}",
+        plan.bytes_to_fetch(),
+        plan.facet_bytes
+    );
+    assert_eq!(
+        plan.bytes_to_fetch(),
+        plan.facet_bytes,
+        "a degraded plan costs the whole facet, and none of it is paid yet"
+    );
+
+    // And the gate still governs: the transfer happens only on consent.
+    view.prefetch(
+        "metadata_content",
+        &parse_window("100..200").unwrap(),
+        WholeFacetFallback::Refuse,
+    )
+    .expect_err("a degraded window must be refused without consent");
+
+    let after = view
+        .prefetch_plan("metadata_content", &parse_window("100..200").unwrap())
+        .unwrap();
+    assert!(
+        !after.is_resident(),
+        "a refused prefetch must leave the facet untouched"
+    );
+
+    view.prefetch(
+        "metadata_content",
+        &parse_window("100..200").unwrap(),
+        WholeFacetFallback::Allow,
+    )
+    .expect("with consent the whole facet is fetched");
+}

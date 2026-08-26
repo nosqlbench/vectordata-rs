@@ -1030,7 +1030,12 @@ fn vvec_range_to_bytes(
     storage: &FacetStorage,
     elem_size: usize,
 ) -> Option<MappedRange> {
-    let offsets = storage.offsets(path_no_window, elem_size)?;
+    // Planning must not move bytes to decide what to move: a remote
+    // vvec with no published sidecar returns `None` here and the window
+    // degrades to a whole-facet fetch, which the fallback policy then
+    // consents to or refuses. Rebuilding the index by walking the file
+    // would download all of it *while planning*, defeating the gate.
+    let offsets = storage.published_offsets(path_no_window, elem_size)?;
     if offsets.is_empty() {
         return None;
     }
@@ -1390,10 +1395,19 @@ impl FacetStorage {
     /// The record-offset index for a variable-length facet, loaded on
     /// first use and reused for the life of this handle.
     ///
-    /// `None` when the index cannot be loaded, or when this handle
+    /// Restricted to [`crate::io::OffsetSource::Published`] — a
+    /// published sidecar, a persisted rebuild, or a local mmap walk.
+    /// This handle exists to answer *planning* questions ("what would
+    /// this window cost?"), and the remaining way to build an index for
+    /// a remote vvec is to walk the file, which downloads all of it. A
+    /// plan that transfers the facet in order to report the cost of
+    /// transferring part of it is not a plan. Readers, which will read
+    /// the data regardless, load their own offsets and may rebuild.
+    ///
+    /// `None` when no such index is available, or when this handle
     /// already holds offsets for a different element width — see
     /// [`CachedOffsets`].
-    pub(crate) fn offsets(
+    pub(crate) fn published_offsets(
         &self,
         source: &str,
         elem_size: usize,
@@ -1401,7 +1415,13 @@ impl FacetStorage {
         if let Some(cached) = self.offsets.get() {
             return (cached.elem_size == elem_size).then(|| cached.offsets.clone());
         }
-        let loaded = crate::io::load_offsets(source, &self.storage, elem_size).ok()?;
+        let loaded = crate::io::load_offsets(
+            source,
+            &self.storage,
+            elem_size,
+            crate::io::OffsetSource::Published,
+        )
+        .ok()?;
         // A race here means two loads and one winner, which is wasteful
         // but never wrong — both produce the same offsets. Return what
         // is *cached* rather than what this call built, so every caller
@@ -2524,8 +2544,8 @@ mod tests {
         let (path, storage) = ivvec_storage(tmp.path(), &[3, 1, 8, 2]);
         let src = path.to_string_lossy().to_string();
 
-        let first = storage.offsets(&src, 4).expect("offsets load");
-        let second = storage.offsets(&src, 4).expect("offsets load");
+        let first = storage.published_offsets(&src, 4).expect("offsets load");
+        let second = storage.published_offsets(&src, 4).expect("offsets load");
         assert!(
             std::sync::Arc::ptr_eq(&first, &second),
             "the second ask must be served from the handle, not reloaded"
@@ -2543,9 +2563,9 @@ mod tests {
         let (path, storage) = ivvec_storage(tmp.path(), &[3, 1, 8, 2]);
         let src = path.to_string_lossy().to_string();
 
-        assert!(storage.offsets(&src, 4).is_some());
+        assert!(storage.published_offsets(&src, 4).is_some());
         assert!(
-            storage.offsets(&src, 8).is_none(),
+            storage.published_offsets(&src, 8).is_none(),
             "a width mismatch degrades to no window rather than wrong bytes"
         );
     }
@@ -2565,7 +2585,9 @@ mod tests {
             .map(|_| {
                 let storage = storage.clone();
                 let src = src.clone();
-                std::thread::spawn(move || storage.offsets(&src, 4).expect("offsets load"))
+                std::thread::spawn(move || {
+                    storage.published_offsets(&src, 4).expect("offsets load")
+                })
             })
             .collect();
 
@@ -2590,8 +2612,8 @@ mod tests {
         let src = path.to_string_lossy().to_string();
         let second = FacetStorage::new(crate::storage::Storage::open_path(&path).unwrap());
 
-        let a = first.offsets(&src, 4).unwrap();
-        let b = second.offsets(&src, 4).unwrap();
+        let a = first.published_offsets(&src, 4).unwrap();
+        let b = second.published_offsets(&src, 4).unwrap();
         assert_eq!(a, b, "same file, same offsets");
         assert!(
             !std::sync::Arc::ptr_eq(&a, &b),

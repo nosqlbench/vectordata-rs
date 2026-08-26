@@ -61,6 +61,36 @@ pub enum IoError {
     /// xvec files.
     #[error("Variable-length records: {0}")]
     VariableLengthRecords(String),
+    /// No record index could be obtained without downloading the whole
+    /// file, and the caller asked for [`OffsetSource::Published`].
+    ///
+    /// Raised for the planning path: a prefetch plan reports what a
+    /// transfer would cost, so it must not move the bytes in order to
+    /// decide. The caller degrades the window to a whole-facet fetch
+    /// and lets the fallback policy consent to it.
+    #[error(
+        "no published offset index for {0}; rebuilding one requires downloading the whole file"
+    )]
+    OffsetIndexUnavailable(String),
+}
+
+/// How hard [`load_offsets`] may work to produce a record index.
+///
+/// The two arms differ only for a *remote* vvec with no published
+/// `IDXFOR__` sidecar, where the only remaining way to learn the record
+/// boundaries is to walk the file — which drags every chunk across the
+/// network. A local walk reads an mmap and is free under either arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OffsetSource {
+    /// Any means necessary, including a remote walk-download. For
+    /// callers opening a reader: they are about to read the data
+    /// anyway, so the transfer is work brought forward, not wasted.
+    Rebuild,
+    /// Only indexes that are already cheap: a published sidecar, a
+    /// rebuild persisted beside the cache file, or a local mmap walk.
+    /// Never a remote walk-download. For callers that are *planning* a
+    /// transfer and must not perform one to do it.
+    Published,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -600,7 +630,12 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         let storage = Storage::open(source)?;
         let offsets = if is_remote {
             let translated = crate::transport::normalize_remote_url(source);
-            load_or_fetch_remote_offsets(translated.as_ref(), &storage, elem_size)?
+            load_or_fetch_remote_offsets(
+                translated.as_ref(),
+                &storage,
+                elem_size,
+                OffsetSource::Rebuild,
+            )?
         } else {
             load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
         };
@@ -805,7 +840,12 @@ pub fn open_vvec_untyped(source: &str) -> Result<Box<dyn VvecReader<u8>>, IoErro
     let storage = Storage::open(source)?;
     let offsets = if is_remote {
         let translated = crate::transport::normalize_remote_url(source);
-        load_or_fetch_remote_offsets(translated.as_ref(), &storage, elem_size)?
+        load_or_fetch_remote_offsets(
+            translated.as_ref(),
+            &storage,
+            elem_size,
+            OffsetSource::Rebuild,
+        )?
     } else {
         load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
     };
@@ -838,10 +878,11 @@ pub(crate) fn load_offsets(
     source: &str,
     storage: &Storage,
     elem_size: usize,
+    want: OffsetSource,
 ) -> Result<Vec<u64>, IoError> {
     if crate::transport::is_remote_url(source) {
         let translated = crate::transport::normalize_remote_url(source);
-        load_or_fetch_remote_offsets(translated.as_ref(), storage, elem_size)
+        load_or_fetch_remote_offsets(translated.as_ref(), storage, elem_size, want)
     } else {
         load_or_build_local_offsets(Path::new(source), storage, elem_size)
     }
@@ -878,8 +919,9 @@ fn load_or_fetch_remote_offsets(
     data_url: &str,
     storage: &Storage,
     elem_size: usize,
+    want: OffsetSource,
 ) -> Result<Vec<u64>, IoError> {
-    // Try sibling IDXFOR__ index URLs (i64 then i32).
+    // Try sibling IDXFOR__ index URLs.
     let url =
         Url::parse(data_url).map_err(|e| IoError::InvalidFormat(format!("invalid URL: {e}")))?;
     let data_name = url
@@ -929,6 +971,14 @@ fn load_or_fetch_remote_offsets(
         if let Some(cached) = load_local_index(&index_path, cp)? {
             return Ok(cached);
         }
+    }
+    // Everything cheap is exhausted; only the walk remains, and for
+    // remote storage that means downloading the whole file. A caller
+    // that is merely *planning* a transfer must not perform one to
+    // decide — it would move the very bytes the plan exists to gate,
+    // and the consent check would then fire after the fact.
+    if want == OffsetSource::Published {
+        return Err(IoError::OffsetIndexUnavailable(data_url.to_string()));
     }
     // Fallback: walk the file via Storage::read_bytes. For remote
     // storage this downloads EVERY chunk of the file before the
