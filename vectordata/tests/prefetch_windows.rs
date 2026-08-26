@@ -1997,3 +1997,168 @@ fn a_scalar_window_prefetches_without_whole_facet_consent() {
     )
     .expect("a mapped window never needs whole-facet consent");
 }
+
+/// **Every scalar width maps at its own stride.**
+///
+/// The stride comes from the extension, so each width is a separate
+/// path through `infer_elem_size` and a separate chance to be off by a
+/// factor. The two-byte and eight-byte widths were previously
+/// unexercised in the mapping.
+#[test]
+fn every_scalar_width_maps_at_its_own_stride() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (ext, width) in [
+        ("u8", 1u64),
+        ("i8", 1),
+        ("u16", 2),
+        ("i16", 2),
+        ("u32", 4),
+        ("i32", 4),
+        ("u64", 8),
+        ("i64", 8),
+    ] {
+        let ds = tmp.path().join(format!("w_{ext}"));
+        std::fs::create_dir_all(&ds).unwrap();
+        // 40 records. The leading bytes are a plausible little-endian
+        // dimension, so a header-reading mapping would not degrade —
+        // it would silently answer with the wrong stride.
+        let bytes: Vec<u8> = (0..40 * width).map(|i| (i % 7 + 1) as u8).collect();
+        std::fs::write(ds.join(format!("layout.{ext}")), &bytes).unwrap();
+        std::fs::write(
+            ds.join("dataset.yaml"),
+            format!("name: w{ext}\nprofiles:\n  default:\n    metadata_layout: layout.{ext}\n"),
+        )
+        .unwrap();
+
+        let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+        let view = group.profile("default").unwrap();
+        let plan = view
+            .prefetch_plan("metadata_layout", &parse_window("3..7").unwrap())
+            .unwrap();
+
+        assert!(!plan.degrades_to_full_download, ".{ext} must be windowable");
+        assert_eq!(
+            plan.byte_ranges,
+            vec![(3 * width, 7 * width)],
+            ".{ext} records are {width} bytes apart"
+        );
+        assert_eq!(plan.prerequisite_bytes, 0, ".{ext} needs no index read");
+    }
+}
+
+/// **The planned bytes are exactly the bytes the reader decodes.**
+///
+/// The other scalar tests assert byte ranges against arithmetic done in
+/// the test. This one closes the loop against the *reader*: whatever
+/// `TypedReader` addresses for those ordinals must be what the prefetch
+/// warmed — no more (wasted transfer) and no less (a read that faults
+/// past the window). It is the invariant the mapping exists to hold.
+#[test]
+fn a_scalar_window_covers_exactly_what_the_reader_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = scalar_dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    let (lo, hi) = (12u64, 37u64);
+    let plan = view
+        .prefetch_plan(
+            "metadata_layout",
+            &parse_window(&format!("{lo}..{hi}")).unwrap(),
+        )
+        .unwrap();
+    let (start, end) = plan.byte_ranges[0];
+
+    // Decode the planned span straight from the file...
+    let raw = std::fs::read(tmp.path().join("scalars/layout.u32")).unwrap();
+    let planned: Vec<u32> = raw[start as usize..end as usize]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // ...and against what the reader returns for the same ordinals.
+    let reader: vectordata::TypedReader<u32> =
+        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
+    let read: Vec<u32> = (lo..hi)
+        .map(|o| reader.get_value(o as usize).unwrap())
+        .collect();
+
+    assert_eq!(
+        planned, read,
+        "the planned span must decode to exactly the records the reader \
+         serves for those ordinals"
+    );
+    assert_eq!(
+        planned.len() as u64,
+        hi - lo,
+        "no partial record at either edge"
+    );
+}
+
+/// A scalar facet over HTTP fetches its window's chunks and not the
+/// rest of the file. The mapping is arithmetic, but residency,
+/// clamping against the content length, and the chunk fill are not —
+/// and none of them were covered on the scalar path.
+#[test]
+fn a_remote_scalar_window_fetches_only_its_chunks() {
+    init_test_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    let published = tmp.path().join("pub");
+    std::fs::create_dir_all(&published).unwrap();
+
+    // 20k u32 values = 80 KiB ≈ 20 chunks at 4 KiB.
+    let vals: Vec<u32> = (0..20_000u32)
+        .map(|i| i.wrapping_mul(2_654_435_761))
+        .collect();
+    let data = published.join("layout.u32");
+    write_u32_scalar(&data, &vals);
+    let content = std::fs::read(&data).unwrap();
+    MerkleRef::from_content(&content, REMOTE_CHUNK)
+        .save(&published.join("layout.u32.mref"))
+        .unwrap();
+
+    let server = TestServer::start(&published).unwrap();
+    let yaml = format!(
+        "name: remote-scalar\nprofiles:\n  default:\n    metadata_layout: {}layout.u32\n",
+        server.base_url()
+    );
+    let ds = tmp.path().join("remote-scalar");
+    std::fs::create_dir_all(&ds).unwrap();
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+    let plan = view
+        .prefetch_plan("metadata_layout", &parse_window("5000..6000").unwrap())
+        .unwrap();
+
+    assert!(
+        !plan.degrades_to_full_download,
+        "a scalar facet windows remotely too"
+    );
+    assert_eq!(plan.byte_ranges, vec![(20_000, 24_000)]);
+    assert!(
+        plan.bytes_to_fetch() < plan.facet_bytes,
+        "a window must cost less than the facet: {} of {}",
+        plan.bytes_to_fetch(),
+        plan.facet_bytes
+    );
+
+    view.prefetch(
+        "metadata_layout",
+        &parse_window("5000..6000").unwrap(),
+        WholeFacetFallback::Refuse,
+    )
+    .expect("a mapped remote window needs no whole-facet consent");
+
+    // The window is resident, and reading inside it agrees with the
+    // values that were published.
+    let after = view
+        .prefetch_plan("metadata_layout", &parse_window("5000..6000").unwrap())
+        .unwrap();
+    assert!(after.is_resident(), "the window's chunks are in the cache");
+    let reader: vectordata::TypedReader<u32> =
+        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
+    for o in [5000usize, 5500, 5999] {
+        assert_eq!(reader.get_value(o).unwrap(), vals[o], "value at {o}");
+    }
+}
