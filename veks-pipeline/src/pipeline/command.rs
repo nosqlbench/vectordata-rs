@@ -102,6 +102,26 @@ pub trait CommandOp: Send {
     /// Describe accepted options for dry-run validation.
     fn describe_options(&self) -> Vec<OptionDesc>;
 
+    /// Whether `describe_options` lists *every* option this command reads.
+    ///
+    /// When true, the runner refuses to execute a step that sets an option
+    /// this command does not declare, instead of passing it through to be
+    /// ignored. That matters for options whose purpose is to narrow the
+    /// work: a build of `generate embed` predating its `range` option
+    /// ignored `range: '[0,50000000)'` and began loading all 531,869,985
+    /// rows of a passage column — roughly 502 GB — while the yaml, the
+    /// plan line, and the log all showed the range set. Failing at the
+    /// step boundary turns that into an error naming the option.
+    ///
+    /// Defaults to false because many commands read options they never
+    /// declared; enforcing against an incomplete list would reject
+    /// working pipelines. Set it to true only after checking that the
+    /// declarations match every key the command actually reads — those
+    /// commands get the strict check, the rest get a warning.
+    fn options_declared_complete(&self) -> bool {
+        false
+    }
+
     /// Return built-in documentation for this command.
     ///
     /// The default generates a basic doc from the command path and options.

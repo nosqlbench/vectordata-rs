@@ -389,6 +389,64 @@ pub fn run_steps(
             }
         }
 
+        // 6a2. Reject options the command does not declare.
+        //
+        // `StepDef.options` is a serde(flatten) catch-all, so any key that
+        // is not a StepDef field becomes a command option — and a command
+        // that never reads it simply proceeds without it. That silence is
+        // dangerous in exactly one direction: an option whose whole purpose
+        // is to *narrow* the work. A binary predating `generate embed`'s
+        // `range` ignored a `range: '[0,50000000)'` step and began loading
+        // all 531,869,985 rows of the passage column, ~502 GB, until the
+        // governor aborted it. The step looked correctly configured in the
+        // yaml, in the plan line, and in the log.
+        //
+        // Declared-but-unread is still possible; this catches the far more
+        // common undeclared case — a typo, or a yaml written against a
+        // newer binary than the one running it.
+        {
+            let descs = cmd.describe_options();
+            // Handled by the runner and governor rather than the command.
+            const RUNNER_KEYS: [&str; 2] = ["resources", "governor"];
+            let unknown: Vec<String> = resolved_opts
+                .iter()
+                .map(|(k, _)| k.clone())
+                .filter(|k| !RUNNER_KEYS.contains(&k.as_str()))
+                .filter(|k| !descs.iter().any(|d| d.name == *k))
+                .collect();
+            if !unknown.is_empty() {
+                if cmd.options_declared_complete() {
+                    let mut known: Vec<&str> =
+                        descs.iter().map(|d| d.name.as_str()).collect();
+                    known.sort_unstable();
+                    return Err(format!(
+                        "step '{}': command '{}' does not accept option(s): {}. \
+                         Accepted: {}. If the option exists in a newer build, the \
+                         binary running this pipeline is older than the yaml — \
+                         rebuild rather than dropping the option, since a command \
+                         that ignores a narrowing option does the whole job instead.",
+                        step.id,
+                        cmd.command_path(),
+                        unknown.join(", "),
+                        known.join(", "),
+                    ));
+                }
+                // The command has not vouched for its own declarations, so
+                // an undeclared key here is at least as likely to be a gap
+                // in the list as a real mistake. Say so and continue.
+                ctx.ui.log(&format!(
+                    "{} {} — WARNING: option(s) {} are not declared by '{}' and \
+                     may be ignored. If one of them is meant to narrow this \
+                     step's work, check that this binary is new enough to \
+                     support it before trusting the result.",
+                    prefix,
+                    step.id,
+                    unknown.join(", "),
+                    cmd.command_path(),
+                ));
+            }
+        }
+
         // 6b. Dry-run: print plan line and continue
         if ctx.dry_run {
             let opts_summary: Vec<String> = resolved_opts
