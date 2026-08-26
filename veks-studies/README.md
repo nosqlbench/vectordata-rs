@@ -8,6 +8,21 @@ this crate produces. It states what is measured, what is fitted, what is
 predicted, what is asserted without evidence, and where the model is
 known to be wrong.
 
+> **Not part of the default build.** This is an as-needed analysis
+> crate, not something the product ships, so it is deliberately absent
+> from the workspace's `default-members`: a bare `cargo build` or
+> `cargo test` at the root skips it. Its suite runs discrete-event
+> simulations and takes around 200 s, which is not a cost a routine
+> build should pay.
+>
+> ```
+> cargo test -p veks-studies --release
+> cargo run  -p veks-studies --release --bin veks-study -- study all
+> ```
+>
+> `cargo test --workspace` overrides `default-members` and will still
+> include it; pass `--exclude veks-studies` there if you do not want it.
+
 ---
 
 ## What this is
