@@ -4,6 +4,13 @@ version = "1.8.0"
 edition = "2024"
 description = "Executable models of the SPLAT family — virtualized stores, traced operations, and measured cost against the published formulas"
 license = "Apache-2.0"
+# Never goes to crates.io. This is as-needed internal analysis —
+# executable models and a storage simulator used to reason about the
+# algorithms, not a library anyone depends on. It is already absent from
+# the workspace's `default-members` and its tests sit behind a feature;
+# this is the leg that matters most, because without it a release
+# uploads it.
+publish = false
 homepage = "https://github.com/nosqlbench/vectordata-rs"
 repository = "https://github.com/nosqlbench/vectordata-rs"
 
