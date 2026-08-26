@@ -1025,20 +1025,69 @@ fn load_local_index(index_path: &Path, data_path: &Path) -> Result<Option<Vec<u6
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
+    // A whole number of offsets, or the file is not one. Belt and
+    // braces beside the atomic write above: a sidecar left short by an
+    // older build, a truncated copy, or a partial download should send
+    // us back to the walk rather than yield a reader that cannot see
+    // the records the tail describes.
+    let width = if ext == "i64" { 8 } else { 4 };
+    if data.is_empty() || !data.len().is_multiple_of(width) {
+        return Ok(None);
+    }
     Ok(Some(parse_index_bytes(&data, ext)))
 }
 
+/// Write the offset sidecar **atomically**.
+///
+/// `File::create` truncates in place and the offsets are written one at
+/// a time, so a reader that opens the sidecar mid-write sees a short
+/// file. `load_local_index` would then parse fewer offsets than the
+/// data has records and hand back a reader that silently cannot see the
+/// tail of the file — no error, just missing records.
+///
+/// That is reachable whenever two readers open the same vvec at once,
+/// in one process or across processes: both walk, both write. Writing
+/// to a sibling temporary and renaming makes the swap atomic, so a
+/// reader sees either the previous index or the whole new one.
 fn write_index(index_path: &Path, offsets: &[u64], file_size: u64) -> Result<(), IoError> {
     use std::io::Write;
-    let mut f = File::create(index_path)?;
-    if file_size <= i32::MAX as u64 {
-        for &o in offsets {
-            f.write_all(&(o as i32).to_le_bytes())?;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Unique per writer: the pid separates processes, the counter
+    // separates threads within one.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = index_path.parent().unwrap_or(Path::new("."));
+    let stem = index_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("IDXFOR__");
+    let tmp = dir.join(format!(
+        ".{stem}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let write = || -> Result<(), IoError> {
+        let mut f = File::create(&tmp)?;
+        if file_size <= i32::MAX as u64 {
+            for &o in offsets {
+                f.write_all(&(o as i32).to_le_bytes())?;
+            }
+        } else {
+            for &o in offsets {
+                f.write_all(&(o as i64).to_le_bytes())?;
+            }
         }
-    } else {
-        for &o in offsets {
-            f.write_all(&(o as i64).to_le_bytes())?;
-        }
+        f.flush()?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, index_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
     }
     Ok(())
 }
@@ -1058,5 +1107,84 @@ pub fn remove_vvec_index(data_path: &Path) {
         if idx.exists() {
             let _ = std::fs::remove_file(&idx);
         }
+    }
+}
+
+#[cfg(test)]
+mod index_atomicity {
+    use super::*;
+
+    /// **A half-written sidecar must never be read as a whole one.**
+    ///
+    /// `write_index` used to truncate the target in place and fill it
+    /// offset by offset, so a concurrent reader saw a short file and
+    /// parsed fewer offsets than the data had records — a reader that
+    /// silently could not see the tail of its own file. It surfaced as
+    /// a one-in-six flake in a test that opened one vvec from eight
+    /// threads.
+    #[test]
+    fn many_writers_never_leave_a_readable_partial_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = tmp.path().join("IDXFOR__x.ivvec.i32");
+        let offsets: Vec<u64> = (0..4096).map(|i| i * 12).collect();
+
+        // Writers racing on one path, readers observing it throughout.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let index = index.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut bad = 0usize;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Ok(bytes) = std::fs::read(&index)
+                            && !bytes.is_empty()
+                            && bytes.len() != offsets_len_bytes()
+                        {
+                            bad += 1;
+                        }
+                    }
+                    bad
+                })
+            })
+            .collect();
+
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let index = index.clone();
+                let offsets = offsets.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        write_index(&index, &offsets, 1 << 20).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let partial: usize = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert_eq!(
+            partial, 0,
+            "readers observed {partial} partial sidecars; the swap is not atomic"
+        );
+
+        // And no temporaries are left lying about.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporaries left behind: {leftovers:?}"
+        );
+    }
+
+    fn offsets_len_bytes() -> usize {
+        4096 * 4
     }
 }
