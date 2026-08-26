@@ -1601,3 +1601,110 @@ fn an_explicit_profile_flag_outranks_the_spec_suffix() {
     };
     assert_eq!(run(req), 0);
 }
+
+/// **A sidecar is found beside the data, not beside the process.**
+///
+/// A `dataset.yaml` names its facets relative to the dataset root.
+/// Resolving `IDXFOR__` from that string instead of from the file the
+/// storage actually opened looks in the process working directory — so
+/// a published index sitting next to the data is missed and every
+/// window pays a full walk instead.
+///
+/// The fixture makes the difference observable: the data file has a
+/// truncated final record, so walking it cannot succeed and only a
+/// published index can place the records. If the sidecar is not found,
+/// the window has no mapping at all.
+#[test]
+fn a_published_sidecar_beside_the_data_is_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("beside");
+    std::fs::create_dir_all(&ds).unwrap();
+
+    let vv = ds.join("meta.ivvec");
+    let dims: Vec<i32> = (0..30).map(|i| 1 + (i % 5)).collect();
+    let starts = write_ivvec(&vv, &dims);
+    let complete = std::fs::metadata(&vv).unwrap().len();
+    // A half-written final record: a walk stops at a boundary that is
+    // not the end of the file and gives up.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&vv).unwrap();
+        f.write_all(&[9u8, 0, 0]).unwrap();
+    }
+
+    let bytes: Vec<u8> = starts
+        .iter()
+        .flat_map(|&o| (o as i32).to_le_bytes())
+        .collect();
+    std::fs::write(ds.join("IDXFOR__meta.ivvec.i32"), bytes).unwrap();
+
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: beside\nprofiles:\n  default:\n    metadata_content: meta.ivvec\n",
+    )
+    .unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("5..10").unwrap())
+        .unwrap();
+    assert!(
+        !plan.degrades_to_full_download,
+        "the sidecar beside the data places these records; only a \
+         lookup against the working directory would miss it"
+    );
+    assert_eq!(plan.byte_ranges, vec![(starts[5], starts[10])]);
+    assert!(complete > starts[10], "sanity: the window is interior");
+}
+
+/// **A rebuilt index is written beside the data, never into the
+/// working directory.**
+///
+/// The walk's result is persisted so it is paid once. Deriving that
+/// path from the caller's source string rather than the opened file
+/// drops an `IDXFOR__` file into whatever directory the process is
+/// running in — which then shadows every later open of any file with
+/// the same basename, since the sidecar is found but the data beside it
+/// is not.
+#[test]
+fn rebuilding_an_index_never_writes_into_the_working_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("rebuild");
+    std::fs::create_dir_all(&ds).unwrap();
+
+    // A basename no other test uses, so the working-directory probe
+    // cannot collide with a parallel test's leavings. Clear any left
+    // by an earlier run so the assertion below measures *this* one —
+    // the failure mode being tested is a file appearing, and a stale
+    // one would otherwise wedge the test permanently.
+    let probe = std::path::Path::new("IDXFOR__cwdprobe.ivvec.i32");
+    let _ = std::fs::remove_file(probe);
+    let vv = ds.join("cwdprobe.ivvec");
+    let dims: Vec<i32> = (0..25).map(|i| 1 + (i % 4)).collect();
+    let starts = write_ivvec(&vv, &dims);
+    // Deliberately no sidecar: the walk is the only way, and its
+    // result gets persisted.
+
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: rebuild\nprofiles:\n  default:\n    metadata_content: cwdprobe.ivvec\n",
+    )
+    .unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("3..8").unwrap())
+        .unwrap();
+    assert_eq!(plan.byte_ranges, vec![(starts[3], starts[8])]);
+
+    assert!(
+        !probe.exists(),
+        "the rebuilt index landed in the working directory"
+    );
+    assert!(
+        ds.join("IDXFOR__cwdprobe.ivvec.i32").is_file(),
+        "the rebuilt index belongs beside the data it describes"
+    );
+}

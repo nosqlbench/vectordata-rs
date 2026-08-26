@@ -853,6 +853,14 @@ fn load_or_build_local_offsets(
     elem_size: usize,
 ) -> Result<Vec<u64>, IoError> {
     let total_size = storage.total_size();
+    // The sidecar lives beside the file the storage actually opened,
+    // which is not necessarily what the caller named. A `dataset.yaml`
+    // facet is written relative to the dataset root ("meta.ivvec"), so
+    // resolving it here against the process CWD both misses a published
+    // sidecar and writes the rebuilt one into whatever directory the
+    // process happens to be sitting in.
+    let opened = storage.local_path();
+    let data_path = opened.as_deref().unwrap_or(data_path);
     let index_path = index_path_for(data_path, total_size);
     if let Some(cached) = load_local_index(&index_path, data_path)? {
         return Ok(cached);

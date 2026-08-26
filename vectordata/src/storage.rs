@@ -37,7 +37,19 @@ use crate::transport::HttpTransport;
 /// expose only shape-aware methods.
 pub(crate) enum Storage {
     /// Local file, mmap'd. Zero-copy, no fallback.
-    Mmap(Mmap),
+    Mmap {
+        mmap: Mmap,
+        /// The file this was opened from.
+        ///
+        /// Carried because sidecars belong beside the file the storage
+        /// actually opened, and only the storage knows which that is.
+        /// A caller-supplied source string may be relative to some
+        /// other directory — a `dataset.yaml` entry is relative to the
+        /// dataset root, not the process CWD — so resolving an
+        /// `IDXFOR__` path from it looks in the wrong place and, worse,
+        /// *writes* the rebuilt index there.
+        path: std::path::PathBuf,
+    },
 
     /// Remote URL with no published `.mref`. Reads route through a
     /// [`ChunkStore`] that lazily downloads 8 MiB chunks on demand
@@ -432,7 +444,10 @@ impl Storage {
     fn open_path_uncached(path: &Path) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
         let mmap = unsafe { Mmap::map(&file) }?;
-        Ok(Storage::Mmap(mmap))
+        Ok(Storage::Mmap {
+            mmap,
+            path: path.to_path_buf(),
+        })
     }
 
     /// Open a remote URL via the shared registry.
@@ -547,7 +562,7 @@ impl Storage {
             return Ok(Vec::new());
         }
         match self {
-            Storage::Mmap(m) => {
+            Storage::Mmap { mmap: m, .. } => {
                 let end = offset.checked_add(len).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "read range overflow")
                 })?;
@@ -635,7 +650,7 @@ impl Storage {
     /// channel-read path forever.
     pub(crate) fn mmap_base(&self) -> Option<*const u8> {
         match self {
-            Storage::Mmap(m) => Some(m.as_ptr()),
+            Storage::Mmap { mmap: m, .. } => Some(m.as_ptr()),
             Storage::Cached { channel, mmap } => {
                 try_promote_cached(channel, mmap);
                 mmap.get().map(|m| m.as_ptr())
@@ -656,7 +671,7 @@ impl Storage {
     pub(crate) fn mmap_slice(&self, offset: u64, len: u64) -> Option<&[u8]> {
         let (start, end) = (offset as usize, (offset + len) as usize);
         match self {
-            Storage::Mmap(m) => m.get(start..end),
+            Storage::Mmap { mmap: m, .. } => m.get(start..end),
             Storage::Cached { channel, mmap } => {
                 try_promote_cached(channel, mmap);
                 mmap.get().and_then(|m| m.get(start..end))
@@ -671,7 +686,7 @@ impl Storage {
     /// Total size in bytes.
     pub(crate) fn total_size(&self) -> u64 {
         match self {
-            Storage::Mmap(m) => m.len() as u64,
+            Storage::Mmap { mmap: m, .. } => m.len() as u64,
             Storage::Http { chunks, .. } => chunks.total_size(),
             Storage::Cached { channel, .. } => channel.content_size(),
         }
@@ -685,7 +700,7 @@ impl Storage {
     /// downloaded the whole file.
     pub(crate) fn is_complete(&self) -> bool {
         match self {
-            Storage::Mmap(_) => true,
+            Storage::Mmap { .. } => true,
             Storage::Http { chunks, mmap } => {
                 try_promote_http(chunks, mmap);
                 mmap.get().is_some()
@@ -700,7 +715,7 @@ impl Storage {
     /// Whether reads avoid network round-trips.
     pub(crate) fn is_local(&self) -> bool {
         match self {
-            Storage::Mmap(_) => true,
+            Storage::Mmap { .. } => true,
             Storage::Cached { channel, mmap } => {
                 try_promote_cached(channel, mmap);
                 mmap.get().is_some()
@@ -757,7 +772,7 @@ impl Storage {
         match self {
             // Local mmap is already fully resident — fire one
             // completion event so callers' meters land at 100%.
-            Storage::Mmap(m) => {
+            Storage::Mmap { mmap: m, .. } => {
                 let mut cb = cb;
                 cb(&crate::transport::DownloadProgress::new(m.len() as u64, 0));
                 Ok(())
@@ -782,7 +797,7 @@ impl Storage {
         F: FnMut(&crate::transport::DownloadProgress),
     {
         match self {
-            Storage::Mmap(_) => Ok(()),
+            Storage::Mmap { .. } => Ok(()),
             Storage::Http { chunks, mmap } => {
                 if mmap.get().is_some() {
                     return Ok(());
@@ -859,7 +874,7 @@ impl Storage {
     /// ready.
     fn promoted_mmap(&self) -> Option<&Mmap> {
         match self {
-            Storage::Mmap(m) => Some(m),
+            Storage::Mmap { mmap: m, .. } => Some(m),
             Storage::Cached { channel, mmap } => {
                 try_promote_cached(channel, mmap);
                 mmap.get()
@@ -983,12 +998,11 @@ impl Storage {
     /// `precache` has downloaded the file (or if a prior precache
     /// left the cache file at the expected path).
     ///
-    /// For `Storage::Mmap` we don't track the originating path
-    /// (the `Mmap` doesn't carry it), so the caller is expected to
-    /// remember it from the open arguments. `None` for
+    /// For `Storage::Mmap` it is the file that was opened. `None` for
     /// `Storage::Http` when no cache file exists yet.
     pub(crate) fn local_path(&self) -> Option<std::path::PathBuf> {
         match self {
+            Storage::Mmap { path, .. } => Some(path.clone()),
             Storage::Cached { channel, .. } => Some(channel.cache_path().to_path_buf()),
             Storage::Http { chunks, .. } if chunks.cache_path().is_file() => {
                 Some(chunks.cache_path().to_path_buf())
@@ -1020,7 +1034,7 @@ impl Storage {
         let (first, last) =
             chunk_span(byte_start, byte_end, chunk_size, total_chunks, content_size)?;
         let resident = match self {
-            Storage::Mmap(_) => return None,
+            Storage::Mmap { .. } => return None,
             Storage::Http { chunks, .. } => chunks.valid_count_in_range(first, last),
             Storage::Cached { channel, .. } => channel.valid_count_in_range(first, last),
         };
@@ -1029,7 +1043,7 @@ impl Storage {
 
     pub(crate) fn fill_stats(&self) -> Option<(u32, u32, u64, u64, bool)> {
         match self {
-            Storage::Mmap(_) => None,
+            Storage::Mmap { .. } => None,
             Storage::Http { chunks, .. } => Some((
                 chunks.valid_count(),
                 chunks.total_chunks(),
@@ -1051,7 +1065,7 @@ impl Storage {
 impl std::fmt::Debug for Storage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Storage::Mmap(m) => f
+            Storage::Mmap { mmap: m, .. } => f
                 .debug_struct("Storage::Mmap")
                 .field("size", &m.len())
                 .finish(),

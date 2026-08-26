@@ -909,9 +909,10 @@ profiles:
 
 #[test]
 fn local_dataset_facet_storage_is_local_with_no_cache_path() {
-    // A dataset.yaml on local disk with relative facet paths —
-    // every facet should be Storage::Mmap, so cache_path is None
-    // (no cache file involved) and is_local is true from the start.
+    // A dataset.yaml on local disk with relative facet paths — every
+    // facet should be Storage::Mmap: local and complete from the start,
+    // and backed by the data file *in place* rather than by a copy
+    // under any cache root.
     let tmp = make_tmp();
     write_fvec(&tmp.path().join("base.fvec"), 10, 4);
     std::fs::write(tmp.path().join("dataset.yaml"), r#"
@@ -927,8 +928,18 @@ profiles:
     let storage = view.open_facet_storage("base_vectors").unwrap();
     assert!(storage.is_local(), "local dataset facets are local from the start");
     assert!(storage.is_complete(), "local dataset facets are complete from the start");
-    assert!(storage.cache_path().is_none(),
-        "local dataset facets have no cache file (data is read in place)");
+    // The backing path is the original file, not a cached copy: no
+    // byte of a local dataset is duplicated anywhere. Reporting None
+    // here instead would make every caller that wants a `&Path` to
+    // mmap special-case local datasets for no reason — and it is what
+    // let the offset-sidecar lookup fall back to the caller's raw
+    // source string, resolving `IDXFOR__` against the process working
+    // directory rather than the dataset.
+    assert_eq!(
+        storage.cache_path().as_deref(),
+        Some(tmp.path().join("base.fvec").as_path()),
+        "a local facet is backed by its own file, read in place"
+    );
     // precache is a no-op
     storage.precache().unwrap();
     assert!(storage.is_complete());
