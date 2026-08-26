@@ -894,9 +894,21 @@ fn load_or_fetch_remote_offsets(
         });
     }
     let base_str = base.as_str().trim_end_matches('/').to_string();
+    let total_size = storage.total_size();
+    // Probe the width this file's size calls for first — the same rule
+    // `index_path_for` writes by — so the common case costs one request
+    // instead of a guaranteed 404 followed by the real one.
+    let (expected, other) = if index_ext_for(total_size) == "i32" {
+        ("i32", "i64")
+    } else {
+        ("i64", "i32")
+    };
     let candidates = [
-        (format!("{base_str}/IDXFOR__{data_name}.i64"), "i64"),
-        (format!("{base_str}/IDXFOR__{data_name}.i32"), "i32"),
+        (
+            format!("{base_str}/IDXFOR__{data_name}.{expected}"),
+            expected,
+        ),
+        (format!("{base_str}/IDXFOR__{data_name}.{other}"), other),
     ];
     let client = crate::transport::shared_client_for(&base_str);
     for (cand, ext) in &candidates {
@@ -904,7 +916,7 @@ fn load_or_fetch_remote_offsets(
             && resp.status().is_success()
             && let Ok(bytes) = resp.bytes()
         {
-            return Ok(parse_index_bytes(&bytes, ext));
+            return Ok(parse_index_bytes(&bytes, ext, total_size));
         }
     }
     // Second chance before the expensive walk: a prior open of this
@@ -987,8 +999,24 @@ fn walk_offsets_via_storage(storage: &Storage, elem_size: usize) -> Result<Vec<u
     Ok(offsets)
 }
 
-fn parse_index_bytes(bytes: &[u8], ext: &str) -> Vec<u64> {
-    match ext {
+/// Parse an `IDXFOR__` sidecar into **record start offsets**.
+///
+/// Two layouts are in circulation next to real data. This crate's own
+/// [`write_index`] persists `N` starts; nbdatatools publishes `N + 1`
+/// entries whose last is the payload size — an end sentinel that makes
+/// every record's extent readable as `offsets[i + 1] - offsets[i]`
+/// without a special case for the final one.
+///
+/// No record can *start* at the payload size, so a trailing entry equal
+/// to `payload_size` is unambiguously the sentinel and is dropped here.
+/// Without that, a sentinel sidecar reads as `N + 1` records, the last
+/// a phantom beginning at EOF: `count()` overstates by one and a window
+/// reaching the tail resolves to an empty range.
+///
+/// Both layouts therefore yield `N` starts, and the record count is the
+/// length of what this returns.
+fn parse_index_bytes(bytes: &[u8], ext: &str, payload_size: u64) -> Vec<u64> {
+    let mut offsets: Vec<u64> = match ext {
         "i32" => bytes
             .chunks_exact(4)
             .map(|c| LittleEndian::read_i32(c) as u64)
@@ -998,6 +1026,23 @@ fn parse_index_bytes(bytes: &[u8], ext: &str) -> Vec<u64> {
             .map(|c| LittleEndian::read_i64(c) as u64)
             .collect(),
         _ => Vec::new(),
+    };
+    if offsets.last() == Some(&payload_size) {
+        offsets.pop();
+    }
+    offsets
+}
+
+/// The sidecar entry width a payload of `file_size` bytes calls for:
+/// `i32` while every offset still fits one, `i64` beyond that.
+///
+/// Shared by the local sidecar name and the remote sidecar probe so
+/// both agree on which file to expect.
+fn index_ext_for(file_size: u64) -> &'static str {
+    if file_size <= i32::MAX as u64 {
+        "i32"
+    } else {
+        "i64"
     }
 }
 
@@ -1007,19 +1052,15 @@ fn index_path_for(data_path: &Path, file_size: u64) -> std::path::PathBuf {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("data");
-    let ext = if file_size <= i32::MAX as u64 {
-        "i32"
-    } else {
-        "i64"
-    };
-    parent.join(format!("IDXFOR__{name}.{ext}"))
+    parent.join(format!("IDXFOR__{name}.{}", index_ext_for(file_size)))
 }
 
 fn load_local_index(index_path: &Path, data_path: &Path) -> Result<Option<Vec<u64>>, IoError> {
     if !index_path.is_file() {
         return Ok(None);
     }
-    let data_mtime = std::fs::metadata(data_path)?
+    let data_meta = std::fs::metadata(data_path)?;
+    let data_mtime = data_meta
         .modified()
         .map_err(|e| IoError::InvalidFormat(format!("mtime: {e}")))?;
     let index_mtime = std::fs::metadata(index_path)?
@@ -1042,7 +1083,7 @@ fn load_local_index(index_path: &Path, data_path: &Path) -> Result<Option<Vec<u6
     if data.is_empty() || !data.len().is_multiple_of(width) {
         return Ok(None);
     }
-    Ok(Some(parse_index_bytes(&data, ext)))
+    Ok(Some(parse_index_bytes(&data, ext, data_meta.len())))
 }
 
 /// Write the offset sidecar **atomically**.
@@ -1115,6 +1156,100 @@ pub fn remove_vvec_index(data_path: &Path) {
         if idx.exists() {
             let _ = std::fs::remove_file(&idx);
         }
+    }
+}
+
+/// The `IDXFOR__` sidecar as it is actually published.
+///
+/// Two layouts are in circulation and both sit next to real data, so
+/// the parse has to read either one as the same N records. These pin
+/// that, and pin the extension tables the parse depends on.
+#[cfg(test)]
+mod sidecar_layouts {
+    use super::*;
+
+    /// Starts-only — what this crate's own `write_index` persists.
+    #[test]
+    fn a_starts_only_sidecar_keeps_every_entry() {
+        // Three records of 4 bytes each in a 12-byte payload.
+        let bytes: Vec<u8> = [0i32, 4, 8].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(parse_index_bytes(&bytes, "i32", 12), vec![0, 4, 8]);
+    }
+
+    /// Sentinel — what nbdatatools publishes. The trailing entry is the
+    /// payload size, which lets a consumer take every record's extent
+    /// as `offsets[i + 1] - offsets[i]`. It is not a record.
+    #[test]
+    fn an_end_sentinel_is_not_a_record() {
+        let bytes: Vec<u8> = [0i32, 4, 8, 12]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            parse_index_bytes(&bytes, "i32", 12),
+            vec![0, 4, 8],
+            "a final entry equal to the payload size is the sentinel; kept, \
+             it reads as a fourth record starting at EOF"
+        );
+    }
+
+    /// The same, at the wider entry width.
+    #[test]
+    fn the_sentinel_is_dropped_at_i64_width_too() {
+        let bytes: Vec<u8> = [0i64, 20, 40]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(parse_index_bytes(&bytes, "i64", 40), vec![0, 20]);
+    }
+
+    /// Only the *last* entry can be the sentinel. An interior offset
+    /// equal to the payload size would be a corrupt index, not a
+    /// layout, and silently dropping it would hide that.
+    #[test]
+    fn only_a_trailing_entry_is_treated_as_the_sentinel() {
+        let bytes: Vec<u8> = [0i32, 12, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(parse_index_bytes(&bytes, "i32", 12), vec![0, 12, 4]);
+    }
+
+    /// A record needs at least a 4-byte header, so no record can start
+    /// at the payload size — which is what makes the sentinel test
+    /// unambiguous rather than a heuristic.
+    #[test]
+    fn the_sentinel_value_is_never_a_legal_record_start() {
+        let dims: [i32; 3] = [2, 5, 1];
+        let mut at = 0u64;
+        let starts: Vec<u64> = dims
+            .iter()
+            .map(|&d| {
+                let s = at;
+                at += 4 + d as u64 * 4;
+                s
+            })
+            .collect();
+        assert!(
+            starts.iter().all(|&s| s < at),
+            "every record start is strictly inside the payload"
+        );
+    }
+
+    /// The width a payload calls for decides both the sidecar's name
+    /// and which remote sidecar is probed first. One rule, so the two
+    /// cannot drift apart and cost a guaranteed 404 on every open.
+    #[test]
+    fn the_entry_width_follows_the_payload_size() {
+        assert_eq!(index_ext_for(0), "i32");
+        assert_eq!(index_ext_for(i32::MAX as u64), "i32");
+        assert_eq!(index_ext_for(i32::MAX as u64 + 1), "i64");
+        let p = std::path::Path::new("/d/x.ivvec");
+        assert_eq!(
+            index_path_for(p, 1024).file_name().unwrap(),
+            "IDXFOR__x.ivvec.i32"
+        );
+        assert_eq!(
+            index_path_for(p, i32::MAX as u64 + 1).file_name().unwrap(),
+            "IDXFOR__x.ivvec.i64"
+        );
     }
 }
 

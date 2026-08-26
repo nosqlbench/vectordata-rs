@@ -1708,3 +1708,93 @@ fn rebuilding_an_index_never_writes_into_the_working_directory() {
         "the rebuilt index belongs beside the data it describes"
     );
 }
+
+/// **A sentinel sidecar describes N records, not N+1.**
+///
+/// `IDXFOR__` files are published in two layouts: `N` record starts,
+/// and `N+1` entries whose last is the payload size, so a consumer can
+/// take every extent as `offsets[i+1] - offsets[i]` without a special
+/// case for the tail. Read verbatim, the second layout invents a
+/// record beginning at EOF — the count is one too high and a window
+/// reaching the end resolves to nothing.
+#[test]
+fn a_sentinel_sidecar_reads_as_the_records_it_describes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("sentinel");
+    std::fs::create_dir_all(&ds).unwrap();
+
+    let vv = ds.join("meta.ivvec");
+    let dims: Vec<i32> = (0..40).map(|i| 1 + (i % 7)).collect();
+    let starts = write_ivvec(&vv, &dims);
+    let total = std::fs::metadata(&vv).unwrap().len();
+
+    // The sentinel layout: every start, then the payload size.
+    let mut entries: Vec<u64> = starts.clone();
+    entries.push(total);
+    let bytes: Vec<u8> = entries
+        .iter()
+        .flat_map(|&o| (o as i32).to_le_bytes())
+        .collect();
+    std::fs::write(ds.join("IDXFOR__meta.ivvec.i32"), bytes).unwrap();
+
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: sentinel\nprofiles:\n  default:\n    metadata_content: meta.ivvec\n",
+    )
+    .unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    // A window running to the last record must reach the end of the
+    // file. With the sentinel kept, record 39 would start at
+    // `starts[39]` and end at `starts[40]` — the phantom — leaving the
+    // final record's bytes outside the window.
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("38..40").unwrap())
+        .unwrap();
+    assert_eq!(
+        plan.byte_ranges,
+        vec![(starts[38], total)],
+        "the last real record ends at the payload size"
+    );
+    assert_eq!(
+        plan.prerequisite_bytes,
+        40 * 8,
+        "the index is counted as record starts, so both published \
+         layouts report the same prerequisite"
+    );
+}
+
+/// The starts-only layout is unchanged by the sentinel tolerance —
+/// dropping a trailing entry must key on it *equalling the payload
+/// size*, not on it being last.
+#[test]
+fn a_starts_only_sidecar_still_describes_every_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("starts");
+    std::fs::create_dir_all(&ds).unwrap();
+
+    let vv = ds.join("meta.ivvec");
+    let dims: Vec<i32> = (0..40).map(|i| 1 + (i % 7)).collect();
+    let starts = write_ivvec(&vv, &dims);
+    let total = std::fs::metadata(&vv).unwrap().len();
+    let bytes: Vec<u8> = starts
+        .iter()
+        .flat_map(|&o| (o as i32).to_le_bytes())
+        .collect();
+    std::fs::write(ds.join("IDXFOR__meta.ivvec.i32"), bytes).unwrap();
+
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: starts\nprofiles:\n  default:\n    metadata_content: meta.ivvec\n",
+    )
+    .unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("38..40").unwrap())
+        .unwrap();
+    assert_eq!(plan.byte_ranges, vec![(starts[38], total)]);
+    assert_eq!(plan.prerequisite_bytes, 40 * 8);
+}

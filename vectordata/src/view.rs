@@ -1056,6 +1056,13 @@ fn vvec_range_to_bytes(
         byte_start,
         byte_end,
         // The index had to be read whole to answer this at all.
+        //
+        // Counted as **record starts × 8**, not sidecar-file bytes: the
+        // published widths differ (`i32` vs `i64`) and the sentinel
+        // layout carries one entry more than there are records, so the
+        // on-disk size is not a stable measure of the same thing.
+        // `offsets` is post-sentinel — see `io::parse_index_bytes` — so
+        // both sidecar layouts report the same figure here.
         prerequisite_bytes: (offsets.len() * std::mem::size_of::<u64>()) as u64,
     })
 }
