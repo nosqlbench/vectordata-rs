@@ -1879,3 +1879,121 @@ fn planning_a_remote_vvec_without_a_sidecar_downloads_nothing() {
     )
     .expect("with consent the whole facet is fetched");
 }
+
+// ─── Format coverage the mapping path had gaps in ──────────────────
+//
+// Three places where the record→byte mapping disagreed with how the
+// data is actually read or published. Each is a silent failure: a
+// window that resolves to the wrong bytes, or a plan that moves the
+// file it was asked to merely price.
+
+/// Write a scalar facet: raw packed values, no header of any kind.
+fn write_u32_scalar(path: &std::path::Path, values: &[u32]) {
+    let mut f = std::fs::File::create(path).unwrap();
+    for v in values {
+        f.write_all(&v.to_le_bytes()).unwrap();
+    }
+}
+
+/// A dataset with two scalar facets and no vector facet windowing in
+/// the way.
+fn scalar_dataset(dir: &std::path::Path) -> vectordata::TestDataGroup {
+    let ds = dir.join("scalars");
+    std::fs::create_dir_all(&ds).unwrap();
+
+    // Values from 7 up. The first four bytes are `7` — a plausible
+    // dimension, which is exactly what makes the xvec path dangerous
+    // here rather than merely unhelpful.
+    let vals: Vec<u32> = (0..100).map(|i| 7 + i).collect();
+    write_u32_scalar(&ds.join("layout.u32"), &vals);
+
+    // Bytes chosen so the same four bytes read as a *negative* dim.
+    let content: Vec<u8> = (0..200u32).map(|i| 200 + (i % 40) as u8).collect();
+    std::fs::write(ds.join("content.u8"), content).unwrap();
+
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: scalars\nprofiles:\n  default:\n    metadata_layout: layout.u32\n    \
+         metadata_content: content.u8\n",
+    )
+    .unwrap();
+    vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap()
+}
+
+/// **A scalar facet has no dimension header, so it must not be read as
+/// if it had one.**
+///
+/// `TypedReader` addresses a scalar facet at `ordinal * elem_size`.
+/// Routing it through the uniform-xvec branch instead takes the first
+/// four bytes as a dimension and derives a stride of
+/// `4 + dim * elem_size` — here `4 + 7*4 = 32` rather than `4`, so
+/// every byte range past the first is wrong. Wrong, not absent: the
+/// plan reports success and warms a region the reader never touches.
+#[test]
+fn a_scalar_window_maps_at_the_element_stride() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = scalar_dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_layout", &parse_window("2..5").unwrap())
+        .unwrap();
+
+    assert!(
+        !plan.degrades_to_full_download,
+        "a fixed-stride facet is windowable"
+    );
+    assert_eq!(
+        plan.byte_ranges,
+        vec![(8, 20)],
+        "records 2..5 of a 4-byte scalar are bytes 8..20; reading the \
+         leading 7 as a dimension would give 64..160 instead"
+    );
+    assert_eq!(
+        plan.prerequisite_bytes, 0,
+        "a fixed stride is known from the extension — nothing to read first"
+    );
+}
+
+/// The other half of the same defect. When the leading bytes do *not*
+/// pass the dimension sanity check, the xvec path returns no mapping at
+/// all and a perfectly windowable facet degrades to a whole-facet
+/// fetch — which the fallback gate then refuses.
+#[test]
+fn a_scalar_window_does_not_degrade_when_its_bytes_look_like_no_dimension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = scalar_dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("10..60").unwrap())
+        .unwrap();
+
+    assert!(
+        !plan.degrades_to_full_download,
+        "the leading bytes are data, not a corrupt header"
+    );
+    assert_eq!(plan.byte_ranges, vec![(10, 60)], "one byte per record");
+}
+
+/// A scalar window is refusable on the same terms as any other, so the
+/// mapping fix does not quietly widen what a caller consents to.
+#[test]
+fn a_scalar_window_prefetches_without_whole_facet_consent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group = scalar_dataset(tmp.path());
+    let view = group.profile("default").unwrap();
+
+    view.prefetch(
+        "metadata_content",
+        &parse_window("10..60").unwrap(),
+        WholeFacetFallback::Refuse,
+    )
+    .expect("a mapped window never needs whole-facet consent");
+    view.prefetch(
+        "metadata_layout",
+        &parse_window("2..5").unwrap(),
+        WholeFacetFallback::Refuse,
+    )
+    .expect("a mapped window never needs whole-facet consent");
+}

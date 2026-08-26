@@ -97,10 +97,12 @@ impl ElementType {
         }
     }
 
+    /// Whether `path` names a scalar facet — raw packed values with no
+    /// per-record header. See [`crate::io::is_scalar_ext`], the single
+    /// table both this and the URL form answer from.
     pub fn is_scalar_format(path: impl AsRef<Path>) -> bool {
         let ext = path.as_ref().extension().and_then(|e| e.to_str()).unwrap_or("");
-        matches!(ext.to_lowercase().as_str(),
-            "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64")
+        crate::io::is_scalar_ext(ext)
     }
 
     pub fn name(self) -> &'static str {
@@ -183,13 +185,18 @@ impl_typed_element!(i32, "i32");
 impl_typed_element!(u64, "u64");
 impl_typed_element!(i64, "i64");
 
+/// URL form of [`ElementType::is_scalar_format`] — same table, applied
+/// to a URL path where `Path::extension` cannot be used.
+///
+/// It must stay the same table: a local open and a remote open of the
+/// same facet that disagree here read the same bytes two different
+/// ways, one of them wrong.
 fn is_scalar_url_path(path: &str) -> bool {
     let ext = match path.rfind('.') {
         Some(p) => &path[p + 1..],
         None => return false,
     };
-    matches!(ext.to_lowercase().as_str(),
-        "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64" | "f32" | "f64")
+    crate::io::is_scalar_ext(ext)
 }
 
 fn read_native_value(data: &[u8], native: ElementType) -> i128 {

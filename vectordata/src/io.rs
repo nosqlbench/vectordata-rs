@@ -270,6 +270,26 @@ pub(crate) fn is_vvec_ext(ext: &str) -> bool {
     e.contains("vvec") || e == "ivec" || e == "ivecs"
 }
 
+/// Whether `ext` names a *scalar* facet: raw packed values with no
+/// per-record header, addressed at `ordinal * elem_size`.
+///
+/// The single authority for the question — [`crate::typed_access`]
+/// classifies both paths and URLs through here. Keeping one table
+/// matters because the answer decides whether the first four bytes of
+/// a file are a dimension header or data: classify a scalar file as
+/// xvec and every offset past the first is wrong.
+///
+/// Deliberately only the eight integer widths. There is no bare
+/// `.f32`/`.f64` scalar extension — [`crate::typed_access::ElementType::from_extension`]
+/// does not recognise one, so such a file is rejected at open before
+/// any of this is reached.
+pub(crate) fn is_scalar_ext(ext: &str) -> bool {
+    matches!(
+        ext.to_lowercase().as_str(),
+        "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64"
+    )
+}
+
 /// Validate that a file's extension is compatible with `T`'s element width.
 fn validate_element_for_source(source: &str) -> Result<(), IoError> {
     let name = source.rsplit('/').next().unwrap_or(source);
@@ -1379,5 +1399,45 @@ mod index_atomicity {
 
     fn offsets_len_bytes() -> usize {
         4096 * 4
+    }
+}
+
+/// How a facet's extension decides whether its first four bytes are a
+/// dimension header or data.
+#[cfg(test)]
+mod scalar_classification {
+    use super::*;
+
+    /// Scalar facets are the eight integer widths and nothing else.
+    ///
+    /// The set decides whether a file's first four bytes are a
+    /// dimension header or data, so it must be one table. `f32`/`f64`
+    /// are absent deliberately: `ElementType::from_extension` has no
+    /// bare-`f32` entry, so such a file never opens in the first place.
+    #[test]
+    fn the_scalar_extensions_are_exactly_the_integer_widths() {
+        for ext in ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64"] {
+            assert!(is_scalar_ext(ext), "{ext} is a scalar facet");
+            assert!(!is_vvec_ext(ext), "{ext} is not variable-length");
+            assert_ne!(infer_elem_size(ext), 0, "{ext} has a known width");
+        }
+        for ext in ["fvec", "ivvec", "parquet", "f32", "f64", ""] {
+            assert!(!is_scalar_ext(ext), "{ext} is not a scalar facet");
+        }
+        assert!(is_scalar_ext("I32"), "extension case must not matter");
+    }
+
+    /// The path and URL classifiers must answer from that one table.
+    /// A local open and a remote open of the same facet that disagree
+    /// read the same bytes two different ways, one of them wrong.
+    #[test]
+    fn path_and_url_classification_agree() {
+        for ext in [
+            "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "fvec", "ivvec", "f32", "f64",
+        ] {
+            let by_path = crate::typed_access::ElementType::is_scalar_format(format!("/d/x.{ext}"));
+            let by_ext = is_scalar_ext(ext);
+            assert_eq!(by_path, by_ext, "path classification of .{ext}");
+        }
     }
 }

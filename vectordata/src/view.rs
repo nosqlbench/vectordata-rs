@@ -230,6 +230,27 @@ pub(crate) fn record_range_to_bytes(
     if crate::io::is_vvec_ext(ext) {
         return vvec_range_to_bytes(path_no_window, win_start, win_end, storage, elem_size);
     }
+    if crate::io::is_scalar_ext(ext) {
+        // Scalar facets are raw packed values with no per-record
+        // header — `TypedReader` addresses them at `ordinal *
+        // elem_size`. Falling through to the xvec path below would
+        // read the first *value* as a dimension: a needless degrade
+        // when it fails the sanity check, and silently wrong byte
+        // ranges when it happens to pass.
+        let stride = elem_size as u64;
+        let total = storage.total_size();
+        let byte_start = win_start.saturating_mul(stride).min(total);
+        let byte_end = win_end.saturating_mul(stride).min(total);
+        if byte_start >= byte_end {
+            return None;
+        }
+        return Some(MappedRange {
+            byte_start,
+            byte_end,
+            // Nothing has to be read to know a fixed stride.
+            prerequisite_bytes: 0,
+        });
+    }
 
     let header = storage.storage.read_bytes(0, 4).ok()?;
     if header.len() != 4 {
