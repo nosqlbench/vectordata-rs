@@ -21,6 +21,21 @@ license = "Apache-2.0"
 homepage = "https://github.com/nosqlbench/vectordata-rs"
 repository = "https://github.com/nosqlbench/vectordata-rs"
 
+# `vectordata-rs` names the *project*, not a crate anyone installs from
+# a registry. The publishable artifacts are its members — `vectordata`,
+# `veks`, `vecd`, `slabtastic` and the `veks-*` libraries. This package
+# exists to build one local multiplexer binary over them:
+#
+#   cargo install --path .
+#
+# Marking it unpublishable is also what unblocks releases. `cargo
+# publish` run at a workspace root selects `default-members`, never the
+# root package — so it was picking up `tools` (itself `publish = false`)
+# and failing with "`tools` cannot be published", which cargo-workspaces
+# reported as "unable to publish package vectordata-rs". Every release
+# ended that way; the crate has never existed on crates.io.
+publish = false
+
 [[bin]]
 name = "vectordata"
 path = "src/main.rs"
