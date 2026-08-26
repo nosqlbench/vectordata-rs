@@ -136,7 +136,7 @@ pub struct PrefetchPlan {
     pub requested: DSWindow,
     pub byte_ranges: Vec<Range<u64>>,
     pub fills: Vec<RangeFill>,
-    pub prerequisite_bytes: u64,      // vvec index; 0 for xvec
+    pub prerequisite_bytes: u64,      // vvec index; 0 for xvec/scalar
     pub degrades_to_full_download: bool,
 }
 ```
@@ -154,7 +154,7 @@ are unavailable.
 
 ## Records to bytes, per format
 
-Decided. The three formats get three different answers, and two of them
+Decided. The four formats get four different answers, and two of them
 are deliberately narrow.
 
 ### xvec — exact, no prerequisite
@@ -166,6 +166,23 @@ any reader does on first access, so it is not a new cost.
 **Status: implemented.** `facet_window_byte_range` already does this; it
 needs splitting so the record→byte half can take a caller-supplied
 window instead of a config-derived one.
+
+### scalar — exact, no prerequisite
+
+A scalar facet (`.u8`, `.i8`, `.u16`, `.i16`, `.u32`, `.i32`, `.u64`,
+`.i64`) is raw packed values with **no header of any kind**, so the
+mapping is simply `ordinal × elem_size` — nothing has to be read to know
+it, not even the four bytes xvec pays.
+
+The distinction matters more than it looks. Routing a scalar facet
+through the xvec branch reads its first value as a dimension. That value
+is data, so it lands in one of two ways: outside the sanity range, and
+the window degrades for a facet that is trivially windowable; or inside
+it, and the window resolves to *plausible wrong bytes* — a prefetch that
+reports success and warms a region the reader never touches. One table,
+`io::is_scalar_ext`, decides the classification for both local paths and
+URLs, because a facet that classifies one way on disk and another over
+HTTP is read two different ways from the same bytes.
 
 ### vvec — exact, one whole-index prerequisite
 
@@ -182,6 +199,34 @@ index is the only way to map an ordinal to a byte. Three rules:
    itself. It is flat and small relative to the data, and making the
    *prerequisite* incremental buys little while doubling the number of
    partial-fetch state machines to reason about.
+4. **Planning never rebuilds it.** Where no index is published, the only
+   remaining way to learn the record boundaries is to walk the file
+   record by record — which over HTTP drags every chunk across the
+   network. A plan that transferred the facet in order to price
+   transferring part of it would not be a plan, and the whole-facet
+   consent gate would fire after the bytes had already landed. So the
+   planning path asks only for indexes that are already cheap (a
+   published sidecar, a persisted rebuild, or a local mmap walk) and
+   reports `degrades_to_full_download` otherwise. Opening a *reader* may
+   still rebuild: that caller is about to read the data regardless, so
+   the walk is work brought forward rather than work invented.
+
+**Two sidecar layouts are in circulation.** This crate's own rebuild
+persists `N` record starts; nbdatatools publishes `N + 1` entries whose
+last is the payload size, so every extent reads as
+`offsets[i + 1] − offsets[i]` without a special case for the tail. Both
+sit next to real data, so the parse accepts either: no record can *start*
+at the payload size, which makes a trailing entry equal to it
+unambiguously a sentinel rather than a record. Read verbatim it would
+invent a record beginning at EOF — the count one too high, and a window
+reaching the tail resolving to nothing.
+
+**The sidecar is located from the file the storage opened**, not from
+the source string the caller supplied. A `dataset.yaml` names its facets
+relative to the dataset root, so resolving `IDXFOR__` from that string
+looks in the process working directory instead — missing a published
+index, and then *writing* the rebuilt one there, where it shadows every
+later open of any file with the same basename.
 
 **And the vvec data file should be merkle-published.** Merkle mode
 carries integrity *and* download-state management — one mechanism, two
@@ -212,7 +257,8 @@ because that is a request rather than a fallback.
 | Format | Record → byte | Prerequisite | Requires `.mref` | Status |
 |---|---|---|---|---|
 | xvec | `4 + dim × elem_size` | 4-byte header | for windowing | ready |
-| vvec | sibling offset index | whole index file | **yes** | needs index plumbing |
+| scalar | `ordinal × elem_size` | none | for windowing | ready |
+| vvec | sibling offset index | whole index file | **yes** | done |
 | parquet | — | — | — | **excluded from this design** |
 
 ## Access modes that cannot window
