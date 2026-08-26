@@ -695,7 +695,7 @@ pub fn replay(trace: &Trace, config: CacheConfig) -> CacheStats {
     cache.stats()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
     use crate::algo::{Rewrite, gsplat::Gsplat, naive::NaiveGather};

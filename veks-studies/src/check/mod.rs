@@ -238,7 +238,7 @@ pub fn deterministic(
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
     use crate::algo::Rewrite;

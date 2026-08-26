@@ -908,7 +908,7 @@ pub fn measured_latency(device: &str) -> &'static [LatencyPoint] {
         .unwrap_or(&[])
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
 

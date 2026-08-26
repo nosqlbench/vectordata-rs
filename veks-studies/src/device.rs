@@ -343,7 +343,7 @@ pub fn paired() -> Vec<(DeviceModel, &'static Regime)> {
     ]
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
 
@@ -466,7 +466,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod dump {
     use super::*;
 
@@ -485,7 +485,7 @@ mod dump {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod concurrency {
     use super::*;
 
@@ -648,7 +648,7 @@ impl DeviceModel {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod crossover {
     use super::*;
 
@@ -838,7 +838,7 @@ pub fn render_concurrency_crossover(payload_bytes: u64, record_bytes: u64) -> St
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod concurrency_crossover {
     use super::*;
 

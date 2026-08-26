@@ -1672,7 +1672,7 @@ pub fn fio_like_sequential(hardware: &Hardware, block_bytes: u64, requests: u64)
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod dump {
     use super::*;
     use crate::regime::ALL;
@@ -1780,7 +1780,7 @@ pub fn mixed_job(hardware: &Hardware, cap: Option<f64>, reader_requests: u64) ->
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
     use crate::regime::{ALL, NVME_CONSUMER, SATA_SSD, SPINNING_SATA};
@@ -2059,7 +2059,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod contention_fit {
     use super::*;
     use crate::regime::ALL;
@@ -2096,7 +2096,7 @@ mod contention_fit {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod modern {
     use super::*;
     use crate::regime::ALL;
@@ -2291,7 +2291,7 @@ mod modern {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod platform {
     use super::*;
     use crate::cache::CacheConfig;
@@ -2741,7 +2741,7 @@ mod platform {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod accounting {
     use super::*;
     use crate::cache::CacheConfig;
@@ -2798,7 +2798,7 @@ pub fn fio_like_detailed(hardware: &Hardware, block_bytes: u64, requests: u64) -
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod latency_dump {
     use super::*;
 
@@ -2853,7 +2853,7 @@ mod latency_dump {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod window_sweep {
     use super::*;
 
@@ -2895,7 +2895,7 @@ mod window_sweep {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod stripe_sweep {
     use super::*;
     use crate::regime::{NVME_CONSUMER, SATA_SSD};
@@ -2937,7 +2937,7 @@ mod stripe_sweep {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod expiry_sweep {
     use super::*;
     use crate::regime::SPINNING_SATA;
@@ -2980,7 +2980,7 @@ mod expiry_sweep {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod write_path {
     use super::*;
 
@@ -3045,7 +3045,7 @@ mod write_path {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod kernel {
     //! The kernel's own machinery: which block scheduler is in force,
     //! and how dirty pages are paced back to the device.

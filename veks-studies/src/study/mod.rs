@@ -153,7 +153,7 @@ fn human_bytes(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
 

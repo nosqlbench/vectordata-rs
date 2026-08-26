@@ -8,20 +8,26 @@ this crate produces. It states what is measured, what is fitted, what is
 predicted, what is asserted without evidence, and where the model is
 known to be wrong.
 
-> **Not part of the default build.** This is an as-needed analysis
-> crate, not something the product ships, so it is deliberately absent
-> from the workspace's `default-members`: a bare `cargo build` or
-> `cargo test` at the root skips it. Its suite runs discrete-event
-> simulations and takes around 200 s, which is not a cost a routine
-> build should pay.
+> **Not part of the default build, and its tests are opt-in.** This is
+> an as-needed analysis crate, not something the product ships. Its
+> suite runs discrete-event simulations for around 200 s, which is not
+> a cost a routine build should pay, so it is excluded twice over:
+>
+> - absent from the workspace's `default-members`, so a bare
+>   `cargo build` / `cargo test` at the root skips the crate entirely;
+> - its test modules sit behind the off-by-default `heavy-tests`
+>   feature, so even `cargo test --workspace` — which overrides
+>   `default-members` — compiles them out.
+>
+> To run them:
 >
 > ```
-> cargo test -p veks-studies --release
+> cargo test -p veks-studies --release --features heavy-tests
 > cargo run  -p veks-studies --release --bin veks-study -- study all
 > ```
 >
-> `cargo test --workspace` overrides `default-members` and will still
-> include it; pass `--exclude veks-studies` there if you do not want it.
+> The `veks-study` binary needs no feature — the studies are the
+> product of this crate, not its tests.
 
 ---
 

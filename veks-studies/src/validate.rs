@@ -360,7 +360,7 @@ pub fn render(cards: &[Scorecard]) -> String {
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
 
@@ -501,7 +501,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod report {
     use super::*;
 
@@ -512,7 +512,7 @@ mod report {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod per_block {
     use super::*;
 
@@ -555,7 +555,7 @@ mod per_block {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod bus_sweep {
     use super::*;
     use crate::regime::NVME_CONSUMER;
@@ -586,7 +586,7 @@ mod bus_sweep {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod spread_sweep {
     use super::*;
 
@@ -623,7 +623,7 @@ mod spread_sweep {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod write_report {
     use super::*;
 
@@ -675,7 +675,7 @@ mod write_report {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod program_sweep {
     use super::*;
 

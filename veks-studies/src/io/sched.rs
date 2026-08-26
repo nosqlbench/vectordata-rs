@@ -398,7 +398,7 @@ pub fn pop_best_within_slice(
     Some(queue.remove(best))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
 

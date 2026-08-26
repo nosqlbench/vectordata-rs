@@ -135,7 +135,7 @@ impl Rewrite for Gsplat {
 /// `02-plan.md` quotes 16 bytes per entry.
 const PLAN_ENTRY_BYTES: u64 = 16;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
     use crate::algo::run_verified;

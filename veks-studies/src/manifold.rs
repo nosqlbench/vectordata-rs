@@ -1176,7 +1176,7 @@ fn frontier_study() -> String {
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
     use crate::device::SATA_SSD_MODEL;

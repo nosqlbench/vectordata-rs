@@ -702,7 +702,7 @@ pub fn render(findings: &[Finding]) -> String {
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
 
@@ -850,7 +850,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod report {
     use super::*;
 

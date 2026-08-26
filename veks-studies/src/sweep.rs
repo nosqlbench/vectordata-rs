@@ -829,7 +829,7 @@ pub fn run(axis: Axis, config: &Config) -> Sweep {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
 

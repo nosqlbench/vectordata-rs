@@ -1039,7 +1039,7 @@ pub fn random_start_angle(rng: &mut impl Rng, rotation_s: f64) -> f64 {
     rng.random::<f64>() * rotation_s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
 

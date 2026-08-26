@@ -71,12 +71,13 @@ members = [
 # which was two thirds of a full workspace test run. Reach for it
 # explicitly:
 #
-#   cargo test -p veks-studies --release
+#   cargo test -p veks-studies --release --features heavy-tests
 #   cargo run  -p veks-studies --release --bin veks-study -- study all
 #
-# Note that `--workspace` overrides this list, so a deliberate
-# `cargo test --workspace` still includes it; use
-# `--workspace --exclude veks-studies` to skip it there.
+# `--workspace` overrides this list, so it would still pull the crate
+# in. Its test modules are therefore also gated behind the crate's
+# off-by-default `heavy-tests` feature, which makes the exclusion hold
+# however the build is invoked.
 default-members = [
     "vectordata",
     "veks-anode",

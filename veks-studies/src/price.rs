@@ -277,7 +277,7 @@ pub fn render_regime_sweep(
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
     use crate::algo::{Rewrite, gsplat::Gsplat, naive::NaiveGather};
@@ -656,7 +656,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod dump {
     use super::*;
     use crate::model::{Geometry, Map};
@@ -832,7 +832,7 @@ pub fn simulate_io(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod full_path {
     use super::*;
     use crate::algo::{Rewrite, gsplat::Gsplat, naive::NaiveGather};
@@ -987,7 +987,7 @@ mod full_path {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod ra_dump {
     use super::*;
     use crate::algo::{Rewrite, gsplat::Gsplat, naive::NaiveGather};

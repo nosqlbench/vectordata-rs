@@ -216,7 +216,7 @@ pub fn render(label: &str, demand: &Demand, records: u64, concurrency: f64) -> S
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
 

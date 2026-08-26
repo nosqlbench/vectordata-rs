@@ -461,7 +461,7 @@ pub fn render_comparison(
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
     use crate::device::{ALL_MODELS, NVME_CONSUMER_MODEL, NVME_MODERN_MODEL, SPINNING_SATA_MODEL};
@@ -955,7 +955,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod crossover {
     use super::*;
     use crate::device::{ALL_MODELS_WITH_MODERN, NVME_CONSUMER_MODEL};

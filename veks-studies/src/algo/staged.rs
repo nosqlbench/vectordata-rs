@@ -297,7 +297,7 @@ fn span_of(entries: &[(u64, u64)]) -> (u64, u64) {
     (first, last)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "heavy-tests"))]
 mod tests {
     use super::*;
     use crate::algo::{Rewrite, gsplat::Gsplat, run_verified};

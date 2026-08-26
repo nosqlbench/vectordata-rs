@@ -15,6 +15,18 @@ path = "src/lib.rs"
 name = "veks-study"
 path = "src/main.rs"
 
+[features]
+# The simulation suite, off by default.
+#
+# This crate is as-needed analysis, not something the product ships, and
+# its tests run discrete-event simulations for around 200 s. Gating them
+# keeps that cost out of `cargo test --workspace`, which overrides the
+# workspace `default-members` list and would otherwise pull them in
+# whatever that list says.
+#
+#   cargo test -p veks-studies --release --features heavy-tests
+heavy-tests = []
+
 [dependencies]
 rand = "0.9"
 rand_xoshiro = "0.7"
