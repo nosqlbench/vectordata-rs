@@ -337,6 +337,16 @@ enum DatasetsCmd {
         /// Overwrite the output directory if it already exists.
         #[arg(long)]
         force: bool,
+        /// Ordinals per shard: split each fixed-stride facet across
+        /// files of this many records, the last shorter.
+        ///
+        /// Mirrors `shard_stride:` in `dataset.yaml`, which the derived
+        /// dataset declares. Output that fits in one shard is written
+        /// as a single file, so a run that happened to fit stays
+        /// readable by anything that predates multi-file facets.
+        /// Accepts SI suffixes: `--shard-stride 1M`.
+        #[arg(long, value_name = "RECORDS")]
+        shard_stride: Option<String>,
         /// Configuration directory containing `catalogs.yaml`
         /// (only used when `--dataset` is a catalog name).
         #[arg(long, default_value_t = crate::catalog::sources::config_dir())]
@@ -676,6 +686,7 @@ pub fn bin_main(argv: Vec<String>) {
                     output,
                     name,
                     force,
+                    shard_stride,
                     configdir,
                     catalog,
                     at,
@@ -688,6 +699,17 @@ pub fn bin_main(argv: Vec<String>) {
                     &at,
                     name.as_deref(),
                     force,
+                    match shard_stride
+                        .as_deref()
+                        .map(crate::dataset::source::parse_number_with_suffix)
+                        .transpose()
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("error: --shard-stride: {e}");
+                            std::process::exit(1);
+                        }
+                    },
                 ),
                 DatasetsCmd::Precache {
                     spec,

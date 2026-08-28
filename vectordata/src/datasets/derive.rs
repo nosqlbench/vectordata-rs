@@ -135,6 +135,12 @@ fn plan_output_size(src: &Path, kind: FacetKind, window: &DSWindow) -> io::Resul
 /// through the runtime access layer (precache-then-copy).
 ///
 /// Returns a process exit code (0 on success).
+/// Derive a dataset.
+///
+/// `shard_stride` is ordinals per shard: `Some(n)` writes each
+/// fixed-stride facet as a series rolling over every `n` records,
+/// `None` writes each whole. A run that fits in one shard collapses to
+/// the single-file form either way (SH-35, SH-83).
 pub fn run(
     dataset: &str,
     profile: &str,
@@ -144,6 +150,7 @@ pub fn run(
     at: &[String],
     name_override: Option<&str>,
     force: bool,
+    shard_stride: Option<u64>,
 ) -> i32 {
     if let Err(e) = preflight_output(output, force) {
         eprintln!("{e}");
@@ -155,12 +162,12 @@ pub fn run(
     // runtime access layer, no precache — just read the YAML
     // and slice the files in place.
     if let Some(yaml_path) = local_dataset_yaml(dataset) {
-        return derive_local(&yaml_path, profile, output, name_override);
+        return derive_local(&yaml_path, profile, output, name_override, shard_stride);
     }
 
     // Otherwise: catalog / URL → runtime access layer.
     derive_via_access_layer(
-        dataset, profile, output, configdir, extra_catalogs, at, name_override)
+        dataset, profile, output, configdir, extra_catalogs, at, name_override, shard_stride)
 }
 
 /// If `dataset` points at a local directory containing a
@@ -209,6 +216,7 @@ fn derive_local(
     profile_name: &str,
     output: &Path,
     name_override: Option<&str>,
+    shard_stride: Option<u64>,
 ) -> i32 {
     let base_dir = yaml_path.parent().unwrap_or(Path::new("."));
     let config = match RichDatasetConfig::load(yaml_path) {
@@ -237,7 +245,7 @@ fn derive_local(
         .to_string();
     run_plan(&plan, output, &donor_name, profile_name,
         &yaml_path.display().to_string(), ds_profile, name_override,
-        /* local_fast_path = */ true)
+        /* local_fast_path = */ true, shard_stride)
 }
 
 /// Slow path: catalog or URL source. Goes through the runtime
@@ -251,6 +259,7 @@ fn derive_via_access_layer(
     extra_catalogs: &[String],
     at: &[String],
     name_override: Option<&str>,
+    shard_stride: Option<u64>,
 ) -> i32 {
     let (resolution, derived_default_name) =
         match resolve_spec(dataset, configdir, extra_catalogs, at) {
@@ -320,7 +329,7 @@ fn derive_via_access_layer(
     };
     run_plan(&plan, output, &derived_default_name, profile_name,
         dataset, ds_profile, name_override,
-        /* local_fast_path = */ false)
+        /* local_fast_path = */ false, shard_stride)
 }
 
 // ─── Planning ─────────────────────────────────────────────────────
@@ -447,13 +456,14 @@ fn run_plan(
     src_profile: &crate::dataset::profile::DSProfile,
     name_override: Option<&str>,
     local_fast_path: bool,
+    shard_stride: Option<u64>,
 ) -> i32 {
     let total_bytes: u64 = plan.iter().map(|r| r.expected_bytes).sum();
     eprintln!("Materializing {} facet(s), {} to write.",
         plan.len(), super::precache::fmt_bytes(total_bytes));
 
     let mut meter = DeriveMeter::new(plan.len(), total_bytes);
-    let mut derived_facets: Vec<(String, String)> = Vec::new();
+    let mut derived_facets: Vec<DerivedFacet> = Vec::new();
 
     for row in plan {
         let dest_path = output.join(&row.dest_filename);
@@ -473,15 +483,18 @@ fn run_plan(
         let mut written: u64 = 0;
         let res = materialize_facet(
             &row.facet, &row.src, &dest_path,
-            row.kind, &row.window,
+            row.kind, &row.window, shard_stride,
             |delta| {
                 written = written.saturating_add(delta);
                 meter.tick_copy(written);
             });
-        if let Err(e) = res {
-            meter.fail(&row.facet, &e.to_string());
-            return 1;
-        }
+        let produced = match res {
+            Ok(p) => p,
+            Err(e) => {
+                meter.fail(&row.facet, &e.to_string());
+                return 1;
+            }
+        };
 
         // Merkle generation. The .mref is computed from the
         // (windowed) output bytes — the donor's mref doesn't
@@ -489,17 +502,42 @@ fn run_plan(
         // GiB facets don't allocate a giant Vec, and tick the meter
         // by hashed bytes so users see real progress instead of a
         // frozen "computing merkle…" line.
-        let merkle_total = std::fs::metadata(&dest_path)
+        // One `.mref` per **file**, never per facet (SH-20): each shard
+        // is independently verifiable and independently re-fetchable,
+        // which is most of the point of splitting them.
+        let merkle_total: u64 = produced
+            .files
+            .iter()
+            .filter_map(|f| std::fs::metadata(f).ok())
             .map(|m| m.len())
-            .unwrap_or(0);
+            .sum();
         meter.begin_merkle(merkle_total);
-        let merkle_res = generate_mref(&dest_path, |hashed| meter.tick_merkle(hashed));
-        if let Err(e) = merkle_res {
-            meter.fail(&row.facet, &format!("mref: {e}"));
-            return 1;
+        for f in &produced.files {
+            if let Err(e) = generate_mref(f, |hashed| meter.tick_merkle(hashed)) {
+                meter.fail(&row.facet, &format!("mref: {e}"));
+                return 1;
+            }
         }
         meter.end_facet(&row.facet, row.expected_bytes);
-        derived_facets.push((row.facet.clone(), row.dest_filename.clone()));
+
+        // The declaration names what was written. `dest_filename`
+        // carries the profile directory; the materializer reports only
+        // the file's own name, so rejoin them.
+        let dir = std::path::Path::new(&row.dest_filename)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|p| !p.is_empty());
+        let source = match dir {
+            Some(d) => format!("{d}/{}", produced.source_spec),
+            None => produced.source_spec.clone(),
+        };
+        derived_facets.push(DerivedFacet {
+            facet: row.facet.clone(),
+            source,
+            shard_stride: produced.shard_stride,
+            shard_count: produced.shard_count,
+            record_count: produced.record_count,
+        });
     }
 
     let derived_name = name_override
@@ -688,14 +726,178 @@ impl DeriveMeter {
 
 // ─── Materialization ────────────────────────────────────────────
 
+/// Bytes per record for a fixed-stride facet, or `None` when the format
+/// has no fixed stride.
+///
+/// Only fixed-stride formats can be sharded by the writer, because
+/// rolling over at a record boundary means knowing where one is.
+fn fixed_record_size(src: &Path, kind: FacetKind) -> io::Result<Option<u64>> {
+    Ok(match kind {
+        FacetKind::Scalar(elem) => Some(elem.byte_width() as u64),
+        FacetKind::UniformXvec(elem) => {
+            let mut f = fs::File::open(src)?;
+            if f.metadata()?.len() < 4 {
+                return Ok(None);
+            }
+            let mut dim_bytes = [0u8; 4];
+            f.read_exact(&mut dim_bytes)?;
+            let dim = i32::from_le_bytes(dim_bytes) as u64;
+            (dim > 0).then_some(4 + dim * elem.byte_width() as u64)
+        }
+        FacetKind::VariableVvec | FacetKind::Slab => None,
+    })
+}
+
+/// Materialize a facet as a **series**, rolling over every `stride`
+/// records (SH-35).
+///
+/// Records are copied whole, so a record never spans a shard boundary
+/// (SH-13) and the output is byte-identical for the same input and
+/// stride (SH-36). A run that fits in one shard collapses to the
+/// single-file form (SH-83) — the writer decides that, not the caller.
+fn materialize_sharded<F: FnMut(u64)>(
+    src: &Path,
+    dir: &Path,
+    basename: &str,
+    ext: &str,
+    record_size: u64,
+    window: &DSWindow,
+    stride: u64,
+    mut cb: F,
+) -> io::Result<crate::datasets::shard_writer::ShardOutcome> {
+    use crate::datasets::shard_writer::ShardWriter;
+
+    let mut src_f = fs::File::open(src)?;
+    let src_len = src_f.metadata()?.len();
+    if record_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cannot shard a facet whose record size is zero",
+        ));
+    }
+    let total_records = src_len / record_size;
+
+    // An empty window is every record; otherwise the window's
+    // intervals, in order.
+    let intervals: Vec<(u64, u64)> = if window.is_empty() {
+        vec![(0, total_records)]
+    } else {
+        window.0.iter().map(|iv| (iv.min_incl, iv.max_excl)).collect()
+    };
+
+    let mut writer = ShardWriter::new(dir, basename, ext, stride)?;
+    let mut buf = vec![0u8; record_size as usize];
+    for (lo, hi) in intervals {
+        if hi * record_size > src_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "window [{lo}..{hi}) of {record_size}-byte records past EOF \
+                     ({src_len} bytes)"
+                ),
+            ));
+        }
+        src_f.seek(SeekFrom::Start(lo * record_size))?;
+        for _ in lo..hi {
+            src_f.read_exact(&mut buf)?;
+            writer.write_record(&buf)?;
+            cb(record_size);
+        }
+    }
+    writer.finish()
+}
+
+/// A facet as written, for the emitted declaration.
+#[derive(Debug, Clone)]
+pub(crate) struct DerivedFacet {
+    pub facet: String,
+    pub source: String,
+    pub shard_stride: Option<u64>,
+    pub shard_count: Option<u32>,
+    pub record_count: Option<u64>,
+}
+
+/// What materializing one facet produced.
+///
+/// Carries the declaration the output needs, so the emitted
+/// `dataset.yaml` describes the files that were actually written rather
+/// than the ones the plan expected (SH-37).
+#[derive(Debug, Clone)]
+pub(crate) struct MaterializedFacet {
+    /// Files written, in ordinal order.
+    pub files: Vec<std::path::PathBuf>,
+    /// The `source:` value for the declaration — a filename, or the
+    /// `NNNN` pattern for a series.
+    pub source_spec: String,
+    /// Set only for a series (SH-83 collapses a one-shard run).
+    pub shard_stride: Option<u64>,
+    pub shard_count: Option<u32>,
+    pub record_count: Option<u64>,
+}
+
 fn materialize_facet<F: FnMut(u64)>(
     facet_name: &str,
     src: &Path,
     dest: &Path,
     kind: FacetKind,
     window: &DSWindow,
+    shard_stride: Option<u64>,
     on_bytes_written: F,
-) -> io::Result<()> {
+) -> io::Result<MaterializedFacet> {
+    // Sharding is available only where records have a fixed stride:
+    // rolling over at a record boundary means knowing where one is. A
+    // format without one is written whole, and the caller is told so
+    // rather than silently getting a single file it did not ask for.
+    if let Some(stride) = shard_stride {
+        match fixed_record_size(src, kind)? {
+            Some(record_size) => {
+                let dir = dest.parent().unwrap_or(Path::new("."));
+                let file = dest
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                let (basename, ext) = file.rsplit_once('.').unwrap_or((file, ""));
+                let out = materialize_sharded(
+                    src,
+                    dir,
+                    basename,
+                    ext,
+                    record_size,
+                    window,
+                    stride,
+                    on_bytes_written,
+                )?;
+                return Ok(MaterializedFacet {
+                    source_spec: out.source_spec(),
+                    shard_stride: out.is_series().then_some(out.stride),
+                    shard_count: out.is_series().then(|| out.shard_count()),
+                    record_count: out.is_series().then_some(out.records),
+                    files: out.files,
+                });
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "facet '{facet_name}' has no fixed record stride, so it cannot \
+                         be sharded; omit the shard stride to write it whole"
+                    ),
+                ));
+            }
+        }
+    }
+    let single = |files: Vec<std::path::PathBuf>| MaterializedFacet {
+        source_spec: dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        files,
+        shard_stride: None,
+        shard_count: None,
+        record_count: None,
+    };
+    let done = |r: io::Result<()>| r.map(|()| single(vec![dest.to_path_buf()]));
     match kind {
         FacetKind::VariableVvec => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -705,11 +907,13 @@ fn materialize_facet<F: FnMut(u64)>(
                  to slice the source file manually for now"
             ),
         )),
-        FacetKind::Scalar(elem) => materialize_scalar(src, dest, elem, window, on_bytes_written),
-        FacetKind::UniformXvec(elem) => {
-            materialize_uniform_xvec(src, dest, elem, window, on_bytes_written)
+        FacetKind::Scalar(elem) => {
+            done(materialize_scalar(src, dest, elem, window, on_bytes_written))
         }
-        FacetKind::Slab => materialize_slab(src, dest, window, on_bytes_written),
+        FacetKind::UniformXvec(elem) => {
+            done(materialize_uniform_xvec(src, dest, elem, window, on_bytes_written))
+        }
+        FacetKind::Slab => done(materialize_slab(src, dest, window, on_bytes_written)),
     }
 }
 
@@ -963,7 +1167,7 @@ fn write_dataset_yaml(
     derived_name: &str,
     source_spec: &str,
     source_profile: &str,
-    facets: &[(String, String)],
+    facets: &[DerivedFacet],
     src_profile: &crate::dataset::profile::DSProfile,
 ) -> io::Result<()> {
     // Keep the format hand-written rather than going through
@@ -986,8 +1190,21 @@ fn write_dataset_yaml(
     if let Some(bc) = src_profile.base_count {
         out.push_str(&format!("    base_count: {bc}\n"));
     }
-    for (facet_name, filename) in facets {
-        out.push_str(&format!("    {facet_name}: {filename}\n"));
+    for f in facets {
+        // A single file keeps the plain one-line spelling — the shape
+        // every dataset written before sharding is in, and the one a
+        // reader predating it can open (SH-4, SH-83). Only a genuine
+        // series takes the mapping form.
+        match (f.shard_stride, f.shard_count, f.record_count) {
+            (Some(stride), Some(count), Some(records)) => {
+                out.push_str(&format!("    {}:\n", f.facet));
+                out.push_str(&format!("      source: {}\n", f.source));
+                out.push_str(&format!("      shard_stride: {stride}\n"));
+                out.push_str(&format!("      shard_count: {count}\n"));
+                out.push_str(&format!("      record_count: {records}\n"));
+            }
+            _ => out.push_str(&format!("    {}: {}\n", f.facet, f.source)),
+        }
     }
     fs::write(output.join("dataset.yaml"), out)
 }
@@ -1218,7 +1435,7 @@ mod tests {
 
         // Drive a local derive on it.
         let yaml_path = src.path().join("dataset.yaml");
-        let rc = derive_local(&yaml_path, "default", dst.path(), Some("derived"));
+        let rc = derive_local(&yaml_path, "default", dst.path(), Some("derived"), None);
         assert_eq!(rc, 0, "derive_local should succeed");
 
         // The output must use the profiles/base layout, not flat.
@@ -1246,5 +1463,138 @@ mod tests {
             "dataset.yaml should reference the profiles/base path: {yaml}"
         );
         assert!(group.profile("default").is_some());
+    }
+}
+
+#[cfg(test)]
+mod sharded_output {
+    use super::*;
+
+    fn tmpdir() -> tempfile::TempDir {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(&base).unwrap()
+    }
+
+    /// A uniform fvec of `n` records, dim 2 → 12 bytes each.
+    fn write_fvec(path: &Path, n: usize) {
+        let mut buf = Vec::new();
+        for i in 0..n {
+            buf.extend(&2i32.to_le_bytes());
+            buf.extend(&(i as f32).to_le_bytes());
+            buf.extend(&((i as f32) + 0.5).to_le_bytes());
+        }
+        fs::write(path, buf).unwrap();
+    }
+
+    /// Record size comes from the format, not from a guess.
+    #[test]
+    fn the_record_size_comes_from_the_format() {
+        let d = tmpdir();
+        let src = d.path().join("in.fvec");
+        write_fvec(&src, 3);
+        assert_eq!(
+            fixed_record_size(&src, FacetKind::UniformXvec(ElementType::F32)).unwrap(),
+            Some(12)
+        );
+        let s = d.path().join("in.u32");
+        fs::write(&s, [0u8; 16]).unwrap();
+        assert_eq!(
+            fixed_record_size(&s, FacetKind::Scalar(ElementType::U32)).unwrap(),
+            Some(4)
+        );
+        // Variable-length and slab have no fixed stride to roll over on.
+        assert_eq!(
+            fixed_record_size(&src, FacetKind::VariableVvec).unwrap(),
+            None
+        );
+        assert_eq!(fixed_record_size(&src, FacetKind::Slab).unwrap(), None);
+    }
+
+    /// **The shards concatenate back to the source.** Splitting is a
+    /// layout change, not a content change (SH-48).
+    #[test]
+    fn a_sharded_copy_concatenates_back_to_the_source() {
+        let d = tmpdir();
+        let src = d.path().join("in.fvec");
+        write_fvec(&src, 10);
+        let out = materialize_sharded(
+            &src,
+            d.path(),
+            "base_vectors",
+            "fvec",
+            12,
+            &DSWindow::default(),
+            4,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(out.records, 10);
+        assert_eq!(out.shard_count(), 3);
+        assert_eq!(out.source_spec(), "base_vectors__NNNN.fvec");
+        let joined: Vec<u8> = out
+            .files
+            .iter()
+            .flat_map(|f| fs::read(f).unwrap())
+            .collect();
+        assert_eq!(joined, fs::read(&src).unwrap(), "content must be identical");
+    }
+
+    /// A window selects records before sharding, and the shards hold
+    /// exactly those.
+    #[test]
+    fn a_window_selects_records_before_they_are_sharded() {
+        let d = tmpdir();
+        let src = d.path().join("in.fvec");
+        write_fvec(&src, 20);
+        let window = crate::dataset::source::parse_window("4..14").unwrap();
+        let out =
+            materialize_sharded(&src, d.path(), "b", "fvec", 12, &window, 4, |_| {}).unwrap();
+
+        assert_eq!(out.records, 10);
+        let joined: Vec<u8> = out
+            .files
+            .iter()
+            .flat_map(|f| fs::read(f).unwrap())
+            .collect();
+        let all = fs::read(&src).unwrap();
+        assert_eq!(joined, all[4 * 12..14 * 12], "exactly the windowed records");
+    }
+
+    /// **Output that fits in one shard collapses** — so a derive run
+    /// that happened to fit does not emit a declaration older readers
+    /// cannot open (SH-83).
+    #[test]
+    fn an_output_that_fits_one_shard_is_written_as_a_single_file() {
+        let d = tmpdir();
+        let src = d.path().join("in.fvec");
+        write_fvec(&src, 5);
+        let out = materialize_sharded(
+            &src,
+            d.path(),
+            "base_vectors",
+            "fvec",
+            12,
+            &DSWindow::default(),
+            1000,
+            |_| {},
+        )
+        .unwrap();
+        assert!(out.collapsed);
+        assert_eq!(out.source_spec(), "base_vectors.fvec");
+        assert!(d.path().join("base_vectors.fvec").exists());
+    }
+
+    /// A window past the end is refused rather than silently truncated.
+    #[test]
+    fn a_window_past_the_end_is_refused() {
+        let d = tmpdir();
+        let src = d.path().join("in.fvec");
+        write_fvec(&src, 5);
+        let window = crate::dataset::source::parse_window("0..99").unwrap();
+        assert!(
+            materialize_sharded(&src, d.path(), "b", "fvec", 12, &window, 4, |_| {}).is_err()
+        );
     }
 }

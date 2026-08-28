@@ -257,6 +257,15 @@ pub enum DatasetsCommand {
         #[arg(long)]
         force: bool,
 
+        /// Ordinals per shard: split each fixed-stride facet across
+        /// files of this many records, the last shorter.
+        ///
+        /// Mirrors `shard_stride:` in `dataset.yaml`. Output that fits
+        /// in one shard is written as a single file. Accepts SI
+        /// suffixes: `--shard-stride 1M`.
+        #[arg(long, value_name = "RECORDS")]
+        shard_stride: Option<String>,
+
         /// Configuration directory containing catalogs.yaml
         /// (only used when `--dataset` is a catalog name).
         #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
@@ -617,6 +626,7 @@ pub fn run(args: DatasetsArgs) {
             output,
             name,
             force,
+            shard_stride,
             configdir,
             catalog: raw_catalog,
             at,
@@ -625,6 +635,17 @@ pub fn run(args: DatasetsArgs) {
                 .iter()
                 .map(|v| resolve_catalog_value(v))
                 .collect();
+            let stride = match shard_stride
+                .as_deref()
+                .map(vectordata::dataset::source::parse_number_with_suffix)
+                .transpose()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: --shard-stride: {e}");
+                    std::process::exit(1);
+                }
+            };
             let code = vectordata::datasets::derive::run(
                 &dataset,
                 &profile,
@@ -634,6 +655,7 @@ pub fn run(args: DatasetsArgs) {
                 &at,
                 name.as_deref(),
                 force,
+                stride,
             );
             if code != 0 {
                 std::process::exit(code);

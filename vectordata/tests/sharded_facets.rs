@@ -894,3 +894,152 @@ fn a_catalog_entry_round_trips_a_series() {
     assert_eq!(v.record_count, Some(20));
 }
 
+// ─── Creation ──────────────────────────────────────────────────────
+
+/// **A derived series reads back as the dataset it was derived from.**
+///
+/// The full loop: write a single-file source, derive it with a stride,
+/// and open the result. Splitting is a layout change, not a content
+/// change (SH-48) — and the derived dataset must declare itself in a
+/// form the reader understands without help.
+#[test]
+fn a_derived_series_round_trips_through_the_reader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write_fvec(&src.join("base_vectors.fvec"), 4, 250, 0);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: src\nprofiles:\n  default:\n    base_vectors: base_vectors.fvec\n",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    let rc = vectordata::datasets::derive::run(
+        src.to_str().unwrap(),
+        "default",
+        &out,
+        "",
+        &[],
+        &[],
+        Some("derived"),
+        true,
+        Some(100),
+    );
+    assert_eq!(rc, 0, "derive must succeed");
+
+    // Three shards, four digits, plus a .mref each (SH-2, SH-20).
+    let dir = out.join("profiles/base");
+    for i in 0..3 {
+        let f = dir.join(format!("base_vectors__{i:04}.fvec"));
+        assert!(f.is_file(), "missing {}", f.display());
+        assert!(
+            dir.join(format!("base_vectors__{i:04}.fvec.mref"))
+                .is_file(),
+            "each shard is independently verifiable"
+        );
+    }
+    assert!(
+        !dir.join("base_vectors.fvec").exists(),
+        "the unsharded name must not also be written"
+    );
+
+    // The emitted declaration describes the series.
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(yaml.contains("base_vectors__NNNN.fvec"), "{yaml}");
+    assert!(yaml.contains("shard_stride: 100"), "{yaml}");
+    assert!(yaml.contains("shard_count: 3"), "{yaml}");
+    assert!(yaml.contains("record_count: 250"), "{yaml}");
+
+    // And it reads back, record for record, as the source did.
+    let orig = vectordata::TestDataGroup::load(src.to_str().unwrap()).unwrap();
+    let orig_r = orig.profile("default").unwrap().base_vectors().unwrap();
+    let derived = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let derived_r = derived.profile("default").unwrap().base_vectors().unwrap();
+
+    assert_eq!(derived_r.count(), 250);
+    assert_eq!(derived_r.dim(), orig_r.dim());
+    for i in 0..250 {
+        assert_eq!(
+            derived_r.get(i).unwrap(),
+            orig_r.get(i).unwrap(),
+            "record {i}"
+        );
+    }
+}
+
+/// **A derive that fits in one shard emits the single-file form**
+/// (SH-83), so a run that happened to fit stays readable by anything
+/// predating multi-file facets.
+#[test]
+fn a_derive_that_fits_one_shard_emits_the_single_file_form() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write_fvec(&src.join("base_vectors.fvec"), 4, 40, 0);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: src\nprofiles:\n  default:\n    base_vectors: base_vectors.fvec\n",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    let rc = vectordata::datasets::derive::run(
+        src.to_str().unwrap(),
+        "default",
+        &out,
+        "",
+        &[],
+        &[],
+        Some("derived"),
+        true,
+        Some(1000),
+    );
+    assert_eq!(rc, 0);
+
+    let dir = out.join("profiles/base");
+    assert!(dir.join("base_vectors.fvec").is_file(), "collapsed");
+    assert!(!dir.join("base_vectors__0000.fvec").exists());
+
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(
+        !yaml.contains("shard_stride"),
+        "a collapsed output declares no shard fields: {yaml}"
+    );
+    assert!(
+        yaml.contains("base_vectors: profiles/base/base_vectors.fvec"),
+        "{yaml}"
+    );
+}
+
+/// Deriving without a stride is exactly what it always was.
+#[test]
+fn deriving_without_a_stride_is_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write_fvec(&src.join("base_vectors.fvec"), 4, 40, 0);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: src\nprofiles:\n  default:\n    base_vectors: base_vectors.fvec\n",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    let rc = vectordata::datasets::derive::run(
+        src.to_str().unwrap(),
+        "default",
+        &out,
+        "",
+        &[],
+        &[],
+        Some("derived"),
+        true,
+        None,
+    );
+    assert_eq!(rc, 0);
+    assert!(out.join("profiles/base/base_vectors.fvec").is_file());
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(!yaml.contains("shard_"), "{yaml}");
+}
+

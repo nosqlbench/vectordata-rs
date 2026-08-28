@@ -9,6 +9,7 @@
 //! `Result`s so the dispatch layer in either binary can simply
 //! `std::process::exit(code)`.
 
+pub(crate) mod shard_writer;
 pub mod cache;
 pub mod curlify;
 pub mod derive;
