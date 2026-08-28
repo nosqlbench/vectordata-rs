@@ -820,3 +820,77 @@ fn a_sliced_facet_is_complete_when_its_window_is() {
     assert_eq!(r.get_value(10).unwrap(), 9990);
 }
 
+// ─── Publication ───────────────────────────────────────────────────
+
+/// **Push publishes every shard and every sidecar** (SH-39).
+///
+/// It is filesystem-driven rather than declaration-driven, so shards —
+/// being ordinary files — are picked up by construction. This pins that
+/// they actually are, and that a temp left by a killed derive is not.
+#[test]
+fn a_published_series_lists_every_shard_and_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    for i in 0..3 {
+        write_fvec(&ds.join(format!("base__{i:04}.fvec")), 4, 10, i * 10);
+        std::fs::write(ds.join(format!("base__{i:04}.fvec.mref")), b"mref").unwrap();
+    }
+    // A temp from a killed run, and a scratch file: neither is content.
+    std::fs::write(ds.join("base__0003.fvec.partial"), b"half").unwrap();
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: pub\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 3\n      \
+         record_count: 30\n",
+    )
+    .unwrap();
+
+    let scan = vectordata::push::plan::scan(&ds).expect("scan");
+    let names: Vec<String> = scan
+        .files
+        .iter()
+        .map(|f| {
+            std::path::Path::new(f)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+
+    for i in 0..3 {
+        assert!(
+            names.contains(&format!("base__{i:04}.fvec")),
+            "shard {i} not published: {names:?}"
+        );
+        assert!(
+            names.contains(&format!("base__{i:04}.fvec.mref")),
+            "shard {i}'s sidecar not published: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n.ends_with(".partial")),
+        "a temp from a killed run must not ship: {names:?}"
+    );
+}
+
+/// A catalog carries a series, so a remote consumer can enumerate the
+/// shards before fetching anything (SH-41).
+#[test]
+fn a_catalog_entry_round_trips_a_series() {
+    let yaml = "default:\n  base_vectors:\n    source:\n      - a.fvec=10\n      - b.fvec=10\n\
+                \x20   record_count: 20\n";
+    let group: vectordata::dataset::DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+    let rendered = serde_yaml::to_string(&group).unwrap();
+    let again: vectordata::dataset::DSProfileGroup = serde_yaml::from_str(&rendered).unwrap();
+
+    let v = again.profiles["default"].views.get("base_vectors").unwrap();
+    assert!(
+        v.is_series(),
+        "the series must survive a catalog round trip: {rendered}"
+    );
+    assert_eq!(v.sources().len(), 2);
+    assert_eq!(v.record_count, Some(20));
+}
+

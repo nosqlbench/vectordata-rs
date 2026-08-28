@@ -98,7 +98,25 @@ pub fn validate_conformance(cfg: &DatasetConfig) -> Result<(), Vec<FacetViolatio
                 continue;
             };
 
-            let locator = view.path();
+            // A series of one shard must be spelled as a single file,
+            // so that readers predating multi-file facets can open it
+            // (SH-4, SH-72). Readers accept the non-canonical form;
+            // reporting it is this function's job.
+            if view.is_one_shard_series() {
+                violations.push(FacetViolation {
+                    profile: profile_name.clone(),
+                    key: key.to_string(),
+                    path: view.path().to_string(),
+                    detail: "a series of one shard must be spelled as a single file, so \
+                             that readers predating multi-file facets can open it"
+                        .to_string(),
+                });
+            }
+
+            // Every shard is checked, not just the first: a series whose
+            // third file is the wrong format is as non-conformant as one
+            // whose first is (SH-42, SH-43).
+            for locator in view.sources().iter().map(|s| s.path.as_str()) {
             let Some(ext) = classifiable_extension(locator) else {
                 continue;
             };
@@ -130,6 +148,7 @@ pub fn validate_conformance(cfg: &DatasetConfig) -> Result<(), Vec<FacetViolatio
                         facet.key(),
                     ),
                 }),
+            }
             }
         }
     }
@@ -203,5 +222,72 @@ profiles:
 "#;
         let cfg: DatasetConfig = serde_yaml::from_str(yaml).expect("parse");
         assert_eq!(validate_conformance(&cfg), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod series_conformance {
+    use super::*;
+    use crate::dataset::DatasetConfig;
+
+    fn check(yaml: &str) -> Result<(), Vec<FacetViolation>> {
+        // This `DatasetConfig` is the catalog-side model, whose views are
+        // `DSView` — the same shape the catalog path realizes through.
+        let cfg: DatasetConfig =
+            serde_yaml::from_str(&format!("name: t\n{yaml}")).expect("loads");
+        validate_conformance(&cfg)
+    }
+
+    /// A conformant series draws no complaint.
+    #[test]
+    fn a_conformant_series_validates() {
+        assert!(
+            check(
+                "profiles:\n  default:\n    base_vectors:\n      source: base__NNNN.fvec\n\
+                 \x20     shard_stride: 100\n      shard_count: 3\n      record_count: 250\n"
+            )
+            .is_ok()
+        );
+    }
+
+    /// **Every shard is checked, not just the first** (SH-42, SH-43).
+    /// A series whose third file is the wrong format is as
+    /// non-conformant as one whose first is.
+    #[test]
+    fn a_wrong_format_in_a_later_shard_is_reported() {
+        let v = check(
+            "profiles:\n  default:\n    base_vectors:\n      source:\n        \
+             - a.fvec=10\n        - b.fvec=10\n        - c.parquet=10\n      record_count: 30\n",
+        )
+        .expect_err("a non-conformant shard must be reported");
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].path.contains("c.parquet"), "names the shard: {:?}", v[0]);
+    }
+
+    /// **A one-shard series is reported** — readers accept it, but it
+    /// must be spelled as a single file so pre-sharding readers can open
+    /// it (SH-4, SH-72).
+    #[test]
+    fn a_one_shard_series_is_reported_as_non_canonical() {
+        let v = check(
+            "profiles:\n  default:\n    base_vectors:\n      source:\n        \
+             - only.fvec=10\n      record_count: 10\n",
+        )
+        .expect_err("a one-shard series is not canonical");
+        assert!(v.iter().any(|x| x.detail.contains("single file")), "{v:?}");
+    }
+
+    /// A sharded filename classifies to its facet, so a conformant
+    /// series is not reported merely for being sharded (SH-6).
+    #[test]
+    fn a_sharded_filename_is_not_mistaken_for_an_unknown_facet() {
+        assert!(
+            check(
+                "profiles:\n  default:\n    metadata_results:\n      source:\n        \
+                 - metadata_results__0000.ivvec=5\n        - metadata_results__0001.ivvec=5\n\
+                 \x20     record_count: 10\n"
+            )
+            .is_ok()
+        );
     }
 }

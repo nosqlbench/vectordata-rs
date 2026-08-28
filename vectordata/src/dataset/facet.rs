@@ -279,11 +279,34 @@ impl StandardFacet {
         };
         let (basename, ext) = name.rsplit_once('.')?;
         let fmt = FacetFormat::from_extension(ext)?;
+        // A shard suffix belongs to the file, not the facet:
+        // `base_vectors__0007.fvec` is the seventh file of
+        // `base_vectors`, not a facet named `base_vectors__0007`
+        // (`docs/design/srd-multifile-facet-shards.md`, SH-6). Exactly
+        // four digits — the width is fixed (SH-2), so a name ending in
+        // some other run of digits is a name, not a shard.
+        let basename = Self::strip_shard_suffix(basename);
         Self::PREFERRED_ORDER
             .iter()
             .copied()
             .find(|f| f.basenames().contains(&basename) && f.accepts_format(fmt))
             .map(|f| (f, fmt))
+    }
+
+    /// Strip a trailing `__<4 digits>` shard suffix, if present.
+    ///
+    /// Composes with the `IDXFOR__` prefix stripping above, so
+    /// `IDXFOR__base_vectors__0007.ivvec.i32` reduces to
+    /// `base_vectors` (SH-6).
+    pub(crate) fn strip_shard_suffix(basename: &str) -> &str {
+        match basename.rsplit_once("__") {
+            Some((head, tail))
+                if tail.len() == 4 && tail.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                head
+            }
+            _ => basename,
+        }
     }
 
     /// Parse a facet from its canonical key name.
@@ -577,5 +600,50 @@ mod tests {
     #[test]
     fn test_resolve_standard_key_custom() {
         assert_eq!(resolve_standard_key("my_custom_facet"), None);
+    }
+}
+
+#[cfg(test)]
+mod shard_suffix {
+    use super::*;
+
+    /// **A shard suffix belongs to the file, not the facet** (SH-6).
+    #[test]
+    fn a_shard_suffix_classifies_to_its_facet() {
+        assert_eq!(
+            StandardFacet::classify("base_vectors__0007.fvec").map(|(f, _)| f),
+            Some(StandardFacet::BaseVectors)
+        );
+        assert_eq!(
+            StandardFacet::classify("base_vectors__0000.fvec").map(|(f, _)| f),
+            Some(StandardFacet::BaseVectors)
+        );
+        // The unsharded name still classifies, unchanged.
+        assert_eq!(
+            StandardFacet::classify("base_vectors.fvec").map(|(f, _)| f),
+            Some(StandardFacet::BaseVectors)
+        );
+    }
+
+    /// It composes with the `IDXFOR__` prefix: a shard's sidecar belongs
+    /// to the same facet as the shard.
+    #[test]
+    fn a_shards_sidecar_classifies_to_the_same_facet() {
+        assert_eq!(
+            StandardFacet::classify("IDXFOR__metadata_results__0003.ivvec.i32").map(|(f, _)| f),
+            Some(StandardFacet::MetadataResults)
+        );
+    }
+
+    /// **Exactly four digits.** The width is fixed (SH-2), so any other
+    /// run is part of the name — stripping it would turn a facet called
+    /// `x__12` into `x`.
+    #[test]
+    fn only_a_four_digit_run_is_a_shard_suffix() {
+        assert_eq!(StandardFacet::strip_shard_suffix("base_vectors__0007"), "base_vectors");
+        assert_eq!(StandardFacet::strip_shard_suffix("base_vectors__007"), "base_vectors__007");
+        assert_eq!(StandardFacet::strip_shard_suffix("base_vectors__00007"), "base_vectors__00007");
+        assert_eq!(StandardFacet::strip_shard_suffix("base_vectors__abcd"), "base_vectors__abcd");
+        assert_eq!(StandardFacet::strip_shard_suffix("base_vectors"), "base_vectors");
     }
 }

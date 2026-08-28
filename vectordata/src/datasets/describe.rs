@@ -135,7 +135,26 @@ fn render(entry: &CatalogEntry, profile_name: &str) {
     println!("Facets:");
     for (facet, view) in &profile.views {
         println!("  {facet}:");
-        println!("    source        {}", view.source.path);
+        if view.is_series() {
+            // Present the series as one facet with a shard count, and
+            // report a stride **only when the lengths are uniform**
+            // (SH-46) — a non-uniform series has no stride, and
+            // printing one would be a number that does not exist.
+            let sources = view.sources();
+            println!("    shards        {}", sources.len().max(1));
+            if let Some(stride) = view.shard_stride {
+                println!("    shard_stride  {stride}");
+            }
+            if let Some(n) = view.record_count {
+                println!("    records       {}",
+                    crate::dataset::source::format_count_with_suffix(n));
+            }
+            for (i, src) in sources.iter().enumerate() {
+                println!("    [{i:>4}]        {src}");
+            }
+        } else {
+            println!("    source        {}", view.source.path);
+        }
         if let Some(ns) = view.source.namespace.as_deref() {
             println!("    namespace     {ns}");
         }
