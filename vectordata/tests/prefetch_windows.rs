@@ -358,7 +358,7 @@ profiles:
     let plan = view
         .prefetch_plan("metadata_content", &parse_window("1..4").unwrap())
         .unwrap();
-    let (start, end) = plan.byte_ranges[0];
+    let (start, end) = (plan.byte_ranges[0].start, plan.byte_ranges[0].end);
 
     let reader: IndexedVvecReader<i32> = IndexedVvecReader::open(vv.to_str().unwrap()).unwrap();
 
@@ -1045,7 +1045,7 @@ fn a_remote_vvec_window_uses_the_published_index() {
         plan.prerequisite_bytes > 0,
         "the index had to be read, and the plan says so"
     );
-    let (start, end) = plan.requested_ranges[0];
+    let (start, end) = (plan.requested_ranges[0].start, plan.requested_ranges[0].end);
     assert!(end > start && end <= plan.facet_bytes);
     assert!(
         end - start < plan.facet_bytes,
@@ -2066,7 +2066,7 @@ fn a_scalar_window_covers_exactly_what_the_reader_reads() {
             &parse_window(&format!("{lo}..{hi}")).unwrap(),
         )
         .unwrap();
-    let (start, end) = plan.byte_ranges[0];
+    let (start, end) = (plan.byte_ranges[0].start, plan.byte_ranges[0].end);
 
     // Decode the planned span straight from the file...
     let raw = std::fs::read(tmp.path().join("scalars/layout.u32")).unwrap();

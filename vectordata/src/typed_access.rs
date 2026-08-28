@@ -224,6 +224,13 @@ fn read_native_value(data: &[u8], native: ElementType) -> i128 {
 /// is hidden inside the storage and selected by [`Storage::open`].
 pub struct TypedReader<T: TypedElement> {
     storage: Arc<Storage>,
+    /// The remaining shards, when this facet is a series.
+    ///
+    /// `None` for a single file — the case that must stay free of any
+    /// added indirection (SH-73). The offset arithmetic below is
+    /// unchanged either way; a series only changes *which* storage it
+    /// is applied to, and at which ordinal within that file (SH-64).
+    series: Option<Arc<crate::view::Series>>,
     native_type: ElementType,
     native_width: usize,
     is_scalar: bool,
@@ -294,13 +301,72 @@ impl<T: TypedElement> TypedReader<T> {
             (dim, count)
         };
         Ok(Self {
-            storage, native_type, native_width, is_scalar, dim, count,
+            storage, series: None, native_type, native_width, is_scalar, dim, count,
             _phantom: std::marker::PhantomData,
         })
     }
 
-    fn read_bytes(&self, offset: usize, len: usize) -> Result<Vec<u8>, TypedAccessError> {
-        self.storage.read_bytes(offset as u64, len as u64)
+    /// Build over a multi-file series.
+    ///
+    /// Every shard shares the element type and dimension (SRD invariant
+    /// 4), so the shape comes from the first file and the count comes
+    /// from the declaration rather than from dividing bytes.
+    pub(crate) fn from_series(
+        series: Arc<crate::view::Series>,
+        native_type: ElementType,
+        is_scalar: bool,
+    ) -> Result<Self, TypedAccessError> {
+        let first = series
+            .file(0)
+            .map_err(|e| TypedAccessError::Io(e.to_string()))?
+            .clone();
+        let count = series.shards().count() as usize;
+        let probe = Self::from_storage(first.clone(), native_type, is_scalar)?;
+        Ok(Self {
+            storage: first,
+            series: Some(series),
+            native_type,
+            native_width: native_type.byte_width(),
+            is_scalar,
+            dim: probe.dim,
+            count,
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
+    /// The storage holding `ordinal`, and the ordinal within that
+    /// file's own numbering (SH-64).
+    ///
+    /// For a single file this is the identity — the ordinal is already
+    /// a file ordinal — so the common path pays one `Option` test.
+    fn at(&self, ordinal: usize) -> Result<(Arc<Storage>, usize), TypedAccessError> {
+        match &self.series {
+            None => Ok((self.storage.clone(), ordinal)),
+            Some(s) => {
+                let located = s.shards().locate(ordinal as u64).ok_or_else(|| {
+                    TypedAccessError::Io(format!(
+                        "ordinal {ordinal} out of range (count {})",
+                        self.count
+                    ))
+                })?;
+                let file = s
+                    .file_index_of_shard(located.shard)
+                    .map_err(|e| TypedAccessError::Io(e.to_string()))?;
+                let storage = s.file(file).map_err(|e| TypedAccessError::Io(e.to_string()))?;
+                Ok((storage, located.file_ordinal as usize))
+            }
+        }
+    }
+
+    /// Read from a named storage, so a series can read from the file
+    /// that actually holds the ordinal.
+    fn read_from(
+        storage: &Storage,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, TypedAccessError> {
+        storage
+            .read_bytes(offset as u64, len as u64)
             .map_err(|e| TypedAccessError::Io(e.to_string()))
     }
 
@@ -315,10 +381,27 @@ impl<T: TypedElement> TypedReader<T> {
 
     /// Force-download every byte into the local cache. No-op for
     /// local files and for non-cacheable HTTP. Idempotent.
-    pub fn precache(&self) -> std::io::Result<()> { self.storage.precache() }
+    pub fn precache(&self) -> std::io::Result<()> {
+        match &self.series {
+            None => self.storage.precache(),
+            Some(s) => {
+                for i in 0..s.file_count() {
+                    s.file(i)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?
+                        .precache()?;
+                }
+                Ok(())
+            }
+        }
+    }
 
     /// Whether all bytes are locally accessible without network round-trips.
-    pub fn is_complete(&self) -> bool { self.storage.is_complete() }
+    pub fn is_complete(&self) -> bool {
+        match &self.series {
+            None => self.storage.is_complete(),
+            Some(s) => (0..s.file_count()).all(|i| s.file(i).is_ok_and(|f| f.is_complete())),
+        }
+    }
 
     /// Get a single value from a scalar file (dim=1), with checked conversion.
     pub fn get_value(&self, ordinal: usize) -> Result<T, TypedAccessError> {
@@ -326,13 +409,17 @@ impl<T: TypedElement> TypedReader<T> {
             return Err(TypedAccessError::Io(
                 format!("ordinal {ordinal} out of range (count {})", self.count)));
         }
+        // The offset formula is unchanged by sharding; only *which*
+        // file it applies to, and at which ordinal within that file
+        // (SH-64). For a single facet `at` is the identity.
+        let (storage, at) = self.at(ordinal)?;
         let offset = if self.is_scalar {
-            ordinal * self.native_width
+            at * self.native_width
         } else {
             let record_bytes = 4 + self.dim * self.native_width;
-            ordinal * record_bytes + 4
+            at * record_bytes + 4
         };
-        let bytes = self.read_bytes(offset, self.native_width)?;
+        let bytes = Self::read_from(&storage, offset, self.native_width)?;
         let val = read_native_value(&bytes, self.native_type);
         T::from_i128(val).ok_or(TypedAccessError::ValueOverflow {
             ordinal, value: val, target: T::type_name(),
@@ -345,14 +432,15 @@ impl<T: TypedElement> TypedReader<T> {
             return Err(TypedAccessError::Io(
                 format!("ordinal {ordinal} out of range (count {})", self.count)));
         }
+        let (storage, at) = self.at(ordinal)?;
         let offset = if self.is_scalar {
-            ordinal * self.native_width * self.dim
+            at * self.native_width * self.dim
         } else {
             let record_bytes = 4 + self.dim * self.native_width;
-            ordinal * record_bytes + 4
+            at * record_bytes + 4
         };
         let total_bytes = self.dim * self.native_width;
-        let bytes = self.read_bytes(offset, total_bytes)?;
+        let bytes = Self::read_from(&storage, offset, total_bytes)?;
         let mut result = Vec::with_capacity(self.dim);
         for d in 0..self.dim {
             let elem_offset = d * self.native_width;

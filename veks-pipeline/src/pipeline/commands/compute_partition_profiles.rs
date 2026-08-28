@@ -349,16 +349,20 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                                 path: format!("profiles/{}/base_vectors.fvecs", name),
                                 namespace: None,
                                 window: DSWindow::default(),
+                                declared_count: None,
                             },
                             window: None,
+                            ..Default::default()
                         });
                         views.insert("query_vectors".to_string(), DSView {
                             source: DSSource {
                                 path: format!("profiles/{}/query_vectors.fvecs", name),
                                 namespace: None,
                                 window: DSWindow::default(),
+                                declared_count: None,
                             },
                             window: None,
+                            ..Default::default()
                         });
 
                         // Inherit maxk from the default profile

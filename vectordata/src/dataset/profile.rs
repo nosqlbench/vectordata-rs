@@ -81,15 +81,92 @@ use serde::de::{self, Visitor};
 use super::facet::resolve_standard_key;
 use super::source::{DSInterval, DSSource, DSWindow, format_count_with_suffix, parse_number_with_suffix, parse_source_string};
 
+/// A `source:` that is either one string or an array of them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
 /// A view of a data facet within a profile.
 ///
 /// Wraps a `DSSource` with an optional view-level window override.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DSView {
     /// The data source for this view.
+    ///
+    /// For a **series** this is the first shard; use [`DSView::sources`]
+    /// to get all of them, and [`DSView::is_series`] to know which case
+    /// you are in. Reading this field directly on a series resolves the
+    /// facet to a fraction of itself, so a consumer that can meet one
+    /// must guard.
     pub source: DSSource,
     /// Optional view-level window override (takes precedence over source window).
     pub window: Option<DSWindow>,
+    /// Shards after the first, for an explicitly-listed series
+    /// (`docs/design/srd-multifile-facet-shards.md`, SH-50). Empty for
+    /// a single-file facet, which is every facet written before
+    /// multi-file support existed.
+    pub extra_sources: Vec<DSSource>,
+    /// Ordinals per shard for a uniform series (SH-49).
+    pub shard_stride: Option<u64>,
+    /// Shard count for a uniform series (SH-49).
+    pub shard_count: Option<u32>,
+    /// Declared total records across the series (SH-8).
+    pub record_count: Option<u64>,
+    /// Whether `source:` was written as an array.
+    ///
+    /// Recorded because a one-element array is *behaviourally* a single
+    /// file but is not the canonical spelling of one — and a validator
+    /// cannot report what the model has forgotten (SH-4, SH-72).
+    pub declared_as_array: bool,
+}
+
+impl DSView {
+    /// Every shard's source, in ordinal order.
+    pub fn sources(&self) -> Vec<&DSSource> {
+        std::iter::once(&self.source)
+            .chain(self.extra_sources.iter())
+            .collect()
+    }
+
+    /// Whether this view declares a multi-file series.
+    pub fn is_series(&self) -> bool {
+        !self.extra_sources.is_empty() || self.shard_count.is_some() || self.declared_as_array
+    }
+
+    /// Whether this view is a **series of one shard** — accepted by
+    /// readers, reported by validators (SH-4, SH-72).
+    pub fn is_one_shard_series(&self) -> bool {
+        self.shard_count == Some(1) || (self.declared_as_array && self.extra_sources.is_empty())
+    }
+
+    /// This view's declaration, realized by the **same** code the
+    /// `dataset.yaml` loader uses (SH-90).
+    pub(crate) fn declaration<'a>(
+        &self,
+        sources: &'a [String],
+    ) -> crate::dataset::shards::Declaration<'a> {
+        crate::dataset::shards::Declaration {
+            sources,
+            is_array: self.declared_as_array,
+            shard_stride: self.shard_stride,
+            shard_count: self.shard_count,
+            record_count: self.record_count,
+        }
+    }
+
+    /// This view's declaration, in the form the shard model consumes.
+    ///
+    /// Rendered back through `Display` and re-parsed by the shard model,
+    /// so the catalog path and the `dataset.yaml` path realize through
+    /// **one** implementation rather than two that can drift (SH-90).
+    /// `Display` and `parse_source_string` are inverses, which is what
+    /// makes that safe.
+    pub(crate) fn declaration_sources(&self) -> Vec<String> {
+        self.sources().iter().map(|s| s.to_string()).collect()
+    }
 }
 
 impl Serialize for DSView {
@@ -97,21 +174,39 @@ impl Serialize for DSView {
     where
         S: serde::Serializer,
     {
-        // Serialize as bare string when possible (simple path, no namespace, no windows)
+        // Serialize as bare string when possible (simple path, no
+        // namespace, no windows, no series).
         if self.window.is_none()
             && self.source.namespace.is_none()
             && self.source.window.is_empty()
+            && self.source.declared_count.is_none()
+            && !self.is_series()
         {
             serializer.serialize_str(&self.source.path)
         } else {
             use serde::ser::SerializeMap;
             let mut map = serializer.serialize_map(None)?;
-            map.serialize_entry("source", &self.source.path)?;
+            if self.extra_sources.is_empty() {
+                map.serialize_entry("source", &self.source.path)?;
+                if !self.source.window.is_empty() {
+                    map.serialize_entry("window", &self.source.window)?;
+                }
+            } else {
+                // A series round-trips through the source-string
+                // grammar, so each entry keeps its own window and count.
+                map.serialize_entry("source", &self.declaration_sources())?;
+            }
             if let Some(ref ns) = self.source.namespace {
                 map.serialize_entry("namespace", ns)?;
             }
-            if !self.source.window.is_empty() {
-                map.serialize_entry("window", &self.source.window)?;
+            if let Some(n) = self.shard_stride {
+                map.serialize_entry("shard_stride", &n)?;
+            }
+            if let Some(n) = self.shard_count {
+                map.serialize_entry("shard_count", &n)?;
+            }
+            if let Some(n) = self.record_count {
+                map.serialize_entry("record_count", &n)?;
             }
             if let Some(ref w) = self.window {
                 map.serialize_entry("window", w)?;
@@ -379,7 +474,10 @@ impl DSProfileGroup {
                         let canonical = resolve_standard_key(facet_key)
                             .unwrap_or_else(|| facet_key.clone());
                         if let Ok(source) = parse_source_string(&interpolated) {
-                            views.insert(canonical, DSView { source, window: None });
+                            views.insert(
+                                canonical,
+                                DSView { source, window: None, ..Default::default() },
+                            );
                         }
                     }
                     Some(views)
@@ -470,7 +568,7 @@ impl DSProfileGroup {
     /// the dataset crate see the same profile structure without needing the
     /// pipeline runtime.
     pub fn derive_views_from_templates(&mut self, templates: &[crate::dataset::pipeline::StepDef]) {
-        use super::source::{DSSource, DSWindow};
+        use super::source::DSSource;
 
         let per_profile_templates: Vec<&crate::dataset::pipeline::StepDef> =
             templates.iter().filter(|s| s.per_profile).collect();
@@ -544,10 +642,10 @@ impl DSProfileGroup {
                         DSView {
                             source: DSSource {
                                 path: resolved_path,
-                                namespace: None,
-                                window: DSWindow::default(),
+                                ..Default::default()
                             },
                             window: None,
+                            ..Default::default()
                         },
                     );
                 }
@@ -579,6 +677,11 @@ impl<'de> Deserialize<'de> for DSView {
                 Ok(DSView {
                     source,
                     window: None,
+                    extra_sources: Vec::new(),
+                    shard_stride: None,
+                    shard_count: None,
+                    record_count: None,
+                    declared_as_array: false,
                 })
             }
 
@@ -588,13 +691,25 @@ impl<'de> Deserialize<'de> for DSView {
             {
                 let mut window: Option<DSWindow> = None;
 
-                let mut source_path: Option<String> = None;
+                let mut source_paths: Option<Vec<String>> = None;
                 let mut source_namespace: Option<String> = None;
+                let mut declared_as_array = false;
+                let mut shard_stride: Option<u64> = None;
+                let mut shard_count: Option<u32> = None;
+                let mut record_count: Option<u64> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
+                        // One string or an array of them — the explicit
+                        // series form (SH-50).
                         "source" | "path" => {
-                            source_path = Some(map.next_value()?);
+                            source_paths = Some(match map.next_value::<OneOrMany>()? {
+                                OneOrMany::One(s) => vec![s],
+                                OneOrMany::Many(v) => {
+                                    declared_as_array = true;
+                                    v
+                                }
+                            });
                         }
                         "namespace" | "ns" => {
                             source_namespace = Some(map.next_value()?);
@@ -602,23 +717,43 @@ impl<'de> Deserialize<'de> for DSView {
                         "window" => {
                             window = Some(map.next_value()?);
                         }
+                        "shard_stride" => shard_stride = Some(map.next_value()?),
+                        "shard_count" => shard_count = Some(map.next_value()?),
+                        "record_count" => record_count = Some(map.next_value()?),
                         _ => {
                             let _ = map.next_value::<serde::de::IgnoredAny>()?;
                         }
                     }
                 }
 
-                let source = source_path
-                    .map(|path| DSSource {
-                        path,
-                        namespace: source_namespace,
-                        window: Default::default(),
-                    })
-                    .ok_or_else(|| {
-                        de::Error::custom("view map must have 'source' or 'path' key")
-                    })?;
+                let paths = source_paths.ok_or_else(|| {
+                    de::Error::custom("view map must have 'source' or 'path' key")
+                })?;
+                let mut parsed: Vec<DSSource> = Vec::with_capacity(paths.len());
+                for p in &paths {
+                    // Parse rather than take verbatim, so a window or an
+                    // `=count` written into a map-form source means the
+                    // same thing it does in the string form.
+                    let mut src = parse_source_string(p).map_err(de::Error::custom)?;
+                    if src.namespace.is_none() {
+                        src.namespace = source_namespace.clone();
+                    }
+                    parsed.push(src);
+                }
+                let mut it = parsed.into_iter();
+                let source = it.next().ok_or_else(|| {
+                    de::Error::custom("view 'source' must name at least one file")
+                })?;
 
-                Ok(DSView { source, window })
+                Ok(DSView {
+                    source,
+                    window,
+                    extra_sources: it.collect(),
+                    shard_stride,
+                    shard_count,
+                    record_count,
+                    declared_as_array,
+                })
             }
         }
 
@@ -1386,7 +1521,10 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                                 .unwrap_or_else(|| facet_key.clone());
                             let source = parse_source_string(&interpolated)
                                 .map_err(de::Error::custom)?;
-                            views.insert(canonical, DSView { source, window: None });
+                            views.insert(
+                                canonical,
+                                DSView { source, window: None, ..Default::default() },
+                            );
                         }
                         Some(views)
                     } else {
@@ -1550,6 +1688,23 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                 _ => Vec::new(),
             }
         }).unwrap_or_default();
+
+        // Realize every view's declaration far enough to catch one that
+        // disagrees with itself — through the same code the
+        // `dataset.yaml` loader runs, so a dataset cannot be accepted by
+        // one path and rejected by the other (SH-85, SH-90).
+        for (profile_name, profile) in &profiles {
+            for (facet_name, view) in &profile.views {
+                let sources = view.declaration_sources();
+                crate::dataset::shards::validate_declaration(
+                    facet_name,
+                    &view.declaration(&sources),
+                )
+                .map_err(|e| {
+                    de::Error::custom(format!("profile '{profile_name}': {e}"))
+                })?;
+            }
+        }
 
         Ok(DSProfileGroup {
             profiles,

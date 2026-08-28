@@ -25,6 +25,7 @@ pub mod facet;
 pub mod layout;
 pub mod pipeline;
 pub mod profile;
+pub mod shards;
 pub mod source;
 pub mod strata;
 

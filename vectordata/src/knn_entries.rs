@@ -83,6 +83,8 @@ impl KnnEntries {
         match by_dataset.into_iter().next() {
             Some((_, profiles)) => build_dataset_config(profiles),
             None => DatasetConfig {
+                // Synthesized in memory: version 1 by construction (V-2).
+                format_version: crate::model::FORMAT_VERSION_BASE,
                 attributes: HashMap::new(),
                 profiles: HashMap::new(),
             },
@@ -165,6 +167,8 @@ fn build_dataset_config(profiles_map: IndexMap<String, &KnnEntry>) -> DatasetCon
         });
     }
     DatasetConfig {
+        // Synthesized in memory: version 1 by construction (V-2).
+        format_version: crate::model::FORMAT_VERSION_BASE,
         attributes: HashMap::new(),
         profiles,
     }
@@ -209,8 +213,8 @@ _defaults:
         let config = entries.to_config();
         assert!(config.profiles.contains_key("default"));
         let default = &config.profiles["default"];
-        assert_eq!(default.base_vectors.as_ref().unwrap().source(), "profiles/base/base_vectors.fvec");
-        assert_eq!(default.neighbor_indices.as_ref().unwrap().source(), "profiles/base/neighbor_indices.ivec");
+        assert_eq!(default.base_vectors.as_ref().unwrap().source(), Some("profiles/base/base_vectors.fvec"));
+        assert_eq!(default.neighbor_indices.as_ref().unwrap().source(), Some("profiles/base/neighbor_indices.ivec"));
     }
 
     #[test]

@@ -173,8 +173,10 @@ pub fn parse_knn_entries_yaml(
                         path,
                         namespace: None,
                         window: Default::default(),
+                        declared_count: None,
                     },
                     window: None,
+                    ..Default::default()
                 };
                 profile.views.insert(facet, view);
             }

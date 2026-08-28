@@ -29,7 +29,7 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 
 /// Data source with optional namespace and window.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct DSSource {
     /// Path to the source file.
     pub path: String,
@@ -39,6 +39,17 @@ pub struct DSSource {
     /// Window (record range) restriction.
     #[serde(skip_serializing_if = "DSWindow::is_empty")]
     pub window: DSWindow,
+    /// The **edifying count** from a trailing `=<count>` suffix.
+    ///
+    /// Redundant by construction, and that is the point: it documents a
+    /// cardinality where a reader would otherwise do arithmetic on
+    /// seven-digit bounds, and it catches a typo in either bound. What
+    /// it is checked against depends on whether a window is present —
+    /// the window's length if so, the file's own cardinality if not.
+    ///
+    /// See `docs/design/srd-multifile-facet-shards.md`, SH-62.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_count: Option<u64>,
 }
 
 /// A window is a list of intervals (empty = ALL data).
@@ -79,13 +90,25 @@ impl fmt::Display for DSWindow {
 }
 
 impl fmt::Display for DSSource {
+    /// Render back to the source-string grammar, faithfully enough to
+    /// parse to an equal `DSSource`.
+    ///
+    /// That round trip is relied upon: it is how a view serializes back
+    /// to YAML, and how the catalog loader hands a source to the shard
+    /// model without a second parser.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.path)?;
         if let Some(ref ns) = self.namespace {
             write!(f, ":{}", ns)?;
         }
         if !self.window.is_empty() {
-            write!(f, "[{}]", self.window)?;
+            // `DSWindow` brackets itself; bracketing again produced
+            // `a.u8[[0..100]]`, which only parsed because the window
+            // parser strips an extra layer.
+            write!(f, "{}", self.window)?;
+        }
+        if let Some(n) = self.declared_count {
+            write!(f, "={n}")?;
         }
         Ok(())
     }
@@ -472,6 +495,7 @@ pub fn parse_window(s: &str) -> Result<DSWindow, String> {
 /// inner content is parsed by `parse_window`/`parse_interval`.
 pub fn parse_source_string(s: &str) -> Result<DSSource, String> {
     let s = s.trim();
+    let (s, declared_count) = split_declared_count(s)?;
 
     // Check for window delimiters: brackets or parens, including mixed forms
     // like "[0..1M)", "(0..1M]", etc. The opening delimiter can be '[' or '('
@@ -499,6 +523,7 @@ pub fn parse_source_string(s: &str) -> Result<DSSource, String> {
                 path: path.to_string(),
                 namespace,
                 window,
+                declared_count,
             });
         }
     }
@@ -509,7 +534,41 @@ pub fn parse_source_string(s: &str) -> Result<DSSource, String> {
         path: path.to_string(),
         namespace,
         window: DSWindow::default(),
+        declared_count,
     })
+}
+
+/// Split a trailing `=<count>` suffix off a source string.
+///
+/// `"a.u8=4194304"` → `("a.u8", Some(4194304))`
+/// `"a.u8[0..1M]=1M"` → `("a.u8[0..1M]", Some(1_000_000))`
+/// `"a.u8"` → `("a.u8", None)`
+///
+/// **A source carrying a query string is never split.** `=` is the
+/// key/value separator inside a URL query, so `f.fvec?token=abc123`
+/// would otherwise be read as a path with a count. The count form is
+/// not lost to such a source: a window (`f.fvec?token=abc[0..1M]`)
+/// declares the same cardinality, so the restriction costs nothing.
+///
+/// The suffix is also only taken when what follows `=` parses as a
+/// count. Anything else is left as part of the path, so an unrelated
+/// `=` cannot turn into a parse error.
+fn split_declared_count(s: &str) -> Result<(&str, Option<u64>), String> {
+    if s.contains('?') {
+        return Ok((s, None));
+    }
+    let Some((head, tail)) = s.rsplit_once('=') else {
+        return Ok((s, None));
+    };
+    if head.is_empty() || tail.is_empty() {
+        return Ok((s, None));
+    }
+    match parse_number_with_suffix(tail) {
+        Ok(n) if n > 0 => Ok((head.trim_end(), Some(n))),
+        // Not a count — leave it in the path rather than failing, so an
+        // `=` that means something else to some other consumer survives.
+        _ => Ok((s, None)),
+    }
 }
 
 /// Split a path string on the last colon that follows a dot-extension,
@@ -713,11 +772,124 @@ impl<'de> Deserialize<'de> for DSSource {
                     path,
                     namespace,
                     window: window.unwrap_or_default(),
+                    declared_count: None,
                 })
             }
         }
 
         deserializer.deserialize_any(SourceVisitor)
+    }
+}
+
+#[cfg(test)]
+mod declared_count {
+    use super::*;
+    /// **`Display` and `parse_source_string` are inverses.**
+    ///
+    /// Relied upon in two places: a view serializes back to YAML through
+    /// `Display`, and the catalog loader hands a parsed source to the
+    /// shard model by rendering it and re-parsing — which is what lets
+    /// both loaders share one realization instead of mirroring it
+    /// (SH-90).
+    #[test]
+    fn display_and_parse_are_inverses() {
+        for raw in [
+            "a.u8",
+            "a.u8[0..100]",
+            "m.slab:ns",
+            "m.slab:ns:[0..1K]",
+            "a.u8=500",
+            "a.u8[0..1M]=1M",
+            "https://h/f.fvec",
+            "b__0000.fvec",
+        ] {
+            let once = parse_source_string(raw).unwrap();
+            let again = parse_source_string(&once.to_string()).unwrap();
+            assert_eq!(once, again, "round trip changed {raw} (via {})", once);
+        }
+    }
+
+    /// The rendered form brackets a window exactly once. It used to
+    /// bracket twice — `a.u8[[0..100]]` — which parsed only because the
+    /// window parser strips an extra layer, and which is what a
+    /// serialized view wrote to disk.
+    #[test]
+    fn a_window_is_bracketed_once() {
+        let s = parse_source_string("a.u8[0..100]").unwrap();
+        assert_eq!(s.to_string(), "a.u8[0..100]");
+    }
+
+    /// The `=<count>` suffix parses off the end, with SI suffixes, and
+    /// leaves the path intact (SH-61).
+    #[test]
+    fn a_bare_name_may_declare_its_cardinality() {
+        let s = parse_source_string("corpus-part-a.u8=4194304").unwrap();
+        assert_eq!(s.path, "corpus-part-a.u8");
+        assert_eq!(s.declared_count, Some(4_194_304));
+        assert!(s.window.is_empty(), "a count is not a window");
+    }
+
+    /// A windowed entry may also carry one, so a mistyped bound is
+    /// caught against its own entry as well as against the series total
+    /// (SH-62).
+    #[test]
+    fn a_window_and_a_count_coexist() {
+        let s = parse_source_string("a.u8[0..1M]=1M").unwrap();
+        assert_eq!(s.path, "a.u8");
+        assert_eq!(s.window.0[0].min_incl, 0);
+        assert_eq!(s.window.0[0].max_excl, 1_000_000);
+        assert_eq!(s.declared_count, Some(1_000_000));
+    }
+
+    /// Namespaces still parse alongside a count.
+    #[test]
+    fn a_namespace_survives_a_count() {
+        let s = parse_source_string("meta.slab:mnodes=500").unwrap();
+        assert_eq!(s.path, "meta.slab");
+        assert_eq!(s.namespace.as_deref(), Some("mnodes"));
+        assert_eq!(s.declared_count, Some(500));
+    }
+
+    /// **A URL query string is never split on `=`.**
+    ///
+    /// `=` is the key/value separator inside a query, so a source like
+    /// `f.fvec?token=abc` would otherwise read as a path with a count.
+    /// The count form is not lost to such a source — a window declares
+    /// the same cardinality — so the restriction costs nothing.
+    #[test]
+    fn a_query_string_is_not_mistaken_for_a_count() {
+        let s = parse_source_string("https://h/f.fvec?token=12345").unwrap();
+        assert_eq!(s.path, "https://h/f.fvec?token=12345");
+        assert_eq!(s.declared_count, None, "the query value is not a count");
+
+        // And such a source can still declare its cardinality by window.
+        let w = parse_source_string("https://h/f.fvec?token=12345[0..1M]").unwrap();
+        assert_eq!(w.window.0[0].max_excl, 1_000_000);
+    }
+
+    /// An `=` whose tail is not a count is left in the path rather than
+    /// raising, so an unrelated `=` cannot become a parse error.
+    #[test]
+    fn a_non_count_suffix_stays_in_the_path() {
+        for raw in ["weird=name.u8", "a.u8=", "a.u8=abc", "=5"] {
+            let s = parse_source_string(raw).unwrap();
+            assert_eq!(s.declared_count, None, "{raw} must not yield a count");
+        }
+    }
+
+    /// Sources without a count report `None` — the field is additive and
+    /// every existing spelling keeps its meaning.
+    #[test]
+    fn existing_spellings_are_unchanged() {
+        for raw in [
+            "base.fvec",
+            "base.fvec[0..1M]",
+            "m.slab:content",
+            "m.slab:ns:[0..1K]",
+        ] {
+            let s = parse_source_string(raw).unwrap();
+            assert_eq!(s.declared_count, None, "{raw}");
+        }
     }
 }
 

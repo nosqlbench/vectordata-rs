@@ -981,8 +981,10 @@ mod tests {
                         path: format!("{}.fvec", v),
                         namespace: None,
                         window: crate::dataset::source::DSWindow::default(),
+                        declared_count: None,
                     },
                     window: None,
+                    ..Default::default()
                 },
             );
         }

@@ -204,10 +204,15 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
                             min_incl: 0,
                             max_excl: *count,
                         }]),
+                        // The window this imposes is new, so any count
+                        // the original source declared describes a
+                        // different range and must not be carried over.
+                        declared_count: None,
                     };
                     views.insert(facet_name.clone(), DSView {
                         source: windowed_source,
                         window: None,
+                        ..Default::default()
                     });
                 }
                 FacetRole::PerProfile => {
@@ -220,10 +225,14 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
                         path: new_path,
                         namespace: view.source.namespace.clone(),
                         window: DSWindow::default(),
+                        // A different file: the original's count does not
+                        // describe it.
+                        declared_count: None,
                     };
                     views.insert(facet_name.clone(), DSView {
                         source,
                         window: None,
+                        ..Default::default()
                     });
                 }
                 FacetRole::Shared => {

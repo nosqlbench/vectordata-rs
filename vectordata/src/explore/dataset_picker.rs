@@ -4312,8 +4312,10 @@ mod tests {
                 path: path.to_string(),
                 namespace: None,
                 window: Default::default(),
+                declared_count: None,
             },
             window: None,
+            ..Default::default()
         };
         let mut profile = DSProfile {
             maxk: None,
@@ -4358,8 +4360,10 @@ mod tests {
                 path: path.to_string(),
                 namespace: None,
                 window: Default::default(),
+                declared_count: None,
             },
             window: None,
+            ..Default::default()
         }
     }
 

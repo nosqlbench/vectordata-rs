@@ -1265,12 +1265,14 @@ profiles:
                 use super::super::source::{DSSource, DSWindow};
                 let mut v = IndexMap::new();
                 v.insert("base_vectors".to_string(), DSView {
-                    source: DSSource { path: "profiles/label-0/base_vectors.fvec".into(), namespace: None, window: DSWindow::default() },
+                    source: DSSource { path: "profiles/label-0/base_vectors.fvec".into(), namespace: None, window: DSWindow::default(), declared_count: None },
                     window: None,
+                    ..Default::default()
                 });
                 v.insert("query_vectors".to_string(), DSView {
-                    source: DSSource { path: "profiles/label-0/query_vectors.fvec".into(), namespace: None, window: DSWindow::default() },
+                    source: DSSource { path: "profiles/label-0/query_vectors.fvec".into(), namespace: None, window: DSWindow::default(), declared_count: None },
                     window: None,
+                    ..Default::default()
                 });
                 v
             },

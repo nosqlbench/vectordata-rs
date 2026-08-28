@@ -667,6 +667,36 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         })
     }
 
+    /// Build over an already-opened storage.
+    ///
+    /// `source` is still needed: it names the file whose sibling
+    /// `IDXFOR__` sidecar holds the offsets, and for a series that is
+    /// the *shard's own* file — each carries its own index, in its own
+    /// file ordinals (SH-17, SH-82).
+    pub(crate) fn from_storage(
+        storage: Arc<Storage>,
+        source: &str,
+        elem_size: usize,
+    ) -> Result<Self, IoError> {
+        let offsets = if crate::transport::is_remote_url(source) {
+            let translated = crate::transport::normalize_remote_url(source);
+            load_or_fetch_remote_offsets(
+                translated.as_ref(),
+                &storage,
+                elem_size,
+                OffsetSource::Rebuild,
+            )?
+        } else {
+            load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
+        };
+        Ok(Self {
+            storage,
+            offsets,
+            elem_size,
+            _phantom: PhantomData,
+        })
+    }
+
     pub fn count(&self) -> usize {
         self.offsets.len()
     }
