@@ -713,187 +713,6 @@ fn prefetching_a_mapped_series_window_needs_no_consent() {
     .expect("a mapped window never needs whole-facet consent");
 }
 
-// ─── Descriptor budget ─────────────────────────────────────────────
-
-/// **A series larger than its descriptor budget still reads** (SH-59).
-///
-/// Files open lazily and the least-recently-used is closed when the
-/// budget is reached, so the number of shards a facet may have is not
-/// bounded by `ulimit -n`. Eviction can never pull a file out from under
-/// a reader: it releases the series' claim, and a reader mid-read holds
-/// its own.
-#[test]
-fn a_series_wider_than_the_descriptor_budget_still_reads() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ds = tmp.path().join("ds");
-    std::fs::create_dir_all(&ds).unwrap();
-
-    // 40 shards of 1 record each.
-    let n = 40usize;
-    for i in 0..n {
-        write_fvec(&ds.join(format!("base__{i:04}.fvec")), 4, 1, i);
-    }
-    std::fs::write(
-        ds.join("dataset.yaml"),
-        format!(
-            "name: wide\nprofiles:\n  default:\n    base_vectors:\n      \
-             source: base__NNNN.fvec\n      shard_stride: 1\n      shard_count: {n}\n      \
-             record_count: {n}\n"
-        ),
-    )
-    .unwrap();
-
-    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-    let view = g.profile("default").unwrap();
-    let r = view.base_vectors().unwrap();
-    assert_eq!(r.count(), n);
-
-    // Every record reads, in order and out of order — the second pass
-    // re-opens files the first pass may have evicted.
-    for i in 0..n {
-        assert_eq!(r.get(i).unwrap()[0], i as f32, "record {i}");
-    }
-    for i in (0..n).rev() {
-        assert_eq!(r.get(i).unwrap()[0], i as f32, "reverse pass, record {i}");
-    }
-
-    // And the budget was enforced along the way: reading every record
-    // touched every file, but no more than the cap are held open.
-    let storage = view.open_facet_storage("base_vectors").unwrap();
-    let series = storage.series_ref().expect("a series");
-    for i in 0..n {
-        let _ = view.base_vectors().unwrap().get(i).unwrap();
-    }
-    assert!(
-        series.open_file_count() <= vectordata::view::open_file_cap(),
-        "open files ({}) exceeded the descriptor budget ({})",
-        series.open_file_count(),
-        vectordata::view::open_file_cap()
-    );
-}
-
-/// The cap is derived, not hardcoded, and leaves headroom for
-/// everything else the process holds open (SH-59).
-#[test]
-fn the_open_file_cap_is_derived_and_leaves_headroom() {
-    let cap = vectordata::view::open_file_cap();
-    assert!(cap >= 8, "a floor keeps small limits workable: {cap}");
-    // On any host this runs on, the budget should not be so small that
-    // it binds on ordinary fetch concurrency — SH-77's assumption.
-    assert!(cap > 0);
-}
-
-/// **Residency means addressable bytes, not whole files** (SH-92).
-///
-/// A facet slicing a fraction of a large file is complete when its
-/// window is resident — otherwise it would report incomplete forever
-/// unless the rest were downloaded, bytes it can never read.
-#[test]
-fn a_sliced_facet_is_complete_when_its_window_is() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ds = tmp.path().join("ds");
-    std::fs::create_dir_all(&ds).unwrap();
-    write_u32(&ds.join("corpus.u32"), 0..10_000);
-    std::fs::write(
-        ds.join("dataset.yaml"),
-        "name: sliced\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
-         - corpus.u32[0..10]=10\n        - corpus.u32[9990..10000]=10\n      record_count: 20\n",
-    )
-    .unwrap();
-
-    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-    let view = g.profile("default").unwrap();
-    let storage = view.open_facet_storage("metadata_layout").unwrap();
-
-    // Local storage is resident by definition, so the facet is complete
-    // — and it reads only 80 of the file's 40,000 bytes.
-    assert!(storage.is_complete());
-    assert!(
-        storage.precache().is_ok(),
-        "precache asks for the window, not the file"
-    );
-
-    let r: vectordata::TypedReader<u32> =
-        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
-    assert_eq!(r.count(), 20);
-    assert_eq!(r.get_value(0).unwrap(), 0);
-    assert_eq!(r.get_value(10).unwrap(), 9990);
-}
-
-// ─── Publication ───────────────────────────────────────────────────
-
-/// **Push publishes every shard and every sidecar** (SH-39).
-///
-/// It is filesystem-driven rather than declaration-driven, so shards —
-/// being ordinary files — are picked up by construction. This pins that
-/// they actually are, and that a temp left by a killed derive is not.
-#[test]
-fn a_published_series_lists_every_shard_and_sidecar() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ds = tmp.path().join("ds");
-    std::fs::create_dir_all(&ds).unwrap();
-    for i in 0..3 {
-        write_fvec(&ds.join(format!("base__{i:04}.fvec")), 4, 10, i * 10);
-        std::fs::write(ds.join(format!("base__{i:04}.fvec.mref")), b"mref").unwrap();
-    }
-    // A temp from a killed run, and a scratch file: neither is content.
-    std::fs::write(ds.join("base__0003.fvec.partial"), b"half").unwrap();
-    std::fs::write(
-        ds.join("dataset.yaml"),
-        "name: pub\nprofiles:\n  default:\n    base_vectors:\n      \
-         source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 3\n      \
-         record_count: 30\n",
-    )
-    .unwrap();
-
-    let scan = vectordata::push::plan::scan(&ds).expect("scan");
-    let names: Vec<String> = scan
-        .files
-        .iter()
-        .map(|f| {
-            std::path::Path::new(f)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
-        })
-        .collect();
-
-    for i in 0..3 {
-        assert!(
-            names.contains(&format!("base__{i:04}.fvec")),
-            "shard {i} not published: {names:?}"
-        );
-        assert!(
-            names.contains(&format!("base__{i:04}.fvec.mref")),
-            "shard {i}'s sidecar not published: {names:?}"
-        );
-    }
-    assert!(
-        !names.iter().any(|n| n.ends_with(".partial")),
-        "a temp from a killed run must not ship: {names:?}"
-    );
-}
-
-/// A catalog carries a series, so a remote consumer can enumerate the
-/// shards before fetching anything (SH-41).
-#[test]
-fn a_catalog_entry_round_trips_a_series() {
-    let yaml = "default:\n  base_vectors:\n    source:\n      - a.fvec=10\n      - b.fvec=10\n\
-                \x20   record_count: 20\n";
-    let group: vectordata::dataset::DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
-    let rendered = serde_yaml::to_string(&group).unwrap();
-    let again: vectordata::dataset::DSProfileGroup = serde_yaml::from_str(&rendered).unwrap();
-
-    let v = again.profiles["default"].views.get("base_vectors").unwrap();
-    assert!(
-        v.is_series(),
-        "the series must survive a catalog round trip: {rendered}"
-    );
-    assert_eq!(v.sources().len(), 2);
-    assert_eq!(v.record_count, Some(20));
-}
-
 // ─── Creation ──────────────────────────────────────────────────────
 
 /// **A derived series reads back as the dataset it was derived from.**
@@ -1043,3 +862,387 @@ fn deriving_without_a_stride_is_unchanged() {
     assert!(!yaml.contains("shard_"), "{yaml}");
 }
 
+// ─── Publication ───────────────────────────────────────────────────
+
+/// **Push publishes every shard and every sidecar** (SH-39).
+///
+/// It is filesystem-driven rather than declaration-driven, so shards —
+/// being ordinary files — are picked up by construction. This pins that
+/// they actually are, and that a temp left by a killed derive is not.
+#[test]
+fn a_published_series_lists_every_shard_and_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    for i in 0..3 {
+        write_fvec(&ds.join(format!("base__{i:04}.fvec")), 4, 10, i * 10);
+        std::fs::write(ds.join(format!("base__{i:04}.fvec.mref")), b"mref").unwrap();
+    }
+    // A temp from a killed run, and a scratch file: neither is content.
+    std::fs::write(ds.join("base__0003.fvec.partial"), b"half").unwrap();
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: pub\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 3\n      \
+         record_count: 30\n",
+    )
+    .unwrap();
+
+    let scan = vectordata::push::plan::scan(&ds).expect("scan");
+    let names: Vec<String> = scan
+        .files
+        .iter()
+        .map(|f| {
+            std::path::Path::new(f)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+
+    for i in 0..3 {
+        assert!(
+            names.contains(&format!("base__{i:04}.fvec")),
+            "shard {i} not published: {names:?}"
+        );
+        assert!(
+            names.contains(&format!("base__{i:04}.fvec.mref")),
+            "shard {i}'s sidecar not published: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n.ends_with(".partial")),
+        "a temp from a killed run must not ship: {names:?}"
+    );
+}
+
+/// A catalog carries a series, so a remote consumer can enumerate the
+/// shards before fetching anything (SH-41).
+#[test]
+fn a_catalog_entry_round_trips_a_series() {
+    let yaml = "default:\n  base_vectors:\n    source:\n      - a.fvec=10\n      - b.fvec=10\n\
+                \x20   record_count: 20\n";
+    let group: vectordata::dataset::DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+    let rendered = serde_yaml::to_string(&group).unwrap();
+    let again: vectordata::dataset::DSProfileGroup = serde_yaml::from_str(&rendered).unwrap();
+
+    let v = again.profiles["default"].views.get("base_vectors").unwrap();
+    assert!(
+        v.is_series(),
+        "the series must survive a catalog round trip: {rendered}"
+    );
+    assert_eq!(v.sources().len(), 2);
+    assert_eq!(v.record_count, Some(20));
+}
+
+// ─── Descriptor budget ─────────────────────────────────────────────
+
+/// **A series larger than its descriptor budget still reads** (SH-59).
+///
+/// Files open lazily and the least-recently-used is closed when the
+/// budget is reached, so the number of shards a facet may have is not
+/// bounded by `ulimit -n`. Eviction can never pull a file out from under
+/// a reader: it releases the series' claim, and a reader mid-read holds
+/// its own.
+#[test]
+fn a_series_wider_than_the_descriptor_budget_still_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+
+    // 40 shards of 1 record each.
+    let n = 40usize;
+    for i in 0..n {
+        write_fvec(&ds.join(format!("base__{i:04}.fvec")), 4, 1, i);
+    }
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        format!(
+            "name: wide\nprofiles:\n  default:\n    base_vectors:\n      \
+             source: base__NNNN.fvec\n      shard_stride: 1\n      shard_count: {n}\n      \
+             record_count: {n}\n"
+        ),
+    )
+    .unwrap();
+
+    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let r = view.base_vectors().unwrap();
+    assert_eq!(r.count(), n);
+
+    // Every record reads, in order and out of order — the second pass
+    // re-opens files the first pass may have evicted.
+    for i in 0..n {
+        assert_eq!(r.get(i).unwrap()[0], i as f32, "record {i}");
+    }
+    for i in (0..n).rev() {
+        assert_eq!(r.get(i).unwrap()[0], i as f32, "reverse pass, record {i}");
+    }
+
+    // And the budget was enforced along the way: reading every record
+    // touched every file, but no more than the cap are held open.
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+    let series = storage.series_ref().expect("a series");
+    for i in 0..n {
+        let _ = view.base_vectors().unwrap().get(i).unwrap();
+    }
+    assert!(
+        series.open_file_count() <= vectordata::view::open_file_cap(),
+        "open files ({}) exceeded the descriptor budget ({})",
+        series.open_file_count(),
+        vectordata::view::open_file_cap()
+    );
+}
+
+/// The cap is derived, not hardcoded, and leaves headroom for
+/// everything else the process holds open (SH-59).
+#[test]
+fn the_open_file_cap_is_derived_and_leaves_headroom() {
+    let cap = vectordata::view::open_file_cap();
+    assert!(cap >= 8, "a floor keeps small limits workable: {cap}");
+    // On any host this runs on, the budget should not be so small that
+    // it binds on ordinary fetch concurrency — SH-77's assumption.
+    assert!(cap > 0);
+}
+
+/// **Residency means addressable bytes, not whole files** (SH-92).
+///
+/// A facet slicing a fraction of a large file is complete when its
+/// window is resident — otherwise it would report incomplete forever
+/// unless the rest were downloaded, bytes it can never read.
+#[test]
+fn a_sliced_facet_is_complete_when_its_window_is() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    write_u32(&ds.join("corpus.u32"), 0..10_000);
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: sliced\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
+         - corpus.u32[0..10]=10\n        - corpus.u32[9990..10000]=10\n      record_count: 20\n",
+    )
+    .unwrap();
+
+    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let storage = view.open_facet_storage("metadata_layout").unwrap();
+
+    // Local storage is resident by definition, so the facet is complete
+    // — and it reads only 80 of the file's 40,000 bytes.
+    assert!(storage.is_complete());
+    assert!(
+        storage.precache().is_ok(),
+        "precache asks for the window, not the file"
+    );
+
+    let r: vectordata::TypedReader<u32> =
+        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
+    assert_eq!(r.count(), 20);
+    assert_eq!(r.get_value(0).unwrap(), 0);
+    assert_eq!(r.get_value(10).unwrap(), 9990);
+}
+
+// ─── Format version ────────────────────────────────────────────────
+
+/// **Absent means 1** (V-2). Every dataset in circulation omits the
+/// field, and they are all version 1 — not a distinct "unversioned"
+/// state to handle.
+#[test]
+fn a_dataset_without_a_version_is_version_one() {
+    let cfg: vectordata::model::DatasetConfig =
+        serde_yaml::from_str("profiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
+    assert_eq!(cfg.format_version, vectordata::model::FORMAT_VERSION_BASE);
+
+    let explicit: vectordata::model::DatasetConfig = serde_yaml::from_str(
+        "format_version: 1\nprofiles:\n  default:\n    base_vectors: b.fvec\n",
+    )
+    .unwrap();
+    assert_eq!(
+        explicit.format_version, cfg.format_version,
+        "an explicit 1 behaves identically to absence"
+    );
+}
+
+/// **A version above what this build supports is refused, naming both
+/// numbers** (V-9) — the diagnosis the field exists to give, in place of
+/// a type error on `source` or a missing `__NNNN` file.
+#[test]
+fn a_dataset_from_the_future_is_refused_with_both_numbers() {
+    let err = serde_yaml::from_str::<vectordata::model::DatasetConfig>(
+        "format_version: 99\nprofiles:\n  default:\n    base_vectors: b.fvec\n",
+    )
+    .expect_err("a version this build cannot read must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("99"), "names what the dataset needs: {msg}");
+    assert!(
+        msg.contains(&vectordata::model::FORMAT_VERSION_SUPPORTED.to_string()),
+        "names what this build supports: {msg}"
+    );
+}
+
+/// The refusal is at **load**, before any facet is opened (V-10). A
+/// dataset the reader cannot understand must not be half-read.
+#[test]
+fn a_refused_version_opens_no_facet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    write_fvec(&ds.join("base.fvec"), 4, 10, 0);
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: future\nformat_version: 99\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
+    )
+    .unwrap();
+    assert!(
+        vectordata::TestDataGroup::load(ds.to_str().unwrap()).is_err(),
+        "a dataset above this build's version must not load at all"
+    );
+}
+
+/// **A new build writing an unsharded dataset emits no version** (V-5),
+/// so it stays readable by every build that ever existed. The field is
+/// worthless if adding it changes what older builds can read.
+#[test]
+fn an_unsharded_derive_emits_no_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write_fvec(&src.join("base_vectors.fvec"), 4, 20, 0);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: src\nprofiles:\n  default:\n    base_vectors: base_vectors.fvec\n",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(),
+            "default",
+            &out,
+            "",
+            &[],
+            &[],
+            Some("derived"),
+            true,
+            None,
+        ),
+        0
+    );
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(!yaml.contains("format_version"), "{yaml}");
+}
+
+/// A sharded derive declares version 2 (V-8), because that is the
+/// lowest version describing what it wrote.
+#[test]
+fn a_sharded_derive_declares_version_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write_fvec(&src.join("base_vectors.fvec"), 4, 250, 0);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: src\nprofiles:\n  default:\n    base_vectors: base_vectors.fvec\n",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(),
+            "default",
+            &out,
+            "",
+            &[],
+            &[],
+            Some("derived"),
+            true,
+            Some(100),
+        ),
+        0
+    );
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(yaml.contains("format_version: 2"), "{yaml}");
+
+    // And it round-trips: this build supports 2, so it still reads.
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    assert_eq!(
+        g.profile("default")
+            .unwrap()
+            .base_vectors()
+            .unwrap()
+            .count(),
+        250
+    );
+}
+
+/// **The required version is derived from the shape, not read from a
+/// field** (V-19) — so a writer cannot drift from the rule, because it
+/// does not restate it.
+#[test]
+fn the_required_version_is_derived_from_the_declaration() {
+    let plain: vectordata::model::DatasetConfig =
+        serde_yaml::from_str("profiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
+    assert_eq!(plain.min_format_version(), 1);
+    assert!(plain.is_v1(), "a v1 dataset proves its own compatibility");
+
+    let sharded: vectordata::model::DatasetConfig = serde_yaml::from_str(
+        "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n      \
+         shard_stride: 100\n      shard_count: 3\n      record_count: 250\n",
+    )
+    .unwrap();
+    assert_eq!(sharded.min_format_version(), 2);
+    assert!(
+        !sharded.is_v1(),
+        "a sharded dataset cannot claim v1 compatibility"
+    );
+}
+
+/// **A v1 declaration is held as the v1 case, not re-encoded** (V-17).
+/// The version is visible in the type rather than probed from whether an
+/// option happens to be set.
+#[test]
+fn a_v1_declaration_stays_the_v1_case() {
+    use vectordata::model::FacetConfig;
+    let cfg: vectordata::model::DatasetConfig = serde_yaml::from_str(
+        "profiles:\n  default:\n    base_vectors: b.fvec\n    query_vectors:\n      \
+         source: q.fvec\n      window: 0..10\n",
+    )
+    .unwrap();
+    let p = &cfg.profiles["default"];
+    assert!(matches!(p.base_vectors, Some(FacetConfig::Simple(_))));
+    assert!(matches!(
+        p.query_vectors,
+        Some(FacetConfig::Detailed { .. })
+    ));
+    assert!(p.base_vectors.as_ref().unwrap().try_as_v1().is_some());
+}
+
+/// **A declaration cannot understate itself** (V-14): a stated version
+/// below what the content needs is refused.
+#[test]
+fn a_stated_version_below_the_content_is_refused() {
+    let err = serde_yaml::from_str::<vectordata::model::DatasetConfig>(
+        "format_version: 1\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: b__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
+         record_count: 250\n",
+    )
+    .expect_err("a version below the content must be refused");
+    assert!(err.to_string().contains("understate"), "{err}");
+}
+
+/// **Absence is not a claim** (V-22). An unannotated sharded dataset
+/// loads: a reader new enough to notice the omission is new enough to
+/// read it, and refusing would reject every hand-written dataset.
+#[test]
+fn an_absent_version_is_not_an_understatement() {
+    let cfg: vectordata::model::DatasetConfig = serde_yaml::from_str(
+        "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n      \
+         shard_stride: 100\n      shard_count: 3\n      record_count: 250\n",
+    )
+    .expect("an unannotated sharded dataset loads");
+    assert_eq!(cfg.format_version, 1, "absent still means 1 for the gate");
+    assert_eq!(cfg.min_format_version(), 2, "but the content needs 2");
+}
