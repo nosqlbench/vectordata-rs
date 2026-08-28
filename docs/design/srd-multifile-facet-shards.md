@@ -149,6 +149,14 @@ the sharded declaration must preserve it; a field that an older reader
 would silently ignore while still resolving the facet is the one shape
 this design must not grow.
 
+A sharded dataset also declares `format_version: 2`
+([srd-dataset-format-version.md](srd-dataset-format-version.md), V-7),
+which turns that failure from a symptom into a diagnosis for every
+reader built from that point on. It does **not** help the readers that
+already exist — they do not know to look for the field — so SH-74's
+loud-failure requirement stands on its own and is not weakened by
+having a version.
+
 ### 4a. Uniform form
 
 **SH-49.** `source` is a string carrying the `NNNN` field, with
@@ -187,6 +195,24 @@ specificity:
 | `a.u8[0..1M]` | implied by the interval | a slice |
 | `a.u8[0..1M]=1M` | implied *and* declared | a slice, cross-checked |
 
+The `=<count>` suffix is taken from the end, accepts the same SI
+suffixes intervals do, and is bound by two parse restrictions.
+
+**A source containing `?` is never split on `=`.** The `=` is the
+key/value separator inside a URL query string, so
+`https://h/f.fvec?token=12345` would otherwise read as a path with a
+count of 12345 — a wrong answer that looks like a right one. The
+restriction costs nothing, because such a source declares its
+cardinality by window instead:
+`https://h/f.fvec?token=12345[0..1M]`. That spelling is available to
+every source, so no entry is left unable to state its length.
+
+**An `=` whose tail does not parse as a count stays in the path.**
+`weird=name.u8` is a filename, not a malformed count, and a grammar
+that raised on it would make an unrelated character a parse error.
+Recognition is therefore positive — a count is taken only when one is
+unambiguously present — rather than a rule the path has to escape.
+
 **SH-62.** The `=<count>` suffix is an **edifying count**: redundant by
 construction, and that is the point. It documents an entry's
 cardinality where a reader would otherwise have to do arithmetic on
@@ -209,11 +235,27 @@ entry scale — declared, redundant, checked — and together the two give a
 mistyped bound two independent chances to be caught: once against its
 own entry's count, once against the series total.
 
+A query-string source (SH-61) reaches the same guarantee through the
+windowed row rather than the bare one: `f.fvec?t=1[0..1M]` is checked
+against its interval exactly as `a.u8[0..1M]` is. What it cannot have is
+the *whole-file* claim of `a.u8=N`, since that spelling is the one the
+restriction withholds. A series that needs a file's total pinned and
+whose sources carry query strings states the window explicitly and gets
+the weaker-but-sufficient check.
+
 **SH-63.** A window on an entry makes that entry's cardinality
 self-declaring, so **a windowed or `=`-counted entry is legal remotely**
-with no file access. A bare filename is a local-only convenience,
-because resolving it costs one round trip per shard — the exact expense
-declaration exists to avoid.
+with no file access. In an explicit series a bare filename is a
+local-only convenience, because resolving it opens every shard before a
+single record is read — the exact expense declaration exists to avoid.
+
+The restriction is on the **series**, not on remoteness. A plain
+single-file facet — `base_vectors: s3://…/base.fvecs`, which is how
+almost every remote facet in existence is written — stays legal bare.
+Its reader must open that file to read anything, so learning its count
+is the same open rather than an extra one, and there is no per-shard
+multiplication to avoid. Requiring a declared count there would break
+every remote facet ever written in exchange for nothing.
 
 **SH-52.** Ordinals are assigned by **concatenation in declared order**:
 entry order is ordinal order, and the global space is the entries'
@@ -555,6 +597,18 @@ this work. The derivation leaves headroom for everything else the
 process holds open (transport sockets, other facets, sidecars); the
 fraction is an implementation constant, the limit itself is not.
 
+**SH-99.** A whole-facet accessor that **cannot fail** must not answer
+`0` for a facet it cannot size. A declared shard that will not open is a
+broken facet, and `0` is indistinguishable from an empty one — the
+silent shape this design exists to forbid.
+
+The fallible form is the real accessor: it propagates the reason and
+names the file. The infallible one delegates to it, logs the failure,
+and returns `0` — which is the only answer its signature allows, and is
+why every caller that can report a failure uses the other. This applies
+wherever a series is summarized behind a signature with no error
+channel.
+
 **SH-27.** `is_complete()` means **every byte this facet can address is
 resident** — not every byte of every file it draws from. `precache()`
 drives exactly that set. A file referenced by two shards is fetched once
@@ -678,6 +732,14 @@ not because a pinning step ran over it. `push` already turns a local
 declaration into a published one; emitting what the loader realized is
 that same transformation, not a new one. There is no separate pinning
 pass anywhere in the system, and the user's own file is never rewritten.
+
+**SH-100.** Publication is **filesystem-driven**, so shards need no
+special handling to be published: they are ordinary files and are picked
+up, checksummed, and listed by the same walk that finds every other
+file. What does need handling is the *inverse* — a partial write must
+not ship. Shard temps therefore carry a suffix the publish walk already
+excludes, so a temp surviving a killed run cannot be published as if it
+were a shard.
 
 **SH-84.** A sliced series publishes its files **whole**. A window
 selects which ordinals a facet exposes, not which bytes exist — the file
@@ -865,6 +927,7 @@ diagnosable in one runtime and inscrutable in the other.
 | `MixedShardDeclaration` | array `source` alongside `shard_stride`/`shard_count` |
 | `NonCanonicalSingleShard` | a sharded declaration describing one shard |
 | `UnboundedRemoteShardEntry{i}` | bare filename in a remote series |
+| `ShardCacheCollision{a, b, relpath}` | two files of one series share a cache path |
 
 ## 17. Invariants
 
@@ -919,13 +982,19 @@ appears to leave open.
 - Records spanning shards.
 - Discovery by probing.
 
-## 19. Interaction with facet variants
+## 19. Interaction with parameterized profiles
 
-A variant-qualified facet may itself be sharded, giving filenames like
-`postfiltered_neighbor_indices__sel001__0000.ivecs`. In the **uniform**
-form the shard field is always last before the extension and always
-all-digits; therefore **a variant token must never be all-digits**. See
-[srd-facet-variants.md](srd-facet-variants.md), FV-6.
+A facet belonging to a parameterized profile may itself be sharded, and
+generators build filenames from the profile name — giving names like
+`postfiltered_neighbor_indices__sel001__0000.ivecs`.
+
+**SH-101.** A token placed before the shard field must never be
+**all-digits**. In the uniform form the shard field is always last
+before the extension and always four digits (SH-1, SH-2), so
+`…__0010__0000.ivecs` has two readings and neither is decidable. This
+binds any generator that interpolates a profile name into a filename —
+see
+[srd-profile-parameterization.md](srd-profile-parameterization.md), P-9.
 
 The constraint is specific to the uniform form, because that is the only
 one whose filenames are *parsed* for a shard field. Explicit-form
@@ -981,12 +1050,21 @@ no naming constraint at all — including none on digits.
 | 51 | sharded slab, namespace selector | `x__0000.slab:mnodes` resolves both parses |
 | 52 | slab shard ordinals | relative per shard; base comes from the map, not the footers |
 | 53 | every dataset predating this feature | unchanged on disk and in declaration; no migration step exists |
+| 54 | series wider than the descriptor budget | reads; open files never exceed the cap |
+| 55 | sliced facet, window resident | complete; precache asks for the window, not the file |
+| 56 | shard temp from a killed run | excluded from publication |
+| 57 | derive with a stride | shards, sidecars, and a declaration that reads back |
+| 58 | derive that fits one shard | single-file form; no shard fields declared |
 | 24 | explicit prefix sums | strictly increasing, end at `record_count` |
 | 25 | sliced entries | windowed view equals the same records copied into whole files |
 | 26 | one file, two disjoint windows | both resolve; one `Storage` opened |
 | 27 | `=<count>` disagrees with its interval | `SliceCountMismatch` |
+| 27a | `=<count>` disagrees with its file's cardinality | `SliceCountMismatch` |
+| 27b | source with a query string | `=` not split; window still declares the count |
+| 27c | `=` whose tail is not a count | stays in the path; no parse error |
 | 28 | entry window past end of file | `WindowExceedsFile` |
 | 29 | bare filename in a remote series | `UnboundedRemoteShardEntry` before any fetch |
+| 29a | bare single-file remote facet | legal; opens once as it always has |
 | 30 | profile window over a sliced series | selects in facet ordinals, not file ordinals |
 | 31 | multi-interval entry | `MultiIntervalShardEntry` |
 
