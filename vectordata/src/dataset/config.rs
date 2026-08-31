@@ -579,7 +579,37 @@ impl DatasetConfig {
                             {
                                 continue;
                             }
-                    if view.window.is_none()
+                    // A series must be written in the form it was
+                    // declared in. Emitting `view.source.path` would
+                    // write a uniform series' `NNNN` pattern with no
+                    // stride or count — a declaration naming a file
+                    // that does not exist — and would drop every entry
+                    // of an explicit one after the first. Saving a
+                    // dataset must not be able to destroy it
+                    // (`srd-multifile-facet-shards.md`, SH-85).
+                    if view.is_series() {
+                        out.push_str(&format!("    {}:\n", key));
+                        if view.shard_count.is_some() {
+                            out.push_str(&format!("      source: {}\n", view.source));
+                            if let Some(stride) = view.shard_stride {
+                                out.push_str(&format!("      shard_stride: {stride}\n"));
+                            }
+                            if let Some(count) = view.shard_count {
+                                out.push_str(&format!("      shard_count: {count}\n"));
+                            }
+                        } else {
+                            out.push_str("      source:\n");
+                            for entry in view.sources() {
+                                out.push_str(&format!("        - {}\n", entry));
+                            }
+                        }
+                        if let Some(records) = view.record_count {
+                            out.push_str(&format!("      record_count: {records}\n"));
+                        }
+                        if let Some(ref w) = view.window {
+                            out.push_str(&format!("      window: \"{}\"\n", w));
+                        }
+                    } else if view.window.is_none()
                         && view.source.namespace.is_none()
                         && view.source.window.is_empty()
                     {
@@ -622,15 +652,20 @@ impl DatasetConfig {
 
         for (profile_name, profile) in &self.profiles.profiles {
             for (key, view) in &profile.views {
-                // Reject paths into managed directories
-                let path = Path::new(view.path());
-                if let Some(first) = path.components().next() {
-                    let s = first.as_os_str().to_string_lossy();
-                    if s == ".scratch" || s == ".cache" {
-                        errors.push(format!(
-                            "Profile '{}', view '{}': path '{}' must not be under managed directory '{}'",
-                            profile_name, key, view.path(), s
-                        ));
+                // Reject paths into managed directories. Checked for
+                // **every** shard: a series that names `.scratch/` in
+                // its third file is as invalid as one that names it
+                // first, and checking only `path()` would pass it.
+                for source in view.sources() {
+                    let path = Path::new(source.path.as_str());
+                    if let Some(first) = path.components().next() {
+                        let s = first.as_os_str().to_string_lossy();
+                        if s == ".scratch" || s == ".cache" {
+                            errors.push(format!(
+                                "Profile '{}', view '{}': path '{}' must not be under managed directory '{}'",
+                                profile_name, key, source.path, s
+                            ));
+                        }
                     }
                 }
             }
@@ -999,6 +1034,31 @@ profiles:
             errors.iter().any(|e| e.contains(".cache")),
             "expected .cache rejection, got: {:?}",
             errors
+        );
+    }
+
+    /// **Validation sees every shard, not the first.**
+    ///
+    /// A series that reaches into a managed directory in its third file
+    /// is as invalid as one that does it in its first, and checking
+    /// only `view.path()` would let it through.
+    #[test]
+    fn validate_rejects_a_managed_path_in_a_later_shard() {
+        let yaml = "\
+name: test
+profiles:
+  default:
+    base_vectors:
+      source:
+        - part_a.fvec=100
+        - .scratch/part_b.fvec=100
+      record_count: 200
+";
+        let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        let errors = config.validate(Path::new("."));
+        assert!(
+            errors.iter().any(|e: &String| e.contains(".scratch/part_b.fvec")),
+            "a later shard's managed path must be reported, got: {errors:?}"
         );
     }
 

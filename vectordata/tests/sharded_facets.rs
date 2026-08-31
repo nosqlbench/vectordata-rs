@@ -1246,3 +1246,62 @@ fn an_absent_version_is_not_an_understatement() {
     assert_eq!(cfg.format_version, 1, "absent still means 1 for the gate");
     assert_eq!(cfg.min_format_version(), 2, "but the content needs 2");
 }
+
+/// **Saving a dataset must not be able to destroy it** (SH-85).
+///
+/// The compact writer emitted `view.source.path`, which for a uniform
+/// series is the `NNNN` pattern with no stride or count — a declaration
+/// naming a file that does not exist — and for an explicit one dropped
+/// every entry after the first. Any command that loads and re-saves a
+/// sharded `dataset.yaml` would have silently reduced it to a fraction
+/// of itself.
+#[test]
+fn saving_a_sharded_dataset_preserves_its_series() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    for s in 0..3 {
+        write_fvec(&ds.join(format!("base__{s:04}.fvec")), 4, 50, s * 50);
+    }
+    write_fvec(&ds.join("part_a.fvec"), 4, 20, 0);
+    write_fvec(&ds.join("part_b.fvec"), 4, 20, 20);
+    let yaml = "name: keep\nprofiles:\n  default:\n    base_vectors:\n      \
+                source: base__NNNN.fvec\n      shard_stride: 50\n      shard_count: 3\n      \
+                record_count: 150\n    query_vectors:\n      source:\n        \
+                - part_a.fvec=20\n        - part_b.fvec=20\n      record_count: 40\n";
+    let path = ds.join("dataset.yaml");
+    std::fs::write(&path, yaml).unwrap();
+
+    let cfg = vectordata::dataset::DatasetConfig::load(&path).expect("loads");
+    let saved = cfg.to_expanded_yaml_string(&path).expect("renders");
+
+    // Both forms survive, each in its own spelling.
+    assert!(saved.contains("source: base__NNNN.fvec"), "{saved}");
+    assert!(saved.contains("shard_stride: 50"), "{saved}");
+    assert!(saved.contains("shard_count: 3"), "{saved}");
+    assert!(saved.contains("- part_a.fvec=20"), "{saved}");
+    assert!(saved.contains("- part_b.fvec=20"), "{saved}");
+
+    // And the saved text reads back as the same facets.
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    for s in 0..3 {
+        std::fs::copy(
+            ds.join(format!("base__{s:04}.fvec")),
+            out.join(format!("base__{s:04}.fvec")),
+        )
+        .unwrap();
+    }
+    std::fs::copy(ds.join("part_a.fvec"), out.join("part_a.fvec")).unwrap();
+    std::fs::copy(ds.join("part_b.fvec"), out.join("part_b.fvec")).unwrap();
+    std::fs::write(out.join("dataset.yaml"), &saved).unwrap();
+
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let base = view.base_vectors().unwrap();
+    assert_eq!(base.count(), 150, "the uniform series survived the round trip");
+    assert_eq!(base.get(149).unwrap()[0], 149.0);
+    let query = view.query_vectors().unwrap();
+    assert_eq!(query.count(), 40, "the explicit series kept both entries");
+    assert_eq!(query.get(39).unwrap()[0], 39.0);
+}
