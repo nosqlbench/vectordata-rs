@@ -220,3 +220,91 @@ filesystem probe entirely from `StandardFacet::basenames()` ×
 
 Full workspace green after Stage 3: `cargo test --workspace
 --no-fail-fast` = **2453 passed, 0 failed**.
+
+## Stage 4 — the reader (DONE)
+
+Stages 1–3 settled where a metadata facet's bytes live, which namespace
+is authoritative, and how conformance is enforced. What none of them
+provided was a way to **read** one through this crate. The vector
+readers in `vectordata::io` are built on fixed-width elements; a slab
+record is neither fixed nor an element run, so every route refused it —
+`facet()` answered *"cannot infer element size from extension '.slab'"*
+for a facet Stage 3's own spec calls conformant.
+
+The codecs were not the gap. Both stages of the record pipeline were
+already present and public:
+
+```text
+slab ──[container]──▶ &[u8] ──[stage 1]──▶ ANode ──[stage 2]──▶ text ──[serde]──▶ T
+        Stage 4               formats::anode      formats::anode_vernacular
+```
+
+**The container is `vectordata::records`.** `RecordFacet` resolves a
+facet ordinal to the container holding it and that container's local
+ordinal, then asks slabtastic. For a single file there is one container;
+for a series there is one per shard, in ordinal order.
+
+**Currying, not a second implementation.** Applying a codec to a facet
+produces a typed reader:
+
+```rust
+let facet = view.open_facet_records("metadata_content")?;
+
+facet.decode(Anode)                    // get(o) -> ANode
+facet.decode(Text(Vernacular::Cql))    // get(o) -> String
+facet.decode(Serde::<Row>::new())      // get(o) -> Row
+```
+
+The untyped level is `Records<Anode>` — the codec that stops after stage
+1 — rather than a path of its own. A codec is a **value**, not only a
+type, so one named in a setting reaches the same `decode` as one written
+in a type signature; `codec_by_name("cql")` resolves through the same
+`Vernacular::parse` every other by-name surface uses. `Serde<T>` routes a
+record through the JSON vernacular into any `Deserialize` target, so a
+caller names its own struct and this crate knows nothing about it.
+`record_bytes(ordinal) -> &[u8]` sits beneath all of it for anything that
+wants to decode some other way.
+
+### Rulings this stage adds
+
+8. **The dialect comes from the record, never from the facet.**
+   `MNode::to_bytes` writes `DIALECT_MNODE` and `PNode::to_bytes_named`
+   writes `DIALECT_PNODE` as the leading byte, and those buffers are what
+   the producers hand to `add_record`. The same container holds MNodes in
+   content position and PNodes in predicate position; deriving the
+   dialect from the facet table would put record identity in two places
+   when the bytes already carry it. A facet holding a mix reads without
+   the caller declaring which is which.
+
+9. **A namespace is a facet of its own.** `facet.namespace("schema")`
+   returns a `RecordFacet` over the same containers under a different
+   name, so the schema sidecar, the `layout` convenience copy and the
+   `survey` report are one operation against three names rather than
+   three special cases.
+
+10. **An absent namespace reports empty, not broken.** Ruling 2 makes the
+    embedded `layout` copy optional and several producers never write
+    one. The container opens the file first — so a real I/O or format
+    failure stays a failure — and lets only the namespace probe answer
+    "absent", which is the separation `dataset::layout` already made and
+    for the same reason.
+
+11. **Residency is required, and refused by name when missing.** A slab
+    is read by memory map, so a remote facet's bytes must be on disk
+    first. An un-precached facet is refused with a message saying so,
+    rather than mapped sparsely — where holes read as zeroes and surface
+    later as a dialect error against an unrelated record.
+
+### What this unblocks
+
+A **sharded** metadata facet now reads through the same surface, which
+makes `srd-multifile-facet-shards.md`'s slab requirements testable in
+this crate rather than only in slabtastic:
+
+- **SH-96** — shards carry relative ordinals. Each shard is an ordinary
+  slab based at zero and the global base lives only in the shard map;
+  the reader proves it by answering facet ordinal 20 with the record that
+  shard 2 calls its own ordinal 0.
+- **SH-98** — an embedded `layout` namespace does not travel into a
+  sharded content facet. Asked for one, the facet reports nothing, from
+  every shard alike.
