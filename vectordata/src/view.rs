@@ -361,6 +361,15 @@ fn map_in_file(
     if hi <= lo {
         return None;
     }
+    // A slab carries its own ordinal index in its tail, so a window
+    // maps to the pages it spans. Without this branch the extension
+    // fails `infer_elem_size` below and every slab window degrades to a
+    // whole-facet fetch — which would leave the planner claiming a cost
+    // the reader does not pay, since a record read costs its page.
+    if slab_ext(path_no_window) {
+        return map_in_slab(path_no_window, lo, hi, storage);
+    }
+
     let ext = path_no_window.rsplit('.').next().unwrap_or("");
     let elem_size = crate::io::infer_elem_size(ext);
     if elem_size == 0 {
@@ -434,6 +443,54 @@ fn map_in_file(
     // A uniform-stride mapping costs a 4-byte header read, which every
     // reader pays on first access anyway — nothing to report.
     (byte_start < byte_end).then_some((byte_start, byte_end, 0))
+}
+
+/// Whether a locator names a slab, ignoring any `:namespace` suffix.
+fn slab_ext(locator: &str) -> bool {
+    let path = locator.split(':').next().unwrap_or(locator);
+    path.rsplit('.')
+        .next()
+        .is_some_and(|e| e.eq_ignore_ascii_case("slab"))
+}
+
+/// Map an ordinal window in a slab to the byte range of the pages that
+/// hold it.
+///
+/// Pages are laid out in ordinal order, so a contiguous window is a
+/// contiguous span of pages and therefore one byte range — the same
+/// shape every other branch returns. The index comes from the tail
+/// (`records::read_slab_index`), which is a bounded read of two short
+/// pages rather than a walk of the file, so planning stays cheap in the
+/// sense SH-21 requires: it must not move the bytes it is deciding
+/// whether to move.
+fn map_in_slab(
+    locator: &str,
+    lo: u64,
+    hi: u64,
+    storage: &crate::storage::Storage,
+) -> Option<(u64, u64, u64)> {
+    let namespace = locator.split_once(':').map(|(_, ns)| ns);
+    let index = crate::records::read_slab_index(storage, namespace, locator)
+        .ok()
+        .flatten()?;
+    if index.total() == 0 {
+        return None;
+    }
+    let first = index.page_of(lo)?;
+    // A window running past the last record ends at the last page, not
+    // at one that does not exist.
+    let last = index.page_of(hi - 1).unwrap_or(index.page_count() - 1);
+    let byte_start = index.page_offset(first)?;
+    let last_start = index.page_offset(last)?;
+    // The final page's extent comes from its own header, which is the
+    // only place its size is written.
+    let size = storage
+        .read_bytes(last_start + 4, 4)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_le_bytes)? as u64;
+    let byte_end = (last_start + size).min(storage.total_size());
+    (byte_start < byte_end).then_some((byte_start, byte_end, index.prerequisite_bytes()))
 }
 
 /// How many bytes a facet contributes to a precache plan.

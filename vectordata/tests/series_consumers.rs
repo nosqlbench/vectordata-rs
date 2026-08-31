@@ -520,3 +520,4 @@ fn a_windowed_vvec_series_slices_the_series() {
     assert_eq!(r.get(10).unwrap()[0], 3000, "first record of the second shard");
     assert_eq!(r.get(24).unwrap()[0], 4400);
 }
+

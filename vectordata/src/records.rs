@@ -198,11 +198,146 @@ pub fn codec_by_name(name: &str) -> Option<Box<dyn RecordCodec<Out = String>>> {
 /// the end of the file — the footer, the tail page, and for a
 /// multi-namespace file the pages-page that page points at. Nothing
 /// before the tail is touched to build it.
-struct SlabIndex {
+pub(crate) struct SlabIndex {
     /// Page entries in ordinal order.
     entries: Vec<slabtastic::PageEntry>,
     /// Records across every page.
     total: u64,
+    /// Bytes that had to be read to build this — the footer and the
+    /// tail page. Reported so a plan can price what planning cost.
+    prerequisite_bytes: u64,
+}
+
+impl SlabIndex {
+    /// Records across every page.
+    pub(crate) fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// What reading this index cost.
+    pub(crate) fn prerequisite_bytes(&self) -> u64 {
+        self.prerequisite_bytes
+    }
+
+    /// The page holding `ordinal`, as an index into the entries.
+    pub(crate) fn page_of(&self, ordinal: u64) -> Option<usize> {
+        if ordinal >= self.total {
+            return None;
+        }
+        match self
+            .entries
+            .binary_search_by_key(&(ordinal as i64), |e| e.start_ordinal)
+        {
+            Ok(i) => Some(i),
+            Err(0) => None,
+            Err(i) => Some(i - 1),
+        }
+    }
+
+    /// Where page `i` starts in the file.
+    pub(crate) fn page_offset(&self, i: usize) -> Option<u64> {
+        self.entries.get(i).map(|e| e.file_offset as u64)
+    }
+
+    /// The first ordinal of page `i`.
+    pub(crate) fn page_start_ordinal(&self, i: usize) -> Option<i64> {
+        self.entries.get(i).map(|e| e.start_ordinal)
+    }
+
+    /// How many pages there are.
+    pub(crate) fn page_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Read a slab's page index from the tail of its storage.
+///
+/// Three short reads: the trailing footer, the page it names, and — for
+/// a multi-namespace file — the pages-page that page points at. Nothing
+/// before the tail is touched, which is what lets a remote slab be
+/// indexed without downloading it.
+///
+/// `Ok(None)` when the file is a readable slab that does not carry the
+/// namespace asked for: an optional document's absence is a normal
+/// state, not a failure.
+pub(crate) fn read_slab_index(
+    storage: &crate::storage::Storage,
+    namespace: Option<&str>,
+    label: &str,
+) -> Result<Option<SlabIndex>> {
+    const FOOTER: u64 = 16;
+    let fail = |what: &str, e: String| RecordError::Container(format!("{label}: {what}: {e}"));
+    let read = |offset: u64, len: u64| -> Result<Vec<u8>> {
+        storage
+            .read_bytes(offset, len)
+            .map_err(|e| fail(&format!("read {len} bytes at {offset}"), e.to_string()))
+    };
+    // A page states its own size in its header (4 bytes at +4), so a
+    // page can be read without knowing anything but where it starts.
+    let page_at = |offset: u64| -> Result<Vec<u8>> {
+        let size = u32::from_le_bytes(
+            read(offset + 4, 4)?
+                .try_into()
+                .map_err(|_| fail("page header", "short read".into()))?,
+        ) as u64;
+        read(offset, size)
+    };
+
+    let file_len = storage.total_size();
+    if file_len < FOOTER {
+        return Err(fail("slab", format!("too small ({file_len} bytes)")));
+    }
+    let mut prerequisite_bytes = FOOTER;
+    let footer = slabtastic::Footer::read_from(&read(file_len - FOOTER, FOOTER)?)
+        .map_err(|e| fail("footer", e.to_string()))?;
+    let tail = read(file_len - footer.page_size as u64, footer.page_size as u64)?;
+    prerequisite_bytes += footer.page_size as u64;
+
+    let pages = match footer.page_type {
+        slabtastic::PageType::Pages => {
+            if namespace.is_some_and(|n| !n.is_empty()) {
+                return Ok(None);
+            }
+            slabtastic::PagesPage::deserialize(&tail)
+                .map_err(|e| fail("pages page", e.to_string()))?
+        }
+        _ => {
+            let ns = slabtastic::NamespacesPage::deserialize(&tail)
+                .map_err(|e| fail("namespaces page", e.to_string()))?;
+            let entries = ns
+                .entries()
+                .map_err(|e| fail("namespace entries", e.to_string()))?;
+            let wanted = match namespace {
+                Some(name) if !name.is_empty() => entries.iter().find(|e| e.name == name),
+                _ => entries.iter().find(|e| e.name.is_empty()),
+            };
+            let Some(entry) = wanted else {
+                return Ok(None);
+            };
+            let bytes = page_at(entry.pages_page_offset as u64)?;
+            prerequisite_bytes += bytes.len() as u64;
+            slabtastic::PagesPage::deserialize(&bytes)
+                .map_err(|e| fail("pages page", e.to_string()))?
+        }
+    };
+
+    // Record counts follow from consecutive entries; only the last page
+    // has to be read for its own.
+    let entries = pages.sorted_entries_ref().to_vec();
+    let total = match entries.last() {
+        None => 0,
+        Some(last) => {
+            let bytes = page_at(last.file_offset as u64)?;
+            let n = slabtastic::Page::record_count_from_buf(&bytes)
+                .map_err(|e| fail("last page", e.to_string()))?;
+            (last.start_ordinal as u64) + n as u64
+        }
+    };
+    Ok(Some(SlabIndex {
+        entries,
+        total,
+        prerequisite_bytes,
+    }))
 }
 
 /// One slab backing part or all of a facet.
@@ -262,69 +397,14 @@ impl Container {
     }
 
     fn build_index(&self) -> Result<SlabIndex> {
-        const FOOTER: u64 = 16;
-        let file_len = self.storage.total_size();
-        if file_len < FOOTER {
-            return Err(RecordError::Container(format!(
-                "{}: too small to be a slab ({file_len} bytes)",
-                self.label
-            )));
-        }
-        // 1. The trailing footer says what the last page is and how big.
-        let footer = slabtastic::Footer::read_from(&self.read(file_len - FOOTER, FOOTER)?)
-            .map_err(|e| RecordError::Container(format!("{}: footer: {e}", self.label)))?;
-        let tail_start = file_len - footer.page_size as u64;
-        let tail = self.read(tail_start, footer.page_size as u64)?;
-
-        // 2. That page is either the pages-page itself, or the
-        //    namespaces page naming where each namespace's pages-page
-        //    lives. An absent namespace is a normal state and reported
-        //    as an empty index, not as a broken file.
-        let pages = match footer.page_type {
-            slabtastic::PageType::Pages => {
-                if self.namespace.as_deref().is_some_and(|n| !n.is_empty()) {
-                    return Ok(SlabIndex { entries: Vec::new(), total: 0 });
-                }
-                slabtastic::PagesPage::deserialize(&tail).map_err(|e| {
-                    RecordError::Container(format!("{}: pages page: {e}", self.label))
-                })?
-            }
-            _ => {
-                let ns = slabtastic::NamespacesPage::deserialize(&tail).map_err(|e| {
-                    RecordError::Container(format!("{}: namespaces page: {e}", self.label))
-                })?;
-                let entries = ns.entries().map_err(|e| {
-                    RecordError::Container(format!("{}: namespace entries: {e}", self.label))
-                })?;
-                let wanted = match self.namespace.as_deref() {
-                    Some(name) if !name.is_empty() => entries.iter().find(|e| e.name == name),
-                    _ => entries.iter().find(|e| e.name.is_empty()),
-                };
-                let Some(entry) = wanted else {
-                    return Ok(SlabIndex { entries: Vec::new(), total: 0 });
-                };
-                let at = entry.pages_page_offset as u64;
-                let bytes = self.page(at)?;
-                slabtastic::PagesPage::deserialize(&bytes).map_err(|e| {
-                    RecordError::Container(format!("{}: pages page: {e}", self.label))
-                })?
-            }
-        };
-
-        // 3. Record counts come from consecutive entries; only the last
-        //    page has to be read for its own count.
-        let entries = pages.sorted_entries_ref().to_vec();
-        let total = match entries.last() {
-            None => 0,
-            Some(last) => {
-                let bytes = self.page(last.file_offset as u64)?;
-                let n = slabtastic::Page::record_count_from_buf(&bytes).map_err(|e| {
-                    RecordError::Container(format!("{}: last page: {e}", self.label))
-                })?;
-                (last.start_ordinal as u64) + n as u64
-            }
-        };
-        Ok(SlabIndex { entries, total })
+        Ok(
+            read_slab_index(&self.storage, self.namespace.as_deref(), &self.label)?
+                .unwrap_or(SlabIndex {
+                    entries: Vec::new(),
+                    total: 0,
+                    prerequisite_bytes: 0,
+                }),
+        )
     }
 
     fn count(&self) -> Result<u64> {
@@ -334,19 +414,13 @@ impl Container {
     /// The record at this container's own ordinal `local`.
     fn record(&self, local: u64) -> Result<std::borrow::Cow<'_, [u8]>> {
         let index = self.index()?;
-        // The page whose start ordinal is the greatest not exceeding
-        // `local`. Entries are sorted, so this is a binary search.
-        let at = match index
-            .entries
-            .binary_search_by_key(&(local as i64), |e| e.start_ordinal)
-        {
-            Ok(i) => i,
-            Err(0) => return Err(RecordError::OutOfBounds(local)),
-            Err(i) => i - 1,
-        };
-        let entry = &index.entries[at];
-        let bytes = self.page(entry.file_offset as u64)?;
-        let within = (local as i64 - entry.start_ordinal) as usize;
+        let at = index.page_of(local).ok_or(RecordError::OutOfBounds(local))?;
+        let offset = index.page_offset(at).ok_or(RecordError::OutOfBounds(local))?;
+        let start = index
+            .page_start_ordinal(at)
+            .ok_or(RecordError::OutOfBounds(local))?;
+        let bytes = self.page(offset)?;
+        let within = (local as i64 - start) as usize;
         let count = slabtastic::Page::record_count_from_buf(&bytes).map_err(|e| {
             RecordError::Container(format!("{}: page record count: {e}", self.label))
         })?;
