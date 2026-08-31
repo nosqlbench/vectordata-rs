@@ -407,6 +407,179 @@ fn binding_a_remote_facet_does_not_download_it() {
     // itself is pinned in `http_storage.rs`, against a served facet.
 }
 
+// ── cases 7, 8, 15: predicate binding ──────────────────────────────
+
+use vectordata::binding::PredicateBinder;
+use vectordata::formats::pnode::{Comparand, FieldRef, OpType, PNode, PredicateNode, ConjugateNode, ConjugateType};
+
+fn pred(field: &str, op: OpType, c: Comparand) -> PNode {
+    PNode::Predicate(PredicateNode {
+        field: FieldRef::Named(field.into()),
+        op,
+        comparands: vec![c],
+    })
+}
+
+fn and(children: Vec<PNode>) -> PNode {
+    PNode::Conjugate(ConjugateNode {
+        conjugate_type: ConjugateType::And,
+        children,
+    })
+}
+
+/// A metadata layout with a temporal and a uuid field, so the typing
+/// question in case 15 is answerable.
+fn typed_layout(dir: &std::path::Path) -> Layout {
+    let mut n = MNode::new();
+    n.insert("id".into(), MValue::Int(1));
+    n.insert("created".into(), MValue::Millis(1_700_000_000_000));
+    n.insert("owner".into(), MValue::UuidV7([0u8; 16]));
+    n.insert("tag".into(), MValue::Text("a".into()));
+    dataset(dir, |p| slab(p, &[n.clone()]));
+    Layout::discover(&open(dir)).unwrap()
+}
+
+/// **Case 7** — a predicate binds parameters, not an inlined fragment.
+///
+/// The rendered form puts comparands in the text; the bound form keeps
+/// the statement fixed and moves only the values.
+#[test]
+fn a_predicate_binds_parameters_rather_than_inlining_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = typed_layout(tmp.path());
+
+    let template = and(vec![
+        pred("created", OpType::Ge, Comparand::Int(0)),
+        pred("tag", OpType::Eq, Comparand::Text(String::new())),
+    ]);
+    let binder = PredicateBinder::compile(&template, &layout).unwrap();
+
+    // The shape, prepared once.
+    let c = binder.conditions();
+    assert_eq!(c.len(), 2);
+    assert_eq!((c[0].field.as_str(), c[0].op), ("created", OpType::Ge));
+    assert_eq!((c[1].field.as_str(), c[1].op), ("tag", OpType::Eq));
+
+    // The values, per record — and the statement text never changes.
+    let actual = and(vec![
+        pred("created", OpType::Ge, Comparand::Int(1_700_000_000_000)),
+        pred("tag", OpType::Eq, Comparand::Text("blue".into())),
+    ]);
+    let bytes = actual.to_bytes_named();
+    let mut bound: Vec<(String, Comparand)> = Vec::new();
+    binder
+        .bind_each(&bytes, |cond, cs| {
+            bound.push((cond.parameter.clone(), cs[0].clone()))
+        })
+        .unwrap();
+
+    assert_eq!(bound[0].0, "created");
+    assert_eq!(bound[0].1, Comparand::Int(1_700_000_000_000));
+    assert_eq!(bound[1].1, Comparand::Text("blue".into()));
+
+    // Contrast: the rendered form inlines them into the text.
+    let rendered = vectordata::formats::anode_vernacular::render(
+        &vectordata::formats::anode::ANode::PNode(actual),
+        vectordata::formats::anode_vernacular::Vernacular::Cql,
+    );
+    assert!(rendered.contains("blue"), "rendering inlines: {rendered}");
+}
+
+/// **Case 15** — a parameter's type comes from the **field's** tag, not
+/// the comparand's variant.
+///
+/// A predicate over a `Millis` field carries a `Comparand::Int`, and a
+/// predicate over a `UuidV7` field carries `Bytes`. Typing parameters
+/// from the comparand would make both of those a bigint and a blob,
+/// collapsing every temporal and identifier column.
+#[test]
+fn a_parameter_is_typed_from_the_field_not_the_comparand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = typed_layout(tmp.path());
+
+    let template = and(vec![
+        pred("created", OpType::Ge, Comparand::Int(0)),
+        pred("owner", OpType::Eq, Comparand::Bytes(vec![0u8; 16])),
+        pred("id", OpType::Eq, Comparand::Int(0)),
+    ]);
+    let binder = PredicateBinder::compile(&template, &layout).unwrap();
+    let c = binder.conditions();
+
+    assert_eq!(c[0].bind_type, BindType::TimestampMillis, "not Int64");
+    assert_eq!(c[1].bind_type, BindType::Uuid, "not Blob");
+    assert_eq!(c[2].bind_type, BindType::Int64);
+
+    // The comparands really are the narrower set — this is what makes
+    // the distinction load-bearing rather than theoretical.
+    assert_eq!(
+        BindType::of_tag(TypeTag::Millis),
+        BindType::TimestampMillis
+    );
+    assert_ne!(c[0].bind_type, BindType::of_tag(TypeTag::Int));
+}
+
+/// **Case 8** — the dialect leader byte is the authority. A metadata
+/// record handed to a predicate binder is refused by what it says it
+/// is, not accepted because a template expected otherwise.
+#[test]
+fn a_form_cannot_override_the_dialect_leader_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = typed_layout(tmp.path());
+    let template = and(vec![pred("id", OpType::Eq, Comparand::Int(0))]);
+    let binder = PredicateBinder::compile(&template, &layout).unwrap();
+
+    let mut m = MNode::new();
+    m.insert("id".into(), MValue::Int(5));
+    let msg = binder
+        .bind_each(&m.to_bytes(), |_, _| {})
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("dialect"), "{msg}");
+    assert!(msg.contains("not a predicate"), "{msg}");
+}
+
+/// A predicate of a different shape is refused rather than bound into
+/// the wrong conditions — the congruence check `fingerprint` exists
+/// for.
+#[test]
+fn a_predicate_of_another_shape_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = typed_layout(tmp.path());
+    let template = and(vec![
+        pred("created", OpType::Ge, Comparand::Int(0)),
+        pred("tag", OpType::Eq, Comparand::Text(String::new())),
+    ]);
+    let binder = PredicateBinder::compile(&template, &layout).unwrap();
+
+    // Same fields, different operator — a different filter.
+    let other = and(vec![
+        pred("created", OpType::Lt, Comparand::Int(1)),
+        pred("tag", OpType::Eq, Comparand::Text("x".into())),
+    ]);
+    let msg = binder
+        .bind_each(&other.to_bytes_named(), |_, _| {})
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("shape differs"), "{msg}");
+}
+
+/// A predicate that is not a flat conjunction has no parameter list,
+/// and is refused saying so rather than partially flattened.
+#[test]
+fn a_disjunctive_predicate_is_refused_at_compile_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = typed_layout(tmp.path());
+    let or = PNode::Conjugate(ConjugateNode {
+        conjugate_type: ConjugateType::Or,
+        children: vec![
+            pred("id", OpType::Eq, Comparand::Int(1)),
+            pred("id", OpType::Eq, Comparand::Int(2)),
+        ],
+    });
+    let msg = PredicateBinder::compile(&or, &layout).unwrap_err().to_string();
+    assert!(msg.contains("flat conjunction"), "{msg}");
+}
+
 // ── case 9: the allocation claim ───────────────────────────────────
 
 /// **Case 9** — binding N records allocates nothing per field name.

@@ -526,3 +526,140 @@ pub fn form_by_name(facet: &RecordFacet, name: &str) -> Result<Form> {
         })
 }
 
+// ---------------------------------------------------------------------------
+// Predicate binding
+// ---------------------------------------------------------------------------
+
+use crate::formats::anode::{self, ANode};
+use crate::formats::pnode::{Comparand, OpType, PNode};
+
+/// One condition of a predicate, prepared.
+///
+/// The statement fragment is `field op ?`; only the comparands move per
+/// record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Condition {
+    /// The metadata field this condition constrains.
+    pub field: String,
+    /// What to call the parameter. The field's name unless a runtime
+    /// overrode it.
+    pub parameter: String,
+    /// The comparison.
+    pub op: OpType,
+    /// What the parameter binds as.
+    ///
+    /// **From the field's tag, not the comparand's variant.** `MValue`
+    /// has 29 variants and `Comparand` has six, so a predicate over a
+    /// `DateTime` field carries an `Int` comparand — typing the
+    /// parameter from that would collapse every temporal and UUID
+    /// column to a bigint or a string.
+    pub bind_type: BindType,
+    /// How many comparands this condition carries. One for the
+    /// scalar operators; a membership set for `In`.
+    pub arity: usize,
+}
+
+/// A compiled predicate template: the shape of a filter, prepared once.
+///
+/// Compiled against **two** things — a sample predicate, which supplies
+/// the fields and operators, and the metadata layout, which supplies
+/// the types. Neither alone is enough: a predicate knows what it
+/// constrains and not what type that field is.
+#[derive(Debug, Clone)]
+pub struct PredicateBinder {
+    conditions: Vec<Condition>,
+    /// The shape every bound record must match, values removed.
+    shape: PNode,
+}
+
+impl PredicateBinder {
+    /// Compile a predicate template.
+    ///
+    /// Only a flat conjunction compiles: a nested or disjunctive
+    /// predicate has no flat parameter list, and pretending otherwise
+    /// would bind values into the wrong conditions. Such a predicate is
+    /// refused by name rather than partially flattened.
+    pub fn compile(predicate: &PNode, layout: &Layout) -> Result<Self> {
+        let flat = crate::formats::mnode::scan::flatten_and(predicate).ok_or_else(|| {
+            BindError::Record(
+                "this predicate is not a flat conjunction of named field \
+                 comparisons, so it has no parameter list — bind its \
+                 conditions individually, or use a template that is"
+                    .to_string(),
+            )
+        })?;
+        let mut conditions = Vec::with_capacity(flat.len());
+        for (field, op, comparands) in flat {
+            let position = layout.position_of(&field).ok_or_else(|| {
+                BindError::NoSuchField {
+                    field: field.clone(),
+                    available: layout.names().to_vec(),
+                }
+            })?;
+            conditions.push(Condition {
+                parameter: field.clone(),
+                field,
+                op,
+                // The field's type, not the comparand's.
+                bind_type: layout.types()[position].clone(),
+                arity: comparands.len(),
+            });
+        }
+        Ok(PredicateBinder {
+            conditions,
+            shape: predicate.fingerprint(),
+        })
+    }
+
+    /// Rename parameters for substitution, as the metadata binder does.
+    pub fn with_overrides(mut self, overrides: &HashMap<String, String>) -> Self {
+        for c in &mut self.conditions {
+            if let Some(to) = overrides.get(c.field.as_str()) {
+                c.parameter = to.clone();
+            }
+        }
+        self
+    }
+
+    /// The conditions, in order. Read once, to build the filter.
+    pub fn conditions(&self) -> &[Condition] {
+        &self.conditions
+    }
+
+    /// Bind one predicate record, handing each condition's comparands
+    /// to `f` in condition order.
+    ///
+    /// The record is checked against the compiled shape first: a
+    /// predicate of a different shape would otherwise bind values into
+    /// conditions they do not belong to, which no downstream check
+    /// would catch.
+    pub fn bind_each<F>(&self, record: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&Condition, &[Comparand]),
+    {
+        let node = anode::decode(record).map_err(BindError::Record)?;
+        // The leader byte is the authority on what a record is; a
+        // template cannot make an MNode into a predicate.
+        let ANode::PNode(pnode) = node else {
+            return Err(BindError::Record(
+                "this record is not a predicate — its dialect byte says MNode, \
+                 and a form does not override what a record is"
+                    .to_string(),
+            ));
+        };
+        if !pnode.is_congruent(&self.shape) {
+            return Err(BindError::Record(
+                "this predicate's shape differs from the one this binder was \
+                 compiled against; its values would bind to the wrong conditions"
+                    .to_string(),
+            ));
+        }
+        let flat = crate::formats::mnode::scan::flatten_and(&pnode).ok_or_else(|| {
+            BindError::Record("predicate is not a flat conjunction".to_string())
+        })?;
+        for (condition, (_, _, comparands)) in self.conditions.iter().zip(flat.iter()) {
+            f(condition, comparands);
+        }
+        Ok(())
+    }
+}
