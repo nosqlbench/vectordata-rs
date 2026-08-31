@@ -151,6 +151,8 @@ pub mod dataset;
 pub mod formats;
 /// Ordinal-addressed record facets (slabs) and the codecs that type them.
 pub mod records;
+/// Binding records to operation parameters.
+pub mod binding;
 /// Content-addressed integrity verification (SHA-256 merkle trees).
 pub mod merkle;
 /// HTTP transport layer. **Crate-private** — exposed only via the
