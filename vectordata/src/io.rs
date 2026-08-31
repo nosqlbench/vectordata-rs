@@ -1035,7 +1035,10 @@ fn load_or_fetch_remote_offsets(
     // reader exists — say so out loud instead of looking like a
     // hang, and point at the durable fix (publish the sidecar).
     log::warn!(
-        "no IDXFOR__ offset index published for {data_url}; rebuilding it requires          downloading the entire file ({} bytes). Publish the IDXFOR__ sidecar next to          the data file (or precache the dataset) to avoid this.",
+        "no IDXFOR__ offset index published for {data_url}; rebuilding it \
+             requires downloading the entire file ({} bytes). Publish the \
+             IDXFOR__ sidecar next to the data file (or precache the dataset) \
+             to avoid this.",
         storage.total_size(),
     );
     let offsets = walk_offsets_via_storage(storage, elem_size)?;

@@ -53,8 +53,13 @@ pub fn resolve_path_option(
     if let Some(v) = options.get(option_key) {
         return Ok(v.to_string());
     }
-    if let Some(value) = lookup_facet(ctx, options, facet_alias) {
-        return Ok(value);
+    match lookup_facet(ctx, options, facet_alias) {
+        Ok(Some(value)) => return Ok(value),
+        // The facet is declared, but as a series this command cannot
+        // read. That is a different answer from "not declared", and
+        // saying so is the whole point of refusing it (SH-74).
+        Err(e) => return Err(e),
+        Ok(None) => {}
     }
     let canonical = resolve_standard_key(facet_alias)
         .unwrap_or_else(|| facet_alias.to_string());
@@ -67,33 +72,60 @@ pub fn resolve_path_option(
     ))
 }
 
+/// `Ok(Some(path))` when the profile names one file for the facet,
+/// `Ok(None)` when it does not name the facet at all, and `Err` when it
+/// names it as something this lookup cannot reduce to a path.
 fn lookup_facet(
     ctx: &StreamContext,
     options: &Options,
     facet_alias: &str,
-) -> Option<String> {
-    let (yaml_path, dataset_root) = resolve_dataset_paths(ctx, options)?;
+) -> Result<Option<String>, String> {
+    let Some((yaml_path, dataset_root)) = resolve_dataset_paths(ctx, options) else {
+        return Ok(None);
+    };
     if !yaml_path.exists() {
-        return None;
+        return Ok(None);
     }
-    let cfg = DatasetConfig::load_and_resolve(&yaml_path).ok()?;
+    let Ok(cfg) = DatasetConfig::load_and_resolve(&yaml_path) else {
+        return Ok(None);
+    };
     let profile_name = options.get("profile").unwrap_or("default");
-    let profile = cfg.profiles.profile(profile_name)?;
-    let canonical = resolve_standard_key(facet_alias)?;
+    let Some(profile) = cfg.profiles.profile(profile_name) else {
+        return Ok(None);
+    };
+    let Some(canonical) = resolve_standard_key(facet_alias) else {
+        return Ok(None);
+    };
     // Resolve the declared view: prefer a view keyed by the canonical
     // name, but also accept one whose (possibly legacy/alias) key
     // normalizes to the same canonical facet — e.g. a `metadata_indices`
     // view satisfies a `metadata_results` lookup. A facet is identified by
     // its canonical identity, not by a single literal key.
-    let raw = profile
-        .view(&canonical)
-        .map(|v| v.path().to_string())
-        .or_else(|| {
-            profile
-                .views()
-                .find(|(k, _)| resolve_standard_key(k).as_deref() == Some(canonical.as_str()))
-                .map(|(_, v)| v.path().to_string())
-        })?;
+    let Some(view) = profile.view(&canonical).or_else(|| {
+        profile
+            .views()
+            .find(|(k, _)| resolve_standard_key(k).as_deref() == Some(canonical.as_str()))
+            .map(|(_, v)| v)
+    }) else {
+        return Ok(None);
+    };
+    // Commands take a path and read one file. A series has no single
+    // one, and its first entry is a real file — so resolving through
+    // `path()` would hand `compute knn` shard 0 and produce neighbours
+    // over a fraction of the base with no error anywhere (SH-74,
+    // SH-79). `None` here surfaces as `resolve_path_option`'s "does not
+    // expose this facet" message, which stops the run.
+    let Some(raw) = view.single_path().map(str::to_string) else {
+        return Err(format!(
+            "the dataset's `{profile_name}` profile declares `{canonical}` as a \
+             multi-file series ({} shards), and this command's kernel reads one \
+             mmapped file. Derive an unsharded copy first — `veks datasets derive \
+             <dataset>:{profile_name} -o <dir>` with no --shard-stride writes the \
+             series back as a single file (SH-38) — then run against that. Or pass \
+             an explicit path. See docs/design/srd-multifile-facet-shards.md.",
+            view.sources().len()
+        ));
+    };
     // A view path may address a slab namespace (`file#namespace`); resolve
     // the file part against the dataset root and preserve the namespace.
     let (file_part, ns_part) = match raw.split_once('#') {
@@ -103,10 +135,10 @@ fn lookup_facet(
     let p = Path::new(file_part);
     let resolved = if p.is_absolute() { p.to_path_buf() } else { dataset_root.join(p) };
     let resolved = resolved.to_string_lossy().into_owned();
-    Some(match ns_part {
+    Ok(Some(match ns_part {
         Some(ns) => format!("{resolved}#{ns}"),
         None => resolved,
-    })
+    }))
 }
 
 /// Resolve `--neighbors` (k), falling back to the active profile's
@@ -557,4 +589,112 @@ fn facet_present(
 /// `metadata_content.slab#layout` → `metadata_content.slab`.
 fn strip_namespace(path: &str) -> &str {
     path.split('#').next().unwrap_or(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::command::{Options, StreamContext};
+    use crate::pipeline::progress::ProgressLog;
+    use indexmap::IndexMap;
+
+    fn ctx_at(workspace: &Path) -> StreamContext {
+        StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+            provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
+        }
+    }
+
+    fn workspace_with(yaml: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("dataset.yaml"), yaml).unwrap();
+        tmp
+    }
+
+    /// A single-file facet resolves to that file, as it always has.
+    #[test]
+    fn a_single_file_facet_resolves_to_its_path() {
+        let tmp = workspace_with(
+            "name: d\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
+        );
+        let got = resolve_path_option(&ctx_at(tmp.path()), &Options::new(), "base", "base_vectors")
+            .expect("a single file resolves");
+        assert!(got.ends_with("base.fvec"), "{got}");
+    }
+
+    /// **An explicit series is refused, not resolved to shard 0**
+    /// (SH-74, SH-79).
+    ///
+    /// This is the dangerous case: `part_a.fvec` is a real file, so a
+    /// lookup that reached for `path()` would hand a single-file
+    /// command a fifth of the base and it would compute neighbours over
+    /// that fraction and report success. The refusal has to name
+    /// sharding, or the operator reads "facet not exposed" about a
+    /// facet that plainly is.
+    #[test]
+    fn an_explicit_series_is_refused_rather_than_resolved_to_its_first_shard() {
+        let tmp = workspace_with(
+            "name: d\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
+             \x20       - part_a.fvec=100\n        - part_b.fvec=100\n      record_count: 200\n",
+        );
+        let err = resolve_path_option(&ctx_at(tmp.path()), &Options::new(), "base", "base_vectors")
+            .expect_err("a series must not resolve to a path");
+        assert!(err.contains("multi-file series"), "{err}");
+        assert!(err.contains("2 shards"), "{err}");
+        assert!(!err.contains("part_a"), "the first shard must not be offered: {err}");
+    }
+
+    /// A uniform series is refused for the same reason, even though its
+    /// pattern names no file — the diagnosis should be the same one.
+    #[test]
+    fn a_uniform_series_is_refused_with_the_same_diagnosis() {
+        let tmp = workspace_with(
+            "name: d\nprofiles:\n  default:\n    base_vectors:\n      source: base__NNNN.fvec\n\
+             \x20     shard_stride: 100\n      shard_count: 5\n      record_count: 500\n",
+        );
+        let err = resolve_path_option(&ctx_at(tmp.path()), &Options::new(), "base", "base_vectors")
+            .expect_err("a series must not resolve to a path");
+        assert!(err.contains("multi-file series"), "{err}");
+        assert!(!err.contains("NNNN"), "the pattern must not be offered as a path: {err}");
+    }
+
+    /// An explicit `--base` still wins: the refusal is about what the
+    /// dataset declares, not a veto on the command.
+    #[test]
+    fn an_explicit_option_overrides_a_sharded_declaration() {
+        let tmp = workspace_with(
+            "name: d\nprofiles:\n  default:\n    base_vectors:\n      source: base__NNNN.fvec\n\
+             \x20     shard_stride: 100\n      shard_count: 5\n      record_count: 500\n",
+        );
+        let mut opts = Options::new();
+        opts.set("base", "/elsewhere/base.fvec");
+        let got = resolve_path_option(&ctx_at(tmp.path()), &opts, "base", "base_vectors").unwrap();
+        assert_eq!(got, "/elsewhere/base.fvec");
+    }
+
+    /// A facet the profile does not declare still reports as missing,
+    /// with the guidance it always had.
+    #[test]
+    fn an_absent_facet_still_reports_as_absent() {
+        let tmp = workspace_with(
+            "name: d\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
+        );
+        let err = resolve_path_option(&ctx_at(tmp.path()), &Options::new(), "gt", "neighbor_indices")
+            .expect_err("an undeclared facet has no path");
+        assert!(err.contains("does not expose"), "{err}");
+        assert!(!err.contains("series"), "{err}");
+    }
 }

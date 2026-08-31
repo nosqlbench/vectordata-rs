@@ -303,9 +303,19 @@ impl AnyDatasetReader {
         });
         let dim = base.dim();
         let count = base.count();
-        let elem = crate::io::infer_elem_size(crate::io::ext_of(
-            view.facet_source("base_vectors").as_deref().unwrap_or(""),
-        ));
+        // `facet_source` answers `None` for a series — it has no single
+        // path — so the element width comes from the facet's declared
+        // type, which every shard shares. Reading the source string and
+        // falling back to f32 would silently mis-size a `u8` series'
+        // byte accounting by four (SH-74).
+        let elem = view
+            .facet_element_type("base_vectors")
+            .map(|t| t.byte_width())
+            .unwrap_or_else(|_| {
+                crate::io::infer_elem_size(crate::io::ext_of(
+                    view.facet_source("base_vectors").as_deref().unwrap_or(""),
+                ))
+            });
         // Unknown extension: assume f32, the only element type the
         // remote f32 reader path can have opened anyway.
         let elem = if elem == 0 { 4 } else { elem };

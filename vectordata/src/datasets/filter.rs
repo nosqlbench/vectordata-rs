@@ -568,14 +568,50 @@ fn extract_dim_from_name(name: &str) -> Option<u32> {
 /// so a `dataset.yaml`-shaped catalog's relative source becomes the
 /// real URL the probe reads — not a bare relative string mistaken for
 /// a local file.
+///
+/// For a series this is the **first shard**, which is the right answer
+/// for the format-shaped probes that use it: every shard shares one
+/// element type and one dim header. It is the wrong answer for
+/// anything byte-shaped — see [`base_vectors_files`].
 pub(crate) fn base_vectors_path(entry: &CatalogEntry) -> Option<String> {
+    base_vectors_files(entry).into_iter().next()
+}
+
+/// Every file the base-vector facet names, in ordinal order.
+///
+/// A byte total taken from [`base_vectors_path`] alone is shard 0's,
+/// and a catalog listing would report a fifth of the dataset's records
+/// as its size (SH-74).
+pub(crate) fn base_vectors_files(entry: &CatalogEntry) -> Vec<String> {
     for (_, profile) in &entry.layout.profiles.profiles {
         if let Some(view) = profile
             .views
             .get("base_vectors")
             .or_else(|| profile.views.get("base"))
         {
-            return entry.resolve_facet_url(view.path());
+            return view
+                .sources()
+                .iter()
+                .filter_map(|s| entry.resolve_facet_url(&s.path))
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// The record count the base-vector facet **declares**, if it does.
+///
+/// A series must state its total (SH-8), so a sharded facet answers
+/// this without touching a file — and answers it correctly, which a
+/// byte probe over one shard cannot.
+fn declared_base_records(entry: &CatalogEntry) -> Option<u64> {
+    for (_, profile) in &entry.layout.profiles.profiles {
+        if let Some(view) = profile
+            .views
+            .get("base_vectors")
+            .or_else(|| profile.views.get("base"))
+        {
+            return view.record_count;
         }
     }
     None
@@ -688,10 +724,22 @@ pub(crate) fn facet_len(path: &str) -> Option<u64> {
 /// xvec facets, which is what the element-size gate enforces. Probe
 /// values come from `mode`.
 fn probed_base_records(entry: &CatalogEntry, mode: ProbeMode) -> Option<u64> {
-    let path = base_vectors_path(entry)?;
+    // A declared total beats any probe, and a series always has one.
+    if let Some(n) = declared_base_records(entry) {
+        return Some(n);
+    }
     let elem = infer_vtype(entry).as_deref().and_then(vtype_elem_bytes)?;
     let dim = resolve_dimension(entry, mode)? as u64;
-    let total = facet_bytes(&path, mode)?;
+    // Summed across every shard: one file's bytes are one file's
+    // records, not the facet's.
+    let files = base_vectors_files(entry);
+    if files.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    for f in &files {
+        total += facet_bytes(f, mode)?;
+    }
     let bytes_per_record = 4 + dim * elem;
     Some(total / bytes_per_record)
 }
@@ -1310,6 +1358,81 @@ mod tests {
         assert!(DatasetFilter { max_dim: Some(1), ..Default::default() }.needs_probe());
         assert!(DatasetFilter { data: Some((1, 1)), ..Default::default() }.needs_probe());
         assert!(DatasetFilter { min_data: Some(1), ..Default::default() }.needs_probe());
+    }
+
+    /// A series' base-vector facet names **every** shard.
+    ///
+    /// `base_vectors_path` still answers the first, which is what the
+    /// dim and format probes want; anything counting bytes must take
+    /// the list, or a five-shard dataset reports a fifth of its size.
+    #[test]
+    fn a_sharded_base_names_every_shard_but_probes_the_first() {
+        let mut e = entry_with_views("ds", &["base_vectors"]);
+        let view = e.layout.profiles.profiles["default"]
+            .views
+            .get("base_vectors")
+            .unwrap()
+            .clone();
+        let sharded = crate::dataset::DSView {
+            extra_sources: (1..4)
+                .map(|i| crate::dataset::DSSource {
+                    path: format!("base_vectors__{i:04}.fvec"),
+                    ..view.source.clone()
+                })
+                .collect(),
+            record_count: Some(400),
+            ..view
+        };
+        e.layout
+            .profiles
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .views
+            .insert("base_vectors".to_string(), sharded);
+
+        let files = base_vectors_files(&e);
+        assert_eq!(files.len(), 4, "{files:?}");
+        assert_eq!(
+            base_vectors_path(&e).as_deref(),
+            files.first().map(String::as_str),
+            "the single-path probe answers the first shard"
+        );
+        assert!(files[3].ends_with("base_vectors__0003.fvec"));
+    }
+
+    /// **A declared total beats a byte probe** (SH-8).
+    ///
+    /// A series must state its record count, so the count is answerable
+    /// without opening anything — and answerable correctly, which a
+    /// probe over one shard is not.
+    #[test]
+    fn a_declared_record_count_is_used_instead_of_probing_one_shard() {
+        let mut e = entry_with_views("ds", &["base_vectors"]);
+        let view = e.layout.profiles.profiles["default"]
+            .views
+            .get("base_vectors")
+            .unwrap()
+            .clone();
+        let sharded = crate::dataset::DSView {
+            extra_sources: vec![crate::dataset::DSSource {
+                path: "base_vectors__0001.fvec".to_string(),
+                ..view.source.clone()
+            }],
+            record_count: Some(1_000),
+            ..view
+        };
+        e.layout
+            .profiles
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .views
+            .insert("base_vectors".to_string(), sharded);
+
+        // No files exist and no probe is configured; the declaration
+        // still answers, and answers the series total.
+        assert_eq!(probed_base_records(&e, ProbeMode::Off), Some(1_000));
     }
 
     #[test]

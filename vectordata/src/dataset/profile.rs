@@ -223,13 +223,29 @@ impl DSView {
     }
 
     /// Returns the source path.
+    ///
+    /// **For a series this is the first shard only.** A consumer that
+    /// resolves a facet to one file must call [`Self::single_path`]
+    /// instead, which answers `None` rather than a fraction (SH-74).
     pub fn path(&self) -> &str {
         &self.source.path
+    }
+
+    /// The one path this view names, or `None` when it names a series.
+    ///
+    /// The counterpart of [`crate::model::FacetConfig::source`] on the
+    /// resolved side, and it exists for the same reason: a consumer
+    /// built around a single file must be told there is not one. The
+    /// alternative is worse than an error — the explicit series form
+    /// names a real file first, so falling back to `path()` computes
+    /// over shard 0 and reports success (SH-74, SH-79).
+    pub fn single_path(&self) -> Option<&str> {
+        (!self.is_series()).then_some(self.source.path.as_str())
     }
 }
 
 /// A named profile: map of canonical view names to views, plus optional maxk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DSProfile {
     /// Maximum k for KNN queries in this profile.
     pub maxk: Option<u32>,

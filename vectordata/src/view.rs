@@ -204,7 +204,9 @@ pub(crate) fn facet_window_byte_range(
 fn single_source<'a>(facet: &'a FacetConfig, what: &str) -> Result<&'a str> {
     facet.source().ok_or_else(|| {
         Error::Other(format!(
-            "{what}: this facet declares a multi-file series, which this path              does not resolve yet — see docs/design/srd-multifile-facet-shards.md"
+            "{what}: this facet declares a multi-file series, which this \
+             path does not resolve yet — see \
+             docs/design/srd-multifile-facet-shards.md"
         ))
     })
 }
@@ -3027,6 +3029,15 @@ impl GenericTestDataView {
         match name {
             "base_vectors" => self.config.base_vectors.as_ref(),
             "query_vectors" => self.config.query_vectors.as_ref(),
+            // Declared in `ProfileConfig` and therefore declarable in
+            // `dataset.yaml`. Without an arm here a dataset can name
+            // one and nothing can open it: `facet()` reports it
+            // missing, and `derive` — which asks this route for an
+            // element type — treats it as a non-data key and drops it
+            // from the output.
+            "base_content" => self.config.base_content.as_ref(),
+            "query_terms" => self.config.query_terms.as_ref(),
+            "query_filters" => self.config.query_filters.as_ref(),
             "neighbor_indices" => self.config.neighbor_indices.as_ref(),
             "neighbor_distances" => self.config.neighbor_distances.as_ref(),
             "metadata_content" => self.config.metadata_content.as_ref(),
@@ -3079,6 +3090,15 @@ impl GenericTestDataView {
         let facet = self.facet_config_by_name(name).ok_or_else(|| {
             crate::typed_access::TypedAccessError::Io(format!("facet '{}' not found", name))
         })?;
+        // A series has no single resource to resolve. The free
+        // `open_facet_typed` reads one through the shard model, and
+        // routing there is what keeps the two entry points answering
+        // the same question the same way — a method that errored where
+        // the function succeeded would be a bypass in the direction
+        // nobody wants (SH-79).
+        if facet.is_series() {
+            return open_facet_typed::<T>(self, name);
+        }
         let resource = self
             .resolve_resource(facet)
             .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;

@@ -257,18 +257,36 @@ pub fn run_cache_status(
                 let mut pv = 0u32;
                 let mut pt = 0u32;
                 for (_facet, view) in &profile.views {
-                    let source = &view.source.path;
-                    if source.is_empty() { continue; }
-                    let clean = if let Some(b) = source.find(['[', '(']) {
-                        &source[..b]
-                    } else { source.as_str() };
-                    let mrkl = ds_cache.join(format!("{}.mrkl", clean));
-                    let state_opt = mrkl_cache.entry(mrkl.clone())
-                        .or_insert_with(|| MerkleState::load(&mrkl).ok());
-                    let Some(state) = state_opt.as_ref() else { continue; };
-                    let (v, t) = facet_chunk_coverage(state, view, source, clean, &ds_cache);
-                    pv += v;
-                    pt += t;
+                    // Every shard, not just the first. A series has one
+                    // sidecar per file (SH-20), so its coverage is the
+                    // sum over files — reading `view.source` alone
+                    // reports shard 0's percentage as the facet's.
+                    let series = view.is_series();
+                    for shard in view.sources() {
+                        let source = &shard.path;
+                        if source.is_empty() { continue; }
+                        let clean = if let Some(b) = source.find(['[', '(']) {
+                            &source[..b]
+                        } else { source.as_str() };
+                        let mrkl = ds_cache.join(format!("{}.mrkl", clean));
+                        let state_opt = mrkl_cache.entry(mrkl.clone())
+                            .or_insert_with(|| MerkleState::load(&mrkl).ok());
+                        let Some(state) = state_opt.as_ref() else { continue; };
+                        // A view-level window addresses the series'
+                        // ordinal space, not any one shard's, so it is
+                        // not a window *in* this file. Only the shard's
+                        // own suffix narrows its bytes (SH-51).
+                        let window = if series {
+                            source_suffix_window(source)
+                        } else {
+                            view.effective_window().0.first()
+                                .map(|iv| (iv.min_incl, iv.max_excl))
+                                .or_else(|| source_suffix_window(source))
+                        };
+                        let (v, t) = facet_chunk_coverage(state, window, clean, &ds_cache);
+                        pv += v;
+                        pt += t;
+                    }
                 }
                 if pt > 0 {
                     let ppct = 100.0 * pv as f64 / pt as f64;
@@ -283,40 +301,44 @@ pub fn run_cache_status(
     }
 }
 
-/// Compute `(valid_chunks, total_chunks)` for a single facet of a
-/// profile. When the view declares a window — either as the
-/// `[start..end)` suffix on the source path or as the explicit
-/// `view.window` / `view.source.window` field surfaced by
-/// `effective_window` — and the format is uniform-stride xvec,
+/// The `[start..end)` window a source string carries, if any.
+fn source_suffix_window(source: &str) -> Option<(u64, u64)> {
+    let parsed = crate::dataset::source::parse_source_string(source).ok()?;
+    let iv = parsed.window.0.first()?;
+    Some((iv.min_incl, iv.max_excl))
+}
+
+/// Compute `(valid_chunks, total_chunks)` for one **file** of a facet.
+///
+/// When `window` is given and the format is uniform-stride xvec,
 /// counting is restricted to the chunks covering the window's byte
 /// range. Without this every sized profile sharing a `.mrkl` reports
 /// the whole file's chunk count, which is what made
 /// `example-1b:100k` show `(1415347/1415355 chunks)` instead of
 /// the few-hundred chunks the 100K window actually needs.
 ///
+/// The window arrives from the caller rather than being read off a
+/// view, because which window applies depends on what the view is: a
+/// single file honours the view-level override, while a shard of a
+/// series honours only its own suffix — a series' window addresses
+/// ordinals across the whole series and is not a range in any one
+/// file.
+///
 /// Falls back to whole-file counts when:
-///   - the view carries no window;
+///   - there is no window;
 ///   - the format isn't xvec (vvec / parquet need a record→byte map
 ///     we don't have at this layer);
 ///   - the cache file's chunk 0 is missing so the xvec dim header
 ///     reads as zeros.
 fn facet_chunk_coverage(
     state: &crate::merkle::MerkleState,
-    view: &crate::dataset::profile::DSView,
-    source: &str,
+    window: Option<(u64, u64)>,
     clean: &str,
     ds_cache: &Path,
 ) -> (u32, u32) {
     let shape = state.shape();
     let whole = || (state.valid_count(), shape.total_chunks);
 
-    let window = view.effective_window().0.first()
-        .map(|iv| (iv.min_incl, iv.max_excl))
-        .or_else(|| {
-            let parsed = crate::dataset::source::parse_source_string(source).ok()?;
-            let iv = parsed.window.0.first()?;
-            Some((iv.min_incl, iv.max_excl))
-        });
     let Some((win_start, win_end)) = window else { return whole(); };
     if win_end <= win_start { return whole(); }
 
