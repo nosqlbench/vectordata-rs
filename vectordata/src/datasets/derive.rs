@@ -77,7 +77,9 @@ enum FacetKind {
 /// a running byte counter.
 struct PlanRow {
     facet: String,
-    src: std::path::PathBuf,
+    /// The source's bytes, as one stream. A single file is one span; a
+    /// series is one per shard, in ordinal order (SH-38).
+    src: SourceSpans,
     dest_filename: String,
     kind: FacetKind,
     window: DSWindow,
@@ -89,18 +91,18 @@ struct PlanRow {
 
 /// Compute the expected output size of a facet given its window.
 /// Used during planning so the meter has a real total.
-fn plan_output_size(src: &Path, kind: FacetKind, window: &DSWindow) -> io::Result<u64> {
+fn plan_output_size(src: &SourceSpans, kind: FacetKind, window: &DSWindow) -> io::Result<u64> {
     // For slabs and variable-length vvecs we don't have a cheap
     // record-size formula; an empty window still byte-copies, but
     // anything else is best counted at materialize time.
     if window.is_empty() {
-        return fs::metadata(src).map(|m| m.len());
+        return Ok(src.len());
     }
     let record_size = match kind {
         FacetKind::Scalar(elem) => elem.byte_width() as u64,
         FacetKind::UniformXvec(elem) => {
-            let mut f = fs::File::open(src)?;
-            if f.metadata()?.len() < 4 { return Ok(0); }
+            if src.len() < 4 { return Ok(0); }
+            let mut f = src.open()?;
             let mut dim_bytes = [0u8; 4];
             f.read_exact(&mut dim_bytes)?;
             let dim = i32::from_le_bytes(dim_bytes) as u64;
@@ -323,7 +325,14 @@ fn derive_via_access_layer(
         return 1;
     }
 
-    let plan = match build_plan_via_view(&*view, ds_profile, output) {
+    // Where a series' shard paths resolve from. Relative sources in a
+    // `dataset.yaml` are relative to the file that declares them, and
+    // that is the only anchor a shard has (SH-78).
+    let yaml_base = std::path::Path::new(&yaml_url)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let plan = match build_plan_via_view(&*view, ds_profile, output, &yaml_base) {
         Ok(p) => p,
         Err(e) => { eprintln!("{e}"); return 1; }
     };
@@ -341,21 +350,85 @@ fn build_plan_local(
 ) -> Result<Vec<PlanRow>, String> {
     let mut rows = Vec::new();
     for (facet_name, dview) in ds_profile.views() {
-        let raw_path = dview.path();
-        let src_path = base_dir.join(raw_path);
-        if !src_path.is_file() {
-            return Err(format!("Facet '{facet_name}': source {} not found.",
-                src_path.display()));
-        }
-        rows.push(plan_row_for(facet_name, src_path, dview.effective_window().clone(), output)?);
+        let spans = spans_for_view(facet_name, dview, base_dir)?;
+        rows.push(plan_row_for(facet_name, spans, dview.effective_window().clone(), output)?);
     }
     Ok(rows)
+}
+
+/// The bytes a declared view presents, whether it names one file or a
+/// series (SH-38).
+///
+/// A series is realized through the **same** code the loader runs, so
+/// derive cannot disagree with the reader about which files a facet is
+/// or what order they are in (SH-90). Deriving from a series is a copy
+/// across that ordinal space; the output's own stride is decided
+/// independently, which is what makes re-striding possible at all.
+fn spans_for_view(
+    facet_name: &str,
+    dview: &crate::dataset::profile::DSView,
+    base_dir: &Path,
+) -> Result<SourceSpans, String> {
+    if !dview.is_series() {
+        let src_path = base_dir.join(dview.path());
+        if !src_path.is_file() {
+            return Err(format!(
+                "Facet '{facet_name}': source {} not found.",
+                src_path.display()
+            ));
+        }
+        return SourceSpans::single(src_path)
+            .map_err(|e| format!("Facet '{facet_name}': {e}"));
+    }
+
+    let sources = dview.declaration_sources();
+    let probe = |s: &crate::dataset::source::DSSource| -> Result<u64, String> {
+        let path = base_dir.join(&s.path);
+        let resolved = path.to_str().ok_or_else(|| "non-UTF-8 path".to_string())?;
+        let storage = crate::storage::Storage::open(resolved).map_err(|e| e.to_string())?;
+        crate::view::records_in(resolved, &storage)
+            .ok_or_else(|| format!("cannot count records in {}", path.display()))
+    };
+    let shards =
+        crate::dataset::shards::realize(facet_name, &dview.declaration(&sources), &probe)
+            .map_err(|e| format!("Facet '{facet_name}': {e}"))?;
+
+    // The record size the spans are measured in. Reading it from the
+    // first shard is reading the facet's: every shard shares one
+    // format and one dimension.
+    let first = shards
+        .entries()
+        .first()
+        .ok_or_else(|| format!("Facet '{facet_name}': series declares no shards"))?;
+    let first_path = base_dir.join(&first.source.path);
+    let ext = first_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+    let kind = classify_facet(facet_name, &first_path, &ext)?;
+    let single = SourceSpans::single(first_path.clone())
+        .map_err(|e| format!("Facet '{facet_name}': {e}"))?;
+    let record_size = fixed_record_size(&single, kind)
+        .map_err(|e| format!("Facet '{facet_name}': {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "Facet '{facet_name}': deriving from a series needs a fixed record \
+                 size, which '{ext}' does not have — a vvec or slab shard carries \
+                 its own index, so its shards cannot be read as one byte stream \
+                 (SH-18, SH-38)."
+            )
+        })?;
+
+    SourceSpans::from_shards(&shards, base_dir, record_size)
+        .map_err(|e| format!("Facet '{facet_name}': {e}"))
 }
 
 fn build_plan_via_view(
     view: &dyn crate::TestDataView,
     ds_profile: &crate::dataset::profile::DSProfile,
     output: &Path,
+    base_dir: &Path,
 ) -> Result<Vec<PlanRow>, String> {
     let mut rows = Vec::new();
     for (facet_name, dview) in ds_profile.views() {
@@ -374,20 +447,40 @@ fn build_plan_via_view(
                     snapshot to copy from."));
             }
             std::path::PathBuf::from(s)
+        } else if dview.is_series() {
+            // A series has no single cache path. Its shards resolve
+            // through the declaration against the dataset's own
+            // directory, which is what the reader does too (SH-78).
+            let spans = spans_for_view(facet_name, dview, base_dir)?;
+            rows.push(plan_row_for(
+                facet_name,
+                spans,
+                dview.effective_window().clone(),
+                output,
+            )?);
+            continue;
         } else {
             return Err(format!("Facet '{facet_name}': cannot resolve source path."));
         };
-        rows.push(plan_row_for(facet_name, src_path, dview.effective_window().clone(), output)?);
+        let spans = SourceSpans::single(src_path)
+            .map_err(|e| format!("Facet '{facet_name}': {e}"))?;
+        rows.push(plan_row_for(facet_name, spans, dview.effective_window().clone(), output)?);
     }
     Ok(rows)
 }
 
 fn plan_row_for(
     facet_name: &str,
-    src_path: std::path::PathBuf,
+    src: SourceSpans,
     window: DSWindow,
     output: &Path,
 ) -> Result<PlanRow, String> {
+    // Every span of a series shares one format, so the first names the
+    // facet's extension — and for a single file it is the only one.
+    let src_path = src
+        .first_path()
+        .ok_or_else(|| format!("Facet '{facet_name}': source names no file"))?
+        .to_path_buf();
     let src_ext = src_path.extension()
         .and_then(|e| e.to_str()).unwrap_or("").to_string();
     let kind = classify_facet(facet_name, &src_path, &src_ext)?;
@@ -399,11 +492,11 @@ fn plan_row_for(
     // location stay in sync automatically.
     let dest_filename = format!("profiles/base/{facet_name}.{src_ext}");
     let _dest_path = output.join(&dest_filename); // computed lazily downstream
-    let expected_bytes = plan_output_size(&src_path, kind, &window)
+    let expected_bytes = plan_output_size(&src, kind, &window)
         .map_err(|e| format!("Facet '{facet_name}': cannot plan output size: {e}"))?;
     Ok(PlanRow {
         facet: facet_name.to_string(),
-        src: src_path,
+        src,
         dest_filename,
         kind,
         window,
@@ -731,14 +824,17 @@ impl DeriveMeter {
 ///
 /// Only fixed-stride formats can be sharded by the writer, because
 /// rolling over at a record boundary means knowing where one is.
-fn fixed_record_size(src: &Path, kind: FacetKind) -> io::Result<Option<u64>> {
+fn fixed_record_size(src: &SourceSpans, kind: FacetKind) -> io::Result<Option<u64>> {
     Ok(match kind {
         FacetKind::Scalar(elem) => Some(elem.byte_width() as u64),
         FacetKind::UniformXvec(elem) => {
-            let mut f = fs::File::open(src)?;
-            if f.metadata()?.len() < 4 {
+            if src.len() < 4 {
                 return Ok(None);
             }
+            // The dim header of the first record. Every shard of a
+            // series shares one dimension, so reading the first is
+            // reading the facet's.
+            let mut f = src.open()?;
             let mut dim_bytes = [0u8; 4];
             f.read_exact(&mut dim_bytes)?;
             let dim = i32::from_le_bytes(dim_bytes) as u64;
@@ -756,7 +852,7 @@ fn fixed_record_size(src: &Path, kind: FacetKind) -> io::Result<Option<u64>> {
 /// stride (SH-36). A run that fits in one shard collapses to the
 /// single-file form (SH-83) — the writer decides that, not the caller.
 fn materialize_sharded<F: FnMut(u64)>(
-    src: &Path,
+    src: &SourceSpans,
     dir: &Path,
     basename: &str,
     ext: &str,
@@ -767,8 +863,12 @@ fn materialize_sharded<F: FnMut(u64)>(
 ) -> io::Result<crate::datasets::shard_writer::ShardOutcome> {
     use crate::datasets::shard_writer::ShardWriter;
 
-    let mut src_f = fs::File::open(src)?;
-    let src_len = src_f.metadata()?.len();
+    // Re-striding is a copy (SH-38): the source's shard boundaries and
+    // the output's have nothing to do with each other, so the read side
+    // presents one ordinal space and the writer rolls over at its own
+    // stride.
+    let mut src_f = src.open()?;
+    let src_len = src.len();
     if record_size == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -807,6 +907,194 @@ fn materialize_sharded<F: FnMut(u64)>(
     writer.finish()
 }
 
+/// The bytes a facet's source presents, as one stream (SH-38).
+///
+/// A facet's source is one file or a series of them, and the copy that
+/// derives a new dataset should not care which. Every span is a byte
+/// range of a real file, in ordinal order; reading across them in
+/// sequence is exactly the facet's own ordinal space, because that is
+/// what the shard model already says a series is.
+///
+/// **Only sound where records have a fixed stride.** For scalar and
+/// uniform-xvec facets a series is the concatenation of its shards'
+/// bytes, so a byte-level read across spans is a record-level read
+/// across shards. A vvec or slab shard carries its own index or page
+/// structure, so concatenating two of them produces neither format —
+/// those ask for [`Self::single_path`] and refuse a series by name.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceSpans {
+    spans: Vec<Span>,
+    total: u64,
+}
+
+#[derive(Debug, Clone)]
+struct Span {
+    path: std::path::PathBuf,
+    /// First byte of the file this span presents.
+    offset: u64,
+    len: u64,
+}
+
+impl SourceSpans {
+    /// One whole file — every facet written before series existed.
+    pub(crate) fn single(path: std::path::PathBuf) -> io::Result<Self> {
+        let len = fs::metadata(&path)?.len();
+        Ok(Self {
+            total: len,
+            spans: vec![Span { path, offset: 0, len }],
+        })
+    }
+
+    /// A series, from the shard model the loader realized.
+    ///
+    /// Byte extents come from the entries' ordinal extents and the
+    /// record size, so a sliced entry contributes only the bytes it
+    /// addresses — the same rule residency uses (SH-92).
+    pub(crate) fn from_shards(
+        shards: &crate::dataset::shards::Shards,
+        base_dir: &Path,
+        record_size: u64,
+    ) -> io::Result<Self> {
+        if record_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot span a facet whose record size is zero",
+            ));
+        }
+        let mut spans = Vec::with_capacity(shards.entries().len());
+        let mut total = 0;
+        for entry in shards.entries() {
+            let path = base_dir.join(&entry.source.path);
+            let file_len = fs::metadata(&path)?.len();
+            let offset = entry.file_base * record_size;
+            let len = entry.len * record_size;
+            if offset + len > file_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "shard {} addresses bytes [{offset}..{}) of a {file_len}-byte file",
+                        path.display(),
+                        offset + len
+                    ),
+                ));
+            }
+            total += len;
+            spans.push(Span { path, offset, len });
+        }
+        Ok(Self { spans, total })
+    }
+
+    /// Total bytes across every span.
+    pub(crate) fn len(&self) -> u64 {
+        self.total
+    }
+
+    /// The one file behind these spans, when there is one.
+    ///
+    /// `None` for a series — the answer a format that cannot be read
+    /// across files needs, so it refuses rather than reading the first
+    /// shard as the whole facet (SH-74).
+    pub(crate) fn single_path(&self) -> Option<&Path> {
+        match self.spans.as_slice() {
+            [only] if only.offset == 0 => Some(&only.path),
+            _ => None,
+        }
+    }
+
+    /// The first file these spans read from.
+    ///
+    /// Sound for format questions only — extension, dimension, element
+    /// type — which every shard of a series shares. Anything about
+    /// *content* must go through [`Self::open`].
+    pub(crate) fn first_path(&self) -> Option<&Path> {
+        self.spans.first().map(|s| s.path.as_path())
+    }
+
+    /// A cursor over the concatenation.
+    pub(crate) fn open(&self) -> io::Result<SpanReader<'_>> {
+        Ok(SpanReader {
+            spans: &self.spans,
+            pos: 0,
+            open: None,
+        })
+    }
+}
+
+/// A `Read + Seek` view of [`SourceSpans`] as one contiguous stream.
+///
+/// Implementing the standard traits rather than a bespoke interface is
+/// what lets the materializers stay as they were: they seek to
+/// `record * stride` and read whole records, and whether that lands in
+/// one file or walks three is not their concern.
+pub(crate) struct SpanReader<'a> {
+    spans: &'a [Span],
+    pos: u64,
+    /// The span currently open, and its file.
+    open: Option<(usize, fs::File)>,
+}
+
+impl SpanReader<'_> {
+    /// Which span holds stream position `pos`, and how far into it.
+    fn locate(&self, pos: u64) -> Option<(usize, u64)> {
+        let mut base = 0u64;
+        for (i, span) in self.spans.iter().enumerate() {
+            if pos < base + span.len {
+                return Some((i, pos - base));
+            }
+            base += span.len;
+        }
+        None
+    }
+}
+
+impl io::Read for SpanReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let Some((index, within)) = self.locate(self.pos) else {
+            // Past the last span: end of stream, exactly as a file
+            // read past EOF answers.
+            return Ok(0);
+        };
+        let span = &self.spans[index];
+        // Reopen only when the span changes. A sequential pass over a
+        // series therefore opens each file once, in order.
+        let reopen = !matches!(self.open, Some((i, _)) if i == index);
+        if reopen {
+            let file = fs::File::open(&span.path)?;
+            self.open = Some((index, file));
+        }
+        let (_, file) = self.open.as_mut().expect("span file");
+        file.seek(SeekFrom::Start(span.offset + within))?;
+        // Never read past this span's extent: the next bytes of the
+        // file may belong to another facet's window, or to nothing.
+        let want = buf.len().min((span.len - within) as usize);
+        let got = file.read(&mut buf[..want])?;
+        self.pos += got as u64;
+        Ok(got)
+    }
+}
+
+impl io::Seek for SpanReader<'_> {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let total: u64 = self.spans.iter().map(|s| s.len).sum();
+        let target = match from {
+            SeekFrom::Start(n) => n as i128,
+            SeekFrom::End(n) => total as i128 + n as i128,
+            SeekFrom::Current(n) => self.pos as i128 + n as i128,
+        };
+        if target < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before the start of the stream",
+            ));
+        }
+        self.pos = target as u64;
+        Ok(self.pos)
+    }
+}
+
 /// A facet as written, for the emitted declaration.
 #[derive(Debug, Clone)]
 pub(crate) struct DerivedFacet {
@@ -837,7 +1125,7 @@ pub(crate) struct MaterializedFacet {
 
 fn materialize_facet<F: FnMut(u64)>(
     facet_name: &str,
-    src: &Path,
+    src: &SourceSpans,
     dest: &Path,
     kind: FacetKind,
     window: &DSWindow,
@@ -928,11 +1216,24 @@ fn materialize_facet<F: FnMut(u64)>(
 /// range, and any sibling namespaces (e.g. `:schema`) are carried
 /// forward verbatim with their original entries.
 fn materialize_slab<F: FnMut(u64)>(
-    src: &Path,
+    src: &SourceSpans,
     dest: &Path,
     window: &DSWindow,
     mut cb: F,
 ) -> io::Result<()> {
+    // A slab shard is a container with its own page index, so two of
+    // them concatenated are neither slab nor readable. Re-striding a
+    // slab series is a slab-format operation, not a byte copy, and
+    // refusing by name beats writing a file that opens as nothing
+    // (SH-18, SH-38).
+    let Some(src) = src.single_path() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "deriving from a slab series is not supported: a slab carries its own \
+             page index, so its shards cannot be copied as bytes — see \
+             docs/design/srd-multifile-facet-shards.md (SH-18, SH-38)",
+        ));
+    };
     if window.is_empty() {
         let mut src_f = fs::File::open(src)?;
         let len = src_f.metadata()?.len();
@@ -1027,14 +1328,14 @@ fn materialize_slab<F: FnMut(u64)>(
 /// intervals address records (= bytes for u8/i8, two-byte words
 /// for u16/i16/f16, etc.).
 fn materialize_scalar<F: FnMut(u64)>(
-    src: &Path,
+    src: &SourceSpans,
     dest: &Path,
     elem: ElementType,
     window: &DSWindow,
     mut cb: F,
 ) -> io::Result<()> {
-    let mut src_f = fs::File::open(src)?;
-    let src_len = src_f.metadata()?.len();
+    let mut src_f = src.open()?;
+    let src_len = src.len();
     if window.is_empty() {
         let mut dst_f = fs::File::create(dest)?;
         copy_with_callback(&mut src_f, &mut dst_f, src_len, &mut cb)?;
@@ -1071,8 +1372,8 @@ fn materialize_scalar<F: FnMut(u64)>(
 /// caller can render a live byte meter. `total` is informational —
 /// not enforced, just provided so a one-block whole-file copy
 /// fires cb exactly once.
-fn copy_with_callback<F: FnMut(u64)>(
-    src: &mut fs::File, dst: &mut fs::File, total: u64, cb: &mut F,
+fn copy_with_callback<F: FnMut(u64), R: Read>(
+    src: &mut R, dst: &mut fs::File, total: u64, cb: &mut F,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; 1024 * 1024];
     let mut remaining = total;
@@ -1092,14 +1393,14 @@ fn copy_with_callback<F: FnMut(u64)>(
 /// the `vvec` extensions). Read `dim` from the first record's
 /// header, compute the stride, and copy whole records.
 fn materialize_uniform_xvec<F: FnMut(u64)>(
-    src: &Path,
+    src: &SourceSpans,
     dest: &Path,
     elem: ElementType,
     window: &DSWindow,
     mut cb: F,
 ) -> io::Result<()> {
-    let mut src_f = fs::File::open(src)?;
-    let src_len = src_f.metadata()?.len();
+    let mut src_f = src.open()?;
+    let src_len = src.len();
 
     if src_len < 4 {
         let mut dst_f = fs::File::create(dest)?;
@@ -1342,6 +1643,13 @@ fn fetch_yaml_url(url: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A single file as the one-span stream every materializer now
+    /// takes. The tests below are about formats, not about series, so
+    /// this keeps them reading exactly as they did.
+    fn spans_of(path: &std::path::Path) -> super::SourceSpans {
+        super::SourceSpans::single(path.to_path_buf()).expect("source exists")
+    }
+
     use super::*;
     use crate::dataset::source::{DSInterval, DSWindow};
 
@@ -1369,7 +1677,7 @@ mod tests {
         write_test_slab(&src, 4);
 
         let mut written = 0u64;
-        materialize_slab(&src, &dst, &DSWindow(vec![]), |d| written += d).unwrap();
+        materialize_slab(&spans_of(&src), &dst, &DSWindow(vec![]), |d| written += d).unwrap();
 
         // Default namespace: 4 content records.
         let r = slabtastic::SlabReader::open(&dst).unwrap();
@@ -1395,7 +1703,7 @@ mod tests {
 
         let window = DSWindow(vec![DSInterval { min_incl: 2, max_excl: 5 }]);
         let mut written = 0u64;
-        materialize_slab(&src, &dst, &window, |d| written += d).unwrap();
+        materialize_slab(&spans_of(&src), &dst, &window, |d| written += d).unwrap();
 
         // Content namespace: exactly the windowed range.
         let r = slabtastic::SlabReader::open(&dst).unwrap();
@@ -1490,6 +1798,11 @@ mod tests {
 mod sharded_output {
     use super::*;
 
+    /// A single file as the one-span stream the materializers take.
+    fn spans_of(path: &std::path::Path) -> SourceSpans {
+        SourceSpans::single(path.to_path_buf()).expect("source exists")
+    }
+
     fn tmpdir() -> tempfile::TempDir {
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
         fs::create_dir_all(&base).unwrap();
@@ -1514,21 +1827,21 @@ mod sharded_output {
         let src = d.path().join("in.fvec");
         write_fvec(&src, 3);
         assert_eq!(
-            fixed_record_size(&src, FacetKind::UniformXvec(ElementType::F32)).unwrap(),
+            fixed_record_size(&spans_of(&src), FacetKind::UniformXvec(ElementType::F32)).unwrap(),
             Some(12)
         );
         let s = d.path().join("in.u32");
         fs::write(&s, [0u8; 16]).unwrap();
         assert_eq!(
-            fixed_record_size(&s, FacetKind::Scalar(ElementType::U32)).unwrap(),
+            fixed_record_size(&spans_of(&s), FacetKind::Scalar(ElementType::U32)).unwrap(),
             Some(4)
         );
         // Variable-length and slab have no fixed stride to roll over on.
         assert_eq!(
-            fixed_record_size(&src, FacetKind::VariableVvec).unwrap(),
+            fixed_record_size(&spans_of(&src), FacetKind::VariableVvec).unwrap(),
             None
         );
-        assert_eq!(fixed_record_size(&src, FacetKind::Slab).unwrap(), None);
+        assert_eq!(fixed_record_size(&spans_of(&src), FacetKind::Slab).unwrap(), None);
     }
 
     /// **The shards concatenate back to the source.** Splitting is a
@@ -1539,7 +1852,7 @@ mod sharded_output {
         let src = d.path().join("in.fvec");
         write_fvec(&src, 10);
         let out = materialize_sharded(
-            &src,
+            &spans_of(&src),
             d.path(),
             "base_vectors",
             "fvec",
@@ -1570,7 +1883,7 @@ mod sharded_output {
         write_fvec(&src, 20);
         let window = crate::dataset::source::parse_window("4..14").unwrap();
         let out =
-            materialize_sharded(&src, d.path(), "b", "fvec", 12, &window, 4, |_| {}).unwrap();
+            materialize_sharded(&spans_of(&src), d.path(), "b", "fvec", 12, &window, 4, |_| {}).unwrap();
 
         assert_eq!(out.records, 10);
         let joined: Vec<u8> = out
@@ -1591,7 +1904,7 @@ mod sharded_output {
         let src = d.path().join("in.fvec");
         write_fvec(&src, 5);
         let out = materialize_sharded(
-            &src,
+            &spans_of(&src),
             d.path(),
             "base_vectors",
             "fvec",
@@ -1614,7 +1927,7 @@ mod sharded_output {
         write_fvec(&src, 5);
         let window = crate::dataset::source::parse_window("0..99").unwrap();
         assert!(
-            materialize_sharded(&src, d.path(), "b", "fvec", 12, &window, 4, |_| {}).is_err()
+            materialize_sharded(&spans_of(&src), d.path(), "b", "fvec", 12, &window, 4, |_| {}).is_err()
         );
     }
 }

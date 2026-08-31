@@ -720,6 +720,20 @@ files are not there.
 **SH-38.** Derivation from a sharded source to a sharded output may
 re-stride. Re-striding is a copy, not a rename.
 
+As built, `derive` reads a series as one byte stream — the spans its
+realized shards address, in ordinal order — and the writer rolls over
+at its own stride, so the input's shard boundaries and the output's are
+unrelated. A stride of none writes the series back as a single file,
+which is also the path a command whose kernel reads one mmapped file
+takes to consume a sharded dataset.
+
+**Fixed-stride formats only.** Scalar and uniform-xvec shards
+concatenate byte-for-byte, so a byte-level read across spans is a
+record-level read across shards. A vvec or slab shard carries its own
+index or page structure and two of them concatenated are neither
+format, so those refuse a series by name rather than writing a file
+that opens as nothing (SH-18).
+
 ## 12. Publication
 
 **SH-39.** `push` publishes every **file** the series names and every

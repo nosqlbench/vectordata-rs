@@ -66,6 +66,174 @@ fn uniform_series(dir: &std::path::Path) {
     .unwrap();
 }
 
+// ── derive ─────────────────────────────────────────────────────────
+
+/// **Deriving from an explicit series copies the whole facet** (SH-38).
+///
+/// This is the case that used to fail silently: `part_a.fvec` is a real
+/// file of 100 records, so a plan built from the view's first source
+/// would copy half the base and write a `dataset.yaml` claiming to be
+/// complete. The derived dataset must hold all 200.
+#[test]
+fn deriving_from_an_explicit_series_copies_every_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    explicit_series(&src);
+    let out = tmp.path().join("out");
+
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(),
+            "default",
+            &out,
+            "",
+            &[],
+            &[],
+            Some("derived"),
+            true,
+            None,
+        ),
+        0,
+        "deriving from a series must succeed"
+    );
+
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(r.count(), 200, "every record of every shard");
+    for i in 0..200usize {
+        assert_eq!(r.get(i).unwrap()[0], i as f32, "derived record {i}");
+    }
+}
+
+/// The uniform form derives the same way — the two spellings differ
+/// only in how the file list is derived, and the copy must not be able
+/// to tell them apart.
+#[test]
+fn deriving_from_a_uniform_series_copies_every_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    uniform_series(&src);
+    let out = tmp.path().join("out");
+
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(),
+            "default",
+            &out,
+            "",
+            &[],
+            &[],
+            Some("derived"),
+            true,
+            None,
+        ),
+        0
+    );
+
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(r.count(), 200);
+    assert_eq!(r.get(0).unwrap()[0], 0.0);
+    assert_eq!(r.get(99).unwrap()[0], 99.0);
+    assert_eq!(r.get(100).unwrap()[0], 100.0, "across the source seam");
+    assert_eq!(r.get(199).unwrap()[0], 199.0);
+}
+
+/// **Re-striding is a copy** (SH-38).
+///
+/// The source's shard boundaries and the output's have nothing to do
+/// with each other. A 2×100 source written at a stride of 60 becomes
+/// four shards — 60, 60, 60, 20 — and reads back as the same 200
+/// records in the same order.
+#[test]
+fn a_series_re_strides_to_a_different_shard_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    explicit_series(&src);
+    let out = tmp.path().join("out");
+
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(),
+            "default",
+            &out,
+            "",
+            &[],
+            &[],
+            Some("restrided"),
+            true,
+            Some(60),
+        ),
+        0
+    );
+
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(yaml.contains("shard_stride: 60"), "{yaml}");
+    assert!(yaml.contains("shard_count: 4"), "{yaml}");
+    assert!(yaml.contains("record_count: 200"), "{yaml}");
+
+    // Four files, and the last is the short one.
+    for s in 0..4 {
+        assert!(
+            out.join(format!("profiles/base/base_vectors__{s:04}.fvec")).exists(),
+            "shard {s} missing"
+        );
+    }
+    let last = std::fs::metadata(out.join("profiles/base/base_vectors__0003.fvec"))
+        .unwrap()
+        .len();
+    assert_eq!(last, 20 * (4 + 4 * 4), "the last shard holds the remainder");
+
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(r.count(), 200);
+    for i in 0..200usize {
+        assert_eq!(r.get(i).unwrap()[0], i as f32, "re-strided record {i}");
+    }
+}
+
+/// A window over a series derives the window, in the series' ordinal
+/// space — not a window into shard 0.
+#[test]
+fn deriving_a_windowed_series_slices_the_series() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write_fvec(&src.join("part_a.fvec"), 4, 100, 0);
+    write_fvec(&src.join("part_b.fvec"), 4, 100, 100);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: series\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
+        \x20       - part_a.fvec=100\n        - part_b.fvec=100\n      record_count: 200\n      \
+         window: 80..130\n",
+    )
+    .unwrap();
+    let out = tmp.path().join("out");
+
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(),
+            "default",
+            &out,
+            "",
+            &[],
+            &[],
+            Some("windowed"),
+            true,
+            None,
+        ),
+        0
+    );
+
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(r.count(), 50, "the window is in the series' ordinals");
+    assert_eq!(r.get(0).unwrap()[0], 80.0);
+    assert_eq!(r.get(19).unwrap()[0], 99.0, "last record of the first shard");
+    assert_eq!(r.get(20).unwrap()[0], 100.0, "first of the second");
+    assert_eq!(r.get(49).unwrap()[0], 129.0);
+}
+
 // ── the typed reader ───────────────────────────────────────────────
 
 /// **Both entry points to a typed reader answer the same** (SH-79).
@@ -195,3 +363,57 @@ fn a_window_across_the_seam_matches_the_unsplit_file() {
     assert_eq!(rs.get(49).unwrap()[0], 129.0);
 }
 
+/// **The refusal names a path that works** (SH-38).
+///
+/// A command whose kernel reads one mmapped file cannot take a series,
+/// but "cannot" is only acceptable when there is something the operator
+/// can do instead. Deriving with no stride writes the series back as a
+/// single file, so the message points there — and the round trip is
+/// asserted here, because a suggestion that does not work is worse than
+/// no suggestion.
+#[test]
+fn deriving_a_series_without_a_stride_yields_the_single_file_a_kernel_needs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    explicit_series(&src);
+    let out = tmp.path().join("out");
+
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(),
+            "default",
+            &out,
+            "",
+            &[],
+            &[],
+            Some("flat"),
+            true,
+            None,
+        ),
+        0
+    );
+
+    // Exactly one file, no shard pattern anywhere in the declaration.
+    let flat = out.join("profiles/base/base_vectors.fvec");
+    assert!(flat.is_file(), "the derived facet must be one file");
+    assert_eq!(
+        std::fs::metadata(&flat).unwrap().len(),
+        200 * (4 + 4 * 4),
+        "holding every record of the series"
+    );
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    for key in ["NNNN", "shard_stride", "shard_count"] {
+        assert!(!yaml.contains(key), "`{key}` leaked into a flat output:\n{yaml}");
+    }
+
+    // And it opens as the single-file facet a path-based kernel wants.
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    assert!(
+        view.facet_source("base_vectors").is_some(),
+        "a flat facet resolves to one path"
+    );
+    let r = view.base_vectors().unwrap();
+    assert_eq!(r.count(), 200);
+    assert_eq!(r.get(199).unwrap()[0], 199.0);
+}
