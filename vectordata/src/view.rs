@@ -870,6 +870,39 @@ pub trait TestDataView: Send + Sync {
         Ok(())
     }
 
+    /// Open a facet of ordinal-addressed records.
+    ///
+    /// For a slab facet — metadata content, predicates, results, the
+    /// layout — this is the reader. The vector readers above are built
+    /// on fixed-width elements and a slab record is neither fixed nor
+    /// an element run, so it has a container of its own.
+    ///
+    /// The result carries no codec yet. Apply one to get values:
+    ///
+    /// ```rust,ignore
+    /// let facet = view.open_facet_records("metadata_content")?;
+    /// let rows  = facet.decode(vectordata::records::Serde::<MyRow>::new());
+    /// let first = rows.get(0)?;
+    /// ```
+    fn open_facet_records(
+        &self,
+        name: &str,
+    ) -> std::result::Result<crate::records::RecordFacet, crate::records::RecordError> {
+        let storage = self.open_facet_storage(name).map_err(|e| {
+            crate::records::RecordError::Container(format!("open facet '{name}': {e}"))
+        })?;
+        // A namespace written into the declaration selects a document
+        // inside the container — `metadata_content.slab:layout` — and
+        // travels with the facet rather than being passed separately.
+        let namespace = self
+            .facet_manifest()
+            .get(name)
+            .and_then(|d| d.source_path.as_deref())
+            .and_then(|raw| crate::dataset::source::parse_source_string(raw).ok())
+            .and_then(|p| p.namespace);
+        crate::records::RecordFacet::open(&storage, name, namespace.as_deref())
+    }
+
     /// **Crate-internal hook** used by the default `prebuffer_all`
     /// implementation. Returns a handle whose `precache*` methods
     /// drive the underlying [`crate::storage::Storage`]. Implementors
@@ -2289,6 +2322,19 @@ impl FacetStorage {
             }),
         }
     }
+    /// The single file behind this facet, when its bytes are on disk.
+    ///
+    /// `None` for a series — which has no single file — and for a
+    /// remote facet whose bytes have not been brought down. Readers
+    /// that memory-map a container of their own need a real path, and
+    /// this is the only honest way to ask for one.
+    pub(crate) fn local_file(&self) -> Option<std::path::PathBuf> {
+        if self.series.is_some() {
+            return None;
+        }
+        self.storage.local_path()
+    }
+
     /// The access mode this facet promises, which is the weakest among
     /// its files (SH-93).
     ///

@@ -149,6 +149,8 @@ pub mod catalog;
 pub mod dataset;
 /// Wire format codecs: MNode, PNode, ANode.
 pub mod formats;
+/// Ordinal-addressed record facets (slabs) and the codecs that type them.
+pub mod records;
 /// Content-addressed integrity verification (SHA-256 merkle trees).
 pub mod merkle;
 /// HTTP transport layer. **Crate-private** — exposed only via the
