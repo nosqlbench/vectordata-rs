@@ -211,6 +211,15 @@ struct DatasetProfileSummary {
     attributes: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     views: Option<serde_json::Value>,
+    /// The parameter values that distinguish this profile from its
+    /// siblings (P-4). Absent when the profile recorded none, which is
+    /// undescribed rather than zero (P-7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_attributes: Option<serde_json::Value>,
+    /// The generator spec this profile came from, and its siblings —
+    /// so a consumer can find the family without parsing names (P-8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    family: Option<serde_json::Value>,
 }
 
 pub fn run(
@@ -481,7 +490,58 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
                     println!("  views: {}", views.join(", "));
                 }
             }
+            print_profile_parameters(entry);
         }
+    }
+}
+
+/// What distinguishes each parameterized profile of an entry (P-12).
+///
+/// `list` is the surface people browse with, so a family whose members
+/// differ by selectivity has to be legible here and not only in
+/// `describe`. Only profiles that recorded something are printed:
+/// absent attributes mean undescribed, and a line of zeroes would
+/// invent measurements nobody took (P-7).
+fn print_profile_parameters(entry: &CatalogEntry) {
+    let mut any = false;
+    for (name, profile) in &entry.layout.profiles.profiles {
+        if profile.attributes.is_empty() {
+            continue;
+        }
+        let rendered: Vec<String> = profile
+            .attributes
+            .iter()
+            .map(|(k, v)| format!("{k}={}", render_attribute(v)))
+            .collect();
+        println!("  profile.{name}: {}", rendered.join(", "));
+        any = true;
+    }
+    if !any {
+        return;
+    }
+    // Families are what make those numbers comparable: two profiles
+    // that are one corpus at two parameter values, rather than two
+    // unrelated profiles that happen to be listed together (P-8).
+    for (spec, members) in entry.layout.profiles.families() {
+        if members.len() > 1 {
+            println!("  family[{spec}]: {}", members.join(", "));
+        }
+    }
+}
+
+/// Render an attribute value for a terminal line. Scalars print bare;
+/// anything structured falls back to trimmed YAML, because an open map
+/// must report what it does not recognise rather than drop it (P-5).
+fn render_attribute(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Null => "null".to_string(),
+        other => serde_yaml::to_string(other)
+            .unwrap_or_default()
+            .trim()
+            .replace('\n', " "),
     }
 }
 
@@ -626,6 +686,8 @@ fn build_structured(entries: &[&CatalogEntry], verbose: bool, pv: &ProfileView) 
                 url: None,
                 attributes: None,
                 views: None,
+                profile_attributes: None,
+                family: None,
             };
 
             if verbose {
@@ -638,6 +700,18 @@ fn build_structured(entries: &[&CatalogEntry], verbose: bool, pv: &ProfileView) 
                     if !view_names.is_empty() {
                         summary.views = Some(serde_json::json!(view_names));
                     }
+                    // A machine consumer choosing "the profile nearest
+                    // 1% selectivity" reads these, not the name.
+                    if !profile.attributes.is_empty() {
+                        summary.profile_attributes =
+                            serde_json::to_value(&profile.attributes).ok();
+                    }
+                }
+                if let Some((spec, members)) = entry.layout.profiles.family_of(profile_name) {
+                    summary.family = Some(serde_json::json!({
+                        "spec": spec,
+                        "members": members,
+                    }));
                 }
             }
 
