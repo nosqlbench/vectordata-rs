@@ -727,12 +727,22 @@ unrelated. A stride of none writes the series back as a single file,
 which is also the path a command whose kernel reads one mmapped file
 takes to consume a sharded dataset.
 
-**Fixed-stride formats only.** Scalar and uniform-xvec shards
-concatenate byte-for-byte, so a byte-level read across spans is a
-record-level read across shards. A vvec or slab shard carries its own
-index or page structure and two of them concatenated are neither
-format, so those refuse a series by name rather than writing a file
-that opens as nothing (SH-18).
+**Each format composes the way its own structure allows.** Scalar and
+uniform-xvec shards concatenate byte-for-byte, so a byte-level read
+across spans is a record-level read across shards. A vvec is a
+self-describing stream — the offset index is a sidecar, not part of the
+file — so its shards concatenate too, and a window over them is
+resolved by walking the concatenation rather than any one shard's
+sidecar. A slab cannot be concatenated at all: it carries its own page
+index, so a series is composed record by record through one writer,
+which is the same operation the windowed single-file path already
+performs.
+
+For the two formats with no fixed stride, shards must be **whole
+files** — the form the explicit series takes, since it composes files
+rather than splitting them (SH-50). A shard addressing part of a file
+is refused by name, because resolving its ordinal window needs the
+index that format keeps somewhere other than in the byte stream.
 
 ## 12. Publication
 

@@ -409,19 +409,21 @@ fn spans_for_view(
     let kind = classify_facet(facet_name, &first_path, &ext)?;
     let single = SourceSpans::single(first_path.clone())
         .map_err(|e| format!("Facet '{facet_name}': {e}"))?;
-    let record_size = fixed_record_size(&single, kind)
+    match fixed_record_size(&single, kind)
         .map_err(|e| format!("Facet '{facet_name}': {e}"))?
-        .ok_or_else(|| {
-            format!(
-                "Facet '{facet_name}': deriving from a series needs a fixed record \
-                 size, which '{ext}' does not have — a vvec or slab shard carries \
-                 its own index, so its shards cannot be read as one byte stream \
-                 (SH-18, SH-38)."
-            )
-        })?;
-
-    SourceSpans::from_shards(&shards, base_dir, record_size)
-        .map_err(|e| format!("Facet '{facet_name}': {e}"))
+    {
+        // A fixed stride turns an ordinal extent into a byte extent, so
+        // a sliced shard contributes exactly the bytes it addresses.
+        Some(record_size) => SourceSpans::from_shards(&shards, base_dir, record_size),
+        // Without one, only the records themselves say where they are.
+        // Whole-file shards need no map — the extent is the file — and
+        // that is the form the explicit series takes, which composes
+        // whole files rather than splitting any (SH-50). A shard
+        // addressing part of a file is refused by name rather than
+        // guessed at.
+        None => SourceSpans::from_whole_shards(&shards, base_dir),
+    }
+    .map_err(|e| format!("Facet '{facet_name}': {e}"))
 }
 
 fn build_plan_via_view(
@@ -928,8 +930,8 @@ pub(crate) struct SourceSpans {
 }
 
 #[derive(Debug, Clone)]
-struct Span {
-    path: std::path::PathBuf,
+pub(crate) struct Span {
+    pub(crate) path: std::path::PathBuf,
     /// First byte of the file this span presents.
     offset: u64,
     len: u64,
@@ -984,6 +986,43 @@ impl SourceSpans {
         Ok(Self { spans, total })
     }
 
+    /// A series of **whole** files, for a format with no fixed stride.
+    ///
+    /// A vvec's records are self-describing and a slab's are indexed by
+    /// its own pages; neither offers a byte offset for an ordinal
+    /// without reading. Whole files sidestep the question — the span is
+    /// the file — and that is what the explicit form declares, since it
+    /// composes files rather than splitting them (SH-50).
+    ///
+    /// A sliced entry is refused by name. Its ordinal window is
+    /// meaningful, but resolving it needs the index this format keeps
+    /// somewhere other than in the byte stream.
+    pub(crate) fn from_whole_shards(
+        shards: &crate::dataset::shards::Shards,
+        base_dir: &Path,
+    ) -> io::Result<Self> {
+        let mut spans = Vec::with_capacity(shards.entries().len());
+        let mut total = 0;
+        for entry in shards.entries() {
+            if entry.file_base != 0 || !entry.source.window.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "shard '{}' reads part of its file, and this format has no \
+                         fixed record size to resolve that against — a variable-length \
+                         or container facet composes whole files (SH-50)",
+                        entry.source.path
+                    ),
+                ));
+            }
+            let path = base_dir.join(&entry.source.path);
+            let len = fs::metadata(&path)?.len();
+            total += len;
+            spans.push(Span { path, offset: 0, len });
+        }
+        Ok(Self { spans, total })
+    }
+
     /// Total bytes across every span.
     pub(crate) fn len(&self) -> u64 {
         self.total
@@ -999,6 +1038,15 @@ impl SourceSpans {
             [only] if only.offset == 0 => Some(&only.path),
             _ => None,
         }
+    }
+
+    /// The files these spans read from, in ordinal order.
+    ///
+    /// For a format that cannot be read as one byte stream — a slab,
+    /// whose shards each carry their own page index — composition has
+    /// to happen file by file, and this is what it walks.
+    pub(crate) fn shards(&self) -> &[Span] {
+        &self.spans
     }
 
     /// The first file these spans read from.
@@ -1095,6 +1143,171 @@ impl io::Seek for SpanReader<'_> {
     }
 }
 
+/// Compose a slab series into one slab (SH-18, SH-38).
+///
+/// Each shard is an ordinary slab based at zero, and the global base
+/// comes from the shard map (SH-96) — so the series' ordinal `o` is
+/// shard `s`'s local ordinal `o - base(s)`. Records are read through
+/// slabtastic and written through a fresh writer, which is the only
+/// composition a page-structured container admits.
+///
+/// Sibling namespaces are **not** carried across. An embedded `layout`
+/// namespace does not travel into a sharded content slab (SH-98): the
+/// standalone `metadata_layout.slab` is authoritative and the embedded
+/// copy is a convenience, so choosing one shard's copy to promote would
+/// invent a rule about where a schema lives that the unsharded case
+/// never needed.
+fn materialize_slab_series<F: FnMut(u64)>(
+    src: &SourceSpans,
+    dest: &Path,
+    window: &DSWindow,
+    mut cb: F,
+) -> io::Result<()> {
+    let config = slabtastic::WriterConfig::default();
+    let mut writer = slabtastic::SlabWriter::new(dest, config)
+        .map_err(|e| io::Error::other(format!("create slab {}: {e}", dest.display())))?;
+
+    // Ordinal extents of each shard within the series, so a window in
+    // the series' space resolves to a range in a shard's own.
+    let mut base = 0u64;
+    for shard in src.shards() {
+        let reader = slabtastic::SlabReader::open(&shard.path).map_err(|e| {
+            io::Error::other(format!("open slab {}: {e}", shard.path.display()))
+        })?;
+        let count = reader.total_records();
+        let end = base + count;
+        // What of this shard the window asks for, in local ordinals.
+        let wanted: Vec<(u64, u64)> = if window.is_empty() {
+            vec![(0, count)]
+        } else {
+            window
+                .0
+                .iter()
+                .filter_map(|iv| {
+                    let lo = iv.min_incl.max(base);
+                    let hi = iv.max_excl.min(end);
+                    (lo < hi).then(|| (lo - base, hi - base))
+                })
+                .collect()
+        };
+        for (lo, hi) in wanted {
+            for ord in lo..hi {
+                let data = reader.get(ord as i64).map_err(|e| {
+                    io::Error::other(format!(
+                        "read ordinal {ord} from {}: {e}",
+                        shard.path.display()
+                    ))
+                })?;
+                writer.add_record(&data).map_err(|e| {
+                    io::Error::other(format!("write to {}: {e}", dest.display()))
+                })?;
+                cb(data.len() as u64);
+            }
+        }
+        base = end;
+    }
+    writer
+        .finish()
+        .map_err(|e| io::Error::other(format!("finish slab {}: {e}", dest.display())))?;
+    Ok(())
+}
+
+/// Copy a variable-length facet, whole or windowed.
+///
+/// **A vvec is a self-describing stream**: each record is an `i32`
+/// dimension followed by that many elements, and the offset index is a
+/// sidecar rather than part of the file. Concatenating two vvec shards
+/// therefore produces a valid vvec, which is what lets a series be read
+/// as one stream here exactly as a fixed-stride facet is (SH-38).
+///
+/// A window has to walk to find its bounds, because only the records
+/// themselves say where they start. The walk is over the spans, so a
+/// windowed series is windowed in the *series'* ordinal space and not
+/// in any one shard's.
+fn materialize_vvec<F: FnMut(u64)>(
+    src: &SourceSpans,
+    dest: &Path,
+    elem: usize,
+    window: &DSWindow,
+    mut cb: F,
+) -> io::Result<()> {
+    let mut src_f = src.open()?;
+    let mut dst_f = fs::File::create(dest)?;
+    if window.is_empty() {
+        copy_with_callback(&mut src_f, &mut dst_f, src.len(), &mut cb)?;
+        return Ok(());
+    }
+
+    let offsets = vvec_record_offsets(src, elem)?;
+    // `offsets` has one entry per record plus a final end sentinel, so
+    // a record's extent is always a pair of neighbours.
+    let records = offsets.len().saturating_sub(1);
+    let mut buf = vec![0u8; 1024 * 1024];
+    for iv in &window.0 {
+        let (lo, hi) = (iv.min_incl as usize, iv.max_excl as usize);
+        if hi > records {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("window [{lo}..{hi}) past the end of a {records}-record facet"),
+            ));
+        }
+        let (mut from, to) = (offsets[lo], offsets[hi]);
+        src_f.seek(SeekFrom::Start(from))?;
+        while from < to {
+            let want = ((to - from).min(buf.len() as u64)) as usize;
+            src_f.read_exact(&mut buf[..want])?;
+            dst_f.write_all(&buf[..want])?;
+            from += want as u64;
+            cb(want as u64);
+        }
+    }
+    Ok(())
+}
+
+/// Byte offsets of every record in a variable-length stream, plus a
+/// final sentinel at the end.
+///
+/// Built by walking the records, which is the only thing that knows
+/// where they are. The published `IDXFOR__` sidecar answers the same
+/// question for a single file, but a series has one per shard and none
+/// for the concatenation — and rebuilding is a local read here, since
+/// derive has already brought its source into the cache.
+fn vvec_record_offsets(src: &SourceSpans, elem: usize) -> io::Result<Vec<u64>> {
+    let mut f = src.open()?;
+    let total = src.len();
+    let mut offsets = Vec::new();
+    let mut at = 0u64;
+    let mut header = [0u8; 4];
+    while at + 4 <= total {
+        offsets.push(at);
+        f.seek(SeekFrom::Start(at))?;
+        f.read_exact(&mut header)?;
+        let dim = i32::from_le_bytes(header);
+        if dim < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("record at byte {at} declares a negative dimension ({dim})"),
+            ));
+        }
+        let len = 4 + dim as u64 * elem as u64;
+        if at + len > total {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("record at byte {at} claims {len} bytes, past the end at {total}"),
+            ));
+        }
+        at += len;
+    }
+    if at != total {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} trailing bytes after the last whole record", total - at),
+        ));
+    }
+    offsets.push(total);
+    Ok(offsets)
+}
+
 /// A facet as written, for the emitted declaration.
 #[derive(Debug, Clone)]
 pub(crate) struct DerivedFacet {
@@ -1187,14 +1400,20 @@ fn materialize_facet<F: FnMut(u64)>(
     };
     let done = |r: io::Result<()>| r.map(|()| single(vec![dest.to_path_buf()]));
     match kind {
-        FacetKind::VariableVvec => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "variable-length vvec facets ('{facet_name}') are not yet \
-                 materializable by `derive`; use `transform extract` \
-                 to slice the source file manually for now"
-            ),
-        )),
+        FacetKind::VariableVvec => {
+            let ext = dest
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default();
+            let elem = crate::io::infer_elem_size(ext);
+            if elem == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("facet '{facet_name}': unknown element width for '.{ext}'"),
+                ));
+            }
+            done(materialize_vvec(src, dest, elem, window, on_bytes_written))
+        }
         FacetKind::Scalar(elem) => {
             done(materialize_scalar(src, dest, elem, window, on_bytes_written))
         }
@@ -1221,18 +1440,14 @@ fn materialize_slab<F: FnMut(u64)>(
     window: &DSWindow,
     mut cb: F,
 ) -> io::Result<()> {
-    // A slab shard is a container with its own page index, so two of
-    // them concatenated are neither slab nor readable. Re-striding a
-    // slab series is a slab-format operation, not a byte copy, and
-    // refusing by name beats writing a file that opens as nothing
-    // (SH-18, SH-38).
+    // A slab carries its own page index, so two shards concatenated are
+    // neither slab nor readable — a byte copy is not available here.
+    // Re-striding one is a slab-format operation: read records by
+    // ordinal from each shard in turn and stream them through one
+    // writer, which is what the windowed path below already does for a
+    // single file (SH-18, SH-38).
     let Some(src) = src.single_path() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "deriving from a slab series is not supported: a slab carries its own \
-             page index, so its shards cannot be copied as bytes — see \
-             docs/design/srd-multifile-facet-shards.md (SH-18, SH-38)",
-        ));
+        return materialize_slab_series(src, dest, window, cb);
     };
     if window.is_empty() {
         let mut src_f = fs::File::open(src)?;
@@ -1665,6 +1880,100 @@ mod tests {
         w.start_namespace("schema").unwrap();
         w.add_record(b"{\"v\":1}").unwrap();
         w.finish().unwrap();
+    }
+
+    /// Two slab shards compose into one slab, in ordinal order
+    /// (SH-18, SH-38).
+    ///
+    /// A slab carries its own page index, so the shards cannot be
+    /// concatenated as bytes. They are read record by record and
+    /// written through one writer — the only composition a
+    /// page-structured container admits.
+    #[test]
+    fn a_slab_series_composes_into_one_slab() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("part_a.slab");
+        let b = tmp.path().join("part_b.slab");
+        let dst = tmp.path().join("joined.slab");
+        write_test_slab_range(&a, 0, 3);
+        write_test_slab_range(&b, 3, 3);
+
+        let spans = SourceSpans::from_whole_shards(
+            &whole_file_shards(&["part_a.slab", "part_b.slab"]),
+            tmp.path(),
+        )
+        .unwrap();
+
+        let mut written = 0u64;
+        materialize_slab(&spans, &dst, &DSWindow(vec![]), |d| written += d).unwrap();
+
+        let r = slabtastic::SlabReader::open(&dst).unwrap();
+        assert_eq!(r.total_records(), 6, "both shards' records");
+        for i in 0..6i64 {
+            assert_eq!(
+                r.get(i).unwrap(),
+                format!("r-{i}").as_bytes(),
+                "ordinal {i} keeps its place in the series"
+            );
+        }
+        assert!(written > 0);
+    }
+
+    /// A window over a slab series is in the **series'** ordinal space:
+    /// it clips each shard to the part of the window that falls in it,
+    /// rather than applying the same range to every shard.
+    #[test]
+    fn a_windowed_slab_series_clips_the_series_not_each_shard() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_slab_range(&tmp.path().join("part_a.slab"), 0, 4);
+        write_test_slab_range(&tmp.path().join("part_b.slab"), 4, 4);
+        let dst = tmp.path().join("windowed.slab");
+
+        let spans = SourceSpans::from_whole_shards(
+            &whole_file_shards(&["part_a.slab", "part_b.slab"]),
+            tmp.path(),
+        )
+        .unwrap();
+
+        // [2..6) spans the seam: the last two of shard 0 and the first
+        // two of shard 1.
+        let window = DSWindow(vec![crate::dataset::source::DSInterval {
+            min_incl: 2,
+            max_excl: 6,
+        }]);
+        materialize_slab(&spans, &dst, &window, |_| {}).unwrap();
+
+        let r = slabtastic::SlabReader::open(&dst).unwrap();
+        assert_eq!(r.total_records(), 4);
+        for (out, src) in (0i64..4).zip(2i64..6) {
+            assert_eq!(r.get(out).unwrap(), format!("r-{src}").as_bytes());
+        }
+    }
+
+    fn write_test_slab_range(path: &Path, first: u64, n: u64) {
+        let cfg = slabtastic::WriterConfig::default();
+        let mut w = slabtastic::SlabWriter::new(path, cfg).unwrap();
+        for i in first..first + n {
+            w.add_record(format!("r-{i}").as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    /// Whole-file shards for the named files, in order.
+    fn whole_file_shards(names: &[&str]) -> crate::dataset::shards::Shards {
+        crate::dataset::shards::Shards::new(
+            names
+                .iter()
+                .map(|n| crate::dataset::shards::Entry {
+                    source: crate::dataset::source::parse_source_string(n).unwrap(),
+                    file_base: 0,
+                    // Lengths are not consulted by the whole-file path;
+                    // the file is the span.
+                    len: 1,
+                })
+                .collect(),
+        )
+        .unwrap()
     }
 
     /// Empty-window derive of a slab is a byte-copy that preserves

@@ -417,3 +417,106 @@ fn deriving_a_series_without_a_stride_yields_the_single_file_a_kernel_needs() {
     assert_eq!(r.count(), 200);
     assert_eq!(r.get(199).unwrap()[0], 199.0);
 }
+
+// ── variable-length and container formats ──────────────────────────
+
+fn write_ivvec(path: &std::path::Path, first: usize, count: usize) {
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    for i in 0..count {
+        let global = first + i;
+        let dim = (global % 5) + 1;
+        f.write_all(&(dim as i32).to_le_bytes()).unwrap();
+        for d in 0..dim {
+            f.write_all(&((global * 100 + d) as i32).to_le_bytes()).unwrap();
+        }
+    }
+    f.flush().unwrap();
+}
+
+/// **A vvec series derives as one facet** (SH-38).
+///
+/// A vvec is a self-describing stream — each record is its own
+/// dimension followed by that many values, and the offset index is a
+/// sidecar rather than part of the file — so its shards concatenate and
+/// the copy reads them as one stream, exactly as a fixed-stride facet
+/// is read.
+#[test]
+fn a_vvec_series_derives_into_one_facet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write_ivvec(&src.join("meta_a.ivvec"), 0, 30);
+    write_ivvec(&src.join("meta_b.ivvec"), 30, 30);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: vv\nprofiles:\n  default:\n    metadata_results:\n      source:\n\
+        \x20       - meta_a.ivvec=30\n        - meta_b.ivvec=30\n      record_count: 60\n",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(), "default", &out, "", &[], &[],
+            Some("vv-derived"), true, None,
+        ),
+        0,
+        "a vvec series must derive"
+    );
+
+    // The derived file is the concatenation, byte for byte.
+    let derived = out.join("profiles/base/metadata_results.ivvec");
+    assert!(derived.is_file(), "expected {}", derived.display());
+    let mut expected = std::fs::read(src.join("meta_a.ivvec")).unwrap();
+    expected.extend(std::fs::read(src.join("meta_b.ivvec")).unwrap());
+    assert_eq!(std::fs::read(&derived).unwrap(), expected);
+
+    // And it reads back as 60 records with the right shapes.
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let r = view.metadata_results().unwrap();
+    assert_eq!(r.count(), 60, "every record of both shards");
+    // Record shapes and values survive the concatenation.
+    for o in [0usize, 29, 30, 59] {
+        assert_eq!(r.dim_at(o).unwrap(), (o % 5) + 1, "dim at {o}");
+        assert_eq!(r.get(o).unwrap()[0], (o * 100) as i32, "value at {o}");
+    }
+}
+
+/// A window over a vvec series is a window in the **series'** ordinal
+/// space, resolved by walking the concatenated records rather than any
+/// one shard's sidecar.
+#[test]
+fn a_windowed_vvec_series_slices_the_series() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write_ivvec(&src.join("meta_a.ivvec"), 0, 30);
+    write_ivvec(&src.join("meta_b.ivvec"), 30, 30);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: vv\nprofiles:\n  default:\n    metadata_results:\n      source:\n\
+        \x20       - meta_a.ivvec=30\n        - meta_b.ivvec=30\n      record_count: 60\n      \
+         window: 20..45\n",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(), "default", &out, "", &[], &[],
+            Some("vv-window"), true, None,
+        ),
+        0
+    );
+
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let r = view.metadata_results().unwrap();
+    assert_eq!(r.count(), 25, "a 25-record window across the seam");
+    // The window starts at series ordinal 20 and crosses into the
+    // second shard at 30.
+    assert_eq!(r.get(0).unwrap()[0], 2000);
+    assert_eq!(r.get(10).unwrap()[0], 3000, "first record of the second shard");
+    assert_eq!(r.get(24).unwrap()[0], 4400);
+}
