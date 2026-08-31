@@ -427,12 +427,19 @@ impl RecordFacet {
                     let handle = series.file(i).map_err(|e| {
                         RecordError::Container(format!("facet '{facet}': {e}"))
                     })?;
-                    let path = handle.local_path().ok_or_else(|| {
-                        RecordError::NotResident(format!(
-                            "facet '{facet}' shard {shard} ({})",
-                            series.file_source(i)
-                        ))
-                    })?;
+                    // Complete, not merely present: a sparse cache file
+                    // exists from the moment a download starts and reads
+                    // as zeroes until it finishes.
+                    let path = handle
+                        .is_complete()
+                        .then(|| handle.local_path())
+                        .flatten()
+                        .ok_or_else(|| {
+                            RecordError::NotResident(format!(
+                                "facet '{facet}' shard {shard} ({})",
+                                series.file_source(i)
+                            ))
+                        })?;
                     containers.push(Container {
                         path,
                         namespace: namespace.map(str::to_string),
