@@ -538,6 +538,7 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
             path: full_path,
             dataset_type,
             layout: CatalogLayout {
+                format_version: crate::model::FORMAT_VERSION_BASE,
                 attributes,
                 profiles,
             },
@@ -688,6 +689,7 @@ mod tests {
             catalog_file: None,
             catalog_name: None,
             layout: CatalogLayout {
+                format_version: crate::model::FORMAT_VERSION_BASE,
                 attributes: None,
                 profiles: crate::dataset::DSProfileGroup::from_profiles(profile_group),
             },

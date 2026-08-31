@@ -275,6 +275,10 @@ impl DiscoveredDataset {
             catalog_file: None,
             catalog_name: None,
             layout: CatalogLayout {
+                // The dataset's own version travels into the catalog,
+                // so a consumer too old for it can say so from the
+                // listing rather than after fetching (V-13).
+                format_version: self.config.format_version,
                 attributes: self.config.attributes.clone(),
                 profiles: self.config.profiles.clone(),
             },

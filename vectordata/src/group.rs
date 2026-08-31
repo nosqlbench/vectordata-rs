@@ -507,6 +507,7 @@ mod tests {
         // the YAML itself. View facet URLs strip this prefix to get
         // a clean file_relpath like "base.fvec".
         let layout = crate::dataset::CatalogLayout {
+            format_version: crate::model::FORMAT_VERSION_BASE,
             attributes: None,
             profiles: Default::default(),
         };
@@ -534,6 +535,7 @@ mod tests {
         // view.open_facet_storage yields the right relpath
         // ("base.fvec", not the absolute URL).
         let layout = crate::dataset::CatalogLayout {
+            format_version: crate::model::FORMAT_VERSION_BASE,
             attributes: None,
             profiles: Default::default(),
         };

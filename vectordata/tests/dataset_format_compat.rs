@@ -290,3 +290,126 @@ fn every_pre_sharding_facet_spelling_still_reads() {
     assert_eq!(suffixed.count(), 30, "a source suffix clips");
     assert_eq!(suffixed.get(0).unwrap()[0], 20.0);
 }
+
+// ── the two loaders ────────────────────────────────────────────────
+
+/// **Both loaders read the version identically** (V-12).
+///
+/// A dataset accepted by one route and refused by the other makes the
+/// *transport* decide whether it is readable: open it as a local
+/// `dataset.yaml` and it fails, reach it through a catalog and it
+/// loads, then dies on a type error or a missing `__NNNN` file — the
+/// diagnosis the field exists to replace.
+///
+/// Asserted as agreement rather than as two separate expectations, so
+/// the test fails whichever side drifts.
+#[test]
+fn both_loaders_agree_about_every_version_case() {
+    let cases = [
+        (
+            "from the future",
+            "format_version: 99\nname: f\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
+            false,
+        ),
+        (
+            "understating its content",
+            "format_version: 1\nname: u\nprofiles:\n  default:\n    base_vectors:\n      \
+             source: b__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
+             record_count: 250\n",
+            false,
+        ),
+        (
+            "unannotated but sharded",
+            "name: a\nprofiles:\n  default:\n    base_vectors:\n      \
+             source: b__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
+             record_count: 250\n",
+            true,
+        ),
+        (
+            "stating more than it needs",
+            "format_version: 2\nname: g\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
+            true,
+        ),
+        (
+            "plain v1",
+            "name: p\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
+            true,
+        ),
+    ];
+
+    for (label, yaml, expected) in cases {
+        let client = serde_yaml::from_str::<vectordata::model::DatasetConfig>(yaml).is_ok();
+        let catalog = serde_yaml::from_str::<vectordata::dataset::DatasetConfig>(yaml).is_ok();
+        assert_eq!(
+            client, catalog,
+            "the loaders disagree about a dataset {label}: \
+             client={client}, catalog={catalog}"
+        );
+        assert_eq!(client, expected, "a dataset {label} should load = {expected}");
+    }
+}
+
+/// **A catalog entry carries the version** (V-13), so a consumer can
+/// refuse before fetching rather than after.
+#[test]
+fn a_generated_catalog_entry_carries_the_datasets_version() {
+    let sharded = "format_version: 2\nname: s\nprofiles:\n  default:\n    base_vectors:\n      \
+                   source: b__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
+                   record_count: 250\n";
+    let cfg: vectordata::dataset::DatasetConfig = serde_yaml::from_str(sharded).unwrap();
+    assert_eq!(cfg.format_version, 2);
+
+    let layout = vectordata::dataset::CatalogLayout {
+        format_version: cfg.format_version,
+        attributes: cfg.attributes.clone(),
+        profiles: cfg.profiles.clone(),
+    };
+    let json = serde_json::to_string(&layout).unwrap();
+    assert!(
+        json.contains("\"format_version\":2"),
+        "the version must reach the catalog: {json}"
+    );
+
+    // And version 1 adds no key, so a catalog of pre-versioning
+    // datasets is unchanged by this.
+    let plain: vectordata::dataset::DatasetConfig =
+        serde_yaml::from_str("name: p\nprofiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
+    let layout = vectordata::dataset::CatalogLayout {
+        format_version: plain.format_version,
+        attributes: None,
+        profiles: plain.profiles.clone(),
+    };
+    let json = serde_json::to_string(&layout).unwrap();
+    assert!(!json.contains("format_version"), "{json}");
+}
+
+/// **A save states the version the content needs, not the one it was
+/// loaded with** (V-4).
+///
+/// Folding it from the declarations is what keeps the field honest
+/// through an edit: a dataset that gained a series says so, and the key
+/// never appears on one that does not need it.
+#[test]
+fn a_saved_dataset_states_the_version_its_content_needs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("dataset.yaml");
+
+    let sharded: vectordata::dataset::DatasetConfig = serde_yaml::from_str(
+        "name: s\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n      \
+         shard_stride: 100\n      shard_count: 3\n      record_count: 250\n",
+    )
+    .unwrap();
+    let out = sharded.to_expanded_yaml_string(&path).unwrap();
+    assert!(
+        out.contains("format_version: 2"),
+        "an unannotated sharded dataset states what it needs on save:\n{out}"
+    );
+
+    let plain: vectordata::dataset::DatasetConfig =
+        serde_yaml::from_str("name: p\nprofiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
+    let out = plain.to_expanded_yaml_string(&path).unwrap();
+    assert!(
+        !out.contains("format_version"),
+        "an unsharded dataset must not acquire the key by being saved:\n{out}"
+    );
+}

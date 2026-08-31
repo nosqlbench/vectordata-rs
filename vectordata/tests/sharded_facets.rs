@@ -1083,6 +1083,12 @@ fn a_dataset_from_the_future_is_refused_with_both_numbers() {
 
 /// The refusal is at **load**, before any facet is opened (V-10). A
 /// dataset the reader cannot understand must not be half-read.
+///
+/// The fixture's one facet is an ordinary v1 `base.fvec` — familiar,
+/// readable, and refused anyway (V-11). "The facets I want are all
+/// version 1" is a judgement the reader is not equipped to make, since
+/// the version exists precisely because it cannot tell what it is
+/// missing.
 #[test]
 fn a_refused_version_opens_no_facet() {
     let tmp = tempfile::tempdir().unwrap();

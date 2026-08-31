@@ -1193,6 +1193,7 @@ fn clean_single_dataset(workspace: &std::path::Path) {
                 eprintln!("Warning: could not load dataset.yaml: {}", e);
                 eprintln!("Cleaning without profile information.");
                 vectordata::dataset::DatasetConfig {
+                    format_version: vectordata::model::FORMAT_VERSION_BASE,
                     name: String::new(),
                     description: None,
                     attributes: None,

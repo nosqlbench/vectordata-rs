@@ -4223,6 +4223,7 @@ mod tests {
             catalog_file: None,
             catalog_name: None,
             layout: crate::dataset::CatalogLayout {
+                format_version: crate::model::FORMAT_VERSION_BASE,
                 attributes: None,
                 profiles: Default::default(),
             },
@@ -4303,6 +4304,7 @@ mod tests {
             catalog_file: None,
             catalog_name: None,
             layout: crate::dataset::CatalogLayout {
+                format_version: crate::model::FORMAT_VERSION_BASE,
                 attributes: None,
                 profiles: Default::default(),
             },

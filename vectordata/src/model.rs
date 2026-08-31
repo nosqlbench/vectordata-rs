@@ -83,6 +83,69 @@ pub const FORMAT_VERSION_SHARDED: u32 = 2;
 /// numbers — the diagnosis the field exists to provide (V-9).
 pub const FORMAT_VERSION_SUPPORTED: u32 = FORMAT_VERSION_SHARDED;
 
+/// The version an absent field stands for (V-2).
+pub fn base_format_version() -> u32 {
+    FORMAT_VERSION_BASE
+}
+
+/// Whether a version is the base one, and so need not be written out.
+///
+/// A writer emits the lowest version that describes what it wrote, and
+/// for version 1 that is nothing at all — which is what keeps an
+/// unsharded output readable by every build that ever existed (V-5).
+pub fn is_base_format_version(v: &u32) -> bool {
+    *v == FORMAT_VERSION_BASE
+}
+
+/// Refuse a dataset this build cannot read, naming both numbers (V-9).
+///
+/// **Shared by both loaders rather than mirrored** (V-12). A dataset
+/// accepted by one route and refused by the other would make the
+/// transport decide whether it is readable, which is the same fault
+/// duplicated shard realization would be (SH-90). One function is what
+/// makes "both read the field identically" a property of the code
+/// rather than a thing to keep true by hand.
+///
+/// Returns the effective version: an absent field means 1, which is
+/// every dataset in circulation and not a distinct unversioned state
+/// (V-2).
+pub fn check_supported_version(stated: Option<u32>) -> Result<u32, String> {
+    let version = stated.unwrap_or(FORMAT_VERSION_BASE);
+    if version > FORMAT_VERSION_SUPPORTED {
+        return Err(format!(
+            "dataset requires format_version {version}; this build \
+             supports up to {FORMAT_VERSION_SUPPORTED}. Upgrade vectordata to read it."
+        ));
+    }
+    Ok(version)
+}
+
+/// Refuse a declaration that understates what it holds (V-14).
+///
+/// A *stated* version lower than the content requires is a declaration
+/// contradicting itself — the same class of fault as a record count
+/// that disagrees with its shards (SH-8).
+///
+/// An **absent** field is not a claim. It means 1 for the gate above
+/// (V-2), but a dataset that never declared a version has not
+/// understated one, and a reader new enough to notice the omission is
+/// new enough to read the data (V-22). Under-annotation is a note from
+/// `veks check`, not a load failure — refusing it here would reject
+/// every hand-written sharded dataset over a field that helps no reader
+/// which can already read it.
+///
+/// A version *higher* than the content requires is merely generous, and
+/// is accepted (V-23).
+pub fn check_stated_against_content(stated: Option<u32>, required: u32) -> Result<(), String> {
+    match stated {
+        Some(stated) if required > stated => Err(format!(
+            "dataset declares format_version {stated} but its content \
+             requires {required} — a declaration cannot understate what it holds"
+        )),
+        _ => Ok(()),
+    }
+}
+
 // Hand-written deserialize so the client tolerates the compact `sized:`
 // spec sitting next to concrete profile entries. The spec is a sequence
 // (or mapping with a `ranges:` key) used by the pipeline as a shorthand
@@ -121,13 +184,8 @@ impl<'de> Deserialize<'de> for DatasetConfig {
         // is opened (V-9, V-10). A dataset half-read is a view with a
         // hole in it, and a caller that checks only what it touched will
         // not find the hole.
-        let format_version = raw.format_version.unwrap_or(FORMAT_VERSION_BASE);
-        if format_version > FORMAT_VERSION_SUPPORTED {
-            return Err(serde::de::Error::custom(format!(
-                "dataset requires format_version {format_version}; this build \
-                 supports up to {FORMAT_VERSION_SUPPORTED}. Upgrade vectordata to read it."
-            )));
-        }
+        let format_version =
+            check_supported_version(raw.format_version).map_err(serde::de::Error::custom)?;
         let mut profiles: HashMap<String, ProfileConfig> = HashMap::new();
         for (name, value) in raw.profiles {
             // Skip the compact sized-spec shorthand and any other
@@ -197,20 +255,14 @@ impl<'de> Deserialize<'de> for DatasetConfig {
         // from `veks check`, not a load failure — refusing it here would
         // reject every hand-written sharded dataset for a field that
         // helps no reader which can already read it.
-        if let Some(stated) = raw.format_version {
-            let required = profiles
-                .values()
-                .flat_map(|p| p.facets())
-                .map(|(_, f)| f.min_format_version())
-                .max()
-                .unwrap_or(FORMAT_VERSION_BASE);
-            if required > stated {
-                return Err(serde::de::Error::custom(format!(
-                    "dataset declares format_version {stated} but its content \
-                     requires {required} — a declaration cannot understate what it holds"
-                )));
-            }
-        }
+        let required = profiles
+            .values()
+            .flat_map(|p| p.facets())
+            .map(|(_, f)| f.min_format_version())
+            .max()
+            .unwrap_or(FORMAT_VERSION_BASE);
+        check_stated_against_content(raw.format_version, required)
+            .map_err(serde::de::Error::custom)?;
 
         Ok(DatasetConfig {
             format_version,

@@ -1054,6 +1054,7 @@ mod tests {
             catalog_file: None,
             catalog_name: None,
             layout: CatalogLayout {
+                format_version: crate::model::FORMAT_VERSION_BASE,
                 attributes: None,
                 profiles: DSProfileGroup::from_profiles(profiles),
             },
@@ -1529,6 +1530,7 @@ mod tests {
             catalog_file: None,
             catalog_name: None,
             layout: CatalogLayout {
+                format_version: crate::model::FORMAT_VERSION_BASE,
                 attributes: None,
                 profiles: DSProfileGroup::from_profiles(profiles),
             },
@@ -1568,6 +1570,7 @@ mod tests {
             catalog_file: None,
             catalog_name: None,
             layout: CatalogLayout {
+                format_version: crate::model::FORMAT_VERSION_BASE,
                 attributes: None,
                 profiles: DSProfileGroup::from_profiles(profiles),
             },

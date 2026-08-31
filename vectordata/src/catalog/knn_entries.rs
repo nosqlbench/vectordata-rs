@@ -198,6 +198,7 @@ pub fn parse_knn_entries_yaml(
             path: default_base_url.trim_end_matches('/').to_string(),
             dataset_type: "knn_entries.yaml".to_string(),
             layout: CatalogLayout {
+                format_version: crate::model::FORMAT_VERSION_BASE,
                 attributes: None,
                 profiles: profile_group,
             },

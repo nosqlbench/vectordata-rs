@@ -103,8 +103,20 @@ impl DatasetAttributes {
 ///
 /// Describes the dataset name, attributes, profiles (view mappings), and an
 /// optional upstream pipeline for building the dataset from source data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DatasetConfig {
+    /// The lowest `dataset.yaml` format version that can express this
+    /// dataset. Absent in the YAML means 1 (V-2).
+    ///
+    /// Read and gated through the **same** functions the client-side
+    /// loader uses (V-12): a dataset accepted by one route and refused
+    /// by the other would make the transport decide whether it is
+    /// readable.
+    ///
+    /// See `docs/design/srd-dataset-format-version.md`.
+    #[serde(skip_serializing_if = "crate::model::is_base_format_version")]
+    pub format_version: u32,
+
     /// Dataset name.
     pub name: String,
 
@@ -155,6 +167,83 @@ pub struct DatasetConfig {
     /// dataset properties without a separate file.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub variables: IndexMap<String, String>,
+}
+
+/// Hand-written so the version gate runs on **every** deserialization
+/// route, not only through [`DatasetConfig::load`] (V-12).
+///
+/// The client-side loader refuses a dataset from the future inside its
+/// own deserializer. Gating this one only in `load` would leave
+/// `serde_yaml::from_str` — which the catalog path, the pipeline and
+/// the tests all use — accepting what the other refuses, which is the
+/// split the requirement exists to prevent.
+///
+/// The shadow struct mirrors the fields above. It is local to this
+/// function so the two lists sit within a screen of each other, which
+/// is the only thing keeping them in step.
+impl<'de> Deserialize<'de> for DatasetConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            format_version: Option<u32>,
+            name: String,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            attributes: Option<DatasetAttributes>,
+            #[serde(default)]
+            upstream: Option<PipelineConfig>,
+            #[serde(default)]
+            strata: Strata,
+            #[serde(default)]
+            profiles: DSProfileGroup,
+            #[serde(default)]
+            variables: IndexMap<String, String>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let format_version = crate::model::check_supported_version(raw.format_version)
+            .map_err(serde::de::Error::custom)?;
+        crate::model::check_stated_against_content(
+            raw.format_version,
+            required_format_version(&raw.profiles),
+        )
+        .map_err(serde::de::Error::custom)?;
+
+        Ok(DatasetConfig {
+            format_version,
+            name: raw.name,
+            description: raw.description,
+            attributes: raw.attributes,
+            upstream: raw.upstream,
+            strata: raw.strata,
+            profiles: raw.profiles,
+            variables: raw.variables,
+        })
+    }
+}
+
+/// The lowest format version that can express these profiles.
+///
+/// Derived by folding the declarations rather than read from a field,
+/// which is what lets a writer emit the lowest version describing what
+/// it actually wrote (V-4). A multi-file facet is the only thing so far
+/// that needs more than version 1.
+pub(crate) fn required_format_version(profiles: &DSProfileGroup) -> u32 {
+    let sharded = profiles
+        .profiles
+        .values()
+        .flat_map(|p| p.views.values())
+        .any(|v| v.is_series());
+    if sharded {
+        crate::model::FORMAT_VERSION_SHARDED
+    } else {
+        crate::model::FORMAT_VERSION_BASE
+    }
 }
 
 impl DatasetConfig {
@@ -441,6 +530,21 @@ impl DatasetConfig {
         let header = existing_header.unwrap_or_default();
 
         let mut out = header;
+
+        // The version this dataset needs, folded from what it declares
+        // rather than copied from the field it was loaded with — so a
+        // save that dropped a series' last shard also drops the claim
+        // to need version 2, and one that gained a series states it
+        // (V-4).
+        //
+        // Version 1 is written as nothing at all. An unsharded dataset
+        // that never carried the key does not acquire one by being
+        // saved, which is what keeps it readable by every build that
+        // ever existed (V-5).
+        let version = required_format_version(&self.profiles).max(self.format_version);
+        if version > crate::model::FORMAT_VERSION_BASE {
+            out.push_str(&format!("format_version: {version}\n"));
+        }
 
         // name
         out.push_str(&format!("name: {}\n", self.name));
