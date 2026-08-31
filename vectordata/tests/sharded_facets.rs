@@ -38,7 +38,8 @@ const BPR: u64 = 20;
 /// **A uniform series opens, and reports the whole facet.**
 ///
 /// `total_size` sums the files, `record_count` comes from the
-/// declaration, and neither is shard 0's answer.
+/// declaration, and neither is shard 0's answer. `count()` is the
+/// series total and `dim()` the dimension every shard shares (SH-23).
 #[test]
 fn a_uniform_series_opens_and_reports_the_whole_facet() {
     let tmp = tempfile::tempdir().unwrap();
@@ -72,7 +73,9 @@ fn a_uniform_series_opens_and_reports_the_whole_facet() {
 /// **A declaration that disagrees with the files is refused at open.**
 ///
 /// The shard files here hold 240 records; the declaration claims 250.
-/// Neither number silently wins (SH-8).
+/// Neither number silently wins (SH-8). The match is verified eagerly,
+/// at open rather than at the first read that falls past the end
+/// (SH-53).
 #[test]
 fn a_series_whose_files_contradict_its_declaration_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -212,8 +215,10 @@ fn a_plain_facet_is_untouched_by_any_of_this() {
 /// **A missing shard is reported, not reported as emptiness.**
 ///
 /// The infallible `total_size()` can only answer `0` for a facet it
-/// cannot size — which reads exactly like an empty facet. The fallible
-/// form says what is actually wrong, and names the file.
+/// cannot size — which reads exactly like an empty facet. A whole-facet
+/// accessor that cannot fail must not answer as though it succeeded
+/// (SH-99), so the fallible form says what is actually wrong and names
+/// the file.
 #[test]
 fn a_missing_shard_is_named_rather_than_read_as_emptiness() {
     let tmp = tempfile::tempdir().unwrap();
@@ -254,7 +259,8 @@ fn a_missing_shard_is_named_rather_than_read_as_emptiness() {
 ///
 /// One fixture written once as a single file and once as a series must
 /// be indistinguishable through the reader: same count, same dim, same
-/// records, in the same order.
+/// records, in the same order. Every `get(o)` resolves to the shard
+/// that owns `o` and reads there (SH-24).
 #[test]
 fn a_series_reads_identically_to_the_single_file_it_was_split_from() {
     let tmp = tempfile::tempdir().unwrap();
@@ -866,9 +872,10 @@ fn deriving_without_a_stride_is_unchanged() {
 
 /// **Push publishes every shard and every sidecar** (SH-39).
 ///
-/// It is filesystem-driven rather than declaration-driven, so shards —
-/// being ordinary files — are picked up by construction. This pins that
-/// they actually are, and that a temp left by a killed derive is not.
+/// Publication is filesystem-driven rather than declaration-driven, so
+/// shards need no special handling — being ordinary files, they are
+/// picked up by construction (SH-100). This pins that they actually
+/// are, and that a temp left by a killed derive is not.
 #[test]
 fn a_published_series_lists_every_shard_and_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
@@ -919,6 +926,10 @@ fn a_published_series_lists_every_shard_and_sidecar() {
 
 /// A catalog carries a series, so a remote consumer can enumerate the
 /// shards before fetching anything (SH-41).
+///
+/// The declaration it carries is serialized from the realized model
+/// (SH-89), so it states its cardinalities by construction rather than
+/// because a pinning step ran over it.
 #[test]
 fn a_catalog_entry_round_trips_a_series() {
     let yaml = "default:\n  base_vectors:\n    source:\n      - a.fvec=10\n      - b.fvec=10\n\
@@ -1543,6 +1554,7 @@ fn saving_a_sharded_dataset_preserves_its_series() {
     assert_eq!(query.count(), 40, "the explicit series kept both entries");
     assert_eq!(query.get(39).unwrap()[0], 39.0);
 }
+
 /// **A facet reports one access mode, and it is the weakest among its
 /// files** (SH-93).
 ///
@@ -1611,3 +1623,48 @@ fn a_local_series_reports_local_through_its_handle() {
     assert_eq!(mode, vectordata::access::AccessMode::Local);
 }
 
+/// **A facet-selecting flag names the facet, never a shard** (SH-45).
+///
+/// There is no CLI surface for "precache shard 7" — that is what a
+/// window is for. A flag that accepted a shard filename would let a
+/// caller address a fraction of a facet by a name the ordinal model
+/// does not use.
+#[test]
+fn facet_selection_names_facets_not_shard_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    for s in 0..2 {
+        write_fvec(&ds.join(format!("base__{s:04}.fvec")), 4, 50, s * 50);
+    }
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: sel\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: base__NNNN.fvec\n      shard_stride: 50\n      shard_count: 2\n      \
+         record_count: 100\n",
+    )
+    .unwrap();
+
+    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+
+    // The facet name resolves.
+    assert!(view.open_facet_storage("base_vectors").is_ok());
+
+    // A shard filename is not a facet name, in any of its spellings.
+    for spelling in ["base__0000", "base__0000.fvec", "base__NNNN.fvec", "base__0001"] {
+        assert!(
+            view.open_facet_storage(spelling).is_err(),
+            "'{spelling}' must not address a facet — a shard is not selectable"
+        );
+    }
+
+    // And the manifest lists the facet once, by its own name.
+    let manifest = view.facet_manifest();
+    assert!(manifest.contains_key("base_vectors"));
+    assert!(
+        !manifest.keys().any(|k| k.contains("__0000")),
+        "no shard appears as a facet: {:?}",
+        manifest.keys().collect::<Vec<_>>()
+    );
+}
