@@ -1,6 +1,6 @@
 # SRD — Record binding, and forms
 
-**Status:** proposed
+**Status:** implemented
 **Scope:** `vectordata::records`, `formats::anode_vernacular`, the slab
 namespace set, `metadata_schema`.
 
@@ -294,7 +294,38 @@ this namespace binds through its schema, as one unnamed form.
 quietly: a forms or schema lookup that reads more than the tail would
 reintroduce the whole-facet fetch that Stage 4 removed.
 
-## 11. Open
+## 11. Settled in implementation
+
+**A reusable buffer cannot be the loop form.** The first cut had `bind`
+fill a caller-owned `Vec` reused across cycles. It does not compile, and
+the reason is the contract working: values borrow their record, so a
+buffer outliving one record cannot hold another's. The loop form is
+therefore a callback — `bind_each` — which allocates nothing and hands
+values over rather than returning them. The buffer form remains for
+callers wanting random access, scoped to a single record.
+
+**A predicate binder needs two inputs.** A predicate says what it
+constrains and not what type that is, so `PredicateBinder::compile`
+takes the sample predicate *and* the metadata layout. This is what makes
+OT-B enforceable rather than advisory: the parameter's type is read from
+the field's position in the layout, and there is no path by which a
+comparand's variant could supply it.
+
+**Only a flat conjunction compiles.** `flatten_and` returns nothing for
+a disjunctive or nested predicate, which has no flat parameter list.
+Such a template is refused at compile time rather than partially
+flattened, because binding values into the wrong conditions is not
+detectable downstream.
+
+**Predicate binding decodes per record.** There is no raw scanner for
+`PNode` as there is for `MNode`, so a predicate record is decoded to
+reach its comparands. Left as it is rather than building one: a
+predicate is small and the shape check dominates, and inventing an
+optimisation without a measurement is what OT-12's history warns
+against. If a filtered workload proves it hot, the analogous scanner is
+the answer.
+
+## 12. Open
 
 **~~The allocation strategy~~ — settled.** Not open, and should not have
 been listed as open: `mnode::scan` answers it. Names resolve to
