@@ -2171,11 +2171,43 @@ impl FacetStorage {
             }
         }
     }
-    pub fn prebuffer_with_progress<F>(&self, cb: F) -> std::io::Result<()>
+    /// Fetch everything this facet can address, reporting progress.
+    ///
+    /// **Walks the series**, exactly as [`Self::precache`] does.
+    /// `self.storage` is the first shard's, so delegating to it would
+    /// fetch one file and return — leaving a facet that reports itself
+    /// precached while most of it is still a hole, which is the worst
+    /// of the three possible outcomes.
+    ///
+    /// Progress arrives **per file**: each shard's fetch reports its
+    /// own totals, so a meter driven by this advances once per shard
+    /// rather than once across the series. That is a display question;
+    /// the alternative — synthesising a combined `DownloadProgress`
+    /// the transport never produced — would misreport what is actually
+    /// in flight.
+    pub fn prebuffer_with_progress<F>(&self, mut cb: F) -> std::io::Result<()>
     where
         F: FnMut(&crate::transport::DownloadProgress),
     {
-        self.storage.prebuffer_with_progress(cb)
+        let Some(s) = &self.series else {
+            return self.storage.prebuffer_with_progress(cb);
+        };
+        for shard in 0..s.shards().entries().len() {
+            // Addressable bytes, not whole files (SH-92): a sliced
+            // shard pulls its window, not bytes it can never read.
+            match s.shard_byte_extent(shard) {
+                Some((lo, hi)) => self.prebuffer_shard_range(shard, lo, hi, &mut cb)?,
+                None => {
+                    let i = s
+                        .file_index_of_shard(shard)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    s.file(i)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?
+                        .prebuffer_with_progress(&mut cb)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Same as [`Self::prebuffer_with_progress`] but only fetches
@@ -2401,16 +2433,58 @@ impl FacetStorage {
         })
     }
 
+    /// Cache fill for the whole facet.
+    ///
+    /// **Summed across a series' files** (SH-81). `self.storage` is the
+    /// first shard's, so reporting its numbers would say "37% cached"
+    /// about a five-file facet on the strength of one file — a
+    /// percentage that is right about nothing. Chunk counts and content
+    /// bytes add; completeness is the conjunction, since a facet with
+    /// one missing shard is not cached.
+    ///
+    /// `None` when no file is cache-backed (local mmap, direct HTTP).
+    /// A series where only some files are cache-backed reports the ones
+    /// that are, which is the same partial answer a single file gives
+    /// while filling.
     pub fn cache_stats(&self) -> Option<CacheStats> {
-        self.storage.fill_stats().map(
-            |(valid_chunks, total_chunks, chunk_size, content_size, is_complete)| CacheStats {
-                valid_chunks,
-                total_chunks,
-                chunk_size,
-                content_size,
-                is_complete,
-            },
-        )
+        let Some(series) = &self.series else {
+            return self.storage.fill_stats().map(
+                |(valid_chunks, total_chunks, chunk_size, content_size, is_complete)| CacheStats {
+                    valid_chunks,
+                    total_chunks,
+                    chunk_size,
+                    content_size,
+                    is_complete,
+                },
+            );
+        };
+        let mut acc: Option<CacheStats> = None;
+        for i in 0..series.file_count() {
+            let Ok(storage) = series.file(i) else { continue };
+            let Some((valid, total, chunk_size, content, complete)) = storage.fill_stats() else {
+                continue;
+            };
+            acc = Some(match acc {
+                None => CacheStats {
+                    valid_chunks: valid,
+                    total_chunks: total,
+                    chunk_size,
+                    content_size: content,
+                    is_complete: complete,
+                },
+                Some(a) => CacheStats {
+                    valid_chunks: a.valid_chunks + valid,
+                    total_chunks: a.total_chunks + total,
+                    // One chunk size across the series; files agreeing
+                    // is the normal case, and the larger is the honest
+                    // answer if they ever do not.
+                    chunk_size: a.chunk_size.max(chunk_size),
+                    content_size: a.content_size + content,
+                    is_complete: a.is_complete && complete,
+                },
+            });
+        }
+        acc
     }
 }
 

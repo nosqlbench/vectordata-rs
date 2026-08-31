@@ -1751,3 +1751,364 @@ fn vvec_remote_sentinel_sidecar_describes_n_records() {
         "the sentinel must not be readable as a record over HTTP either"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// sharded_remote — a multi-file facet served over HTTP
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Everything above reads a facet that is one remote file. A series is
+// several, and the transport concerns multiply with it: each shard is
+// its own URL, its own cache slot, its own `.mref`, and its own range
+// support. The claim under test is that none of that reaches the
+// reader — a series over HTTP answers exactly as the single file it
+// was split from (SH-30, SH-31, SH-34, SH-60).
+
+/// Serve `base_vectors` as a uniform two-shard series of 25 records
+/// each, with `.mref` sidecars so opens take the merkle-cached path.
+fn make_remote_series(server_root: &Path, mrefs: bool) {
+    // Shard content is the same function of the *global* ordinal as
+    // `write_fvec` produces for one file, so a series and a whole file
+    // are directly comparable record for record.
+    for shard in 0..2usize {
+        let path = server_root.join(format!("base__{shard:04}.fvec"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..25usize {
+            let global = shard * 25 + i;
+            f.write_i32::<LittleEndian>(8).unwrap();
+            for d in 0..8usize {
+                f.write_f32::<LittleEndian>(global as f32 * 100.0 + d as f32)
+                    .unwrap();
+            }
+        }
+        drop(f);
+        if mrefs {
+            write_mref(&path);
+        }
+    }
+    write_fvec(&server_root.join("query.fvec"), 5, 8);
+    if mrefs {
+        write_mref(&server_root.join("query.fvec"));
+    }
+    std::fs::write(
+        server_root.join("dataset.yaml"),
+        "name: remote-series\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: base__NNNN.fvec\n      shard_stride: 25\n      shard_count: 2\n      \
+         record_count: 50\n    query_vectors: query.fvec\n",
+    )
+    .unwrap();
+}
+
+/// **A uniform series over HTTP reads as one facet.**
+///
+/// Every record, in order and across the seam, with the same values
+/// `write_fvec` puts in a single 50-record file.
+#[test]
+fn a_uniform_series_reads_over_http() {
+    let tmp = make_tmp();
+    make_remote_series(tmp.path(), false);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let base = view.base_vectors().unwrap();
+
+    assert_eq!(base.count(), 50, "the count spans the series");
+    assert_eq!(base.dim(), 8);
+    for i in 0..50usize {
+        let rec = base.get(i).unwrap();
+        assert_eq!(rec[0], i as f32 * 100.0, "record {i} over HTTP");
+        assert_eq!(rec[7], i as f32 * 100.0 + 7.0, "record {i} tail");
+    }
+    // Backwards, so shard 0 is re-fetched after shard 1 was in hand.
+    for i in (0..50usize).rev() {
+        assert_eq!(base.get(i).unwrap()[0], i as f32 * 100.0);
+    }
+}
+
+/// **An explicit series over HTTP reads the same way.** The two
+/// declaration forms differ only in how the file list is derived, and
+/// the transport must not be able to tell them apart.
+#[test]
+fn an_explicit_series_reads_over_http() {
+    let tmp = make_tmp();
+    make_remote_series(tmp.path(), false);
+    std::fs::write(
+        tmp.path().join("dataset.yaml"),
+        "name: remote-series\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
+        \x20       - base__0000.fvec=25\n        - base__0001.fvec=25\n      record_count: 50\n",
+    )
+    .unwrap();
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let base = group.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(base.count(), 50);
+    for i in [0usize, 24, 25, 49] {
+        assert_eq!(base.get(i).unwrap()[0], i as f32 * 100.0, "record {i}");
+    }
+}
+
+/// **A window inside one shard does not fetch the other** (SH-30).
+///
+/// The point of sharding a remote facet is that a window costs the
+/// shards it spans. A plan that degraded to a whole-facet download
+/// would make the series strictly worse than the file it replaced.
+#[test]
+fn a_window_inside_one_shard_does_not_degrade_to_a_full_download() {
+    let tmp = make_tmp();
+    make_remote_series(tmp.path(), true);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let window = vectordata::dataset::source::parse_window("5..10").unwrap();
+    let plan = view.prefetch_plan("base_vectors", &window).unwrap();
+    assert!(
+        !plan.degrades_to_full_download,
+        "a five-record window must not price as the whole facet"
+    );
+    assert_eq!(
+        plan.fills.len(),
+        1,
+        "a window inside shard 0 touches one shard: {:?}",
+        plan.fills.len()
+    );
+}
+
+/// A window across the seam plans one fill per shard — and still does
+/// not degrade. Two fetches, not one download.
+#[test]
+fn a_window_across_the_seam_plans_one_fill_per_shard() {
+    let tmp = make_tmp();
+    make_remote_series(tmp.path(), true);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let window = vectordata::dataset::source::parse_window("20..30").unwrap();
+    let plan = view.prefetch_plan("base_vectors", &window).unwrap();
+    assert!(!plan.degrades_to_full_download);
+    assert_eq!(plan.fills.len(), 2, "the window spans both shards");
+}
+
+/// Serve a series big enough that a shard is several merkle chunks, so
+/// a window costs visibly less than a file. `records` per shard, dim 8
+/// ⇒ 36 bytes a record.
+fn make_big_remote_series(server_root: &Path, shards: usize, records: usize) {
+    for shard in 0..shards {
+        let path = server_root.join(format!("big__{shard:04}.fvec"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..records {
+            let global = shard * records + i;
+            f.write_i32::<LittleEndian>(8).unwrap();
+            for d in 0..8usize {
+                f.write_f32::<LittleEndian>(global as f32 * 100.0 + d as f32)
+                    .unwrap();
+            }
+        }
+        drop(f);
+        write_mref(&path);
+    }
+    std::fs::write(
+        server_root.join("dataset.yaml"),
+        format!(
+            "name: big-series\nprofiles:\n  default:\n    base_vectors:\n      \
+             source: big__NNNN.fvec\n      shard_stride: {records}\n      \
+             shard_count: {shards}\n      record_count: {}\n",
+            shards * records
+        ),
+    )
+    .unwrap();
+}
+
+/// **A window costs the chunks it spans, not the facet** (SH-30,
+/// SH-34).
+///
+/// Ranged fetching has to work *per shard*, or sharding a remote facet
+/// makes it strictly more expensive than the single file it replaced.
+/// Measured against the facet's own total rather than a fixed number,
+/// so the claim is about proportion.
+#[test]
+fn a_windowed_prefetch_of_a_series_fetches_far_less_than_the_facet() {
+    let tmp = make_tmp();
+    make_big_remote_series(tmp.path(), 3, 400);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+    let total = storage.total_size();
+    assert_eq!(total, 3 * 400 * 36, "three shards of 400 records");
+
+    // Deep inside the last shard, past the chunks that opening the
+    // series already faulted in to read dim headers — otherwise the
+    // window is free and the measurement says nothing.
+    let window = vectordata::dataset::source::parse_window("1150..1160").unwrap();
+    let plan = view.prefetch_plan("base_vectors", &window).unwrap();
+    assert!(!plan.degrades_to_full_download);
+    assert_eq!(plan.fills.len(), 1, "the window sits inside one shard");
+    let cost: u64 = plan.fills.iter().map(|f| f.bytes_to_fetch()).sum();
+    assert!(
+        cost > 0 && cost < total / 4,
+        "a ten-record window cost {cost} of {total} bytes"
+    );
+
+    // Fetching it leaves the facet incomplete: the other shards were
+    // not dragged along.
+    view.prefetch(
+        "base_vectors",
+        &window,
+        vectordata::view::WholeFacetFallback::Refuse,
+    )
+    .unwrap();
+    assert!(
+        !storage.is_complete(),
+        "a windowed fetch must not have downloaded the whole series"
+    );
+}
+
+/// **Cache statistics are the series', not shard 0's** (SH-81).
+///
+/// `cache_stats` reads `self.storage`, which for a series is the first
+/// shard. Reporting its chunk counts would describe a three-file facet
+/// by one file — a percentage that is right about nothing.
+#[test]
+fn cache_stats_for_a_series_cover_every_shard() {
+    let tmp = make_tmp();
+    make_big_remote_series(tmp.path(), 3, 400);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+
+    let stats = storage.cache_stats().expect("a cached remote series has stats");
+    assert_eq!(
+        stats.content_size,
+        3 * 400 * 36,
+        "content size is the series', not one shard's"
+    );
+    assert!(
+        stats.total_chunks >= 3,
+        "every shard contributes chunks: {}",
+        stats.total_chunks
+    );
+    assert!(!stats.is_complete, "nothing has been fetched yet");
+
+    // Reading everything fills every shard, and the aggregate says so.
+    let base = view.base_vectors().unwrap();
+    for i in 0..1200usize {
+        assert_eq!(base.get(i).unwrap()[0], i as f32 * 100.0, "record {i}");
+    }
+    let stats = storage.cache_stats().unwrap();
+    assert_eq!(
+        stats.valid_chunks, stats.total_chunks,
+        "every chunk of every shard is resident after a full read"
+    );
+    assert!(stats.is_complete);
+    assert!(storage.is_complete());
+}
+
+/// **A server without byte-range support still reads a series
+/// correctly** (SH-34).
+///
+/// The no-range fallback transfers whole files. That is a cost
+/// question, not a correctness one: the ordinal algebra, the seam, and
+/// every value must be exactly what the ranged path produces.
+#[test]
+fn a_series_reads_correctly_on_a_range_less_server() {
+    let tmp = make_tmp();
+    make_remote_series(tmp.path(), true);
+    let server = TestServer::start_no_range(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let base = view.base_vectors().unwrap();
+
+    assert_eq!(base.count(), 50);
+    for i in 0..50usize {
+        assert_eq!(base.get(i).unwrap()[0], i as f32 * 100.0, "record {i}");
+    }
+    // A window still plans, and reads through the fallback.
+    let window = vectordata::dataset::source::parse_window("20..30").unwrap();
+    let plan = view.prefetch_plan("base_vectors", &window).unwrap();
+    assert!(!plan.fills.is_empty(), "the window maps to fills either way");
+    assert_eq!(base.get(25).unwrap()[0], 2500.0);
+}
+
+/// **A missing shard over HTTP is named, not read as emptiness.**
+///
+/// The declaration promises two files. When the second 404s, the
+/// facet must fail by name rather than silently reporting the records
+/// of the shards that happen to be there.
+#[test]
+fn a_missing_shard_over_http_is_named() {
+    let tmp = make_tmp();
+    make_remote_series(tmp.path(), false);
+    std::fs::remove_file(tmp.path().join("base__0001.fvec")).unwrap();
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let err = match view.base_vectors() {
+        Ok(r) => panic!(
+            "a series with a missing shard must not open; it reported {} records",
+            r.count()
+        ),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("base__0001"),
+        "the error must name the missing shard: {err}"
+    );
+}
+
+/// **Precaching a series fills every shard** (SH-27, SH-30).
+///
+/// `prebuffer_all_with_progress` is the "download this dataset" path.
+/// A series must come down whole — a facet reported complete while one
+/// of its files is still a hole would make every later read a silent
+/// network fault, or worse, a read of zeros.
+#[test]
+fn precaching_a_series_downloads_every_shard() {
+    let tmp = make_tmp();
+    make_big_remote_series(tmp.path(), 3, 400);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+    assert!(!storage.is_complete(), "nothing fetched yet");
+
+    let mut seen_total = 0u64;
+    view.prebuffer_all_with_progress(&mut |_facet: &str,
+                                           p: &vectordata::view::PrebufferProgress| {
+        seen_total = seen_total.max(p.total_bytes);
+    })
+    .expect("precache the dataset");
+
+    assert!(
+        storage.is_complete(),
+        "every shard must be resident after a precache"
+    );
+    let stats = storage.cache_stats().expect("stats");
+    assert_eq!(stats.valid_chunks, stats.total_chunks);
+    assert_eq!(stats.content_size, 3 * 400 * 36);
+
+    // And the data reads without touching the network again.
+    let base = view.base_vectors().unwrap();
+    for i in [0usize, 399, 400, 800, 1199] {
+        assert_eq!(base.get(i).unwrap()[0], i as f32 * 100.0, "record {i}");
+    }
+}
