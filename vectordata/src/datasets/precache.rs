@@ -670,7 +670,10 @@ fn plan_prebuffer(view: &dyn TestDataView) -> crate::Result<PrebufferPlan> {
     let mut facets = Vec::new();
     let mut total_bytes = 0u64;
     for (name, desc) in view.facet_manifest() {
-        if view.facet_element_type(&name).is_err() {
+        // The spec's formats, not an element width: a slab holds
+        // data and has no element type, and asking the wrong question
+        // left metadata out of every precache.
+        if !view.facet_holds_data(&name) {
             continue;
         }
         if let Ok(storage) = view.open_facet_storage(&name) {

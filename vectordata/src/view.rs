@@ -653,7 +653,18 @@ impl FacetDescriptor {
     /// container extensions (`slab`, `json`, `parquet`, `npy`, `hdf5`,
     /// `h5`). The returned string is the lowercase canonical form.
     fn infer_type(source: &str) -> Option<String> {
-        let ext = source.rsplit('.').next()?;
+        // Strip the `[start..end)` window suffix and any `:namespace`
+        // before looking at the extension. A window contains dots, so
+        // `base.fvec[0..20)` splits to `20)` and the facet reports no
+        // format at all — which is invisible while the answer is only
+        // shown to a human, and load-bearing the moment anything gates
+        // on it. `facet_element_type` has always done this; the
+        // manifest did not.
+        let path = match crate::dataset::source::parse_source_string(source) {
+            Ok(parsed) => parsed.path,
+            Err(_) => source.to_string(),
+        };
+        let ext = path.rsplit('.').next()?;
         let lower = ext.to_lowercase();
         if crate::typed_access::ElementType::from_extension(&lower).is_some() {
             return Some(lower);
@@ -799,7 +810,7 @@ pub trait TestDataView: Send + Sync {
         // free; the `.mref`/header round trips are simply paid now.
         let mut bytes_to_fetch: u64 = 0;
         for (name, desc) in self.facet_manifest() {
-            if self.facet_element_type(&name).is_err() {
+            if !self.facet_holds_data(&name) {
                 continue;
             }
             // Open failures are not diagnosed here — the download loop
@@ -821,10 +832,9 @@ pub trait TestDataView: Send + Sync {
             .map_err(|e| Error::Other(e.to_string()))?;
 
         for (name, desc) in self.facet_manifest() {
-            // Skip facets with unrecognised extensions (e.g., layout
-            // sidecars) — they're not data facets the typed reader
-            // API would touch.
-            if self.facet_element_type(&name).is_err() {
+            // Skip facets whose format the spec does not name — they
+            // are not data this build knows how to move.
+            if !self.facet_holds_data(&name) {
                 continue;
             }
 
@@ -958,6 +968,29 @@ pub trait TestDataView: Send + Sync {
             .and_then(|raw| crate::dataset::source::parse_source_string(raw).ok())
             .and_then(|p| p.namespace);
         crate::records::RecordFacet::open(&storage, name, namespace.as_deref())
+    }
+
+    /// Whether this facet holds data this build can move.
+    ///
+    /// **Not the same question as "what element width does it have?"**,
+    /// which is what the gates here used to ask. For every fixed-width
+    /// format the two coincide; for a slab they do not — a slab record
+    /// is not a run of elements — and taking the element answer skipped
+    /// metadata facets entirely: `prebuffer_all` downloaded the vectors
+    /// and silently left the metadata behind, and the catalog path of
+    /// `derive` dropped it from its output while the local path kept
+    /// it.
+    ///
+    /// The facet spec is the authority on what formats exist
+    /// (`FacetFormat`), so it is what gets asked. That keeps this to
+    /// exactly the formats the spec names — a parquet or hdf5 facet is
+    /// still out of scope here, as it was.
+    fn facet_holds_data(&self, name: &str) -> bool {
+        self.facet_manifest()
+            .get(name)
+            .and_then(|d| d.source_type.as_deref())
+            .and_then(crate::dataset::facet::FacetFormat::from_extension)
+            .is_some()
     }
 
     /// **Crate-internal hook** used by the default `prebuffer_all`
@@ -3213,10 +3246,16 @@ impl GenericTestDataView {
                 // instead would silently map the facet against a
                 // fraction of itself.
                 let source = facet.source().map(str::to_string);
-                let source_type = source
-                    .as_deref()
-                    .map(FacetDescriptor::infer_type)
-                    .unwrap_or_default();
+                // The **format** is answerable for a series even though
+                // the path is not: every shard shares one format (SRD
+                // invariant 4), so the first declared source names it.
+                // Leaving this `None` for a series made a sharded facet
+                // look formatless to anything that asks what it is.
+                let source_type = facet
+                    .sources()
+                    .first()
+                    .map(|s| s.as_str())
+                    .and_then(FacetDescriptor::infer_type);
                 manifest.insert(
                     name.to_string(),
                     FacetDescriptor {

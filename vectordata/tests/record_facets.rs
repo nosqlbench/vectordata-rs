@@ -347,3 +347,97 @@ fn a_sharded_content_facet_carries_no_embedded_layout() {
         "no shard carries the embedded copy"
     );
 }
+
+// ── what counts as a data facet ────────────────────────────────────
+
+/// **A metadata slab is precached like any other data facet.**
+///
+/// The gate asked "what element width does this have?" and skipped
+/// anything without one. For every fixed-width format that is the same
+/// question as "is this data?"; for a slab it is not, so precaching a
+/// dataset fetched the vectors and silently left the metadata behind.
+#[test]
+fn precaching_a_dataset_visits_its_slab_facets() {
+    let tmp = tempfile::tempdir().unwrap();
+    single_facet_dataset(tmp.path(), 40);
+
+    let g = vectordata::TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+
+    let mut visited: Vec<String> = Vec::new();
+    view.prebuffer_all_with_progress(&mut |facet: &str, _p| {
+        if !visited.iter().any(|s| s == facet) {
+            visited.push(facet.to_string());
+        }
+    })
+    .unwrap();
+    visited.sort();
+
+    assert!(
+        visited.iter().any(|f| f == "metadata_content"),
+        "the metadata facet must be precached, not skipped: {visited:?}"
+    );
+    assert!(visited.iter().any(|f| f == "base_vectors"));
+}
+
+/// The same holds for a **sharded** slab facet, which additionally has
+/// to report its format at all: a series has no single source path, and
+/// the manifest inferred the format from that path.
+#[test]
+fn a_sharded_slab_facet_reports_its_format_and_is_precached() {
+    let tmp = tempfile::tempdir().unwrap();
+    sharded_facet_dataset(tmp.path());
+
+    let g = vectordata::TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+
+    assert_eq!(
+        view.facet_manifest()
+            .get("metadata_content")
+            .and_then(|d| d.source_type.clone())
+            .as_deref(),
+        Some("slab"),
+        "every shard shares one format, so a series has one to report"
+    );
+
+    let mut visited: Vec<String> = Vec::new();
+    view.prebuffer_all_with_progress(&mut |facet: &str, _p| {
+        if !visited.iter().any(|s| s == facet) {
+            visited.push(facet.to_string());
+        }
+    })
+    .unwrap();
+    assert!(visited.iter().any(|f| f == "metadata_content"), "{visited:?}");
+}
+
+/// **A windowed facet still reports its format.**
+///
+/// A window contains dots, so taking the extension by splitting on `.`
+/// yields `20)` for `base.fvec[0..20)` and the facet reports no format.
+/// Harmless while only a human read it; load-bearing once anything
+/// gates on it — a windowed profile would have stopped precaching its
+/// own base vectors.
+#[test]
+fn a_windowed_source_still_reports_its_format() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path();
+    write_metadata_slab(&ds.join("metadata_content.slab"), 0, 40);
+    std::fs::write(ds.join("base.fvec"), [4u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: w\nprofiles:\n  default:\n    base_vectors: base.fvec[0..1)\n    \
+         metadata_content: metadata_content.slab\n",
+    )
+    .unwrap();
+
+    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    assert_eq!(
+        view.facet_manifest()
+            .get("base_vectors")
+            .and_then(|d| d.source_type.clone())
+            .as_deref(),
+        Some("fvec"),
+        "the window suffix must not swallow the extension"
+    );
+}

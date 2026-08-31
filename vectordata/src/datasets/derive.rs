@@ -443,8 +443,11 @@ fn build_plan_via_view(
 ) -> Result<Vec<PlanRow>, String> {
     let mut rows = Vec::new();
     for (facet_name, dview) in ds_profile.views() {
-        if view.facet_element_type(facet_name).is_err() {
-            // Skip non-data facets.
+        // Skip non-data facets. Asked as "does the spec name this
+        // format?" rather than "what element width does it have?" —
+        // the second dropped slab facets here while the local plan
+        // builder kept them, so one dataset derived two ways.
+        if !view.facet_holds_data(facet_name) {
             continue;
         }
         let storage = view.open_facet_storage(facet_name)

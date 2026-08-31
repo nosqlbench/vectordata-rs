@@ -567,3 +567,54 @@ fn a_sliced_vvec_shard_contributes_only_its_own_records() {
     assert_eq!(r.get(14).unwrap()[0], 10400);
 }
 
+/// **Both derive paths agree about which facets exist** (B).
+///
+/// The local plan builder classifies by extension and keeps a slab
+/// facet; the view-driven builder gated on element width and dropped
+/// it. The same dataset derived two ways produced different datasets,
+/// and the one that lost its metadata said nothing about it.
+#[test]
+fn a_slab_facet_survives_derive_by_either_plan_builder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let cfg = slabtastic::WriterConfig::new(4096, 4096, 1 << 20, false).unwrap();
+    let mut w = slabtastic::SlabWriter::new(src.join("metadata_content.slab"), cfg).unwrap();
+    for i in 0..100i32 {
+        let mut n = vectordata::formats::mnode::MNode::new();
+        n.fields
+            .insert("id".into(), vectordata::formats::mnode::MValue::Int32(i));
+        w.add_record(&n.to_bytes()).unwrap();
+    }
+    w.finish().unwrap();
+    write_fvec(&src.join("base.fvec"), 4, 10, 0);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: s\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+         metadata_content: metadata_content.slab\n",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(), "default", &out, "", &[], &[],
+            Some("derived"), true, None,
+        ),
+        0
+    );
+
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(yaml.contains("metadata_content"), "the facet must survive:\n{yaml}");
+    assert!(
+        out.join("profiles/base/metadata_content.slab").is_file(),
+        "and so must its file"
+    );
+
+    // And it reads back with every record.
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let facet = view.open_facet_records("metadata_content").unwrap();
+    assert_eq!(facet.count().unwrap(), 100);
+}
