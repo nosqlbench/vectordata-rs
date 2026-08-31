@@ -372,6 +372,174 @@ fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 // Schema discovery
 // ---------------------------------------------------------------------------
+// Raw field access
+// ---------------------------------------------------------------------------
+
+/// One field of a record, borrowed from the record's bytes.
+///
+/// Nothing is copied: the name and the value payload are slices into the
+/// buffer the record was read from, and the tag is the wire discriminant.
+/// A caller that wants a materialized value converts; a caller on a hot
+/// path reads through the accessors below.
+#[derive(Debug, Clone, Copy)]
+pub struct Field<'a> {
+    /// Position in the record's field order — the stable identity a
+    /// compiled binder or predicate addresses fields by.
+    pub index: usize,
+    /// Field name, as written.
+    pub name: &'a [u8],
+    /// Wire type discriminant. See [`crate::mnode::TypeTag`].
+    pub tag: u8,
+    /// The value payload, after the tag byte.
+    pub value: &'a [u8],
+}
+
+impl Field<'_> {
+    /// The name as UTF-8, when it is.
+    pub fn name_str(&self) -> Option<&str> {
+        std::str::from_utf8(self.name).ok()
+    }
+
+    /// The value as a signed integer, for the integer-shaped tags.
+    ///
+    /// `None` for a tag that is not integer-shaped — the caller asked
+    /// the wrong question of this field, which is not the same as the
+    /// field being absent.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self.tag {
+            1 | 18 | 19 | 22 => Some(read_i64(self.value, 0)),
+            12 | 7 | 20 | 21 => Some(read_i32(self.value, 0) as i64),
+            13 => Some(read_i16(self.value, 0) as i64),
+            _ => None,
+        }
+    }
+
+    /// The value as a float, for the float-shaped tags.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self.tag {
+            2 => Some(read_f64(self.value, 0)),
+            16 => Some(read_f32(self.value, 0) as f64),
+            _ => None,
+        }
+    }
+
+    /// The value as a boolean.
+    pub fn as_bool(&self) -> Option<bool> {
+        (self.tag == 3).then(|| self.value.first().is_some_and(|b| *b != 0))
+    }
+
+    /// The value as text, for the string-shaped tags.
+    ///
+    /// The length prefix is stripped; the result borrows the record.
+    pub fn as_str(&self) -> Option<&str> {
+        match self.tag {
+            0 | 6 | 10 | 11 => {
+                let len = read_u32(self.value, 0) as usize;
+                self.value
+                    .get(4..4 + len)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+            }
+            _ => None,
+        }
+    }
+
+    /// The value as raw bytes, for byte-shaped tags.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self.tag {
+            4 => {
+                let len = read_u32(self.value, 0) as usize;
+                self.value.get(4..4 + len)
+            }
+            // Fixed-width identifiers carry no length prefix:
+            // UuidV1, UuidV7, Ulid.
+            23..=25 => Some(self.value),
+            _ => None,
+        }
+    }
+
+    /// Whether this field is the null value.
+    pub fn is_null(&self) -> bool {
+        self.tag == 5
+    }
+}
+
+/// Walk a record's fields without allocating.
+///
+/// The same traversal [`scan_record`] performs, exposed so a caller
+/// that binds values can reuse it rather than re-implement the wire
+/// layout. Field names are skipped over rather than copied, and a
+/// caller addressing fields by position need never look at them.
+pub fn fields(data: &[u8]) -> Result<Fields<'_>, ScanError> {
+    if data.is_empty() {
+        return Err(ScanError::UnexpectedEof);
+    }
+    if data[0] != DIALECT_MNODE {
+        return Err(ScanError::InvalidDialect(data[0]));
+    }
+    if data.len() < 3 {
+        return Err(ScanError::UnexpectedEof);
+    }
+    Ok(Fields {
+        data,
+        pos: 3,
+        remaining: read_u16(data, 1) as usize,
+        index: 0,
+    })
+}
+
+/// Iterator over a record's fields. See [`fields`].
+pub struct Fields<'a> {
+    data: &'a [u8],
+    pos: usize,
+    remaining: usize,
+    index: usize,
+}
+
+impl<'a> Iterator for Fields<'a> {
+    type Item = Result<Field<'a>, ScanError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let index = self.index;
+        self.index += 1;
+
+        let mut step = || -> Result<Field<'a>, ScanError> {
+            if self.pos + 2 > self.data.len() {
+                return Err(ScanError::UnexpectedEof);
+            }
+            let name_len = read_u16(self.data, self.pos) as usize;
+            self.pos += 2;
+            let name = self
+                .data
+                .get(self.pos..self.pos + name_len)
+                .ok_or(ScanError::UnexpectedEof)?;
+            self.pos += name_len;
+            let tag = *self.data.get(self.pos).ok_or(ScanError::UnexpectedEof)?;
+            let value_pos = self.pos + 1;
+            let end = skip_value(self.data, value_pos, tag)?;
+            let value = self
+                .data
+                .get(value_pos..end)
+                .ok_or(ScanError::UnexpectedEof)?;
+            self.pos = end;
+            Ok(Field { index, name, tag, value })
+        };
+        match step() {
+            Ok(f) => Some(Ok(f)),
+            Err(e) => {
+                // A malformed record cannot be walked past; stop rather
+                // than report the same fault once per declared field.
+                self.remaining = 0;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 /// Field layout discovered from a sample MNode record.
 ///
@@ -1276,5 +1444,102 @@ mod tests {
     #[test]
     fn test_missing_field_gt() {
         assert!(!missing_field_passes(&OpType::Gt, &[Comparand::Int(0)]));
+    }
+}
+
+#[cfg(test)]
+mod field_access_tests {
+    use super::*;
+    use crate::mnode::{MNode, MValue};
+
+    fn record() -> Vec<u8> {
+        let mut n = MNode::new();
+        n.insert("id".into(), MValue::Int(42));
+        n.insert("score".into(), MValue::Float(1.5));
+        n.insert("tag".into(), MValue::Text("hello".into()));
+        n.insert("ok".into(), MValue::Bool(true));
+        n.insert("small".into(), MValue::Int32(7));
+        n.insert("absent".into(), MValue::Null);
+        n.to_bytes()
+    }
+
+    /// Fields come back in wire order, which is the order they were
+    /// inserted — the stable position a binder addresses them by.
+    #[test]
+    fn fields_walk_in_declared_order() {
+        let bytes = record();
+        let names: Vec<String> = fields(&bytes)
+            .unwrap()
+            .map(|f| f.unwrap().name_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["id", "score", "tag", "ok", "small", "absent"]);
+        let idx: Vec<usize> = fields(&bytes).unwrap().map(|f| f.unwrap().index).collect();
+        assert_eq!(idx, [0, 1, 2, 3, 4, 5]);
+    }
+
+    /// Values read without materializing an `MValue`, and the borrows
+    /// point into the record.
+    #[test]
+    fn values_read_raw_by_shape() {
+        let bytes = record();
+        let f: Vec<Field<'_>> = fields(&bytes).unwrap().map(|f| f.unwrap()).collect();
+
+        assert_eq!(f[0].as_i64(), Some(42));
+        assert_eq!(f[1].as_f64(), Some(1.5));
+        assert_eq!(f[2].as_str(), Some("hello"));
+        assert_eq!(f[3].as_bool(), Some(true));
+        assert_eq!(f[4].as_i64(), Some(7), "Int32 is integer-shaped");
+        assert!(f[5].is_null());
+
+        // The borrow is into the record's own buffer, not a copy.
+        let s = f[2].as_str().unwrap();
+        assert!(bytes.as_ptr_range().contains(&s.as_ptr()));
+    }
+
+    /// Asking the wrong question of a field answers `None` rather than
+    /// coercing — a text field is not a number, and saying so is not
+    /// the same as the field being absent.
+    #[test]
+    fn a_mismatched_accessor_declines_rather_than_coercing() {
+        let bytes = record();
+        let f: Vec<Field<'_>> = fields(&bytes).unwrap().map(|f| f.unwrap()).collect();
+        assert_eq!(f[2].as_i64(), None, "text is not an integer");
+        assert_eq!(f[0].as_str(), None, "an integer is not text");
+        assert_eq!(f[0].as_f64(), None, "integer-shaped is not float-shaped");
+        assert!(!f[0].is_null());
+    }
+
+    /// The walk agrees with `discover_schema`, which is what lets a
+    /// binder compile positions from one and read values with the
+    /// other.
+    #[test]
+    fn the_walk_agrees_with_the_discovered_schema() {
+        let bytes = record();
+        let schema = discover_schema(&bytes).unwrap();
+        let walked: Vec<&[u8]> = fields(&bytes).unwrap().map(|f| f.unwrap().name).collect();
+        assert_eq!(schema.field_count, walked.len());
+        for (i, name) in walked.iter().enumerate() {
+            assert_eq!(&schema.field_names[i], name, "position {i}");
+        }
+    }
+
+    /// A record that is not an MNode is refused by its leader byte,
+    /// not walked into.
+    #[test]
+    fn a_foreign_dialect_is_refused() {
+        let mut bytes = record();
+        bytes[0] = crate::pnode::DIALECT_PNODE;
+        assert!(matches!(fields(&bytes), Err(ScanError::InvalidDialect(_))));
+    }
+
+    /// A truncated record stops at the fault rather than reporting one
+    /// per declared field.
+    #[test]
+    fn a_truncated_record_stops_at_the_fault() {
+        let bytes = record();
+        let short = &bytes[..bytes.len() - 4];
+        let results: Vec<_> = fields(short).unwrap().collect();
+        assert!(results.iter().any(|r| r.is_err()));
+        assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
     }
 }
