@@ -289,11 +289,24 @@ wants to decode some other way.
     "absent", which is the separation `dataset::layout` already made and
     for the same reason.
 
-11. **Residency is required, and refused by name when missing.** A slab
-    is read by memory map, so a remote facet's bytes must be on disk
-    first. An un-precached facet is refused with a message saying so,
-    rather than mapped sparsely — where holes read as zeroes and surface
-    later as a dialect error against an unrelated record.
+11. **Access is incremental, by the same means as every other format.**
+    Reads go through `Storage`, not a memory map of the reader's own. A
+    slab ends with a pages-page indexing every data page by start
+    ordinal, so opening a facet costs its tail and reading a record
+    costs that record's page — each fetched and merkle-verified as a
+    byte range by the same chunked source the vector readers use.
+
+    An earlier cut of this reader took the other road: it called
+    `SlabReader::open(path)`, which memory-maps, and then required the
+    facet to be fully resident so the map could not fall on a sparse
+    cache file. That made a slab a bulk-download-only format and broke
+    the incremental-access property every other type has — for a
+    reason that was really only "the mmap constructor was one line".
+    The sparse-map hazard is an argument against mapping a partial
+    file, not for downloading a whole one. Nothing in slabtastic
+    required it: `Footer::read_from`, `PagesPage::deserialize`,
+    `NamespacesPage::deserialize` and `Page::get_record_from_buf` are
+    all public and take byte slices.
 
 ### What this unblocks
 

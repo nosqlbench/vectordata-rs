@@ -2193,12 +2193,19 @@ fn a_shard_colliding_with_another_facets_file_is_refused() {
 use vectordata::formats::anode::ANode;
 use vectordata::formats::anode_vernacular::Vernacular;
 use vectordata::formats::mnode::{MNode, MValue};
-use vectordata::records::{Anode, RecordError, Serde, Text};
+use vectordata::records::{Anode, Serde, Text};
 
 /// A metadata slab of MNode records with `id` and `bucket` fields.
+///
+/// Written with a small page size. The default is 4 MiB, which would
+/// put a fixture this size in a single page — and a single-page slab
+/// legitimately fetches whole, which would make the incremental tests
+/// below pass for the wrong reason. A real metadata slab at the scale
+/// that motivated any of this has millions of pages.
 fn write_remote_metadata_slab(path: &Path, first: i32, count: i32) {
-    let mut w =
-        slabtastic::SlabWriter::new(path, slabtastic::WriterConfig::default()).unwrap();
+    let cfg = slabtastic::WriterConfig::new(4096, 4096, 1 << 20, false)
+        .expect("a valid page-size triple");
+    let mut w = slabtastic::SlabWriter::new(path, cfg).unwrap();
     for i in first..first + count {
         let mut node = MNode::new();
         node.fields.insert("id".to_string(), MValue::Int32(i));
@@ -2212,6 +2219,22 @@ fn write_remote_metadata_slab(path: &Path, first: i32, count: i32) {
 struct RemoteRow {
     id: i32,
     bucket: i32,
+}
+
+/// As [`make_remote_metadata_dataset`], with enough records that the
+/// slab spans many chunks — so "did this fetch everything?" is a
+/// question with a visible answer.
+fn make_large_remote_metadata_dataset(root: &Path, records: i32) {
+    write_fvec(&root.join("base.fvec"), 8, 8);
+    write_mref(&root.join("base.fvec"));
+    write_remote_metadata_slab(&root.join("metadata_content.slab"), 0, records);
+    write_mref(&root.join("metadata_content.slab"));
+    std::fs::write(
+        root.join("dataset.yaml"),
+        "name: remote-meta\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+         metadata_content: metadata_content.slab\n",
+    )
+    .unwrap();
 }
 
 /// Serve a dataset whose `metadata_content` is one slab, with `.mref`
@@ -2229,31 +2252,86 @@ fn make_remote_metadata_dataset(root: &Path) {
     .unwrap();
 }
 
-/// **A remote slab facet is refused until its bytes are here** — by
-/// name, not by a sparse map.
+/// **A remote slab facet reads without downloading it.**
 ///
-/// Every other reader in this file serves ranges from a partially
-/// resident file. A slab cannot: it is read by memory map, and a map
-/// over a sparse cache file reads holes as zeroes, which decode as a
-/// dialect error against whichever record happens to straddle one. The
-/// refusal has to say what is actually wrong.
+/// This is the property that keeps a slab no worse than every other
+/// format here. A slab ends with a pages-page indexing every data page
+/// by start ordinal, so opening the facet costs its tail and reading a
+/// record costs that record's page — both fetched and merkle-verified
+/// as ranges by the same chunked source the vector readers use.
+///
+/// The assertion that matters is the last one: after reading a handful
+/// of records the facet is still **incomplete**. If this ever starts
+/// passing only because the whole file came down, it has stopped
+/// testing anything.
 #[test]
-fn a_remote_slab_facet_is_refused_until_precached() {
+fn a_remote_slab_facet_reads_without_downloading_it_all() {
     let tmp = make_tmp();
-    make_remote_metadata_dataset(tmp.path());
+    make_large_remote_metadata_dataset(tmp.path(), 4000);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
 
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
+    let storage = view.open_facet_storage("metadata_content").unwrap();
+    assert!(!storage.is_complete(), "nothing fetched yet");
 
-    match view.open_facet_records("metadata_content") {
-        Err(RecordError::NotResident(what)) => {
-            assert!(what.contains("metadata_content"), "{what}");
-        }
-        Err(other) => panic!("expected a residency refusal, got {other}"),
-        Ok(_) => panic!("a facet whose bytes are still remote must not open"),
+    // Opens with no precache at all.
+    let facet = view.open_facet_records("metadata_content").unwrap();
+    assert_eq!(facet.count().unwrap(), 4000);
+
+    // A few records, scattered, decode correctly.
+    let rows = facet.decode(Serde::<RemoteRow>::new());
+    for o in [0u64, 1, 2000, 3999] {
+        assert_eq!(
+            rows.get(o).unwrap(),
+            RemoteRow { id: o as i32, bucket: (o % 4) as i32 },
+            "record {o} over HTTP"
+        );
     }
+
+    assert!(
+        !storage.is_complete(),
+        "reading four records must not have pulled the whole facet down"
+    );
+}
+
+/// The cost of a read is its page, and the cost of another read in the
+/// same page is nothing.
+#[test]
+fn reading_a_remote_slab_record_costs_its_page_not_the_file() {
+    let tmp = make_tmp();
+    make_large_remote_metadata_dataset(tmp.path(), 4000);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let storage = view.open_facet_storage("metadata_content").unwrap();
+    let facet = view.open_facet_records("metadata_content").unwrap();
+    let nodes = facet.decode(Anode);
+
+    let after_open = storage.cache_stats().map(|s| s.valid_chunks).unwrap_or(0);
+    nodes.get(0).unwrap();
+    let after_first = storage.cache_stats().map(|s| s.valid_chunks).unwrap_or(0);
+    // A neighbouring ordinal is almost certainly in the page just
+    // fetched, so it should cost nothing more.
+    nodes.get(1).unwrap();
+    let after_second = storage.cache_stats().map(|s| s.valid_chunks).unwrap_or(0);
+
+    assert!(
+        after_first >= after_open,
+        "a read fetches what it needs: {after_open} -> {after_first}"
+    );
+    assert_eq!(
+        after_first, after_second,
+        "a second record in the same page must cost nothing"
+    );
+    let total = storage.cache_stats().map(|s| s.total_chunks).unwrap_or(0);
+    assert!(
+        after_second < total,
+        "two records must not have fetched all {total} chunks (got {after_second})"
+    );
 }
 
 /// **Precached, a remote slab facet reads through the ANode AST.**
@@ -2332,7 +2410,7 @@ fn a_precached_remote_slab_facet_reads_as_cql_and_as_a_struct() {
     // Stage 2, by name — the same bytes through the same codec.
     let named = vectordata::records::codec_by_name("cql").expect("cql is known");
     assert_eq!(
-        named.decode(facet.record_bytes(5).unwrap()).unwrap(),
+        named.decode(&facet.record_bytes(5).unwrap()).unwrap(),
         rendered,
         "a codec named at runtime must render what its type does"
     );

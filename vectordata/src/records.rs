@@ -50,9 +50,18 @@
 //! local one — which is what makes shards of a slab series ordinary
 //! slabs based at zero (`docs/design/srd-multifile-facet-shards.md`,
 //! SH-96).
+//!
+//! ## Incremental by the same means as everything else
+//!
+//! Reads go through [`crate::storage::Storage`], not a memory map of
+//! this module's own. A slab ends with a pages-page indexing every data
+//! page by start ordinal, so opening a facet costs its tail and reading
+//! a record costs that record's page — each fetched and merkle-verified
+//! as a byte range by the same chunked source the vector readers use.
+//! Nothing here requires a facet to be downloaded first, and a facet
+//! spread over shards costs only the shards touched.
 
 use std::marker::PhantomData;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::formats::anode::{self, ANode};
@@ -63,9 +72,6 @@ use crate::formats::anode_vernacular::{self, Vernacular};
 pub enum RecordError {
     /// The facet declares no readable container.
     NotAContainer(String),
-    /// The facet's bytes are not local, so the container cannot be
-    /// opened. Slab access is by memory map, which needs a real file.
-    NotResident(String),
     /// The container could not be opened or read.
     Container(String),
     /// The ordinal lies outside the facet.
@@ -78,11 +84,6 @@ impl std::fmt::Display for RecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotAContainer(s) => write!(f, "not a record container: {s}"),
-            Self::NotResident(s) => write!(
-                f,
-                "{s} is not resident locally; precache the facet before reading \
-                 records — a slab is read by memory map and needs a real file"
-            ),
             Self::Container(s) => write!(f, "{s}"),
             Self::OutOfBounds(o) => write!(f, "ordinal {o} is past the end of this facet"),
             Self::Decode(s) => write!(f, "decode: {s}"),
@@ -190,58 +191,186 @@ pub fn codec_by_name(name: &str) -> Option<Box<dyn RecordCodec<Out = String>>> {
     Vernacular::parse(name).map(|v| Box::new(Text(v)) as Box<dyn RecordCodec<Out = String>>)
 }
 
-/// One slab file backing part or all of a facet.
+/// The ordinal index of one slab, read from its tail.
+///
+/// A slab ends with a pages-page listing `(start_ordinal, file_offset)`
+/// for every data page, so the whole index is three short reads from
+/// the end of the file — the footer, the tail page, and for a
+/// multi-namespace file the pages-page that page points at. Nothing
+/// before the tail is touched to build it.
+struct SlabIndex {
+    /// Page entries in ordinal order.
+    entries: Vec<slabtastic::PageEntry>,
+    /// Records across every page.
+    total: u64,
+}
+
+/// One slab backing part or all of a facet.
+///
+/// Reads through [`crate::storage::Storage`] rather than a memory map
+/// of its own. That is what keeps a slab facet incremental like every
+/// other format: a chunked, merkle-verified source fetches and verifies
+/// the chunks covering each range as it is asked for, so opening a
+/// facet costs its tail and reading a record costs its page — not the
+/// file.
 struct Container {
-    path: PathBuf,
+    storage: std::sync::Arc<crate::storage::Storage>,
+    /// What the container is called, for diagnostics.
+    label: String,
     namespace: Option<String>,
-    /// Opened on first read. A facet may name many shards and a caller
-    /// may touch few, so the memory map is paid for per file used.
-    ///
-    /// `Some(None)` means the file opened but does not carry the
-    /// namespace asked for — a normal state, not a failure.
-    reader: OnceLock<Option<slabtastic::SlabReader>>,
-    /// Records this container contributes, known after it is opened.
-    count: OnceLock<u64>,
+    /// Built on first use from the tail of the file.
+    index: OnceLock<SlabIndex>,
 }
 
 impl Container {
-    /// The reader for this container, or `None` when the file is a
-    /// readable slab that simply lacks the namespace asked for.
-    ///
-    /// The file is opened first so a real I/O or format failure stays a
-    /// failure, and only the namespace probe is allowed to answer
-    /// "absent" — the same separation `dataset::layout` makes, and for
-    /// the same reason: an optional document's absence is a normal
-    /// state and must not read as a broken file.
-    fn open(&self) -> Result<Option<&slabtastic::SlabReader>> {
-        if let Some(r) = self.reader.get() {
-            return Ok(r.as_ref());
-        }
-        let opened = match self.namespace.as_deref() {
-            None => Some(slabtastic::SlabReader::open(&self.path).map_err(|e| {
-                RecordError::Container(format!("open slab {}: {e}", self.path.display()))
-            })?),
-            Some(ns) => {
-                slabtastic::SlabReader::open(&self.path).map_err(|e| {
-                    RecordError::Container(format!("open slab {}: {e}", self.path.display()))
-                })?;
-                slabtastic::SlabReader::open_namespace(&self.path, Some(ns)).ok()
-            }
-        };
-        // A race here loses the duplicate map rather than the read.
-        let _ = self.reader.set(opened);
-        Ok(self.reader.get().expect("just set").as_ref())
+    /// Read `len` bytes at `offset`, fetching what is missing.
+    fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.storage.read_bytes(offset, len).map_err(|e| {
+            RecordError::Container(format!(
+                "{}: read {len} bytes at {offset}: {e}",
+                self.label
+            ))
+        })
     }
 
-    /// Records this container contributes — zero when it does not carry
-    /// the namespace.
-    fn count(&self) -> Result<u64> {
-        if let Some(n) = self.count.get() {
-            return Ok(*n);
+    /// The page bytes at `offset`, borrowed when the source is mapped.
+    ///
+    /// A local file — or a remote one already fully resident — serves
+    /// the page without copying; anything else pays one copy of one
+    /// page. The same borrow-where-mapped rule the vector readers use.
+    fn page(&self, offset: u64) -> Result<std::borrow::Cow<'_, [u8]>> {
+        // The page's own header states its size (4 bytes at +4).
+        let size = u32::from_le_bytes(
+            self.read(offset + 4, 4)?
+                .try_into()
+                .map_err(|_| RecordError::Container(format!("{}: short page header", self.label)))?,
+        ) as u64;
+        if let Some(mapped) = self.storage.mmap_slice(offset, size) {
+            return Ok(std::borrow::Cow::Borrowed(mapped));
         }
-        let n = self.open()?.map_or(0, |r| r.total_records());
-        let _ = self.count.set(n);
-        Ok(n)
+        Ok(std::borrow::Cow::Owned(self.read(offset, size)?))
+    }
+
+    /// The ordinal index, built from the tail on first use.
+    fn index(&self) -> Result<&SlabIndex> {
+        if let Some(i) = self.index.get() {
+            return Ok(i);
+        }
+        let built = self.build_index()?;
+        let _ = self.index.set(built);
+        Ok(self.index.get().expect("just set"))
+    }
+
+    fn build_index(&self) -> Result<SlabIndex> {
+        const FOOTER: u64 = 16;
+        let file_len = self.storage.total_size();
+        if file_len < FOOTER {
+            return Err(RecordError::Container(format!(
+                "{}: too small to be a slab ({file_len} bytes)",
+                self.label
+            )));
+        }
+        // 1. The trailing footer says what the last page is and how big.
+        let footer = slabtastic::Footer::read_from(&self.read(file_len - FOOTER, FOOTER)?)
+            .map_err(|e| RecordError::Container(format!("{}: footer: {e}", self.label)))?;
+        let tail_start = file_len - footer.page_size as u64;
+        let tail = self.read(tail_start, footer.page_size as u64)?;
+
+        // 2. That page is either the pages-page itself, or the
+        //    namespaces page naming where each namespace's pages-page
+        //    lives. An absent namespace is a normal state and reported
+        //    as an empty index, not as a broken file.
+        let pages = match footer.page_type {
+            slabtastic::PageType::Pages => {
+                if self.namespace.as_deref().is_some_and(|n| !n.is_empty()) {
+                    return Ok(SlabIndex { entries: Vec::new(), total: 0 });
+                }
+                slabtastic::PagesPage::deserialize(&tail).map_err(|e| {
+                    RecordError::Container(format!("{}: pages page: {e}", self.label))
+                })?
+            }
+            _ => {
+                let ns = slabtastic::NamespacesPage::deserialize(&tail).map_err(|e| {
+                    RecordError::Container(format!("{}: namespaces page: {e}", self.label))
+                })?;
+                let entries = ns.entries().map_err(|e| {
+                    RecordError::Container(format!("{}: namespace entries: {e}", self.label))
+                })?;
+                let wanted = match self.namespace.as_deref() {
+                    Some(name) if !name.is_empty() => entries.iter().find(|e| e.name == name),
+                    _ => entries.iter().find(|e| e.name.is_empty()),
+                };
+                let Some(entry) = wanted else {
+                    return Ok(SlabIndex { entries: Vec::new(), total: 0 });
+                };
+                let at = entry.pages_page_offset as u64;
+                let bytes = self.page(at)?;
+                slabtastic::PagesPage::deserialize(&bytes).map_err(|e| {
+                    RecordError::Container(format!("{}: pages page: {e}", self.label))
+                })?
+            }
+        };
+
+        // 3. Record counts come from consecutive entries; only the last
+        //    page has to be read for its own count.
+        let entries = pages.sorted_entries_ref().to_vec();
+        let total = match entries.last() {
+            None => 0,
+            Some(last) => {
+                let bytes = self.page(last.file_offset as u64)?;
+                let n = slabtastic::Page::record_count_from_buf(&bytes).map_err(|e| {
+                    RecordError::Container(format!("{}: last page: {e}", self.label))
+                })?;
+                (last.start_ordinal as u64) + n as u64
+            }
+        };
+        Ok(SlabIndex { entries, total })
+    }
+
+    fn count(&self) -> Result<u64> {
+        Ok(self.index()?.total)
+    }
+
+    /// The record at this container's own ordinal `local`.
+    fn record(&self, local: u64) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let index = self.index()?;
+        // The page whose start ordinal is the greatest not exceeding
+        // `local`. Entries are sorted, so this is a binary search.
+        let at = match index
+            .entries
+            .binary_search_by_key(&(local as i64), |e| e.start_ordinal)
+        {
+            Ok(i) => i,
+            Err(0) => return Err(RecordError::OutOfBounds(local)),
+            Err(i) => i - 1,
+        };
+        let entry = &index.entries[at];
+        let bytes = self.page(entry.file_offset as u64)?;
+        let within = (local as i64 - entry.start_ordinal) as usize;
+        let count = slabtastic::Page::record_count_from_buf(&bytes).map_err(|e| {
+            RecordError::Container(format!("{}: page record count: {e}", self.label))
+        })?;
+        if within >= count {
+            return Err(RecordError::OutOfBounds(local));
+        }
+        match bytes {
+            // Mapped: the record is a borrow into the source.
+            std::borrow::Cow::Borrowed(b) => {
+                slabtastic::Page::get_record_ref_from_buf(b, within, count)
+                    .map(std::borrow::Cow::Borrowed)
+                    .map_err(|e| {
+                        RecordError::Container(format!("{}: record {local}: {e}", self.label))
+                    })
+            }
+            // Fetched: one copy of one page, and the record out of it.
+            std::borrow::Cow::Owned(b) => {
+                slabtastic::Page::get_record_from_buf(&b, within)
+                    .map(std::borrow::Cow::Owned)
+                    .map_err(|e| {
+                        RecordError::Container(format!("{}: record {local}: {e}", self.label))
+                    })
+            }
+        }
     }
 }
 
@@ -300,24 +429,19 @@ impl RecordFacet {
         Err(RecordError::OutOfBounds(o))
     }
 
-    /// One record's bytes, borrowed from the container's mapping.
+    /// One record's bytes.
+    ///
+    /// Borrowed when the source is mapped — a local file, or a remote
+    /// one already resident — and owned when the page had to be
+    /// fetched. The same borrow-where-mapped rule the vector readers
+    /// follow, and the reason reading one record from a remote facet
+    /// costs one page rather than one file.
     ///
     /// The escape hatch beneath every codec: a caller that wants to
     /// decode a record some other way is not obliged to go through one.
-    pub fn record_bytes(&self, ordinal: u64) -> Result<&[u8]> {
+    pub fn record_bytes(&self, ordinal: u64) -> Result<std::borrow::Cow<'_, [u8]>> {
         let (container, local) = self.locate(ordinal)?;
-        // `locate` only returns a container the ordinal falls inside,
-        // and an absent namespace contributes none — so reaching here
-        // means the reader exists.
-        let reader = container
-            .open()?
-            .ok_or(RecordError::OutOfBounds(ordinal))?;
-        reader.get_ref(local as i64).map_err(|e| {
-            RecordError::Container(format!(
-                "read ordinal {ordinal} (local {local}) from {}: {e}",
-                container.path.display()
-            ))
-        })
+        container.record(local)
     }
 
     /// A sibling namespace of this facet as a facet of its own.
@@ -333,10 +457,10 @@ impl RecordFacet {
                 .containers
                 .iter()
                 .map(|c| Container {
-                    path: c.path.clone(),
+                    storage: c.storage.clone(),
+                    label: format!("{}:{name}", c.label),
                     namespace: Some(name.to_string()),
-                    reader: OnceLock::new(),
-                    count: OnceLock::new(),
+                    index: OnceLock::new(),
                 })
                 .collect(),
             starts: OnceLock::new(),
@@ -373,7 +497,7 @@ impl<C: RecordCodec> Records<'_, C> {
 
     /// The record at `ordinal`, decoded.
     pub fn get(&self, ordinal: u64) -> Result<C::Out> {
-        self.codec.decode(self.facet.record_bytes(ordinal)?)
+        self.codec.decode(&self.facet.record_bytes(ordinal)?)
     }
 
     /// Every record in order, decoded lazily.
@@ -403,23 +527,16 @@ impl RecordFacet {
     ) -> Result<Self> {
         let mut containers = Vec::new();
         match storage.series_ref() {
-            None => {
-                let path = storage.local_file().ok_or_else(|| {
-                    RecordError::NotResident(format!("facet '{facet}'"))
-                })?;
-                containers.push(Container {
-                    path,
-                    namespace: namespace.map(str::to_string),
-                    reader: OnceLock::new(),
-                    count: OnceLock::new(),
-                });
-            }
+            None => containers.push(Container {
+                storage: storage.storage_handle(),
+                label: format!("facet '{facet}'"),
+                namespace: namespace.map(str::to_string),
+                index: OnceLock::new(),
+            }),
             Some(series) => {
                 // One container per **shard**, in ordinal order, so the
                 // facet's ordinal space is the concatenation the shard
-                // map describes. Two shards drawn from one file open it
-                // twice, which is the price of a container that maps
-                // its own file.
+                // map describes.
                 for shard in 0..series.shards().entries().len() {
                     let i = series.file_index_of_shard(shard).map_err(|e| {
                         RecordError::Container(format!("facet '{facet}': {e}"))
@@ -427,24 +544,11 @@ impl RecordFacet {
                     let handle = series.file(i).map_err(|e| {
                         RecordError::Container(format!("facet '{facet}': {e}"))
                     })?;
-                    // Complete, not merely present: a sparse cache file
-                    // exists from the moment a download starts and reads
-                    // as zeroes until it finishes.
-                    let path = handle
-                        .is_complete()
-                        .then(|| handle.local_path())
-                        .flatten()
-                        .ok_or_else(|| {
-                            RecordError::NotResident(format!(
-                                "facet '{facet}' shard {shard} ({})",
-                                series.file_source(i)
-                            ))
-                        })?;
                     containers.push(Container {
-                        path,
+                        storage: handle,
+                        label: format!("facet '{facet}' shard {shard}"),
                         namespace: namespace.map(str::to_string),
-                        reader: OnceLock::new(),
-                        count: OnceLock::new(),
+                        index: OnceLock::new(),
                     });
                 }
             }

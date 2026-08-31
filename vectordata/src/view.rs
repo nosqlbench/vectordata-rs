@@ -2322,25 +2322,14 @@ impl FacetStorage {
             }),
         }
     }
-    /// The single file behind this facet, when **every** byte of it is
-    /// on disk.
+    /// The storage behind this facet.
     ///
-    /// `None` for a series — which has no single file — and for a
-    /// remote facet that is not fully resident. Completeness is the
-    /// test, not the existence of a path: a cache file is pre-sized
-    /// sparse the moment a download starts, so it exists and reads as
-    /// zeroes long before it holds anything. A reader that maps its own
-    /// container would map those holes and decode them, so the question
-    /// it has to ask is whether the bytes are there, not whether the
-    /// file is.
-    pub(crate) fn local_file(&self) -> Option<std::path::PathBuf> {
-        if self.series.is_some() {
-            return None;
-        }
-        if !self.storage.is_complete() {
-            return None;
-        }
-        self.storage.local_path()
+    /// A reader that parses a container of its own reads through this
+    /// rather than mapping a file, which is what keeps such a facet
+    /// incremental: a chunked, merkle-verified source fetches and
+    /// verifies the chunks covering each range as it is asked for.
+    pub(crate) fn storage_handle(&self) -> std::sync::Arc<crate::storage::Storage> {
+        self.storage.clone()
     }
 
     /// The access mode this facet promises, which is the weakest among

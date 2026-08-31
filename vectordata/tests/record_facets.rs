@@ -143,7 +143,7 @@ fn a_codec_named_at_runtime_decodes_identically() {
 
     let by_type = facet.decode(Text(Vernacular::Cql)).get(1).unwrap();
     let named = vectordata::records::codec_by_name("cql").expect("cql is a known codec");
-    let by_name = named.decode(facet.record_bytes(1).unwrap()).unwrap();
+    let by_name = named.decode(&facet.record_bytes(1).unwrap()).unwrap();
     assert_eq!(by_type, by_name);
 
     assert!(vectordata::records::codec_by_name("not-a-codec").is_none());
@@ -287,7 +287,10 @@ fn a_sibling_namespace_reads_through_the_same_containers() {
     // name — no special case per document.
     let schema = facet.namespace("schema");
     assert_eq!(schema.count().unwrap(), 1);
-    assert_eq!(schema.record_bytes(0).unwrap(), br#"{"kind":"metadata"}"#);
+    assert_eq!(
+        schema.record_bytes(0).unwrap().as_ref(),
+        br#"{"kind":"metadata"}"#
+    );
     assert!(schema.name().ends_with(":schema"));
 }
 
