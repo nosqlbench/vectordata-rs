@@ -1247,6 +1247,238 @@ fn an_absent_version_is_not_an_understatement() {
     assert_eq!(cfg.min_format_version(), 2, "but the content needs 2");
 }
 
+/// **A gap in the middle of a series is an error, not a short read**
+/// (SH-3).
+///
+/// The uniform form derives contiguous names, so an absent middle shard
+/// is a hole in the ordinal space. Reporting the records either side of
+/// it — or the count the declaration promised — would put wrong
+/// vectors at every ordinal past the gap.
+#[test]
+fn a_gap_in_the_middle_of_a_series_is_reported_by_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    write_fvec(&ds.join("base__0000.fvec"), 4, 100, 0);
+    // __0001 deliberately absent — the shards either side of it exist.
+    write_fvec(&ds.join("base__0002.fvec"), 4, 100, 200);
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: gap\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
+         record_count: 300\n",
+    )
+    .unwrap();
+
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+
+    let err = storage
+        .try_total_size()
+        .expect_err("a hole in the middle of a series must be reported");
+    assert!(
+        err.to_string().contains("base__0001.fvec"),
+        "the message must name the missing shard: {err}"
+    );
+    assert!(!storage.is_complete());
+
+    // And a read that would land past the gap must not answer from the
+    // shard that happens to be there.
+    let reader = view.base_vectors();
+    if let Ok(r) = reader {
+        assert!(
+            r.get(250).is_err(),
+            "an ordinal past a missing shard must not resolve"
+        );
+    }
+}
+
+/// **A shard and another facet's file that share a basename stay
+/// distinct on disk** (SH-33).
+///
+/// The cache-relpath collision guard is a catalog concern — it fires
+/// when two facets would cache to one filename. Locally there is no
+/// cache and the paths differ, so what must hold here is the weaker
+/// but more basic property: each facet reads its own file, and a
+/// basename shared with a shard of another facet changes nothing.
+#[test]
+fn a_shard_sharing_a_basename_with_another_facet_reads_its_own_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    std::fs::create_dir_all(ds.join("a")).unwrap();
+    std::fs::create_dir_all(ds.join("b")).unwrap();
+    write_fvec(&ds.join("a/base__0000.fvec"), 4, 50, 0);
+    write_fvec(&ds.join("a/base__0001.fvec"), 4, 50, 50);
+    write_fvec(&ds.join("b/base__0001.fvec"), 4, 50, 0);
+
+    // Both facets live outside a dataset home URL, so each file caches
+    // under its basename — and `base__0001.fvec` is claimed twice.
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: clash\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: a/base__NNNN.fvec\n      shard_stride: 50\n      shard_count: 2\n      \
+         record_count: 100\n    query_vectors: b/base__0001.fvec\n",
+    )
+    .unwrap();
+
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    // Local files resolve to distinct absolute paths, so this dataset
+    // is legal on disk; the guard is a catalog-cache concern. What must
+    // hold either way is that the two facets read their own bytes.
+    let base = view.base_vectors().unwrap();
+    let query = view.query_vectors().unwrap();
+    assert_eq!(base.count(), 100);
+    assert_eq!(query.count(), 50);
+    assert_eq!(base.get(50).unwrap()[0], 50.0, "shard 1 of base_vectors");
+    assert_eq!(query.get(0).unwrap()[0], 0.0, "b/base__0001 is its own file");
+}
+
+/// **The CLI stride and the YAML key are one knob** (SH-44).
+///
+/// `--shard-stride 1M` and `shard_stride: 1000000` have to mean the
+/// same number, and the number the flag asked for has to be the one
+/// that lands in the written declaration. Both CLI surfaces parse
+/// through `parse_number_with_suffix`, so the congruence is a property
+/// of that function plus what `derive` emits.
+#[test]
+fn the_cli_stride_and_the_yaml_key_mean_the_same_number() {
+    use vectordata::dataset::source::parse_number_with_suffix;
+    assert_eq!(parse_number_with_suffix("1M").unwrap(), 1_000_000);
+    assert_eq!(
+        parse_number_with_suffix("1M").unwrap(),
+        parse_number_with_suffix("1000000").unwrap(),
+        "the suffixed and plain spellings are the same knob"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write_fvec(&src.join("base_vectors.fvec"), 4, 250, 0);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: src\nprofiles:\n  default:\n    base_vectors: base_vectors.fvec\n",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    let stride = parse_number_with_suffix("100").unwrap();
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(),
+            "default",
+            &out,
+            "",
+            &[],
+            &[],
+            Some("derived"),
+            true,
+            Some(stride),
+        ),
+        0
+    );
+
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(
+        yaml.contains("shard_stride: 100"),
+        "the flag's value is the key's value:\n{yaml}"
+    );
+    // And the dataset that comes back out reads as one facet.
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(r.count(), 250);
+    assert_eq!(r.get(249).unwrap()[0], 249.0);
+}
+
+/// **A sliced series publishes its files whole** (SH-84).
+///
+/// A window is a view over ordinals, not a licence to ship a fraction
+/// of a file. Publishing only the windowed bytes would produce files
+/// whose declared entry windows no longer describe them, and any other
+/// profile sharing those files would find them truncated.
+#[test]
+fn a_sliced_series_publishes_whole_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    write_fvec(&ds.join("part_a.fvec"), 4, 100, 0);
+    write_fvec(&ds.join("part_b.fvec"), 4, 100, 100);
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: sliced\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
+        \x20       - part_a.fvec[20..60)=40\n        - part_b.fvec[0..30)=30\n      \
+         record_count: 70\n",
+    )
+    .unwrap();
+
+    // The declaration reads 70 of the 200 records on disk.
+    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(r.count(), 70);
+    assert_eq!(r.get(0).unwrap()[0], 20.0, "the first entry's window applies");
+    assert_eq!(r.get(40).unwrap()[0], 100.0, "the second entry starts at its own base");
+
+    let scan = vectordata::push::plan::scan(&ds).expect("scan");
+    for name in ["part_a.fvec", "part_b.fvec"] {
+        let published = scan
+            .files
+            .iter()
+            .find(|f| f.ends_with(name))
+            .unwrap_or_else(|| panic!("{name} not published: {:?}", scan.files));
+        assert_eq!(
+            std::fs::metadata(ds.join(published)).unwrap().len(),
+            100 * (4 + 4 * 4),
+            "{name} must ship whole, not clipped to its window"
+        );
+    }
+}
+
+/// **`veks check` reports a non-canonical series; it does not rewrite
+/// it** (SH-88).
+///
+/// A one-shard series is legal to read and wrong to write (SH-4), so a
+/// validator has to say so. Repairing it silently would edit a file the
+/// operator did not ask to change, and the next run would report
+/// nothing — hiding whatever produced the declaration.
+#[test]
+fn validation_reports_a_non_canonical_series_without_rewriting_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    write_fvec(&ds.join("base__0000.fvec"), 4, 40, 0);
+    let yaml = "name: single\nprofiles:\n  default:\n    base_vectors:\n      \
+                source: base__NNNN.fvec\n      shard_stride: 40\n      shard_count: 1\n      \
+                record_count: 40\n";
+    std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
+
+    let cfg: vectordata::dataset::DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+    let violations = vectordata::dataset::conformance::validate_conformance(&cfg)
+        .expect_err("a one-shard series is not canonical");
+    assert!(
+        violations
+            .iter()
+            .any(|v: &vectordata::dataset::conformance::FacetViolation| {
+                v.to_string().contains("base_vectors")
+            }),
+        "the facet must be named: {violations:?}"
+    );
+
+    // The reader accepts it, and the file on disk is untouched.
+    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    assert_eq!(
+        g.profile("default").unwrap().base_vectors().unwrap().count(),
+        40
+    );
+    assert_eq!(
+        std::fs::read_to_string(ds.join("dataset.yaml")).unwrap(),
+        yaml,
+        "validation must not rewrite the declaration"
+    );
+}
+
 /// **Saving a dataset must not be able to destroy it** (SH-85).
 ///
 /// The compact writer emitted `view.source.path`, which for a uniform

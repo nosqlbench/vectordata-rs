@@ -878,6 +878,27 @@ pub(crate) fn shard_filename(source: &str, index: u32) -> String {
     source.replacen(SHARD_FIELD, &format!("{index:04}"), 1)
 }
 
+/// The all-digit token immediately before the shard field, if there is
+/// one (SH-101).
+///
+/// The shard field is always last before the extension and always four
+/// digits, so `p__0010__NNNN.ivecs` derives `p__0010__0000.ivecs` —
+/// which reads equally well as shard 10 of `p` with a stray suffix, or
+/// shard 0 of `p__0010`. Nothing downstream parses these names, but a
+/// human and a directory listing both do, and a generator
+/// interpolating a numeric profile name into a basename produces
+/// exactly this.
+fn ambiguous_token_before_shard_field(pattern: &str) -> Option<&str> {
+    let path = pattern.split(':').next().unwrap_or(pattern);
+    let stem = match path.rfind('.') {
+        Some(dot) => &path[..dot],
+        None => path,
+    };
+    let before = stem.strip_suffix(SHARD_FIELD)?.strip_suffix("__")?;
+    let token = before.rsplit("__").next()?;
+    (!token.is_empty() && token.bytes().all(|b| b.is_ascii_digit())).then_some(token)
+}
+
 /// What a facet's declaration says about its layout, independent of how
 /// it was spelled.
 ///
@@ -953,6 +974,13 @@ fn realize_uniform(facet: &str, decl: &Declaration<'_>) -> Result<Shards, ShardE
         ));
     }
     let pattern = &decl.sources[0];
+    if let Some(ambiguous) = ambiguous_token_before_shard_field(pattern) {
+        return Err(incomplete(&format!(
+            "the token '{ambiguous}' before the '{SHARD_FIELD}' field is all digits, \
+             so the derived filenames have two readings and neither is decidable \
+             (SH-101); give it a non-numeric prefix"
+        )));
+    }
     let stride = decl
         .shard_stride
         .ok_or_else(|| incomplete(&format!("'{SHARD_FIELD}' without shard_stride")))?;
@@ -1224,6 +1252,161 @@ mod realization {
     }
 
     // ── the uniform form ───────────────────────────────────────────
+
+    /// **Ordinals follow the declared order, not the filenames**
+    /// (SH-52).
+    ///
+    /// An explicit series is a concatenation of what the declaration
+    /// lists, in the order it lists it. Sorting the names — or assuming
+    /// they sort — would silently reorder the dataset for anyone whose
+    /// parts are named by content rather than by position.
+    #[test]
+    fn ordinals_follow_declared_order_not_alphabetical_order() {
+        let sources = v(&["zulu.u8=10", "alpha.u8=10", "mike.u8=10"]);
+        let shards = realize(
+            "metadata_content",
+            &Declaration {
+                record_count: Some(30),
+                ..decl(&sources, true)
+            },
+            &probe(&[]),
+        )
+        .expect("counted entries need no probe");
+
+        let names: Vec<&str> = shards
+            .entries()
+            .iter()
+            .map(|e| e.source.path.as_str())
+            .collect();
+        assert_eq!(names, vec!["zulu.u8", "alpha.u8", "mike.u8"]);
+        assert_eq!(shards.locate(0).unwrap().shard, 0, "ordinal 0 is zulu's");
+        assert_eq!(shards.locate(15).unwrap().shard, 1, "ordinal 15 is alpha's");
+        assert_eq!(shards.locate(25).unwrap().shard, 2, "ordinal 25 is mike's");
+    }
+
+    /// **A bare entry is probed once** (SH-87).
+    ///
+    /// Resolution happens at load, in one place. A probe per read — or
+    /// per shard per read — turns a length lookup into an I/O pattern,
+    /// and for a remote entry into a fetch.
+    #[test]
+    fn a_bare_entry_is_probed_exactly_once_per_shard() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::<String>::new());
+        let counting = |s: &DSSource| {
+            calls.borrow_mut().push(s.path.clone());
+            Ok(10u64)
+        };
+        let sources = v(&["a.u8", "b.u8", "c.u8"]);
+        let shards = realize(
+            "metadata_content",
+            &Declaration {
+                record_count: Some(30),
+                ..decl(&sources, true)
+            },
+            &counting,
+        )
+        .expect("bare entries realize by probing");
+        assert_eq!(shards.count(), 30);
+        assert_eq!(
+            calls.borrow().as_slice(),
+            &["a.u8".to_string(), "b.u8".to_string(), "c.u8".to_string()],
+            "one probe per shard, in order, and no more"
+        );
+    }
+
+    /// **A counted entry is not probed at all** (SH-87). The count in
+    /// the declaration is the answer; going to the file anyway would
+    /// make the edifying suffix cost what it was meant to save.
+    #[test]
+    fn a_counted_entry_is_never_probed() {
+        let sources = v(&["a.u8=10", "b.u8=10"]);
+        let shards = realize(
+            "metadata_content",
+            &Declaration {
+                record_count: Some(20),
+                ..decl(&sources, true)
+            },
+            // Any probe call fails this test loudly.
+            &probe(&[]),
+        )
+        .expect("counted entries need no probe");
+        assert_eq!(shards.count(), 20);
+    }
+
+    /// **An all-digit token before the shard field is refused**
+    /// (SH-101).
+    ///
+    /// `p__0010__NNNN.ivecs` derives `p__0010__0000.ivecs`, which reads
+    /// as shard 10 of `p` or shard 0 of `p__0010` and gives no way to
+    /// choose. A generator interpolating a numeric profile name into a
+    /// basename produces exactly this, so it is refused where the
+    /// declaration is realized rather than left to be noticed later.
+    #[test]
+    fn an_all_digit_token_before_the_shard_field_is_refused() {
+        let sources = v(&["p__0010__NNNN.ivecs"]);
+        let err = realize(
+            "metadata_results",
+            &Declaration {
+                shard_stride: Some(100),
+                shard_count: Some(3),
+                record_count: Some(300),
+                ..decl(&sources, false)
+            },
+            &probe(&[]),
+        )
+        .expect_err("an ambiguous basename must not realize");
+        let msg = err.to_string();
+        assert!(msg.contains("0010"), "{msg}");
+        assert!(msg.contains("two readings"), "{msg}");
+    }
+
+    /// A non-numeric token in the same position is fine — the rule is
+    /// about digits, not about how many `__`-separated parts a name has.
+    #[test]
+    fn a_named_token_before_the_shard_field_is_accepted() {
+        let sources = v(&["p__profile10__NNNN.ivecs"]);
+        let shards = realize(
+            "metadata_results",
+            &Declaration {
+                shard_stride: Some(100),
+                shard_count: Some(2),
+                record_count: Some(200),
+                ..decl(&sources, false)
+            },
+            &probe(&[]),
+        )
+        .expect("a non-numeric token is unambiguous");
+        assert_eq!(shards.entries()[1].source.path, "p__profile10__0001.ivecs");
+    }
+
+    /// **A namespace selector and the shard field do not reach into
+    /// each other** (SH-97). The namespace follows the path, the index
+    /// sits inside the filename, and each parse leaves the other alone.
+    #[test]
+    fn a_slab_namespace_survives_shard_derivation() {
+        let sources = v(&["metadata_content__NNNN.slab:mnodes"]);
+        let shards = realize(
+            "metadata_content",
+            &Declaration {
+                shard_stride: Some(50),
+                shard_count: Some(3),
+                record_count: Some(140),
+                ..decl(&sources, false)
+            },
+            &probe(&[]),
+        )
+        .expect("a namespaced pattern realizes");
+        for (i, e) in shards.entries().iter().enumerate() {
+            assert_eq!(e.source.path, format!("metadata_content__{i:04}.slab"));
+            assert_eq!(
+                e.source.namespace.as_deref(),
+                Some("mnodes"),
+                "every shard keeps the selector"
+            );
+        }
+        assert_eq!(shards.entries()[2].len, 40, "the last shard is short");
+    }
 
     /// Filenames come from the `NNNN` field, four digits, and lengths
     /// from stride plus the declared total (SH-2, SH-49).
