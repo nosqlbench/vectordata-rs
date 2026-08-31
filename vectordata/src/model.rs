@@ -229,27 +229,138 @@ impl<'de> Deserialize<'de> for DatasetConfig {
 /// profile's GT lives at `profiles/<name>/neighbor_*.ivecs`, not at
 /// the default's path.
 fn apply_default_inheritance(profiles: &mut HashMap<String, ProfileConfig>) {
-    let default = match profiles.get("default").cloned() {
-        Some(d) => d,
-        None => return,
-    };
-    for (name, profile) in profiles.iter_mut() {
-        if name == "default" { continue; }
-        // Partition profiles are self-contained: they carry their
-        // own base bytes and must not pick up default's shared facets.
-        if profile.partition { continue; }
+    // Resolve each profile against its parent, parents first, so a
+    // chain (`1m-sel001` → `1m` → `default`) resolves in one pass with
+    // the grandparent's facets already in place.
+    for name in inheritance_order(profiles) {
+        let Some(parent_name) = parent_of(profiles, &name) else {
+            continue;
+        };
+        let Some(parent) = profiles.get(&parent_name).cloned() else {
+            continue;
+        };
+        let Some(profile) = profiles.get_mut(&name) else {
+            continue;
+        };
+        inherit_from(profile, &parent, parent_name == "default");
+    }
+}
 
-        let bc = profile.base_count;
-        inherit_with_window(&mut profile.base_vectors, &default.base_vectors, bc);
-        inherit_with_window(&mut profile.metadata_content, &default.metadata_content, bc);
-        inherit(&mut profile.base_content, &default.base_content);
-        inherit(&mut profile.query_vectors, &default.query_vectors);
-        inherit(&mut profile.query_terms, &default.query_terms);
-        inherit(&mut profile.query_filters, &default.query_filters);
-        inherit(&mut profile.metadata_predicates, &default.metadata_predicates);
-        inherit(&mut profile.predicate_results, &default.predicate_results);
-        inherit(&mut profile.metadata_layout, &default.metadata_layout);
-        if profile.maxk.is_none() { profile.maxk = default.maxk; }
+/// The parent a profile inherits from, or `None` when it inherits from
+/// nothing.
+///
+/// A named parent must exist and must not be the profile itself; an
+/// unresolvable name falls back to `default` rather than failing the
+/// load, because the facets a profile *does* declare are still readable
+/// and `veks check` is where a broken declaration should be reported.
+fn parent_of(profiles: &HashMap<String, ProfileConfig>, name: &str) -> Option<String> {
+    if name == "default" {
+        return None;
+    }
+    let profile = profiles.get(name)?;
+    // Partition profiles are self-contained: they carry their own base
+    // bytes and must not pick up another profile's shared facets.
+    if profile.partition {
+        return None;
+    }
+    match profile.inherits.as_deref() {
+        Some(parent) if parent != name && profiles.contains_key(parent) => {
+            Some(parent.to_string())
+        }
+        _ => profiles.contains_key("default").then(|| "default".to_string()),
+    }
+}
+
+/// Profile names ordered so a parent is always resolved before its
+/// children.
+///
+/// A cycle — `a: inherits: b`, `b: inherits: a` — leaves both members
+/// unresolved rather than looping. They keep whatever they declared,
+/// which is the same outcome as having no parent, and `veks check`
+/// names the cycle.
+fn inheritance_order(profiles: &HashMap<String, ProfileConfig>) -> Vec<String> {
+    let mut names: Vec<String> = profiles.keys().cloned().collect();
+    names.sort();
+    let mut done: Vec<String> = Vec::with_capacity(names.len());
+    let mut settled: std::collections::HashSet<String> =
+        std::collections::HashSet::from(["default".to_string()]);
+    // At most one profile is settled per pass, so the depth of the
+    // deepest chain bounds the passes.
+    for _ in 0..names.len() {
+        let mut progressed = false;
+        for name in &names {
+            if settled.contains(name) {
+                continue;
+            }
+            let ready = match parent_of(profiles, name) {
+                None => true,
+                Some(parent) => settled.contains(&parent),
+            };
+            if ready {
+                done.push(name.clone());
+                settled.insert(name.clone());
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    done
+}
+
+/// Copy the facets `profile` did not declare from `parent`.
+///
+/// **What inherits depends on the axis** (P-2). Per-profile outputs —
+/// the unfiltered and filtered ground truth — cannot be shared across a
+/// *size* family, because they are derived from `base_count`; a 1m
+/// profile inheriting the default's full-base ground truth would
+/// mis-route every verify. Across a *selectivity* family they are
+/// invariant, and restating them per member is the drift hazard the
+/// axis was supposed to remove.
+///
+/// The parent decides which it is. Inheriting from `default` keeps the
+/// size-axis rule, which is what every dataset written before
+/// parameterized profiles relies on (P-13). Naming a parent explicitly
+/// is a statement that this profile is a parameterization *of that
+/// one*, so everything it does not override comes across — the general
+/// case of which the default rule is one instance (P-3).
+fn inherit_from(profile: &mut ProfileConfig, parent: &ProfileConfig, size_axis: bool) {
+    let bc = profile.base_count;
+    inherit_with_window(&mut profile.base_vectors, &parent.base_vectors, bc);
+    inherit_with_window(&mut profile.metadata_content, &parent.metadata_content, bc);
+    inherit(&mut profile.base_content, &parent.base_content);
+    inherit(&mut profile.query_vectors, &parent.query_vectors);
+    inherit(&mut profile.query_terms, &parent.query_terms);
+    inherit(&mut profile.query_filters, &parent.query_filters);
+    inherit(&mut profile.metadata_predicates, &parent.metadata_predicates);
+    inherit(&mut profile.predicate_results, &parent.predicate_results);
+    inherit(&mut profile.metadata_layout, &parent.metadata_layout);
+    if !size_axis {
+        inherit(&mut profile.neighbor_indices, &parent.neighbor_indices);
+        inherit(&mut profile.neighbor_distances, &parent.neighbor_distances);
+        inherit(
+            &mut profile.prefiltered_neighbor_indices,
+            &parent.prefiltered_neighbor_indices,
+        );
+        inherit(
+            &mut profile.prefiltered_neighbor_distances,
+            &parent.prefiltered_neighbor_distances,
+        );
+        inherit(
+            &mut profile.postfiltered_neighbor_indices,
+            &parent.postfiltered_neighbor_indices,
+        );
+        inherit(
+            &mut profile.postfiltered_neighbor_distances,
+            &parent.postfiltered_neighbor_distances,
+        );
+        if profile.base_count.is_none() {
+            profile.base_count = parent.base_count;
+        }
+    }
+    if profile.maxk.is_none() {
+        profile.maxk = parent.maxk;
     }
 }
 
@@ -342,6 +453,45 @@ pub struct ProfileConfig {
     /// base vectors (not a windowed subset of the default profile).
     #[serde(default)]
     pub partition: bool,
+
+    /// Open key/value map describing what this profile *is* — the
+    /// parameter values that distinguish it from its siblings (P-4).
+    ///
+    /// `base_count` and `maxk` are fields because the reader acts on
+    /// them. A selectivity is not something the reader acts on; it is
+    /// something a consumer selects by. Without somewhere to put it, a
+    /// family of selectivities is machine-readable only by parsing
+    /// member names, and a name is an identifier, not a measurement.
+    ///
+    /// Conventional keys are `selectivity` (a fraction in `0.0..=1.0`),
+    /// `predicate_count`, and `k` — conventions, not requirements
+    /// (P-5). Unknown keys are preserved and reported, never rejected.
+    ///
+    /// Values record **what a run realized**, never what it targeted
+    /// (P-6): a sweep aiming at 1% that achieves 1.2% records `0.012`.
+    /// Absent means undescribed, which is not `selectivity: 0.0` (P-7)
+    /// — hence a map that can be empty rather than fields that can be
+    /// zero.
+    ///
+    /// See `docs/design/srd-profile-parameterization.md`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub attributes: HashMap<String, serde_yaml::Value>,
+
+    /// The profile this one inherits unstated facets from.
+    ///
+    /// Absent means `default`, which is every dataset written before
+    /// parameterized profiles and the reason the field is optional
+    /// rather than required (P-13).
+    ///
+    /// Naming a parent is what lets inheritance follow **the axis a
+    /// family varies along** (P-2). On a size axis the unfiltered
+    /// ground truth cannot be shared, because it depends on
+    /// `base_count`; on a selectivity axis every member has one
+    /// `base_count` and the ground truth is invariant, so a member
+    /// naming its sized parent inherits it instead of restating a path
+    /// per member and drifting the moment one is edited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherits: Option<String>,
 
     // -- Vector facets --
 

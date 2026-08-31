@@ -3591,6 +3591,8 @@ mod tests {
 
         fn empty_profile() -> crate::model::ProfileConfig {
             crate::model::ProfileConfig {
+                attributes: Default::default(),
+                inherits: None,
                 base_count: None,
                 maxk: None,
                 partition: false,

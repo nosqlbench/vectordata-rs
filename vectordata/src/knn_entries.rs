@@ -146,6 +146,8 @@ fn build_dataset_config(profiles_map: IndexMap<String, &KnnEntry>) -> DatasetCon
     let mut profiles = HashMap::new();
     for (profile_name, entry) in profiles_map {
         profiles.insert(profile_name, ProfileConfig {
+            attributes: Default::default(),
+            inherits: None,
             maxk: None,
             base_count: None,
             partition: false,

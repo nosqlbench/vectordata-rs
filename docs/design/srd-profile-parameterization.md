@@ -1,6 +1,6 @@
 # SRD — Parameterized profiles
 
-**Status:** proposed
+**Status:** implemented
 **Scope:** `ProfileConfig` / `DSProfile`, default inheritance, the
 `sized:` generator, conformance, `describe` / `list`.
 
@@ -119,6 +119,16 @@ readings and neither is decidable
 ([srd-multifile-facet-shards.md](srd-multifile-facet-shards.md),
 SH-101).
 
+**Narrowed in implementation to the name/template *pair*.** An
+all-digit name is not ambiguous by itself — only next to a shard field
+— and strata specs in the field already generate names like `5` into
+unsharded paths. Rejecting every all-digit name would fail P-13 for
+data that has never been ambiguous. The rule as built: a generated name
+that is all digits is refused when, and only when, a facet template
+interpolating it also carries the shard field. SH-101 catches the same
+fault at realization; this catches it where the name is invented,
+before there are files carrying it.
+
 **P-10.** A family member is produced **whole**: one run of a sweep
 writes every facet in the generator's override set, and the profile is
 declared only after all of them are durable. A half-written member is
@@ -171,25 +181,32 @@ profiles:
     neighbor_distances: profiles/1m/neighbor_distances.fvecs
 
   1m-sel001:
-    base_count: 1000000
-    attributes: { selectivity: 0.001, predicate_count: 1000, k: 100 }
+    inherits: 1m
+    attributes: { selectivity: 0.0012, predicate_count: 1000, k: 100 }
     metadata_predicates: profiles/1m-sel001/metadata_predicates.slab
     metadata_results: profiles/1m-sel001/metadata_results.ivvec
     postfiltered_neighbor_indices: profiles/1m-sel001/postfiltered_neighbor_indices.ivecs
     postfiltered_neighbor_distances: profiles/1m-sel001/postfiltered_neighbor_distances.fvecs
 
   1m-sel010:
-    base_count: 1000000
-    attributes: { selectivity: 0.01, predicate_count: 1000, k: 100 }
+    inherits: 1m
+    attributes: { selectivity: 0.0104, predicate_count: 1000, k: 100 }
     metadata_predicates: profiles/1m-sel010/metadata_predicates.slab
     metadata_results: profiles/1m-sel010/metadata_results.ivvec
     postfiltered_neighbor_indices: profiles/1m-sel010/postfiltered_neighbor_indices.ivecs
     postfiltered_neighbor_distances: profiles/1m-sel010/postfiltered_neighbor_distances.fvecs
 ```
 
-`base_vectors` and `query_vectors` are inherited, not repeated. Under
-P-2, `neighbor_indices` would be inherited from `1m` as well rather than
-restated, since the selectivity axis does not change it.
+`base_vectors` and `query_vectors` are inherited from `default`;
+`neighbor_indices`, `neighbor_distances` and `base_count` are inherited
+from `1m`, because `inherits: 1m` says this profile is a
+parameterization of that one and the selectivity axis does not change
+them (P-2).
+
+The selectivities recorded are what the sweep **realized** — 0.12% and
+1.04% against this corpus — not the 0.1% and 1% it targeted (P-6). The
+names still read `sel001` and `sel010`; a consumer choosing by value
+reads the attribute, which is the point of having one.
 
 ```
 veks datasets precache amazon-reviews-2023:1m-sel001
@@ -232,11 +249,30 @@ in existence already depends on, so generalizing it (P-2, P-3) is the
 one change here that can break data in the field. It ships only with
 that case green.
 
-## 11. Open
+## 11. Settled
 
-**The shape of the override declaration (P-3).** Whether a generator
-names the facets it overrides explicitly, or derives them from which
-facets its templates mention, is unsettled. Deriving is less to write
-and cannot fall out of step with the templates; naming is explicit and
-survives a template that mentions a facet it does not actually vary.
-Worth deciding against a real `sized:` spec before implementing.
+**The shape of the override declaration (P-3) — derived from the
+templates.** Measured against the real `sized:` spec, the structured
+form already carries a facet-template map, and its keys are exactly the
+facets the generator writes per member. Naming an override set
+separately would be a second list to keep in step with the first, and
+the failure mode of drift between them — a facet named but not
+templated, or templated but not named — is silent. The template keys
+are the override set; a spec with no templates keeps the size-axis
+rule, which is what every dataset in the field relies on (P-13).
+
+**Inheritance for hand-declared profiles — a named parent.** P-2's own
+example needs `1m-sel001` to inherit `neighbor_indices` from `1m`, and
+inheritance only ever had one parent. A profile may now name one with
+`inherits:`. Absent, the parent is `default` and the size-axis rule
+applies unchanged, so nothing written before this behaves differently.
+Naming a parent is the statement that this profile is a
+parameterization *of that one*, which is what makes the withheld
+per-profile outputs inheritable — the general case of which the default
+rule is one instance.
+
+A parent that does not exist, names itself, or closes a cycle leaves
+the profile with what it declared and is reported by `veks check`
+rather than failing the load: the facets it does declare are still
+readable, and taking a whole dataset out of reach over one profile is
+the worse failure.

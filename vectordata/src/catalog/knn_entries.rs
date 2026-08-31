@@ -166,6 +166,7 @@ pub fn parse_knn_entries_yaml(
                 base_count: None,
                 partition: false,
                 views: IndexMap::new(),
+                ..Default::default()
             };
             for (facet, path) in views {
                 let view = DSView {

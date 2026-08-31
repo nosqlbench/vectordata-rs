@@ -70,6 +70,52 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, profile_name: &str
     0
 }
 
+/// Render an attribute value for a terminal line.
+///
+/// Scalars print bare; anything structured falls back to its YAML,
+/// trimmed. Unknown keys and unusual shapes are reported rather than
+/// dropped — the conventional key set is a convention (P-5).
+fn render_attribute(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Null => "null".to_string(),
+        other => serde_yaml::to_string(other)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    }
+}
+
+/// The attribute keys whose values differ across `name`'s family.
+///
+/// A family varies along one axis, so the key that differs is the
+/// parameter — the thing switching profiles actually changes. Keys
+/// every member agrees on are invariants and say nothing about the
+/// choice.
+fn varying_attributes(
+    profiles: &crate::dataset::profile::DSProfileGroup,
+    name: &str,
+) -> Vec<String> {
+    let members = profiles.family_attributes(name);
+    if members.len() < 2 {
+        return Vec::new();
+    }
+    let mut keys: Vec<String> = members
+        .iter()
+        .flat_map(|(_, attrs)| attrs.keys().cloned())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys.retain(|key| {
+        let mut seen = members.iter().map(|(_, attrs)| attrs.get(key));
+        let first = seen.next().unwrap_or(None);
+        seen.any(|v| v != first)
+    });
+    keys
+}
+
 /// Split `<dataset>[:<profile>]`. Profile defaults to `default`,
 /// including the bare-trailing-colon case (`myset:` → `myset` +
 /// `default`) so a stray keystroke doesn't produce a dataset name
@@ -130,6 +176,46 @@ fn render(entry: &CatalogEntry, profile_name: &str) {
         { kv("base_count", &crate::dataset::source::format_count_with_suffix(bc)); }
     if profile.partition
         { kv("partition", "yes (independent base)"); }
+    if let Some(parent) = profile.inherits.as_deref()
+        { kv("inherits", parent); }
+
+    // What this profile *is*, before what it points at (P-12).
+    //
+    // Absent attributes report as undescribed rather than as zeroes: a
+    // profile that never recorded a selectivity has not recorded one of
+    // 0.0, and printing the latter invents a measurement (P-7).
+    println!();
+    println!("Attributes:");
+    if profile.attributes.is_empty() {
+        kv("(undescribed)", "no attributes recorded");
+    } else {
+        for (key, value) in &profile.attributes {
+            kv(key, &render_attribute(value));
+        }
+    }
+
+    // The family this profile belongs to, and what distinguishes it
+    // from its siblings — which is what a reader actually needs when
+    // deciding which profile to open (P-12).
+    if let Some((spec, members)) = entry.layout.profiles.family_of(profile_name) {
+        println!();
+        println!("Family:");
+        kv("spec", spec);
+        kv("members", &members.join(", "));
+        let varying = varying_attributes(&entry.layout.profiles, profile_name);
+        if varying.is_empty() {
+            kv("varies by", "(nothing recorded — members are undescribed)");
+        } else {
+            for key in varying {
+                let here = profile
+                    .attributes
+                    .get(&key)
+                    .map(render_attribute)
+                    .unwrap_or_else(|| "(undescribed)".to_string());
+                kv(&format!("varies by {key}"), &format!("this profile: {here}"));
+            }
+        }
+    }
 
     println!();
     println!("Facets:");

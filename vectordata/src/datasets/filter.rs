@@ -1044,6 +1044,7 @@ mod tests {
                 base_count: None,
                 partition: false,
                 views: view_map,
+                ..Default::default()
             },
         );
         CatalogEntry {
@@ -1511,12 +1512,15 @@ mod tests {
         let mut profiles = IndexMap::new();
         profiles.insert("default".to_string(), DSProfile {
             maxk: None, base_count: None, partition: false, views: IndexMap::new(),
+            ..Default::default()
         });
         profiles.insert("10m".to_string(), DSProfile {
             maxk: None, base_count: Some(10_000_000), partition: false, views: IndexMap::new(),
+            ..Default::default()
         });
         profiles.insert("100m".to_string(), DSProfile {
             maxk: None, base_count: Some(100_000_000), partition: false, views: IndexMap::new(),
+            ..Default::default()
         });
         let entry = CatalogEntry {
             name: "test".to_string(),
@@ -1554,6 +1558,7 @@ mod tests {
                 base_count: Some(1_000_000),
                 partition: false,
                 views: IndexMap::new(),
+                ..Default::default()
             },
         );
         let entry = CatalogEntry {

@@ -4322,6 +4322,7 @@ mod tests {
             base_count: None,
             partition: false,
             views: indexmap::IndexMap::new(),
+            ..Default::default()
         };
         profile.views.insert("base_vectors".into(),
             view_for("https://h/cat/ds-a/profiles/base.fvecs"));
@@ -4373,6 +4374,7 @@ mod tests {
             base_count: None,
             partition: false,
             views: indexmap::IndexMap::new(),
+            ..Default::default()
         };
         profile.views.insert("base_vectors".into(), view_for(path));
         profile

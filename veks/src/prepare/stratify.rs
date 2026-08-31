@@ -246,6 +246,10 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
             base_count: Some(*count),
             partition: false,
             views,
+            // A stratum is a size of the default corpus, which is the
+            // axis default-inheritance already describes: no parent to
+            // name, and nothing yet measured to record.
+            ..Default::default()
         };
         config.profiles.profiles.insert(prof_name.clone(), profile);
     }

@@ -259,12 +259,30 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                     }
                 };
                 let dim_bytes = (dim as i32).to_le_bytes();
+                let mut wrote = Ok(());
                 for &ord in ordinals {
                     let slice = base_reader.get_slice(ord);
-                    f.write_all(&dim_bytes).unwrap_or(());
+                    wrote = wrote.and_then(|()| f.write_all(&dim_bytes));
                     for &val in slice {
-                        f.write_all(&val.to_le_bytes()).unwrap_or(());
+                        wrote = wrote.and_then(|()| f.write_all(&val.to_le_bytes()));
                     }
+                    if wrote.is_err() {
+                        break;
+                    }
+                }
+                // A `BufWriter` dropped without a flush swallows the
+                // error on its last buffer, so the flush is checked
+                // here rather than left to the drop. A member whose
+                // base vectors are short is the case P-10 exists to
+                // prevent: absent is a visible gap, half-written is a
+                // selectable profile whose ground truth does not match
+                // its data.
+                if let Err(e) = wrote.and_then(|()| f.flush()) {
+                    ctx.ui.log(&format!(
+                        "    ERROR writing {}: {} — profile not declared",
+                        part_base_path.display(), e));
+                    pb.inc(1);
+                    continue;
                 }
             }
 
@@ -296,12 +314,23 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                         }
                     };
                     let dim_bytes = (dim as i32).to_le_bytes();
+                    let mut wrote = Ok(());
                     for &qi in &matching {
                         let slice = query_reader.get_slice(qi);
-                        f.write_all(&dim_bytes).unwrap_or(());
+                        wrote = wrote.and_then(|()| f.write_all(&dim_bytes));
                         for &val in slice {
-                            f.write_all(&val.to_le_bytes()).unwrap_or(());
+                            wrote = wrote.and_then(|()| f.write_all(&val.to_le_bytes()));
                         }
+                        if wrote.is_err() {
+                            break;
+                        }
+                    }
+                    if let Err(e) = wrote.and_then(|()| f.flush()) {
+                        ctx.ui.log(&format!(
+                            "    ERROR writing {}: {} — profile not declared",
+                            part_query_path.display(), e));
+                        pb.inc(1);
+                        continue;
                     }
                     ctx.ui.log(&format!("    {} queries (of {} total) match label {}",
                         matching.len(), query_count, label));
@@ -313,6 +342,19 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                 let _ = veks_core::paths::portable_symlink_file(&rel, &part_query_path);
                 query_count
             };
+
+            // **A member is declared only once every facet it will
+            // name is on disk** (P-10). The profile entry written below
+            // promises `base_vectors` and `query_vectors`; a promise
+            // made before the files exist turns a failed run into a
+            // dataset that looks complete and reads short.
+            if let Some(missing) = first_missing_facet(&[&part_base_path, &part_query_path]) {
+                ctx.ui.log(&format!(
+                    "  {} — NOT declared: {} is missing or empty",
+                    profile_name, missing.display()));
+                pb.inc(1);
+                continue;
+            }
 
             profile_names.push((profile_name, partition_size));
             profiles_created += 1;
@@ -375,6 +417,11 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                             base_count: Some(*count as u64),
                             partition: true,
                             views,
+                            // A partition is its own corpus, not a
+                            // parameterization of another, so it names
+                            // no parent and records nothing to compare
+                            // siblings by.
+                            ..Default::default()
                         });
                     }
 
@@ -640,6 +687,19 @@ fn extract_predicate_label(pnode: &PNode) -> Option<u64> {
     }
 }
 
+/// The first of `paths` that is missing or empty, if any (P-10).
+///
+/// Empty counts as missing: a zero-length `base_vectors.fvecs` is a
+/// file whose creation succeeded and whose writes did not, and a
+/// profile pointing at one is exactly the half-written member that is
+/// worse than an absent one. A symlink is followed, since that is how a
+/// partition shares the full query set.
+fn first_missing_facet<'a>(paths: &[&'a std::path::Path]) -> Option<&'a std::path::Path> {
+    paths.iter().copied().find(|p| {
+        std::fs::metadata(p).map(|m| m.len() == 0).unwrap_or(true)
+    })
+}
+
 /// Compute relative path from `from` directory to `to` file.
 fn relative_path(from: &Path, to: &Path) -> PathBuf {
     let from_abs = std::fs::canonicalize(from).unwrap_or_else(|_| from.to_path_buf());
@@ -654,3 +714,50 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
     result
 }
 
+
+#[cfg(test)]
+mod whole_member_tests {
+    use super::first_missing_facet;
+
+    /// **A member is declared only when every facet it names is on
+    /// disk** (P-10).
+    ///
+    /// Absent is a visible gap; half-written is a selectable profile
+    /// whose ground truth does not match its data, and nothing
+    /// downstream can tell the difference.
+    #[test]
+    fn a_member_with_every_file_present_is_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base_vectors.fvecs");
+        let query = tmp.path().join("query_vectors.fvecs");
+        std::fs::write(&base, b"not empty").unwrap();
+        std::fs::write(&query, b"also not empty").unwrap();
+        assert!(first_missing_facet(&[&base, &query]).is_none());
+    }
+
+    /// A file that was never created stops the declaration, and the
+    /// one that stopped it is named.
+    #[test]
+    fn a_missing_file_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base_vectors.fvecs");
+        let query = tmp.path().join("query_vectors.fvecs");
+        std::fs::write(&base, b"not empty").unwrap();
+        assert_eq!(
+            first_missing_facet(&[&base, &query]),
+            Some(query.as_path())
+        );
+    }
+
+    /// **Empty counts as missing.** `File::create` succeeding and every
+    /// write failing leaves a zero-length file, which is the shape a
+    /// half-written member actually takes — a check for existence alone
+    /// would call it whole.
+    #[test]
+    fn an_empty_file_counts_as_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base_vectors.fvecs");
+        std::fs::write(&base, b"").unwrap();
+        assert_eq!(first_missing_facet(&[&base]), Some(base.as_path()));
+    }
+}

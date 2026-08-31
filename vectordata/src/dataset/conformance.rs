@@ -153,11 +153,134 @@ pub fn validate_conformance(cfg: &DatasetConfig) -> Result<(), Vec<FacetViolatio
         }
     }
 
+    violations.extend(family_violations(cfg));
+    violations.extend(inheritance_violations(cfg));
+
     if violations.is_empty() {
         Ok(())
     } else {
         Err(violations)
     }
+}
+
+/// Ways in which the members of one family disagree about what they are
+/// parameterizations *of* (P-11).
+///
+/// A family is one corpus at several parameter values. Members must
+/// therefore agree on their invariants — the same `base_count`, the
+/// same shared facets — and differ only in what the generator varies. A
+/// member that quietly points at a different `base_vectors` is not a
+/// parameterization of the same corpus, and a benchmark comparing
+/// results across it is comparing two datasets while reporting one
+/// number.
+///
+/// Reported against the **first** member, which is the generator's own
+/// order, so a sweep that drifted partway through names the point it
+/// drifted rather than the whole family.
+fn family_violations(cfg: &DatasetConfig) -> Vec<FacetViolation> {
+    let mut out = Vec::new();
+    for (spec, members) in cfg.profiles.families() {
+        let Some(first) = members.first() else { continue };
+        let Some(anchor) = cfg.profiles.profiles.get(first) else {
+            continue;
+        };
+        for name in members.iter().skip(1) {
+            let Some(profile) = cfg.profiles.profiles.get(name) else {
+                out.push(FacetViolation {
+                    profile: name.clone(),
+                    key: "<family>".to_string(),
+                    path: spec.to_string(),
+                    detail: format!(
+                        "spec '{spec}' names this profile as a family member, but the                          dataset declares no such profile"
+                    ),
+                });
+                continue;
+            };
+            // A size family varies `base_count` by construction, so it
+            // is an invariant only where the generator holds it fixed.
+            // Comparing the *shared* facets is what holds in either
+            // case: a member reading different base bytes is a
+            // different corpus whatever the axis.
+            for key in ["base_vectors", "query_vectors", "metadata_content"] {
+                let (Some(a), Some(b)) = (anchor.view(key), profile.view(key)) else {
+                    continue;
+                };
+                // Windows differ legitimately across a size family —
+                // that *is* the parameter. The file must not.
+                if a.sources().iter().map(|s| &s.path).collect::<Vec<_>>()
+                    != b.sources().iter().map(|s| &s.path).collect::<Vec<_>>()
+                {
+                    out.push(FacetViolation {
+                        profile: name.clone(),
+                        key: key.to_string(),
+                        path: b.path().to_string(),
+                        detail: format!(
+                            "family '{spec}' member differs from '{first}' in '{key}'                              ('{}'): members of one family are one corpus at different                              parameter values, so comparing results across them is only                              meaningful if they read the same base data",
+                            a.path()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Profiles whose `inherits:` names something that cannot be resolved
+/// (P-2).
+///
+/// The loader leaves such a profile with what it declared rather than
+/// failing — the facets it does declare are still readable, and a load
+/// failure would take a whole dataset out of reach over one profile.
+/// That makes reporting it here the only place the mistake surfaces.
+fn inheritance_violations(cfg: &DatasetConfig) -> Vec<FacetViolation> {
+    let mut out = Vec::new();
+    for (name, profile) in &cfg.profiles.profiles {
+        let Some(parent) = profile.inherits.as_deref() else {
+            continue;
+        };
+        let detail = if parent == name {
+            Some("a profile cannot inherit from itself".to_string())
+        } else if !cfg.profiles.profiles.contains_key(parent) {
+            Some(format!(
+                "inherits from '{parent}', which this dataset does not declare"
+            ))
+        } else if inherits_cycle(cfg, name) {
+            Some(format!(
+                "inherits from '{parent}' through a cycle, so neither profile                  resolves and both keep only what they declared"
+            ))
+        } else {
+            None
+        };
+        if let Some(detail) = detail {
+            out.push(FacetViolation {
+                profile: name.clone(),
+                key: "inherits".to_string(),
+                path: parent.to_string(),
+                detail,
+            });
+        }
+    }
+    out
+}
+
+/// Whether following `inherits:` from `start` returns to `start`.
+fn inherits_cycle(cfg: &DatasetConfig, start: &str) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut at = start.to_string();
+    while seen.insert(at.clone()) {
+        let Some(profile) = cfg.profiles.profiles.get(&at) else {
+            return false;
+        };
+        let Some(parent) = profile.inherits.clone() else {
+            return false;
+        };
+        if parent == start {
+            return true;
+        }
+        at = parent;
+    }
+    false
 }
 
 #[cfg(test)]

@@ -677,6 +677,7 @@ mod tests {
                     base_count: None,
                     partition: false,
                     views: IndexMap::new(),
+                    ..Default::default()
                 },
             );
         }

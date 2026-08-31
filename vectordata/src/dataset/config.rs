@@ -563,15 +563,41 @@ impl DatasetConfig {
                 if let Some(base_count) = profile.base_count {
                     out.push_str(&format!("    base_count: {}\n", base_count));
                 }
+                if let Some(parent) = profile.inherits.as_deref() {
+                    out.push_str(&format!("    inherits: {}\n", parent));
+                }
+                // What the profile *is*. Written only when non-empty:
+                // an emitted empty map would make "undescribed" and
+                // "described as nothing" look alike in the file (P-7).
+                if !profile.attributes.is_empty() {
+                    out.push_str("    attributes:\n");
+                    for (key, value) in &profile.attributes {
+                        out.push_str(&format!(
+                            "      {}: {}\n",
+                            key,
+                            Self::scalar_yaml(value)
+                        ));
+                    }
+                }
                 // partition is derived structurally (non-default + has own
                 // base_vectors) — not stored in the YAML.
+                // Suppression compares against the profile's **actual**
+                // parent, not always `default`: a profile inheriting
+                // from `1m` re-derives `1m`'s views on load, so writing
+                // them back is the same noise the default case avoids.
+                let parent_views = profile
+                    .inherits
+                    .as_deref()
+                    .and_then(|parent| self.profiles.profiles.get(parent))
+                    .map(|p| &p.views)
+                    .or(default_views);
                 for (key, view) in &profile.views {
                     // For non-default profiles, suppress views that the
                     // deserializer will re-derive by inheritance from
                     // default. Without this, expanded-save bloats the
                     // file with N copies of every shared view.
                     if name != "default"
-                        && let Some(dv) = default_views.and_then(|m| m.get(key))
+                        && let Some(dv) = parent_views.and_then(|m| m.get(key))
                             && dv.source.path == view.source.path
                                 && dv.source.window == view.source.window
                                 && dv.source.namespace == view.source.namespace
@@ -639,6 +665,26 @@ impl DatasetConfig {
     }
 
     // -------------------------------------------------------------------------
+
+    /// Render an attribute value as a YAML scalar for `save()`.
+    ///
+    /// Strings are quoted so a value like `1e-3` or `yes` survives the
+    /// round trip as the string it was; everything else prints as
+    /// itself. A structured value is written as inline YAML, which
+    /// reparses to the same thing — attributes are an open map and a
+    /// writer must not drop what it does not recognise (P-5).
+    fn scalar_yaml(value: &serde_yaml::Value) -> String {
+        match value {
+            serde_yaml::Value::String(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+            serde_yaml::Value::Number(n) => n.to_string(),
+            serde_yaml::Value::Bool(b) => b.to_string(),
+            serde_yaml::Value::Null => "null".to_string(),
+            other => serde_yaml::to_string(other)
+                .unwrap_or_default()
+                .trim()
+                .replace('\n', " "),
+        }
+    }
 
     /// Validate structural rules for all profiles.
     ///
@@ -1336,6 +1382,7 @@ profiles:
                 });
                 v
             },
+            ..Default::default()
         });
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
