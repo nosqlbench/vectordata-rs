@@ -521,3 +521,49 @@ fn a_windowed_vvec_series_slices_the_series() {
     assert_eq!(r.get(24).unwrap()[0], 4400);
 }
 
+/// **A sliced vvec shard is resolved, not refused** (SH-50, SH-67).
+///
+/// An entry window is in the file's own ordinals, and a vvec is a
+/// self-describing stream, so walking it says where those records
+/// start. An earlier cut refused this with "no fixed record size to
+/// resolve that against" — a claim the same file disproves, since the
+/// windowed single-file copy performs exactly that walk.
+#[test]
+fn a_sliced_vvec_shard_contributes_only_its_own_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // 40 records each; the series takes the middle 10 of the first and
+    // the first 5 of the second.
+    write_ivvec(&src.join("part_a.ivvec"), 0, 40);
+    write_ivvec(&src.join("part_b.ivvec"), 100, 40);
+    std::fs::write(
+        src.join("dataset.yaml"),
+        "name: sliced-vv\nprofiles:\n  default:\n    metadata_results:\n      source:\n\
+        \x20       - part_a.ivvec[10..20)=10\n        - part_b.ivvec[0..5)=5\n      \
+         record_count: 15\n",
+    )
+    .unwrap();
+
+    let out = tmp.path().join("out");
+    assert_eq!(
+        vectordata::datasets::derive::run(
+            src.to_str().unwrap(), "default", &out, "", &[], &[],
+            Some("sliced"), true, None,
+        ),
+        0,
+        "a sliced vvec series must derive"
+    );
+
+    let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let r = view.metadata_results().unwrap();
+    assert_eq!(r.count(), 15, "only the windowed records");
+    // The first shard contributed its records 10..20, whose ids are
+    // 10..20; the second contributed its 0..5, whose ids are 100..105.
+    assert_eq!(r.get(0).unwrap()[0], 1000);
+    assert_eq!(r.get(9).unwrap()[0], 1900);
+    assert_eq!(r.get(10).unwrap()[0], 10000, "first record of the second shard");
+    assert_eq!(r.get(14).unwrap()[0], 10400);
+}
+

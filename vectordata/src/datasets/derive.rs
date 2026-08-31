@@ -415,12 +415,21 @@ fn spans_for_view(
         // A fixed stride turns an ordinal extent into a byte extent, so
         // a sliced shard contributes exactly the bytes it addresses.
         Some(record_size) => SourceSpans::from_shards(&shards, base_dir, record_size),
-        // Without one, only the records themselves say where they are.
-        // Whole-file shards need no map — the extent is the file — and
-        // that is the form the explicit series takes, which composes
-        // whole files rather than splitting any (SH-50). A shard
-        // addressing part of a file is refused by name rather than
-        // guessed at.
+        // Without one, where a record starts is only knowable from the
+        // records. A vvec is a self-describing stream, so walking it
+        // answers that — which is the same walk `materialize_vvec` does
+        // for a window, and refusing a sliced shard here while doing it
+        // there would be a claim this file disproves.
+        None if matches!(kind, FacetKind::VariableVvec) => {
+            SourceSpans::from_variable_shards(&shards, base_dir, elem_width(&ext))
+        }
+        // A slab's records are indexed by its own pages, not by a
+        // position in the byte stream, so a sliced shard cannot be
+        // reduced to a byte extent here. The composer walks slab shards
+        // record by record instead (`materialize_slab_series`), and it
+        // applies the *series* window rather than a per-shard one — so
+        // a sliced entry would be silently ignored, which is worse than
+        // refused.
         None => SourceSpans::from_whole_shards(&shards, base_dir),
     }
     .map_err(|e| format!("Facet '{facet_name}': {e}"))
@@ -986,6 +995,55 @@ impl SourceSpans {
         Ok(Self { spans, total })
     }
 
+    /// A series of variable-length shards, honouring each entry's
+    /// window.
+    ///
+    /// Each file is walked to find where its records start, so an entry
+    /// reading part of a file contributes exactly the bytes its
+    /// ordinals cover. The walk is local — derive has already brought
+    /// its source into the cache — and is the same one a windowed
+    /// single-file copy performs.
+    pub(crate) fn from_variable_shards(
+        shards: &crate::dataset::shards::Shards,
+        base_dir: &Path,
+        elem: usize,
+    ) -> io::Result<Self> {
+        if elem == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot span a variable-length facet of unknown element width",
+            ));
+        }
+        let mut spans = Vec::with_capacity(shards.entries().len());
+        let mut total = 0;
+        for entry in shards.entries() {
+            let path = base_dir.join(&entry.source.path);
+            let whole = Self::single(path.clone())?;
+            // A whole-file entry needs no walk: the span is the file.
+            if entry.file_base == 0 && entry.source.window.is_empty() {
+                total += whole.len();
+                spans.push(Span { path, offset: 0, len: whole.len() });
+                continue;
+            }
+            let offsets = vvec_record_offsets(&whole, elem)?;
+            let records = offsets.len().saturating_sub(1) as u64;
+            let (lo, hi) = (entry.file_base, entry.file_base + entry.len);
+            if hi > records {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "shard '{}' reads records [{lo}..{hi}) of a {records}-record file",
+                        entry.source.path
+                    ),
+                ));
+            }
+            let (offset, end) = (offsets[lo as usize], offsets[hi as usize]);
+            total += end - offset;
+            spans.push(Span { path, offset, len: end - offset });
+        }
+        Ok(Self { spans, total })
+    }
+
     /// A series of **whole** files, for a format with no fixed stride.
     ///
     /// A vvec's records are self-describing and a slab's are indexed by
@@ -1210,6 +1268,11 @@ fn materialize_slab_series<F: FnMut(u64)>(
         .finish()
         .map_err(|e| io::Error::other(format!("finish slab {}: {e}", dest.display())))?;
     Ok(())
+}
+
+/// Element width for a variable-length extension, or zero.
+fn elem_width(ext: &str) -> usize {
+    crate::io::infer_elem_size(ext)
 }
 
 /// Copy a variable-length facet, whole or windowed.
