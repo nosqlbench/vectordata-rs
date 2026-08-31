@@ -243,6 +243,32 @@ pub enum Error {
     /// A required facet (e.g., `base_vectors`) is not defined in the profile.
     #[error("Required facet not defined: {0}")]
     MissingFacet(String),
+    /// The facet was opened through a reader for the wrong shape.
+    ///
+    /// Not a missing capability: the facet is readable, through the
+    /// other path. A `metadata_content.slab` holds opaque records and
+    /// has no element width, so asking a vector reader for it is asking
+    /// a question it cannot answer — and saying "cannot infer element
+    /// size" describes the symptom rather than the situation.
+    ///
+    /// Carries the shape so a caller can branch on it rather than parse
+    /// a message; [`crate::dataset::facet::FacetShape`] is also
+    /// available up front through `facet_shape()`, which is the way to
+    /// avoid the error entirely.
+    #[error(
+        "facet '{facet}' holds {shape} and was opened as {attempted}; \
+         open it with {reader}"
+    )]
+    WrongFacetShape {
+        /// The facet as declared.
+        facet: String,
+        /// What the facet actually holds.
+        shape: crate::dataset::facet::FacetShape,
+        /// The shape the caller's reader expects.
+        attempted: crate::dataset::facet::FacetShape,
+        /// The reader that does open this facet.
+        reader: &'static str,
+    },
     /// Catch-all for errors that do not fit other variants.
     #[error("{0}")]
     Other(String),

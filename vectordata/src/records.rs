@@ -70,6 +70,17 @@ use crate::formats::anode_vernacular::{self, Vernacular};
 /// What went wrong reading or decoding a record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordError {
+    /// The facet holds element runs, not opaque records.
+    ///
+    /// The mirror of [`crate::Error::WrongFacetShape`]: a caller that
+    /// brings an `.fvec` here would otherwise get a slab parse failure
+    /// about a footer, which says nothing about what actually happened.
+    WrongShape {
+        /// The facet as declared.
+        facet: String,
+        /// The reader that does open it.
+        reader: &'static str,
+    },
     /// The facet declares no readable container.
     NotAContainer(String),
     /// The container could not be opened or read.
@@ -83,6 +94,11 @@ pub enum RecordError {
 impl std::fmt::Display for RecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::WrongShape { facet, reader } => write!(
+                f,
+                "facet '{facet}' holds element runs, not opaque records; \
+                 open it with {reader}"
+            ),
             Self::NotAContainer(s) => write!(f, "not a record container: {s}"),
             Self::Container(s) => write!(f, "{s}"),
             Self::OutOfBounds(o) => write!(f, "ordinal {o} is past the end of this facet"),
@@ -198,6 +214,7 @@ pub fn codec_by_name(name: &str) -> Option<Box<dyn RecordCodec<Out = String>>> {
 /// the end of the file — the footer, the tail page, and for a
 /// multi-namespace file the pages-page that page points at. Nothing
 /// before the tail is touched to build it.
+#[derive(Debug)]
 pub(crate) struct SlabIndex {
     /// Page entries in ordinal order.
     entries: Vec<slabtastic::PageEntry>,
@@ -348,6 +365,7 @@ pub(crate) fn read_slab_index(
 /// the chunks covering each range as it is asked for, so opening a
 /// facet costs its tail and reading a record costs its page — not the
 /// file.
+#[derive(Debug)]
 struct Container {
     storage: std::sync::Arc<crate::storage::Storage>,
     /// What the container is called, for diagnostics.
@@ -453,6 +471,7 @@ impl Container {
 /// Holds the containers behind the facet — one for a single file, one
 /// per shard for a series — and answers a facet ordinal by finding the
 /// container that owns it and asking for its local ordinal.
+#[derive(Debug)]
 pub struct RecordFacet {
     facet: String,
     containers: Vec<Container>,

@@ -308,6 +308,28 @@ wants to decode some other way.
     `NamespacesPage::deserialize` and `Page::get_record_from_buf` are
     all public and take byte slices.
 
+12. **Shape is a property of the data, and is exposed as one.** Some
+    facets hold runs of a fixed-width element and some hold opaque
+    records of their own length. `FacetShape` says which, derived from
+    the format by the spec that already owns formats, and
+    `view.facet_shape(name)` answers it before anything is opened — so
+    a consumer handling both branches on it rather than trying a reader
+    and interpreting the failure.
+
+    Everything that does not depend on what a record *is* stays common
+    to both: ordinal count, windows, shards, residency, precache cost,
+    merkle verification. Only the record differs, and only the record's
+    reader differs with it.
+
+13. **Wrong-door errors name the right door.** Opening a record facet
+    as vectors raised *"cannot infer element size from extension
+    '.slab'"* — true, a description of the symptom, and no help. It now
+    raises `Error::WrongFacetShape`, carrying the facet, the shape it
+    holds, the shape attempted, and the reader that opens it — a value
+    to branch on rather than prose to parse. The mirror holds: an
+    element facet brought to `open_facet_records` is refused by name
+    instead of failing as a slab footer parse.
+
 ### What this unblocks
 
 A **sharded** metadata facet now reads through the same surface, which

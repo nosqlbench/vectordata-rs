@@ -86,6 +86,69 @@ impl FacetFormat {
     }
 }
 
+/// How a facet's records are addressed, and therefore which reader
+/// opens it.
+///
+/// Some facets hold runs of a fixed-width element and some hold opaque
+/// records of their own length. That is a fact about the data, not a
+/// gap in the reader, and it is exposed rather than smoothed over: a
+/// caller can ask what shape a facet has and take the matching path,
+/// instead of trying one and reading an error.
+///
+/// Everything that does not depend on what a record *is* stays common
+/// to both — a facet's ordinal count, its windows, its shards, its
+/// residency, what precaching it costs. Only the record itself differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FacetShape {
+    /// Records are runs of a fixed-width element, addressed as vectors.
+    ///
+    /// Opened with `facet()`, `base_vectors()`, `open_facet_typed()` —
+    /// the readers that answer `dim()` and hand back `Vec<T>`.
+    Elements,
+    /// Records are opaque and individually sized, addressed by ordinal.
+    ///
+    /// Opened with `open_facet_records()`, which hands back bytes and
+    /// the codecs that type them. A `dim()` would be a fiction here:
+    /// there is no element and no fixed count of them.
+    Records,
+}
+
+impl fmt::Display for FacetShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Elements => write!(f, "element runs"),
+            Self::Records => write!(f, "opaque records"),
+        }
+    }
+}
+
+impl FacetShape {
+    /// The reader entry point for this shape, named so an error can
+    /// tell a caller where to go rather than only what went wrong.
+    pub fn reader(self) -> &'static str {
+        match self {
+            Self::Elements => "facet() / open_facet_typed()",
+            Self::Records => "open_facet_records()",
+        }
+    }
+}
+
+impl FacetFormat {
+    /// How this format's records are addressed.
+    pub fn shape(self) -> FacetShape {
+        match self {
+            // A slab's records carry their own extents in its pages.
+            Self::Slab => FacetShape::Records,
+            // Everything else is a run of elements — fixed per record
+            // for xvec and scalar, per record for vvec, but elements
+            // either way, with a width the reader can act on.
+            Self::FloatXvec | Self::IntegerXvec | Self::IntegerVarXvec | Self::ScalarPacked => {
+                FacetShape::Elements
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StandardFacet {
     /// Base vectors (the corpus to search) — facet code `B`

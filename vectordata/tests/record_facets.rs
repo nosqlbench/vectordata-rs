@@ -441,3 +441,115 @@ fn a_windowed_source_still_reports_its_format() {
         "the window suffix must not swallow the extension"
     );
 }
+
+// ── shape, and signalling ──────────────────────────────────────────
+
+/// **A facet's shape is answerable before opening it.**
+///
+/// Some facets hold element runs and some hold opaque records. That is
+/// a property of the data, not a gap in the reader, so a caller
+/// handling both branches on it rather than trying one path and
+/// interpreting the failure.
+#[test]
+fn a_facet_reports_which_shape_it_holds() {
+    use vectordata::dataset::facet::FacetShape;
+
+    let tmp = tempfile::tempdir().unwrap();
+    single_facet_dataset(tmp.path(), 4);
+
+    let g = vectordata::TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+
+    assert_eq!(view.facet_shape("base_vectors").unwrap(), FacetShape::Elements);
+    assert_eq!(view.facet_shape("metadata_content").unwrap(), FacetShape::Records);
+
+    // And branching on it reaches a working reader either way.
+    for name in ["base_vectors", "metadata_content"] {
+        match view.facet_shape(name).unwrap() {
+            FacetShape::Elements => {
+                assert!(view.facet(name).is_ok(), "{name} should open as vectors");
+            }
+            FacetShape::Records => {
+                assert!(
+                    view.open_facet_records(name).is_ok(),
+                    "{name} should open as records"
+                );
+            }
+        }
+    }
+}
+
+/// **Opening a record facet as vectors names the reader that works.**
+///
+/// The old failure was "cannot infer element size from extension
+/// '.slab'" — true, and a description of the symptom rather than the
+/// situation. The facet is readable; the caller is at the wrong door,
+/// and the error's job is to say which door.
+#[test]
+fn opening_a_record_facet_as_vectors_points_at_the_right_reader() {
+    use vectordata::dataset::facet::FacetShape;
+
+    let tmp = tempfile::tempdir().unwrap();
+    single_facet_dataset(tmp.path(), 4);
+    let g = vectordata::TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+
+    // Structured, so a caller can branch rather than parse prose.
+    match view.facet("metadata_content") {
+        Err(vectordata::Error::WrongFacetShape {
+            facet,
+            shape,
+            attempted,
+            reader,
+        }) => {
+            assert_eq!(facet, "metadata_content");
+            assert_eq!(shape, FacetShape::Records);
+            assert_eq!(attempted, FacetShape::Elements);
+            assert!(reader.contains("open_facet_records"), "{reader}");
+        }
+        Err(other) => panic!("expected a shape mismatch, got {other}"),
+        Ok(_) => panic!("a record facet must not open as vectors"),
+    }
+
+    // The typed and element-width paths agree with it.
+    let msg = view.facet_element_type("metadata_content").unwrap_err().to_string();
+    assert!(msg.contains("open_facet_records"), "{msg}");
+    assert!(!msg.contains("unknown element type"), "{msg}");
+}
+
+/// **And the mirror.** An element facet brought to the record reader
+/// would otherwise fail as a slab parse error about a footer, which
+/// says nothing about what happened.
+#[test]
+fn opening_an_element_facet_as_records_points_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    single_facet_dataset(tmp.path(), 4);
+    let g = vectordata::TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+
+    match view.open_facet_records("base_vectors") {
+        Err(vectordata::records::RecordError::WrongShape { facet, reader }) => {
+            assert_eq!(facet, "base_vectors");
+            assert!(reader.contains("facet()"), "{reader}");
+        }
+        other => panic!("expected a shape mismatch, got {other:?}"),
+    }
+}
+
+/// A sharded record facet reports its shape too — the format is a
+/// property of the series, not of the one path a series does not have.
+#[test]
+fn a_sharded_record_facet_reports_its_shape() {
+    use vectordata::dataset::facet::FacetShape;
+
+    let tmp = tempfile::tempdir().unwrap();
+    sharded_facet_dataset(tmp.path());
+    let g = vectordata::TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+
+    assert_eq!(view.facet_shape("metadata_content").unwrap(), FacetShape::Records);
+    assert_eq!(
+        view.open_facet_records("metadata_content").unwrap().count().unwrap(),
+        25
+    );
+}

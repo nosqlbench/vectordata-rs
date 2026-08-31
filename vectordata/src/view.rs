@@ -955,6 +955,15 @@ pub trait TestDataView: Send + Sync {
         &self,
         name: &str,
     ) -> std::result::Result<crate::records::RecordFacet, crate::records::RecordError> {
+        // The mirror of the vector path's guard: an element-shaped
+        // facet brought here would fail as a slab parse error about a
+        // footer, which says nothing about what went wrong.
+        if self.facet_shape(name).ok() == Some(crate::dataset::facet::FacetShape::Elements) {
+            return Err(crate::records::RecordError::WrongShape {
+                facet: name.to_string(),
+                reader: crate::dataset::facet::FacetShape::Elements.reader(),
+            });
+        }
         let storage = self.open_facet_storage(name).map_err(|e| {
             crate::records::RecordError::Container(format!("open facet '{name}': {e}"))
         })?;
@@ -968,6 +977,61 @@ pub trait TestDataView: Send + Sync {
             .and_then(|raw| crate::dataset::source::parse_source_string(raw).ok())
             .and_then(|p| p.namespace);
         crate::records::RecordFacet::open(&storage, name, namespace.as_deref())
+    }
+
+    /// How this facet's records are addressed, and therefore which
+    /// reader opens it.
+    ///
+    /// Ask this rather than trying a reader and interpreting the
+    /// failure. Some facets hold element runs and some hold opaque
+    /// records; that is a property of the data, and a caller handling
+    /// both should branch on it explicitly.
+    ///
+    /// ```rust,ignore
+    /// match view.facet_shape("metadata_content")? {
+    ///     FacetShape::Elements => { let r = view.facet("metadata_content")?; }
+    ///     FacetShape::Records  => { let r = view.open_facet_records("metadata_content")?; }
+    /// }
+    /// ```
+    fn facet_shape(&self, name: &str) -> Result<crate::dataset::facet::FacetShape> {
+        let desc = self
+            .facet_manifest()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::MissingFacet(name.to_string()))?;
+        desc.source_type
+            .as_deref()
+            .and_then(crate::dataset::facet::FacetFormat::from_extension)
+            .map(|f| f.shape())
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "facet '{name}': the spec names no format for '{}'",
+                    desc.source_type.as_deref().unwrap_or("(none)")
+                ))
+            })
+    }
+
+    /// Refuse a facet whose shape this reader cannot address, naming
+    /// the one that can.
+    ///
+    /// A facet of the wrong shape is not unreadable — it is readable
+    /// elsewhere — so the error says where rather than describing the
+    /// symptom the caller happened to hit.
+    fn require_facet_shape(
+        &self,
+        name: &str,
+        attempted: crate::dataset::facet::FacetShape,
+    ) -> Result<()> {
+        let shape = self.facet_shape(name)?;
+        if shape == attempted {
+            return Ok(());
+        }
+        Err(Error::WrongFacetShape {
+            facet: name.to_string(),
+            shape,
+            attempted,
+            reader: shape.reader(),
+        })
     }
 
     /// Whether this facet holds data this build can move.
@@ -3032,6 +3096,12 @@ impl GenericTestDataView {
         name: &str,
     ) -> Result<Arc<dyn VectorReader<T>>> {
         let facet = facet_opt.ok_or_else(|| Error::MissingFacet(name.to_string()))?;
+        // `VectorReader` promises `dim()` and a run of `T` per record.
+        // A record-shaped facet has neither, so it is refused here with
+        // the reader that does open it — rather than failing further in
+        // with "cannot infer element size", which describes the symptom
+        // and points nowhere.
+        self.require_facet_shape(name, crate::dataset::facet::FacetShape::Elements)?;
 
         // A series reads through the shard model. The profile window
         // still applies on top, in *facet* ordinals (SH-67) — an entry
@@ -3173,67 +3243,75 @@ impl GenericTestDataView {
     fn collect_facets(&self) -> HashMap<String, FacetDescriptor> {
         let mut manifest = HashMap::new();
 
-        let standard_facets: &[(&str, Option<&FacetConfig>, StandardFacet)] = &[
+        // Every facet this view can open, whether or not the spec
+        // names it. `base_content`, `query_terms` and `query_filters`
+        // are declarable in `dataset.yaml` and openable by name, so a
+        // manifest that omitted them made them invisible to everything
+        // that asks what a profile holds — precache among them.
+        let standard_facets: &[(&str, Option<&FacetConfig>, Option<StandardFacet>)] = &[
             (
                 "base_vectors",
                 self.config.base_vectors.as_ref(),
-                StandardFacet::BaseVectors,
+                Some(StandardFacet::BaseVectors),
             ),
             (
                 "query_vectors",
                 self.config.query_vectors.as_ref(),
-                StandardFacet::QueryVectors,
+                Some(StandardFacet::QueryVectors),
             ),
             (
                 "neighbor_indices",
                 self.config.neighbor_indices.as_ref(),
-                StandardFacet::NeighborIndices,
+                Some(StandardFacet::NeighborIndices),
             ),
             (
                 "neighbor_distances",
                 self.config.neighbor_distances.as_ref(),
-                StandardFacet::NeighborDistances,
+                Some(StandardFacet::NeighborDistances),
             ),
             (
                 "metadata_content",
                 self.config.metadata_content.as_ref(),
-                StandardFacet::MetadataContent,
+                Some(StandardFacet::MetadataContent),
             ),
             (
                 "metadata_predicates",
                 self.config.metadata_predicates.as_ref(),
-                StandardFacet::MetadataPredicates,
+                Some(StandardFacet::MetadataPredicates),
             ),
             (
                 "predicate_results",
                 self.config.predicate_results.as_ref(),
-                StandardFacet::MetadataResults,
+                Some(StandardFacet::MetadataResults),
             ),
             (
                 "metadata_layout",
                 self.config.metadata_layout.as_ref(),
-                StandardFacet::MetadataLayout,
+                Some(StandardFacet::MetadataLayout),
             ),
             (
                 "prefiltered_neighbor_indices",
                 self.config.prefiltered_neighbor_indices.as_ref(),
-                StandardFacet::PrefilteredNeighborIndices,
+                Some(StandardFacet::PrefilteredNeighborIndices),
             ),
             (
                 "prefiltered_neighbor_distances",
                 self.config.prefiltered_neighbor_distances.as_ref(),
-                StandardFacet::PrefilteredNeighborDistances,
+                Some(StandardFacet::PrefilteredNeighborDistances),
             ),
             (
                 "postfiltered_neighbor_indices",
                 self.config.postfiltered_neighbor_indices.as_ref(),
-                StandardFacet::PostfilteredNeighborIndices,
+                Some(StandardFacet::PostfilteredNeighborIndices),
             ),
             (
                 "postfiltered_neighbor_distances",
                 self.config.postfiltered_neighbor_distances.as_ref(),
-                StandardFacet::PostfilteredNeighborDistances,
+                Some(StandardFacet::PostfilteredNeighborDistances),
             ),
+            ("base_content", self.config.base_content.as_ref(), None),
+            ("query_terms", self.config.query_terms.as_ref(), None),
+            ("query_filters", self.config.query_filters.as_ref(), None),
         ];
 
         for (name, facet_opt, kind) in standard_facets {
@@ -3263,7 +3341,7 @@ impl GenericTestDataView {
                         source_type,
                         source_path: source,
                         window: facet.window().map(|w| w.to_string()),
-                        standard_kind: Some(*kind),
+                        standard_kind: *kind,
                     },
                 );
             }
@@ -3337,6 +3415,8 @@ impl GenericTestDataView {
         crate::typed_access::TypedReader<T>,
         crate::typed_access::TypedAccessError,
     > {
+        self.require_facet_shape(name, crate::dataset::facet::FacetShape::Elements)
+            .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
         let facet = self.facet_config_by_name(name).ok_or_else(|| {
             crate::typed_access::TypedAccessError::Io(format!("facet '{}' not found", name))
         })?;
@@ -3533,6 +3613,11 @@ impl TestDataView for GenericTestDataView {
     }
 
     fn facet_element_type(&self, name: &str) -> Result<crate::typed_access::ElementType> {
+        // A record-shaped facet has no element width, and saying so as
+        // "unknown element type" reads like a gap in this build rather
+        // than a property of the data. Name the shape and the reader
+        // that opens it.
+        self.require_facet_shape(name, crate::dataset::facet::FacetShape::Elements)?;
         let facet = self
             .facet_config_by_name(name)
             .ok_or_else(|| Error::MissingFacet(name.to_string()))?;
