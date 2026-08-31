@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use vectordata::binding::{BindType, Binder, Layout};
+use vectordata::binding::{BindType, Binder, Form, Layout, forms_of, form_by_name};
 use vectordata::formats::mnode::{MNode, MValue, TypeTag};
 #[allow(unused_imports)]
 use vectordata::formats::mnode::vernacular as render;
@@ -150,6 +150,103 @@ fn a_parameter_may_be_renamed_without_touching_the_field() {
     assert_eq!(out[0].as_i64(), Some(3), "the rename moved no data");
 }
 
+// ── cases 1–4: forms ───────────────────────────────────────────────
+
+/// **Case 1 / case 10 — the gate.** A facet with no `forms` namespace
+/// offers exactly one form and binds unchanged. That is every dataset
+/// in existence; absence is not an empty set.
+#[test]
+fn a_facet_without_forms_offers_one_implicit_form() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path(), |p| slab(p, &[row(1, "a", 1.0)]));
+    let facet = open(tmp.path());
+
+    let forms = forms_of(&facet).unwrap();
+    assert_eq!(forms.len(), 1, "one implicit form, not none");
+    assert_eq!(forms[0].name, Form::IMPLICIT);
+
+    // And it binds every field under its own name.
+    let layout = Layout::discover(&facet).unwrap();
+    let binder = forms[0].binder(&layout).unwrap();
+    assert_eq!(binder.parameters(), ["id", "tag", "score"]);
+}
+
+/// **Case 2** — declared forms are enumerable by name, and each
+/// compiles to its own binder.
+#[test]
+fn declared_forms_are_enumerable_and_compile_independently() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path(), |p| {
+        slab_with_forms(
+            p,
+            &[row(1, "a", 1.0)],
+            &[
+                r#"{"name":"row","operation":"insert","fields":["id","tag","score"]}"#,
+                r#"{"name":"key","operation":"get","fields":["id"],"parameters":{"id":"pk"}}"#,
+            ],
+        )
+    });
+    let facet = open(tmp.path());
+    let layout = Layout::discover(&facet).unwrap();
+
+    let forms = forms_of(&facet).unwrap();
+    let names: Vec<&str> = forms.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["row", "key"]);
+
+    let row_binder = form_by_name(&facet, "row").unwrap().binder(&layout).unwrap();
+    assert_eq!(row_binder.parameters(), ["id", "tag", "score"]);
+
+    // A second form of the same records, binding a subset under a
+    // different parameter name.
+    let key_binder = form_by_name(&facet, "key").unwrap().binder(&layout).unwrap();
+    assert_eq!(key_binder.parameters(), ["pk"]);
+    assert_eq!(key_binder.types(), [BindType::Int64]);
+
+    let mut out = Vec::new();
+    let bytes = facet.record_bytes(0).unwrap();
+    key_binder.bind(&bytes, &mut out).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].as_i64(), Some(1));
+}
+
+/// **Case 3** — a form the facet does not offer is refused, naming the
+/// ones it does.
+#[test]
+fn an_unknown_form_is_refused_naming_what_is_offered() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path(), |p| {
+        slab_with_forms(p, &[row(1, "a", 1.0)], &[r#"{"name":"row"}"#])
+    });
+    let facet = open(tmp.path());
+
+    let msg = form_by_name(&facet, "document").unwrap_err().to_string();
+    assert!(msg.contains("document"), "{msg}");
+    assert!(msg.contains("row"), "names what is offered: {msg}");
+}
+
+/// **Case 4** — a form carrying keys this build does not know is
+/// preserved, not rejected. A writer recording a capability this build
+/// lacks is recording, not misbehaving.
+#[test]
+fn an_unrecognised_form_key_is_preserved() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path(), |p| {
+        slab_with_forms(
+            p,
+            &[row(1, "a", 1.0)],
+            &[r#"{"name":"row","consistency":"quorum","ttl_seconds":600}"#],
+        )
+    });
+    let facet = open(tmp.path());
+
+    let form = form_by_name(&facet, "row").unwrap();
+    assert_eq!(form.extra.get("consistency").and_then(|v| v.as_str()), Some("quorum"));
+    assert_eq!(form.extra.get("ttl_seconds").and_then(|v| v.as_u64()), Some(600));
+    // And it still compiles — an unknown key is not a broken form.
+    let layout = Layout::discover(&facet).unwrap();
+    assert_eq!(form.binder(&layout).unwrap().parameters(), ["id", "tag", "score"]);
+}
+
 // ── cases 13, 14, 16: the type asymmetry (OT-A) ────────────────────
 
 /// **Case 13** — a `Half` binds as a float, not as a smallint.
@@ -228,6 +325,86 @@ fn every_tag_has_a_bind_type() {
         BindType::of_tag(TypeTag::Millis),
         BindType::of_tag(TypeTag::Nanos)
     );
+}
+
+// ── cases 11, 12: series and remote ────────────────────────────────
+
+/// **Case 11** — forms and schema are read from the series, not from
+/// shard 0. A sharded facet's layout is the facet's.
+#[test]
+fn a_sharded_facet_binds_across_its_shards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path();
+    std::fs::create_dir_all(ds).unwrap();
+    for sh in 0..2i64 {
+        slab(
+            &ds.join(format!("meta__{sh:04}.slab")),
+            &(0..5)
+                .map(|i| row(sh * 5 + i, "x", (sh * 5 + i) as f64))
+                .collect::<Vec<_>>(),
+        );
+    }
+    std::fs::write(ds.join("b.fvec"), [4u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: sh\nprofiles:\n  default:\n    base_vectors: b.fvec\n    \
+         metadata_content:\n      source: meta__NNNN.slab\n      shard_stride: 5\n      \
+         shard_count: 2\n      record_count: 10\n",
+    )
+    .unwrap();
+
+    let facet = open(ds);
+    assert_eq!(facet.count().unwrap(), 10);
+
+    // One implicit form for the whole series, not one per shard.
+    assert_eq!(forms_of(&facet).unwrap().len(), 1);
+
+    let layout = Layout::discover(&facet).unwrap();
+    let binder = Binder::all(&layout);
+    // Across the seam, in the facet's ordinals. The callback form is
+    // the loop form: no buffer outlives a record.
+    for o in [0u64, 4, 5, 9] {
+        let bytes = facet.record_bytes(o).unwrap();
+        let mut id = None;
+        binder
+            .bind_each(&bytes, |slot, f| if slot == 0 { id = f.as_i64() })
+            .unwrap();
+        assert_eq!(id, Some(o as i64), "facet ordinal {o}");
+    }
+}
+
+/// **Case 12** — binding stays incremental. A record costs its page,
+/// not the facet, so a generator touching a scattered fraction of a
+/// large facet fetches a fraction of it.
+#[test]
+fn binding_a_remote_facet_does_not_download_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path();
+    std::fs::create_dir_all(ds).unwrap();
+    let rows: Vec<MNode> = (0..2000).map(|i| row(i, "x", i as f64)).collect();
+    slab(&ds.join("metadata_content.slab"), &rows);
+    std::fs::write(ds.join("b.fvec"), [4u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: r\nprofiles:\n  default:\n    base_vectors: b.fvec\n    \
+         metadata_content: metadata_content.slab\n",
+    )
+    .unwrap();
+
+    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let facet = view.open_facet_records("metadata_content").unwrap();
+
+    let layout = Layout::discover(&facet).unwrap();
+    let binder = Binder::select(&layout, &["id"]).unwrap();
+    for o in [0u64, 900, 1999] {
+        let bytes = facet.record_bytes(o).unwrap();
+        let mut id = None;
+        binder.bind_each(&bytes, |_, f| id = f.as_i64()).unwrap();
+        assert_eq!(id, Some(o as i64));
+    }
+    // The local case proves the addressing; the remote incrementality
+    // itself is pinned in `http_storage.rs`, against a served facet.
 }
 
 // ── case 9: the allocation claim ───────────────────────────────────

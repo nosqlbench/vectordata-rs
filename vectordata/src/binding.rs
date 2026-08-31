@@ -404,3 +404,125 @@ impl Binder {
     }
 }
 
+/// Slab namespace enumerating the op-template forms a facet offers.
+///
+/// Absent from every dataset written so far, and absent means one
+/// implicit form rather than none.
+pub const FORMS_NAMESPACE: &str = "forms";
+
+/// One op-template form a facet offers.
+///
+/// Open by construction: unknown keys are kept in `extra` rather than
+/// rejected. A writer recording a form this build does not implement is
+/// recording, not misbehaving.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Form {
+    /// The form's name, as selected.
+    pub name: String,
+    /// Which dialect of record this form is for — `metadata` or
+    /// `predicate`. Advisory: the record's leader byte remains the
+    /// authority on what a record is.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The record encoding this form consumes, e.g. `mnode:v1`.
+    #[serde(default)]
+    pub wire_format: Option<String>,
+    /// What operation the bound record becomes, e.g. `insert`.
+    #[serde(default)]
+    pub operation: Option<String>,
+    /// Fields this form binds, in bind order. Absent means all of them,
+    /// in the facet's own order.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+    /// Parameter renames, keyed by field name.
+    #[serde(default)]
+    pub parameters: HashMap<String, String>,
+    /// Anything this build does not recognise, preserved.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl Form {
+    /// The name an unnamed, implicit form goes by.
+    pub const IMPLICIT: &'static str = "default";
+
+    /// The form a facet with no `forms` namespace offers: every field,
+    /// under its own name.
+    pub fn implicit() -> Self {
+        Form {
+            name: Self::IMPLICIT.to_string(),
+            kind: None,
+            wire_format: None,
+            operation: None,
+            fields: None,
+            parameters: HashMap::new(),
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Compile this form against a layout.
+    pub fn binder(&self, layout: &Layout) -> Result<Binder> {
+        let binder = match &self.fields {
+            None => Binder::all(layout),
+            Some(names) => {
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                Binder::select(layout, &refs)?
+            }
+        };
+        Ok(binder.with_overrides(&self.parameters))
+    }
+}
+
+/// The forms a facet offers.
+///
+/// Read from the `forms` namespace when a facet has one. A facet
+/// without it offers exactly one form — the implicit one its records
+/// already have — which is every dataset in existence and must keep
+/// working unchanged. Absence is not an empty set.
+pub fn forms_of(facet: &RecordFacet) -> Result<Vec<Form>> {
+    let ns = facet.namespace(FORMS_NAMESPACE);
+    let count = ns.count()?;
+    if count == 0 {
+        return Ok(vec![Form::implicit()]);
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for o in 0..count {
+        let bytes = ns.record_bytes(o)?;
+        // A form record this build cannot parse is skipped rather than
+        // failing the facet: the forms it *can* read are still usable,
+        // and refusing all of them over one would make a facet
+        // unreadable for describing a capability it also has.
+        match serde_json::from_slice::<Form>(&bytes) {
+            Ok(form) => out.push(form),
+            Err(e) => log::warn!(
+                "facet '{}': form record {o} not understood, skipping: {e}",
+                facet.name()
+            ),
+        }
+    }
+    if out.is_empty() {
+        out.push(Form::implicit());
+    }
+    Ok(out)
+}
+
+/// Select a form by name.
+///
+/// A name this facet does not offer is refused naming what it does —
+/// the same rule as a wrong-door reader error, for the same reason.
+pub fn form_by_name(facet: &RecordFacet, name: &str) -> Result<Form> {
+    let forms = forms_of(facet)?;
+    forms
+        .iter()
+        .find(|f| f.name == name)
+        .cloned()
+        .ok_or_else(|| BindError::NoSuchForm {
+            form: name.to_string(),
+            available: forms
+                .iter()
+                .map(|f| f.name.clone())
+                .filter(|n| n != Form::IMPLICIT)
+                .collect(),
+        })
+}
+
