@@ -1655,9 +1655,33 @@ impl ShardOpen {
 /// fraction is an implementation constant; the limit it applies to is
 /// not.
 pub fn open_file_cap() -> usize {
+    resolve_open_file_cap(
+        std::env::var("VECTORDATA_SHARD_FD_CAP").ok().as_deref(),
+        fd_soft_limit(),
+    )
+}
+
+/// The cap, given the two things that decide it.
+///
+/// Split from [`open_file_cap`] so it is answerable without a process
+/// to configure: the environment value and the limit arrive as
+/// arguments, which is the only way to test the derivation without
+/// mutating the environment out from under a parallel test.
+///
+/// An explicit `VECTORDATA_SHARD_FD_CAP` wins outright — an operator
+/// setting it knows something the fraction cannot. A value that is not
+/// a positive integer is ignored rather than fatal: a typo in an
+/// environment variable should not stop a dataset from opening.
+pub(crate) fn resolve_open_file_cap(env: Option<&str>, soft_limit: Option<u64>) -> usize {
     const FRACTION: u64 = 4;
     const FLOOR: usize = 8;
-    let soft = fd_soft_limit().unwrap_or(1024);
+    if let Some(n) = env
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
+    let soft = soft_limit.unwrap_or(1024);
     ((soft / FRACTION) as usize).max(FLOOR)
 }
 
@@ -1737,6 +1761,11 @@ pub struct Series {
     /// Open files, most-recently-used last. Bounded by
     /// [`open_file_cap`]; the least-recently-used is closed when the
     /// budget is reached (SH-59).
+    ///
+    /// This list is the authority on what the series holds: a file is
+    /// installed in its slot and recorded here under one lock, so the
+    /// two can never disagree and the bound holds under concurrent
+    /// readers.
     lru: std::sync::Mutex<std::collections::VecDeque<usize>>,
     /// How many files may be open at once.
     cap: usize,
@@ -1752,6 +1781,21 @@ impl Series {
     /// Build from the ordinal model and a per-shard open spec,
     /// collapsing shards that name one file onto one entry.
     pub(crate) fn new(shards: crate::dataset::shards::Shards, per_shard: Vec<ShardOpen>) -> Self {
+        Self::with_cap(shards, per_shard, open_file_cap())
+    }
+
+    /// As [`Self::new`], with the descriptor budget supplied.
+    ///
+    /// The budget is a property of the process, so `new` reads it from
+    /// the process. Naming it here is what lets eviction be exercised
+    /// at a size a test can build: with the real budget a test would
+    /// need more shards than the host has descriptors, so the branch
+    /// that closes a file would never run.
+    pub(crate) fn with_cap(
+        shards: crate::dataset::shards::Shards,
+        per_shard: Vec<ShardOpen>,
+        budget: usize,
+    ) -> Self {
         let mut files: Vec<SeriesFile> = Vec::new();
         let mut file_of_shard = Vec::with_capacity(per_shard.len());
         for spec in per_shard {
@@ -1775,7 +1819,6 @@ impl Series {
             .collect();
         // A series never needs more descriptors than it has files, so
         // the cap is the smaller of the budget and the series.
-        let budget = open_file_cap();
         if files.len() > budget {
             warn_if_cap_binds_concurrency();
         }
@@ -1838,46 +1881,81 @@ impl Series {
             .files
             .get(i)
             .ok_or_else(|| Error::Other(format!("shard file {i} out of range")))?;
+
+        // The recency list is taken before a slot, and that order is
+        // never reversed in this type — an eviction holds the list
+        // while it closes its victims, so a slot lock is only ever
+        // acquired by a thread that already holds the list or holds
+        // nothing.
         {
-            let held = slot.opened.lock().expect("shard slot");
-            if let Some(s) = held.as_ref() {
+            let mut lru = self.lru.lock().expect("lru");
+            if let Some(s) = slot.opened.lock().expect("shard slot").as_ref() {
                 let s = s.clone();
-                drop(held);
-                self.touch(i);
+                Self::touch_locked(&mut lru, i);
                 return Ok(s);
             }
         }
+
+        // Opening happens outside every lock. It may hit the filesystem
+        // or the network, and a series is meant to fetch its shards in
+        // parallel — holding the recency list across an open would
+        // serialise exactly what sharding exists to spread out. Two
+        // threads may therefore open the same file at once; one
+        // installs and the other's handle is dropped.
         let opened = slot.spec.open().map_err(|e| {
             Error::Other(format!("open shard file '{}': {e}", slot.spec.resolved()))
         })?;
-        *slot.opened.lock().expect("shard slot") = Some(opened.clone());
-        self.touch(i);
-        self.evict_over_cap();
-        Ok(opened)
-    }
 
-    /// Mark file `i` as most recently used.
-    fn touch(&self, i: usize) {
+        // Install, record, and evict as **one** critical section. Any
+        // of the three alone lets the open set and the recency list
+        // disagree, and the descriptor bound is precisely their
+        // agreement: two threads opening different shards would each
+        // install before either evicted, and the series would hold
+        // more files than its budget.
+        //
+        // The bound is on files this series *holds*. A handle opened
+        // above but not yet installed is a descriptor in flight, and
+        // those are bounded by fetch concurrency rather than by the
+        // cap — the case `warn_if_cap_binds_concurrency` reports.
         let mut lru = self.lru.lock().expect("lru");
-        if let Some(pos) = lru.iter().position(|&x| x == i) {
-            lru.remove(pos);
-        }
-        lru.push_back(i);
-    }
-
-    /// Close least-recently-used files until the budget is met.
-    ///
-    /// Dropping the `Arc` here releases only *this* handle's claim: a
-    /// reader mid-read holds its own, so eviction can never pull a file
-    /// out from under one.
-    fn evict_over_cap(&self) {
-        let mut lru = self.lru.lock().expect("lru");
+        Self::touch_locked(&mut lru, i);
         while lru.len() > self.cap {
             let Some(victim) = lru.pop_front() else { break };
+            // The file just opened is the most recently used, so it is
+            // never the victim. Asserting that here rather than relying
+            // on it keeps a cap of one from closing what it just
+            // opened, which would make the series unable to advance.
+            if victim == i {
+                lru.push_back(victim);
+                break;
+            }
             if let Some(slot) = self.files.get(victim) {
                 *slot.opened.lock().expect("shard slot") = None;
             }
         }
+        // Installed **after** the eviction, so the set of held files
+        // never passes through a state above the budget. Installing
+        // first and trimming after would hold cap+1 descriptors for the
+        // width of the eviction loop. Nothing outside can observe that
+        // window — every observer goes through the same list — but on a
+        // host where the cap is the real ceiling, the descriptor is
+        // claimed whether or not anyone is counting.
+        let held = {
+            let mut slotted = slot.opened.lock().expect("shard slot");
+            slotted.get_or_insert(opened).clone()
+        };
+        Ok(held)
+    }
+
+    /// Mark file `i` as most recently used, under a list already held.
+    ///
+    /// Takes the guard rather than the lock so a caller can record a
+    /// use and act on the result without releasing the list in between.
+    fn touch_locked(lru: &mut std::collections::VecDeque<usize>, i: usize) {
+        if let Some(pos) = lru.iter().position(|&x| x == i) {
+            lru.remove(pos);
+        }
+        lru.push_back(i);
     }
 
     /// The byte range shard `s` can address in its file.
@@ -1902,7 +1980,15 @@ impl Series {
     ///
     /// Never exceeds the descriptor budget (SH-59) — that bound is what
     /// this exists to make observable.
+    ///
+    /// Counted under the recency list, not by walking the slots freely.
+    /// A free walk answers from a torn view: it can read one slot
+    /// before an eviction closes it and a later slot after the open
+    /// that displaced it, and report a total that was never held at any
+    /// instant. Holding the list makes the answer a real moment,
+    /// because every install and every eviction passes through it.
     pub fn open_file_count(&self) -> usize {
+        let _lru = self.lru.lock().expect("lru");
         self.files
             .iter()
             .filter(|f| f.opened.lock().expect("shard slot").is_some())
@@ -3805,6 +3891,169 @@ mod tests {
             );
         }
         assert_eq!(first.len(), 6);
+    }
+
+    // ── the descriptor budget ──────────────────────────────────────
+
+    /// `n` one-file shards, each holding four bytes of the shard's own
+    /// index, opened under an explicit budget.
+    fn byte_series(dir: &std::path::Path, n: usize, cap: usize) -> Series {
+        use crate::dataset::shards::{Entry, Shards};
+        let mut entries = Vec::new();
+        let mut opens = Vec::new();
+        for i in 0..n {
+            let path = dir.join(format!("part__{i:04}.u8"));
+            std::fs::write(&path, [i as u8; 4]).unwrap();
+            entries.push(Entry {
+                source: crate::dataset::source::parse_source_string(
+                    path.to_str().unwrap(),
+                )
+                .unwrap(),
+                file_base: 0,
+                len: 4,
+            });
+            opens.push(ShardOpen::Plain {
+                resolved: path.to_str().unwrap().to_string(),
+            });
+        }
+        Series::with_cap(Shards::new(entries).unwrap(), opens, cap)
+    }
+
+    /// Whether the series is currently holding file `i` open. Reads
+    /// the slot directly rather than widening `Series`: eviction order
+    /// is an internal policy, and this test module is inside the module
+    /// that owns it.
+    fn is_open(s: &Series, i: usize) -> bool {
+        s.files[i].opened.lock().expect("shard slot").is_some()
+    }
+
+    /// An explicit setting wins; otherwise a quarter of the limit,
+    /// never below the floor, and a junk value is ignored rather than
+    /// fatal (SH-59).
+    #[test]
+    fn the_cap_derivation_answers_from_its_two_inputs() {
+        assert_eq!(resolve_open_file_cap(Some("3"), Some(1024)), 3);
+        assert_eq!(resolve_open_file_cap(Some(" 12 "), Some(1024)), 12);
+        assert_eq!(resolve_open_file_cap(None, Some(1024)), 256);
+        // No limit to read: the documented default stands in.
+        assert_eq!(resolve_open_file_cap(None, None), 256);
+        // The floor keeps a constrained host workable.
+        assert_eq!(resolve_open_file_cap(None, Some(4)), 8);
+        // Junk, zero, and negatives fall through to the derivation
+        // rather than stopping a dataset from opening.
+        for junk in ["", "lots", "0", "-1", "8.5"] {
+            assert_eq!(
+                resolve_open_file_cap(Some(junk), Some(1024)),
+                256,
+                "{junk:?} should not have been honoured"
+            );
+        }
+    }
+
+    /// **A series never claims more descriptors than it has files.** The
+    /// budget is an upper bound, not a target.
+    #[test]
+    fn the_cap_never_exceeds_the_file_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = byte_series(tmp.path(), 3, 4096);
+        assert_eq!(s.cap, 3);
+    }
+
+    /// **Reading past the budget closes the least-recently-used file**
+    /// (SH-59). With a real budget this branch needs more shards than
+    /// the host has descriptors, which is why the cap is injectable.
+    #[test]
+    fn a_series_over_its_budget_closes_the_least_recently_used_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = byte_series(tmp.path(), 8, 3);
+
+        for i in 0..8 {
+            let _ = s.file(i).unwrap();
+            assert!(
+                s.open_file_count() <= 3,
+                "after opening {i}, {} files were open",
+                s.open_file_count()
+            );
+        }
+        // The budget bound is met exactly, and it is the *oldest* three
+        // that were closed rather than an arbitrary three.
+        assert_eq!(s.open_file_count(), 3);
+        let open: Vec<usize> = (0..8).filter(|&i| is_open(&s, i)).collect();
+        assert_eq!(open, vec![5, 6, 7]);
+    }
+
+    /// **An evicted file reopens and reads the same bytes.** Eviction
+    /// is a descriptor economy, not a loss of data — a second pass over
+    /// a series wider than the budget must answer exactly as the first.
+    #[test]
+    fn an_evicted_file_reopens_and_reads_the_same_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = byte_series(tmp.path(), 8, 2);
+
+        let first: Vec<u8> = (0..8)
+            .map(|i| s.file(i).unwrap().read_bytes(0, 4).unwrap()[0])
+            .collect();
+        assert_eq!(first, (0..8).map(|i| i as u8).collect::<Vec<_>>());
+
+        // Every file but the last two has been evicted by now; reading
+        // backwards evicts the rest and reopens the front.
+        let second: Vec<u8> = (0..8)
+            .rev()
+            .map(|i| s.file(i).unwrap().read_bytes(0, 4).unwrap()[0])
+            .collect();
+        assert_eq!(second, (0..8).rev().map(|i| i as u8).collect::<Vec<_>>());
+        assert!(s.open_file_count() <= 2);
+    }
+
+    /// **Eviction never pulls a file out from under a reader** (SH-59).
+    /// `file()` hands back an owned `Arc`, so a caller mid-read keeps
+    /// its own claim after the series has closed its slot.
+    #[test]
+    fn eviction_cannot_invalidate_a_handle_a_caller_still_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = byte_series(tmp.path(), 6, 2);
+
+        let held = s.file(0).unwrap();
+        for i in 1..6 {
+            let _ = s.file(i).unwrap();
+        }
+        assert!(!is_open(&s, 0), "file 0 should have been evicted");
+        // The evicted slot is empty, but the handle taken before the
+        // eviction still reads.
+        assert_eq!(held.read_bytes(0, 4).unwrap(), vec![0u8; 4]);
+    }
+
+    /// **Parallel readers stay inside the budget and see their own
+    /// bytes.** The LRU is shared mutable state behind a lock; a series
+    /// read from several threads must neither exceed the cap nor return
+    /// one shard's bytes for another's.
+    #[test]
+    fn parallel_readers_respect_the_budget_and_read_correctly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(byte_series(tmp.path(), 16, 4));
+
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let s = std::sync::Arc::clone(&s);
+                scope.spawn(move || {
+                    for pass in 0..40 {
+                        let i = (t * 7 + pass * 3) % 16;
+                        let bytes = s.file(i).unwrap().read_bytes(0, 4).unwrap();
+                        assert_eq!(
+                            bytes,
+                            vec![i as u8; 4],
+                            "thread {t} pass {pass} read shard {i}"
+                        );
+                        assert!(
+                            s.open_file_count() <= 4,
+                            "budget exceeded: {}",
+                            s.open_file_count()
+                        );
+                    }
+                });
+            }
+        });
+        assert!(s.open_file_count() <= 4);
     }
 
     /// Separate handles are separate caches — the point of putting the
