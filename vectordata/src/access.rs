@@ -86,6 +86,40 @@ impl AccessMode {
     /// (the safe sparse path that works without `.mref`). When
     /// sparse access can't apply at all (vvec format, unknown
     /// extension), returns `FullTransfer`.
+    /// How constraining this mode is on a caller, lowest first.
+    ///
+    /// Not a quality ranking: the axis is what a caller must plan
+    /// around. `FullTransfer` constrains most — no read succeeds until
+    /// the whole file is down. The two chunked modes both serve ranges
+    /// and differ in *trust* rather than access, so they rank together
+    /// with the verified one above the trusted one, because a caller
+    /// that can rely on per-chunk verification can do strictly more.
+    /// `Local` constrains nothing.
+    fn strength(self) -> u8 {
+        match self {
+            AccessMode::FullTransfer => 0,
+            AccessMode::MerkleChunked => 1,
+            AccessMode::MerkleHashed => 2,
+            AccessMode::Local => 3,
+        }
+    }
+
+    /// The weakest of several modes — the one true of every file
+    /// (SH-93).
+    ///
+    /// A facet's mode is a promise about every read it will serve. A
+    /// caller that plans against "supports range" and then reaches a
+    /// no-range shard has been misled by an average, so a series
+    /// reports its weakest link. Understating a good shard costs
+    /// efficiency; overstating a bad one costs correctness, and only
+    /// one of those is recoverable.
+    ///
+    /// `None` for an empty sequence: a facet with no files makes no
+    /// promise, which is not the same as promising the weakest thing.
+    pub fn weakest(modes: impl IntoIterator<Item = AccessMode>) -> Option<AccessMode> {
+        modes.into_iter().min_by_key(|m| m.strength())
+    }
+
     pub fn classify(resolved_source: &str, cache_dir: &Path) -> AccessMode {
         if !crate::transport::is_remote_url(resolved_source) {
             return AccessMode::Local;

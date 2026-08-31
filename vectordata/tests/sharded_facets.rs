@@ -1543,3 +1543,71 @@ fn saving_a_sharded_dataset_preserves_its_series() {
     assert_eq!(query.count(), 40, "the explicit series kept both entries");
     assert_eq!(query.get(39).unwrap()[0], 39.0);
 }
+/// **A facet reports one access mode, and it is the weakest among its
+/// files** (SH-93).
+///
+/// A mode is a promise about every read the facet will serve. A series
+/// whose shards were published differently — one with a `.mref`, one
+/// without — must answer for the worst of them, or a caller plans
+/// against an average it will not get. Understating a good shard costs
+/// efficiency; overstating a bad one costs correctness, and only one of
+/// those is recoverable.
+#[test]
+fn a_series_reports_the_weakest_access_mode_of_its_shards() {
+    use vectordata::access::AccessMode::{self, *};
+    fn weakest<const N: usize>(m: [AccessMode; N]) -> Option<AccessMode> {
+        AccessMode::weakest(m)
+    }
+
+    // The ordering the fold is built on: what a caller must plan
+    // around, not a quality ranking.
+    assert_eq!(weakest([Local, MerkleHashed]), Some(MerkleHashed));
+    assert_eq!(
+        weakest([MerkleHashed, MerkleChunked]),
+        Some(MerkleChunked),
+        "a trusted-bytes shard is weaker than a verified one"
+    );
+    assert_eq!(
+        weakest([Local, MerkleHashed, FullTransfer]),
+        Some(FullTransfer),
+        "one shard that must download whole makes the facet's promise that"
+    );
+    assert_eq!(weakest([Local, Local]), Some(Local));
+    assert_eq!(
+        weakest([]),
+        None,
+        "a facet with no files makes no promise, which is not the weakest promise"
+    );
+}
+
+/// **A local series reports Local, through the facet handle** (SH-93).
+///
+/// The fold above is the rule; this is the rule reaching a facet. Every
+/// shard on disk means every read is served from disk, and the handle
+/// says so without the caller enumerating shards.
+#[test]
+fn a_local_series_reports_local_through_its_handle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    for s in 0..3 {
+        write_fvec(&ds.join(format!("base__{s:04}.fvec")), 4, 50, s * 50);
+    }
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: modes\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: base__NNNN.fvec\n      shard_stride: 50\n      shard_count: 3\n      \
+         record_count: 150\n",
+    )
+    .unwrap();
+
+    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+
+    // The declared source is the NNNN pattern, which names no file —
+    // the series must classify its shards, not that.
+    let mode = storage.access_mode("base__NNNN.fvec", tmp.path());
+    assert_eq!(mode, vectordata::access::AccessMode::Local);
+}
+

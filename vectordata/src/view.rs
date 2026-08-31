@@ -1978,6 +1978,12 @@ impl Series {
         Some((m.0, m.1))
     }
 
+    /// The resolved source of file `i` — the string it was opened
+    /// from, which is what classification reads.
+    pub(crate) fn file_source(&self, i: usize) -> &str {
+        self.files[i].spec.resolved()
+    }
+
     /// How many files are open right now.
     ///
     /// Never exceeds the descriptor budget (SH-59) — that bound is what
@@ -2283,6 +2289,37 @@ impl FacetStorage {
             }),
         }
     }
+    /// The access mode this facet promises, which is the weakest among
+    /// its files (SH-93).
+    ///
+    /// A facet's mode is a promise about every read it will serve. A
+    /// series whose shards were published differently — one with a
+    /// `.mref`, one without, one on a server with no range support —
+    /// must answer for the worst of them, or a caller plans against an
+    /// average it will not get. Understating a good shard costs
+    /// efficiency; overstating a bad one costs correctness.
+    ///
+    /// Per-file detail stays available to `describe` and the explore
+    /// TUI, where it is information rather than a promise (SH-46).
+    /// `source` is the facet's declared source, which is all a
+    /// single-file facet needs. A series ignores it — it is the `NNNN`
+    /// pattern, which names no file — and classifies each shard from
+    /// the source it was actually opened from.
+    pub fn access_mode(
+        &self,
+        source: &str,
+        cache_dir: &std::path::Path,
+    ) -> crate::access::AccessMode {
+        let Some(s) = &self.series else {
+            return crate::access::AccessMode::classify(source, cache_dir);
+        };
+        crate::access::AccessMode::weakest(
+            (0..s.file_count())
+                .map(|i| crate::access::AccessMode::classify(s.file_source(i), cache_dir)),
+        )
+        .unwrap_or(crate::access::AccessMode::Local)
+    }
+
     pub fn is_local(&self) -> bool {
         match &self.series {
             None => self.storage.is_local(),
