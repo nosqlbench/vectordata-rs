@@ -2112,3 +2112,69 @@ fn precaching_a_series_downloads_every_shard() {
         assert_eq!(base.get(i).unwrap()[0], i as f32 * 100.0, "record {i}");
     }
 }
+/// **A shard collides with another facet's file in the cache, and is
+/// refused** (SH-33).
+///
+/// The guard read each other facet's *single* source to compare cache
+/// paths, and a series has none — so a series facet was skipped and its
+/// shards never entered the comparison. Two files with one basename
+/// share a cache slot and a chunk sidecar, which is silent corruption
+/// rather than an error.
+///
+/// The collision needs facets living outside the dataset's home URL,
+/// where the cache path is the basename: hence two servers, one holding
+/// the `dataset.yaml` that anchors the dataset and one holding the
+/// files it points at.
+#[test]
+fn a_shard_colliding_with_another_facets_file_is_refused() {
+    let files = make_tmp();
+    std::fs::create_dir_all(files.path().join("left")).unwrap();
+    std::fs::create_dir_all(files.path().join("right")).unwrap();
+    write_fvec(&files.path().join("left/shared__0000.fvec"), 25, 8);
+    write_fvec(&files.path().join("left/shared__0001.fvec"), 25, 8);
+    write_fvec(&files.path().join("right/shared__0001.fvec"), 5, 8);
+    let file_server = TestServer::start(files.path()).unwrap();
+
+    // Served from a named subdirectory: the dataset's cache identity is
+    // the last path segment of its URL, and a bare host root has none —
+    // without it the open is not catalog-anchored and the guard, which
+    // is about cache paths, has nothing to guard.
+    let home = make_tmp();
+    std::fs::create_dir_all(home.path().join("clash")).unwrap();
+    let f = file_server.base_url();
+    std::fs::write(
+        home.path().join("clash/dataset.yaml"),
+        format!(
+            "name: clash\nprofiles:\n  default:\n    base_vectors:\n      \
+             source: {f}left/shared__NNNN.fvec\n      shard_stride: 25\n      \
+             shard_count: 2\n      record_count: 50\n    \
+             query_vectors: {f}right/shared__0001.fvec\n"
+        ),
+    )
+    .unwrap();
+    let home_server = TestServer::start(home.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&format!("{}clash/", home_server.base_url())).unwrap();
+    let view = group.profile("default").unwrap();
+
+    // Opening the *single-file* facet's storage is the direction that
+    // was blind: the guard compared against each other facet's one
+    // source, and a series has none.
+    let err = match view.open_facet_storage("query_vectors") {
+        Ok(_) => panic!("a facet colliding with a shard must not open its cache"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("collision"),
+        "the clash with a shard of base_vectors must be named: {err}"
+    );
+    assert!(err.contains("shared__0001.fvec"), "{err}");
+
+    // The other direction was already covered and must stay covered.
+    assert!(
+        view.open_facet_storage("base_vectors").is_err(),
+        "the series must refuse the same clash"
+    );
+}
+

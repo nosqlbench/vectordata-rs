@@ -574,6 +574,27 @@ impl FacetConfig {
         }
     }
 
+    /// Every file this facet names, with a uniform pattern expanded.
+    ///
+    /// [`Self::sources`] returns the declaration as written, which for
+    /// the uniform form is one string containing `NNNN` — a pattern,
+    /// not a filename. A caller reasoning about *files* (cache paths,
+    /// publication, collisions) needs the expansion, and it is pure
+    /// string work: the names follow from the pattern and the count
+    /// with nothing to read.
+    pub fn declared_files(&self) -> Vec<String> {
+        match self {
+            Self::Sharded(ShardedFacet::Uniform {
+                source,
+                shard_count,
+                ..
+            }) => (0..*shard_count)
+                .map(|i| crate::dataset::shards::shard_filename(source, i))
+                .collect(),
+            other => other.sources().to_vec(),
+        }
+    }
+
     /// Ordinals per shard for a uniform series, if this is one.
     pub fn shard_stride(&self) -> Option<u64> {
         match self {

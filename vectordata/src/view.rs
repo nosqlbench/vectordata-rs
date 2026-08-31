@@ -3221,28 +3221,40 @@ impl GenericTestDataView {
         relpath: &str,
         home_norm: &str,
     ) -> Result<()> {
-        for (other_name, desc) in self.facet_manifest() {
+        for other_name in self.facet_manifest().keys() {
             if other_name == facet_name {
                 continue;
             }
-            let Some(raw) = desc.source_path.as_deref() else {
+            // Every file the other facet names, not its single source.
+            // A series has no single source, so reading one would skip
+            // series facets entirely — and a shard is exactly the kind
+            // of file that collides, since shard names are derived from
+            // a basename many facets could share (SH-33).
+            let Some(other) = self.facet_config_by_name(other_name) else {
                 continue;
             };
-            let other_path = match crate::dataset::source::parse_source_string(raw) {
-                Ok(parsed) => parsed.path,
-                Err(_) => raw.to_string(),
-            };
-            let Ok(other_resolved) = self.resolve_path_str(&other_path) else {
-                continue;
-            };
-            if other_resolved == resolved {
-                continue;
-            }
-            if facet_cache_relpath(&other_resolved, home_norm) == relpath {
-                return Err(Error::Other(format!(
-                    "cache filename collision in dataset '{}': facets '{facet_name}'                      ({resolved}) and '{other_name}' ({other_resolved}) both cache as                      '{relpath}'. Rename one of the source files (or move it under the                      dataset's home URL) so each facet has a distinct filename.",
-                    self.dataset_name.as_deref().unwrap_or("?"),
-                )));
+            for raw in other.declared_files() {
+                let other_path = match crate::dataset::source::parse_source_string(&raw) {
+                    Ok(parsed) => parsed.path,
+                    Err(_) => raw.clone(),
+                };
+                let Ok(other_resolved) = self.resolve_path_str(&other_path) else {
+                    continue;
+                };
+                if other_resolved == resolved {
+                    continue;
+                }
+                if facet_cache_relpath(&other_resolved, home_norm) == relpath {
+                    return Err(Error::Other(format!(
+                        "cache filename collision in dataset '{}': facets \
+                         '{facet_name}' ({resolved}) and '{other_name}' \
+                         ({other_resolved}) both cache as '{relpath}'. Rename \
+                         one of the source files (or move it under the \
+                         dataset's home URL) so each facet has a distinct \
+                         filename.",
+                        self.dataset_name.as_deref().unwrap_or("?"),
+                    )));
+                }
             }
         }
         Ok(())
