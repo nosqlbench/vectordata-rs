@@ -217,9 +217,25 @@ impl Serialize for DSView {
 }
 
 impl DSView {
-    /// Returns the effective window: view-level override if present, else source window.
+    /// The window that applies to this view's **facet ordinals**.
+    ///
+    /// The view-level override if present, otherwise the source's own
+    /// suffix — which for a single file are the same coordinate space.
+    ///
+    /// **For a series, only the view-level window qualifies.** An entry
+    /// window is in the *file's* ordinals, not the facet's (SH-67), and
+    /// `self.source` is merely the first entry — so falling back to it
+    /// would apply one shard's file-local range to the whole series.
+    /// Where the two coordinate spaces coincide there is nothing to
+    /// choose between them; where they do not, taking the wrong one is
+    /// silent.
     pub fn effective_window(&self) -> &DSWindow {
-        self.window.as_ref().unwrap_or(&self.source.window)
+        static NONE: DSWindow = DSWindow(Vec::new());
+        match &self.window {
+            Some(w) => w,
+            None if self.is_series() => &NONE,
+            None => &self.source.window,
+        }
     }
 
     /// Returns the source path.
