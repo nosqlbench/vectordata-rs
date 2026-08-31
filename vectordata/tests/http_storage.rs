@@ -2178,3 +2178,170 @@ fn a_shard_colliding_with_another_facets_file_is_refused() {
     );
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════
+// remote_records — a slab metadata facet served over HTTP
+// ═══════════════════════════════════════════════════════════════════════
+//
+// A slab is read by memory map, so unlike every vector reader above it
+// cannot serve a byte until the file is on disk. That makes the remote
+// path a different shape: the facet is refused until precached, and
+// identical to a local one afterwards. Both halves are pinned here,
+// through the two codec levels a caller actually uses — the ANode AST,
+// and a named vernacular.
+
+use vectordata::formats::anode::ANode;
+use vectordata::formats::anode_vernacular::Vernacular;
+use vectordata::formats::mnode::{MNode, MValue};
+use vectordata::records::{Anode, RecordError, Serde, Text};
+
+/// A metadata slab of MNode records with `id` and `bucket` fields.
+fn write_remote_metadata_slab(path: &Path, first: i32, count: i32) {
+    let mut w =
+        slabtastic::SlabWriter::new(path, slabtastic::WriterConfig::default()).unwrap();
+    for i in first..first + count {
+        let mut node = MNode::new();
+        node.fields.insert("id".to_string(), MValue::Int32(i));
+        node.fields.insert("bucket".to_string(), MValue::Int32(i % 4));
+        w.add_record(&node.to_bytes()).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+#[derive(Debug, serde::Deserialize, PartialEq)]
+struct RemoteRow {
+    id: i32,
+    bucket: i32,
+}
+
+/// Serve a dataset whose `metadata_content` is one slab, with `.mref`
+/// sidecars so the opens take the merkle-cached path.
+fn make_remote_metadata_dataset(root: &Path) {
+    write_fvec(&root.join("base.fvec"), 8, 8);
+    write_mref(&root.join("base.fvec"));
+    write_remote_metadata_slab(&root.join("metadata_content.slab"), 0, 8);
+    write_mref(&root.join("metadata_content.slab"));
+    std::fs::write(
+        root.join("dataset.yaml"),
+        "name: remote-meta\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+         metadata_content: metadata_content.slab\n",
+    )
+    .unwrap();
+}
+
+/// **A remote slab facet is refused until its bytes are here** — by
+/// name, not by a sparse map.
+///
+/// Every other reader in this file serves ranges from a partially
+/// resident file. A slab cannot: it is read by memory map, and a map
+/// over a sparse cache file reads holes as zeroes, which decode as a
+/// dialect error against whichever record happens to straddle one. The
+/// refusal has to say what is actually wrong.
+#[test]
+fn a_remote_slab_facet_is_refused_until_precached() {
+    let tmp = make_tmp();
+    make_remote_metadata_dataset(tmp.path());
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    match view.open_facet_records("metadata_content") {
+        Err(RecordError::NotResident(what)) => {
+            assert!(what.contains("metadata_content"), "{what}");
+        }
+        Err(other) => panic!("expected a residency refusal, got {other}"),
+        Ok(_) => panic!("a facet whose bytes are still remote must not open"),
+    }
+}
+
+/// **Precached, a remote slab facet reads through the ANode AST.**
+///
+/// The dialect comes from each record's leading byte, so nothing about
+/// the transport reaches the codec: the same records that decode from a
+/// local file decode from a cached one, field for field.
+#[test]
+fn a_precached_remote_slab_facet_reads_as_anode() {
+    let tmp = make_tmp();
+    make_remote_metadata_dataset(tmp.path());
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    view.open_facet_storage("metadata_content")
+        .unwrap()
+        .precache()
+        .expect("bring the slab down");
+
+    let facet = view.open_facet_records("metadata_content").unwrap();
+    assert_eq!(facet.count().unwrap(), 8);
+
+    // Stage 1: the record is the node it says it is.
+    let nodes = facet.decode(Anode);
+    for o in 0..8u64 {
+        match nodes.get(o).unwrap() {
+            ANode::MNode(n) => {
+                assert_eq!(
+                    n.fields.get("id"),
+                    Some(&MValue::Int32(o as i32)),
+                    "id at remote ordinal {o}"
+                );
+                assert_eq!(n.fields.get("bucket"), Some(&MValue::Int32((o % 4) as i32)));
+            }
+            other => panic!("ordinal {o} decoded as {other:?}"),
+        }
+    }
+    // And the raw bytes carry the dialect leader the decode dispatched
+    // on — the transport did not reshape the record.
+    assert_eq!(
+        facet.record_bytes(0).unwrap()[0],
+        vectordata::formats::anode::DIALECT_MNODE
+    );
+}
+
+/// **The same remote facet reads through the CQL vernacular**, and
+/// through a serde target, from one container.
+///
+/// The vernacular is selected two ways — as a type and by name — and
+/// both must render identically, because the by-name path is a lookup
+/// in front of the same codec rather than a second implementation.
+#[test]
+fn a_precached_remote_slab_facet_reads_as_cql_and_as_a_struct() {
+    let tmp = make_tmp();
+    make_remote_metadata_dataset(tmp.path());
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    view.open_facet_storage("metadata_content")
+        .unwrap()
+        .precache()
+        .expect("bring the slab down");
+
+    let facet = view.open_facet_records("metadata_content").unwrap();
+
+    // Stage 2, by type.
+    let cql = facet.decode(Text(Vernacular::Cql));
+    let rendered = cql.get(5).unwrap();
+    assert!(rendered.contains('5'), "CQL for id=5 over HTTP: {rendered}");
+    assert_eq!(cql.count().unwrap(), 8);
+
+    // Stage 2, by name — the same bytes through the same codec.
+    let named = vectordata::records::codec_by_name("cql").expect("cql is known");
+    assert_eq!(
+        named.decode(facet.record_bytes(5).unwrap()).unwrap(),
+        rendered,
+        "a codec named at runtime must render what its type does"
+    );
+
+    // Stage 2 + serde: the caller's own type, by ordinal, over HTTP.
+    let rows = facet.decode(Serde::<RemoteRow>::new());
+    assert_eq!(rows.get(5).unwrap(), RemoteRow { id: 5, bucket: 1 });
+    assert_eq!(rows.get(7).unwrap(), RemoteRow { id: 7, bucket: 3 });
+
+    // Three types, one container, one set of bytes.
+    assert_eq!(rows.count().unwrap(), cql.count().unwrap());
+}
