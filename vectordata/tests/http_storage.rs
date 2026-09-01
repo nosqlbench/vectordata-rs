@@ -2423,3 +2423,250 @@ fn a_precached_remote_slab_facet_reads_as_cql_and_as_a_struct() {
     // Three types, one container, one set of bytes.
     assert_eq!(rows.count().unwrap(), cql.count().unwrap());
 }
+
+// ── binding a remote facet to operation parameters ──────────────────
+//
+// The record API above answers "can a caller read a remote slab
+// incrementally". These answer the question a template runtime asks
+// next: can it learn a schema, compile a binder, and drive a cycle
+// over a dataset it never downloaded. Every assertion here has a local
+// twin in `record_binding.rs`; what is remote-specific is the last one
+// in each — that none of it required the file.
+
+use vectordata::binding::{BindType, Binder, FORMS_NAMESPACE, Layout, PredicateBinder, forms_of};
+use vectordata::formats::pnode::{Comparand, FieldRef, OpType, PNode, PredicateNode};
+
+/// As [`write_remote_metadata_slab`], plus a `forms` namespace — the
+/// shape a producer writes when it declares more than one operation
+/// against the same records.
+fn write_remote_metadata_slab_with_forms(path: &Path, count: i32, forms: &[&str]) {
+    let cfg = slabtastic::WriterConfig::new(4096, 4096, 1 << 20, false).unwrap();
+    let mut w = slabtastic::SlabWriter::new(path, cfg).unwrap();
+    for i in 0..count {
+        let mut node = MNode::new();
+        node.fields.insert("id".to_string(), MValue::Int32(i));
+        node.fields.insert("bucket".to_string(), MValue::Int32(i % 4));
+        w.add_record(&node.to_bytes()).unwrap();
+    }
+    w.start_namespace(FORMS_NAMESPACE).unwrap();
+    for f in forms {
+        w.add_record(f.as_bytes()).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+/// A predicate slab: record `i` is `bucket = i % 4`, one flat
+/// condition — the same shape for every record, which is what lets one
+/// compiled binder drive the whole facet.
+fn write_remote_predicate_slab(path: &Path, count: i32) {
+    let cfg = slabtastic::WriterConfig::new(4096, 4096, 1 << 20, false).unwrap();
+    let mut w = slabtastic::SlabWriter::new(path, cfg).unwrap();
+    for i in 0..count {
+        let p = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("bucket".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Int((i % 4) as i64)],
+        });
+        w.add_record(&p.to_bytes_named()).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+/// A dataset whose metadata and predicates are both remote slabs — the
+/// two facets a filtered-query template reads together.
+fn make_remote_predicate_dataset(root: &Path, records: i32) {
+    write_fvec(&root.join("base.fvec"), 8, 8);
+    write_mref(&root.join("base.fvec"));
+    write_remote_metadata_slab(&root.join("metadata_content.slab"), 0, records);
+    write_mref(&root.join("metadata_content.slab"));
+    write_remote_predicate_slab(&root.join("metadata_predicates.slab"), records);
+    write_mref(&root.join("metadata_predicates.slab"));
+    std::fs::write(
+        root.join("dataset.yaml"),
+        "name: remote-meta\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+         metadata_content: metadata_content.slab\n    \
+         metadata_predicates: metadata_predicates.slab\n",
+    )
+    .unwrap();
+}
+
+fn make_remote_forms_dataset(root: &Path, records: i32, forms: &[&str]) {
+    write_fvec(&root.join("base.fvec"), 8, 8);
+    write_mref(&root.join("base.fvec"));
+    write_remote_metadata_slab_with_forms(&root.join("metadata_content.slab"), records, forms);
+    write_mref(&root.join("metadata_content.slab"));
+    std::fs::write(
+        root.join("dataset.yaml"),
+        "name: remote-meta\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+         metadata_content: metadata_content.slab\n",
+    )
+    .unwrap();
+}
+
+/// **A template runtime can compile against a remote dataset.**
+///
+/// The layout is learned from the first record — one page — and the
+/// binder built from it drives a cycle over records scattered through
+/// the facet. The schema is remote, the values are remote, and the
+/// file is never downloaded.
+#[test]
+fn a_binder_compiles_and_binds_over_http() {
+    let tmp = make_tmp();
+    make_large_remote_metadata_dataset(tmp.path(), 4000);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let storage = view.open_facet_storage("metadata_content").unwrap();
+    let facet = view.open_facet_records("metadata_content").unwrap();
+
+    // Compile: schema first, once.
+    let layout = Layout::discover(&facet).unwrap();
+    assert_eq!(layout.names(), ["id", "bucket"]);
+    assert_eq!(layout.types(), [BindType::Int32, BindType::Int32]);
+    let binder = Binder::select(&layout, &["bucket", "id"]).unwrap();
+
+    // Cycle: bind scattered records, in template order.
+    for o in [0u64, 1, 1500, 3999] {
+        let bytes = facet.record_bytes(o).unwrap();
+        binder
+            .bind_each(&bytes, |i, value| {
+                match i {
+                    0 => assert_eq!(value.as_i64(), Some((o % 4) as i64), "bucket at {o}"),
+                    1 => assert_eq!(value.as_i64(), Some(o as i64), "id at {o}"),
+                    _ => panic!("only two parameters were selected"),
+                }
+            })
+            .unwrap();
+    }
+
+    assert!(
+        !storage.is_complete(),
+        "compiling and binding must not have pulled the facet down"
+    );
+}
+
+/// A predicate template compiles against a layout discovered over HTTP,
+/// and binds each remote predicate record's comparands into its
+/// conditions — the filtered-query half of the same cycle, across two
+/// facets that are both remote.
+#[test]
+fn a_predicate_template_binds_over_http() {
+    let tmp = make_tmp();
+    make_remote_predicate_dataset(tmp.path(), 2000);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let meta_storage = view.open_facet_storage("metadata_content").unwrap();
+    let pred_storage = view.open_facet_storage("metadata_predicates").unwrap();
+
+    // Types come from the metadata facet, shape from a predicate.
+    let layout = Layout::discover(&view.open_facet_records("metadata_content").unwrap()).unwrap();
+    let preds = view.open_facet_records("metadata_predicates").unwrap();
+    assert_eq!(preds.count().unwrap(), 2000);
+
+    let template = PNode::Predicate(PredicateNode {
+        field: FieldRef::Named("bucket".into()),
+        op: OpType::Eq,
+        comparands: vec![Comparand::Int(0)],
+    });
+    let binder = PredicateBinder::compile(&template, &layout).unwrap();
+    assert_eq!(binder.conditions().len(), 1);
+    assert_eq!(binder.conditions()[0].parameter, "bucket");
+    assert_eq!(binder.conditions()[0].bind_type, BindType::Int32);
+
+    // Each remote predicate record binds one comparand into it.
+    for o in [0u64, 1, 1234, 1999] {
+        let bytes = preds.record_bytes(o).unwrap();
+        let mut seen = Vec::new();
+        binder
+            .bind_each(&bytes, |cond, cs| {
+                seen.push((cond.parameter.clone(), cs.to_vec()))
+            })
+            .unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "bucket");
+        assert_eq!(seen[0].1, [Comparand::Int((o % 4) as i64)], "predicate {o}");
+    }
+
+    assert!(
+        !meta_storage.is_complete() && !pred_storage.is_complete(),
+        "compiling and binding predicates must not have pulled either facet down"
+    );
+}
+
+/// A metadata record is not a predicate, and a binder says so rather
+/// than binding whatever the first field happens to hold.
+#[test]
+fn a_metadata_record_is_refused_by_a_predicate_binder_over_http() {
+    let tmp = make_tmp();
+    make_remote_predicate_dataset(tmp.path(), 64);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let content = view.open_facet_records("metadata_content").unwrap();
+    let layout = Layout::discover(&content).unwrap();
+
+    let binder = PredicateBinder::compile(
+        &PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("bucket".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Int(0)],
+        }),
+        &layout,
+    )
+    .unwrap();
+
+    let msg = binder
+        .bind_each(&content.record_bytes(0).unwrap(), |_, _| {})
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("MNode"), "the dialect byte is the authority: {msg}");
+}
+
+/// Declared forms are read from the remote facet's `forms` namespace,
+/// which lives in its own pages — so enumerating operations costs those
+/// pages, not the file.
+#[test]
+fn declared_forms_are_read_over_http() {
+    let tmp = make_tmp();
+    make_remote_forms_dataset(
+        tmp.path(),
+        4000,
+        &[
+            r#"{"name":"insert","operation":"INSERT INTO t (id,bucket) VALUES (?,?)"}"#,
+            r#"{"name":"select","operation":"SELECT * FROM t WHERE id = ?","fields":["id"]}"#,
+        ],
+    );
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let storage = view.open_facet_storage("metadata_content").unwrap();
+    let facet = view.open_facet_records("metadata_content").unwrap();
+
+    let forms = forms_of(&facet).unwrap();
+    assert_eq!(forms.len(), 2);
+    assert_eq!(forms[0].name, "insert");
+    assert_eq!(forms[1].name, "select");
+    assert_eq!(forms[1].fields.as_deref(), Some(["id".to_string()].as_slice()));
+
+    // And a form's fields select from the same layout the content has.
+    let layout = Layout::discover(&facet).unwrap();
+    let binder = Binder::select(&layout, &["id"]).unwrap();
+    let bytes = facet.record_bytes(1234).unwrap();
+    let mut out = Vec::new();
+    binder.bind(&bytes, &mut out).unwrap();
+    assert_eq!(out[0].as_i64(), Some(1234));
+
+    assert!(
+        !storage.is_complete(),
+        "reading forms must not have pulled the facet down"
+    );
+}
