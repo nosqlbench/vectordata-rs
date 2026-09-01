@@ -85,6 +85,30 @@ pub(crate) enum Storage {
         /// Set exactly once when the cache is fully verified.
         mmap: OnceLock<Mmap>,
     },
+
+    /// A multi-file series presented as one byte space (SH-38).
+    ///
+    /// The concatenation of a uniform facet's shards **is** the
+    /// facet's byte stream — records are fixed width and never
+    /// straddle a shard (SH-13) — so a reader that asks this for
+    /// bytes at an offset gets the same answer it would from the
+    /// unsharded file. That is what lets a facet be split without
+    /// every reader learning about shards.
+    ///
+    /// What it deliberately cannot do is hand back a single base
+    /// pointer: there is no one mapping. [`Storage::mmap_base`]
+    /// returns `None` here, and callers that need zero-copy work
+    /// per-part through [`Storage::parts`] instead of pretending the
+    /// shards are contiguous in memory.
+    Series {
+        /// The shards, in ordinal order.
+        parts: Vec<Arc<Storage>>,
+        /// Byte offset at which each part begins in the joined space.
+        /// One entry per part, ascending, first is zero.
+        starts: Vec<u64>,
+        /// Sum of every part's size.
+        total: u64,
+    },
 }
 
 /// Process-wide registry of `Storage` instances keyed on the
@@ -430,7 +454,22 @@ impl Storage {
     }
 
     /// Open a local file by mmap, returned via the shared registry.
+    ///
+    /// **A path whose file is absent resolves to its series, if one is
+    /// there.** A facet written across shards is named
+    /// `base__0000.fvecs`, `base__0001.fvecs`, … and nothing at
+    /// `base.fvecs`; a reader handed the unsharded name would
+    /// otherwise fail with "no such file" for a facet that is
+    /// completely present. The combination "this file is missing and
+    /// its shards exist" has no other meaning, so resolving it turns
+    /// an error into the right answer and changes nothing else.
     pub(crate) fn open_path(path: &Path) -> io::Result<Arc<Self>> {
+        if !path.exists() {
+            let shards = crate::dataset::shards::discover_shards(path);
+            if !shards.is_empty() {
+                return Self::open_series(&shards);
+            }
+        }
         Self::open(path.to_str().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -438,6 +477,54 @@ impl Storage {
             )
         })?)
     }
+
+    /// Open the given shard files as one joined byte space.
+    ///
+    /// Order is the caller's: shard ordinal order, which is what the
+    /// concatenation has to be for the joined offsets to mean what a
+    /// reader thinks they mean (SH-38).
+    pub(crate) fn open_series(shards: &[std::path::PathBuf]) -> io::Result<Arc<Self>> {
+        if shards.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a series needs at least one shard",
+            ));
+        }
+        let mut parts = Vec::with_capacity(shards.len());
+        let mut starts = Vec::with_capacity(shards.len());
+        let mut total = 0u64;
+        for path in shards {
+            let part = Self::open(path.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("non-UTF8 path: {}", path.display()),
+                )
+            })?)?;
+            starts.push(total);
+            total += part.total_size();
+            parts.push(part);
+        }
+        // One shard is not a series: returning the file itself keeps
+        // every zero-copy path available, which a joined space cannot
+        // offer (SH-83 says the writer collapses these, so this is the
+        // case of a series that lost shards, or a hand-made one).
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("one part"));
+        }
+        Ok(Arc::new(Storage::Series { parts, starts, total }))
+    }
+
+    /// The shards behind this storage, in ordinal order.
+    ///
+    /// A single file is one part, so a caller that wants to work
+    /// per-file does not need to know which it has.
+    pub(crate) fn parts(&self) -> Vec<&Arc<Storage>> {
+        match self {
+            Storage::Series { parts, .. } => parts.iter().collect(),
+            _ => Vec::new(),
+        }
+    }
+
 
     /// Crate-internal: build a fresh local-file `Storage::Mmap` (no
     /// registry lookup). Used by `Storage::open` after a registry miss.
@@ -631,6 +718,35 @@ impl Storage {
                 }
                 Ok(bytes)
             }
+            Storage::Series { parts, starts, total } => {
+                let end = offset.checked_add(len).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "read range overflow")
+                })?;
+                if end > *total {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("read past end of series: offset={offset} len={len} size={total}"),
+                    ));
+                }
+                // Walk only the parts the range touches. A read inside
+                // one shard — which every record-sized read is, because
+                // records never straddle (SH-13) — copies once.
+                let mut out = Vec::with_capacity(len as usize);
+                let mut want = offset;
+                while want < end {
+                    let i = match starts.binary_search(&want) {
+                        Ok(i) => i,
+                        Err(i) => i - 1,
+                    };
+                    let part_start = starts[i];
+                    let part_len = parts[i].total_size();
+                    let within = want - part_start;
+                    let take = (part_len - within).min(end - want);
+                    out.extend_from_slice(&parts[i].read_bytes(within, take)?);
+                    want += take;
+                }
+                Ok(out)
+            }
         }
     }
 
@@ -659,6 +775,11 @@ impl Storage {
                 try_promote_http(chunks, mmap);
                 mmap.get().map(|m| m.as_ptr())
             }
+            // A series has no single mapping, and saying it has one is
+            // the mistake that would make a zero-copy read walk off
+            // the end of the first shard into unrelated memory.
+            // Callers that need pointers take them per part.
+            Storage::Series { .. } => None,
         }
     }
 
@@ -680,6 +801,19 @@ impl Storage {
                 try_promote_http(chunks, mmap);
                 mmap.get().and_then(|m| m.get(start..end))
             }
+            // Borrowable only when the range lies inside one shard.
+            // A range crossing a seam has no contiguous backing, and
+            // the caller falls back to `read_bytes` as it does for any
+            // other non-borrowable storage.
+            Storage::Series { parts, starts, .. } => {
+                let i = match starts.binary_search(&offset) {
+                    Ok(i) => i,
+                    Err(0) => return None,
+                    Err(i) => i - 1,
+                };
+                let within = offset - starts[i];
+                parts[i].mmap_slice(within, len)
+            }
         }
     }
 
@@ -689,6 +823,7 @@ impl Storage {
             Storage::Mmap { mmap: m, .. } => m.len() as u64,
             Storage::Http { chunks, .. } => chunks.total_size(),
             Storage::Cached { channel, .. } => channel.content_size(),
+            Storage::Series { total, .. } => *total,
         }
     }
 
@@ -700,6 +835,9 @@ impl Storage {
     /// downloaded the whole file.
     pub(crate) fn is_complete(&self) -> bool {
         match self {
+            // A series is resident only when every shard is: a facet
+            // half of whose shards are here is not readable.
+            Storage::Series { parts, .. } => parts.iter().all(|p| p.is_complete()),
             Storage::Mmap { .. } => true,
             Storage::Http { chunks, mmap } => {
                 try_promote_http(chunks, mmap);
@@ -715,6 +853,7 @@ impl Storage {
     /// Whether reads avoid network round-trips.
     pub(crate) fn is_local(&self) -> bool {
         match self {
+            Storage::Series { parts, .. } => parts.iter().all(|p| p.is_local()),
             Storage::Mmap { .. } => true,
             Storage::Cached { channel, mmap } => {
                 try_promote_cached(channel, mmap);
@@ -764,16 +903,48 @@ impl Storage {
         &self,
         byte_start: u64,
         byte_end: u64,
-        cb: F,
+        mut cb: F,
     ) -> io::Result<()>
     where
         F: FnMut(&crate::transport::DownloadProgress),
     {
+        self.prebuffer_range_with_progress_dyn(byte_start, byte_end, &mut cb)
+    }
+
+    /// The body of [`Self::prebuffer_range_with_progress`], with the
+    /// callback dynamically dispatched.
+    ///
+    /// A series delegates to its shards, and a generic callback would
+    /// re-instantiate this function at `&mut F`, then `&mut &mut F`,
+    /// for as long as the compiler was willing — so the recursive form
+    /// takes a trait object and the recursion stays monomorphic.
+    fn prebuffer_range_with_progress_dyn(
+        &self,
+        byte_start: u64,
+        byte_end: u64,
+        cb: &mut dyn FnMut(&crate::transport::DownloadProgress),
+    ) -> io::Result<()> {
         match self {
+            // Each shard buffers the slice of the range that falls in
+            // it, so a window over a series costs the shards it spans
+            // rather than the whole facet (SH-92).
+            Storage::Series { parts, starts, total } => {
+                let end = byte_end.min(*total);
+                for (i, part) in parts.iter().enumerate() {
+                    let part_start = starts[i];
+                    let part_end = part_start + part.total_size();
+                    if part_end <= byte_start || part_start >= end {
+                        continue;
+                    }
+                    let from = byte_start.saturating_sub(part_start);
+                    let to = end.min(part_end) - part_start;
+                    part.prebuffer_range_with_progress_dyn(from, to, cb)?;
+                }
+                Ok(())
+            }
             // Local mmap is already fully resident — fire one
             // completion event so callers' meters land at 100%.
             Storage::Mmap { mmap: m, .. } => {
-                let mut cb = cb;
                 cb(&crate::transport::DownloadProgress::new(m.len() as u64, 0));
                 Ok(())
             }
@@ -792,11 +963,27 @@ impl Storage {
     /// rather than wait for completion. Same strict contract:
     /// either every byte is resident on `Ok`, or an `Err` is
     /// returned.
-    pub(crate) fn prebuffer_with_progress<F>(&self, cb: F) -> io::Result<()>
+    pub(crate) fn prebuffer_with_progress<F>(&self, mut cb: F) -> io::Result<()>
     where
         F: FnMut(&crate::transport::DownloadProgress),
     {
+        self.prebuffer_with_progress_dyn(&mut cb)
+    }
+
+    /// The body of [`Self::prebuffer_with_progress`]. See
+    /// [`Self::prebuffer_range_with_progress_dyn`] for why the
+    /// recursive form takes a trait object.
+    fn prebuffer_with_progress_dyn(
+        &self,
+        cb: &mut dyn FnMut(&crate::transport::DownloadProgress),
+    ) -> io::Result<()> {
         match self {
+            Storage::Series { parts, .. } => {
+                for part in parts {
+                    part.prebuffer_with_progress_dyn(cb)?;
+                }
+                Ok(())
+            }
             Storage::Mmap { .. } => Ok(()),
             Storage::Http { chunks, mmap } => {
                 if mmap.get().is_some() {
@@ -874,6 +1061,8 @@ impl Storage {
     /// ready.
     fn promoted_mmap(&self) -> Option<&Mmap> {
         match self {
+            // No single mapping to promote; see `mmap_base`.
+            Storage::Series { .. } => None,
             Storage::Mmap { mmap: m, .. } => Some(m),
             Storage::Cached { channel, mmap } => {
                 try_promote_cached(channel, mmap);
@@ -1035,6 +1224,11 @@ impl Storage {
             chunk_span(byte_start, byte_end, chunk_size, total_chunks, content_size)?;
         let resident = match self {
             Storage::Mmap { .. } => return None,
+            // Chunk fill is a property of one transport. A series
+            // spans several, each with its own chunk map, so there is
+            // no single span to report — residency for a series is
+            // asked per shard.
+            Storage::Series { .. } => return None,
             Storage::Http { chunks, .. } => chunks.valid_count_in_range(first, last),
             Storage::Cached { channel, .. } => channel.valid_count_in_range(first, last),
         };
@@ -1044,6 +1238,8 @@ impl Storage {
     pub(crate) fn fill_stats(&self) -> Option<(u32, u32, u64, u64, bool)> {
         match self {
             Storage::Mmap { .. } => None,
+            // See `range_fill`: one chunk map per shard, not per facet.
+            Storage::Series { .. } => None,
             Storage::Http { chunks, .. } => Some((
                 chunks.valid_count(),
                 chunks.total_chunks(),
@@ -1065,6 +1261,11 @@ impl Storage {
 impl std::fmt::Debug for Storage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Storage::Series { parts, total, .. } => f
+                .debug_struct("Storage::Series")
+                .field("shards", &parts.len())
+                .field("size", total)
+                .finish(),
             Storage::Mmap { mmap: m, .. } => f
                 .debug_struct("Storage::Mmap")
                 .field("size", &m.len())
@@ -1244,5 +1445,152 @@ mod chunk_span_tests {
         // 250 bytes in 100-byte chunks = 3 chunks, the last holding 50.
         assert_eq!(chunk_span(200, 250, CS, 3, 250), Some((2, 2)));
         assert_eq!(chunk_span(0, 250, CS, 3, 250), Some((0, 2)));
+    }
+}
+
+#[cfg(test)]
+mod series_tests {
+    use super::*;
+
+    fn tmpdir() -> tempfile::TempDir {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(&base).unwrap()
+    }
+
+    /// Write shard `i` of a ramp: byte `n` of the joined space is
+    /// `n as u8`, so any read reports where it came from.
+    fn shard(dir: &Path, i: u32, from: usize, len: usize) -> std::path::PathBuf {
+        let p = dir.join(crate::dataset::shards::shard_name("f", "fvecs", i));
+        let bytes: Vec<u8> = (from..from + len).map(|n| n as u8).collect();
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// **The joined space is the concatenation.** A read at any offset
+    /// returns the bytes the unsharded file would have had there.
+    #[test]
+    fn a_series_reads_as_one_byte_space() {
+        let tmp = tmpdir();
+        let shards = vec![
+            shard(tmp.path(), 0, 0, 100),
+            shard(tmp.path(), 1, 100, 100),
+            shard(tmp.path(), 2, 200, 50),
+        ];
+        let s = Storage::open_series(&shards).unwrap();
+        assert_eq!(s.total_size(), 250);
+
+        // Whole space, one read.
+        let all = s.read_bytes(0, 250).unwrap();
+        assert_eq!(all, (0..250).map(|n| n as u8).collect::<Vec<u8>>());
+
+        // Reads inside one shard.
+        assert_eq!(s.read_bytes(0, 4).unwrap(), [0, 1, 2, 3]);
+        assert_eq!(s.read_bytes(150, 4).unwrap(), [150, 151, 152, 153]);
+        assert_eq!(s.read_bytes(246, 4).unwrap(), [246, 247, 248, 249]);
+    }
+
+    /// A read that crosses a seam is stitched, not truncated — the
+    /// case a reader hits whenever a window straddles two shards.
+    #[test]
+    fn a_read_across_a_seam_is_stitched() {
+        let tmp = tmpdir();
+        let shards = vec![
+            shard(tmp.path(), 0, 0, 100),
+            shard(tmp.path(), 1, 100, 100),
+        ];
+        let s = Storage::open_series(&shards).unwrap();
+
+        assert_eq!(s.read_bytes(98, 4).unwrap(), [98, 99, 100, 101]);
+        // And a read spanning all of both.
+        assert_eq!(s.read_bytes(0, 200).unwrap().len(), 200);
+    }
+
+    /// Past the end is refused rather than silently short.
+    #[test]
+    fn a_read_past_the_end_is_refused() {
+        let tmp = tmpdir();
+        let shards = vec![shard(tmp.path(), 0, 0, 10), shard(tmp.path(), 1, 10, 10)];
+        let s = Storage::open_series(&shards).unwrap();
+        assert!(s.read_bytes(19, 4).is_err());
+        assert!(s.read_bytes(20, 1).is_err());
+        assert_eq!(s.read_bytes(19, 1).unwrap(), [19]);
+    }
+
+    /// **A series has no single base pointer**, and says so — the
+    /// alternative is a zero-copy read walking off the end of the
+    /// first shard into unrelated memory.
+    #[test]
+    fn a_series_offers_no_single_mapping() {
+        let tmp = tmpdir();
+        let shards = vec![shard(tmp.path(), 0, 0, 10), shard(tmp.path(), 1, 10, 10)];
+        let s = Storage::open_series(&shards).unwrap();
+        assert!(s.mmap_base().is_none());
+        // But a range inside one shard is still borrowable.
+        assert_eq!(s.mmap_slice(2, 4).unwrap(), &[2, 3, 4, 5]);
+        assert_eq!(s.mmap_slice(12, 4).unwrap(), &[12, 13, 14, 15]);
+        // And one that crosses a seam is not.
+        assert!(s.mmap_slice(8, 4).is_none());
+    }
+
+    /// A single shard is not a series: it opens as the file itself, so
+    /// every zero-copy path stays available.
+    #[test]
+    fn one_shard_is_just_a_file() {
+        let tmp = tmpdir();
+        let shards = vec![shard(tmp.path(), 0, 0, 10)];
+        let s = Storage::open_series(&shards).unwrap();
+        assert!(s.mmap_base().is_some(), "still a plain mapping");
+        assert_eq!(s.total_size(), 10);
+    }
+
+    /// **A path whose file is absent resolves to its shards.** This is
+    /// what lets a step that writes a series and a step that reads the
+    /// unsharded name meet without either knowing about the other.
+    #[test]
+    fn an_absent_file_resolves_to_its_series() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 0, 100);
+        shard(tmp.path(), 1, 100, 100);
+
+        let s = Storage::open_path(&tmp.path().join("f.fvecs")).unwrap();
+        assert_eq!(s.total_size(), 200);
+        assert_eq!(s.read_bytes(99, 2).unwrap(), [99, 100]);
+    }
+
+    /// The plain file wins when it is there, so nothing about an
+    /// ordinary unsharded facet changes.
+    #[test]
+    fn a_present_file_is_preferred_over_stray_shards() {
+        let tmp = tmpdir();
+        std::fs::write(tmp.path().join("f.fvecs"), [9u8; 7]).unwrap();
+        shard(tmp.path(), 0, 0, 100);
+
+        let s = Storage::open_path(&tmp.path().join("f.fvecs")).unwrap();
+        assert_eq!(s.total_size(), 7, "the file itself, not the shard");
+    }
+
+    /// **A gap stops discovery**, so a facet missing a shard is not
+    /// read as the prefix that happens to be there.
+    #[test]
+    fn a_missing_shard_truncates_discovery_rather_than_skipping_it() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 0, 10);
+        shard(tmp.path(), 1, 10, 10);
+        // No shard 2.
+        shard(tmp.path(), 3, 30, 10);
+
+        let found = crate::dataset::shards::discover_shards(&tmp.path().join("f.fvecs"));
+        assert_eq!(found.len(), 2, "stops at the gap: {found:?}");
+    }
+
+    /// A path with no shards at all discovers nothing — the ordinary
+    /// case for every unsharded file.
+    #[test]
+    fn an_ordinary_path_discovers_no_shards() {
+        let tmp = tmpdir();
+        std::fs::write(tmp.path().join("f.fvecs"), [1u8; 4]).unwrap();
+        assert!(crate::dataset::shards::discover_shards(&tmp.path().join("f.fvecs")).is_empty());
+        assert!(crate::dataset::shards::discover_shards(&tmp.path().join("absent.fvecs")).is_empty());
     }
 }

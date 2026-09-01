@@ -126,3 +126,106 @@ pub fn pwrite_all(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
         ))
     }
 }
+
+/// A facet opened for positional reads, whether it is one file or a
+/// series of shards.
+///
+/// The hot scan paths read with `pread` into heap buffers rather than
+/// mapping the file, so they hold a `File` rather than a reader — and
+/// a `File` is one file. This presents the shards of a series the same
+/// way [`Storage::Series`](vectordata) presents them to the mapped
+/// readers: as one byte space, with offsets that mean what the
+/// unsharded file's offsets meant.
+///
+/// A read never crosses a shard here because callers read whole
+/// records and records never straddle (SH-13) — but one that did would
+/// be stitched rather than truncated, so the abstraction does not
+/// depend on the caller knowing that.
+pub struct SpanFile {
+    parts: Vec<File>,
+    /// Byte offset at which each part begins. Ascending, first zero.
+    starts: Vec<u64>,
+    total: u64,
+}
+
+impl SpanFile {
+    /// Open `path`, or its shards when `path` itself is absent.
+    ///
+    /// The same resolution rule the mapped readers use: a facet
+    /// written as a series has nothing at the unsharded name, and a
+    /// caller handed that name means the facet.
+    pub fn open(path: &std::path::Path) -> io::Result<Self> {
+        let files: Vec<std::path::PathBuf> = if path.exists() {
+            vec![path.to_path_buf()]
+        } else {
+            let shards = vectordata::dataset::discover_shards(path);
+            if shards.is_empty() {
+                // Let `File::open` produce the usual not-found error,
+                // naming the path the caller asked for.
+                vec![path.to_path_buf()]
+            } else {
+                shards
+            }
+        };
+        let mut parts = Vec::with_capacity(files.len());
+        let mut starts = Vec::with_capacity(files.len());
+        let mut total = 0u64;
+        for f in files {
+            let file = File::open(&f)?;
+            let len = file.metadata()?.len();
+            starts.push(total);
+            total += len;
+            parts.push(file);
+        }
+        Ok(Self { parts, starts, total })
+    }
+
+    /// Total bytes across every part.
+    pub fn len(&self) -> u64 {
+        self.total
+    }
+
+    /// Whether this facet holds no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// How many files back this facet. `1` for an unsharded one.
+    pub fn part_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Fill `buf` from `offset` in the joined space.
+    #[inline]
+    pub fn pread_exact(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        // The overwhelmingly common case, and the one the scan loops
+        // take on every record: one file, or a read wholly inside one
+        // shard. Kept to a single positional read.
+        if self.parts.len() == 1 {
+            return pread_exact(&self.parts[0], buf, offset);
+        }
+        let end = offset + buf.len() as u64;
+        if end > self.total {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("read past end of series: offset={offset} len={} size={}", buf.len(), self.total),
+            ));
+        }
+        let mut want = offset;
+        let mut at = 0usize;
+        while want < end {
+            let i = match self.starts.binary_search(&want) {
+                Ok(i) => i,
+                Err(i) => i - 1,
+            };
+            let part_start = self.starts[i];
+            let part_len = self.parts[i].metadata()?.len();
+            let within = want - part_start;
+            let take = ((part_len - within).min(end - want)) as usize;
+            pread_exact(&self.parts[i], &mut buf[at..at + take], within)?;
+            at += take;
+            want += take as u64;
+        }
+        Ok(())
+    }
+}

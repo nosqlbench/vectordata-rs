@@ -324,6 +324,18 @@ pub struct XvecReader<T> {
     dim: usize,
     count: usize,
     entry_size: usize,
+    /// Mapped base address of each shard, when this reads a series.
+    ///
+    /// Empty for a single file, which keeps the hot path a plain
+    /// pointer add. Held as `usize` rather than `*const u8` so the
+    /// reader stays `Send + Sync`: the addresses belong to mmaps that
+    /// `storage` owns for this reader's whole life, so sharing them
+    /// across threads is exactly as safe as sharing the one base
+    /// pointer a single-file reader already shares.
+    part_bases: Vec<usize>,
+    /// Records in each shard but the last, so an ordinal resolves to
+    /// its shard with one division rather than a search (SH-64).
+    shard_records: usize,
     _phantom: PhantomData<T>,
 }
 
@@ -428,6 +440,8 @@ impl<T: VvecElement> XvecReader<T> {
                 dim: DIM_UNDEFINED,
                 count: 0,
                 entry_size: 0,
+                part_bases: Vec::new(),
+                shard_records: 0,
                 _phantom: PhantomData,
             });
         }
@@ -452,13 +466,53 @@ impl<T: VvecElement> XvecReader<T> {
             )));
         }
         let count = (total_size / entry_size as u64) as usize;
+        // For a series, remember where each shard is mapped and how
+        // many records it holds, so the zero-copy path can resolve an
+        // ordinal to a shard-local address.
+        let parts = storage.parts();
+        let (part_bases, shard_records) = if parts.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            let bases: Vec<usize> = parts
+                .iter()
+                .map(|p| p.mmap_base().map_or(0, |b| b as usize))
+                .collect();
+            // Every shard but the last is full, so shard 0's record
+            // count is the stride (SH-35).
+            let first = (parts[0].total_size() / entry_size as u64) as usize;
+            (bases, first)
+        };
         Ok(Self {
             storage,
             dim,
             count,
             entry_size,
+            part_bases,
+            shard_records,
             _phantom: PhantomData,
         })
+    }
+
+    /// The mapped address of record `index` and its offset within the
+    /// shard that holds it.
+    ///
+    /// For a single file this is the file's base and `index` itself —
+    /// the same arithmetic that was here before a facet could be a
+    /// series. For a series it is one division and an index.
+    #[inline]
+    fn slice_base(&self, index: usize) -> (*const u8, usize) {
+        if self.part_bases.is_empty() {
+            let base = self
+                .storage
+                .mmap_base()
+                .expect("XvecReader::get_slice requires mmap-backed storage");
+            return (base, index);
+        }
+        let shard = index / self.shard_records;
+        let local = index % self.shard_records;
+        let base = self.part_bases[shard];
+        assert!(base != 0, "shard {shard} of this series is not mmap-backed");
+        (base as *const u8, local)
     }
 }
 
@@ -473,11 +527,8 @@ impl XvecReader<f32> {
     /// the bounds-checked `Option<&[T]>` form.
     #[inline]
     pub fn get_slice(&self, index: usize) -> &[f32] {
-        let data_start = index * self.entry_size + 4;
-        let base = self
-            .storage
-            .mmap_base()
-            .expect("XvecReader::<f32>::get_slice requires mmap-backed storage");
+        let (base, local) = self.slice_base(index);
+        let data_start = local * self.entry_size + 4;
         unsafe { core::slice::from_raw_parts(base.add(data_start) as *const f32, self.dim) }
     }
 }
@@ -488,12 +539,8 @@ macro_rules! impl_get_slice {
             /// See [`XvecReader::<f32>::get_slice`] — same semantics.
             #[inline]
             pub fn get_slice(&self, index: usize) -> &[$t] {
-                let data_start = index * self.entry_size + 4;
-                let base = self.storage.mmap_base().expect(concat!(
-                    "XvecReader::<",
-                    stringify!($t),
-                    ">::get_slice requires mmap-backed storage"
-                ));
+                let (base, local) = self.slice_base(index);
+                let data_start = local * self.entry_size + 4;
                 unsafe { core::slice::from_raw_parts(base.add(data_start) as *const $t, self.dim) }
             }
         }
@@ -1472,5 +1519,131 @@ mod scalar_classification {
             let by_ext = is_scalar_ext(ext);
             assert_eq!(by_path, by_ext, "path classification of .{ext}");
         }
+    }
+}
+
+#[cfg(test)]
+mod series_reader_tests {
+    use super::*;
+
+    fn tmpdir() -> tempfile::TempDir {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(&base).unwrap()
+    }
+
+    /// Write records `from..from+n` of a dim-`d` fvec into shard `i`.
+    /// Record `r` is `[r, r+0.5, ...]`, so a value identifies its own
+    /// ordinal.
+    fn shard(dir: &std::path::Path, i: u32, d: usize, from: usize, n: usize) {
+        let p = dir.join(crate::dataset::shards::shard_name("base", "fvecs", i));
+        let mut bytes = Vec::new();
+        for r in from..from + n {
+            bytes.extend_from_slice(&(d as i32).to_le_bytes());
+            for k in 0..d {
+                bytes.extend_from_slice(&((r * 10 + k) as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    /// **A sharded facet reads as one vector space.** Count, dim, and
+    /// every record come back as if the shards were one file — which
+    /// is what lets a kernel scan a series without knowing it is one.
+    #[test]
+    fn a_sharded_facet_reads_as_one_vector_space() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 4, 0, 10);
+        shard(tmp.path(), 1, 4, 10, 10);
+        shard(tmp.path(), 2, 4, 20, 5);
+
+        let r = XvecReader::<f32>::open_path(&tmp.path().join("base.fvecs")).unwrap();
+        assert_eq!(VectorReader::count(&r), 25);
+        assert_eq!(VectorReader::dim(&r), 4);
+
+        for o in 0..25usize {
+            let want: Vec<f32> = (0..4).map(|k| (o * 10 + k) as f32).collect();
+            assert_eq!(r.get(o).unwrap(), want, "record {o} via get");
+        }
+    }
+
+    /// **The zero-copy path crosses shards.** `get_slice` is the KNN
+    /// inner loop; if it resolved every ordinal against the first
+    /// shard's base it would read adjacent memory and return plausible
+    /// garbage rather than failing.
+    #[test]
+    fn the_zero_copy_path_resolves_per_shard() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 3, 0, 8);
+        shard(tmp.path(), 1, 3, 8, 8);
+        shard(tmp.path(), 2, 3, 16, 4);
+
+        let r = XvecReader::<f32>::open_path(&tmp.path().join("base.fvecs")).unwrap();
+        assert_eq!(VectorReader::count(&r), 20);
+
+        for o in 0..20usize {
+            let want: Vec<f32> = (0..3).map(|k| (o * 10 + k) as f32).collect();
+            assert_eq!(r.get_slice(o), want.as_slice(), "record {o} via get_slice");
+        }
+        // The two paths agree, which is the invariant the hot loop
+        // relies on.
+        for o in [0usize, 7, 8, 15, 16, 19] {
+            assert_eq!(r.get_slice(o), r.get(o).unwrap().as_slice(), "record {o}");
+        }
+    }
+
+    /// A seam is where an off-by-one hides: the last record of each
+    /// shard and the first of the next are checked explicitly.
+    #[test]
+    fn records_either_side_of_a_seam_are_correct() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 2, 0, 6);
+        shard(tmp.path(), 1, 2, 6, 6);
+        let r = XvecReader::<f32>::open_path(&tmp.path().join("base.fvecs")).unwrap();
+
+        assert_eq!(r.get_slice(5), [50.0f32, 51.0].as_slice(), "last of shard 0");
+        assert_eq!(r.get_slice(6), [60.0f32, 61.0].as_slice(), "first of shard 1");
+    }
+
+    /// An unsharded file behaves exactly as it did — the series
+    /// machinery is inert when there is one file.
+    #[test]
+    fn a_single_file_is_unaffected() {
+        let tmp = tmpdir();
+        let path = tmp.path().join("solo.fvecs");
+        let mut bytes = Vec::new();
+        for r in 0..5usize {
+            bytes.extend_from_slice(&2i32.to_le_bytes());
+            for k in 0..2 {
+                bytes.extend_from_slice(&((r * 10 + k) as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).unwrap();
+
+        let r = XvecReader::<f32>::open_path(&path).unwrap();
+        assert_eq!(VectorReader::count(&r), 5);
+        assert_eq!(r.get_slice(4), [40.0f32, 41.0].as_slice());
+    }
+
+    /// A series of integer records reads the same way — the shard
+    /// resolution is about layout, not element type.
+    #[test]
+    fn an_integer_series_reads_across_shards() {
+        let tmp = tmpdir();
+        for (i, from) in [(0u32, 0usize), (1, 4)] {
+            let p = tmp.path().join(crate::dataset::shards::shard_name("n", "ivecs", i));
+            let mut bytes = Vec::new();
+            for r in from..from + 4 {
+                bytes.extend_from_slice(&3i32.to_le_bytes());
+                for k in 0..3 {
+                    bytes.extend_from_slice(&((r * 10 + k) as i32).to_le_bytes());
+                }
+            }
+            std::fs::write(p, bytes).unwrap();
+        }
+        let r = XvecReader::<i32>::open_path(&tmp.path().join("n.ivecs")).unwrap();
+        assert_eq!(VectorReader::count(&r), 8);
+        assert_eq!(r.get_slice(7), [70, 71, 72].as_slice());
+        assert_eq!(r.get(4).unwrap(), vec![40, 41, 42]);
     }
 }

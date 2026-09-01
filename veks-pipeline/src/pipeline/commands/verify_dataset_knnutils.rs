@@ -867,7 +867,8 @@ checks, in a single pipeline step.
             "  Streaming sgemm scan over {} base vectors ({} sample queries, elem={}B)",
             n_base, actual_sample, elem_size,
         ));
-        let base_file = match std::fs::File::open(&base_path) {
+        // See `compute_knn_blas`: a series reads as one byte space.
+        let base_file = match veks_core::formats::portable_io::SpanFile::open(&base_path) {
             Ok(f) => f,
             Err(e) => return error_result(format!("open base for streaming: {}", e), start),
         };

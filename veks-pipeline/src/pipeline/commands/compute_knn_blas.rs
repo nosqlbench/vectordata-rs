@@ -20,9 +20,8 @@
 //! `libmkl-dev`) — no static compilation, no FAISS dependency.
 
 use std::collections::BinaryHeap;
-use std::fs::File;
 use std::io::Write;
-use veks_core::formats::portable_io::pread_exact;
+use veks_core::formats::portable_io::SpanFile;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -122,7 +121,7 @@ fn alloc_packed_buf(n: usize, dim: usize) -> Vec<f32> {
 /// The sgemm kernel itself only knows f32, so the upcast happens
 /// here at unpack time (cost is negligible vs the sgemm).
 fn pread_and_unpack(
-    file: &File,
+    file: &SpanFile,
     byte_off: u64,
     n_vecs: usize,
     entry_size: usize,
@@ -132,7 +131,7 @@ fn pread_and_unpack(
     packed: &mut [f32],
 ) -> std::io::Result<()> {
     let n_bytes = n_vecs * entry_size;
-    pread_exact(file, &mut raw[..n_bytes], byte_off)?;
+    file.pread_exact(&mut raw[..n_bytes], byte_off)?;
     // Unpack: for each entry, skip the 4-byte dim header, then
     // either copy or convert dim elements into the packed buffer.
     match elem_size {
@@ -421,7 +420,7 @@ impl SgemmScanBuffers {
 /// sgemm when computing cosine on non-normalized inputs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_range_sgemm(
-    base_file: &File,
+    base_file: &SpanFile,
     base_range: std::ops::Range<usize>,
     dim: usize,
     // On-disk element width of base records: 4 for `.fvec` / `.fvecs`,
@@ -754,7 +753,9 @@ Reuses the shared segment-cache infrastructure:
             Ok(r) => r,
             Err(e) => return error_result(format!("open query: {}", e), start),
         };
-        let base_file = match File::open(&base_path) {
+        // Opens the shards when the facet is a series (SH-35); a
+        // single file is one part and reads exactly as before.
+        let base_file = match SpanFile::open(&base_path) {
             Ok(f) => Arc::new(f),
             Err(e) => return error_result(format!("open base for streaming: {}", e), start),
         };

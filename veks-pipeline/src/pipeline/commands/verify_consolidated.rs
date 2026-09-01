@@ -595,7 +595,9 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // buffers so RSS stays bounded. `elem_size` (4 for f32 /
         // 2 for f16) controls how `pread_and_unpack` decodes
         // each record into the f32 sgemm packed buffer.
-        let base_file = match std::fs::File::open(&base_path) {
+        // Opens the shards when the facet is a series (SH-35); a
+        // single file is one part and reads exactly as before.
+        let base_file = match veks_core::formats::portable_io::SpanFile::open(&base_path) {
             Ok(f) => f,
             Err(e) => return error_result(format!("open base for streaming: {}", e), start),
         };
