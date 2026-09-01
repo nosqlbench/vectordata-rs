@@ -553,3 +553,110 @@ fn a_sharded_record_facet_reports_its_shape() {
         25
     );
 }
+
+// ── the planner's slab branch ──────────────────────────────────────
+
+/// A facet of `records` MNodes in 4 KiB pages, so a window spans some
+/// pages and not others.
+fn paged_facet(dir: &std::path::Path, records: i32) {
+    std::fs::create_dir_all(dir).unwrap();
+    let cfg = slabtastic::WriterConfig::new(4096, 4096, 1 << 20, false).unwrap();
+    let mut w = slabtastic::SlabWriter::new(dir.join("metadata_content.slab"), cfg).unwrap();
+    for i in 0..records {
+        let mut n = MNode::new();
+        n.fields.insert("id".to_string(), MValue::Int32(i));
+        n.fields.insert("pad".to_string(), MValue::Text("x".repeat(40)));
+        w.add_record(&n.to_bytes()).unwrap();
+    }
+    w.finish().unwrap();
+    std::fs::write(dir.join("base.fvec"), [4u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    std::fs::write(
+        dir.join("dataset.yaml"),
+        "name: paged\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+         metadata_content: metadata_content.slab\n",
+    )
+    .unwrap();
+}
+
+/// **A slab window costs the pages it spans, not the facet.**
+///
+/// Before the planner learned about slabs, `map_in_file` gave up at
+/// `infer_elem_size(".slab") == 0` and every window priced as a whole
+/// facet download — the reader fetching a page at a time while the
+/// planner said otherwise.
+#[test]
+fn a_slab_window_prices_at_the_pages_it_spans() {
+    use vectordata::dataset::source::parse_window;
+
+    let tmp = tempfile::tempdir().unwrap();
+    paged_facet(tmp.path(), 2000);
+    let g = vectordata::TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let total = view.open_facet_storage("metadata_content").unwrap().total_size();
+    assert!(total > 40_000, "the fixture must span many pages: {total}");
+
+    let narrow = view
+        .prefetch_plan("metadata_content", &parse_window("10..20").unwrap())
+        .unwrap();
+    assert!(
+        !narrow.degrades_to_full_download,
+        "a ten-record window must not price as the whole facet"
+    );
+    let narrow_bytes: u64 = narrow.byte_ranges.iter().map(|r| r.end - r.start).sum();
+    assert!(
+        narrow_bytes > 0 && narrow_bytes < total / 4,
+        "a ten-record window cost {narrow_bytes} of {total}"
+    );
+
+    // The whole facet costs the whole facet — the mapping is not merely
+    // returning something small.
+    let whole = view
+        .prefetch_plan("metadata_content", &parse_window("0..2000").unwrap())
+        .unwrap();
+    let whole_bytes: u64 = whole.byte_ranges.iter().map(|r| r.end - r.start).sum();
+    assert!(
+        whole_bytes > narrow_bytes * 4,
+        "every record costs more than ten: {whole_bytes} vs {narrow_bytes}"
+    );
+    assert!(whole_bytes <= total);
+}
+
+/// A window running past the last record ends at the last page rather
+/// than at one that does not exist.
+#[test]
+fn a_slab_window_past_the_end_stops_at_the_last_page() {
+    use vectordata::dataset::source::parse_window;
+
+    let tmp = tempfile::tempdir().unwrap();
+    paged_facet(tmp.path(), 500);
+    let g = vectordata::TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let total = view.open_facet_storage("metadata_content").unwrap().total_size();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("490..100000").unwrap())
+        .unwrap();
+    let bytes: u64 = plan.byte_ranges.iter().map(|r| r.end - r.start).sum();
+    assert!(bytes > 0, "the tail records are still fetchable");
+    assert!(bytes <= total, "and the plan does not run past the file");
+}
+
+/// A window whose lower bound is past the end maps to nothing, which
+/// degrades rather than inventing a range.
+#[test]
+fn a_slab_window_starting_past_the_end_maps_to_nothing() {
+    use vectordata::dataset::source::parse_window;
+
+    let tmp = tempfile::tempdir().unwrap();
+    paged_facet(tmp.path(), 100);
+    let g = vectordata::TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+
+    let plan = view
+        .prefetch_plan("metadata_content", &parse_window("500..600").unwrap())
+        .unwrap();
+    assert!(
+        plan.degrades_to_full_download,
+        "an unmappable window degrades rather than fabricating a range"
+    );
+}
