@@ -1104,6 +1104,15 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
         config.set_variable(k, v);
     }
 
+    // Make the declarations describe what the run actually wrote: a
+    // facet the pipeline split under the shard cap has shards on disk
+    // and nothing at its declared filename (SH-37).
+    let workspace = dataset_path.parent().unwrap_or(std::path::Path::new("."));
+    let reconciled = config.reconcile_shard_declarations(workspace);
+    if reconciled > 0 {
+        eprintln!("  declared {reconciled} facet(s) as multi-file series");
+    }
+
     // Derive attributes from pipeline results.
     // The attribute reflects the actual output state:
     // - If the pipeline removed zeros/duplicates, the output is free of them.

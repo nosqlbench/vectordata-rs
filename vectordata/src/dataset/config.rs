@@ -454,6 +454,72 @@ impl DatasetConfig {
     }
 
     /// Set a variable in the config.
+    /// Make every facet declaration describe the files that are
+    /// actually there.
+    ///
+    /// A facet the pipeline wrote as a series has nothing at its
+    /// declared filename and shards beside it (SH-35). Readers resolve
+    /// that themselves, but the declaration is what an external
+    /// consumer reads, so it is corrected here rather than left
+    /// describing a file nobody wrote (SH-37: the declaration
+    /// describes what was written).
+    ///
+    /// Observed from disk rather than reported by the writer: several
+    /// steps produce facets, some of them out of process, and one rule
+    /// applied to the result cannot disagree with itself.
+    ///
+    /// `base` is the directory declared paths are relative to.
+    /// Returns how many declarations changed.
+    pub fn reconcile_shard_declarations(&mut self, base: &std::path::Path) -> usize {
+        let mut changed = 0;
+        for profile in self.profiles.profiles.values_mut() {
+            for view in profile.views.values_mut() {
+                // Only a plain path can become a series here: a
+                // windowed or namespaced source names something inside
+                // a file, which is a different question.
+                if !view.source.window.is_empty() || view.source.namespace.is_some() {
+                    continue;
+                }
+                let path = view.source.path.clone();
+                if super::shards::has_shard_field(&path) {
+                    continue; // already declared as a series
+                }
+                let declared = base.join(&path);
+                if declared.exists() {
+                    continue;
+                }
+                let shards = super::shards::discover_shards(&declared);
+                if shards.is_empty() {
+                    continue;
+                }
+                let Some(shape) = super::shards::observe_series(&shards) else {
+                    continue;
+                };
+                // The `source:` keeps whatever directory prefix it had
+                // and gains the shard field (SH-47).
+                let file = std::path::Path::new(&path);
+                let (basename, ext) = match file.file_name().and_then(|n| n.to_str()) {
+                    Some(name) => match name.rsplit_once('.') {
+                        Some((b, e)) => (b.to_string(), e.to_string()),
+                        None => (name.to_string(), String::new()),
+                    },
+                    None => continue,
+                };
+                let pattern = super::shards::shard_source_spec(&basename, &ext);
+                let spec = match file.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    Some(dir) => dir.join(&pattern).to_string_lossy().into_owned(),
+                    None => pattern,
+                };
+                view.source.path = spec;
+                view.shard_stride = Some(shape.stride);
+                view.shard_count = Some(shape.shards);
+                view.record_count = Some(shape.records);
+                changed += 1;
+            }
+        }
+        changed
+    }
+
     pub fn set_variable(&mut self, key: &str, value: &str) {
         self.variables.insert(key.to_string(), value.to_string());
     }
