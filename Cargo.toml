@@ -14,7 +14,7 @@
 # collides on the output filename — build one or the other with -p.
 [package]
 name = "vectordata-rs"
-version = "1.9.0"
+version = "2.0.0"
 edition = "2024"
 description = "Umbrella binary for the vectordata-rs toolkit: the vectordata CLI plus veks, vecd, and slab in one installable multiplexer"
 license = "Apache-2.0"
@@ -42,9 +42,9 @@ path = "src/main.rs"
 
 [dependencies]
 slabtastic = { path = "slabtastic", version = "1.0.0" }
-vecd = { path = "vecd", version = "1.0.0" }
-vectordata = { path = "vectordata", version = "1.0.0", features = ["cli"] }
-veks = { path = "veks", version = "1.0.0", default-features = false }
+vecd = { path = "vecd", version = "2.0.0" }
+vectordata = { path = "vectordata", version = "2.0.0", features = ["cli"] }
+veks = { path = "veks", version = "2.0.0", default-features = false }
 
 # Mirror veks's feature surface so `cargo install --path .` gets the same
 # default personality as `cargo install --path veks` (knnutils is veks's
