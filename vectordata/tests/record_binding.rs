@@ -673,3 +673,103 @@ fn binding_allocates_nothing_per_record() {
          path should allocate nothing"
     );
 }
+
+// ── error paths and the small surface ──────────────────────────────
+
+use vectordata::binding::{BindError, FORMS_NAMESPACE};
+
+/// A facet with no records has no layout to learn, and says so rather
+/// than producing an empty one that binds nothing.
+#[test]
+fn an_empty_facet_has_no_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path(), |p| slab(p, &[]));
+    let facet = open(tmp.path());
+    assert_eq!(facet.count().unwrap(), 0);
+
+    match Layout::discover(&facet) {
+        Err(BindError::NoLayout(what)) => assert!(what.contains("metadata_content"), "{what}"),
+        other => panic!("expected NoLayout, got {other:?}"),
+    }
+}
+
+/// The error variants carry what a caller needs to act, not only text
+/// to print.
+#[test]
+fn bind_errors_are_matchable_not_only_readable() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path(), |p| {
+        slab_with_forms(p, &[row(1, "a", 1.0)], &[r#"{"name":"row"}"#])
+    });
+    let facet = open(tmp.path());
+    let layout = Layout::discover(&facet).unwrap();
+
+    match Binder::select(&layout, &["absent"]) {
+        Err(BindError::NoSuchField { field, available }) => {
+            assert_eq!(field, "absent");
+            assert_eq!(available, ["id", "tag", "score"]);
+        }
+        other => panic!("expected NoSuchField, got {other:?}"),
+    }
+
+    match form_by_name(&facet, "nope") {
+        Err(BindError::NoSuchForm { form, available }) => {
+            assert_eq!(form, "nope");
+            assert_eq!(available, ["row"]);
+        }
+        other => panic!("expected NoSuchForm, got {other:?}"),
+    }
+}
+
+/// A facet with no declared forms reports none *available* while still
+/// offering its implicit one — the distinction a caller needs to tell
+/// "undeclared" from "declared and unmatched".
+#[test]
+fn an_implicit_form_is_offered_but_not_listed_as_a_choice() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path(), |p| slab(p, &[row(1, "a", 1.0)]));
+    let facet = open(tmp.path());
+
+    assert_eq!(forms_of(&facet).unwrap().len(), 1);
+    match form_by_name(&facet, "row") {
+        Err(BindError::NoSuchForm { available, .. }) => {
+            assert!(available.is_empty(), "the implicit form is not a named choice");
+        }
+        other => panic!("expected NoSuchForm, got {other:?}"),
+    }
+    // But the implicit form is reachable by its own name.
+    assert!(form_by_name(&facet, Form::IMPLICIT).is_ok());
+}
+
+/// The layout answers where a field sits, which is the identity every
+/// compiled binder is built on.
+#[test]
+fn a_layout_reports_field_positions() {
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path(), |p| slab(p, &[row(1, "a", 1.0)]));
+    let layout = Layout::discover(&open(tmp.path())).unwrap();
+
+    assert_eq!(layout.position_of("id"), Some(0));
+    assert_eq!(layout.position_of("tag"), Some(1));
+    assert_eq!(layout.position_of("score"), Some(2));
+    assert_eq!(layout.position_of("absent"), None);
+    // Positions index the type list too.
+    assert_eq!(layout.types()[layout.position_of("score").unwrap()], BindType::Float64);
+}
+
+/// The namespace is named by a constant, and the fixtures write the
+/// name that constant holds — otherwise renaming it would leave the
+/// tests passing against a namespace nothing reads.
+#[test]
+fn the_forms_namespace_constant_is_the_name_written() {
+    assert_eq!(FORMS_NAMESPACE, "forms");
+
+    let tmp = tempfile::tempdir().unwrap();
+    dataset(tmp.path(), |p| {
+        slab_with_forms(p, &[row(1, "a", 1.0)], &[r#"{"name":"row"}"#])
+    });
+    let facet = open(tmp.path());
+    // Read through the constant rather than the literal.
+    assert_eq!(facet.namespace(FORMS_NAMESPACE).count().unwrap(), 1);
+    assert_eq!(forms_of(&facet).unwrap()[0].name, "row");
+}
