@@ -24,6 +24,7 @@
 //! ```
 
 pub mod atomic_write;
+pub mod shard_write;
 pub mod blas_abi;
 pub mod bound;
 pub mod cli;

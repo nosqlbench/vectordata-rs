@@ -125,6 +125,10 @@ pub enum VecFormat {
     ScalarI64,
 }
 
+/// Bytes a slab spends per record beyond its payload: one entry in
+/// the page's offset array.
+pub const SLAB_RECORD_FRAMING: u64 = 4;
+
 impl VecFormat {
     /// Human-readable name matching the file extension.
     pub fn name(self) -> &'static str {
@@ -398,6 +402,31 @@ impl VecFormat {
             Some(record_count * stride)
         } else if self.is_scalar() {
             Some(record_count * self.element_size() as u64)
+        } else {
+            None
+        }
+    }
+
+    /// Bytes one record of `dimension` occupies on disk, framing
+    /// included — the inverse of [`Self::expected_file_size`], and
+    /// what a shard-size cap is divided by.
+    ///
+    /// `None` where a record has no fixed size to state: a vvec
+    /// record carries its own dimension, and npy/parquet/hdf5 are
+    /// container formats with their own structure. Those are sized by
+    /// sampling instead (see
+    /// [`sample_spread`](vectordata::dataset::shard_sizing::sample_spread)).
+    ///
+    /// `Slab` is `None` too, and for a subtler reason: a slab's record
+    /// payload is the width of whatever was written *into* it, which
+    /// is a property of the source, not of the slab. See
+    /// [`SinkConfig::record_bytes`](writer::SinkConfig::record_bytes),
+    /// which knows both.
+    pub fn record_bytes(self, dimension: u32) -> Option<u64> {
+        if self.is_uniform_xvec() {
+            Some(4 + (dimension as u64) * (self.element_size() as u64))
+        } else if self.is_scalar() {
+            Some(self.element_size() as u64)
         } else {
             None
         }

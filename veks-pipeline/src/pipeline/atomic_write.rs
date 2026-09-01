@@ -116,7 +116,7 @@ impl Drop for AtomicWriter {
 ///
 /// Uses the same directory (same filesystem for atomic rename) with a
 /// `.tmp` suffix appended.
-fn temp_path_for(path: &Path) -> PathBuf {
+pub(crate) fn temp_path_for(path: &Path) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(".tmp");
     PathBuf::from(p)

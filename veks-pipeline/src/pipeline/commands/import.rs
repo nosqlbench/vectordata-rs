@@ -257,6 +257,17 @@ work with.
             slab_page_size,
             slab_namespace,
             schema_sidecar: None,
+            // A facet larger than the governor's cap is written as a
+            // series rather than one file it may not be possible to
+            // store or move (SH-35). Defaulted, so this holds for a
+            // run that passed no --resources at all — and never
+            // applied to a cache artifact, which the next step opens
+            // by its exact path.
+            max_shard_bytes: crate::pipeline::shard_write::cap_for_output(
+                &ctx.governor,
+                &ctx.workspace,
+                &output_path,
+            ),
         };
         let mut sink = match writer::open_sink(&output_path, target_format, &sink_config) {
             Ok(s) => s,
