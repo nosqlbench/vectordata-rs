@@ -2306,3 +2306,233 @@ mod sharded_output {
         );
     }
 }
+
+#[cfg(test)]
+mod span_reader_tests {
+    use super::*;
+    use crate::dataset::shards::{Entry, Shards};
+    use std::io::{Read, Seek, SeekFrom};
+
+    /// A file of `n` bytes whose byte `i` is `i as u8` — so any read
+    /// answers *where in the file* it came from, not merely how much.
+    fn ramp(path: &Path, n: usize) {
+        let bytes: Vec<u8> = (0..n).map(|i| i as u8).collect();
+        fs::write(path, bytes).unwrap();
+    }
+
+    /// Spans over `parts` whole files, in order.
+    fn series(dir: &Path, parts: &[(&str, usize)]) -> SourceSpans {
+        for (name, n) in parts {
+            ramp(&dir.join(name), *n);
+        }
+        let shards = Shards::new(
+            parts
+                .iter()
+                .map(|(name, n)| Entry {
+                    source: crate::dataset::source::parse_source_string(name).unwrap(),
+                    file_base: 0,
+                    len: *n as u64,
+                })
+                .collect(),
+        )
+        .unwrap();
+        SourceSpans::from_shards(&shards, dir, 1).unwrap()
+    }
+
+    /// **The concatenation is the stream.** Reading a series to the end
+    /// yields every shard's bytes, in shard order, once.
+    #[test]
+    fn a_series_reads_as_one_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spans = series(tmp.path(), &[("a", 10), ("b", 5), ("c", 7)]);
+        assert_eq!(spans.len(), 22);
+
+        let mut all = Vec::new();
+        spans.open().unwrap().read_to_end(&mut all).unwrap();
+
+        let expect: Vec<u8> = (0..10u8).chain(0..5).chain(0..7).collect();
+        assert_eq!(all, expect);
+    }
+
+    /// A read that would cross a shard seam stops at it and returns a
+    /// short read — the contract `Read` allows, and what keeps a read
+    /// from splicing two files in one syscall. `read_exact` loops over
+    /// that seam, which is what the materializers rely on.
+    #[test]
+    fn a_read_stops_at_a_seam_and_read_exact_crosses_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spans = series(tmp.path(), &[("a", 10), ("b", 10)]);
+        let mut r = spans.open().unwrap();
+
+        r.seek(SeekFrom::Start(8)).unwrap();
+        let mut buf = [0u8; 8];
+        let got = r.read(&mut buf).unwrap();
+        assert_eq!(got, 2, "the read stops at the seam");
+        assert_eq!(&buf[..2], &[8, 9]);
+
+        // read_exact spans it, and the bytes come from both files.
+        r.seek(SeekFrom::Start(8)).unwrap();
+        let mut exact = [0u8; 6];
+        r.read_exact(&mut exact).unwrap();
+        assert_eq!(exact, [8, 9, 0, 1, 2, 3]);
+    }
+
+    /// A sliced shard contributes only the bytes it addresses. The
+    /// stream must never read past a span's extent into whatever the
+    /// file holds next (SH-92).
+    #[test]
+    fn a_sliced_shard_contributes_only_its_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        ramp(&tmp.path().join("a"), 100);
+        ramp(&tmp.path().join("b"), 100);
+        let shards = Shards::new(vec![
+            Entry {
+                source: crate::dataset::source::parse_source_string("a").unwrap(),
+                file_base: 20,
+                len: 5,
+            },
+            Entry {
+                source: crate::dataset::source::parse_source_string("b").unwrap(),
+                file_base: 90,
+                len: 4,
+            },
+        ])
+        .unwrap();
+        let spans = SourceSpans::from_shards(&shards, tmp.path(), 1).unwrap();
+        assert_eq!(spans.len(), 9);
+
+        let mut all = Vec::new();
+        spans.open().unwrap().read_to_end(&mut all).unwrap();
+        assert_eq!(all, [20, 21, 22, 23, 24, 90, 91, 92, 93]);
+    }
+
+    /// Seeks address the stream, not a file: from the start, from the
+    /// end, and relative — each landing in whichever shard holds that
+    /// stream position.
+    #[test]
+    fn seeks_address_the_stream_not_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spans = series(tmp.path(), &[("a", 10), ("b", 10), ("c", 10)]);
+        let mut r = spans.open().unwrap();
+        let mut one = [0u8; 1];
+
+        // Into the third shard from the start.
+        assert_eq!(r.seek(SeekFrom::Start(25)).unwrap(), 25);
+        r.read_exact(&mut one).unwrap();
+        assert_eq!(one[0], 5);
+
+        // Backwards into the first, relatively.
+        assert_eq!(r.seek(SeekFrom::Current(-24)).unwrap(), 2);
+        r.read_exact(&mut one).unwrap();
+        assert_eq!(one[0], 2);
+
+        // The last byte, from the end.
+        assert_eq!(r.seek(SeekFrom::End(-1)).unwrap(), 29);
+        r.read_exact(&mut one).unwrap();
+        assert_eq!(one[0], 9);
+    }
+
+    /// Past the end is end-of-stream, exactly as a file read past EOF
+    /// answers — not an error, and not a wrap to another shard.
+    #[test]
+    fn reading_past_the_end_is_end_of_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spans = series(tmp.path(), &[("a", 4), ("b", 4)]);
+        let mut r = spans.open().unwrap();
+
+        assert_eq!(r.seek(SeekFrom::Start(8)).unwrap(), 8);
+        let mut buf = [0u8; 4];
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+        assert_eq!(r.seek(SeekFrom::Start(1000)).unwrap(), 1000);
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+    }
+
+    /// Seeking before the start is refused rather than wrapping to a
+    /// huge unsigned position.
+    #[test]
+    fn seeking_before_the_start_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spans = series(tmp.path(), &[("a", 4)]);
+        let mut r = spans.open().unwrap();
+        assert_eq!(
+            r.seek(SeekFrom::Start(2)).unwrap(),
+            2,
+            "a legal seek first, so the error below is about the sign"
+        );
+        assert!(r.seek(SeekFrom::Current(-3)).is_err());
+        assert!(r.seek(SeekFrom::End(-5)).is_err());
+        // The refused seek left the position alone.
+        let mut one = [0u8; 1];
+        r.read_exact(&mut one).unwrap();
+        assert_eq!(one[0], 2);
+    }
+
+    /// A zero-length read is zero bytes, not an attempt to open a file
+    /// or a claim of end-of-stream at a valid position.
+    #[test]
+    fn an_empty_buffer_reads_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spans = series(tmp.path(), &[("a", 4)]);
+        let mut r = spans.open().unwrap();
+        assert_eq!(r.read(&mut []).unwrap(), 0);
+        // And the position is untouched.
+        let mut one = [0u8; 1];
+        r.read_exact(&mut one).unwrap();
+        assert_eq!(one[0], 0);
+    }
+
+    /// `single_path` is the question "is this one whole file?" — the
+    /// answer a format that cannot be read across files needs (SH-74).
+    /// A series and a sliced single file both answer no.
+    #[test]
+    fn single_path_answers_only_for_one_whole_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        ramp(&tmp.path().join("a"), 100);
+
+        let whole = SourceSpans::single(tmp.path().join("a")).unwrap();
+        assert_eq!(whole.single_path(), Some(tmp.path().join("a").as_path()));
+
+        let two = series(tmp.path(), &[("a", 10), ("b", 10)]);
+        assert_eq!(two.single_path(), None, "a series is not one file");
+        assert_eq!(two.shards().len(), 2);
+        assert_eq!(two.first_path(), Some(tmp.path().join("a").as_path()));
+
+        ramp(&tmp.path().join("c"), 100);
+        let sliced = Shards::new(vec![Entry {
+            source: crate::dataset::source::parse_source_string("c").unwrap(),
+            file_base: 10,
+            len: 5,
+        }])
+        .unwrap();
+        let sliced = SourceSpans::from_shards(&sliced, tmp.path(), 1).unwrap();
+        assert_eq!(
+            sliced.single_path(),
+            None,
+            "a file read from an offset is not the whole file"
+        );
+    }
+
+    /// A shard that addresses bytes the file does not have is refused
+    /// when the spans are built, not discovered as a short read halfway
+    /// through a derive.
+    #[test]
+    fn a_shard_that_overruns_its_file_is_refused_up_front() {
+        let tmp = tempfile::tempdir().unwrap();
+        ramp(&tmp.path().join("a"), 40);
+        let shards = Shards::new(vec![Entry {
+            source: crate::dataset::source::parse_source_string("a").unwrap(),
+            file_base: 0,
+            len: 10,
+        }])
+        .unwrap();
+
+        // Ten 4-byte records fit exactly.
+        assert_eq!(SourceSpans::from_shards(&shards, tmp.path(), 4).unwrap().len(), 40);
+        // Ten 8-byte records do not.
+        let err = SourceSpans::from_shards(&shards, tmp.path(), 8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // And a record size of zero is not a stride at all.
+        let err = SourceSpans::from_shards(&shards, tmp.path(), 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+}
