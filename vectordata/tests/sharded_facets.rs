@@ -552,6 +552,7 @@ fn a_vvec_series_matches_the_single_file_it_was_split_from() {
 
 use vectordata::WholeFacetFallback;
 use vectordata::dataset::source::parse_window;
+use vectordata::dataset::Sharding;
 
 /// **A window inside one shard plans only that shard.**
 ///
@@ -749,7 +750,7 @@ fn a_derived_series_round_trips_through_the_reader() {
         &[],
         Some("derived"),
         true,
-        Some(100),
+        Sharding::Stride(100),
     );
     assert_eq!(rc, 0, "derive must succeed");
 
@@ -818,7 +819,7 @@ fn a_derive_that_fits_one_shard_emits_the_single_file_form() {
         &[],
         Some("derived"),
         true,
-        Some(1000),
+        Sharding::Stride(1000),
     );
     assert_eq!(rc, 0);
 
@@ -860,7 +861,7 @@ fn deriving_without_a_stride_is_unchanged() {
         &[],
         Some("derived"),
         true,
-        None,
+        Sharding::Whole,
     );
     assert_eq!(rc, 0);
     assert!(out.join("profiles/base/base_vectors.fvec").is_file());
@@ -1143,7 +1144,7 @@ fn an_unsharded_derive_emits_no_version() {
             &[],
             Some("derived"),
             true,
-            None,
+            Sharding::Whole,
         ),
         0
     );
@@ -1176,7 +1177,7 @@ fn a_sharded_derive_declares_version_two() {
             &[],
             Some("derived"),
             true,
-            Some(100),
+            Sharding::Stride(100),
         ),
         0
     );
@@ -1393,7 +1394,7 @@ fn the_cli_stride_and_the_yaml_key_mean_the_same_number() {
             &[],
             Some("derived"),
             true,
-            Some(stride),
+            Sharding::Stride(stride),
         ),
         0
     );
@@ -1667,4 +1668,99 @@ fn facet_selection_names_facets_not_shard_files() {
         "no shard appears as a facet: {:?}",
         manifest.keys().collect::<Vec<_>>()
     );
+}
+
+// ── sizing a series from a file-size cap ───────────────────────────
+
+use vectordata::dataset::shard_sizing::{plan_fixed, xvec_record_bytes};
+
+fn capped_source(dir: &std::path::Path, dim: i32, records: usize) {
+    std::fs::create_dir_all(dir).unwrap();
+    write_fvec(&dir.join("base_vectors.fvec"), dim, records, 0);
+    std::fs::write(
+        dir.join("dataset.yaml"),
+        "name: src\nprofiles:\n  default:\n    base_vectors: base_vectors.fvec\n",
+    )
+    .unwrap();
+}
+
+/// **A cap becomes a stride, and the stride becomes the layout.** The
+/// operator says how large a file may get; the record size decides how
+/// many records that is.
+#[test]
+fn a_size_cap_derives_a_decade_stride() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    // dim 4 → 20 bytes a record. A 250-byte cap holds 12 records, so
+    // the decade below is 10.
+    capped_source(&src, 4, 25);
+    assert_eq!(xvec_record_bytes(4, 4), 20);
+    assert_eq!(plan_fixed(250, 20).unwrap().stride, 10);
+
+    let out = tmp.path().join("out");
+    let rc = vectordata::datasets::derive::run(
+        src.to_str().unwrap(), "default", &out, "", &[], &[],
+        Some("derived"), true, Sharding::MaxBytes(250),
+    );
+    assert_eq!(rc, 0, "derive under a cap must succeed");
+
+    let dir = out.join("profiles/base");
+    for i in 0..3 {
+        assert!(
+            dir.join(format!("base_vectors__{i:04}.fvec")).exists(),
+            "shard {i} must exist"
+        );
+    }
+    // And the declaration says what was written.
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(yaml.contains("base_vectors__NNNN.fvec"), "{yaml}");
+    assert!(yaml.contains("shard_stride: 10"), "{yaml}");
+    assert!(yaml.contains("shard_count: 3"), "{yaml}");
+    assert!(yaml.contains("record_count: 25"), "{yaml}");
+
+    // Every shard is under the cap it was sized for.
+    for i in 0..3 {
+        let len = std::fs::metadata(dir.join(format!("base_vectors__{i:04}.fvec")))
+            .unwrap()
+            .len();
+        assert!(len <= 250, "shard {i} is {len} bytes, over a 250-byte cap");
+    }
+}
+
+/// A facet that fits under the cap is written as one file (SH-83), so
+/// asking for a cap does not itself produce a series.
+#[test]
+fn a_facet_under_its_cap_stays_a_single_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    capped_source(&src, 4, 25);
+
+    let out = tmp.path().join("out");
+    let rc = vectordata::datasets::derive::run(
+        src.to_str().unwrap(), "default", &out, "", &[], &[],
+        Some("derived"), true, Sharding::MaxBytes(1_000_000_000),
+    );
+    assert_eq!(rc, 0);
+
+    let dir = out.join("profiles/base");
+    assert!(dir.join("base_vectors.fvec").exists(), "one file");
+    assert!(!dir.join("base_vectors__0000.fvec").exists());
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(!yaml.contains("shard_stride"), "no series declared: {yaml}");
+}
+
+/// A cap that cannot hold ten records is a misconfiguration, and is
+/// refused rather than emitting a file per handful of records.
+#[test]
+fn a_cap_too_small_for_a_run_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    capped_source(&src, 4, 25);
+
+    let out = tmp.path().join("out");
+    let rc = vectordata::datasets::derive::run(
+        src.to_str().unwrap(), "default", &out, "", &[], &[],
+        Some("derived"), true, Sharding::MaxBytes(100), // five records
+    );
+    assert_ne!(rc, 0, "a cap this small must be refused, not honoured");
 }

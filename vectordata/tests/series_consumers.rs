@@ -16,6 +16,7 @@
 //! See `docs/design/srd-multifile-facet-shards.md`.
 
 use std::io::Write as _;
+use vectordata::dataset::Sharding;
 
 fn write_fvec(path: &std::path::Path, dim: i32, records: usize, first: usize) {
     let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
@@ -91,7 +92,7 @@ fn deriving_from_an_explicit_series_copies_every_record() {
             &[],
             Some("derived"),
             true,
-            None,
+            Sharding::Whole,
         ),
         0,
         "deriving from a series must succeed"
@@ -125,7 +126,7 @@ fn deriving_from_a_uniform_series_copies_every_record() {
             &[],
             Some("derived"),
             true,
-            None,
+            Sharding::Whole,
         ),
         0
     );
@@ -162,7 +163,7 @@ fn a_series_re_strides_to_a_different_shard_layout() {
             &[],
             Some("restrided"),
             true,
-            Some(60),
+            Sharding::Stride(60),
         ),
         0
     );
@@ -220,7 +221,7 @@ fn deriving_a_windowed_series_slices_the_series() {
             &[],
             Some("windowed"),
             true,
-            None,
+            Sharding::Whole,
         ),
         0
     );
@@ -388,7 +389,7 @@ fn deriving_a_series_without_a_stride_yields_the_single_file_a_kernel_needs() {
             &[],
             Some("flat"),
             true,
-            None,
+            Sharding::Whole,
         ),
         0
     );
@@ -458,7 +459,7 @@ fn a_vvec_series_derives_into_one_facet() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(), "default", &out, "", &[], &[],
-            Some("vv-derived"), true, None,
+            Some("vv-derived"), true, Sharding::Whole,
         ),
         0,
         "a vvec series must derive"
@@ -505,7 +506,7 @@ fn a_windowed_vvec_series_slices_the_series() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(), "default", &out, "", &[], &[],
-            Some("vv-window"), true, None,
+            Some("vv-window"), true, Sharding::Whole,
         ),
         0
     );
@@ -549,7 +550,7 @@ fn a_sliced_vvec_shard_contributes_only_its_own_records() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(), "default", &out, "", &[], &[],
-            Some("sliced"), true, None,
+            Some("sliced"), true, Sharding::Whole,
         ),
         0,
         "a sliced vvec series must derive"
@@ -600,7 +601,7 @@ fn a_slab_facet_survives_derive_by_either_plan_builder() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(), "default", &out, "", &[], &[],
-            Some("derived"), true, None,
+            Some("derived"), true, Sharding::Whole,
         ),
         0
     );

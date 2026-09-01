@@ -347,6 +347,18 @@ enum DatasetsCmd {
         /// Accepts SI suffixes: `--shard-stride 1M`.
         #[arg(long, value_name = "RECORDS")]
         shard_stride: Option<String>,
+        /// Maximum size of one shard file; the stride is whatever
+        /// number of records fits under it.
+        ///
+        /// The stride chosen is the largest power of ten that fits,
+        /// so `shard(o) = o / stride` stays arithmetic a person can do
+        /// in their head. The cap is a ceiling, not a target: a shard
+        /// will usually be well under it.
+        ///
+        /// Accepts size suffixes: `--max-shard-bytes 1TB`. Mutually
+        /// exclusive with `--shard-stride`.
+        #[arg(long, value_name = "BYTES", conflicts_with = "shard_stride")]
+        max_shard_bytes: Option<String>,
         /// Configuration directory containing `catalogs.yaml`
         /// (only used when `--dataset` is a catalog name).
         #[arg(long, default_value_t = crate::catalog::sources::config_dir())]
@@ -687,6 +699,7 @@ pub fn bin_main(argv: Vec<String>) {
                     name,
                     force,
                     shard_stride,
+                    max_shard_bytes,
                     configdir,
                     catalog,
                     at,
@@ -699,14 +712,13 @@ pub fn bin_main(argv: Vec<String>) {
                     &at,
                     name.as_deref(),
                     force,
-                    match shard_stride
-                        .as_deref()
-                        .map(crate::dataset::source::parse_number_with_suffix)
-                        .transpose()
-                    {
+                    match crate::dataset::Sharding::from_flags(
+                        shard_stride.as_deref(),
+                        max_shard_bytes.as_deref(),
+                    ) {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("error: --shard-stride: {e}");
+                            eprintln!("error: {e}");
                             std::process::exit(1);
                         }
                     },

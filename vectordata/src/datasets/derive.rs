@@ -45,6 +45,7 @@ use super::build_sources;
 use crate::catalog::resolver::Catalog;
 use crate::dataset::config::DatasetConfig as RichDatasetConfig;
 use crate::dataset::source::DSWindow;
+use crate::dataset::Sharding;
 use crate::merkle::MerkleRef;
 use crate::typed_access::ElementType;
 
@@ -139,10 +140,12 @@ fn plan_output_size(src: &SourceSpans, kind: FacetKind, window: &DSWindow) -> io
 /// Returns a process exit code (0 on success).
 /// Derive a dataset.
 ///
-/// `shard_stride` is ordinals per shard: `Some(n)` writes each
-/// fixed-stride facet as a series rolling over every `n` records,
-/// `None` writes each whole. A run that fits in one shard collapses to
-/// the single-file form either way (SH-35, SH-83).
+/// `sharding` decides how each facet is laid out:
+/// [`Sharding::Whole`] writes one file per facet,
+/// [`Sharding::Stride`] rolls over every `n` records, and
+/// [`Sharding::MaxBytes`] picks whatever stride keeps one shard under
+/// a size cap. A run that fits in one shard collapses to the
+/// single-file form in every case (SH-35, SH-83).
 pub fn run(
     dataset: &str,
     profile: &str,
@@ -152,7 +155,7 @@ pub fn run(
     at: &[String],
     name_override: Option<&str>,
     force: bool,
-    shard_stride: Option<u64>,
+    sharding: Sharding,
 ) -> i32 {
     if let Err(e) = preflight_output(output, force) {
         eprintln!("{e}");
@@ -164,12 +167,12 @@ pub fn run(
     // runtime access layer, no precache — just read the YAML
     // and slice the files in place.
     if let Some(yaml_path) = local_dataset_yaml(dataset) {
-        return derive_local(&yaml_path, profile, output, name_override, shard_stride);
+        return derive_local(&yaml_path, profile, output, name_override, sharding);
     }
 
     // Otherwise: catalog / URL → runtime access layer.
     derive_via_access_layer(
-        dataset, profile, output, configdir, extra_catalogs, at, name_override, shard_stride)
+        dataset, profile, output, configdir, extra_catalogs, at, name_override, sharding)
 }
 
 /// If `dataset` points at a local directory containing a
@@ -218,7 +221,7 @@ fn derive_local(
     profile_name: &str,
     output: &Path,
     name_override: Option<&str>,
-    shard_stride: Option<u64>,
+    sharding: Sharding,
 ) -> i32 {
     let base_dir = yaml_path.parent().unwrap_or(Path::new("."));
     let config = match RichDatasetConfig::load(yaml_path) {
@@ -247,7 +250,7 @@ fn derive_local(
         .to_string();
     run_plan(&plan, output, &donor_name, profile_name,
         &yaml_path.display().to_string(), ds_profile, name_override,
-        /* local_fast_path = */ true, shard_stride)
+        /* local_fast_path = */ true, sharding)
 }
 
 /// Slow path: catalog or URL source. Goes through the runtime
@@ -261,7 +264,7 @@ fn derive_via_access_layer(
     extra_catalogs: &[String],
     at: &[String],
     name_override: Option<&str>,
-    shard_stride: Option<u64>,
+    sharding: Sharding,
 ) -> i32 {
     let (resolution, derived_default_name) =
         match resolve_spec(dataset, configdir, extra_catalogs, at) {
@@ -338,7 +341,7 @@ fn derive_via_access_layer(
     };
     run_plan(&plan, output, &derived_default_name, profile_name,
         dataset, ds_profile, name_override,
-        /* local_fast_path = */ false, shard_stride)
+        /* local_fast_path = */ false, sharding)
 }
 
 // ─── Planning ─────────────────────────────────────────────────────
@@ -563,7 +566,7 @@ fn run_plan(
     src_profile: &crate::dataset::profile::DSProfile,
     name_override: Option<&str>,
     local_fast_path: bool,
-    shard_stride: Option<u64>,
+    sharding: Sharding,
 ) -> i32 {
     let total_bytes: u64 = plan.iter().map(|r| r.expected_bytes).sum();
     eprintln!("Materializing {} facet(s), {} to write.",
@@ -590,7 +593,7 @@ fn run_plan(
         let mut written: u64 = 0;
         let res = materialize_facet(
             &row.facet, &row.src, &dest_path,
-            row.kind, &row.window, shard_stride,
+            row.kind, &row.window, sharding,
             |delta| {
                 written = written.saturating_add(delta);
                 meter.tick_copy(written);
@@ -1408,16 +1411,32 @@ fn materialize_facet<F: FnMut(u64)>(
     dest: &Path,
     kind: FacetKind,
     window: &DSWindow,
-    shard_stride: Option<u64>,
+    sharding: Sharding,
     on_bytes_written: F,
 ) -> io::Result<MaterializedFacet> {
-    // Sharding is available only where records have a fixed stride:
-    // rolling over at a record boundary means knowing where one is. A
-    // format without one is written whole, and the caller is told so
-    // rather than silently getting a single file it did not ask for.
-    if let Some(stride) = shard_stride {
+    // Sharding here is available only where records have a fixed
+    // stride: this materializer copies bytes, so rolling over at a
+    // record boundary means knowing where one is without decoding. A
+    // format without one is refused rather than silently written as a
+    // single file the caller did not ask for.
+    if sharding.is_requested() {
         match fixed_record_size(src, kind)? {
             Some(record_size) => {
+                let Some(stride) = sharding.stride_for_fixed(record_size) else {
+                    // Only reachable from a cap: an explicit stride is
+                    // used verbatim. A cap that cannot hold ten
+                    // records of this facet is a misconfiguration, not
+                    // a layout, and saying so beats emitting a series
+                    // with a file per handful of records.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "facet '{facet_name}': a shard cap of {} bytes cannot hold ten \
+                             {record_size}-byte records; raise the cap",
+                            sharding.max_bytes().unwrap_or(0),
+                        ),
+                    ));
+                };
                 let dir = dest.parent().unwrap_or(Path::new("."));
                 let file = dest
                     .file_name()
@@ -1443,11 +1462,17 @@ fn materialize_facet<F: FnMut(u64)>(
                 });
             }
             None => {
+                // A slab or a vvec carries per-record extents, so a
+                // byte-range copy cannot find a record boundary. The
+                // *pipeline* writes these as series through a
+                // record-oriented sink; this materializer does not,
+                // and refuses rather than pretending.
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!(
-                        "facet '{facet_name}' has no fixed record stride, so it cannot \
-                         be sharded; omit the shard stride to write it whole"
+                        "facet '{facet_name}' has no fixed record stride, so this \
+                         derivation cannot shard it; write it whole, or produce it \
+                         through the pipeline, which shards record-oriented formats"
                     ),
                 ));
             }
@@ -2138,7 +2163,13 @@ mod tests {
 
         // Drive a local derive on it.
         let yaml_path = src.path().join("dataset.yaml");
-        let rc = derive_local(&yaml_path, "default", dst.path(), Some("derived"), None);
+        let rc = derive_local(
+            &yaml_path,
+            "default",
+            dst.path(),
+            Some("derived"),
+            Sharding::Whole,
+        );
         assert_eq!(rc, 0, "derive_local should succeed");
 
         // The output must use the profiles/base layout, not flat.

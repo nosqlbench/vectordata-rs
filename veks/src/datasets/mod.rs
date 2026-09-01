@@ -266,6 +266,19 @@ pub enum DatasetsCommand {
         #[arg(long, value_name = "RECORDS")]
         shard_stride: Option<String>,
 
+        /// Maximum size of one shard file; the stride is whatever
+        /// number of records fits under it.
+        ///
+        /// The stride chosen is the largest power of ten that fits, so
+        /// `shard(o) = o / stride` stays arithmetic a person can do in
+        /// their head. The cap is a ceiling, not a target: a shard will
+        /// usually be well under it.
+        ///
+        /// Accepts size suffixes: `--max-shard-bytes 1TB`. Mutually
+        /// exclusive with `--shard-stride`.
+        #[arg(long, value_name = "BYTES", conflicts_with = "shard_stride")]
+        max_shard_bytes: Option<String>,
+
         /// Configuration directory containing catalogs.yaml
         /// (only used when `--dataset` is a catalog name).
         #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
@@ -627,6 +640,7 @@ pub fn run(args: DatasetsArgs) {
             name,
             force,
             shard_stride,
+            max_shard_bytes,
             configdir,
             catalog: raw_catalog,
             at,
@@ -635,14 +649,13 @@ pub fn run(args: DatasetsArgs) {
                 .iter()
                 .map(|v| resolve_catalog_value(v))
                 .collect();
-            let stride = match shard_stride
-                .as_deref()
-                .map(vectordata::dataset::source::parse_number_with_suffix)
-                .transpose()
-            {
+            let sharding = match vectordata::dataset::Sharding::from_flags(
+                shard_stride.as_deref(),
+                max_shard_bytes.as_deref(),
+            ) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("error: --shard-stride: {e}");
+                    eprintln!("error: {e}");
                     std::process::exit(1);
                 }
             };
@@ -655,7 +668,7 @@ pub fn run(args: DatasetsArgs) {
                 &at,
                 name.as_deref(),
                 force,
-                stride,
+                sharding,
             );
             if code != 0 {
                 std::process::exit(code);

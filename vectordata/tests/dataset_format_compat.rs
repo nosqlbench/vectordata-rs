@@ -25,6 +25,7 @@
 //! `docs/design/srd-dataset-format-version.md`.
 
 use serde::Deserialize;
+use vectordata::dataset::Sharding;
 
 /// The pre-sharding facet declaration, verbatim: an untagged pair of a
 /// bare filename and a `{source, window}` object. No shard fields, and
@@ -143,7 +144,7 @@ fn an_old_build_reads_a_collapsed_single_shard_output() {
             &[],
             Some("derived"),
             true,
-            Some(1000),
+            Sharding::Stride(1000),
         ),
         0
     );
@@ -199,7 +200,7 @@ fn an_unsharded_output_is_spelled_exactly_as_it_always_was() {
             &[],
             Some("derived"),
             true,
-            None,
+            Sharding::Whole,
         ),
         0
     );
