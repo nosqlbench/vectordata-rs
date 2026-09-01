@@ -699,6 +699,14 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
     } else {
         resource::ResourceBudget::new()
     };
+    let mut resource_budget = resource_budget;
+
+    // A dataset may declare its own shard-file cap. Seeded after
+    // --resources is parsed, so an explicit flag wins and the
+    // declaration is the fallback rather than an override.
+    if let Some(bytes) = config.declared_shard_bytes() {
+        resource_budget.seed("shardsize", bytes);
+    }
 
     let governor = resource::ResourceGovernor::new(resource_budget, Some(&workspace));
 

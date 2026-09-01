@@ -247,6 +247,23 @@ pub(crate) fn required_format_version(profiles: &DSProfileGroup) -> u32 {
 }
 
 impl DatasetConfig {
+
+    /// The maximum shard-file size this dataset declares, in bytes.
+    ///
+    /// Read from `upstream.defaults.shard_size` — the YAML mirror of
+    /// `--resources shardsize:`. A dataset that says how large its
+    /// facet files may get carries that with it, so the same run on
+    /// another machine produces the same layout; the command line
+    /// still overrides it.
+    ///
+    /// `None` when undeclared or unparseable, so a malformed value
+    /// falls back to the governor default rather than failing a run
+    /// over a hint.
+    pub fn declared_shard_bytes(&self) -> Option<u64> {
+        let defaults = self.upstream.as_ref()?.defaults.as_ref()?;
+        let raw = defaults.get(super::shard_sizing::SHARD_SIZE_KEY)?;
+        super::source::parse_number_with_suffix(raw).ok()
+    }
     /// Load a `DatasetConfig` from a YAML file on disk.
     ///
     /// After deserialization, applies the `partition_profiles` list to
@@ -1522,5 +1539,73 @@ profiles:
 
         assert_eq!(config.is_normalized(), Some(true));
         assert_eq!(config.distance_function(), Some("Cosine"));
+    }
+}
+
+#[cfg(test)]
+mod shard_size_declaration_tests {
+    use super::*;
+
+    fn config_with(defaults: &str) -> DatasetConfig {
+        let yaml = format!(
+            "name: d\nprofiles:\n  default:\n    base_vectors: b.fvec\n\
+             upstream:\n  defaults:\n{defaults}  steps:\n    - run: import\n"
+        );
+        serde_yaml::from_str(&yaml).expect("a valid dataset")
+    }
+
+    /// **A dataset carries the cap its facets were sized for.** The
+    /// same run on another machine then produces the same layout,
+    /// rather than inheriting whatever that machine's default is.
+    #[test]
+    fn a_dataset_declares_its_shard_cap() {
+        assert_eq!(
+            config_with("    shard_size: 1TB\n").declared_shard_bytes(),
+            Some(1_000_000_000_000)
+        );
+        assert_eq!(
+            config_with("    shard_size: 500GB\n").declared_shard_bytes(),
+            Some(500_000_000_000)
+        );
+        // Plain digits are bytes, as everywhere else here.
+        assert_eq!(
+            config_with("    shard_size: 4096\n").declared_shard_bytes(),
+            Some(4096)
+        );
+    }
+
+    /// Undeclared is `None`, so the governor's default applies rather
+    /// than a zero cap that would shard every facet to nothing.
+    #[test]
+    fn an_undeclared_cap_is_absent_not_zero() {
+        assert_eq!(config_with("    seed: 1\n").declared_shard_bytes(), None);
+
+        let bare: DatasetConfig =
+            serde_yaml::from_str("name: d\nprofiles:\n  default:\n    base_vectors: b.fvec\n")
+                .unwrap();
+        assert_eq!(bare.declared_shard_bytes(), None);
+    }
+
+    /// A malformed value falls back rather than failing a run over a
+    /// hint — the cap has a working default, and a dataset that
+    /// mis-spells it should still build.
+    #[test]
+    fn a_malformed_cap_falls_back_rather_than_failing() {
+        assert_eq!(config_with("    shard_size: enormous\n").declared_shard_bytes(), None);
+        assert_eq!(config_with("    shard_size: \"\"\n").declared_shard_bytes(), None);
+    }
+
+    /// The key is the one constant, so the writer and the reader
+    /// cannot spell it differently.
+    #[test]
+    fn the_key_is_named_once() {
+        assert_eq!(super::super::shard_sizing::SHARD_SIZE_KEY, "shard_size");
+        let yaml = format!(
+            "name: d\nprofiles:\n  default:\n    base_vectors: b.fvec\n\
+             upstream:\n  defaults:\n    {}: 2TB\n  steps:\n    - run: import\n",
+            super::super::shard_sizing::SHARD_SIZE_KEY
+        );
+        let c: DatasetConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(c.declared_shard_bytes(), Some(2_000_000_000_000));
     }
 }

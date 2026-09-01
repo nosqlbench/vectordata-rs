@@ -50,6 +50,12 @@ pub enum ResourceType {
     Cache,
     /// Read-ahead buffer / prefetch window. Supports sizes with units and percentages.
     Readahead,
+    /// Maximum size of one shard file a facet is written across.
+    ///
+    /// A facet larger than this is written as a multi-file series
+    /// rather than one file, because filesystems and transfer tools
+    /// still carry 2 TB limits. Supports sizes with units.
+    ShardSize,
 }
 
 /// Whether a resource type accepts memory-like values (sizes, percentages)
@@ -74,13 +80,15 @@ impl ResourceType {
             ResourceType::Cpu => "cpu",
             ResourceType::Cache => "cache",
             ResourceType::Readahead => "readahead",
+            ResourceType::ShardSize => "shardsize",
         }
     }
 
     /// What kind of values this resource accepts.
     pub fn value_kind(&self) -> ValueKind {
         match self {
-            ResourceType::Mem | ResourceType::Cache | ResourceType::Readahead => ValueKind::Memory,
+            ResourceType::Mem | ResourceType::Cache | ResourceType::Readahead
+            | ResourceType::ShardSize => ValueKind::Memory,
             ResourceType::Threads | ResourceType::Segments | ResourceType::SegmentSize
             | ResourceType::IoThreads | ResourceType::Cpu => ValueKind::Count,
         }
@@ -97,12 +105,28 @@ impl ResourceType {
             ResourceType::Cpu => "CPU core limit",
             ResourceType::Cache => "Maximum disk space for .cache/",
             ResourceType::Readahead => "Read-ahead buffer / prefetch window",
+            ResourceType::ShardSize => "Maximum size of one shard file",
         }
     }
 
     /// Whether this resource supports percentage values (% of system RAM).
+    ///
+    /// Not simply "is it a size". A percentage here is resolved
+    /// against system RAM, so it only means something for a resource
+    /// that is *relative to* RAM. A shard-file cap is a size in the
+    /// same units and is not one of those: `shardsize:50%` would
+    /// silently mean "half this machine's memory per file", which is
+    /// a property of the host rather than of the dataset, and would
+    /// make the same command produce different layouts on different
+    /// machines.
     pub fn supports_percentage(&self) -> bool {
-        self.value_kind() == ValueKind::Memory
+        match self {
+            Self::Mem | Self::Cache | Self::Readahead => true,
+            Self::ShardSize => false,
+            Self::Threads | Self::Segments | Self::SegmentSize | Self::IoThreads | Self::Cpu => {
+                false
+            }
+        }
     }
 
     /// Look up a resource type by its canonical name.
@@ -116,6 +140,7 @@ impl ResourceType {
             "cpu" => Some(ResourceType::Cpu),
             "cache" => Some(ResourceType::Cache),
             "readahead" => Some(ResourceType::Readahead),
+            "shardsize" => Some(ResourceType::ShardSize),
             _ => None,
         }
     }
@@ -131,6 +156,7 @@ impl ResourceType {
             ResourceType::Cpu,
             ResourceType::Cache,
             ResourceType::Readahead,
+            ResourceType::ShardSize,
         ]
     }
 }
@@ -618,6 +644,18 @@ pub struct ResourceBudget {
 }
 
 impl ResourceBudget {
+
+    /// Set `name` only if it is not already set.
+    ///
+    /// The precedence rule between a value a dataset declares and one
+    /// the command line gives, expressed once: seeding happens after
+    /// `--resources` is parsed, so anything explicit is already there
+    /// and stays.
+    pub fn seed(&mut self, name: &str, value: u64) {
+        self.resources
+            .entry(name.to_string())
+            .or_insert(ResourceValue::Fixed(value));
+    }
     /// Create an empty budget.
     pub fn new() -> Self {
         Self::default()
@@ -1427,6 +1465,7 @@ impl ResourceGovernor {
     /// - `mem`: 65% of system RAM (see note below)
     /// - `threads`: available CPU parallelism
     /// - `segmentsize`: 1,000,000 records
+    /// - `shardsize`: 1 TB per facet file
     ///
     /// The 65% mem default leaves ~35% of physical RAM as headroom for:
     ///   1. **mmap pages from input files counted toward RSS.** Large
@@ -1458,6 +1497,19 @@ impl ResourceGovernor {
                 .unwrap_or(4);
             budget.resources.insert("threads".to_string(), ResourceValue::Fixed(cpus));
         }
+        // shardsize IS defaulted, and deliberately: a facet written
+        // without a cap becomes one enormous file, and the systems
+        // that cannot hold it fail at write time or at transfer time
+        // rather than here. 1 TB is well under the 2 TB limits still
+        // in the field, and an operator who knows better raises it
+        // with --resources 'shardsize:...'.
+        if !budget.resources.contains_key("shardsize") {
+            budget.resources.insert(
+                "shardsize".to_string(),
+                ResourceValue::Fixed(vectordata::dataset::DEFAULT_MAX_SHARD_BYTES),
+            );
+        }
+
         // segmentsize is NOT defaulted. When absent, compute-knn auto-sizes
         // partitions based on available RAM. Users can override with
         // --resources 'segmentsize:1M' for fine-grained cache segments.
@@ -1600,6 +1652,12 @@ impl ResourceGovernor {
         budget
             .resources
             .insert("segmentsize".to_string(), ResourceValue::Fixed(1_000_000));
+
+        // Default shardsize: 1 TB per facet file. See ResourceGovernor::new.
+        budget.resources.insert(
+            "shardsize".to_string(),
+            ResourceValue::Fixed(vectordata::dataset::DEFAULT_MAX_SHARD_BYTES),
+        );
 
         let mut effective = HashMap::new();
         for (name, value) in &budget.resources {
@@ -2617,5 +2675,117 @@ mod tests {
         assert!(gov.storage_info().is_none());
         assert_eq!(gov.storage_type(), StorageType::Unknown);
         assert_eq!(gov.io_saturation_depth(), 32);
+    }
+}
+
+#[cfg(test)]
+mod shard_size_tests {
+    use super::*;
+
+    /// **A facet file is capped by default.** Nothing has to ask for
+    /// it: a pipeline run with no `--resources` at all still knows a
+    /// shard ceiling, because a facet written without one becomes a
+    /// file some systems cannot hold.
+    #[test]
+    fn the_shard_cap_is_one_terabyte_by_default() {
+        let governor = ResourceGovernor::new(ResourceBudget::parse("").unwrap(), None);
+        assert_eq!(
+            governor.current("shardsize"),
+            Some(vectordata::dataset::DEFAULT_MAX_SHARD_BYTES)
+        );
+        assert_eq!(governor.current("shardsize"), Some(1_000_000_000_000));
+    }
+
+    /// An operator who knows their filesystem can raise or lower it,
+    /// in the same size units every other resource takes.
+    #[test]
+    fn the_shard_cap_is_overridable_with_units() {
+        for (spec, want) in [
+            ("shardsize:2TB", 2_000_000_000_000u64),
+            ("shardsize:500GB", 500_000_000_000),
+            ("shardsize:1TiB", 1u64 << 40),
+            ("shardsize:100MB", 100_000_000),
+        ] {
+            let governor = ResourceGovernor::new(ResourceBudget::parse(spec).unwrap(), None);
+            assert_eq!(governor.current("shardsize"), Some(want), "{spec}");
+        }
+    }
+
+    /// **A percentage is refused for the shard cap.** Percentages here
+    /// resolve against system RAM, so `shardsize:50%` would make the
+    /// same command produce different file layouts on different
+    /// machines — a property of the host leaking into the dataset.
+    #[test]
+    fn a_shard_cap_is_not_a_percentage_of_anything() {
+        assert!(!ResourceType::ShardSize.supports_percentage());
+        // Contrast with the resources that genuinely are RAM-relative.
+        assert!(ResourceType::Mem.supports_percentage());
+        assert!(ResourceType::Cache.supports_percentage());
+        // And it is a size, not a count, so it accepts units at all.
+        assert_eq!(ResourceType::ShardSize.value_kind(), ValueKind::Memory);
+    }
+
+    /// The type is registered everywhere the enum is the authority —
+    /// so `--resources` accepts it, help lists it, and nothing has to
+    /// carry a second table of names.
+    #[test]
+    fn the_shard_cap_is_a_first_class_resource() {
+        assert_eq!(ResourceType::from_name("shardsize"), Some(ResourceType::ShardSize));
+        assert_eq!(ResourceType::ShardSize.name(), "shardsize");
+        assert!(ResourceType::all().contains(&ResourceType::ShardSize));
+        assert!(!ResourceType::ShardSize.description().is_empty());
+        // Every type round-trips through its own name.
+        for rt in ResourceType::all() {
+            assert_eq!(ResourceType::from_name(rt.name()), Some(*rt), "{rt}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod shard_size_precedence_tests {
+    use super::*;
+
+    /// **A declared cap fills a gap; it does not override a flag.**
+    /// Seeding runs after `--resources` is parsed, so an explicit
+    /// value is already present and survives.
+    #[test]
+    fn an_explicit_resource_wins_over_a_seeded_one() {
+        let mut budget = ResourceBudget::parse("shardsize:2TB").unwrap();
+        budget.seed("shardsize", 500_000_000_000);
+        let governor = ResourceGovernor::new(budget, None);
+        assert_eq!(governor.current("shardsize"), Some(2_000_000_000_000));
+    }
+
+    /// With no flag, the seeded value is what applies — ahead of the
+    /// built-in default.
+    #[test]
+    fn a_seeded_cap_applies_when_no_flag_was_given() {
+        let mut budget = ResourceBudget::parse("").unwrap();
+        budget.seed("shardsize", 500_000_000_000);
+        let governor = ResourceGovernor::new(budget, None);
+        assert_eq!(governor.current("shardsize"), Some(500_000_000_000));
+    }
+
+    /// And with neither, the default. Three sources, one order:
+    /// flag, then dataset, then default.
+    #[test]
+    fn the_default_applies_when_nothing_else_does() {
+        let governor = ResourceGovernor::new(ResourceBudget::parse("").unwrap(), None);
+        assert_eq!(
+            governor.current("shardsize"),
+            Some(vectordata::dataset::DEFAULT_MAX_SHARD_BYTES)
+        );
+    }
+
+    /// Seeding is not specific to the shard cap — it is the
+    /// precedence rule, and it holds for any resource.
+    #[test]
+    fn seeding_never_overwrites_whatever_is_already_set() {
+        let mut budget = ResourceBudget::parse("threads:8").unwrap();
+        budget.seed("threads", 2);
+        budget.seed("segments", 4);
+        let governor = ResourceGovernor::new(budget, None);
+        assert_eq!(governor.current("threads"), Some(8), "the flag stands");
+        assert_eq!(governor.current("segments"), Some(4), "the gap is filled");
     }
 }
