@@ -23,6 +23,19 @@ use crate::pipeline::command::{ArtifactState, Options};
 ///   cannot be verified without a recognized format)
 pub fn check_artifact_default(output: &Path, _options: &Options) -> ArtifactState {
     if !output.exists() {
+        // A facet written across shards has nothing at the unsharded
+        // name (SH-35). It is present — as much as any facet is — and
+        // reporting it Absent would make the step that produced it
+        // look like it did nothing. Each shard is an ordinary file of
+        // the format, so each is checked as one.
+        let shards = vectordata::dataset::discover_shards(output);
+        if !shards.is_empty() {
+            return shards
+                .iter()
+                .map(|s| check_artifact_default(s, _options))
+                .find(|state| *state != ArtifactState::Complete)
+                .unwrap_or(ArtifactState::Complete);
+        }
         return ArtifactState::Absent;
     }
 

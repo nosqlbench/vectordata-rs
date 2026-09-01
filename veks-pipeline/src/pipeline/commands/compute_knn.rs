@@ -1123,6 +1123,9 @@ fn merge_partitions(
     base_path: &Path,
     metric: Metric,
     ui: &veks_core::ui::UiHandle,
+    // Cap on one output file, from the governor. `None` writes each
+    // output whole, which is what a cache artifact gets.
+    max_shard_bytes: Option<u64>,
 ) -> Result<MergeResult, String> {
     // Open all partition files
     let load_pb = ui.bar_with_unit(
@@ -1153,18 +1156,22 @@ fn merge_partitions(
     }
     load_pb.finish();
 
-    // Open output files via AtomicWriter (temp-then-rename)
-    use crate::pipeline::atomic_write::AtomicWriter;
-    let mut idx_writer = AtomicWriter::with_capacity(1 << 20, indices_path)
+    // Both outputs are neighbour rows of a fixed width, so a capped
+    // facet is written as a series here the same way every other
+    // fixed-stride facet is (SH-35).
+    use crate::pipeline::shard_write::FacetWriter;
+    let row_bytes = 4 + k * 4; // dim header + k elements
+    let mut idx_writer = FacetWriter::open(indices_path, row_bytes as u64, max_shard_bytes)
         .map_err(|e| format!("create {}: {}", indices_path.display(), e))?;
 
-    let mut dist_writer: Option<AtomicWriter> = match distances_path {
-        Some(p) => Some(AtomicWriter::with_capacity(1 << 20, p)
-            .map_err(|e| format!("create {}: {}", p.display(), e))?),
+    let mut dist_writer: Option<FacetWriter> = match distances_path {
+        Some(p) => Some(
+            FacetWriter::open(p, row_bytes as u64, max_shard_bytes)
+                .map_err(|e| format!("create {}: {}", p.display(), e))?,
+        ),
         None => None,
     };
 
-    let row_bytes = 4 + k * 4; // dim header + k elements
     let mut ivec_row = vec![0u8; row_bytes];
     let mut fvec_row = vec![0u8; row_bytes];
 
@@ -2779,6 +2786,11 @@ where
         base_path,
         metric,
         &ctx.ui,
+        crate::pipeline::shard_write::cap_for_output(
+            &ctx.governor,
+            &ctx.workspace,
+            indices_path,
+        ),
     ) {
         Ok(v) => v,
         Err(e) => return error_result(format!("merge failed: {}", e), start),

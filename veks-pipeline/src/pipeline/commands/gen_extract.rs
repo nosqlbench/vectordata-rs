@@ -31,7 +31,7 @@ use std::time::Instant;
 use vectordata::VectorReader;
 use vectordata::io::{IndexedVvecReader, XvecReader, VvecReader};
 
-use crate::pipeline::atomic_write::{AtomicWriter, safe_create_file};
+use crate::pipeline::atomic_write::safe_create_file;
 use crate::pipeline::element_type::ElementType;
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -249,7 +249,17 @@ facets of the dataset.
                 );
             }
 
-            let mut writer = match AtomicWriter::new(&output_path) {
+            // A facet this large is written as a capped series rather
+            // than one file (SH-35). Every fvec record is the same
+            // width, so the split is arithmetic and the loop below
+            // does not change.
+            let record_bytes = 4 + dim as u64 * 4;
+            let cap = crate::pipeline::shard_write::cap_for_output(
+                &ctx.governor, &ctx.workspace, &output_path,
+            );
+            let mut writer = match crate::pipeline::shard_write::FacetWriter::open(
+                &output_path, record_bytes, cap,
+            ) {
                 Ok(w) => w,
                 Err(e) => return error_result(format!("failed to create {}: {}", output_path.display(), e), start),
             };
@@ -272,8 +282,17 @@ facets of the dataset.
                 pb.inc(1);
             }
             pb.finish();
-            if let Err(e) = writer.finish() {
-                return error_result(format!("failed to finalize {}: {}", output_path.display(), e), start);
+            let outcome = match writer.finish() {
+                Ok(o) => o,
+                Err(e) => return error_result(format!("failed to finalize {}: {}", output_path.display(), e), start),
+            };
+            if outcome.is_series() {
+                ctx.ui.log(&format!(
+                    "  wrote {} as {} shards of {} records",
+                    outcome.source_spec,
+                    outcome.shard_count.unwrap_or(0),
+                    outcome.shard_stride.unwrap_or(0),
+                ));
             }
 
             // Write verified count for the bound checker
@@ -287,7 +306,7 @@ facets of the dataset.
             CommandResult {
                 status: Status::Ok,
                 message: format!("extracted {} vectors to {}", extracted, output_path.display()),
-                produced: vec![output_path],
+                produced: outcome.files,
                 elapsed: start.elapsed(),
             }
         }
@@ -1984,19 +2003,23 @@ fn sorted_index_extract_fvec(
         (partition_size * record_bytes) as f64 / (1024.0 * 1024.0),
     ));
 
-    // Pre-allocate output
-    let total_bytes = (extract_count as u64) * (record_bytes as u64);
-    {
-        let f = safe_create_file(output_path)
-            .map_err(|e| format!("failed to create output: {}", e))?;
-        f.set_len(total_bytes)
-            .map_err(|e| format!("failed to set output size: {}", e))?;
-    }
-
-    let mut out_file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(output_path)
-        .map_err(|e| format!("failed to open output {}: {}", output_path.display(), e))?;
+    // The passes below append in output order, so this is a
+    // sequential write despite the seek that used to precede it —
+    // which is what lets a capped facet be written as a series here
+    // without changing how the data is produced (SH-35). Records are
+    // fixed width, so a shard boundary is arithmetic.
+    //
+    // The preallocation this replaces sized the file up front and
+    // truncated it at the end; a sharded write has no single file to
+    // size, and writes exactly the records it produces either way.
+    let cap = crate::pipeline::shard_write::cap_for_output(
+        &ctx.governor,
+        &ctx.workspace,
+        output_path,
+    );
+    let mut out_file =
+        crate::pipeline::shard_write::FacetWriter::open(output_path, record_bytes as u64, cap)
+            .map_err(|e| format!("failed to create output {}: {}", output_path.display(), e))?;
 
     let dim_bytes = (dim as i32).to_le_bytes();
     let pass_label = |p: usize| -> String {
@@ -2484,10 +2507,6 @@ fn sorted_index_extract_fvec(
             format!("writing {:.0} MB{}", write_mb, pass_label(pass)),
             "bytes",
         );
-        let file_offset = (total_written as u64) * (record_bytes as u64);
-        use std::io::Seek;
-        out_file.seek(std::io::SeekFrom::Start(file_offset))
-            .map_err(|e| format!("seek failed: {}", e))?;
         let write_chunk = 8 * 1024 * 1024; // 8 MiB per write syscall
         let mut bytes_written: usize = 0;
         for co in &chunk_outputs {
@@ -2534,10 +2553,17 @@ fn sorted_index_extract_fvec(
     }
 
     // Truncate output file to actual written size (may be smaller if zeros were skipped)
-    let final_bytes = (total_written as u64) * (record_bytes as u64);
-    out_file.set_len(final_bytes)
-        .map_err(|e| format!("truncate failed: {}", e))?;
-    out_file.sync_all().map_err(|e| format!("sync failed: {}", e))?;
+    let outcome = out_file
+        .finish()
+        .map_err(|e| format!("failed to finalize {}: {}", output_path.display(), e))?;
+    if outcome.is_series() {
+        ctx.ui.log(&format!(
+            "  wrote {} as {} shards of {} records",
+            outcome.source_spec,
+            outcome.shard_count.unwrap_or(0),
+            outcome.shard_stride.unwrap_or(0),
+        ));
+    }
 
     let zero_count = zero_ordinals.len();
 
