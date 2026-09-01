@@ -532,6 +532,27 @@ impl RecordFacet {
     ///
     /// The escape hatch beneath every codec: a caller that wants to
     /// decode a record some other way is not obliged to go through one.
+    /// Measure this facet's record lengths, for sizing a shard.
+    ///
+    /// A slab's records carry their own extents, so there is no record
+    /// size to divide a file-size cap by — only a measurement. This
+    /// takes one at evenly spaced ordinals and hands back a basis a
+    /// [`ShardPlan`](crate::dataset::ShardPlan) can carry a margin on.
+    ///
+    /// Costs the pages the sampled ordinals fall in, not the facet: a
+    /// thousand records spread across a terabyte slab is a thousand
+    /// page reads, and against a remote facet those are ranges like
+    /// any other read here.
+    pub fn sample_record_size(
+        &self,
+        target: u64,
+    ) -> Result<Option<crate::dataset::RecordSize>> {
+        let total = self.count()?;
+        crate::dataset::shard_sizing::sample_spread(total, target, |o| {
+            self.record_bytes(o).map(|b| b.len() as u64)
+        })
+    }
+
     pub fn record_bytes(&self, ordinal: u64) -> Result<std::borrow::Cow<'_, [u8]>> {
         let (container, local) = self.locate(ordinal)?;
         container.record(local)

@@ -660,3 +660,109 @@ fn a_slab_window_starting_past_the_end_maps_to_nothing() {
         "an unmappable window degrades rather than fabricating a range"
     );
 }
+
+// ── sizing a shard from a variable-length facet ────────────────────
+
+use vectordata::dataset::shard_sizing::{
+    DEFAULT_MAX_SHARD_BYTES, DEFAULT_SAMPLE_RECORDS, RecordSize, plan,
+};
+
+/// A slab whose record `i` is `pad_bytes(i)` long, so the mean is
+/// something a test can state rather than guess.
+fn variable_slab(path: &std::path::Path, count: i32, pad_bytes: impl Fn(i32) -> usize) {
+    let cfg = slabtastic::WriterConfig::new(4096, 4096, 1 << 20, false).unwrap();
+    let mut w = slabtastic::SlabWriter::new(path, cfg).unwrap();
+    for i in 0..count {
+        let mut node = MNode::new();
+        node.fields.insert("id".to_string(), MValue::Int32(i));
+        node.fields
+            .insert("pad".to_string(), MValue::Text("x".repeat(pad_bytes(i))));
+        w.add_record(&node.to_bytes()).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+fn open_facet(dir: &std::path::Path) -> vectordata::records::RecordFacet {
+    let g = vectordata::TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+    g.profile("default").unwrap().open_facet_records("metadata_content").unwrap()
+}
+
+/// **A slab facet measures its own record size.** There is no stride
+/// to divide a file-size cap by, so the facet is asked what its
+/// records weigh and the answer carries a margin.
+#[test]
+fn a_slab_facet_samples_its_record_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path()).unwrap();
+    variable_slab(&tmp.path().join("metadata_content.slab"), 2000, |_| 100);
+    std::fs::write(tmp.path().join("base.fvec"), [4u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    std::fs::write(
+        tmp.path().join("dataset.yaml"),
+        "name: meta\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+         metadata_content: metadata_content.slab\n",
+    )
+    .unwrap();
+
+    let facet = open_facet(tmp.path());
+    let basis = facet.sample_record_size(DEFAULT_SAMPLE_RECORDS).unwrap().unwrap();
+
+    let RecordSize::Sampled { mean, max, sampled } = basis else {
+        panic!("a slab has no fixed record size: {basis:?}")
+    };
+    assert_eq!(sampled, DEFAULT_SAMPLE_RECORDS, "capped at the target");
+    // Every record here is the same size, so mean and max agree.
+    assert_eq!(mean, max);
+    assert!((120..200).contains(&mean), "a ~100-byte pad plus MNode framing: {mean}");
+
+    // And it plans a stride that keeps a full shard under the cap.
+    let p = plan(DEFAULT_MAX_SHARD_BYTES, basis).unwrap();
+    assert_eq!(p.record_bytes, mean * 2, "the 2x margin");
+    assert!(p.projected_bytes() <= DEFAULT_MAX_SHARD_BYTES);
+    assert_eq!(p.stride, vectordata::dataset::shard_sizing::floor_to_decade(p.stride));
+}
+
+/// The sample spans the facet, so a slab whose records grow with
+/// ordinal is measured near its true mean rather than its first page.
+#[test]
+fn a_growing_slab_is_measured_across_its_whole_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path()).unwrap();
+    // Records 0..1000 are small; 1000..2000 are ten times larger.
+    variable_slab(&tmp.path().join("metadata_content.slab"), 2000, |i| {
+        if i < 1000 { 20 } else { 1020 }
+    });
+    std::fs::write(tmp.path().join("base.fvec"), [4u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    std::fs::write(
+        tmp.path().join("dataset.yaml"),
+        "name: meta\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+         metadata_content: metadata_content.slab\n",
+    )
+    .unwrap();
+
+    let facet = open_facet(tmp.path());
+    let basis = facet.sample_record_size(200).unwrap().unwrap();
+    let RecordSize::Sampled { mean, max, .. } = basis else { panic!("sampled") };
+
+    // The true mean is ~570. A prefix sample would have said ~60.
+    assert!((480..=660).contains(&mean), "mean across the range: {mean}");
+    assert!(max > 1000, "the large half was reached: {max}");
+}
+
+/// An empty facet has nothing to measure, and says so rather than
+/// reporting a zero-byte record and an unbounded stride.
+#[test]
+fn an_empty_facet_yields_no_basis() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path()).unwrap();
+    variable_slab(&tmp.path().join("metadata_content.slab"), 0, |_| 0);
+    std::fs::write(tmp.path().join("base.fvec"), [4u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    std::fs::write(
+        tmp.path().join("dataset.yaml"),
+        "name: meta\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+         metadata_content: metadata_content.slab\n",
+    )
+    .unwrap();
+
+    let facet = open_facet(tmp.path());
+    assert!(facet.sample_record_size(DEFAULT_SAMPLE_RECORDS).unwrap().is_none());
+}
