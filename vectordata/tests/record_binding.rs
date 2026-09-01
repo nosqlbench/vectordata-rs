@@ -325,6 +325,16 @@ fn every_tag_has_a_bind_type() {
         BindType::of_tag(TypeTag::Millis),
         BindType::of_tag(TypeTag::Nanos)
     );
+    // The three temporals differ in encoding as well as meaning, and
+    // the bind type has to say so: `Date`, `Time` and `DateTime` are
+    // strings on the wire while `Millis` and `Nanos` are numbers. A
+    // parameter typed as a number and bound from a string is the kind
+    // of mistake nothing downstream reports.
+    assert_eq!(BindType::of_tag(TypeTag::DateTime), BindType::TimestampText);
+    assert_ne!(
+        BindType::of_tag(TypeTag::DateTime),
+        BindType::of_tag(TypeTag::Nanos)
+    );
 }
 
 // ── cases 11, 12: series and remote ────────────────────────────────

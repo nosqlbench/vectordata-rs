@@ -73,8 +73,12 @@ pub enum BindType {
     Time,
     /// An instant, in milliseconds.
     TimestampMillis,
-    /// An instant, in nanoseconds.
+    /// An instant, in seconds plus a nanosecond adjustment.
     TimestampNanos,
+    /// An instant carried as text. Distinct from the numeric
+    /// timestamps because that is what it is on the wire, and a
+    /// parameter typed as a number would be bound from a string.
+    TimestampText,
     /// A UUID whose ordering carries a timestamp.
     TimeUuid,
     /// A UUID.
@@ -121,7 +125,9 @@ impl BindType {
             TypeTag::Date => BindType::Date,
             TypeTag::Time => BindType::Time,
             TypeTag::Millis => BindType::TimestampMillis,
-            TypeTag::Nanos | TypeTag::DateTime => BindType::TimestampNanos,
+            TypeTag::Nanos => BindType::TimestampNanos,
+            // Textual on the wire, whatever the name suggests.
+            TypeTag::DateTime => BindType::TimestampText,
             TypeTag::UuidV1 => BindType::TimeUuid,
             TypeTag::UuidV7 => BindType::Uuid,
             TypeTag::Ulid => BindType::Ulid,

@@ -199,6 +199,29 @@ fn read_f64(data: &[u8], pos: usize) -> f64 {
     f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap())
 }
 
+/// Widen an IEEE binary16 bit pattern to `f64`.
+///
+/// `MValue::Half` stores the bits, not a value, so this is the only
+/// correct way to read one as a number.
+fn f16_to_f64(bits: u16) -> f64 {
+    let sign = if bits & 0x8000 != 0 { -1.0f64 } else { 1.0 };
+    let exp = ((bits >> 10) & 0x1F) as i32;
+    let frac = (bits & 0x03FF) as f64;
+    match exp {
+        // Subnormal, including zero.
+        0 => sign * frac * 2f64.powi(-24),
+        // Infinity and NaN.
+        31 => {
+            if frac == 0.0 {
+                sign * f64::INFINITY
+            } else {
+                f64::NAN
+            }
+        }
+        _ => sign * (1.0 + frac / 1024.0) * 2f64.powi(exp - 15),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Raw comparison (zero-alloc)
 // ---------------------------------------------------------------------------
@@ -400,25 +423,36 @@ impl Field<'_> {
         std::str::from_utf8(self.name).ok()
     }
 
-    /// The value as a signed integer, for the integer-shaped tags.
+    /// The value as a signed integer.
     ///
-    /// `None` for a tag that is not integer-shaped — the caller asked
-    /// the wrong question of this field, which is not the same as the
-    /// field being absent.
+    /// Only the tags whose payload **is** an integer: `Int` and
+    /// `Millis` (i64), `EnumOrd` and `Int32` (i32), `Short` (i16).
+    ///
+    /// `Date`, `Time` and `DateTime` are deliberately absent: they are
+    /// length-prefixed strings on the wire, and reading one as an
+    /// integer returns its length prefix. `Nanos` is absent because it
+    /// is two fields — see [`Self::as_epoch_nanos`], which returns
+    /// both rather than silently dropping the adjustment.
     pub fn as_i64(&self) -> Option<i64> {
         match self.tag {
-            1 | 18 | 19 | 22 => Some(read_i64(self.value, 0)),
-            12 | 7 | 20 | 21 => Some(read_i32(self.value, 0) as i64),
+            1 | 18 => Some(read_i64(self.value, 0)),
+            7 | 12 => Some(read_i32(self.value, 0) as i64),
             13 => Some(read_i16(self.value, 0) as i64),
             _ => None,
         }
     }
 
-    /// The value as a float, for the float-shaped tags.
+    /// The value as a float.
+    ///
+    /// `Half` is included and widened from its binary16 bits. It is
+    /// stored as a `u16`, so a caller reading it as an integer would
+    /// get the bit pattern — 15360 for 1.0 — which is why this is the
+    /// accessor for it and `as_i64` is not.
     pub fn as_f64(&self) -> Option<f64> {
         match self.tag {
             2 => Some(read_f64(self.value, 0)),
             16 => Some(read_f32(self.value, 0) as f64),
+            17 => Some(f16_to_f64(read_u16(self.value, 0))),
             _ => None,
         }
     }
@@ -428,12 +462,15 @@ impl Field<'_> {
         (self.tag == 3).then(|| self.value.first().is_some_and(|b| *b != 0))
     }
 
-    /// The value as text, for the string-shaped tags.
+    /// The value as text.
     ///
-    /// The length prefix is stripped; the result borrows the record.
+    /// The length prefix is stripped and the result borrows the record.
+    /// Covers `Text`, `EnumStr`, `TextValidated` and `Ascii` — and the
+    /// temporal trio `Date`, `Time` and `DateTime`, which are textual
+    /// on the wire whatever their names suggest.
     pub fn as_str(&self) -> Option<&str> {
         match self.tag {
-            0 | 6 | 10 | 11 => {
+            0 | 6 | 10 | 11 | 20 | 21 | 22 => {
                 let len = read_u32(self.value, 0) as usize;
                 self.value
                     .get(4..4 + len)
@@ -443,18 +480,43 @@ impl Field<'_> {
         }
     }
 
-    /// The value as raw bytes, for byte-shaped tags.
+    /// The value as raw bytes.
+    ///
+    /// `Bytes` and `Varint` are length-prefixed; the identifiers are
+    /// sixteen bytes with no prefix.
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self.tag {
-            4 => {
+            4 | 15 => {
                 let len = read_u32(self.value, 0) as usize;
                 self.value.get(4..4 + len)
             }
-            // Fixed-width identifiers carry no length prefix:
-            // UuidV1, UuidV7, Ulid.
+            // UuidV1, UuidV7, Ulid: fixed width, no length prefix.
             23..=25 => Some(self.value),
             _ => None,
         }
+    }
+
+    /// A `Nanos` instant, as `(epoch_seconds, nano_adjust)`.
+    ///
+    /// Two fields, returned as two. Reading only the seconds would
+    /// look right and lose the sub-second part.
+    pub fn as_epoch_nanos(&self) -> Option<(i64, i32)> {
+        (self.tag == 19).then(|| (read_i64(self.value, 0), read_i32(self.value, 8)))
+    }
+
+    /// A `Decimal`, as `(scale, unscaled digits)`.
+    ///
+    /// The digits are the big-integer bytes; the value is those digits
+    /// scaled by `10^-scale`. Handed over rather than converted, since
+    /// this crate carries no arbitrary-precision type and inventing a
+    /// lossy one would be worse than making the caller choose.
+    pub fn as_decimal(&self) -> Option<(i32, &[u8])> {
+        if self.tag != 14 {
+            return None;
+        }
+        let scale = read_i32(self.value, 0);
+        let len = read_u32(self.value, 4) as usize;
+        self.value.get(8..8 + len).map(|d| (scale, d))
     }
 
     /// Whether this field is the null value.
@@ -1541,5 +1603,112 @@ mod field_access_tests {
         let results: Vec<_> = fields(short).unwrap().collect();
         assert!(results.iter().any(|r| r.is_err()));
         assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod wire_shape_tests {
+    use super::*;
+    use crate::mnode::{MNode, MValue, TypeTag};
+
+    fn one(v: MValue) -> Vec<u8> {
+        let mut n = MNode::new();
+        n.insert("f".into(), v);
+        n.to_bytes()
+    }
+
+    fn field(bytes: &[u8]) -> Field<'_> {
+        fields(bytes).unwrap().next().unwrap().unwrap()
+    }
+
+    /// **The temporal trio is textual.** `Date`, `Time` and `DateTime`
+    /// hold strings on the wire whatever their names suggest, and an
+    /// accessor that read them as integers would return their length
+    /// prefix — a plausible number, silently wrong.
+    #[test]
+    fn date_time_and_datetime_are_strings_not_integers() {
+        for (v, expect) in [
+            (MValue::Date("2026-09-01".into()), "2026-09-01"),
+            (MValue::Time("12:34:56".into()), "12:34:56"),
+            (MValue::DateTime("2026-09-01T12:34:56Z".into()), "2026-09-01T12:34:56Z"),
+        ] {
+            let bytes = one(v);
+            let f = field(&bytes);
+            assert_eq!(f.as_str(), Some(expect));
+            assert_eq!(f.as_i64(), None, "reading {expect} as an integer must decline");
+        }
+    }
+
+    /// **`Nanos` is two fields**, and both come back. Returning only
+    /// the seconds would look right and lose the adjustment.
+    #[test]
+    fn nanos_yields_both_of_its_fields() {
+        let bytes = one(MValue::Nanos {
+            epoch_seconds: 1_700_000_000,
+            nano_adjust: 123_456_789,
+        });
+        let f = field(&bytes);
+        assert_eq!(f.as_epoch_nanos(), Some((1_700_000_000, 123_456_789)));
+        assert_eq!(f.as_i64(), None, "not a plain integer");
+    }
+
+    /// **`Half` reads as the float it is**, not as its bit pattern.
+    #[test]
+    fn half_widens_from_its_bits() {
+        for (bits, expect) in [(0x3C00u16, 1.0f64), (0x4000, 2.0), (0xC000, -2.0), (0x0000, 0.0)] {
+            let bytes = one(MValue::Half(bits));
+            let f = field(&bytes);
+            assert_eq!(f.as_f64(), Some(expect), "bits {bits:#06x}");
+            assert_eq!(f.as_i64(), None, "the bit pattern is not the value");
+        }
+    }
+
+    /// The integer family reads by its own width, and nothing else
+    /// answers as an integer.
+    #[test]
+    fn the_integer_family_reads_by_width() {
+        assert_eq!(field(&one(MValue::Int(-5))).as_i64(), Some(-5));
+        assert_eq!(field(&one(MValue::Millis(1_700_000_000_000))).as_i64(), Some(1_700_000_000_000));
+        assert_eq!(field(&one(MValue::Int32(-7))).as_i64(), Some(-7));
+        assert_eq!(field(&one(MValue::Short(-9))).as_i64(), Some(-9));
+        assert_eq!(field(&one(MValue::EnumOrd(3))).as_i64(), Some(3));
+    }
+
+    /// Identifiers are sixteen bytes with no length prefix; `Bytes` has
+    /// one. Both come back as their content.
+    #[test]
+    fn byte_shaped_values_strip_their_prefix_or_do_not_have_one() {
+        let id = [7u8; 16];
+        assert_eq!(field(&one(MValue::UuidV7(id))).as_bytes(), Some(&id[..]));
+        assert_eq!(field(&one(MValue::Ulid(id))).as_bytes(), Some(&id[..]));
+        assert_eq!(
+            field(&one(MValue::Bytes(vec![1, 2, 3]))).as_bytes(),
+            Some(&[1u8, 2, 3][..])
+        );
+    }
+
+    /// **Every tag the scanner can skip is a tag `fields` can walk.**
+    ///
+    /// The tag set is a cross-language contract wider than this crate's
+    /// value enum — `TextValidated`, `Decimal` and `Varint` have no
+    /// `MValue` — so a record written by another implementation can
+    /// carry them. Walking must not stop at one.
+    #[test]
+    fn every_tag_can_be_walked_even_without_a_local_value_type() {
+        // Hand-built: a Decimal field, which has no MValue to build from.
+        let mut rec = vec![DIALECT_MNODE];
+        rec.extend_from_slice(&1u16.to_le_bytes()); // one field
+        rec.extend_from_slice(&1u16.to_le_bytes()); // name length
+        rec.push(b'd');
+        rec.push(TypeTag::Decimal as u8);
+        rec.extend_from_slice(&2i32.to_le_bytes()); // scale
+        rec.extend_from_slice(&3u32.to_le_bytes()); // digit length
+        rec.extend_from_slice(&[9, 8, 7]);
+
+        let f = field(&rec);
+        assert_eq!(f.name_str(), Some("d"));
+        assert_eq!(f.as_decimal(), Some((2, &[9u8, 8, 7][..])));
+        // And the walk completes rather than stopping at an unknown shape.
+        assert_eq!(fields(&rec).unwrap().count(), 1);
     }
 }
