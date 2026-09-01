@@ -656,3 +656,150 @@ impl RecordFacet {
         })
     }
 }
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use crate::formats::mnode::{MNode, MValue};
+
+    /// A slab of `n` records in small pages, so the index has many
+    /// entries and page seams are reachable.
+    fn paged_slab(path: &std::path::Path, n: i32) {
+        let cfg = slabtastic::WriterConfig::new(4096, 4096, 1 << 20, false).unwrap();
+        let mut w = slabtastic::SlabWriter::new(path, cfg).unwrap();
+        for i in 0..n {
+            let mut node = MNode::new();
+            node.fields.insert("id".to_string(), MValue::Int32(i));
+            node.fields
+                .insert("pad".to_string(), MValue::Text("y".repeat(40)));
+            w.add_record(&node.to_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    fn index_of(path: &std::path::Path) -> SlabIndex {
+        let storage = crate::storage::Storage::open(path.to_str().unwrap()).unwrap();
+        read_slab_index(&storage, None, "test").unwrap().expect("a slab index")
+    }
+
+    /// The index comes from the tail: three short reads, and it reports
+    /// what they cost so a plan can price what planning cost.
+    #[test]
+    fn the_index_is_read_from_the_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.slab");
+        paged_slab(&path, 600);
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let index = index_of(&path);
+        assert_eq!(index.total(), 600);
+        assert!(index.page_count() > 1, "the fixture must span pages");
+        assert!(index.prerequisite_bytes() > 0);
+        assert!(
+            index.prerequisite_bytes() < file_len / 4,
+            "reading the index must not amount to reading the file: {} of {file_len}",
+            index.prerequisite_bytes()
+        );
+    }
+
+    /// **Every ordinal resolves to the page that holds it**, and the
+    /// page it resolves to starts at or before it.
+    #[test]
+    fn every_ordinal_lands_in_a_page_that_contains_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.slab");
+        paged_slab(&path, 400);
+        let index = index_of(&path);
+
+        for o in 0..index.total() {
+            let page = index.page_of(o).unwrap_or_else(|| panic!("ordinal {o}"));
+            let start = index.page_start_ordinal(page).unwrap();
+            assert!(start as u64 <= o, "page {page} starts after ordinal {o}");
+            // And the next page starts after it, so `o` is in this one.
+            if let Some(next) = index.page_start_ordinal(page + 1) {
+                assert!(o < next as u64, "ordinal {o} belongs to page {}", page + 1);
+            }
+        }
+    }
+
+    /// **A page seam is a boundary, not a gap.** The last ordinal of a
+    /// page and the first of the next land in different pages, and
+    /// consecutively.
+    #[test]
+    fn page_seams_divide_without_a_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.slab");
+        paged_slab(&path, 400);
+        let index = index_of(&path);
+        assert!(index.page_count() >= 2);
+
+        for page in 1..index.page_count() {
+            let first = index.page_start_ordinal(page).unwrap() as u64;
+            assert_eq!(index.page_of(first), Some(page), "first ordinal of page {page}");
+            assert_eq!(
+                index.page_of(first - 1),
+                Some(page - 1),
+                "the ordinal before it belongs to the previous page"
+            );
+        }
+    }
+
+    /// An ordinal past the end resolves to nothing rather than clamping
+    /// to the last page — the same rule the ordinal model takes.
+    #[test]
+    fn an_ordinal_past_the_end_does_not_clamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.slab");
+        paged_slab(&path, 50);
+        let index = index_of(&path);
+
+        assert!(index.page_of(49).is_some());
+        assert_eq!(index.page_of(50), None, "one past the end");
+        assert_eq!(index.page_of(u64::MAX), None);
+        assert_eq!(index.page_offset(index.page_count()), None);
+        assert_eq!(index.page_start_ordinal(index.page_count()), None);
+    }
+
+    /// Page offsets increase with ordinal order, which is what lets a
+    /// window over consecutive ordinals be one byte range.
+    #[test]
+    fn pages_are_laid_out_in_ordinal_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.slab");
+        paged_slab(&path, 400);
+        let index = index_of(&path);
+
+        let mut last = 0u64;
+        for page in 0..index.page_count() {
+            let at = index.page_offset(page).unwrap();
+            assert!(at >= last, "page {page} starts before page {}", page - 1);
+            last = at;
+        }
+    }
+
+    /// A namespace the file does not carry is absent, not an error —
+    /// the layout copy is optional and several producers never write
+    /// one.
+    #[test]
+    fn an_absent_namespace_reads_as_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.slab");
+        paged_slab(&path, 4);
+        let storage = crate::storage::Storage::open(path.to_str().unwrap()).unwrap();
+        assert!(
+            read_slab_index(&storage, Some("layout"), "test").unwrap().is_none(),
+            "an absent namespace is a normal state"
+        );
+    }
+
+    /// A file that is not a slab is refused by its own structure rather
+    /// than walked into.
+    #[test]
+    fn a_file_that_is_not_a_slab_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("not.slab");
+        std::fs::write(&path, b"this is not a slab file at all, truly").unwrap();
+        let storage = crate::storage::Storage::open(path.to_str().unwrap()).unwrap();
+        assert!(read_slab_index(&storage, None, "test").is_err());
+    }
+}
