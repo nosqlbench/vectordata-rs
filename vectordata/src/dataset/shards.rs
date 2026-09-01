@@ -869,13 +869,131 @@ pub(crate) type Cardinality<'a> = &'a dyn Fn(&DSSource) -> Result<u64, String>;
 pub(crate) const SHARD_FIELD: &str = "NNNN";
 
 /// Whether a source string declares a uniform series.
-pub(crate) fn has_shard_field(source: &str) -> bool {
+pub fn has_shard_field(source: &str) -> bool {
     source.contains(SHARD_FIELD)
 }
 
 /// Substitute the shard index into a uniform source's `NNNN` field.
 pub(crate) fn shard_filename(source: &str, index: u32) -> String {
     source.replacen(SHARD_FIELD, &format!("{index:04}"), 1)
+}
+
+/// The `source:` value a series of `basename.ext` declares (SH-47).
+///
+/// The pattern, not a filename: the declaration says what the series
+/// is rather than naming one of its files.
+pub fn shard_source_spec(basename: &str, ext: &str) -> String {
+    if ext.is_empty() {
+        format!("{basename}__{SHARD_FIELD}")
+    } else {
+        format!("{basename}__{SHARD_FIELD}.{ext}")
+    }
+}
+
+/// The filename of shard `index` of `basename.ext`.
+///
+/// Defined as the pattern with its field substituted, rather than as
+/// its own format string. A writer and a reader that each spell the
+/// four digits independently agree only by coincidence, and the day
+/// one of them changes is the day a series stops resolving.
+pub fn shard_name(basename: &str, ext: &str, index: u32) -> String {
+    shard_filename(&shard_source_spec(basename, ext), index)
+}
+
+/// The shard files of the series whose unsharded name is `path`.
+///
+/// Uniform naming only (SH-2): `<stem>__NNNN.<ext>`, four digits,
+/// consecutive from zero. Stops at the first gap rather than skipping
+/// it — a series missing shard 3 is a broken facet, and silently
+/// reading shards 0–2 as the whole thing would hand back a prefix that
+/// looks complete.
+///
+/// Empty when there is no shard zero, which is the ordinary case for
+/// every unsharded file.
+pub fn discover_shards(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Some(dir) = path.parent() else {
+        return Vec::new();
+    };
+    let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let (basename, ext) = match file.rsplit_once('.') {
+        Some((b, e)) => (b, e),
+        None => (file, ""),
+    };
+    let mut out = Vec::new();
+    for i in 0u32.. {
+        let candidate = dir.join(shard_name(basename, ext, i));
+        if !candidate.is_file() {
+            break;
+        }
+        out.push(candidate);
+    }
+    out
+}
+
+/// What a set of shard files on disk actually holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedSeries {
+    /// Records per shard, taken from the first — every shard but the
+    /// last is full (SH-35).
+    pub stride: u64,
+    /// How many shards there are.
+    pub shards: u32,
+    /// Records across all of them.
+    pub records: u64,
+}
+
+/// Measure a series from its files.
+///
+/// Reads each shard's dim header and size, which is two syscalls per
+/// shard and no data. `None` when the shards do not agree on a
+/// dimension, or when one is not a whole number of records — either
+/// means these files are not one uniform facet, and declaring them as
+/// one would produce a `record_count` nothing could satisfy.
+pub fn observe_series(shards: &[std::path::PathBuf]) -> Option<ObservedSeries> {
+    use std::io::Read;
+    let mut counts: Vec<u64> = Vec::with_capacity(shards.len());
+    let mut stride_bytes: Option<u64> = None;
+    for path in shards {
+        let len = std::fs::metadata(path).ok()?.len();
+        let mut header = [0u8; 4];
+        let mut f = std::fs::File::open(path).ok()?;
+        f.read_exact(&mut header).ok()?;
+        let dim = i32::from_le_bytes(header);
+        if dim <= 0 {
+            return None;
+        }
+        // The element width is not knowable from the header alone, but
+        // it does not need to be: every shard shares one record size,
+        // so the first shard's size divided by its record count gives
+        // it — and the first shard is full by construction.
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let elem = crate::io::infer_elem_size(ext) as u64;
+        if elem == 0 {
+            return None;
+        }
+        let record = 4 + dim as u64 * elem;
+        match stride_bytes {
+            None => stride_bytes = Some(record),
+            Some(r) if r == record => {}
+            // Shards disagreeing on record size are not one facet.
+            Some(_) => return None,
+        }
+        if !len.is_multiple_of(record) {
+            return None;
+        }
+        counts.push(len / record);
+    }
+    let stride = *counts.first()?;
+    if stride == 0 {
+        return None;
+    }
+    Some(ObservedSeries {
+        stride,
+        shards: counts.len() as u32,
+        records: counts.iter().sum(),
+    })
 }
 
 /// The all-digit token immediately before the shard field, if there is

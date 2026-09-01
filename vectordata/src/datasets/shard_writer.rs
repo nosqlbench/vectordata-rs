@@ -55,12 +55,16 @@ impl ShardOutcome {
         match (self.collapsed, self.files.first()) {
             (true, Some(f)) => name(f),
             (false, Some(f)) => {
-                // Replace the shard field with the literal token, so the
-                // declaration says what it means rather than naming one
-                // file (SH-47).
+                // The declaration says what the series is rather than
+                // naming one file (SH-47), so it is rebuilt from the
+                // same pattern the filenames came from.
                 let n = name(f);
                 match n.rfind("__") {
-                    Some(i) => format!("{}__{}{}", &n[..i], "NNNN", &n[i + 6..]),
+                    Some(i) => {
+                        let (basename, rest) = (&n[..i], &n[i + 6..]);
+                        let ext = rest.strip_prefix('.').unwrap_or("");
+                        crate::dataset::shards::shard_source_spec(basename, ext)
+                    }
                     None => n,
                 }
             }
@@ -124,8 +128,11 @@ impl ShardWriter {
 
     /// The final path of shard `i` — four digits, always (SH-2).
     fn shard_path(&self, i: u32) -> PathBuf {
-        self.dir
-            .join(format!("{}__{:04}.{}", self.basename, i, self.ext))
+        self.dir.join(crate::dataset::shards::shard_name(
+            &self.basename,
+            &self.ext,
+            i,
+        ))
     }
 
     /// The single-file path this output collapses to (SH-83).
