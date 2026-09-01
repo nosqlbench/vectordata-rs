@@ -117,6 +117,7 @@ pub(crate) fn run(args: SynthesizeArgs) {
         required_facets: None,
         provided_facets: None,
         round_digits: 2,
+        max_shard_bytes: vectordata::dataset::DEFAULT_MAX_SHARD_BYTES,
         selectivity: 0.0001,
         predicate_count: 10000,
         predicate_strategy: "eq".to_string(),

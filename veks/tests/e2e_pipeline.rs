@@ -70,6 +70,7 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         base_fraction: 1.0,
         required_facets: None,
         round_digits: 10, // disable rounding for exact counts in tests
+        max_shard_bytes: vectordata::dataset::DEFAULT_MAX_SHARD_BYTES,
         pedantic_dedup: false,
         selectivity: 0.0001,
         predicate_count: 10000,

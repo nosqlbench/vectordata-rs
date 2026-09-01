@@ -187,6 +187,20 @@ pub enum PrepareCommand {
         #[arg(long, default_value = "2")]
         round_digits: u32,
 
+        /// Maximum size of one facet shard file.
+        ///
+        /// A facet larger than this is written as a series of files
+        /// rather than one, so it stays within the 2TB file-size
+        /// limits some filesystems and transfer tools still have.
+        /// Recorded in the dataset as `upstream.defaults.shard_size`,
+        /// and overridable per-run with `--resources shardsize:...`.
+        ///
+        /// Accepts size suffixes: `--max-shard-bytes 1TB`. In
+        /// interactive mode this seeds the prompt instead of skipping
+        /// it. Defaults to 1TB.
+        #[arg(long, value_name = "BYTES")]
+        max_shard_bytes: Option<String>,
+
         /// Run dedup+zeros on the full input before subsetting (slower but
         /// stable). Default: subset first, then dedup on the subset.
         #[arg(long)]
@@ -544,10 +558,26 @@ pub fn run(args: PrepareArgs) {
             no_filtered, normalize, no_normalize,
             assume_normalized_like_faiss, use_proper_cosine_metric,
             force, reset, clean, recursive,
-            base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
+            base_fraction, required_facets, provided_facets, round_digits, max_shard_bytes,
+            pedantic_dedup, auto, classic, sources,
             personality, synthesize_metadata, metadata_fields, metadata_range,
             synthesis_mode, synthesis_format, selectivity, predicate_count,
         } => {
+            // A size with units, resolved once. An unparseable value
+            // is a hard stop rather than a silent fall back to the
+            // default: the operator asked for a specific cap.
+            let max_shard_bytes: Option<u64> = match max_shard_bytes
+                .as_deref()
+                .map(vectordata::dataset::source::parse_number_with_suffix)
+                .transpose()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: --max-shard-bytes: {e}");
+                    std::process::exit(1);
+                }
+            };
+
             // Derive cosine_mode from the two mutually-exclusive
             // flags. Clap already enforces "can't both be true".
             // Non-interactive mode with metric=COSINE requires one
@@ -670,6 +700,7 @@ pub fn run(args: PrepareArgs) {
                         required_facets: required_facets.clone(),
                         provided_facets: provided_facets.clone(),
                         round_digits: None,
+                        max_shard_bytes,
                         selectivity: None,
                         force: true,
                         classic,
@@ -833,6 +864,7 @@ pub fn run(args: PrepareArgs) {
                         required_facets: required_facets.clone(),
                         provided_facets: provided_facets.clone(),
                         round_digits: Some(round_digits),
+                        max_shard_bytes,
                         force: force || reset,
                         selectivity: None,
                         classic,
@@ -866,6 +898,8 @@ pub fn run(args: PrepareArgs) {
                         required_facets: required_facets.clone(),
                         provided_facets: provided_facets.clone(),
                         round_digits,
+                        max_shard_bytes: max_shard_bytes
+                            .unwrap_or(vectordata::dataset::DEFAULT_MAX_SHARD_BYTES),
                         pedantic_dedup,
                         selectivity,
                         predicate_count,
@@ -911,6 +945,7 @@ pub fn run(args: PrepareArgs) {
                     required_facets: required_facets.clone(),
                     provided_facets: provided_facets.clone(),
                     round_digits: Some(round_digits),
+                    max_shard_bytes,
                     force,
                     selectivity: None,
                     classic,
@@ -942,6 +977,8 @@ pub fn run(args: PrepareArgs) {
                     required_facets,
                     provided_facets,
                     round_digits,
+                    max_shard_bytes: max_shard_bytes
+                        .unwrap_or(vectordata::dataset::DEFAULT_MAX_SHARD_BYTES),
                     pedantic_dedup,
                     selectivity,
                     predicate_count,

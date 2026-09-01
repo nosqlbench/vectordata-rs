@@ -47,6 +47,8 @@ pub struct WizardSeeds {
     pub required_facets: Option<String>,
     pub provided_facets: Option<String>,
     pub round_digits: Option<u32>,
+    /// Maximum bytes per facet shard file, from `--max-shard-bytes`.
+    pub max_shard_bytes: Option<u64>,
     pub selectivity: Option<f64>,
     pub force: bool,
     pub classic: bool,
@@ -277,6 +279,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             required_facets: None,
             provided_facets: seeds.provided_facets.clone(),
             round_digits: 2,
+            max_shard_bytes: vectordata::dataset::DEFAULT_MAX_SHARD_BYTES,
             pedantic_dedup: false,
             selectivity: 0.0001,
             predicate_count: 10000,
@@ -821,6 +824,10 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     } else {
         0
     };
+
+    // Shard sizing: how large one facet file may get before the facet
+    // is written as a multi-file series instead.
+    let max_shard_bytes = prompt_shard_size(dim, base_vec_count, seeds.max_shard_bytes);
 
     // Oracle partition profiles (O facet): configured when O is in the
     // confirmed facet set, same as any other facet.
@@ -1410,6 +1417,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         required_facets,
         provided_facets: seeds.provided_facets.clone(),
         round_digits: seeds.round_digits.unwrap_or(2),
+        max_shard_bytes,
         pedantic_dedup: seeds.pedantic_dedup.unwrap_or(false),
         selectivity,
         predicate_count,
@@ -2447,6 +2455,67 @@ fn prompt_u64(question: &str, default: u64) -> u64 {
             Err(_) => eprintln!("  invalid number '{}', try again", trimmed),
         }
     }
+}
+
+/// Ask how large one shard file may get, and report what that means
+/// in records.
+///
+/// The cap exists because filesystems and transfer tools still carry
+/// 2 TB limits, so a facet large enough to hit one is written as a
+/// series instead. The default is 1 TB — a round number well under
+/// that, with room for the estimate to be wrong.
+///
+/// The projection shown is for the base vectors, whose record size is
+/// known from the dimension probed above. Facets whose records vary —
+/// a metadata slab, a variable-length vvec — are measured when they
+/// are written rather than guessed at here.
+fn prompt_shard_size(dim: u64, base_count: u64, seeded: Option<u64>) -> u64 {
+    use vectordata::dataset::shard_sizing::{DEFAULT_MAX_SHARD_BYTES, plan_fixed, xvec_record_bytes};
+
+    println!();
+    println!("--- Shard Sizing ---");
+    println!("  A facet larger than this is written as a series of files rather");
+    println!("  than one, so it stays within the 2TB file limits some systems have.");
+
+    let chosen = match seeded {
+        Some(v) => {
+            println!("  (seeded: {})", format_size(v));
+            v
+        }
+        None => prompt_u64("Maximum shard file size", DEFAULT_MAX_SHARD_BYTES),
+    };
+
+    // What the answer means for the facet whose shape is already known.
+    if dim > 0 {
+        // f32 is what the base facet is written as unless converted;
+        // the projection is indicative, and the writer recomputes it
+        // from the format it actually writes.
+        let record = xvec_record_bytes(dim, 4);
+        match plan_fixed(chosen, record) {
+            Some(p) => {
+                println!(
+                    "  → {} records per shard at dim={} ({} per file)",
+                    p.stride,
+                    dim,
+                    format_size(p.projected_bytes()),
+                );
+                if base_count > 0 {
+                    let shards = p.shards_for(base_count);
+                    if shards > 1 {
+                        println!("  → {} base vectors would occupy {} files", base_count, shards);
+                    } else {
+                        println!("  → {} base vectors fit in one file", base_count);
+                    }
+                }
+            }
+            None => println!(
+                "  ! {} cannot hold ten {}-byte records; facets will not be sharded",
+                format_size(chosen),
+                record,
+            ),
+        }
+    }
+    chosen
 }
 
 /// Exposed for testing.

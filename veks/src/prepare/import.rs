@@ -82,6 +82,15 @@ pub struct ImportArgs {
     /// Default 2 produces clean sizes (e.g., 180000000 instead of 184623729).
     /// Set to 10+ to effectively disable rounding.
     pub round_digits: u32,
+
+    /// Maximum size of one facet shard file, in bytes.
+    ///
+    /// Emitted into the dataset's `upstream.defaults.shard_size`, so
+    /// the pipeline that builds it writes a facet larger than this as
+    /// a series rather than one file. Defaults to 1 TB, which is what
+    /// the governor uses when a dataset declares nothing.
+    #[serde(default = "default_max_shard_bytes")]
+    pub max_shard_bytes: u64,
     /// Selectivity ratio for synthesized predicates.
     /// Lower values produce harder predicates (fewer qualifying neighbors).
     /// Default 0.0001 means ~0.01% of base vectors match each predicate.
@@ -166,6 +175,10 @@ fn default_personality() -> String {
 
 fn default_metadata_fields() -> u32 { 3 }
 fn default_metadata_range_max() -> i32 { 1000 }
+fn default_max_shard_bytes() -> u64 {
+    vectordata::dataset::DEFAULT_MAX_SHARD_BYTES
+}
+
 fn default_predicate_count() -> u32 { 10000 }
 fn default_predicate_strategy() -> String { "eq".to_string() }
 fn default_synthesis_mode() -> String { "simple-int-eq".to_string() }
@@ -2567,6 +2580,14 @@ fn generate_yaml(
         out.push_str("  defaults:\n");
         out.push_str(&format!("    query_count: {}\n", args.query_count));
         out.push_str(&format!("    seed: {}\n", args.seed));
+        // The cap this dataset's facets were sized for, so a run on
+        // another machine produces the same layout. `--resources
+        // shardsize:` still overrides it per run.
+        out.push_str(&format!(
+            "    {}: {}\n",
+            vectordata::dataset::shard_sizing::SHARD_SIZE_KEY,
+            args.max_shard_bytes,
+        ));
         out.push_str("\n  steps:\n");
 
         for step in steps {
@@ -3600,6 +3621,7 @@ mod tests {
             required_facets: None,
             provided_facets: None,
             round_digits: 2,
+            max_shard_bytes: vectordata::dataset::DEFAULT_MAX_SHARD_BYTES,
             pedantic_dedup: false,
             selectivity: 0.0001,
             predicate_count: 10000,
