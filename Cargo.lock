@@ -6409,6 +6409,7 @@ dependencies = [
 name = "veks-pipeline"
 version = "2.0.0"
 dependencies = [
+ "arrow",
  "atty",
  "byteorder",
  "candle-core",
@@ -6430,6 +6431,7 @@ dependencies = [
  "jaq-std",
  "libc",
  "log",
+ "parquet",
  "petgraph",
  "quick-xml",
  "rand 0.9.4",
