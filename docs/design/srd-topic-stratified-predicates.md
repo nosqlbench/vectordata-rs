@@ -361,7 +361,7 @@ but five times the predicates where the resolution matters. Against
 today's 174.5 GB for the same ladder, that is a **4.3× reduction**
 alongside the coverage improvement.
 
-## 4. Derived columns and their encoding
+## 4. Derived columns, encoding, and adjunct data
 
 ### 4.1 The columns
 
@@ -454,11 +454,12 @@ The statistical machinery lives in the **sampler**, not in the
 predicate. Density conditioning happens when a predicate is *selected*
 (§3); it leaves no residue in the predicate that is *published*.
 
-**TS-58.** A retained predicate is an ordinary PNode over named fields
-with literal comparands. Nothing in the published artifact records the
-decade it was drawn for, the cluster size that qualified it, or the
-stratum it filled — that belongs in the generation report (TS-34), not
-in the test corpus.
+**TS-58.** A retained predicate **record** is an ordinary PNode over
+named fields with literal comparands, and nothing else. It does not
+record the cluster size that qualified it or the stratum it filled —
+that belongs in the generation report (TS-34). What a predicate *is*
+and what it *does* is annotated separately, in a sibling namespace
+(§4.5), which a consumer reading filters can ignore entirely.
 
 So the predicate facet a consumer reads contains only this:
 
@@ -487,6 +488,151 @@ published, so that a consumer cannot mistake it for a realistic query
 (TS-2, TS-48). Everything else in the corpus is a sentence somebody
 could have meant, and reads as one without reference to this document —
 which is the acceptance test in TS-45.
+
+### 4.5 Marking the predicate family
+
+TS-7 requires results be reported per `(family × decade)` cell, so the
+grouping key has to survive into the published dataset. Nothing marks
+it today.
+
+**TS-60.** The family is recorded in a **sibling namespace of
+`predicates.slab`**, one record per predicate ordinal: record *i* of the
+annotation namespace describes predicate *i* of the content namespace.
+
+The facet spec already models this — `StandardFacet::namespaces()`
+returns `["layout", ""]` for the layout facet — so
+`MetadataPredicates` gains an annotation namespace beside its default
+one. The reader exists too: `RecordFacet::namespace(name)` opens a named
+namespace as an ordinal-addressed record facet.
+
+**TS-61.** Annotation records are MNode. The name tax that mattered at
+531,869,985 passages (§4.2) is irrelevant across a few thousand
+predicates.
+
+**TS-62.** The annotation carries what a predicate **is** and what it
+**does**, not why it was selected:
+
+| field | type | notes |
+|---|---|---|
+| `family` | text | `topical` / `structural` / `bibliographic` / `control` |
+| `selectivity` | float64 | the fraction measured when the predicate was admitted |
+| `topic_level` | int | 1 / 2 / 3, topical family only |
+| `query_placement` | text | `in-topic` / `out-of-topic` (TS-19), topical only |
+
+**The decade is derived, not stored.** It is `⌊log₁₀ selectivity⌋`, so
+recording the continuous value and computing the bin keeps the artifact
+describing the predicate rather than the experiment that produced it —
+which is what reconciles TS-7 with TS-58.
+
+**TS-63.** Absence of the namespace means **one unlabelled family**, not
+zero predicates. Every dataset written before this design has no such
+namespace and must keep working unchanged. This follows the `forms`
+namespace precedent exactly, where absence means one implicit form
+rather than none.
+
+**TS-64.** The annotation must live in the same file as the predicates
+it describes. A sibling facet or a side-car report can be lost,
+truncated or updated independently; a namespace in the same slab cannot
+drift from the records it annotates.
+
+#### Rejected alternatives
+
+**TS-65.** *Annotate inside the PNode.* A PNode has slots for a field,
+an operator and comparands, and nothing else. The only way to attach a
+label within one is to conjoin a synthetic predicate — which changes
+what the predicate matches and therefore its selectivity. It would
+corrupt the very quantity the annotation exists to report.
+
+**TS-66.** *A separate facet.* Same information, an extra declaration,
+an extra file, and the ability for the two to disagree. Namespaces
+exist for precisely this relationship.
+
+**TS-67.** *Encode by ordinal range* — predicates 0–999 topical,
+1000–1999 structural. Implicit, undiscoverable, and broken by any
+change to per-cell counts (TS-54), which are configuration.
+
+**TS-68.** *The generation report alone.* The report is where the
+selection process belongs (TS-34), but it is a side artifact. A
+consumer holding only the published dataset could not group results by
+family, and TS-7 would be unsatisfiable from the dataset itself. The
+dataset must be self-describing.
+
+### 4.6 Adjunct provenance and diagnostics
+
+§4.5 solves one instance of a general problem. Stated once, so the next
+one does not get argued from scratch.
+
+**TS-69.** The M facet is the **query surface**. Intermediate models,
+causal traces and provenance must not be added to it. Two reasons, and
+the second is the one that matters: every added field inflates all
+531,869,985 records for readers who will never query it (§4.2), and
+anything present in M is something a predicate can name — so putting
+diagnostics there blurs the boundary between what the benchmark
+*measures* and what it *explains*.
+
+**TS-70.** They are nonetheless worth keeping. A dataset that can
+explain an anomalous result is worth more than one that cannot, and the
+cost of retaining a trace is far lower than the cost of regenerating a
+corpus to recover it. Adjunct data is **retained in the dataset,
+ordinal-aligned**, so it joins to the records it describes without a
+key.
+
+**TS-71.** Two carriers, chosen by scale and cardinality:
+
+| relationship | carrier | example |
+|---|---|---|
+| 1:1 with a slab's records, thousands of rows | **namespace** in that slab | predicate families (§4.5) |
+| 1:1 with passages, hundreds of millions | **adjunct facet**, ordinal-aligned | cluster-assignment margin |
+| dataset-level, one value | **namespace** or dataset attribute | embedding model revision |
+
+**TS-72.** Adjuncts are **optional**. Absence must be legal and must
+not fail a read — the `forms` precedent again (TS-63). A consumer that
+wants only the benchmark reads M, P, R, G, D, E, F and nothing else.
+
+**TS-73.** Adjuncts are **never required** to evaluate a predicate or
+reproduce ground truth. They explain; they do not define. Anything that
+a result *depends* on belongs in a facet, not an adjunct.
+
+**TS-74.** The packed-column encoding rejected in TS-57 is the right
+encoding **here**. It was wrong for the query surface because it would
+have put a second storage format between predicates and the fields they
+name; nothing writes a predicate against a diagnostic, so that objection
+does not apply, and the density does:
+
+| per-passage cluster-margin trace | per record | total |
+|---|---:|---:|
+| as MNode fields on M | 64 B | 34.0 GB |
+| as packed `f16` columns in an adjunct facet | 6 B | **3.2 GB** |
+
+Eleven times smaller, and it keeps M unchanged.
+
+**TS-75.** Adjuncts worth retaining for this design:
+
+- **Topic centroids** — the fitted model, 10,310 × 1024 f32 = 42 MB.
+  Already required by TS-26 for reproducibility; this is where it lives.
+- **Cluster-assignment margin** — distance to the assigned centroid and
+  to the runner-up, per passage. This is the trace that explains
+  *filter crispness*: a passage near a boundary belongs to its topic by
+  a hair, so a topical filter includes it almost arbitrarily. When
+  pre-filter and post-filter results diverge in a way the selectivity
+  does not account for, this is the column that says why.
+- **Predicate generation trace** — per predicate, the candidate pool it
+  was drawn from and the stratum it filled. The residue TS-58 keeps out
+  of the predicate record, kept where it can still be read.
+- **Embedding provenance** — model and resolved revision. tessera's are
+  currently recorded only in a markdown file beside the corpus, so
+  nothing in the dataset says which weights produced its vectors. That
+  is exactly the gap this requirement exists to close.
+
+#### Rejected
+
+**TS-76.** *Keeping traces outside the dataset* — in a report, a
+notebook, or a file beside the corpus. This is the status quo for
+tessera's embedding revision, and its own provenance notes concede the
+failure mode: "nothing in dataset.log or runlog.jsonl would show the
+difference" if another host resolved the model tag differently. A trace
+that does not travel with the data it describes is a trace that will
+eventually describe something else.
 
 ## 5. Topic hierarchy
 
@@ -749,6 +895,33 @@ the cluster size that qualified it. That belongs in the generation
 report. A consumer reading the predicate facet sees filters, not an
 experimental design. → TS-58.
 
+**D-14 — The predicate family is a sibling namespace, not a field, a
+facet, or a report.** *Rejected:* annotating inside the PNode, which
+would change what the predicate matches; a separate facet, which can
+disagree with what it describes; ordinal-range conventions, which are
+implicit and break when counts change; and the generation report alone,
+which would leave a consumer holding the dataset unable to satisfy TS-7
+from it. The namespace keeps the filter clean and the dataset
+self-describing at once, and it reuses machinery that already exists —
+the spec models per-facet namespaces, the reader opens them, and the
+`forms` namespace already establishes that absence means a default
+rather than an error. **The decade is derived from the recorded
+selectivity rather than stored**, which is what lets TS-7 and TS-58 both
+hold. → TS-60 … TS-68.
+
+**D-15 — Provenance and diagnostics are retained, ordinal-aligned,
+and never in the metadata facet.** Generalises D-14 from the predicate
+family to the pattern. M is the query surface, so anything in it is
+something a predicate can name and something every reader pays for;
+traces belong beside the data, joined by ordinal, and optional.
+*Rejected:* keeping traces outside the dataset entirely, which is
+tessera's current handling of its embedding revision and which its own
+provenance notes admit is undetectable when it goes wrong. This also
+gives the packed-column encoding rejected in D-11 its proper home — the
+objection there was a second format between predicates and the fields
+they name, and nothing writes predicates against a diagnostic. →
+TS-69 … TS-76.
+
 ### 10.1 What changed while this was written
 
 **TS-38** asked whether the L3 cluster count should be set by the
@@ -757,6 +930,5 @@ threshold profile, and 10,000 clusters clear it comfortably.
 
 **TS-40** asked whether the control family should ship. D-5 settled it —
 it must, because it is what gives sub-threshold profiles a predicate set
-at all. That surfaced the question now in its place: **the dataset
-carries no field marking a predicate's family, and TS-7 requires results
-be grouped by one.** That is the live gap in this design.
+at all. That surfaced the question now in its place — how a predicate's family
+reaches a consumer — which §4.5 and D-14 now answer.
