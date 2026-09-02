@@ -647,3 +647,116 @@ an identical predicate facet, byte for byte.
 **TS-45.** A reader of the predicate set, given only the vernacular
 form of each predicate, can state what each one is asking for without
 reference to this document — the operational test for TS-2.
+
+## 10. Decision record
+
+The requirements above state *what* the design does. These are the
+judgement calls behind them, with the alternative that was rejected —
+recorded because a reader who disagrees needs the reasoning, not just
+the conclusion, and because several of these looked settled and were
+not.
+
+**D-1 — Believability is a hard requirement, not a preference.**
+*Rejected:* a scheme of uniform hash buckets and random hyperplanes over
+the embedding, which solves the distribution problem exactly and at
+lower cost than anything here. It produces predicates like
+`WHERE bucket_1000 = 37` and `WHERE hplane_bits & 0x0F = 0x0A`. A
+benchmark whose filters are visibly reverse-engineered from the
+measurement cannot be offered as evidence about anything, so the
+statistical merit was not decisive. → TS-2.
+
+**D-2 — Control and credibility are orthogonal.** The reframe that made
+D-1 survivable. Control is a property of how an attribute is
+*distributed*; credibility is a property of what it *means*. Nothing
+requires them to travel together, so the move is not to choose between
+them but to engineer the distribution of attributes that already mean
+something. → §2.
+
+**D-3 — The control family is demoted, not deleted.** A filter with
+exactly known selectivity and provably zero semantic correlation is a
+legitimate null hypothesis. Keeping it is what lets a cost difference be
+attributed to *semantics* rather than to filtering as such. It is
+labelled, never presented as a realistic query. → TS-2, TS-59.
+
+**D-4 — Reliability is promised above a threshold, not everywhere.**
+*Rejected:* a hard floor enforced at every profile. A 100,000-passage
+profile cannot host a topic both fine-grained enough to be interesting
+and populous enough to measure — no clustering makes that true, and
+requiring it would have distorted the design to serve the least
+interesting end of the ladder. **More than half the ladder (18 of 31
+detents) sits below the threshold, and that is accepted rather than
+worked around.** → TS-46, TS-49.
+
+**D-5 — Below the threshold the hash family carries the profile, and
+this buys availability rather than precision.** A bucket of any modulus
+can be defined on demand; no clustering can be asked for a topic of
+arbitrary size. The statistical spread is identical — both give
+`Binomial(N, s)` — so the small profiles still have a predicate set
+with known selectivity, but nothing about small-*N* variance improves.
+Stated explicitly so the guarantee is not read as stronger than it is.
+→ TS-47.
+
+**D-6 — Clusters are measured, not balanced.** *Rejected:* balanced
+k-means. Forcing equal sizes distorts clusters into shapes no topic
+model would produce, reintroducing exactly the artificiality D-1
+rejects. Letting them fall naturally and selecting from the resulting
+size distribution gives real topics and exact selectivity at once; the
+unevenness becomes the menu rather than the problem. → TS-8, TS-9.
+
+**D-7 — Only the decade detents are built for this dataset.** The
+`mul`, `fib` and `linear` strata are dropped, leaving 31 profiles. →
+§3.7.
+
+**D-8 — One master predicate set, selected per profile.** *Rejected:*
+sampling independently per profile, which the per-profile R facet would
+have permitted. Because selectivity is scale-free, predicate *p* means
+the same thing at 10m and at 400m, so a difference between two profiles
+is attributable to scale alone; independent sampling would confound the
+two across 31 profiles. It also matches what is already on disk —
+`predicates.slab` is a single shared artifact. → TS-50, TS-51.
+
+**D-9 — Predicates are anchored at decade boundaries; mantissa steps
+inherit them.** Consecutive detents differ by at most 2×. The mantissa
+sweep measures how cost grows with *N*; the decade anchors measure how
+it varies with the predicate. Generating different predicates per step
+would add no information and would break D-8. → TS-52.
+
+**D-10 — Per-decade predicate counts are tapered.** Follows from
+`R bytes/base = 4 · Σ selectivity`, which validates to 0.17% against the
+measured facet. Ten predicates at 10⁻¹ carry the same storage mass as
+ten thousand at 10⁻⁴, so a flat count spends the budget at the coarse
+end where predicates are least interesting. → TS-53, TS-54.
+
+**D-11 — Derived columns are stored natively as MNode fields.**
+*Rejected:* packed `ScalarPacked` columns with code→label dimension
+tables, which costs 15 bytes a record instead of 226 — 8 GB instead of
+120. Rejected because the M facet is shared across profiles and paid
+once, so 112 GB on a dataset with a 2 TB base does not justify a second
+storage format that the layout facet, the survey, the generator, the
+evaluator and every external consumer would have to understand. → TS-55,
+TS-57.
+
+**D-12 — Coded values store their label, not a code.** The consequence
+of D-11 that matters most: the value a predicate compares against is
+the value on the wire, so nothing stands between the stored data and
+the query a person would write, and D-1 needs no decode step to hold.
+→ TS-56.
+
+**D-13 — The sampler's machinery leaves no residue in the artifact.**
+Density conditioning happens when a predicate is *selected*; the
+published predicate records nothing of the decade it was drawn for or
+the cluster size that qualified it. That belongs in the generation
+report. A consumer reading the predicate facet sees filters, not an
+experimental design. → TS-58.
+
+### 10.1 What changed while this was written
+
+**TS-38** asked whether the L3 cluster count should be set by the
+smallest profile. D-4 resolved it: the count is now bounded by the
+threshold profile, and 10,000 clusters clear it comfortably.
+
+**TS-40** asked whether the control family should ship. D-5 settled it —
+it must, because it is what gives sub-threshold profiles a predicate set
+at all. That surfaced the question now in its place: **the dataset
+carries no field marking a predicate's family, and TS-7 requires results
+be grouped by one.** That is the live gap in this design.
