@@ -474,9 +474,20 @@ impl DatasetConfig {
         let mut changed = 0;
         for profile in self.profiles.profiles.values_mut() {
             for view in profile.views.values_mut() {
-                // Only a plain path can become a series here: a
-                // windowed or namespaced source names something inside
-                // a file, which is a different question.
+                // A **view-level** window is not disqualifying and is
+                // deliberately not checked here: it is in facet
+                // ordinals, so it means the same range whether the
+                // facet is one file or five. Every sized profile
+                // declares one, and skipping those would leave them
+                // naming a filename nothing wrote while the unwindowed
+                // profile named the series.
+                //
+                // A window on the **source** is a different thing — an
+                // entry window, in that file's own ordinals (SH-67).
+                // If the facet became a series, `source` is merely its
+                // first entry, so carrying that range onto the pattern
+                // would silently reinterpret it in a coordinate space
+                // it was never written in. Left alone instead.
                 if !view.source.window.is_empty() || view.source.namespace.is_some() {
                     continue;
                 }
@@ -495,8 +506,9 @@ impl DatasetConfig {
                 let Some(shape) = super::shards::observe_series(&shards) else {
                     continue;
                 };
-                // The `source:` keeps whatever directory prefix it had
-                // and gains the shard field (SH-47).
+                // The `source:` keeps whatever directory prefix it
+                // had — and its window and namespace, which are
+                // untouched — and gains the shard field (SH-47).
                 let file = std::path::Path::new(&path);
                 let (basename, ext) = match file.file_name().and_then(|n| n.to_str()) {
                     Some(name) => match name.rsplit_once('.') {
@@ -1673,5 +1685,136 @@ mod shard_size_declaration_tests {
         );
         let c: DatasetConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(c.declared_shard_bytes(), Some(2_000_000_000_000));
+    }
+}
+
+#[cfg(test)]
+mod reconcile_shard_tests {
+    use super::*;
+
+    fn tmpdir() -> tempfile::TempDir {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(&base).unwrap()
+    }
+
+    /// Write `n` records of dim 2 as shard `i` of `base/b.fvecs`.
+    fn shard(dir: &std::path::Path, i: u32, n: usize) {
+        std::fs::create_dir_all(dir.join("base")).unwrap();
+        let mut bytes = Vec::new();
+        for r in 0..n {
+            bytes.extend_from_slice(&2i32.to_le_bytes());
+            for k in 0..2 {
+                bytes.extend_from_slice(&((r * 2 + k) as f32).to_le_bytes());
+            }
+        }
+        let name = super::super::shards::shard_name("b", "fvecs", i);
+        std::fs::write(dir.join("base").join(name), bytes).unwrap();
+    }
+
+    fn config_of(yaml: &str) -> DatasetConfig {
+        serde_yaml::from_str(yaml).expect("valid dataset")
+    }
+
+    /// **A windowed view is reconciled too.** Sized profiles declare
+    /// `source: …/b.fvecs` with a window, and skipping them would leave
+    /// every one of them naming a file nothing wrote while the
+    /// unwindowed profile named the series — the declaration
+    /// disagreeing with itself.
+    #[test]
+    fn a_windowed_view_follows_the_series_and_keeps_its_window() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 10);
+        shard(tmp.path(), 1, 10);
+        shard(tmp.path(), 2, 4);
+
+        let mut c = config_of(
+            "name: d\nprofiles:\n  default:\n    base_vectors: base/b.fvecs\n\
+             \x20 p100k:\n    base_vectors:\n      source: base/b.fvecs\n      \
+             window: \"[0..10]\"\n",
+        );
+        assert_eq!(c.reconcile_shard_declarations(tmp.path()), 2, "both views");
+
+        for profile in ["default", "p100k"] {
+            let v = c.profiles.profiles[profile].views["base_vectors"].clone();
+            assert_eq!(v.source.path, "base/b__NNNN.fvecs", "{profile}");
+            assert_eq!(v.shard_stride, Some(10), "{profile}");
+            assert_eq!(v.shard_count, Some(3), "{profile}");
+            assert_eq!(v.record_count, Some(24), "{profile}");
+        }
+        // The window is untouched — it is in facet ordinals, and the
+        // facet's ordinals did not move.
+        let sized = &c.profiles.profiles["p100k"].views["base_vectors"];
+        assert!(sized.window.is_some(), "the view-level window survived");
+        assert!(c.profiles.profiles["default"].views["base_vectors"].window.is_none());
+    }
+
+    /// **An entry window on the source is left alone.** That range is
+    /// in the file's own ordinals (SH-67), and `source` would be only
+    /// the first entry of a series — so rewriting it onto the pattern
+    /// would reinterpret it in a coordinate space it was never written
+    /// in. The declaration stays as it is, and a reader still resolves
+    /// the facet, rather than being handed a confidently wrong range.
+    #[test]
+    fn an_entry_window_on_the_source_is_not_rewritten() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 10);
+        shard(tmp.path(), 1, 10);
+
+        let mut c = config_of(
+            "name: d\nprofiles:\n  default:\n    base_vectors: \"base/b.fvecs[0..5)\"\n",
+        );
+        assert!(
+            !c.profiles.profiles["default"].views["base_vectors"]
+                .source
+                .window
+                .is_empty(),
+            "fixture must carry an entry window"
+        );
+        assert_eq!(c.reconcile_shard_declarations(tmp.path()), 0);
+        assert_eq!(
+            c.profiles.profiles["default"].views["base_vectors"].source.path,
+            "base/b.fvecs",
+        );
+    }
+
+    /// A facet whose file is still there is left alone — the rule is
+    /// "the file is gone and shards are present", not "shards exist".
+    #[test]
+    fn a_facet_still_present_as_one_file_is_untouched() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 10);
+        // …and the plain file exists too.
+        std::fs::write(tmp.path().join("base/b.fvecs"), [0u8; 12]).unwrap();
+
+        let mut c = config_of("name: d\nprofiles:\n  default:\n    base_vectors: base/b.fvecs\n");
+        assert_eq!(c.reconcile_shard_declarations(tmp.path()), 0);
+        assert_eq!(
+            c.profiles.profiles["default"].views["base_vectors"].source.path,
+            "base/b.fvecs"
+        );
+    }
+
+    /// A declaration already naming a series is not rewritten again,
+    /// so the pass is idempotent across repeated runs.
+    #[test]
+    fn reconciling_twice_changes_nothing_the_second_time() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 10);
+        shard(tmp.path(), 1, 5);
+
+        let mut c = config_of("name: d\nprofiles:\n  default:\n    base_vectors: base/b.fvecs\n");
+        assert_eq!(c.reconcile_shard_declarations(tmp.path()), 1);
+        assert_eq!(c.reconcile_shard_declarations(tmp.path()), 0, "idempotent");
+    }
+
+    /// A facet that is simply missing — no file, no shards — is left
+    /// as declared rather than being blamed on sharding.
+    #[test]
+    fn a_missing_facet_is_not_mistaken_for_a_series() {
+        let tmp = tmpdir();
+        std::fs::create_dir_all(tmp.path().join("base")).unwrap();
+        let mut c = config_of("name: d\nprofiles:\n  default:\n    base_vectors: base/b.fvecs\n");
+        assert_eq!(c.reconcile_shard_declarations(tmp.path()), 0);
     }
 }
