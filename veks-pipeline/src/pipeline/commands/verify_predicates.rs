@@ -390,10 +390,13 @@ fn load_metadata_to_sqlite(
 
     let field_names: Vec<String> = first_mnode.fields.keys().cloned().collect();
 
-    // Build CREATE TABLE with all fields as TEXT (SQLite is dynamically typed,
-    // so this works for all comparisons)
+    // Each column takes the affinity of its value type. A TEXT column
+    // would store an integer as text and compare a numeric range
+    // lexicographically ('5' >= '37' is true), so an integer field is
+    // INTEGER, a float field REAL, a text field TEXT, and anything else
+    // NUMERIC, which lets SQLite decide per value.
     let columns: Vec<String> = std::iter::once("ordinal INTEGER PRIMARY KEY".to_string())
-        .chain(field_names.iter().map(|f| format!("\"{}\" TEXT", f)))
+        .chain(field_names.iter().map(|f| format!("\"{}\" {}", f, sql_affinity(first_mnode.fields.get(f)))))
         .collect();
     let create_sql = format!("CREATE TABLE metadata ({})", columns.join(", "));
     db.execute(&create_sql, [])
@@ -459,6 +462,18 @@ fn load_metadata_to_sqlite(
     }
 
     Ok(db)
+}
+
+/// The SQLite column affinity a field takes from its value type, so
+/// comparisons in `pnode_to_sql` mean what the evaluator means.
+fn sql_affinity(v: Option<&vectordata::formats::mnode::MValue>) -> &'static str {
+    use vectordata::formats::mnode::MValue;
+    match v {
+        Some(MValue::Int(_) | MValue::Int32(_) | MValue::Short(_) | MValue::Bool(_) | MValue::EnumOrd(_)) => "INTEGER",
+        Some(MValue::Float(_) | MValue::Float32(_)) => "REAL",
+        Some(MValue::Text(_) | MValue::Ascii(_) | MValue::EnumStr(_)) => "TEXT",
+        _ => "NUMERIC",
+    }
 }
 
 /// Convert an MValue to a SQLite-compatible value.
@@ -573,5 +588,100 @@ fn error_result(message: String, start: Instant) -> CommandResult {
         message,
         produced: vec![],
         elapsed: start.elapsed(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indexmap::IndexMap;
+    use slabtastic::{SlabWriter, WriterConfig};
+    use veks_core::formats::anode::{self, ANode};
+    use veks_core::formats::mnode::{MNode, MValue};
+    use veks_core::formats::pnode::eval::evaluate;
+    use veks_core::formats::pnode::{ConjugateNode, ConjugateType, FieldRef, OpType, PredicateNode};
+
+    fn rows() -> Vec<MNode> {
+        (0..200)
+            .map(|i| {
+                let mut fields = IndexMap::new();
+                fields.insert("citation_percentile".to_string(), MValue::Short((i * 37 % 100) as i16));
+                fields.insert("year".to_string(), MValue::Int32(2010 + (i % 12) as i32));
+                fields.insert("word_count".to_string(), MValue::Int(60 + (i * 17 % 171) as i64));
+                fields.insert("section_class".to_string(), MValue::Text(["introduction", "methods", "other"][i % 3].into()));
+                fields.insert("isopenaccess".to_string(), MValue::Bool(i % 3 == 0));
+                MNode { fields }
+            })
+            .collect()
+    }
+
+    fn cmp(field: &str, op: OpType, v: i64) -> PNode {
+        PNode::Predicate(PredicateNode {
+            field: FieldRef::Named(field.into()),
+            op,
+            comparands: vec![Comparand::Int(v)],
+        })
+    }
+
+    /// Numeric ranges must compare numerically in the oracle: a TEXT
+    /// column made `5 >= 37` true. Every form the stratified generator
+    /// emits is checked against the evaluator on the same rows.
+    #[test]
+    fn oracle_compares_numbers_numerically() {
+        let dir = tempfile::tempdir().unwrap();
+        let slab = dir.path().join("m.slab");
+        let rows = rows();
+        let config = WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
+        let mut w = SlabWriter::new(&slab, config).unwrap();
+        for r in &rows {
+            w.add_record(&anode::encode(&ANode::MNode(r.clone()))).unwrap();
+        }
+        w.finish().unwrap();
+        let reader = SlabReader::open(&slab).unwrap();
+        let ordinals: Vec<usize> = (0..rows.len()).collect();
+        let ui = veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new()));
+        let db = load_metadata_to_sqlite(&reader, &ordinals, &ui).unwrap();
+        let between = |f: &str, lo: i64, hi: i64| {
+            PNode::Conjugate(ConjugateNode {
+                conjugate_type: ConjugateType::And,
+                children: vec![cmp(f, OpType::Ge, lo), cmp(f, OpType::Le, hi)],
+            })
+        };
+        let text_eq = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("section_class".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Text("methods".into())],
+        });
+        let bool_eq = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("isopenaccess".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Bool(true)],
+        });
+        let cases = vec![
+            cmp("citation_percentile", OpType::Ge, 37),
+            cmp("citation_percentile", OpType::Lt, 8),
+            between("word_count", 60, 120),
+            between("year", 2012, 2015),
+            text_eq,
+            bool_eq,
+            PNode::Conjugate(ConjugateNode {
+                conjugate_type: ConjugateType::And,
+                children: vec![
+                    PNode::Predicate(PredicateNode {
+                        field: FieldRef::Named("section_class".into()),
+                        op: OpType::Eq,
+                        comparands: vec![Comparand::Text("other".into())],
+                    }),
+                    cmp("year", OpType::Ge, 2018),
+                ],
+            }),
+        ];
+        for p in cases {
+            let expected = rows.iter().filter(|r| evaluate(&p, r)).count() as i64;
+            let sql = format!("SELECT COUNT(*) FROM metadata WHERE {}", pnode_to_sql(&p).unwrap());
+            let got: i64 = db.query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(got, expected, "{} via `{}`", p, sql);
+            assert!(expected > 0 && expected < rows.len() as i64, "{} is not a useful case", p);
+        }
     }
 }
