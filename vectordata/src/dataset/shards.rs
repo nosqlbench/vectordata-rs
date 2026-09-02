@@ -288,6 +288,20 @@ impl Shards {
 mod tests {
     use super::*;
 
+    /// `series_of_shard` is the inverse of `shard_name`, and nothing
+    /// else looks like a shard to it.
+    #[test]
+    fn series_of_shard_inverts_shard_name() {
+        assert_eq!(series_of_shard(&shard_name("base_vectors", "fvecs", 3)).as_deref(), Some("base_vectors.fvecs"));
+        assert_eq!(series_of_shard(&shard_name("blob", "", 12)).as_deref(), Some("blob"));
+        assert_eq!(series_of_shard("base_vectors__0000.fvecs").as_deref(), Some("base_vectors.fvecs"));
+        assert_eq!(series_of_shard("base_vectors.fvecs"), None);
+        assert_eq!(series_of_shard("IDXFOR__metadata_results.ivvec.i32"), None, "a double underscore is not a shard field");
+        assert_eq!(series_of_shard("x__12345.fvecs"), None, "five digits is not the form");
+        assert_eq!(series_of_shard("x__12a4.fvecs"), None);
+        assert_eq!(series_of_shard("__0001.fvecs"), None, "no stem");
+    }
+
     fn src(path: &str) -> DSSource {
         crate::dataset::source::parse_source_string(path).unwrap()
     }
@@ -898,6 +912,27 @@ pub fn shard_source_spec(basename: &str, ext: &str) -> String {
 /// one of them changes is the day a series stops resolving.
 pub fn shard_name(basename: &str, ext: &str, index: u32) -> String {
     shard_filename(&shard_source_spec(basename, ext), index)
+}
+
+/// The unsharded name a shard file belongs to: `<stem>__0007.<ext>` →
+/// `<stem>.<ext>` (or `<stem>__0007` → `<stem>`). The inverse of
+/// [`shard_name`], recognising exactly its form — four digits after a
+/// double underscore, immediately before the extension — so an
+/// ordinary filename with a double underscore elsewhere is not mistaken
+/// for a shard. `None` for anything else.
+pub fn series_of_shard(filename: &str) -> Option<String> {
+    let (stem_and_index, ext) = match filename.rsplit_once('.') {
+        Some((s, e)) if !e.is_empty() && !e.contains("__") => (s, Some(e)),
+        _ => (filename, None),
+    };
+    let (stem, index) = stem_and_index.rsplit_once("__")?;
+    if stem.is_empty() || index.len() != 4 || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(match ext {
+        Some(e) => format!("{stem}.{e}"),
+        None => stem.to_string(),
+    })
 }
 
 /// The shard files of the series whose unsharded name is `path`.
