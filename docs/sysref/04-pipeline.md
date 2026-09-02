@@ -102,16 +102,16 @@ Three presets cover the common cases:
 
 | Preset | Components | Use when |
 |--------|------------|----------|
-| `strict` (default) | every component | safest; matches v4 behaviour |
-| `version-aware` | identity + `version_major` + options + upstream | binary minor/patch upgrade is known to preserve outputs |
-| `config-only` | identity + options + upstream | binary version differences should never invalidate (e.g., comparing across builds) |
+| `config-only` (default) | identity + options + upstream | a rebuilt binary never invalidates a completed step; only configuration and upstreams do |
+| `version-aware` | identity + `version_major` + options + upstream | a major version bump should invalidate, minor/patch should not |
+| `strict` | every component | the binary itself is part of the key |
 
 Pick a selector at the CLI:
 
 ```bash
-veks run --provenance strict          # default
+veks run --provenance config-only     # default: ignore the binary version
 veks run --provenance version-aware   # ignore minor/patch/git/dirty
-veks run --provenance config-only     # ignore binary version entirely
+veks run --provenance strict          # every component, binary included
 veks run --provenance step_id,command_path,version_major,options
                                       # custom comma-separated component list
 ```
