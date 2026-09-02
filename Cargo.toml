@@ -7,11 +7,12 @@
 # its own crate's `shell` module and the member binaries remain the
 # canonical standalone installs (`cargo install --path veks`, …).
 #
-# NOTE: this package's bin and the vectordata crate's bin intentionally
-# share the name `vectordata` (superset relationship). They are never in
-# the same default build (see default-members); building both explicitly
-# in one invocation (`cargo build --workspace` with the cli feature)
-# collides on the output filename — build one or the other with -p.
+# NOTE: this package's bins intentionally share the names `vectordata`
+# and `veks` with the crates of the same name (superset relationship).
+# They are never in the same default build (see default-members);
+# building both explicitly in one invocation (`cargo build --workspace`
+# with the cli feature) collides on the output filename — build one or
+# the other with -p.
 [package]
 name = "vectordata-rs"
 version = "2.0.0"
@@ -38,6 +39,24 @@ publish = false
 
 [[bin]]
 name = "vectordata"
+path = "src/main.rs"
+
+# `veks` under its own name, from the same multiplexer. argv0 dispatch
+# already routes a binary whose file stem is `veks` to the veks
+# personality, so this is the same program installed under a second
+# name — not a second build of it.
+#
+# It exists because `cargo install --path .` installs this package's
+# bins and nothing else: without it, installing the umbrella left a
+# stale standalone `veks` earlier in PATH, and a build ran for ten
+# hours on a binary two weeks older than the fix it was meant to have.
+# Sharing one source path means the two can never drift.
+#
+# `vecd` and `slab` are deliberately not here: they are reachable as
+# `vectordata vecd …` / `vectordata slab …`, and each still has its own
+# standalone install for anyone who wants the bare name.
+[[bin]]
+name = "veks"
 path = "src/main.rs"
 
 [dependencies]
