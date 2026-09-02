@@ -602,9 +602,12 @@ does not apply, and the density does:
 | per-passage cluster-margin trace | per record | total |
 |---|---:|---:|
 | as MNode fields on M | 64 B | 34.0 GB |
-| as packed `f16` columns in an adjunct facet | 6 B | **3.2 GB** |
+| as an `mvecs` adjunct facet, dim 2 | 8 B | **4.25 GB** |
 
-Eleven times smaller, and it keeps M unchanged.
+Eight times smaller, and it keeps M unchanged. `ScalarPacked` would be
+denser still at 4 B, but it has no float extension (`u8`…`i64` only), so
+it would mean a fixed-point scale convention every reader has to know.
+The self-describing form is worth 2 GB here. → TS-89.
 
 **TS-75.** Adjuncts worth retaining for this design:
 
@@ -663,18 +666,19 @@ Four new commands. Existing `evaluate-predicates` is unchanged.
 **TS-28.** Fits a hierarchical clustering over a base facet and emits
 per-passage assignments.
 
-| option | role | notes |
-|---|---|---|
-| `base` | input | base vectors; accepts a series (SH-35) |
-| `levels` | config | default `10,30,33` |
-| `sample-size` | config | passages used to fit, default 5M |
-| `seed` | config | fitting and sampling determinism |
-| `centroids` | output | published, for reproducibility |
-| `output` | output | assignment columns, one record per ordinal |
+Full surface in §10.1.
 
 **TS-29.** The assignment pass reads the base facet sequentially and
 must not require the whole facet resident — the same incremental
 contract every other reader here holds.
+
+**TS-77.** The same pass emits the **cluster-assignment margin**
+(TS-75): the distance to the assigned centroid and to the runner-up,
+per passage, as a packed `f16` adjunct facet (TS-74). Both distances are
+already computed to make the assignment; recovering them later would
+cost a second pass over 531,869,985 × 1024 floats. Optional output —
+absence is legal (TS-72) — but it is nearly free at the point where the
+numbers exist and unaffordable anywhere else.
 
 ### 6.2 `analyze topic-sizes`
 
@@ -690,6 +694,34 @@ emitting an enriched artifact in the same format. Inputs: the metadata
 parquet, the topic assignments, and the passage table for `ordinal`,
 `char_start`, `char_end`.
 
+**TS-78.** The command is **not a pure row-wise map**, and the plan must
+say so rather than let an implementation discover it. Three of the six
+derivations are row-local; two need an aggregate over the corpus first:
+
+| column | derivation | pass |
+|---|---|---|
+| `word_count` | `char_end − char_start` | row-local |
+| `sample_bucket` | `hash(corpusid ‖ ordinal) mod K` | row-local |
+| `section_class` | heading → class lookup | row-local, given the table |
+| `topic_l1/l2/l3` | assignment lookup by ordinal | row-local, given assignments |
+| `passage_position` | `ordinal ÷ passages_in_paper` | **needs a group-by on `corpusid`** |
+| `citation_percentile` | rank of `citationcount` within `year` | **needs a group-by on `year`** |
+
+Both aggregates are small — 17,457,121 paper lengths and 116 per-year
+citation distributions — so each is one counting pass and an in-memory
+table, not a sort of the corpus.
+
+**TS-79.** The heading → `section_class` mapping is published as an
+adjunct (TS-71). It is a judgement call applied 531,869,985 times across
+72,977 distinct headings, and anyone assessing a `section_class`
+predicate will want to audit it. Headings the table does not cover fall
+to `other`; an unmapped heading is never an error.
+
+**TS-80.** The hash keyed for `sample_bucket` is over
+`(corpusid, ordinal)` — the **passage**, not the paper. Keying it on
+`corpusid` would reproduce the paper-blocking of §1.1 in the one family
+that exists to be free of it.
+
 **TS-32.** Enrichment happens **upstream of** `convert-metadata`, so
 the M facet, the survey, and everything downstream flow from it without
 special-casing.
@@ -699,21 +731,53 @@ special-casing.
 **TS-33.** A third strategy alongside `eq` and `compound`, implementing
 §3.4.
 
-| option | role |
-|---|---|
-| `topic-sizes` | the measured table from TS-30 |
-| `survey` | existing metadata survey |
-| `decades` | e.g. `1e-1..1e-6` |
-| `per-cell` | predicates per `(family, decade)` |
-| `families` | which families to include, and their mix |
-| `min-matches` | *M* in TS-11 |
-| `base-count` | *N*, for the per-profile floor |
-| `reliability-threshold` | *N*ᵣ in TS-46, default 10M |
-| `query-placement` | in-topic / out-of-topic mix (TS-19) |
+Full surface in §10.4.
 
 **TS-34.** The command emits a generation report alongside the
 predicate facet: per-cell counts, realised selectivity distribution,
 and any shortfalls from TS-16.
+
+**TS-81.** The same command writes the **families namespace** (§4.5)
+into `predicates.slab` in the same operation. It is the only step that
+knows a predicate's family, and writing the two together is what makes
+TS-64's co-location hold by construction rather than by discipline.
+
+**TS-82.** The per-predicate portion of the generation report — the
+candidate pool a predicate was drawn from and the stratum it filled —
+is additionally retained as an ordinal-aligned adjunct (TS-75), so the
+selection process travels with the dataset rather than only with the
+run that produced it.
+
+### 6.5 Recording embedding provenance
+
+**TS-83.** The model identity and **resolved** revision that produced
+the base vectors are recorded in the dataset. For tessera this is a
+back-fill: the values exist only in a markdown file beside the corpus,
+and its own notes concede that nothing in `dataset.log` or
+`runlog.jsonl` would show the difference if another host resolved the
+model tag differently (TS-76). For future builds the embed command
+emits them at the point it resolves them, which is the only point where
+they are known to be correct.
+
+### 6.6 What is cache and what is retained
+
+**TS-84.** Intermediates that can be recomputed live under `.cache/`
+and are removable by `veks prepare cache-gc`. Retained adjuncts live in
+the dataset and are not:
+
+| artifact | where | why |
+|---|---|---|
+| topic assignments | `.cache/` | consumed by `enrich-metadata`; the values then live in M |
+| topic centroids | dataset | reproducing the labelling requires them (TS-26) |
+| assignment margin | dataset | explains filter crispness; a second pass to recover |
+| heading → class table | dataset | a judgement call worth auditing |
+| families namespace | in `predicates.slab` | TS-64 |
+| generation trace | dataset | selection provenance |
+| embed provenance | dataset | irrecoverable once the host cache turns over |
+
+**TS-85.** An adjunct must never be written under `.cache/`. It would
+be correct until the first `cache-gc`, and its loss would be silent —
+the failure mode TS-76 rejects, arrived at by a different route.
 
 ## 7. Augmenting tessera in place
 
@@ -727,8 +791,13 @@ What re-runs is the metadata and predicate chain:
 
 ```
 compute-topics          NEW    one GPU pass over base_vectors
-analyze-topic-sizes     NEW    counting pass
-enrich-metadata         NEW    one pass over metadata + passages parquet
+                               -> assignments (.cache), centroids +
+                                  margins (dataset)
+analyze-topic-sizes     NEW    counting pass over assignments
+enrich-metadata         NEW    two counting passes (paper lengths,
+                               per-year citation ranks) then one
+                               pass over metadata + passages parquet
+record-embed-provenance NEW    back-fill; dataset attribute only
 convert-metadata        re-run ~300 s (measured)
 extract-metadata        re-run ~2 passes (measured ~207 s each)
 survey-metadata         re-run
@@ -750,7 +819,351 @@ files and their `.cache/*.predkeys.slab` segments become garbage and
 should be removed by `veks prepare cache-gc` before the run to reclaim
 space.
 
-## 8. Open questions
+## 8. Artifact register
+
+Every artifact this design introduces, named, located and formatted.
+Nothing below is inferable from §§4–6, and an implementation cannot
+start without it.
+
+**TS-86.**
+
+| artifact | path | format | lifetime |
+|---|---|---|---|
+| topic assignments | `.cache/topic_assign_l{1,2,3}.u16` | `ScalarPacked` u16 | cache |
+| topic centroids | `profiles/base/topic_centroids.fvecs` | `FloatXvec` f32, dim 1024 | retained |
+| cluster margin | `profiles/base/topic_margin.mvecs` | `FloatXvec` f16, dim 2 | retained |
+| section-class map | `profiles/base/section_class_map.slab` | `Slab`, MNode | retained |
+| predicate families | `predicates.slab` ns `families` | `Slab`, MNode | retained |
+| generation trace | `predicates.slab` ns `generation` | `Slab`, MNode | retained |
+| embed provenance | `dataset.yaml` attributes | yaml | retained |
+
+**TS-87.** The retained adjuncts are declared as **ordinary views with
+non-standard keys**, not as new `StandardFacet` variants.
+
+Conformance leaves a view whose key is not a standard facet alone, so
+this works without touching the spec. It is also the right category:
+the facet spec exists to say what a dataset *must* have and what shape
+it must take, and TS-73 states that nothing depends on an adjunct. A
+single-letter facet code is a scarce namespace that should not be spent
+on optional diagnostics. The cost is that `veks check` will not validate
+them, which is the correct trade for artifacts whose absence is legal.
+
+**TS-88.** `predicates.slab` gains **two** namespaces, not one:
+
+| namespace | holds | why separate |
+|---|---|---|
+| `families` | what a predicate *is* (TS-62) | read by anyone grouping results |
+| `generation` | why it was *selected* (TS-82) | the residue TS-58 keeps out of the record |
+
+Kept apart so a consumer can read the family without also reading the
+experimental design. `StandardFacet::MetadataPredicates::namespaces()`
+changes from `[""]` to `["families", "generation", ""]`, and each name
+is a published constant beside `FORMS_NAMESPACE`.
+
+**TS-89.** The cluster margin is one `mvecs` facet of dim 2 — the
+distance to the assigned L3 centroid and to the runner-up — rather than
+two scalar facets. Both numbers are read together or not at all, and
+`ScalarPacked` has no float extension.
+
+**TS-90.** No artifact in this register is required to evaluate a
+predicate, compute ground truth, or run the benchmark. A consumer that
+reads only M, P, R, G, D, E and F is complete and correct (TS-73).
+
+## 9. Algorithms
+
+### 9.1 Clustering
+
+**TS-91.** **Spherical k-means.** The vectors are unit-normalised
+(measured: max |1−‖v‖| = 2.99×10⁻⁸), so cosine similarity is the inner
+product and assignment is an argmax of `v · c`. Centroids are
+re-normalised to unit length after each update; without that step the
+centroids drift off the sphere and the argmax stops corresponding to
+cosine.
+
+**TS-92.** **Initialisation is k-means++ over the fitted sample**,
+seeded. Random initialisation on a corpus this skewed leaves empty
+clusters, and an empty cluster is a topic with no members and no label.
+
+**TS-93.** **Convergence** is a cap on iterations (default 50) or a
+mean centroid movement below a threshold (default 10⁻⁴ cosine),
+whichever comes first. The cap is not a failure — a clustering that has
+not fully converged still partitions the space, and TS-9 measures what
+it actually produced rather than trusting it.
+
+**TS-94.** **Determinism under threading.** Summing vectors to form a
+centroid is a floating-point reduction, and reduction order changes the
+result. Fitting must therefore use a fixed reduction order independent
+of thread count and scheduling — a deterministic tree reduction over a
+fixed partition of the sample, not an unordered atomic accumulation.
+Without this, TS-26's "pure function of the vector and the fitted
+centroids" holds for assignment but not for the fit, and a re-run on a
+different machine produces different topics.
+
+**TS-95.** An empty or single-member cluster at any level is **split
+from the largest sibling** rather than left in place, up to a bounded
+number of repair rounds. A cluster of one is not a topic and would
+occupy a stratum slot that no predicate can usefully fill.
+
+### 9.2 Assignment and margin
+
+**TS-96.** Assignment descends the hierarchy: argmax over 10 L1
+centroids, then over the ~30 L2 children of that branch, then over the
+~33 L3 children of that. About 73 inner products of width 1024 per
+passage rather than 10,310.
+
+**TS-97.** Descent is greedy and therefore **not equivalent to a flat
+argmax over all 10,000 L3 centroids**. A passage near an L1 boundary can
+be assigned to an L3 cluster that is not its global nearest. This is
+accepted — it is what makes assignment affordable — and it is
+*measurable*, which is what the margin facet is for. It must be stated
+so nobody later reads a topic as "the nearest cluster".
+
+**TS-98.** The margin records the two L3 distances at the point of
+assignment: to the chosen centroid and to the best alternative among its
+siblings.
+
+### 9.3 Labelling
+
+**TS-99.** Labels come from a **class-based TF-IDF** over each
+cluster's member passages: term frequencies aggregated per cluster,
+weighted against their frequency across all clusters at the same level,
+top terms joined with hyphens into a slug.
+
+**TS-100.** Labelling reads `passages.parquet`, not the metadata — the
+passage text is not in M and never will be (TS-69). It runs on a
+**sample** of each cluster's members (default 2,000), because term
+statistics converge long before the member list is exhausted.
+
+**TS-101.** Labels must be **unique within a level**, since TS-56 stores
+them as the predicate's comparand and two clusters sharing a label would
+be two different filters that read identically. Collisions are broken by
+appending the next distinguishing term, then by ordinal.
+
+**TS-102.** A cluster whose label cannot be generated — no usable terms
+— gets a stable positional label (`l3-04187`). It remains a valid
+predicate target; it is simply not a believable one, and TS-16's
+shortfall reporting is where that surfaces.
+
+### 9.4 Derived-column derivations
+
+**TS-103.** `section_class`. The raw heading is lowercased, stripped of
+leading numbering (`3.`, `iii.`, `A)`) and trailing punctuation, then
+matched against an ordered prefix table to one of `introduction`,
+`background`, `methods`, `results`, `discussion`, `conclusion`,
+`references`, `other`. First match wins; order is significant because
+`results and discussion` must not match `results` before the compound
+rule is tried. The table is published (TS-79).
+
+**TS-104.** `citation_percentile`. The rank of a paper's
+`citationcount` **within its publication year**, expressed as an integer
+0–99 over *papers*, not passages — otherwise papers with many passages
+would dominate their own percentile. Ties take the **midpoint** rank, so
+the large mass of zero-citation papers maps to a single value rather
+than being spread arbitrarily. A year with fewer than 100 papers still
+produces valid percentiles; the resolution is simply coarser.
+
+**TS-105.** `passage_position`. `⌊100 · ordinal / passages_in_paper⌋`,
+so 0–99. A single-passage paper yields 0, which is correct: its one
+passage is at the start.
+
+**TS-106.** `word_count` is whitespace-delimited tokens of the passage
+text, not `char_end − char_start`. Character span is a proxy that
+diverges with language and markup, and the field exists so a person can
+filter on "long passages" in the unit they think in. It is computed
+during the same pass that reads `passages.parquet` for labelling.
+
+## 10. Command surfaces
+
+Complete option tables. `role` is the `OptionRole` the runner uses —
+`Input` participates in the "input newer than output" staleness check,
+`Config` is provenance-bearing, `Output` is what `check_artifact`
+inspects.
+
+### 10.1 `compute topics`
+
+| option | role | req | default | notes |
+|---|---|---|---|---|
+| `base` | Input | yes | — | base vectors; accepts a series (SH-35) |
+| `levels` | Config | no | `10,30,33` | branching per level |
+| `sample-size` | Config | no | `5000000` | passages used to fit |
+| `iterations` | Config | no | `50` | convergence cap (TS-93) |
+| `tolerance` | Config | no | `1e-4` | mean centroid movement |
+| `seed` | Config | no | `42` | k-means++ and sampling |
+| `centroids` | Output | yes | — | `topic_centroids.fvecs` |
+| `assignments` | Output | yes | — | `.cache/topic_assign_l*.u16` |
+| `margin` | Output | no | — | omit to skip (TS-72) |
+
+**TS-107.** `check_artifact` is Complete when the centroid file holds
+`Σ levels` records of the base's dimension **and** every assignment
+column has one record per base ordinal. Either alone is insufficient:
+centroids without assignments is a fit that never finished, and
+assignments without centroids cannot be reproduced or extended.
+
+**TS-108.** Declares `mem` and `threads` to the governor. The fit holds
+`sample-size × 1024 × 4` bytes — 20 GB at the default — and must
+request it rather than discover it.
+
+### 10.2 `analyze topic-sizes`
+
+| option | role | req | default | notes |
+|---|---|---|---|---|
+| `assignments` | Input | yes | — | from `compute topics` |
+| `output` | Output | yes | — | size table per level |
+| `min-members` | Config | no | `0` | report clusters below this |
+
+**TS-109.** Emits, per cluster: level, code, member count, and the
+member count as a fraction of the corpus. That fraction is the
+`selectivity` the sampler stratifies on (TS-14) and the value written
+into the families namespace (TS-62).
+
+### 10.3 `transform enrich-metadata`
+
+| option | role | req | default | notes |
+|---|---|---|---|---|
+| `metadata` | Input | yes | — | source parquet |
+| `passages` | Input | yes | — | for `ordinal`, text, word count |
+| `assignments` | Input | yes | — | topic codes |
+| `labels` | Input | yes | — | code → label, from `compute topics` |
+| `section-map` | Input | no | built-in | override the prefix table |
+| `buckets` | Config | no | `1000` | *K* for `sample_bucket` |
+| `seed` | Config | no | `42` | hash seed |
+| `output` | Output | yes | — | enriched parquet |
+| `section-map-out` | Output | no | — | the table actually applied (TS-79) |
+
+**TS-110.** Fails if the assignment count does not equal the metadata
+row count. A silent off-by-one here mislabels every passage after the
+divergence and would surface only as inexplicable benchmark results.
+
+### 10.4 `generate predicates --strategy stratified`
+
+| option | role | req | default | notes |
+|---|---|---|---|---|
+| `survey` | Input | yes | — | existing metadata survey |
+| `base-count` | Config | yes | — | *N*, for the per-profile floor |
+| `query-placement` | Config | no | mixed | in-topic / out-of-topic mix (TS-19) |
+| `topic-sizes` | Input | yes | — | from `analyze topic-sizes` |
+| `queries` | Input | no | — | required for `query-placement` |
+| `families` | Config | no | all four | which families, and their mix |
+| `per-cell` | Config | no | tapered | per-decade counts (TS-54) |
+| `decades` | Config | no | `1e-1..1e-7` | target range |
+| `min-matches` | Config | no | `100` | *M* in TS-11 |
+| `reliability-threshold` | Config | no | `10000000` | *N*ᵣ (TS-46) |
+| `report` | Output | no | — | generation report (TS-34) |
+
+**TS-111.** `check_artifact` is Complete when the content namespace
+holds at least one predicate **and** the `families` namespace holds
+exactly as many records. An unequal count means annotation and
+predicates disagree, which TS-64 exists to prevent.
+
+## 11. Candidate enumeration
+
+The sampler draws from candidate pools (TS-14). Nothing yet says what
+is in them.
+
+**TS-112.** **Topical.** Every cluster at every level is a candidate:
+10 + 300 + 10,000 = 10,310, each with a measured selectivity from
+TS-109. No enumeration cost — the size table *is* the pool.
+
+**TS-113.** **Bibliographic.** Enumerated from the survey as threshold
+and range predicates over `citation_percentile`, `year` and
+`isopenaccess`. `citation_percentile` is uniform by construction, so a
+threshold at *t* has selectivity `(100−t)/100` exactly and the pool is
+dense across the coarse decades. `year` ranges are enumerated from the
+observed distribution, which is skewed, so their selectivities are
+measured rather than assumed.
+
+**TS-114.** **Structural.** Enumerated over `section_class` values
+(eight, measured), `passage_position` ranges (uniform by construction),
+and `word_count` ranges (measured from the distribution).
+
+**TS-115.** **Control.** Generated, not enumerated: for a target
+selectivity *s*, emit `sample_bucket = c` with `K = round(1/s)` and *c*
+drawn seeded. The only family that can fill any cell on demand, which is
+what TS-47 relies on.
+
+**TS-116.** **Conjunctions** (TS-17) are formed only after the single-
+field pools are exhausted for a cell, pairing a topical candidate with a
+bibliographic one. Their selectivity is **measured, not multiplied**
+(TS-18): evaluated over a uniform sample of the corpus (default 10M
+passages) sized so the estimate's relative error at the cell's target
+decade is under 10%, then admitted to whichever band the estimate lands
+in.
+
+**TS-117.** Query placement (TS-19) requires the query vectors. Each
+query is assigned to a topic by the same descent as TS-96, and a
+topical predicate is labelled `in-topic` when at least one query falls
+in its cluster, `out-of-topic` otherwise. Without `queries` the
+generator omits the field rather than guessing.
+
+## 12. Test strategy
+
+**TS-118.** Each of §9's algorithms is tested against a **synthetic
+corpus with known structure** — planted clusters at known sizes,
+metadata with known distributions — so expected outputs are derivable
+rather than golden. Determinism (TS-94) is tested by fitting the same
+sample at 1, 4 and 16 threads and comparing centroids bit-for-bit.
+
+**TS-119.** The sampler is tested without any clustering: given a
+synthetic size table, every `(family, decade)` cell above the floor is
+populated, cells below it are reported unpopulated rather than filled,
+and the same seed reproduces the same set (TS-15, TS-44).
+
+**TS-120.** End-to-end, on a small dataset built by the existing
+fixtures: the pipeline runs, the enriched M facet carries all eight
+columns, `predicates.slab` carries both namespaces with matching
+counts, and every generated predicate returns a non-empty match set at
+a profile above the threshold (TS-42).
+
+**TS-121.** The acceptance criterion of TS-43 — realised selectivity
+within the assigned band — is checked **against the R facet after
+evaluation**, not against the generator's own estimate. A generator
+that mis-measures would otherwise validate itself.
+
+## 13. Work breakdown
+
+Ordered by dependency. Each phase is independently testable and leaves
+the tree green.
+
+**Phase 1 — clustering.** `compute topics` (§10.1) with §9.1–9.2:
+spherical k-means, deterministic reduction, hierarchical assignment,
+margin output. The largest single piece and the only one needing GPU
+work. Testable in isolation against planted clusters (TS-118).
+
+**Phase 2 — measurement.** `analyze topic-sizes` (§10.2). Small, and it
+unblocks the sampler.
+
+**Phase 3 — labelling.** §9.3, as a mode of `compute topics` or a
+sibling command. Independent of Phases 4–6: positional labels (TS-102)
+let everything downstream proceed while this is unfinished.
+
+**Phase 4 — enrichment.** `transform enrich-metadata` (§10.3) with
+§9.4. Two counting passes plus a map. No new formats.
+
+**Phase 5 — sampling.** `generate predicates --strategy stratified`
+(§10.4) with §11, plus the two namespaces (TS-88). The most intricate
+logic and the least I/O.
+
+**Phase 6 — provenance.** Embedding provenance (TS-83) and the
+cache/retained split (TS-84). Small, and separable.
+
+**TS-122.** Phases 1–2 and 4 can be validated on tessera without
+regenerating any predicate: they produce artifacts that nothing yet
+consumes. The first irreversible step is Phase 5, because it invalidates
+`evaluate-predicates` across every profile.
+
+**TS-123.** Estimated cost on tessera, from measured comparable steps:
+
+| phase | pass | estimate |
+|---|---|---|
+| 1 fit | 5M × 1024, 50 iterations | GPU minutes |
+| 1 assign | 531.9M × 73 inner products | one sequential pass over 2.03 TB |
+| 2 | count 531.9M u16 | minutes |
+| 3 | text of 10,310 × 2,000 passages | one indexed pass over `passages.parquet` |
+| 4 | 2 counting passes + 1 map over 531.9M | comparable to `convert-metadata`, ~300 s measured |
+| 5 | sampling + conjunction measurement on 10M | minutes |
+| — | `evaluate-predicates` re-run | per profile; the dominant cost |
+
+## 14. Open questions
 
 **TS-38.** ~~*L3 cluster count interacts with the smallest profile.*~~
 **Resolved by TS-46.** The cluster count is now constrained by the
@@ -759,10 +1172,10 @@ clear it comfortably: at *N* = 10M a mean selectivity of ~10⁻⁴ yields
 ~1,000 matches, a relative spread of ~3%. The question that forced a
 choice before fitting no longer does.
 
-**TS-39.** *Do topic labels need to be good?* They are cosmetic to
-correctness and load-bearing for TS-2. Unresolved: whether generated
-term lists suffice or whether a labelling pass over cluster exemplars
-is warranted.
+**TS-39.** *Do topic labels need to be good?* §9.3 now specifies a
+mechanism — class-based TF-IDF, sampled, uniqueness-enforced — so the
+question is no longer "how" but "how good is good enough". Still open,
+and TS-102's positional fallback means it does not block anything.
 
 **TS-40.** ~~*Should the control family ship?*~~ **Settled by TS-47:
 it must.** It is what gives sub-threshold profiles a predicate set at
@@ -775,7 +1188,7 @@ predicate's family, and TS-7 requires results be grouped by one.
 enough to place 10,000 L3 centroids stably is untested; the failure
 mode is unstable small clusters, which the size table would expose.
 
-## 9. Acceptance
+## 15. Acceptance
 
 **TS-42.** At every profile with *N* ≥ *N*ᵣ: no predicate returns zero
 matches, and every `(family, decade)` cell above the floor is populated
@@ -794,7 +1207,7 @@ an identical predicate facet, byte for byte.
 form of each predicate, can state what each one is asking for without
 reference to this document — the operational test for TS-2.
 
-## 10. Decision record
+## 16. Decision record
 
 The requirements above state *what* the design does. These are the
 judgement calls behind them, with the alternative that was rejected —
@@ -922,7 +1335,36 @@ objection there was a second format between predicates and the fields
 they name, and nothing writes predicates against a diagnostic. →
 TS-69 … TS-76.
 
-### 10.1 What changed while this was written
+**D-16 — Adjunct data is written by the command that already computes
+it, not by passes of its own.** The cluster margin is emitted by
+`compute topics` because both distances exist at assignment time and
+recovering them later costs a second pass over half a billion 1024-wide
+vectors; the families namespace is written by `generate predicates`
+because it is the only step that knows a family, which makes
+co-location structural rather than a rule someone must remember.
+*Rejected:* separate analysis passes for each adjunct, which would be
+tidier to specify and would pay for the tidiness in full re-reads of the
+largest facet in the dataset. → TS-77, TS-81, TS-82.
+
+**D-17 — Adjuncts are non-standard view keys, not new facet-spec
+variants.** *Rejected:* registering each as a `StandardFacet`.
+Conformance leaves non-standard keys alone, so registration is not
+needed to declare them — and the facet spec's job is to say what a
+dataset *must* have, while TS-73 says nothing depends on an adjunct. A
+single-letter facet code is a scarce namespace and should not be spent
+on optional diagnostics. The cost, accepted knowingly, is that
+`veks check` will not validate them. → TS-87.
+
+**D-18 — Hierarchical assignment is greedy, and says so.** Descending
+10 → 30 → 33 costs 73 inner products per passage instead of 10,310, and
+is therefore not equivalent to a flat argmax over all L3 centroids: a
+passage near an L1 boundary can land in a cluster that is not its global
+nearest. Accepted for the 140× saving, but stated explicitly so nobody
+later reads a topic assignment as "the nearest cluster" — and the margin
+facet is what makes the discrepancy measurable rather than invisible.
+→ TS-97, TS-98.
+
+### 16.1 What changed while this was written
 
 **TS-38** asked whether the L3 cluster count should be set by the
 smallest profile. D-4 resolved it: the count is now bounded by the
