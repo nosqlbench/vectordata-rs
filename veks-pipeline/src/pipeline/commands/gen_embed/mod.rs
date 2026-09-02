@@ -171,6 +171,20 @@ bf16 on CUDA.
             }
         };
         fetch.finish();
+        // Embedding provenance travels with the dataset, recorded at
+        // the one point where the resolved weights are known to be
+        // correct (SRD TS-83).
+        let resolved = files.resolved_revision.clone().unwrap_or_else(|| revision.clone());
+        ctx.ui.log(&format!("embed provenance: model {} revision {} (requested {})", model_id, resolved, revision));
+        for (key, value) in [
+            ("model", model_id.as_str()),
+            ("model_revision", resolved.as_str()),
+            ("model_revision_requested", revision.as_str()),
+        ] {
+            if let Err(e) = crate::pipeline::variables::set_dataset_attribute(&ctx.workspace, key, value) {
+                ctx.ui.log(&format!("  warning: could not record dataset attribute {}: {}", key, e));
+            }
+        }
 
         let config: qwen3::Config = match std::fs::read_to_string(&files.config)
             .map_err(|e| format!("read config: {}", e))
@@ -381,6 +395,25 @@ struct ModelFiles {
     config: PathBuf,
     tokenizer: PathBuf,
     weights: Vec<PathBuf>,
+    /// The commit the requested revision resolved to, when the hub
+    /// cache lays the files out under `snapshots/<sha>/`. A floating
+    /// revision such as `main` resolves differently on another host or
+    /// after the cache turns over, and nothing else in the dataset
+    /// would show the difference — so this is recorded as a dataset
+    /// attribute the moment it is known.
+    resolved_revision: Option<String>,
+}
+
+/// The commit sha a hub-cached file path names, from its
+/// `snapshots/<sha>/` component.
+fn resolved_revision_of(path: &std::path::Path) -> Option<String> {
+    let parent = path.parent()?;
+    if parent.parent()?.file_name()?.to_str()? != "snapshots" {
+        return None;
+    }
+    let sha = parent.file_name()?.to_str()?;
+    let hex = sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit());
+    hex.then(|| sha.to_string())
 }
 
 /// Fetch config/tokenizer/weights through the shared HF cache (no network
@@ -397,10 +430,13 @@ fn fetch_model_files(model_id: &str, revision: &str) -> Result<ModelFiles, Strin
         repo.get(name)
             .map_err(|e| format!("fetch {}/{}: {}", model_id, name, e))
     };
+    let config = get("config.json")?;
+    let resolved_revision = resolved_revision_of(&config);
     Ok(ModelFiles {
-        config: get("config.json")?,
+        config,
         tokenizer: get("tokenizer.json")?,
         weights: vec![get("model.safetensors")?],
+        resolved_revision,
     })
 }
 
@@ -510,6 +546,19 @@ fn error_result(message: String, start: Instant) -> CommandResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resolved_revision_is_read_from_the_snapshot_path() {
+        use super::resolved_revision_of;
+        use std::path::Path;
+        let p = Path::new("/hf/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3/config.json");
+        assert_eq!(
+            resolved_revision_of(p).as_deref(),
+            Some("97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3")
+        );
+        assert_eq!(resolved_revision_of(Path::new("/tmp/model/config.json")), None);
+        assert_eq!(resolved_revision_of(Path::new("/hub/snapshots/not-a-sha/config.json")), None);
+    }
+
     use super::*;
 
     #[test]

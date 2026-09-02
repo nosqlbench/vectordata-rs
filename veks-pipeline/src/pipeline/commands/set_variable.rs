@@ -53,6 +53,12 @@ Evaluates the `value` expression and stores the result under `name` in
 `variables.yaml` next to the dataset file. The variable becomes available
 to all subsequent steps via `${{name}}` interpolation.
 
+With `attribute: true` the result is stored as a **dataset attribute**
+in `dataset.yaml` instead — the place for facts that describe the
+dataset rather than the run, such as the embedding model and the
+revision its vectors were produced with, back-filled for a dataset whose
+embed step predates recording them.
+
 ## Expressions
 
 - `count:<path>` — record count of a vector file (fvec/mvec/ivec) or slab
@@ -122,6 +128,19 @@ Then reference in a downstream step:
             ),
         };
 
+        let as_attribute = options.get("attribute").map(|s| s == "true").unwrap_or(false);
+        if as_attribute {
+            if let Err(e) = variables::set_dataset_attribute(&ctx.workspace, name, &value) {
+                return error_result(format!("failed to set dataset attribute '{}': {}", name, e), start);
+            }
+            ctx.ui.log(&format!("  attribute {} = {}", name, value));
+            return CommandResult {
+                status: Status::Ok,
+                message: format!("set attribute {} = {}", name, value),
+                produced: vec![],
+                elapsed: start.elapsed(),
+            };
+        }
         // Persist to variables.yaml
         if let Err(e) = variables::set_and_save(&ctx.workspace, name, &value) {
             return error_result(
@@ -164,6 +183,15 @@ Then reference in a downstream step:
                 required: true,
                 default: None,
                 description: "Expression: count:<path>, dim:<path>, or a literal value".to_string(),
+                extended_description: None,
+                role: OptionRole::Config,
+        },
+            OptionDesc {
+                name: "attribute".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "Store the value as a dataset attribute in dataset.yaml rather than a pipeline variable".to_string(),
                 extended_description: None,
                 role: OptionRole::Config,
         },

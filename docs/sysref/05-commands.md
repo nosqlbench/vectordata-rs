@@ -115,7 +115,7 @@ palette.
 | `merkle create` | Generate merkle hash trees for data files |
 | `merkle verify` | Verify merkle hashes |
 | `catalog generate` | Generate catalog.json index |
-| `state set` / `state clear` | Pipeline variable management |
+| `state set` / `state clear` | Pipeline variable management; `state set` with `attribute: true` writes a dataset attribute instead |
 | `download huggingface` | Download from Hugging Face Hub |
 | `download bulk` | Parallel bulk download (see config below) |
 

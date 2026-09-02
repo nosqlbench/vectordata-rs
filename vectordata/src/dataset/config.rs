@@ -34,6 +34,16 @@ pub struct DatasetAttributes {
     /// Name of the embedding model used to generate vectors (e.g. "CLIP ViT-B/32").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The model revision the vectors were actually produced with —
+    /// the commit a floating tag resolved to at embed time. Another
+    /// host resolving the same tag later may get different weights,
+    /// and nothing else in the dataset would show it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_revision: Option<String>,
+    /// The revision that was *asked for* (`main`, a tag, a commit), so
+    /// a reader can see whether the build pinned its weights.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_revision_requested: Option<String>,
 
     /// Canonical URL for the dataset source.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -545,6 +555,8 @@ impl DatasetConfig {
             "is_duplicate_vector_free" => { attrs.is_duplicate_vector_free = Some(value == "true"); true }
             "distance_function" => { attrs.distance_function = Some(value.to_string()); true }
             "model" => { attrs.model = Some(value.to_string()); true }
+            "model_revision" => { attrs.model_revision = Some(value.to_string()); true }
+            "model_revision_requested" => { attrs.model_revision_requested = Some(value.to_string()); true }
             "url" => { attrs.url = Some(value.to_string()); true }
             "license" => { attrs.license = Some(value.to_string()); true }
             "vendor" => { attrs.vendor = Some(value.to_string()); true }
@@ -657,6 +669,8 @@ impl DatasetConfig {
             if let Some(v) = attrs.is_zero_vector_free { out.push_str(&format!("  is_zero_vector_free: {}\n", v)); }
             if let Some(v) = attrs.is_duplicate_vector_free { out.push_str(&format!("  is_duplicate_vector_free: {}\n", v)); }
             if let Some(ref v) = attrs.model { out.push_str(&format!("  model: {}\n", v)); }
+            if let Some(ref v) = attrs.model_revision { out.push_str(&format!("  model_revision: {}\n", v)); }
+            if let Some(ref v) = attrs.model_revision_requested { out.push_str(&format!("  model_revision_requested: {}\n", v)); }
             if let Some(ref v) = attrs.url { out.push_str(&format!("  url: {}\n", v)); }
             if let Some(ref v) = attrs.license { out.push_str(&format!("  license: {}\n", v)); }
             if let Some(ref v) = attrs.vendor { out.push_str(&format!("  vendor: {}\n", v)); }
@@ -1617,6 +1631,17 @@ profiles:
 
         assert_eq!(config.is_normalized(), Some(true));
         assert_eq!(config.distance_function(), Some("Cosine"));
+        // Embedding provenance: the model and the revision its vectors
+        // were produced with, both round-tripping through YAML.
+        assert!(config.set_attribute("model", "Qwen/Qwen3-Embedding-0.6B"));
+        assert!(config.set_attribute("model_revision", "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"));
+        assert!(config.set_attribute("model_revision_requested", "main"));
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let back: DatasetConfig = serde_yaml::from_str(&yaml).unwrap();
+        let attrs = back.attributes.as_ref().unwrap();
+        assert_eq!(attrs.model.as_deref(), Some("Qwen/Qwen3-Embedding-0.6B"));
+        assert_eq!(attrs.model_revision.as_deref(), Some("97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"));
+        assert_eq!(attrs.model_revision_requested.as_deref(), Some("main"));
     }
 }
 

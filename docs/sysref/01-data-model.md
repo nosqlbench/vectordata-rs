@@ -298,6 +298,9 @@ attributes:
   distance_function: L2              # L2, COSINE, or DOT_PRODUCT
   is_zero_vector_free: true          # verified by pipeline
   is_duplicate_vector_free: true     # verified by pipeline
+  model: Qwen/Qwen3-Embedding-0.6B   # recorded by generate embed
+  model_revision: 97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3   # the commit the weights resolved to
+  model_revision_requested: main     # what the build asked for
 
 variables:
   base_count: '1000000'
@@ -410,3 +413,21 @@ Every published dataset must have:
 - `distance_function` — the metric used for KNN computation
 - `is_zero_vector_free` — set automatically after zero-vector scan
 - `is_duplicate_vector_free` — set automatically after dedup scan
+
+### Provenance attributes
+
+Recorded by `generate embed` at the point it resolves the model weights,
+which is the only point where they are known to be correct:
+
+- `model` — the embedding model identifier
+- `model_revision` — the commit the requested revision resolved to, read
+  from the hub cache's `snapshots/<sha>/` layout. A floating tag such as
+  `main` resolves differently on another host or after the cache turns
+  over, and nothing else in the dataset would show the difference.
+- `model_revision_requested` — the revision the build asked for, so a
+  reader can see whether the weights were pinned.
+
+A dataset whose embed step predates these is back-filled with
+`state set` and `attribute: true`, which writes a dataset attribute
+rather than a pipeline variable and refuses a key the dataset does not
+define.
