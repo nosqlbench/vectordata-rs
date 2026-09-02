@@ -39,6 +39,8 @@ each run against the synthetic-1k test fixture.
 | `compute evaluate-predicates` | Evaluate predicates against metadata → vvec results |
 | `compute sort` | Sort vectors for deduplication |
 | `compute partition-profiles` | Extract per-label base vectors and register partition profiles |
+| `compute topics` | Hierarchical spherical k-means: centroids per level, one code per level per base vector, leaf margin |
+| `compute topic-labels` | Class TF-IDF slugs for every cluster of a topic model, from a seeded subset of the passage table |
 
 ---
 
@@ -48,7 +50,7 @@ each run against the synthetic-1k test fixture.
 |---------|-------------|
 | `generate vectors` | Random vector generation (gaussian, uniform) |
 | `generate metadata` | Random integer metadata labels |
-| `generate predicates` | Random equality predicates (simple-int-eq) |
+| `generate predicates` | Predicates: random equality (simple-int-eq), survey-driven, or `stratified` — four families covering every selectivity decade from the survey census |
 | `generate vvec-index` | Build IDXFOR__ offset indices for vvec files |
 | `generate shuffle` | Random permutation of vector ordinals |
 | `generate dataset-json` | Produce dataset.json from dataset.yaml |
@@ -77,6 +79,7 @@ each run against the synthetic-1k test fixture.
 | `transform extract` | Extract vector subsets by ordinal range |
 | `transform convert` | Convert between vector formats |
 | `transform ordinals` | Apply ordinal permutation |
+| `transform enrich-metadata` | Add topic, section-class, citation-percentile, position, word-count and hash-bucket columns to a passage metadata table |
 
 ---
 

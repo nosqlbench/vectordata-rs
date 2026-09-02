@@ -28,6 +28,8 @@ Every command with a working example run against the
 | [compute postfiltered-knn](./compute-postfiltered-knn.md) | Post-filter KNN ground truth (E facet) — `G ∩ R`, sparse possible, cheap O(K) derivation |
 | [compute evaluate-predicates](./compute-evaluate-predicates.md) | Evaluate predicates against metadata |
 | [compute partition-profiles](./compute-partition-profiles.md) | Per-label partition profiles with partitioned KNN |
+| [compute topics](./compute-topics.md) | Hierarchical spherical k-means topic model: centroids, per-level codes, leaf margin |
+| [compute topic-labels](./compute-topic-labels.md) | Readable slugs for every topic cluster (class TF-IDF over sampled passages) |
 
 ## Generate
 
@@ -35,10 +37,16 @@ Every command with a working example run against the
 |---------|-------------|
 | [generate vectors](./generate-vectors.md) | Random vector generation |
 | [generate metadata](./generate-metadata.md) | Random integer metadata labels |
-| [generate predicates](./generate-predicates.md) | Random equality predicates |
+| [generate predicates](./generate-predicates.md) | Predicates: random equality, survey-driven, or stratified families over the survey census |
 | [generate vvec-index](./generate-vvec-index.md) | Build offset indices for vvec files |
 | [generate passages](./generate-passages.md) | Chunk an s2orc-format text corpus into passages.parquet (+ parent manifest) |
 | [generate embed](./generate-embed.md) | Embed a parquet text column into npy vectors (candle, Qwen3-Embedding; `embed`/`embed-cuda` features) |
+
+## Transform
+
+| Command | Description |
+|---------|-------------|
+| [transform enrich-metadata](./transform-enrich-metadata.md) | Derived predicate columns (topics, section class, citation percentile, position, word count, hash bucket) on a passage metadata table |
 
 ## Download
 

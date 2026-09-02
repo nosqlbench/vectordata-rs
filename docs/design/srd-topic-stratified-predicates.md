@@ -389,8 +389,9 @@ year**, so it means "well-cited for its age". This is both the more
 meaningful quantity and the one that breaks the `year`/`citationcount`
 correlation identified in §1.2.
 
-**TS-22.** `section_class` normalises the 72,977 raw headings to a
-small closed taxonomy (`introduction`, `background`, `methods`,
+**TS-22.** `section_class` normalises the raw headings (72,977 distinct
+in the 10M pilot; 82,165,334 in the 550M corpus, measured 2026-09-02)
+to a small closed taxonomy (`introduction`, `background`, `methods`,
 `results`, `discussion`, `conclusion`, `references`, `other`).
 
 **TS-23.** `passage_position`, `word_count` and `section_class` are
@@ -519,7 +520,8 @@ predicates.
 | `family` | text | `topical` / `structural` / `bibliographic` / `control` |
 | `selectivity` | float64 | the fraction measured when the predicate was admitted |
 | `topic_level` | int | 1 / 2 / 3, topical family only |
-| `query_placement` | text | `in-topic` / `out-of-topic` (TS-19), topical only |
+| `conjunct` | bool | topical only: a topic conjoined with one bibliographic qualifier (TS-17) |
+| `query_placement` | text | `in-topic` / `out-of-topic` (TS-19), topical only, present only when queries were given |
 
 **The decade is derived, not stored.** It is `⌊log₁₀ selectivity⌋`, so
 recording the continuous value and computing the bin keeps the artifact
@@ -686,12 +688,20 @@ computed in source order crosses the bridge the same way M does — the
 margin through the mvec mode of `transform extract` — never by a
 mapping of its own.
 
-**TS-131.** Consequently `compute topics` reads `_base_all.fvecs`, not
-`profiles/base/base_vectors.fvecs`, and emits one assignment per source
-row. The fitting sample is drawn from the same file and so includes the
-6.75% of rows later removed as duplicates. Accepted: a passage repeated
-across papers is a real region of the embedding space, and it is the
-census (TS-132), not the fit, that decides selectivity.
+**TS-131.** Consequently `compute topics` **assigns** over
+`_base_all.fvecs`, not `profiles/base/base_vectors.fvecs`, and emits one
+assignment per source row.
+
+**TS-150.** The **fit** reads a different file: the first `sample-size`
+rows of the shuffled base, `profiles/base/base_vectors.fvecs`. A prefix
+of a shuffled facet is a uniform sample of the base population (TS-10),
+it excludes the duplicates and queries the base excludes, and it is one
+sequential read of 20 GB. *Rejected:* sampling the source-order file,
+whose prefix is one corner of the corpus and whose uniform sample is
+five million scattered 4 KB reads across 2.18 TB. The command keeps
+both forms — `sample-order: prefix` for a shuffled facet, `strided` for
+one in corpus order — so a dataset without a shuffled base still fits
+on a uniform sample, just more slowly.
 
 ### 6.1 `compute topics`
 
@@ -1037,18 +1047,29 @@ TS-64's co-location hold by construction rather than by discipline.
 candidate pool a predicate was drawn from and the stratum it filled —
 is additionally retained as an ordinal-aligned adjunct (TS-75), so the
 selection process travels with the dataset rather than only with the
-run that produced it.
+run that produced it. Its record carries `cell` (`family:1e-d`), `pool`
+(candidates in that cell), `source` (which census table: hierarchy,
+histogram, values, pair, or control), `expected_count` (the exact
+matches over the census population) and `vernacular` (the predicate
+rendered), so a reader can check any predicate's claim against the R
+facet without the generator.
 
 ### 6.5 Recording embedding provenance
 
 **TS-83.** The model identity and **resolved** revision that produced
-the base vectors are recorded in the dataset. For tessera this is a
-back-fill: the values exist only in a markdown file beside the corpus,
-and its own notes concede that nothing in `dataset.log` or
-`runlog.jsonl` would show the difference if another host resolved the
-model tag differently (TS-76). For future builds the embed command
-emits them at the point it resolves them, which is the only point where
-they are known to be correct.
+the base vectors are recorded in the dataset, as the attributes
+`model`, `model_revision` (the commit the request resolved to, read
+from the hub cache's `snapshots/<sha>/` layout) and
+`model_revision_requested` (what the build asked for, so a floating tag
+is visible as such). For tessera this is a back-fill: the values exist
+only in a markdown file beside the corpus, and its own notes concede
+that nothing in `dataset.log` or `runlog.jsonl` would show the
+difference if another host resolved the model tag differently (TS-76).
+The back-fill route is `state set` with `attribute: true`, which writes
+a dataset attribute rather than a pipeline variable and refuses a key
+the dataset does not define. For future builds the embed command emits
+all three at the point it resolves the weights, which is the only point
+where they are known to be correct.
 
 ### 6.6 What is cache and what is retained
 
@@ -1063,6 +1084,7 @@ the dataset and are not:
 | survey, with census tables | `.cache/` | recomputable from M in one pass; the selectivity that matters is retained per predicate (TS-62) |
 | topic labels | dataset | the comparand every topical predicate names (TS-56) |
 | topic centroids | dataset | reproducing the labelling requires them (TS-26) |
+| topic model report | dataset | levels, seed and sample, without which the centroids cannot be re-fitted (TS-152) |
 | assignment margin | dataset | explains filter crispness; a second pass to recover |
 | heading → class table | dataset | a judgement call worth auditing |
 | families namespace | in `predicates.slab` | TS-64 |
@@ -1087,12 +1109,17 @@ sample of rows. `passages.parquet` is 508 row groups of ~1.05M rows, so
 2,000 uniformly sampled members of a typical L3 cluster fall in ~20
 distinct groups, and a sample that touches every group is a full read of
 241 GB (TS-136). Instead the command reads `row-groups` groups chosen by
-seed (default 64, an eighth of the file) and takes up to
-`sample-per-cluster` members of each cluster from what it finds there.
-The cap is a ceiling, not a floor: a cluster at 10⁻⁶ meets ~67 members
-in 67M rows, which is enough for term statistics, and a cluster that
-meets fewer than `min-sample` (default 20) is given a positional label
-rather than a label fitted to noise.
+seed (default 64, an eighth of the file), visits each group's rows in a
+seeded order so a cluster's cap does not fill from one corner of the
+group, and accepts a passage for its cluster at every level whose cap
+has room, up to `sample-per-cluster` per cluster. Acceptance is decided
+sequentially because it depends on the caps filling; the accepted
+passages are then tokenised in parallel and their terms added in the
+same order, so the labels are identical for any thread count. The cap
+is a ceiling, not a floor: a cluster at 10⁻⁶ meets ~67 members in 67M
+rows, which is enough for term statistics, and a cluster that meets
+fewer than `min-sample` (default 20) is given a positional label rather
+than a label fitted to noise.
 
 Full surface in §10.5.
 
@@ -1107,9 +1134,11 @@ stay fresh.
 What re-runs is the metadata and predicate chain:
 
 ```
-compute-topics             NEW    one GPU pass over _base_all.fvecs, source
-                                  order (TS-131) -> assignments + margin
-                                  (.cache), centroids (dataset)
+compute-topics             NEW    fit on the shuffled base prefix (TS-150),
+                                  then one CPU pass over _base_all.fvecs,
+                                  source order (TS-131) -> assignments +
+                                  margin (.cache), centroids + model
+                                  report (dataset)
 compute-topic-labels       NEW    seeded row-group sample of passages.parquet
                                   (TS-138) -> topic_labels.slab (dataset)
 enrich-metadata            NEW    one paper-level aggregate, two lookups,
@@ -1162,8 +1191,9 @@ start without it.
 
 | artifact | path | order (TS-130) | format | lifetime |
 |---|---|---|---|---|
-| topic assignments | `.cache/topic_assign_l{1,2,3}.u16` | source | `ScalarPacked` u16 | cache |
+| topic assignments | `.cache/topic_assign.u16vecs` | source | u16 xvec, dim = levels (TS-151) | cache |
 | topic centroids | `profiles/base/topic_centroids.fvecs` | by cluster | `FloatXvec` f32, dim 1024 | retained |
+| topic model report | `profiles/base/topic_centroids.json` | — | JSON (TS-152) | retained |
 | topic labels | `profiles/base/topic_labels.slab` | by cluster | `Slab`, MNode | retained |
 | cluster margin, as computed | `.cache/topic_margin_all.mvecs` | source | `FloatXvec` f16, dim 2 | cache |
 | cluster margin | `profiles/base/topic_margin.mvecs` | base | `FloatXvec` f16, dim 2 | retained |
@@ -1202,9 +1232,13 @@ them, which is the correct trade for artifacts whose absence is legal.
 | `generation` | why it was *selected* (TS-82) | the residue TS-58 keeps out of the record |
 
 Kept apart so a consumer can read the family without also reading the
-experimental design. `StandardFacet::MetadataPredicates::namespaces()`
+experimental design. They join the `schema` and `survey` namespaces
+the slab already carries — the generation template and the survey the
+predicates were drawn from — so a stratified `predicates.slab` holds
+five namespaces. `StandardFacet::MetadataPredicates::namespaces()`
 changes from `[""]` to `["families", "generation", ""]`, and each name
-is a published constant beside `FORMS_NAMESPACE`.
+is a published constant beside `SCHEMA_NAMESPACE` and
+`SURVEY_NAMESPACE`.
 
 **TS-89.** The cluster margin is one `mvecs` facet of dim 2 — the
 distance to the assigned L3 centroid and to the runner-up — rather than
@@ -1332,20 +1366,43 @@ inspects.
 | option | role | req | default | notes |
 |---|---|---|---|---|
 | `base` | Input | yes | — | `_base_all.fvecs`, **source order** (TS-131); accepts a series (SH-35) |
+| `sample` | Input | no | `base` | facet to fit on; the shuffled base with `sample-order: prefix` (TS-150) |
+| `sample-size` | Config | no | `5000000` | rows fitted |
+| `sample-order` | Config | no | `strided` | `prefix` for a shuffled facet, `strided` for corpus order (TS-150) |
 | `levels` | Config | no | `10,30,33` | branching per level |
-| `sample-size` | Config | no | `5000000` | passages used to fit |
 | `iterations` | Config | no | `50` | convergence cap (TS-93) |
 | `tolerance` | Config | no | `1e-4` | mean centroid movement |
 | `seed` | Config | no | `42` | k-means++ and sampling |
-| `centroids` | Output | yes | — | `topic_centroids.fvecs` |
-| `assignments` | Output | yes | — | `.cache/topic_assign_l*.u16` |
+| `normalize` | Config | no | `true` | unit-normalise before fitting and assigning (TS-91) |
+| `centroids` | Output | yes | — | `topic_centroids.fvecs`, every level in order |
+| `output` | Output | yes | — | `.cache/topic_assign.u16vecs`: one record per base vector, one code per level (TS-151) |
 | `margin` | Output | no | — | `.cache/topic_margin_all.mvecs`, source order; omit to skip (TS-72) |
+| `model` | Output | no | beside `centroids`, `.json` | the model report (TS-152) |
 
 **TS-107.** `check_artifact` is Complete when the centroid file holds
-`Σ levels` records of the base's dimension **and** every assignment
-column has one record per source row (TS-131). Either alone is insufficient:
-centroids without assignments is a fit that never finished, and
-assignments without centroids cannot be reproduced or extended.
+`Σ levels` records of the base's dimension, the assignment facet holds
+one record per source row with one code per level (TS-131, TS-151), the
+margin — if declared — holds one dim-2 record per source row, and the
+model report parses with the configured levels. Any one alone is
+insufficient: centroids without assignments is a fit that never
+finished, and assignments without centroids cannot be reproduced or
+extended.
+
+**TS-151.** The assignments are **one facet**, `topic_assign.u16vecs`,
+a u16 xvec whose dimension is the number of levels, rather than one
+packed file per level. The runner anchors a step's freshness on one
+`output`, a reader wants every level of a row in one record, and a
+leaf code determines its ancestors anyway; three files would be three
+ways to be inconsistent. Codes are positional per level — level *l*'s
+code `c` is child `c mod k` of level *l*−1's `c div k` — so the tree
+is implicit in the branching.
+
+**TS-152.** A **model report** is written beside the centroids,
+`topic_centroids.json`, and retained: levels, seed, the sample and how
+it was taken, iteration cap and tolerance, the kernel, and per level
+the cluster count, empties, runs converged, largest final movement and
+repairs. The centroid file carries none of this, and TS-26's
+reproducibility promise needs all of it.
 
 **TS-108.** Declares `mem` and `threads` to the governor. The fit holds
 `sample-size × 1024 × 4` bytes — 20 GB at the default — and must
@@ -1394,13 +1451,46 @@ exist.
 | `metadata` | Input | yes | — | source parquet |
 | `passages` | Input | yes | — | `passages.parquet`: `ordinal`, `text` |
 | `parents` | Input | yes | — | `parents.parquet`: `passage_count`, `row_start` |
-| `assignments` | Input | yes | — | topic codes, source order (TS-131) |
+| `assignments` | Input | yes | — | `topic_assign.u16vecs`, source order (TS-131, TS-151) |
 | `labels` | Input | no | positional | code → label, from `compute topic-labels` (TS-135) |
-| `section-map` | Input | no | built-in | override the prefix table |
+| `paper-column` | Config | no | `corpusid` | metadata column identifying the paper |
+| `section-column` | Config | no | `section` | metadata column holding the heading |
+| `year-column` | Config | no | `year` | metadata column holding the year |
+| `citations-column` | Config | no | `citationcount` | metadata column holding the citation count |
 | `buckets` | Config | no | `16777216` | *K* for `sample_bucket`, 2²⁴ (TS-115) |
 | `seed` | Config | no | `42` | hash seed |
-| `output` | Output | yes | — | enriched parquet |
-| `section-map-out` | Output | no | — | the table actually applied (TS-79) |
+| `output` | Output | yes | — | enriched parquet, source order |
+| `section-map-out` | Output | no | beside `output`, `section_class_map.slab` | every distinct heading with its class and count (TS-79) |
+| `report` | Output | no | beside `output`, `.json` | rows, papers, years, distinct headings, share classed `other` |
+
+**TS-154.** The prefix table itself (TS-103) is a constant of the
+command and appears in its documentation; what is published beside the
+output is its **outcome** on this corpus — one record per distinct
+heading with the class it received and how many passages carry it —
+because that, not the rules, is what an auditor of a `section_class`
+predicate needs to read. `check_artifact` is Complete when the enriched
+table holds exactly as many rows as the metadata and carries every
+derived column, typed as §4.1 says, for the assignments' depth.
+
+**TS-155.** The map runs in parallel over the passage table's row
+groups — each worker reads one group's `ordinal` and `text`, the
+aligned metadata rows by row range whatever the metadata's own row
+groups are, and the aligned assignments — and one consumer writes the
+enriched rows in group order, so the output is identical for any
+thread count. Workers are bounded independently of the governor's
+thread count because each holds a row group of text.
+
+*Measured on tessera, 2026-09-02 (128 cores, 32 workers, outputs in a
+scratch directory):* 531,869,985 rows enriched in 10 min 11 s wall
+(583.6 s inside the command) at ~1.5 M rows/s, peak resident set
+101 GB; 17,457,121 papers over 231 distinct years; 82,165,334 distinct
+headings, of which the prefix table classes 67.5 % of passages as
+`other`. The published heading map (TS-154) is therefore 8.9 GB —
+larger than the enriched table's own increment — because most
+headings are singletons. Whether the map should keep every heading or
+only those carrying at least two passages is an open question for the
+dataset owner; the command writes what TS-154 says until that is
+decided.
 
 **TS-110.** Fails if the assignment count does not equal the metadata
 row count. A silent off-by-one here mislabels every passage after the
@@ -1411,16 +1501,28 @@ divergence and would surface only as inexplicable benchmark results.
 | option | role | req | default | notes |
 |---|---|---|---|---|
 | `survey` | Input | yes | — | schema, distributions **and** the census tables (TS-143) |
-| `base-count` | Config | yes | — | *N*, for the per-profile floor |
-| `query-placement` | Config | no | mixed | in-topic / out-of-topic mix (TS-19) |
-| `centroids` | Input | no | — | required with `queries`, for placement (TS-137) |
-| `queries` | Input | no | — | required for `query-placement` |
-| `families` | Config | no | all four | which families, and their mix; the semantic three never read the hash (TS-149) |
-| `per-cell` | Config | no | tapered | per-decade counts (TS-54) |
-| `decades` | Config | no | `1e-1..1e-7` | target range |
+| `base-count` | Config | no | the census population | *N*, for the floors in the report |
+| `families` | Config | no | all four | which families, in output order; the semantic three never read the hash (TS-149) |
+| `topic-fields` | Config | no | the survey's first hierarchy | topic fields, outermost first |
+| `bibliographic-fields` | Config | no | `citation_percentile,year,isopenaccess` | censused paper-level fields |
+| `structural-fields` | Config | no | `section_class,passage_position,word_count` | censused passage-level fields |
+| `control-field` | Config | no | `sample_bucket` | the hash field (TS-115) |
+| `buckets` | Config | no | `16777216` | its modulus |
+| `decades` | Config | no | `1e-1..1e-7` | target range, or a comma list |
+| `per-cell` | Config | no | tapered | per-decade counts (TS-54): `tapered`, one count, or one per decade |
 | `min-matches` | Config | no | `100` | *M* in TS-11 |
 | `reliability-threshold` | Config | no | `10000000` | *N*ᵣ (TS-46) |
-| `report` | Output | no | — | generation report (TS-34) |
+| `query-placement` | Config | no | mixed | `mixed`, `in-topic`, `out-of-topic` or `any` (TS-19); needs `queries` |
+| `queries` | Input | no | — | query vectors, for placement |
+| `centroids` | Input | no | — | with `queries` (TS-137) |
+| `model` | Input | no | — | with `queries`: the model report, for the branching |
+| `labels` | Input | no | — | with `queries`: code → label, so placement is by label |
+| `report` | Output | no | beside `output`, `.json` | generation report (TS-34) |
+
+The strategy is a branch of `generate predicates` — `--strategy
+stratified` — implemented in its own module, since its surface and its
+outputs share nothing with `eq` and `compound` beyond the slab they
+write. The other strategies' options are ignored under it.
 
 **TS-111.** `check_artifact` is Complete when the content namespace
 holds at least one predicate **and** the `families` namespace holds
@@ -1431,28 +1533,49 @@ predicates disagree, which TS-64 exists to prevent.
 vectors. The queries are perturbed copies of source vectors
 (`extract-queries`), so their topics cannot be looked up from the
 source-order assignments; each is assigned by the descent of TS-96
-against `centroids`. `queries` without `centroids` is a configuration
-error, not a silent omission.
+against `centroids`, structured by the model report's branching, and
+its codes are turned into labels through the label slab, because a
+topical predicate names a label. `queries` without all three of
+`centroids`, `model` and `labels` is a configuration error, not a
+silent omission.
 
 ### 10.5 `compute topic-labels`
 
 | option | role | req | default | notes |
 |---|---|---|---|---|
 | `passages` | Input | yes | — | `passages.parquet`, source order |
-| `assignments` | Input | yes | — | from `compute topics` |
+| `assignments` | Input | yes | — | `topic_assign.u16vecs` from `compute topics` (TS-151) |
+| `model` | Input | yes | — | the model report (TS-152), for the branching per level |
+| `text-column` | Config | no | `text` | column holding the passage text |
 | `row-groups` | Config | no | `64` | seeded subset read (TS-138) |
-| `sample-per-cluster` | Config | no | `2000` | cap on members per cluster |
+| `sample-per-cluster` | Config | no | `2000` | cap on members per cluster, per level |
 | `min-sample` | Config | no | `20` | below this, positional label (TS-102) |
 | `top-terms` | Config | no | `3` | terms joined into the slug |
-| `seed` | Config | no | `42` | row-group and member selection |
+| `seed` | Config | no | `42` | row-group and row-order selection |
 | `output` | Output | yes | — | `topic_labels.slab` |
+| `report` | Output | no | beside `output`, `.json` | row groups read, rows visited, per-level positional and collision counts, sample sizes |
 
 **TS-134.** `check_artifact` is Complete when the slab holds exactly
-`Σ levels` records — one per cluster, in level order, matching the
-centroid file — and every label is unique within its level (TS-101). A
-record carries `level`, `code`, `label`, `terms` (the ranked terms the
-slug was cut from) and `sample_size`, so a reader can see how much
-evidence stood behind each name.
+`Σ levels` records — one per cluster, in level then code order,
+matching the model report's branching — and every label is unique
+within its level (TS-101). A record carries `level`, `code`, `label`,
+`terms` (the ranked terms the slug was cut from), `sample_size` and
+`positional`, so a reader can see how much evidence stood behind each
+name and whether it is a name at all.
+
+**TS-153.** Terms are lower-cased alphabetic tokens of three to thirty
+characters with a short list of function words and academic
+boilerplate removed, plus the bigrams of tokens that were adjacent in
+the text — a hyphen or apostrophe keeps adjacency, other punctuation
+ends a phrase. Class-based TF-IDF scores each term against the level:
+its frequency within the cluster's sampled passages, times the log of
+one plus the level's mean token count over the term's total count
+across the level, so a term that is everywhere scores nothing. The
+slug takes the top terms without repeating a word — or a stem: a word
+that is a prefix of one already used, or shares its first five
+characters, so `robot`, `robots` and `robotic` do not make a label
+between them — and a collision within the level extends the slug with
+the next ranked terms and, failing that, appends the code.
 
 ## 11. Candidate enumeration
 
@@ -1496,11 +1619,15 @@ fill any cell on demand, which is what TS-47 relies on.
 **TS-116.** **Conjunctions** (TS-17) are formed only after the single-
 field pools are exhausted for a cell, pairing a topical candidate with a
 bibliographic one, and **only over pairs the survey censused** (TS-142).
-Their selectivity is **read, not multiplied** (TS-18): the joint table
-gives the exact count over the base population, and the candidate is
-admitted to whichever band that lands in. A pair that was not declared
-yields no conjunctions and is reported as a shortfall (TS-16) rather
-than estimated.
+They belong to the topical family — the topic is what they are about,
+the qualifier is how they reach a lower decade — and are flagged
+`conjunct` in the families namespace. Their selectivity is **read, not
+multiplied** (TS-18): for an integer qualifier every threshold
+`topic = x AND b ≥ t` is a suffix sum over the joint table's row, for a
+boolean or text qualifier every `topic = x AND b = v` is a cell, and the
+candidate is admitted to whichever band that lands in. A pair that was
+not declared yields no conjunctions and is reported as a shortfall
+(TS-16) rather than estimated.
 
 **TS-117.** Query placement (TS-19) requires the query vectors and the
 centroids (TS-137). Each query is assigned to a topic by the same
@@ -1549,9 +1676,11 @@ the tree green.
 
 **Phase 1 — clustering.** `compute topics` (§10.1) with §9.1–9.2:
 spherical k-means, deterministic reduction, hierarchical assignment,
-margin output, all in source order (TS-131). The largest single piece
-and the only one needing GPU work. Testable in isolation against
-planted clusters (TS-118).
+margin output, the fit on the shuffled prefix (TS-150) and the
+assignment in source order (TS-131). The largest single piece. It runs
+on the CPU with the KNN engines' AVX kernels — the fit is about 19
+TFLOP and the assignment is bound by reading 2.18 TB, so a GPU would
+buy nothing. Testable in isolation against planted clusters (TS-118).
 
 **Phase 2 — labelling.** `compute topic-labels` (§10.5) with §9.3.
 Independent of everything after it: positional labels (TS-102, TS-135)
@@ -1590,8 +1719,8 @@ predicate set invalidates `evaluate-predicates` across every profile.
 
 | phase | pass | estimate |
 |---|---|---|
-| 1 fit | 5M × 1024, 50 iterations | GPU minutes |
-| 1 assign | 531.9M × 73 inner products | one sequential pass over 2.18 TB |
+| 1 fit | 5M × 1024, 50 iterations, ≈19 TFLOP | 106.7 s measured on tessera, 128 threads, AVX-512 |
+| 1 assign | 531.9M × 73 inner products | 746.1 s measured: one sequential pass over 2.18 TB at ~2.9 GB/s |
 | 2 | text of 64 row groups, ~67M passages | ~30 GB read; minutes |
 | 3 aggregate | 3 columns of `metadata.parquet`, first row per paper | minutes |
 | 3 map | 531.9M rows including the 241 GB `text` column | tens of minutes, I/O bound (TS-136) |
@@ -1611,8 +1740,17 @@ choice before fitting no longer does.
 
 **TS-39.** *Do topic labels need to be good?* §9.3 now specifies a
 mechanism — class-based TF-IDF, sampled, uniqueness-enforced — so the
-question is no longer "how" but "how good is good enough". Still open,
-and TS-102's positional fallback means it does not block anything.
+question is no longer "how" but "how good is good enough". **Measured
+on tessera, 2026-09-02:** 64 of 508 row groups read in 12 min 51 s;
+every level-1 and level-2 cluster labelled from a full 2,000-passage
+sample; 9,897 of 9,900 leaves labelled, 3 positional, 135 collisions
+resolved by extension. Level 1 reads `theorem-proof-lemma`,
+`patients-disease-risk`, `energy-field-model`, `species-water-soil`,
+`cells-expression-protein`, and one cluster of non-English passages;
+leaves read `biosensors-aptamer-sers`, `controller-robot-tracking`,
+`absorbance-spectrophotometer-vis`. Good enough to be read as a query
+by someone in the field, which is the bar TS-45 sets; still open is
+whether a reviewer outside the field reads them the same way.
 
 **TS-40.** ~~*Should the control family ship?*~~ **Settled by TS-47:
 it must.** It is what gives sub-threshold profiles a predicate set at
@@ -1621,9 +1759,29 @@ in its place: how to label it so a consumer cannot mistake a control
 for a realistic query. The dataset carries no field today that marks a
 predicate's family, and TS-7 requires results be grouped by one.
 
-**TS-41.** *Sampling the fit.* 5M of 531.9M is ~1%. Whether that is
-enough to place 10,000 L3 centroids stably is untested; the failure
-mode is unstable small clusters, which the census would expose.
+**TS-41.** ~~*Sampling the fit.*~~ **Measured on tessera, 2026-09-02.**
+A fit on the first 5M rows of the shuffled base (TS-150), 10 / 30 / 33,
+converged at every level with no empty cluster and no repair, in
+106.7 s; assigning all 531,869,985 source rows took 746.1 s, bound by
+reading 2.18 TB at ~2.9 GB/s. The assignment distribution over the
+source population:
+
+| level | clusters | smallest | median | largest | selectivity range |
+|---|---:|---:|---:|---:|---|
+| 1 | 10 | 39.3M | 50.8M | 74.0M | 7.4×10⁻² … 1.4×10⁻¹ |
+| 2 | 300 | 614,819 | 1,657,167 | 3,762,990 | 1.2×10⁻³ … 7.1×10⁻³ |
+| 3 | 9,900 | 42 | 48,917 | 623,987 | 7.9×10⁻⁸ … 1.2×10⁻³ |
+
+9,884 of the 9,900 leaves fall in the 10⁻⁴ and 10⁻⁵ decades (4,237
+and 5,647); the tail is 10 leaves at 10⁻⁶, four at 10⁻⁷ and one at
+10⁻⁸ — the unstable small clusters this question anticipated, present
+but few, and exactly what the census reports and the sampler skips or
+labels. The topical family therefore serves 10⁻¹, 10⁻³, 10⁻⁴ and 10⁻⁵
+on its own, with 10⁻² and below 10⁻⁵ left to conjunctions (TS-17) and
+the control family. The leaf margin confirms the greedy descent is
+worth measuring: the median gap between a passage's leaf and its best
+sibling is 0.029 in cosine distance, and 20.8% of passages sit within
+0.01 of a sibling.
 
 ## 15. Acceptance
 
@@ -1845,6 +2003,19 @@ says they are spread evenly. *Rejected:* a mapping of the pipeline's own
 for the margin (a second way to do what `extract-metadata` already
 does), and censusing the enriched parquet (cheaper by a columnar read,
 wrong by 6.75% of rows unevenly distributed). → TS-130 … TS-132.
+
+**D-22 — Fit on the shuffled prefix, assign in source order, one
+assignment facet.** The shuffled base's prefix is a uniform sample of
+the base population and a sequential 20 GB read; the source-order
+file's prefix is a corner of the corpus and its uniform sample is five
+million scattered reads. Assignment still runs over the source-order
+file, because that is the order enrichment joins in (TS-130). The
+assignments are one u16 xvec with one code per level per record rather
+than a packed file per level: the runner anchors freshness on one
+output, a reader wants a row's levels together, and codes are
+positional so the tree is implicit. A model report is retained beside
+the centroids because reproducing the fit needs the levels, seed and
+sample the centroid file cannot carry. → TS-150 … TS-152.
 
 ### 16.1 What changed while this was written
 
