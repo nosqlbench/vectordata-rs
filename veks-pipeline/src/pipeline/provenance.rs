@@ -3,27 +3,38 @@
 
 //! Structured per-step provenance and selectable staleness checks.
 //!
-//! Replaces the v4 single-hash `fingerprint: Option<String>` field on
-//! [`super::progress::StepRecord`]. Each step now records a
-//! [`ProvenanceMap`] capturing every component that *could* be used
-//! to decide whether the step is stale: identity (id, command path),
-//! the binary version decomposed by axis (major / minor / patch / git
-//! hash / dirty), the resolved options as a sorted map, and the full
-//! provenance maps of every upstream step.
+//! Each step records a [`ProvenanceNode`] capturing every component
+//! that *could* be used to decide whether the step is stale: identity
+//! (id, command path), the binary version decomposed by axis (major /
+//! minor / patch / git hash / dirty), the resolved options as a sorted
+//! map, and — by **address** — the node of every upstream step it was
+//! built on.
 //!
-//! At staleness-check time, the runner picks a [`ProvenanceSelector`]
-//! and only the selected components contribute to the comparison.
-//! That lets a user say "I just upgraded the binary and I know the
-//! import logic didn't change — match by major version + options +
-//! upstream" without losing the safety of a content-addressed cache
-//! key, and without dropping the components from storage so that a
-//! later run can pick a stricter selector and re-validate.
+//! Nodes live in a [`ProvenanceGraph`], a flat table keyed by content
+//! address: a node's address is its hash under
+//! [`ProvenanceFlags::STRICT`], so equal content has equal address, a
+//! subtree shared by many dependents is stored once, and a step that
+//! runs again with different inputs gets a *new* node while the node
+//! its dependents were built on stays in the table for as long as
+//! they reference it. Nothing nests: the graph is the same shape in
+//! memory, in the progress log and in a sidecar, and its depth on disk
+//! is constant however long an `after:` chain runs.
+//!
+//! At staleness-check time, the runner picks a selector and hashes the
+//! recorded and the current node under it; the hash recurses through
+//! upstream addresses, so a relaxed selector cascades: when the head
+//! is hashed under selector S, each upstream contribution is also
+//! computed under S. That lets a user say "I just upgraded the binary
+//! and I know the import logic didn't change — match by major version,
+//! options and upstream" without losing a content-addressed cache key,
+//! and without dropping components from storage so that a later run
+//! can pick a stricter selector and re-validate.
 //!
 //! The selector is a [`ProvenanceFlags`] bitset; presets (`STRICT`,
 //! `VERSION_AWARE`, `CONFIG_ONLY`) are provided for the common cases.
-//! The default is `STRICT` — current v4 behaviour.
+//! The default is [`ProvenanceFlags::DEFAULT`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -32,32 +43,31 @@ use super::progress::FnvHasher;
 
 /// Extension appended to the cached provenance path for an artifact.
 /// Sidecars are centralised under `<cache>/provenance/` (never beside
-/// the dataset artifact) — see [`ProvenanceMap::sidecar_path`] for the
+/// the dataset artifact) — see [`ProvenanceGraph::sidecar_path`] for the
 /// 1-1 affine mapping.
 pub const SIDECAR_EXT: &str = "provenance.json";
 
+/// The content address of a [`ProvenanceNode`]: its hash under
+/// [`ProvenanceFlags::STRICT`], sixteen hex digits.
+pub type Address = String;
+
 /// Structured provenance of a single step's execution.
 ///
-/// Stored on [`super::progress::StepRecord`] in place of v4's opaque
-/// `fingerprint: String`. Every component is captured here verbatim;
-/// the staleness hash is computed *on demand* under a
-/// [`ProvenanceSelector`] so a single stored record can answer
-/// strict-equality, major-version-equality, options-equality, etc.
-/// queries without a re-run of the producing step.
+/// Every component is captured verbatim; the staleness hash is
+/// computed *on demand* by [`ProvenanceGraph::hash`] under a selector,
+/// so one stored node can answer strict-equality,
+/// major-version-equality, options-equality, etc. queries without a
+/// re-run of the producing step.
 ///
-/// `upstream` carries the **full** provenance map of each upstream
-/// step (not just its hash) so the selector cascades correctly: when
-/// a user picks a relaxed selector for the head step, that selector
-/// is applied recursively to every upstream contribution. Without
-/// the recursive structure, the head's hash would still pull in the
-/// strictly-computed leaves and the relaxation would be useless.
+/// `upstream` names each upstream by the **address** of the node the
+/// step was built on. The node itself is in the graph; two dependents
+/// of one upstream share it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProvenanceMap {
+pub struct ProvenanceNode {
     /// Step identifier — the YAML `id` field.
     pub step_id: String,
     /// Fully-qualified command path (e.g., `compute knn-metal`).
     pub command_path: String,
-
     /// Binary's major version at the time the step ran.
     pub binary_version_major: u32,
     /// Binary's minor version.
@@ -74,36 +84,30 @@ pub struct ProvenanceMap {
     /// every save.
     #[serde(default)]
     pub binary_dirty: bool,
-
     /// Resolved options for this step. Sorted for deterministic
     /// hashing; `BTreeMap` preserves that on serialise/deserialise.
     #[serde(default)]
     pub options: BTreeMap<String, String>,
-
-    /// Per-upstream provenance, keyed by upstream `step_id`. The
-    /// recursive shape is what makes the selector cascade — when the
-    /// head's hash is computed under selector S, each upstream
-    /// contribution is also computed under S.
+    /// Per-upstream node address, keyed by upstream `step_id` (or by
+    /// input role, for a command keying a cache on its inputs).
     #[serde(default)]
-    pub upstream: BTreeMap<String, ProvenanceMap>,
+    pub upstream: BTreeMap<String, Address>,
 }
 
-impl ProvenanceMap {
-    /// Build a `ProvenanceMap` for a step given the resolved option
-    /// map, the upstream provenance maps, and a parsed
-    /// [`BinaryVersion`]. The binary version is extracted from the
-    /// command's [`super::command::CommandOp::build_version`] string
-    /// at the call site — see [`BinaryVersion::parse`].
+impl ProvenanceNode {
+    /// Build a node for a step given the resolved option map, the
+    /// upstream addresses, and a parsed [`BinaryVersion`]. The binary
+    /// version is extracted from the command's
+    /// [`super::command::CommandOp::build_version`] string at the
+    /// call site — see [`BinaryVersion::parse`].
     pub fn build(
         step_id: &str,
         command_path: &str,
         binary: &BinaryVersion,
-        options: &std::collections::HashMap<String, String>,
-        upstream: BTreeMap<String, ProvenanceMap>,
+        options: &HashMap<String, String>,
+        upstream: BTreeMap<String, Address>,
     ) -> Self {
-        let mut sorted_opts: BTreeMap<String, String> = BTreeMap::new();
-        for (k, v) in options { sorted_opts.insert(k.clone(), v.clone()); }
-        ProvenanceMap {
+        ProvenanceNode {
             step_id: step_id.to_string(),
             command_path: command_path.to_string(),
             binary_version_major: binary.major,
@@ -111,24 +115,95 @@ impl ProvenanceMap {
             binary_version_patch: binary.patch,
             binary_git_hash: binary.git_hash.clone(),
             binary_dirty: binary.dirty,
-            options: sorted_opts,
+            options: options.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             upstream,
         }
     }
 
-    /// Compute the staleness hash under `selector`. Only the
-    /// components selected by the bitset contribute to the hash.
-    /// Identity components (`STEP_ID`, `COMMAND_PATH`) are usually
-    /// always included — when comparing two stored maps for the
-    /// same step, those won't differ anyway, so excluding them is
-    /// just a small bit of metadata savings.
-    pub fn hash(&self, selector: ProvenanceFlags) -> String {
+    /// The node recorded for an upstream whose record is missing or
+    /// carries no provenance: a known-distinct sentinel under any
+    /// selector that includes `UPSTREAM`, so the dependent counts as
+    /// stale until the upstream has a real record.
+    pub fn unknown(step_id: &str) -> Self {
+        ProvenanceNode {
+            step_id: step_id.to_string(),
+            command_path: String::new(),
+            binary_version_major: 0,
+            binary_version_minor: 0,
+            binary_version_patch: 0,
+            binary_git_hash: String::new(),
+            binary_dirty: false,
+            options: BTreeMap::new(),
+            upstream: BTreeMap::new(),
+        }
+    }
+
+    /// Build a degenerate node from a file's path, size, and mtime
+    /// when no sidecar is available. The cascade is weaker here — two
+    /// files with identical size/mtime collide — but it preserves the
+    /// *cheap and sticky* contract: an overwrite, regenerate, or touch
+    /// invalidates downstream caches without ever reading the file's
+    /// content.
+    ///
+    /// The resulting node has empty `binary_*` and `upstream` fields;
+    /// its load-bearing distinguishers are the path and the file
+    /// metadata, recorded under `options`. The synthetic step id
+    /// `degenerate:<filename>` makes it clear in `diff` output that
+    /// this entry didn't come from an upstream pipeline step.
+    pub fn degenerate_from_artifact(artifact: &Path) -> std::io::Result<Self> {
+        let meta = std::fs::metadata(artifact)?;
+        let size = meta.len();
+        // `mtime` only — `ctime`/`atime` swing too much to be a
+        // stable cache signal. The literal seconds + nanos make a
+        // string that diff prints cleanly.
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+            .unwrap_or_else(|| "0".to_string());
+        let name = artifact
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut options: BTreeMap<String, String> = BTreeMap::new();
+        options.insert("path".into(), artifact.to_string_lossy().into_owned());
+        options.insert("size".into(), size.to_string());
+        options.insert("mtime".into(), mtime);
+        Ok(ProvenanceNode {
+            step_id: format!("degenerate:{name}"),
+            command_path: "degenerate".into(),
+            binary_version_major: 0,
+            binary_version_minor: 0,
+            binary_version_patch: 0,
+            binary_git_hash: String::new(),
+            binary_dirty: false,
+            options,
+            upstream: BTreeMap::new(),
+        })
+    }
+
+    /// The node's content address: its hash under
+    /// [`ProvenanceFlags::STRICT`], to which each upstream contributes
+    /// its own address. Because an address *is* the strict hash,
+    /// [`ProvenanceGraph::hash`] under `STRICT` returns the address
+    /// unchanged.
+    pub fn address(&self) -> Address {
         let mut h = FnvHasher::new();
-        self.hash_into(selector, &mut h);
+        self.hash_own_into(ProvenanceFlags::STRICT, &mut h);
+        h.write(b"upstream:");
+        for (id, address) in &self.upstream {
+            h.write(id.as_bytes());
+            h.write(b":");
+            h.write(address.as_bytes());
+            h.write(b"\0");
+        }
         format!("{:016x}", h.finish())
     }
 
-    fn hash_into(&self, selector: ProvenanceFlags, h: &mut FnvHasher) {
+    /// Hash the node's own components (everything but `upstream`)
+    /// under `selector` into `h`.
+    fn hash_own_into(&self, selector: ProvenanceFlags, h: &mut FnvHasher) {
         if selector.contains(ProvenanceFlags::STEP_ID) {
             h.write(b"step_id=");
             h.write(self.step_id.as_bytes());
@@ -173,24 +248,218 @@ impl ProvenanceMap {
                 h.write(b"\0");
             }
         }
+    }
+}
+
+/// A table of [`ProvenanceNode`]s by address — the whole provenance of
+/// a progress log, or the part of it a sidecar carries.
+///
+/// The graph is **closed**: a node can only be inserted once every
+/// address it names is present, so a hash never has to guess at a
+/// missing upstream. It serialises as the bare address → node map.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ProvenanceGraph {
+    nodes: BTreeMap<Address, ProvenanceNode>,
+}
+
+impl ProvenanceGraph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fn get(&self, address: &str) -> Option<&ProvenanceNode> {
+        self.nodes.get(address)
+    }
+
+    pub fn contains(&self, address: &str) -> bool {
+        self.nodes.contains_key(address)
+    }
+
+    /// Insert `node`, returning its address. Every upstream address
+    /// the node names must already be in the graph.
+    pub fn insert(&mut self, node: ProvenanceNode) -> Result<Address, String> {
+        for (id, address) in &node.upstream {
+            if !self.nodes.contains_key(address) {
+                return Err(format!(
+                    "provenance of '{}' names upstream '{}' at {}, which the graph does not hold",
+                    node.step_id, id, address
+                ));
+            }
+        }
+        let address = node.address();
+        self.nodes.entry(address.clone()).or_insert(node);
+        Ok(address)
+    }
+
+    /// Take every node of `other` — the way a sidecar's nodes join
+    /// the graph of the run that reads it.
+    pub fn absorb(&mut self, other: &ProvenanceGraph) {
+        for (address, node) in &other.nodes {
+            self.nodes
+                .entry(address.clone())
+                .or_insert_with(|| node.clone());
+        }
+    }
+
+    /// The staleness hash of the node at `address` under `selector`,
+    /// recursing through upstream addresses so a relaxed selector
+    /// applies all the way down. `None` if the graph has no such node.
+    pub fn hash(&self, address: &str, selector: ProvenanceFlags) -> Option<String> {
+        let mut memo: HashMap<&str, String> = HashMap::new();
+        self.hash_memo(address, selector, &mut memo)
+    }
+
+    fn hash_memo<'a>(
+        &'a self,
+        address: &'a str,
+        selector: ProvenanceFlags,
+        memo: &mut HashMap<&'a str, String>,
+    ) -> Option<String> {
+        if let Some(done) = memo.get(address) {
+            return Some(done.clone());
+        }
+        let node = self.nodes.get(address)?;
+        let mut h = FnvHasher::new();
+        node.hash_own_into(selector, &mut h);
         if selector.contains(ProvenanceFlags::UPSTREAM) {
             h.write(b"upstream:");
-            for (id, up) in &self.upstream {
+            for (id, up_address) in &node.upstream {
                 h.write(id.as_bytes());
                 h.write(b":");
-                let up_hash = up.hash(selector);
+                // A closed graph always resolves; the literal address
+                // is the deterministic stand-in should it not.
+                let up_hash = self
+                    .hash_memo(up_address, selector, memo)
+                    .unwrap_or_else(|| up_address.clone());
                 h.write(up_hash.as_bytes());
                 h.write(b"\0");
             }
         }
+        let out = format!("{:016x}", h.finish());
+        memo.insert(address, out.clone());
+        Some(out)
     }
+
+    /// The addresses reachable from `roots`, roots included.
+    fn reachable_from<'a>(&self, roots: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = roots.into_iter().map(str::to_string).collect();
+        while let Some(address) = stack.pop() {
+            if !seen.insert(address.clone()) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(&address) {
+                stack.extend(node.upstream.values().cloned());
+            }
+        }
+        seen
+    }
+
+    /// The self-contained subgraph reachable from `root`.
+    pub fn reachable(&self, root: &str) -> ProvenanceGraph {
+        let keep = self.reachable_from([root]);
+        ProvenanceGraph {
+            nodes: self
+                .nodes
+                .iter()
+                .filter(|(a, _)| keep.contains(a.as_str()))
+                .map(|(a, n)| (a.clone(), n.clone()))
+                .collect(),
+        }
+    }
+
+    /// Drop every node not reachable from `roots` — the versions no
+    /// record references any more.
+    pub fn retain_reachable<'a>(&mut self, roots: impl IntoIterator<Item = &'a str>) {
+        let keep = self.reachable_from(roots);
+        self.nodes.retain(|a, _| keep.contains(a.as_str()));
+    }
+
+    /// Diff the node at `new` against the node at `old`, returning the
+    /// components whose values differ. Used by `--explain-staleness`
+    /// to tell the user *which* axes pushed a step into the stale
+    /// bucket. Upstream differences are reported by upstream id,
+    /// one level deep (the cascade is implicit — if upstream A is
+    /// stale, this step is stale, even if no other component
+    /// changed). An address the graph does not hold diffs as if every
+    /// component were absent.
+    pub fn diff(&self, new: &str, old: &str) -> Vec<ProvenanceDiff> {
+        let (Some(new), Some(old)) = (self.nodes.get(new), self.nodes.get(old)) else {
+            return vec![ProvenanceDiff::Component {
+                flag: ProvenanceFlags::STEP_ID,
+                label: "record".into(),
+                old: if self.nodes.contains_key(old) { "present".into() } else { "<absent>".into() },
+                new: if self.nodes.contains_key(new) { "present".into() } else { "<absent>".into() },
+            }];
+        };
+        let mut out = Vec::new();
+        macro_rules! check {
+            ($flag:expr, $field:ident, $label:expr) => {
+                if new.$field != old.$field {
+                    out.push(ProvenanceDiff::Component {
+                        flag: $flag,
+                        label: $label.to_string(),
+                        old: format!("{:?}", old.$field),
+                        new: format!("{:?}", new.$field),
+                    });
+                }
+            };
+        }
+        check!(ProvenanceFlags::STEP_ID, step_id, "step_id");
+        check!(ProvenanceFlags::COMMAND_PATH, command_path, "command_path");
+        check!(ProvenanceFlags::VERSION_MAJOR, binary_version_major, "binary_version_major");
+        check!(ProvenanceFlags::VERSION_MINOR, binary_version_minor, "binary_version_minor");
+        check!(ProvenanceFlags::VERSION_PATCH, binary_version_patch, "binary_version_patch");
+        check!(ProvenanceFlags::GIT_HASH, binary_git_hash, "binary_git_hash");
+        check!(ProvenanceFlags::DIRTY_FLAG, binary_dirty, "binary_dirty");
+        let opt_keys: std::collections::BTreeSet<&str> = new
+            .options
+            .keys()
+            .chain(old.options.keys())
+            .map(String::as_str)
+            .collect();
+        for k in opt_keys {
+            let n = new.options.get(k);
+            let o = old.options.get(k);
+            if n != o {
+                out.push(ProvenanceDiff::Component {
+                    flag: ProvenanceFlags::OPTIONS,
+                    label: format!("option '{k}'"),
+                    old: o.cloned().unwrap_or_else(|| "<unset>".into()),
+                    new: n.cloned().unwrap_or_else(|| "<unset>".into()),
+                });
+            }
+        }
+        let up_keys: std::collections::BTreeSet<&str> = new
+            .upstream
+            .keys()
+            .chain(old.upstream.keys())
+            .map(String::as_str)
+            .collect();
+        for k in up_keys {
+            if new.upstream.get(k) != old.upstream.get(k) {
+                out.push(ProvenanceDiff::UpstreamChanged(k.to_string()));
+            }
+        }
+        out
+    }
+
+    // ── Sidecars ────────────────────────────────────────────────────
 
     /// Path of the provenance sidecar **co-located** with a cache
     /// segment (e.g. `<cache>/run-3.slab` →
     /// `<cache>/run-3.slab.provenance.json`). Used only for
     /// intermediate cache files that already live under `.cache/` —
-    /// dataset artifacts use [`cached_sidecar_path`](Self::cached_sidecar_path)
-    /// instead so provenance never lands in the dataset storage layer.
+    /// dataset artifacts use [`cached_sidecar_path`](Self::cached_sidecar_path).
     pub fn sidecar_path(artifact: &Path) -> PathBuf {
         let mut p = artifact.as_os_str().to_os_string();
         p.push(".");
@@ -228,47 +497,56 @@ impl ProvenanceMap {
         PathBuf::from(p)
     }
 
-    /// Write this `ProvenanceMap` to `path`, creating parent dirs.
-    /// Pretty-printed JSON so the file is greppable in the field.
-    fn write_to(&self, path: &Path) -> std::io::Result<()> {
-        let body = serde_json::to_vec_pretty(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+    /// Write the subgraph reachable from `root` to `path` as a
+    /// [`ProvenanceSidecar`], creating parent dirs. Pretty-printed JSON
+    /// so the file is greppable in the field.
+    fn write_to(&self, root: &str, path: &Path) -> std::io::Result<()> {
+        let sidecar = ProvenanceSidecar {
+            root: root.to_string(),
+            nodes: self.reachable(root),
+        };
+        let body = serde_json::to_vec_pretty(&sidecar)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, body)
     }
 
-    /// Write this map as the co-located sidecar of a cache segment
-    /// (see [`sidecar_path`](Self::sidecar_path)).
-    pub fn write_sidecar(&self, artifact: &Path) -> std::io::Result<()> {
-        self.write_to(&Self::sidecar_path(artifact))
+    /// Write the provenance rooted at `root` as the co-located sidecar
+    /// of a cache segment (see [`sidecar_path`](Self::sidecar_path)).
+    pub fn write_sidecar(&self, root: &str, artifact: &Path) -> std::io::Result<()> {
+        self.write_to(root, &Self::sidecar_path(artifact))
     }
 
-    /// Write this map as the cached sidecar of a dataset artifact
-    /// (see [`cached_sidecar_path`](Self::cached_sidecar_path)).
-    pub fn write_cached_sidecar(&self, cache_dir: &Path, rel_artifact: &Path) -> std::io::Result<()> {
-        self.write_to(&Self::cached_sidecar_path(cache_dir, rel_artifact))
+    /// Write the provenance rooted at `root` as the cached sidecar of a
+    /// dataset artifact (see [`cached_sidecar_path`](Self::cached_sidecar_path)).
+    pub fn write_cached_sidecar(
+        &self,
+        root: &str,
+        cache_dir: &Path,
+        rel_artifact: &Path,
+    ) -> std::io::Result<()> {
+        self.write_to(root, &Self::cached_sidecar_path(cache_dir, rel_artifact))
+    }
+
+    fn read_from(path: &Path) -> std::io::Result<Option<ProvenanceSidecar>> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice::<ProvenanceSidecar>(&bytes)
+                .map(Some)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Read the co-located sidecar of a cache segment. Returns
     /// `Ok(None)` if absent — consumers should fall back to
-    /// [`degenerate_from_artifact`](Self::degenerate_from_artifact)
-    /// so hand-curated or pre-existing files still cascade *something*
-    /// into the consumer's hash.
-    pub fn read_sidecar(artifact: &Path) -> std::io::Result<Option<Self>> {
-        let path = Self::sidecar_path(artifact);
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                let parsed: Self = serde_json::from_slice(&bytes).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                })?;
-                Ok(Some(parsed))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
+    /// [`ProvenanceNode::degenerate_from_artifact`] so hand-curated or
+    /// pre-existing files still cascade *something* into the
+    /// consumer's hash.
+    pub fn read_sidecar(artifact: &Path) -> std::io::Result<Option<ProvenanceSidecar>> {
+        Self::read_from(&Self::sidecar_path(artifact))
     }
 
     /// Read the cached sidecar of a dataset artifact (the counterpart of
@@ -277,148 +555,62 @@ impl ProvenanceMap {
     pub fn read_cached_sidecar(
         cache_dir: &Path,
         rel_artifact: &Path,
-    ) -> std::io::Result<Option<Self>> {
-        match std::fs::read(Self::cached_sidecar_path(cache_dir, rel_artifact)) {
-            Ok(bytes) => {
-                let parsed: Self = serde_json::from_slice(&bytes).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                })?;
-                Ok(Some(parsed))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
+    ) -> std::io::Result<Option<ProvenanceSidecar>> {
+        Self::read_from(&Self::cached_sidecar_path(cache_dir, rel_artifact))
     }
 
-    /// Resolve the provenance of an input artifact for an upstream
-    /// cascade, checking both sidecar homes before degrading: the
-    /// cached (relocated) sidecar of a dataset artifact, then the
-    /// co-located sidecar of a cache segment, then a degenerate
-    /// `(path, size, mtime)` map from the file itself. `workspace` is
-    /// the dataset root used to derive the artifact's relative path.
-    pub fn for_input(cache_dir: &Path, workspace: &Path, artifact: &Path) -> std::io::Result<Self> {
+    /// Take the provenance of an input artifact into this graph for an
+    /// upstream cascade and return its address, checking both sidecar
+    /// homes before degrading: the cached (relocated) sidecar of a
+    /// dataset artifact, then the co-located sidecar of a cache
+    /// segment, then a degenerate `(path, size, mtime)` node from the
+    /// file itself. `workspace` is the dataset root used to derive the
+    /// artifact's relative path.
+    pub fn for_input(
+        &mut self,
+        cache_dir: &Path,
+        workspace: &Path,
+        artifact: &Path,
+    ) -> std::io::Result<Address> {
         let rel = artifact.strip_prefix(workspace).unwrap_or(artifact);
-        if let Some(p) = Self::read_cached_sidecar(cache_dir, rel)? {
-            return Ok(p);
+        if let Some(sidecar) = Self::read_cached_sidecar(cache_dir, rel)? {
+            return Ok(sidecar.absorb_into(self));
         }
-        if let Some(p) = Self::read_sidecar(artifact)? {
-            return Ok(p);
+        if let Some(sidecar) = Self::read_sidecar(artifact)? {
+            return Ok(sidecar.absorb_into(self));
         }
-        Self::degenerate_from_artifact(artifact)
-    }
-
-    /// Build a degenerate `ProvenanceMap` from a file's path, size,
-    /// and mtime when no sidecar is available. The cascade is
-    /// weaker here — two files with identical size/mtime collide —
-    /// but it preserves the *cheap and sticky* contract: an
-    /// overwrite, regenerate, or touch invalidates downstream
-    /// caches without ever reading the file's content.
-    ///
-    /// The resulting map has empty `binary_*` and `upstream` fields;
-    /// its load-bearing distinguishers are the path and the file
-    /// metadata, recorded under `options`. The synthetic step id
-    /// `degenerate:<filename>` makes it clear in `diff` output that
-    /// this entry didn't come from an upstream pipeline step.
-    pub fn degenerate_from_artifact(artifact: &Path) -> std::io::Result<Self> {
-        let meta = std::fs::metadata(artifact)?;
-        let size = meta.len();
-        // `mtime` only — `ctime`/`atime` swing too much to be a
-        // stable cache signal. The literal seconds + nanos make a
-        // string that diff prints cleanly.
-        let mtime = meta.modified().ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
-            .unwrap_or_else(|| "0".to_string());
-        let name = artifact.file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
-        let mut options: BTreeMap<String, String> = BTreeMap::new();
-        options.insert("path".into(), artifact.to_string_lossy().into_owned());
-        options.insert("size".into(), size.to_string());
-        options.insert("mtime".into(), mtime);
-        Ok(ProvenanceMap {
-            step_id: format!("degenerate:{name}"),
-            command_path: "degenerate".into(),
-            binary_version_major: 0,
-            binary_version_minor: 0,
-            binary_version_patch: 0,
-            binary_git_hash: String::new(),
-            binary_dirty: false,
-            options,
-            upstream: BTreeMap::new(),
-        })
-    }
-
-    /// Diff two provenance maps, returning the set of components
-    /// whose values differ. Used by `--explain-staleness` to tell
-    /// the user *which* axes pushed a step into the stale bucket.
-    /// Upstream differences are reported by upstream id, recursing
-    /// only one level (the cascade is implicit — if upstream A is
-    /// stale, this step is stale, even if no other component
-    /// changed).
-    pub fn diff(&self, other: &ProvenanceMap) -> Vec<ProvenanceDiff> {
-        let mut out = Vec::new();
-        macro_rules! check {
-            ($flag:expr, $field:ident, $label:expr) => {
-                if self.$field != other.$field {
-                    out.push(ProvenanceDiff::Component {
-                        flag: $flag,
-                        label: $label.to_string(),
-                        old: format!("{:?}", other.$field),
-                        new: format!("{:?}", self.$field),
-                    });
-                }
-            };
-        }
-        check!(ProvenanceFlags::STEP_ID, step_id, "step_id");
-        check!(ProvenanceFlags::COMMAND_PATH, command_path, "command_path");
-        check!(ProvenanceFlags::VERSION_MAJOR, binary_version_major, "binary_version_major");
-        check!(ProvenanceFlags::VERSION_MINOR, binary_version_minor, "binary_version_minor");
-        check!(ProvenanceFlags::VERSION_PATCH, binary_version_patch, "binary_version_patch");
-        check!(ProvenanceFlags::GIT_HASH, binary_git_hash, "binary_git_hash");
-        check!(ProvenanceFlags::DIRTY_FLAG, binary_dirty, "binary_dirty");
-
-        // Per-option diff.
-        let mut opt_keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        for k in self.options.keys() { opt_keys.insert(k.as_str()); }
-        for k in other.options.keys() { opt_keys.insert(k.as_str()); }
-        for k in opt_keys {
-            let new = self.options.get(k);
-            let old = other.options.get(k);
-            if new != old {
-                out.push(ProvenanceDiff::Component {
-                    flag: ProvenanceFlags::OPTIONS,
-                    label: format!("option '{k}'"),
-                    old: old.cloned().unwrap_or_else(|| "<unset>".into()),
-                    new: new.cloned().unwrap_or_else(|| "<unset>".into()),
-                });
-            }
-        }
-
-        // Per-upstream diff (one level).
-        let mut up_keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        for k in self.upstream.keys() { up_keys.insert(k.as_str()); }
-        for k in other.upstream.keys() { up_keys.insert(k.as_str()); }
-        for k in up_keys {
-            let new = self.upstream.get(k);
-            let old = other.upstream.get(k);
-            match (new, old) {
-                (Some(n), Some(o)) if n == o => {}
-                (None, None) => {}
-                _ => {
-                    out.push(ProvenanceDiff::UpstreamChanged(k.to_string()));
-                }
-            }
-        }
-        out
+        let node = ProvenanceNode::degenerate_from_artifact(artifact)?;
+        self.insert(node)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
 
-/// One axis of difference between two `ProvenanceMap`s.
+/// A sidecar: the provenance of one artifact, self-contained — the
+/// address of its node and every node that address reaches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvenanceSidecar {
+    pub root: Address,
+    pub nodes: ProvenanceGraph,
+}
+
+impl ProvenanceSidecar {
+    /// Join the sidecar's nodes to `graph` and return the root address.
+    pub fn absorb_into(self, graph: &mut ProvenanceGraph) -> Address {
+        graph.absorb(&self.nodes);
+        self.root
+    }
+}
+
+/// One axis of difference between two provenance nodes.
 #[derive(Debug, Clone)]
 pub enum ProvenanceDiff {
     /// A specific component diverged (version, an option, etc.).
-    Component { flag: ProvenanceFlags, label: String, old: String, new: String },
+    Component {
+        flag: ProvenanceFlags,
+        label: String,
+        old: String,
+        new: String,
+    },
     /// An upstream step's provenance changed (likely because that
     /// upstream re-ran or its own provenance shifted).
     UpstreamChanged(String),
@@ -439,9 +631,8 @@ impl std::fmt::Display for ProvenanceDiff {
 
 /// Bitset selecting which provenance components contribute to the
 /// staleness hash. Use the `STRICT`, `VERSION_AWARE`, `CONFIG_ONLY`
-/// constants for typical configurations, or build a custom set with
-/// `from_components`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// presets or compose from the individual flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProvenanceFlags(u32);
 
 impl ProvenanceFlags {
@@ -457,7 +648,7 @@ impl ProvenanceFlags {
 
     pub const fn empty() -> Self { Self(0) }
 
-    /// Strict / current v4 behaviour: every component.
+    /// Strict: every component.
     pub const STRICT: Self = Self(
         Self::STEP_ID.0 | Self::COMMAND_PATH.0
             | Self::VERSION_MAJOR.0 | Self::VERSION_MINOR.0 | Self::VERSION_PATCH.0
@@ -563,7 +754,7 @@ impl Default for ProvenanceFlags {
 /// [`super::command::CommandOp::build_version`]'s
 /// `{CARGO_PKG_VERSION}+{git_short}[+dirty]` format. Never fails —
 /// missing components default to zero / empty / false so an
-/// unrecognised string still produces a usable map.
+/// unrecognised string still produces a usable node.
 #[derive(Debug, Clone, Default)]
 pub struct BinaryVersion {
     pub major: u32,
@@ -599,21 +790,33 @@ impl BinaryVersion {
 mod tests {
     use super::*;
 
-    fn opts() -> std::collections::HashMap<String, String> {
-        let mut m = std::collections::HashMap::new();
+    fn opts() -> HashMap<String, String> {
+        let mut m = HashMap::new();
         m.insert("k".into(), "100".into());
         m.insert("metric".into(), "L2".into());
         m
     }
 
-    fn make_map(version: &str, opts_in: std::collections::HashMap<String, String>) -> ProvenanceMap {
-        ProvenanceMap::build(
+    fn node(version: &str, opts_in: HashMap<String, String>) -> ProvenanceNode {
+        ProvenanceNode::build(
             "compute-knn",
             "compute knn",
             &BinaryVersion::parse(version),
             &opts_in,
             BTreeMap::new(),
         )
+    }
+
+    /// A graph holding one node; returns the graph and the address.
+    fn single(version: &str, opts_in: HashMap<String, String>) -> (ProvenanceGraph, Address) {
+        let mut g = ProvenanceGraph::new();
+        let a = g.insert(node(version, opts_in)).unwrap();
+        (g, a)
+    }
+
+    fn hash_of(version: &str, opts_in: HashMap<String, String>, sel: ProvenanceFlags) -> String {
+        let (g, a) = single(version, opts_in);
+        g.hash(&a, sel).unwrap()
     }
 
     #[test]
@@ -660,103 +863,147 @@ mod tests {
         assert!(err.contains("bogus"));
     }
 
+    /// An address is the strict hash, so hashing under STRICT returns
+    /// the address itself — the property the cache keys rely on.
+    #[test]
+    fn the_address_is_the_strict_hash() {
+        let (g, a) = single("1.0.1+abcd1234", opts());
+        assert_eq!(g.hash(&a, ProvenanceFlags::STRICT).unwrap(), a);
+        assert_eq!(g.get(&a).unwrap().address(), a);
+    }
+
     #[test]
     fn version_bump_stale_under_strict_fresh_under_config_only() {
-        let a = make_map("1.0.1+abcd1234", opts());
-        let b = make_map("0.25.0+ffff0000", opts());
-
-        // Strict: differs (binary version + git differ).
-        assert_ne!(a.hash(ProvenanceFlags::STRICT), b.hash(ProvenanceFlags::STRICT));
-
-        // Config-only: same (only options + identity matter).
+        let a = "1.0.1+abcd1234";
+        let b = "0.25.0+ffff0000";
+        assert_ne!(hash_of(a, opts(), ProvenanceFlags::STRICT), hash_of(b, opts(), ProvenanceFlags::STRICT));
         assert_eq!(
-            a.hash(ProvenanceFlags::CONFIG_ONLY),
-            b.hash(ProvenanceFlags::CONFIG_ONLY),
+            hash_of(a, opts(), ProvenanceFlags::CONFIG_ONLY),
+            hash_of(b, opts(), ProvenanceFlags::CONFIG_ONLY),
             "binary version change must not invalidate under CONFIG_ONLY"
         );
     }
 
     #[test]
     fn major_bump_invalidates_under_version_aware_minor_does_not() {
-        let a = make_map("1.0.1+abcd", opts());
-        let b = make_map("2.0.0+abcd", opts());
-        let c = make_map("1.5.7+abcd", opts());
-
-        // Major bump: stale under VERSION_AWARE.
-        assert_ne!(a.hash(ProvenanceFlags::VERSION_AWARE),
-                   b.hash(ProvenanceFlags::VERSION_AWARE));
-        // Minor bump: still fresh under VERSION_AWARE.
-        assert_eq!(a.hash(ProvenanceFlags::VERSION_AWARE),
-                   c.hash(ProvenanceFlags::VERSION_AWARE),
-                   "minor-version bump must not invalidate under VERSION_AWARE");
+        let sel = ProvenanceFlags::VERSION_AWARE;
+        assert_ne!(hash_of("1.0.1+abcd", opts(), sel), hash_of("2.0.0+abcd", opts(), sel));
+        assert_eq!(
+            hash_of("1.0.1+abcd", opts(), sel),
+            hash_of("1.5.7+abcd", opts(), sel),
+            "minor-version bump must not invalidate under VERSION_AWARE"
+        );
     }
 
     #[test]
     fn options_change_invalidates_everywhere() {
         let mut o2 = opts();
         o2.insert("k".into(), "200".into());
-        let a = make_map("1.0.1+abcd", opts());
-        let b = make_map("1.0.1+abcd", o2);
-        assert_ne!(a.hash(ProvenanceFlags::CONFIG_ONLY), b.hash(ProvenanceFlags::CONFIG_ONLY));
-        assert_ne!(a.hash(ProvenanceFlags::STRICT), b.hash(ProvenanceFlags::STRICT));
+        assert_ne!(hash_of("1.0.1+abcd", opts(), ProvenanceFlags::CONFIG_ONLY), hash_of("1.0.1+abcd", o2.clone(), ProvenanceFlags::CONFIG_ONLY));
+        assert_ne!(hash_of("1.0.1+abcd", opts(), ProvenanceFlags::STRICT), hash_of("1.0.1+abcd", o2, ProvenanceFlags::STRICT));
     }
 
+    /// Two heads built on two versions of one upstream: the selector
+    /// that includes UPSTREAM tells them apart, the one that drops it
+    /// does not.
     #[test]
     fn upstream_change_cascades_under_upstream_flag() {
-        let mut up_a = ProvenanceMap::build(
-            "extract", "transform extract", &BinaryVersion::parse("1.0.0+abcd"),
-            &opts(), BTreeMap::new(),
+        let mut g = ProvenanceGraph::new();
+        let up_v1 = g
+            .insert(ProvenanceNode::build("extract", "transform extract", &BinaryVersion::parse("1.0.0+abcd"), &opts(), BTreeMap::new()))
+            .unwrap();
+        let up_v2 = g
+            .insert(ProvenanceNode::build("extract", "transform extract", &BinaryVersion::parse("2.0.0+abcd"), &opts(), BTreeMap::new()))
+            .unwrap();
+        assert_ne!(up_v1, up_v2);
+        let head = |g: &mut ProvenanceGraph, up: &str| {
+            g.insert(ProvenanceNode::build(
+                "knn", "compute knn", &BinaryVersion::parse("1.0.0+abcd"), &opts(),
+                BTreeMap::from([("extract".to_string(), up.to_string())]),
+            )).unwrap()
+        };
+        let head_a = head(&mut g, &up_v1);
+        let head_b = head(&mut g, &up_v2);
+        assert_ne!(
+            g.hash(&head_a, ProvenanceFlags::VERSION_AWARE).unwrap(),
+            g.hash(&head_b, ProvenanceFlags::VERSION_AWARE).unwrap(),
+            "upstream version change must cascade to head"
         );
-        let up_b = up_a.clone();
-        up_a.binary_version_major = 1;
-        let mut a_upstreams = BTreeMap::new();
-        a_upstreams.insert("extract".to_string(), up_a);
-        let mut b_upstreams = BTreeMap::new();
-        let mut up_b_changed = up_b.clone();
-        up_b_changed.binary_version_major = 2;
-        b_upstreams.insert("extract".to_string(), up_b_changed);
-
-        let head_a = ProvenanceMap::build(
-            "knn", "compute knn", &BinaryVersion::parse("1.0.0+abcd"),
-            &opts(), a_upstreams,
-        );
-        let head_b = ProvenanceMap::build(
-            "knn", "compute knn", &BinaryVersion::parse("1.0.0+abcd"),
-            &opts(), b_upstreams,
-        );
-
-        // Upstream's major changed; under VERSION_AWARE+UPSTREAM
-        // (which VERSION_AWARE preset includes) the head should be
-        // stale because the upstream's contribution differs.
-        assert_ne!(head_a.hash(ProvenanceFlags::VERSION_AWARE),
-                   head_b.hash(ProvenanceFlags::VERSION_AWARE),
-                   "upstream version change must cascade to head");
-
-        // If we drop UPSTREAM from the selector, the head's own
-        // components are identical → fresh.
         let no_up = ProvenanceFlags(ProvenanceFlags::CONFIG_ONLY.0 & !ProvenanceFlags::UPSTREAM.0);
-        assert_eq!(head_a.hash(no_up), head_b.hash(no_up));
+        assert_eq!(g.hash(&head_a, no_up).unwrap(), g.hash(&head_b, no_up).unwrap());
+        // Under CONFIG_ONLY the upstream's version is ignored all the
+        // way down, so the two heads agree: the relaxation cascades.
+        assert_eq!(
+            g.hash(&head_a, ProvenanceFlags::CONFIG_ONLY).unwrap(),
+            g.hash(&head_b, ProvenanceFlags::CONFIG_ONLY).unwrap(),
+        );
+        assert_eq!(g.len(), 4, "both versions of the upstream stay while heads reference them");
     }
 
-    /// Sidecar round-trip — write to disk next to an artifact,
-    /// read back from disk, recover an identical map. The cache
-    /// layer's upstream cascade depends on this.
+    /// The graph is closed: a node naming an address it does not hold
+    /// is refused.
+    #[test]
+    fn insert_refuses_a_dangling_upstream() {
+        let mut g = ProvenanceGraph::new();
+        let err = g
+            .insert(ProvenanceNode::build(
+                "knn", "compute knn", &BinaryVersion::parse("1.0.0+abcd"), &opts(),
+                BTreeMap::from([("extract".to_string(), "deadbeefdeadbeef".to_string())]),
+            ))
+            .unwrap_err();
+        assert!(err.contains("deadbeefdeadbeef"), "{err}");
+        assert!(g.is_empty());
+    }
+
+    /// A chain of 400 steps hashes in linear time with a shared subtree
+    /// stored once, and pruning keeps what a root reaches.
+    #[test]
+    fn a_long_chain_is_linear_and_prunable() {
+        let mut g = ProvenanceGraph::new();
+        let binary = BinaryVersion::parse("1.2.3+abc");
+        let mut prev: Option<Address> = None;
+        let mut addresses = Vec::new();
+        for i in 0..400 {
+            let mut up = BTreeMap::new();
+            if let Some(p) = prev.take() {
+                up.insert(format!("s{}", i - 1), p);
+            }
+            let a = g.insert(ProvenanceNode::build(&format!("s{i}"), "compute x", &binary, &opts(), up)).unwrap();
+            addresses.push(a.clone());
+            prev = Some(a);
+        }
+        let head = addresses.last().unwrap();
+        assert_eq!(g.len(), 400);
+        assert_eq!(g.hash(head, ProvenanceFlags::STRICT).unwrap(), *head);
+        assert!(g.hash(head, ProvenanceFlags::CONFIG_ONLY).is_some());
+        assert_eq!(g.reachable(&addresses[9]).len(), 10);
+        g.retain_reachable([addresses[199].as_str()]);
+        assert_eq!(g.len(), 200);
+    }
+
+    /// Sidecar round-trip — write beside an artifact, read back, the
+    /// root and every node it reaches come back. The cache layer's
+    /// upstream cascade depends on this.
     #[test]
     fn sidecar_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let artifact = tmp.path().join("preds.slab");
         std::fs::write(&artifact, b"placeholder").unwrap();
-        let original = make_map("1.0.0+abcd", opts());
-        original.write_sidecar(&artifact).unwrap();
-
-        // Sidecar lives at exactly the expected path.
-        let sidecar = ProvenanceMap::sidecar_path(&artifact);
-        assert!(sidecar.exists(), "sidecar must be written at <artifact>.provenance.json");
-
-        let recovered = ProvenanceMap::read_sidecar(&artifact).unwrap()
-            .expect("sidecar should be readable");
-        assert_eq!(recovered.hash(ProvenanceFlags::STRICT),
-                   original.hash(ProvenanceFlags::STRICT));
+        let mut g = ProvenanceGraph::new();
+        let base = g.insert(node("1.0.0+abcd", opts())).unwrap();
+        let head = g
+            .insert(ProvenanceNode::build("keys", "compute keys", &BinaryVersion::parse("1.0.0+abcd"), &opts(), BTreeMap::from([("source".to_string(), base.clone())])))
+            .unwrap();
+        g.write_sidecar(&head, &artifact).unwrap();
+        let sidecar_path = ProvenanceGraph::sidecar_path(&artifact);
+        assert!(sidecar_path.exists(), "sidecar must be written at <artifact>.provenance.json");
+        let sidecar = ProvenanceGraph::read_sidecar(&artifact).unwrap().expect("sidecar should be readable");
+        assert_eq!(sidecar.root, head);
+        assert_eq!(sidecar.nodes.len(), 2);
+        let mut other = ProvenanceGraph::new();
+        let root = sidecar.absorb_into(&mut other);
+        assert_eq!(other.hash(&root, ProvenanceFlags::STRICT).unwrap(), head);
+        assert_eq!(other.hash(&root, ProvenanceFlags::CONFIG_ONLY), g.hash(&head, ProvenanceFlags::CONFIG_ONLY));
     }
 
     /// Missing sidecar is `Ok(None)`, not an error — lets consumers
@@ -768,32 +1015,42 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let artifact = tmp.path().join("preds.slab");
         std::fs::write(&artifact, b"placeholder").unwrap();
-        let result = ProvenanceMap::read_sidecar(&artifact).unwrap();
-        assert!(result.is_none(), "absent sidecar must surface as Ok(None)");
+        assert!(ProvenanceGraph::read_sidecar(&artifact).unwrap().is_none(), "absent sidecar must surface as Ok(None)");
     }
 
     /// Degenerate provenance captures path/size/mtime so two
     /// different files at the same path with different sizes
-    /// produce different hashes.
+    /// produce different addresses; `for_input` takes that route when
+    /// no sidecar exists and the sidecar route when one does.
     #[test]
-    fn degenerate_from_artifact_distinguishes_by_size() {
+    fn for_input_prefers_a_sidecar_and_degrades_to_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.slab");
         let b = tmp.path().join("b.slab");
         std::fs::write(&a, b"short").unwrap();
         std::fs::write(&b, b"a much longer payload, surely different size").unwrap();
-        let pa = ProvenanceMap::degenerate_from_artifact(&a).unwrap();
-        let pb = ProvenanceMap::degenerate_from_artifact(&b).unwrap();
-        assert_ne!(pa.hash(ProvenanceFlags::STRICT),
-                   pb.hash(ProvenanceFlags::STRICT),
-                   "different files should produce different degenerate provenances");
+        let pa = ProvenanceNode::degenerate_from_artifact(&a).unwrap();
+        let pb = ProvenanceNode::degenerate_from_artifact(&b).unwrap();
+        assert_ne!(pa.address(), pb.address(), "different files should produce different degenerate provenances");
+
+        let mut g = ProvenanceGraph::new();
+        let from_file = g.for_input(tmp.path(), tmp.path(), &a).unwrap();
+        assert_eq!(from_file, pa.address());
+        // Now give `a` a sidecar: the producer's node wins over the file.
+        let mut producer = ProvenanceGraph::new();
+        let root = producer.insert(node("1.0.0+abcd", opts())).unwrap();
+        producer.write_sidecar(&root, &a).unwrap();
+        let from_sidecar = g.for_input(tmp.path(), tmp.path(), &a).unwrap();
+        assert_eq!(from_sidecar, root);
+        assert!(g.contains(&root));
     }
 
     #[test]
     fn diff_reports_changed_components() {
-        let a = make_map("1.0.1+abcd", opts());
-        let b = make_map("2.0.0+ffff", opts());
-        let diffs = a.diff(&b);
+        let mut g = ProvenanceGraph::new();
+        let a = g.insert(node("1.0.1+abcd", opts())).unwrap();
+        let b = g.insert(node("2.0.0+ffff", opts())).unwrap();
+        let diffs = g.diff(&a, &b);
         let labels: Vec<String> = diffs.iter().map(|d| match d {
             ProvenanceDiff::Component { label, .. } => label.clone(),
             ProvenanceDiff::UpstreamChanged(id) => format!("upstream:{id}"),
@@ -801,7 +1058,6 @@ mod tests {
         assert!(labels.iter().any(|l| l == "binary_version_major"));
         assert!(labels.iter().any(|l| l == "binary_git_hash"));
     }
-
 
     /// **The default ignores the binary version.** Rebuilding the tool
     /// must not invalidate completed steps: a dataset whose base facet
@@ -819,8 +1075,6 @@ mod tests {
         ] {
             assert!(!ProvenanceFlags::DEFAULT.contains(ignored));
         }
-        // What it does still consult: the step's own identity, its
-        // options, and its upstreams.
         for consulted in [
             ProvenanceFlags::STEP_ID,
             ProvenanceFlags::COMMAND_PATH,
@@ -858,17 +1112,14 @@ mod tests {
     /// stale under `strict` — the behaviour change this default is.
     #[test]
     fn a_rebuild_is_fresh_by_default_and_stale_under_strict() {
-        let before = make_map("2.0.0+aaaaaaaa", opts());
-        let after = make_map("2.0.1+bbbbbbbb", opts());
-
         assert_eq!(
-            before.hash(ProvenanceFlags::DEFAULT),
-            after.hash(ProvenanceFlags::DEFAULT),
+            hash_of("2.0.0+aaaaaaaa", opts(), ProvenanceFlags::DEFAULT),
+            hash_of("2.0.1+bbbbbbbb", opts(), ProvenanceFlags::DEFAULT),
             "a rebuild must not invalidate a completed step"
         );
         assert_ne!(
-            before.hash(ProvenanceFlags::STRICT),
-            after.hash(ProvenanceFlags::STRICT),
+            hash_of("2.0.0+aaaaaaaa", opts(), ProvenanceFlags::STRICT),
+            hash_of("2.0.1+bbbbbbbb", opts(), ProvenanceFlags::STRICT),
             "strict still notices, for callers that ask for it"
         );
     }
@@ -878,11 +1129,9 @@ mod tests {
     fn a_changed_option_is_still_stale_by_default() {
         let mut other = opts();
         other.insert("range".to_string(), "[0,999)".to_string());
-        let before = make_map("2.0.0+aaaaaaaa", opts());
-        let after = make_map("2.0.0+aaaaaaaa", other);
         assert_ne!(
-            before.hash(ProvenanceFlags::DEFAULT),
-            after.hash(ProvenanceFlags::DEFAULT),
+            hash_of("2.0.0+aaaaaaaa", opts(), ProvenanceFlags::DEFAULT),
+            hash_of("2.0.0+aaaaaaaa", other, ProvenanceFlags::DEFAULT),
         );
     }
 }

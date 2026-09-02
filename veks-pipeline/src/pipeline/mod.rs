@@ -696,6 +696,22 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
     if let Some(msg) = schema_msg {
         println!("{}", msg);
     }
+    // A migrated log is written back at once, so the on-disk file and
+    // every sidecar are in the current form before any step runs — and
+    // so a dry run leaves the workspace loadable by `veks check`.
+    if progress.migrated_from().is_some() {
+        match progress.save() {
+            Ok(()) => {
+                let refreshed = progress.rewrite_sidecars();
+                println!(
+                    "  progress log rewritten at {}; sidecars refreshed for {} step record(s)",
+                    progress_path.display(),
+                    refreshed,
+                );
+            }
+            Err(e) => println!("Warning: failed to save the migrated progress log: {}", e),
+        }
+    }
 
     // Invalidation is now per-step via fingerprint chains (computed in
     // the runner). No whole-log invalidation needed — changing a step's
@@ -1215,13 +1231,13 @@ fn explain_staleness(
     );
     println!();
 
-    // Build a snapshot of the resolved options + command path for each
-    // step up front. We need them for two reasons: (1) to compute each
-    // step's own current provenance, and (2) so an upstream's *current*
-    // provenance is in scope when computing a downstream's — letting
-    // the user see what would happen if every upstream re-ran exactly
-    // as currently configured.
-    let mut current_provenances: std::collections::HashMap<String, provenance::ProvenanceMap> =
+    // Current nodes are built into a copy of the log's graph, so an
+    // upstream's *current* node is in scope when computing a
+    // downstream's — letting the user see what would happen if every
+    // upstream re-ran exactly as currently configured — without the
+    // walk touching the log itself.
+    let mut graph = ctx.progress.provenance.clone();
+    let mut current_addresses: std::collections::HashMap<String, provenance::Address> =
         std::collections::HashMap::new();
     let mut fresh_count = 0usize;
     let mut stale_count = 0usize;
@@ -1253,39 +1269,50 @@ fn explain_staleness(
         let cmd = factory();
         let cmd_build_version = cmd.build_version().to_string();
 
-        // Build current provenance the same way runner.rs does, but
-        // pull upstream maps from the in-flight `current_provenances`
+        // Build the current node the same way runner.rs does, but take
+        // upstream addresses from the in-flight `current_addresses`
         // when present so the diff reflects the planned re-run order.
         let upstream_ids: Vec<&str> = step.def.after.iter().map(|s| s.as_str()).collect();
-        let mut upstream_maps: std::collections::BTreeMap<String, provenance::ProvenanceMap> =
+        let mut upstream: std::collections::BTreeMap<String, provenance::Address> =
             std::collections::BTreeMap::new();
         for up in &upstream_ids {
-            if let Some(p) = current_provenances.get(*up) {
-                upstream_maps.insert((*up).to_string(), p.clone());
-            } else if let Some(rec) = ctx.progress.get_step(up)
-                && let Some(p) = rec.provenance.clone()
+            let address = if let Some(a) = current_addresses.get(*up) {
+                a.clone()
+            } else if let Some(a) = ctx
+                .progress
+                .get_step(up)
+                .and_then(|rec| rec.provenance.clone())
+                .filter(|a| graph.contains(a))
             {
-                upstream_maps.insert((*up).to_string(), p);
-            }
+                a
+            } else {
+                graph
+                    .insert(provenance::ProvenanceNode::unknown(up))
+                    .expect("a node without upstreams always inserts")
+            };
+            upstream.insert((*up).to_string(), address);
         }
         let binary = provenance::BinaryVersion::parse(&cmd_build_version);
-        let current = provenance::ProvenanceMap::build(
-            &step.id, &step.def.run, &binary, &resolved_map, upstream_maps,
-        );
-
-        let stored = ctx.progress.get_step(&step.id).and_then(|r| r.provenance.as_ref());
+        let current = graph
+            .insert(provenance::ProvenanceNode::build(
+                &step.id, &step.def.run, &binary, &resolved_map, upstream,
+            ))
+            .expect("every upstream address was just taken from or put into this graph");
+        current_addresses.insert(step.id.clone(), current.clone());
+        let stored = ctx.progress.get_step(&step.id).and_then(|r| r.provenance.as_deref());
         match stored {
             None => {
                 println!("  {} {} — STALE (no prior record)", term::warn("●"), step.id);
                 stale_count += 1;
             }
             Some(stored) => {
-                if stored.hash(selector) == current.hash(selector) {
+                let stored_hash = graph.hash(stored, selector);
+                if stored_hash.is_some() && stored_hash == graph.hash(&current, selector) {
                     println!("  {} {} — fresh", term::ok("✓"), step.id);
                     fresh_count += 1;
                 } else {
                     println!("  {} {} — STALE", term::warn("●"), step.id);
-                    let diffs = current.diff(stored);
+                    let diffs = graph.diff(&current, stored);
                     let shown = diffs.iter().take(8);
                     for d in shown {
                         println!("      {}", d);
@@ -1298,7 +1325,6 @@ fn explain_staleness(
             }
         }
 
-        current_provenances.insert(step.id.clone(), current);
     }
 
     println!();

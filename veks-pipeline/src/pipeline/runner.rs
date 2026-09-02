@@ -58,7 +58,7 @@ use super::command::{ArtifactState, CommandResult, Options, Status, StreamContex
 use super::dag::ResolvedStep;
 use super::interpolate;
 use super::progress::{OutputRecord, ResourceSummary, StepRecord};
-use super::provenance::ProvenanceMap;
+use super::provenance::Address;
 use super::registry::CommandRegistry;
 use super::schema::OnPartial;
 
@@ -181,11 +181,11 @@ pub fn run_steps(
 
         // 3. Build the structured provenance for this step.
         //    Captures identity, decomposed binary version, resolved
-        //    options, and the recursive provenance maps of every
-        //    upstream step. Staleness is decided by hashing this map
-        //    under the runtime-selected `ProvenanceFlags` selector;
-        //    storing the full structure lets us compare under a
-        //    different selector on a later run without re-execution.
+        //    options, and the address of every upstream step's node.
+        //    Staleness is decided by hashing the node under the
+        //    runtime-selected `ProvenanceFlags` selector; storing the
+        //    full node lets us compare under a different selector on a
+        //    later run without re-execution.
         let upstream_ids: Vec<&str> = step.def.after.iter()
             .map(|s| s.as_str())
             .collect();
@@ -825,7 +825,7 @@ fn step_record_from_result(
     result: &CommandResult,
     resolved_opts: &indexmap::IndexMap<String, String>,
     resource_summary: Option<ResourceSummary>,
-    provenance: Option<ProvenanceMap>,
+    provenance: Option<Address>,
 ) -> StepRecord {
     let outputs: Vec<OutputRecord> = result
         .produced

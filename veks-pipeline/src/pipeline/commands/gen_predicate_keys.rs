@@ -281,12 +281,12 @@ struct SegmentInfo {
     cached: bool,
 }
 
-/// Build a `ProvenanceMap` for this run, suitable for cache
-/// keying. Captures binary version, resolved options, and the
-/// upstream cascade — for each input artifact listed in
-/// `inputs`, looks for a sidecar (written by the producing step)
-/// and falls back to a degenerate `(path, size, mtime)` map when
-/// none exists.
+/// Build the provenance of this run, suitable for cache keying:
+/// a graph holding the run's node and everything it reaches, and the
+/// node's address. Captures binary version, resolved options, and the
+/// upstream cascade — for each input artifact listed in `inputs`,
+/// looks for a sidecar (written by the producing step) and falls back
+/// to a degenerate `(path, size, mtime)` node when none exists.
 ///
 /// `inputs` is a slice of `(role_name, artifact_path)` pairs; the
 /// role name keys the entry in `upstream` so the diff output
@@ -298,25 +298,29 @@ fn build_run_provenance(
     cache_dir: &Path,
     workspace: &Path,
     inputs: &[(&str, &Path)],
-) -> crate::pipeline::provenance::ProvenanceMap {
-    use crate::pipeline::provenance::{BinaryVersion, ProvenanceMap};
+) -> (crate::pipeline::provenance::ProvenanceGraph, crate::pipeline::provenance::Address) {
+    use crate::pipeline::provenance::{BinaryVersion, ProvenanceGraph, ProvenanceNode};
     let binary = BinaryVersion::parse(build_version);
-    let mut upstream: std::collections::BTreeMap<String, ProvenanceMap> =
+    let mut graph = ProvenanceGraph::new();
+    let mut upstream: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for (role, path) in inputs {
         // Sidecar first — that's the strong signal (full producer
         // lineage), checked at both its cached and co-located homes;
         // degenerate fallback covers hand-curated files that pre-date
         // the convention. A missing file → caller surfaces it later.
-        let Ok(entry) = ProvenanceMap::for_input(cache_dir, workspace, path) else {
+        let Ok(address) = graph.for_input(cache_dir, workspace, path) else {
             continue;
         };
-        upstream.insert((*role).to_string(), entry);
+        upstream.insert((*role).to_string(), address);
     }
     let opts_map: std::collections::HashMap<String, String> =
         options.0.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let step_id = options.get("id").unwrap_or(command_path);
-    ProvenanceMap::build(step_id, command_path, &binary, &opts_map, upstream)
+    let root = graph
+        .insert(ProvenanceNode::build(step_id, command_path, &binary, &opts_map, upstream))
+        .expect("every input was just absorbed into this graph");
+    (graph, root)
 }
 
 /// Plan segments at exact `segment_size` ordinal boundaries.
@@ -326,8 +330,8 @@ fn build_run_provenance(
 /// both adjacent segments; the scan loop filters records to the segment's
 /// ordinal range.
 ///
-/// `cache_prefix` is the provenance hash for this run (computed via
-/// [`ProvenanceMap::hash(STRICT)`](crate::pipeline::provenance::ProvenanceMap::hash))
+/// `cache_prefix` is the provenance address for this run (its hash
+/// under `STRICT`, see [`ProvenanceNode::address`](crate::pipeline::provenance::ProvenanceNode::address))
 /// — it encodes the binary version, resolved options, and the
 /// upstream cascade of the source / predicate inputs. Two runs whose
 /// (eval semantics, options, input identity) tuples differ will
@@ -344,7 +348,7 @@ fn plan_segments(
     segment_size: usize,
     cache_dir: Option<&Path>,
     cache_prefix: &str,
-    expected_provenance: Option<&crate::pipeline::provenance::ProvenanceMap>,
+    expected_provenance: Option<&str>,
     pred_count: usize,
     first_ordinal: i64,
     compress_cache: bool,
@@ -431,7 +435,7 @@ fn is_cache_valid(
     path: &Path,
     expected_records: usize,
     compress_cache: bool,
-    expected_provenance: Option<&crate::pipeline::provenance::ProvenanceMap>,
+    expected_provenance: Option<&str>,
 ) -> bool {
     let record_count_ok = |p: &Path| -> bool {
         match SlabReader::open(p) {
@@ -442,12 +446,12 @@ fn is_cache_valid(
 
     let provenance_matches = |artifact: &Path| -> bool {
         let Some(expected) = expected_provenance else { return true; };
-        use crate::pipeline::provenance::{ProvenanceFlags, ProvenanceMap};
-        match ProvenanceMap::read_sidecar(artifact) {
-            Ok(Some(stored)) => {
-                stored.hash(ProvenanceFlags::STRICT)
-                    == expected.hash(ProvenanceFlags::STRICT)
-            }
+        use crate::pipeline::provenance::ProvenanceGraph;
+        match ProvenanceGraph::read_sidecar(artifact) {
+            // The sidecar's root is the producer's address, which is
+            // its strict hash — so equality of addresses is the
+            // strict comparison.
+            Ok(Some(stored)) => stored.root == expected,
             // Missing sidecar with a strict expectation is a
             // miss — better to recompute than reuse a file we
             // can't audit. Old caches from before the sidecar
@@ -1280,7 +1284,7 @@ sweep.
             );
         }
 
-        // Cache key from a structured `ProvenanceMap`:
+        // Cache key from the run's provenance node:
         // (binary version, resolved options, upstream sidecars
         // of source + predicate inputs) — the same machinery
         // every other pipeline consumer uses for staleness
@@ -1295,7 +1299,7 @@ sweep.
         // That keeps hand-curated dataset files invalidating
         // downstream caches on overwrite/touch without ever
         // hashing the file content.
-        let run_provenance = build_run_provenance(
+        let (run_graph, run_root) = build_run_provenance(
             self.build_version(),
             self.command_path(),
             options,
@@ -1303,9 +1307,7 @@ sweep.
             &ctx.workspace,
             &[("source", &input_path), ("predicates", &predicates_path)],
         );
-        let cache_prefix = run_provenance.hash(
-            crate::pipeline::provenance::ProvenanceFlags::STRICT,
-        );
+        let cache_prefix = run_root.clone();
 
         let segments = plan_segments(
             &page_entries,
@@ -1313,7 +1315,7 @@ sweep.
             segment_size,
             Some(cache_dir.as_path()),
             &cache_prefix,
-            Some(&run_provenance),
+            Some(run_root.as_str()),
             pred_len,
             effective_start,
             compress_cache,
@@ -1755,7 +1757,7 @@ sweep.
                             // cache (the file is still usable; only
                             // the next run's strict-validation check
                             // would reject it as un-auditable).
-                            if let Err(e) = run_provenance.write_sidecar(cache_path) {
+                            if let Err(e) = run_graph.write_sidecar(&run_root, cache_path) {
                                 log::warn!(
                                     "compute predicates: sidecar write error for segment {}: {}",
                                     seg_idx, e,
@@ -2551,14 +2553,14 @@ mod tests {
         let opts_a = build_opts(ws, &meta_path, &pred_path_a, "keys_a.slab");
         let opts_b = build_opts(ws, &meta_path, &pred_path_b, "keys_b.slab");
 
-        let prov_a = build_run_provenance(
+        let (_, hash_a) = build_run_provenance(
             "1.0.0+abcd",
             "compute evaluate-predicates",
             &opts_a,
             ws, ws,
             &[("source", &meta_path), ("predicates", &pred_path_a)],
         );
-        let prov_b = build_run_provenance(
+        let (_, hash_b) = build_run_provenance(
             "1.0.0+abcd",
             "compute evaluate-predicates",
             &opts_b,
@@ -2566,8 +2568,6 @@ mod tests {
             &[("source", &meta_path), ("predicates", &pred_path_b)],
         );
 
-        let hash_a = prov_a.hash(crate::pipeline::provenance::ProvenanceFlags::STRICT);
-        let hash_b = prov_b.hash(crate::pipeline::provenance::ProvenanceFlags::STRICT);
         assert_ne!(hash_a, hash_b,
             "different predicate slabs (different paths, sizes, mtimes) \
              must produce different provenance hashes");
@@ -2591,22 +2591,20 @@ mod tests {
         let pred_path = create_predicates_slab(ws, "preds.slab", &[p]);
 
         let opts = build_opts(ws, &meta_path, &pred_path, "keys.slab");
-        let prov_v1 = build_run_provenance(
+        let (_, h1) = build_run_provenance(
             "1.0.0+abcd1234",
             "compute evaluate-predicates",
             &opts,
             ws, ws,
             &[("source", &meta_path), ("predicates", &pred_path)],
         );
-        let prov_v2 = build_run_provenance(
+        let (_, h2) = build_run_provenance(
             "1.0.0+ffff5678", // same version, different git hash
             "compute evaluate-predicates",
             &opts,
             ws, ws,
             &[("source", &meta_path), ("predicates", &pred_path)],
         );
-        let h1 = prov_v1.hash(crate::pipeline::provenance::ProvenanceFlags::STRICT);
-        let h2 = prov_v2.hash(crate::pipeline::provenance::ProvenanceFlags::STRICT);
         assert_ne!(h1, h2,
             "git-hash bump must invalidate cache under STRICT — \
              this is what would have caught the MATCHES regression");
@@ -2618,7 +2616,7 @@ mod tests {
     /// Sidecar absent with provenance expected: returns false.
     #[test]
     fn is_cache_valid_enforces_sidecar_when_provenance_expected() {
-        use crate::pipeline::provenance::{BinaryVersion, ProvenanceMap};
+        use crate::pipeline::provenance::{BinaryVersion, ProvenanceGraph, ProvenanceNode};
         use std::collections::{BTreeMap, HashMap};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2631,25 +2629,20 @@ mod tests {
         w.add_record(&[]).unwrap();
         w.finish().unwrap();
 
-        let prov_a = ProvenanceMap::build(
-            "step", "cmd",
-            &BinaryVersion::parse("1.0.0+aaaa"),
-            &HashMap::new(),
-            BTreeMap::new(),
-        );
-        let prov_b = ProvenanceMap::build(
-            "step", "cmd",
-            &BinaryVersion::parse("1.0.0+bbbb"),
-            &HashMap::new(),
-            BTreeMap::new(),
-        );
+        let mut graph = ProvenanceGraph::new();
+        let prov_a = graph
+            .insert(ProvenanceNode::build("step", "cmd", &BinaryVersion::parse("1.0.0+aaaa"), &HashMap::new(), BTreeMap::new()))
+            .unwrap();
+        let prov_b = graph
+            .insert(ProvenanceNode::build("step", "cmd", &BinaryVersion::parse("1.0.0+bbbb"), &HashMap::new(), BTreeMap::new()))
+            .unwrap();
 
         // No sidecar yet → invalid under strict expectation.
         assert!(!is_cache_valid(&cache_path, 2, false, Some(&prov_a)),
             "sidecar absence must fail strict validation");
 
         // Write sidecar A → valid for A, invalid for B.
-        prov_a.write_sidecar(&cache_path).unwrap();
+        graph.write_sidecar(&prov_a, &cache_path).unwrap();
         assert!(is_cache_valid(&cache_path, 2, false, Some(&prov_a)),
             "matching sidecar must pass");
         assert!(!is_cache_valid(&cache_path, 2, false, Some(&prov_b)),

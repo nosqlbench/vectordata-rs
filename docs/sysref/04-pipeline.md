@@ -76,24 +76,24 @@ range: "[0,${base_count})"        # computed by earlier step
 output: "${cache}/sorted.ivecs"    # .cache/ directory
 ```
 
-### Freshness checking — structured provenance (v5)
+### Freshness checking — structured provenance (v6)
 
 Staleness is provenance-based, not mtime-based. Each step's progress
-record carries a structured **`ProvenanceMap`** capturing every
-component that *could* be used to decide whether the step is stale:
+record points at a **`ProvenanceNode`** capturing every component that
+*could* be used to decide whether the step is stale:
 
 - **Identity** — `step_id`, `command_path`
 - **Binary version** — `version_major`, `version_minor`, `version_patch`,
   `git_hash`, `dirty` (parsed from `{CARGO_PKG_VERSION}+{git_hash}[+dirty]`)
 - **Resolved options** — sorted `BTreeMap<String, String>`
-- **Upstream provenance** — recursive: each upstream step's *full*
-  `ProvenanceMap`, not just its hash, so a relaxed selector cascades
-  correctly through the DAG
+- **Upstream provenance** — the *address* of each upstream step's node
+  in the log's graph, so a relaxed selector cascades correctly through
+  the DAG (the hash recurses through addresses)
 
 A step is fresh when:
 - The output file exists with the recorded size, AND
-- The step's `ProvenanceMap.hash(selector)` equals the stored hash
-  under the **active selector**
+- The step's node hashes under the **active selector** to the same
+  value as the node recorded for it
 
 #### Selectors and presets
 
@@ -120,23 +120,69 @@ Tab-completion suggests presets up front; once a comma is typed it
 switches to suggesting individual components and excludes any already
 chosen.
 
-#### Why the full map is stored
+#### Why the full node is stored
 
-Storing the full structure (rather than a single opaque hash) means a
-later run can pick a *different* selector against the same record
-without re-execution. The recursive `upstream` field is what makes the
-relaxation cascade: when the head step's hash is computed under
-selector S, each upstream contribution is *also* recomputed under S —
-otherwise the head's hash would still pull in strictly-computed leaves
-and the relaxation would be silently neutered.
+Storing the full node (rather than a single opaque hash) means a later
+run can pick a *different* selector against the same record without
+re-execution. The `upstream` addresses are what make the relaxation
+cascade: when the head step's hash is computed under selector S, each
+upstream's node is *also* hashed under S — otherwise the head's hash
+would still pull in strictly-computed leaves and the relaxation would
+be silently neutered.
+
+#### The provenance graph
+
+Nodes live in one flat, content-addressed table per progress log — the
+**`ProvenanceGraph`**. A node's address is its hash under `strict`, so
+equal content has equal address, a subtree shared by many dependents
+is stored once, and a step that runs again with different inputs gets
+a *new* node while the node its dependents were built on stays for as
+long as they reference it. Nothing nests: the graph has the same shape
+in memory, in the log, and in a sidecar, and its depth on disk is
+constant however long an `after:` chain runs.
+
+```yaml
+schema_version: 6
+provenance:
+  1f0c…:              # address = strict hash of the node
+    step_id: compute-knn-90m
+    command_path: compute knn
+    options: {base: profiles/90m/base_vectors.fvecs, …}
+    upstream: {compute-knn-89m: 9a41…, count-base: 77e2…, extract-queries: 03bd…}
+steps:
+  compute-knn-90m:
+    status: ok
+    provenance: 1f0c…
+```
+
+Sidecars (`<cache>/provenance/…provenance.json`) hold a `root` address
+and the `nodes` it reaches, so a consumer that keys a cache on its
+inputs absorbs them into its own graph and compares roots.
+
+This shape matters: schema 5 nested each upstream's full map inside
+every dependent, which made the file quadratic in the length of an
+`after:` chain and — past 64 chained steps — deeper than the 128
+levels the YAML and JSON parsers will read. A per-profile KNN chain
+across 85 profiles reached that limit, at which point the log could not
+be loaded and every step looked unrecorded.
 
 #### Schema version
 
-The progress log carries `schema_version: 5`. On load, a v4-or-earlier
-log is invalidated wholesale (records cleared, log re-initialized) so
-the next run starts from a known-correct state. This is a one-time
-penalty per workspace per major schema bump; subsequent v5-on-v5 loads
-preserve all records.
+The progress log carries `schema_version: 6`. A schema-5 log is
+**migrated** on load, not cleared: its records are kept, and each
+record's node is rebuilt with, for every upstream, the *snapshot* the
+record carried — the upstream's own components as they were when the
+record ran, read one level deep with anything nested further skipped
+unparsed. A snapshot that matches the upstream's own record is the
+same node; one that differs stays in the graph as the version the
+record was built on, so the record hashes exactly as it did before
+under every selector. The load message names records built on an
+earlier upstream version. Schema 5 also recorded a sharded output under
+its logical name with size 0; the migration re-measures such outputs as
+their shards. The runner writes the migrated log back at once and keeps
+the original beside it as `.upstream.progress.v5.yaml`. A v4-or-earlier
+log is still invalidated wholesale (records cleared) so the next run
+starts from a known-correct state.
 
 #### Tools
 
