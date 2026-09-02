@@ -175,6 +175,16 @@ pub fn resolve_all_steps(
     expanded
 }
 
+/// The `--provenance` default exactly as the CLI declares it.
+///
+/// `default_value` must be a literal, so it cannot name
+/// [`ProvenanceFlags::DEFAULT_NAME`](provenance::ProvenanceFlags::DEFAULT_NAME)
+/// directly. This hands the literal to a test that asserts they agree.
+#[cfg(test)]
+pub(crate) fn run_args_provenance_default() -> &'static str {
+    "config-only"
+}
+
 /// CLI arguments for `veks run`.
 #[derive(veks_completion_derive::VeksCli)]
 pub struct RunArgs {
@@ -269,11 +279,24 @@ pub struct RunArgs {
     /// `command_path`, `version_major`, `version_minor`, `version_patch`,
     /// `git_hash`, `dirty`, `options`, `upstream`).
     ///
-    /// Default: `strict` — current v4 behaviour. Use `version-aware`
-    /// after a minor/patch binary upgrade to keep cached steps fresh
-    /// without re-running everything; use `config-only` to ignore the
-    /// binary version entirely.
-    #[arg(long, default_value = "strict", value_name = "SELECTOR")]
+    /// Default: `config-only` — a step is stale when its own options
+    /// or an upstream's provenance changed, and not merely because the
+    /// binary did.
+    ///
+    /// The default used to be `strict`, which also hashes the version,
+    /// git hash and dirty flag. That is the safer rule in the abstract
+    /// and the wrong one in practice: it means rebuilding the tool
+    /// invalidates every completed step, so fixing a bug in one command
+    /// discards days of unrelated work — a dataset whose base facet
+    /// took nine hours to extract loses it because an unrelated
+    /// command was recompiled. The cost of being wrong the other way is
+    /// re-running a step by hand; the cost of being wrong this way is
+    /// re-running everything, and it is paid silently.
+    ///
+    /// Use `strict` when a build genuinely changes what a step
+    /// produces — a kernel fix, a format change — and `version-aware`
+    /// to re-run only across major versions.
+    #[arg(long, default_value = "config-only", value_name = "SELECTOR")]
     pub provenance: String,
 
     /// Print the provenance diff between the stored and current

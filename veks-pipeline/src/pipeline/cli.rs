@@ -514,7 +514,7 @@ pub fn run_direct(args: Vec<String>) {
         ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::PlainSink::new())),
         status_interval: std::time::Duration::from_secs(1),
         estimated_total_steps: 0,
-        provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
+        provenance_selector: crate::pipeline::provenance::ProvenanceFlags::DEFAULT,
     };
 
     let mut cmd = factory();

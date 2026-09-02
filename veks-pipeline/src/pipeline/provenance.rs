@@ -481,6 +481,19 @@ impl ProvenanceFlags {
             | Self::OPTIONS.0 | Self::UPSTREAM.0
     );
 
+    /// What a run uses when nothing asks for anything else.
+    ///
+    /// `CONFIG_ONLY`: a step is stale when its own options or an
+    /// upstream changed, not merely because the binary did. See the
+    /// `--provenance` flag for why this is the default rather than
+    /// [`Self::STRICT`].
+    pub const DEFAULT: Self = Self::CONFIG_ONLY;
+
+    /// The name of [`Self::DEFAULT`], for the CLI and for the callers
+    /// that build a run programmatically. One spelling, so a change
+    /// here reaches all of them.
+    pub const DEFAULT_NAME: &'static str = "config-only";
+
     pub fn contains(&self, other: ProvenanceFlags) -> bool {
         (self.0 & other.0) == other.0 && other.0 != 0
     }
@@ -787,5 +800,89 @@ mod tests {
         }).collect();
         assert!(labels.iter().any(|l| l == "binary_version_major"));
         assert!(labels.iter().any(|l| l == "binary_git_hash"));
+    }
+
+
+    /// **The default ignores the binary version.** Rebuilding the tool
+    /// must not invalidate completed steps: a dataset whose base facet
+    /// took nine hours to extract should not lose it because an
+    /// unrelated command was recompiled.
+    #[test]
+    fn the_default_is_config_only() {
+        assert_eq!(ProvenanceFlags::DEFAULT, ProvenanceFlags::CONFIG_ONLY);
+        for ignored in [
+            ProvenanceFlags::VERSION_MAJOR,
+            ProvenanceFlags::VERSION_MINOR,
+            ProvenanceFlags::VERSION_PATCH,
+            ProvenanceFlags::GIT_HASH,
+            ProvenanceFlags::DIRTY_FLAG,
+        ] {
+            assert!(!ProvenanceFlags::DEFAULT.contains(ignored));
+        }
+        // What it does still consult: the step's own identity, its
+        // options, and its upstreams.
+        for consulted in [
+            ProvenanceFlags::STEP_ID,
+            ProvenanceFlags::COMMAND_PATH,
+            ProvenanceFlags::OPTIONS,
+            ProvenanceFlags::UPSTREAM,
+        ] {
+            assert!(ProvenanceFlags::DEFAULT.contains(consulted));
+        }
+    }
+
+    /// The name and the flags agree, and the name parses back — the
+    /// CLI's `default_value` is a literal clap requires, so this is
+    /// what keeps the two from drifting apart.
+    #[test]
+    fn the_default_name_round_trips() {
+        assert_eq!(ProvenanceFlags::DEFAULT_NAME, "config-only");
+        assert_eq!(
+            ProvenanceFlags::parse(ProvenanceFlags::DEFAULT_NAME).unwrap(),
+            ProvenanceFlags::DEFAULT
+        );
+    }
+
+    /// **What `veks run` actually defaults to**, read out of the CLI
+    /// definition rather than trusted. `default_value` has to be a
+    /// literal, so it is the one spelling that can drift from
+    /// [`ProvenanceFlags::DEFAULT_NAME`] without anything noticing.
+    #[test]
+    fn the_cli_default_is_the_named_default() {
+        let literal = crate::pipeline::run_args_provenance_default();
+        assert_eq!(literal, ProvenanceFlags::DEFAULT_NAME);
+        assert_eq!(ProvenanceFlags::parse(literal).unwrap(), ProvenanceFlags::DEFAULT);
+    }
+
+    /// A rebuilt binary leaves a step fresh under the default and
+    /// stale under `strict` — the behaviour change this default is.
+    #[test]
+    fn a_rebuild_is_fresh_by_default_and_stale_under_strict() {
+        let before = make_map("2.0.0+aaaaaaaa", opts());
+        let after = make_map("2.0.1+bbbbbbbb", opts());
+
+        assert_eq!(
+            before.hash(ProvenanceFlags::DEFAULT),
+            after.hash(ProvenanceFlags::DEFAULT),
+            "a rebuild must not invalidate a completed step"
+        );
+        assert_ne!(
+            before.hash(ProvenanceFlags::STRICT),
+            after.hash(ProvenanceFlags::STRICT),
+            "strict still notices, for callers that ask for it"
+        );
+    }
+
+    /// What the default *does* catch: a changed option.
+    #[test]
+    fn a_changed_option_is_still_stale_by_default() {
+        let mut other = opts();
+        other.insert("range".to_string(), "[0,999)".to_string());
+        let before = make_map("2.0.0+aaaaaaaa", opts());
+        let after = make_map("2.0.0+aaaaaaaa", other);
+        assert_ne!(
+            before.hash(ProvenanceFlags::DEFAULT),
+            after.hash(ProvenanceFlags::DEFAULT),
+        );
     }
 }

@@ -159,7 +159,8 @@ pub(crate) fn run(args: SynthesizeArgs) {
         governor: "maximize".to_string(),
         status_interval: 250,
         output: "auto".to_string(),
-        provenance: "strict".to_string(),
+        provenance: veks_pipeline::pipeline::provenance::ProvenanceFlags::DEFAULT_NAME
+            .to_string(),
         explain_staleness: false,
     };
     if crate::pipeline::run_pipeline(run_args).is_err() {
