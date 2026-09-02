@@ -2581,21 +2581,71 @@ fn sorted_index_extract_fvec(
         if dup_path.exists() {
             match XvecReader::<i32>::open_path(&dup_path) {
                 Ok(dup_reader) => {
+                    use rayon::prelude::*;
+                    use std::sync::atomic::{AtomicU64, Ordering};
+
                     let dup_count = <XvecReader<i32> as VectorReader<i32>>::count(&dup_reader);
-                    let mut dz = 0usize;
-                    for i in 0..dup_count {
-                        let ord = dup_reader.get_slice(i)[0] as usize;
-                        if ord < fvec_count {
-                            let vec = fvec_reader.get_slice(ord);
-                            let norm_sq: f64 = vec.iter().map(|&v| {
-                                let vf = v as f64;
-                                vf * vf
-                            }).sum();
-                            if norm_sq < zero_threshold_sq {
-                                dz += 1;
+
+                    // The duplicates file is small and read straight
+                    // through, so mmap is the right way to collect the
+                    // ordinals. The *source* reads below are not.
+                    let mut ords: Vec<u32> = (0..dup_count)
+                        .map(|i| dup_reader.get_slice(i)[0] as u32)
+                        .filter(|&o| (o as usize) < fvec_count)
+                        .collect();
+
+                    // Sorted, so the scan walks the source forward
+                    // instead of jumping around a multi-TB file. Each
+                    // random read costs a whole readahead window
+                    // whatever it asked for; in source order those
+                    // windows are consumed instead of discarded, and
+                    // consecutive duplicates share one.
+                    ords.sort_unstable();
+
+                    ctx.ui.log(&format!(
+                        "  checking {} removed duplicates for near-zero vectors",
+                        ords.len(),
+                    ));
+                    let pb = ctx.ui.bar_with_unit(
+                        ords.len() as u64,
+                        "checking duplicates for near-zero vectors",
+                        "vectors",
+                    );
+                    let seen = AtomicU64::new(0);
+
+                    // One dependent read at a time leaves the device at
+                    // a queue depth of about two and every other core
+                    // idle: this is latency-bound, not bandwidth-bound,
+                    // so it wants concurrency rather than bigger reads.
+                    //
+                    // `pread` rather than the mmap reader for the same
+                    // reason the extraction passes above use it —
+                    // faulting a shuffled read pattern over a multi-TB
+                    // source inflates RSS by hundreds of GiB, and these
+                    // pages are never looked at twice.
+                    let dz = ords
+                        .par_iter()
+                        .filter(|&&ord| {
+                            let near_zero = match pread_vector(ord as usize) {
+                                Ok(v) => {
+                                    let norm_sq: f64 =
+                                        v.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                                    norm_sq < zero_threshold_sq
+                                }
+                                // A read that fails cannot be judged
+                                // near-zero; the extraction passes
+                                // would have failed on it already.
+                                Err(_) => false,
+                            };
+                            let n = seen.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_multiple_of(65_536) {
+                                pb.set_position(n);
                             }
-                        }
-                    }
+                            near_zero
+                        })
+                        .count();
+                    pb.finish();
+
                     if dz > 0 {
                         ctx.ui.log(&format!(
                             "  {} of {} removed duplicates were also near-zero vectors",

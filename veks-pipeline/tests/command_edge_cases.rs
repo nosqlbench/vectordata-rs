@@ -3286,3 +3286,126 @@ fn cross_engine_knn_parity() {
         panic!("Cross-engine parity failures:\n{}", failures.join("\n"));
     }
 }
+
+// ===========================================================================
+// Duplicate near-zero scan: parallel, ordered, and counted correctly
+// ===========================================================================
+
+/// Build the inputs the index-based extract path needs, with `dups`
+/// naming source ordinals that were removed as duplicates.
+fn extract_with_duplicates(ws: &Path, sources: &[Vec<f32>], take: &[i32], dups: &[i32]) -> Options {
+    let source = ws.join("base.fvecs");
+    write_test_fvec(&source, sources);
+
+    let index = ws.join("shuffle.ivecs");
+    write_test_ivec_1d(&index, take);
+
+    std::fs::create_dir_all(ws.join(".cache")).unwrap();
+    write_test_ivec_1d(&ws.join(".cache/dedup_duplicates.ivecs"), dups);
+
+    let mut opts = Options::new();
+    opts.set("source", source.to_string_lossy().to_string());
+    opts.set("ivec-file", index.to_string_lossy().to_string());
+    opts.set("output", ws.join("out.fvecs").to_string_lossy().to_string());
+    opts
+}
+
+/// **Removed duplicates that were also near-zero are counted.**
+///
+/// The count feeds `source_zero_count`, which is how the dataset
+/// reports how many zero vectors the original input had — dedup
+/// removes all but one copy, so the ones it removed have to be counted
+/// separately or the total is wrong.
+#[test]
+fn duplicate_near_zero_vectors_are_counted() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Ordinals 1, 3 and 5 are near-zero; the rest are not.
+    let sources: Vec<Vec<f32>> = (0..8)
+        .map(|i| if [1, 3, 5].contains(&i) { vec![0.0, 0.0] } else { vec![i as f32, 1.0] })
+        .collect();
+    // Duplicates name four ordinals, three of which are near-zero.
+    let opts = extract_with_duplicates(ws, &sources, &[0, 2, 4, 6, 7], &[1, 3, 5, 7]);
+
+    let mut op = veks_pipeline::pipeline::commands::gen_extract::extract_factory();
+    let mut ctx = test_ctx(ws);
+    let result = op.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "{}", result.message);
+
+    assert_eq!(
+        ctx.defaults.get("duplicate_zero_count").map(String::as_str),
+        Some("3"),
+        "three of the four removed duplicates were near-zero"
+    );
+}
+
+/// **The answer does not depend on how the work was split.** The scan
+/// runs in parallel over sorted ordinals, so a count that came out
+/// right only for one thread, or only in file order, would be a real
+/// defect this pins.
+#[test]
+fn the_duplicate_scan_is_order_and_thread_independent() {
+    let counts: Vec<Option<String>> = [1usize, 4, 16]
+        .iter()
+        .map(|threads| {
+            let tmp = tmp_dir();
+            let ws = tmp.path();
+            // 64 sources, every third near-zero.
+            let sources: Vec<Vec<f32>> = (0..64)
+                .map(|i| if i % 3 == 0 { vec![0.0, 0.0] } else { vec![i as f32, 2.0] })
+                .collect();
+            // Duplicates listed in a deliberately jumbled order, so a
+            // scan that assumed input order would differ from one that
+            // sorts.
+            let mut dups: Vec<i32> = (0..64).filter(|i| i % 2 == 0).collect();
+            dups.reverse();
+            let take: Vec<i32> = (0..64).filter(|i| i % 2 == 1).collect();
+            let opts = extract_with_duplicates(ws, &sources, &take, &dups);
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(*threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut op = veks_pipeline::pipeline::commands::gen_extract::extract_factory();
+                let mut ctx = test_ctx(ws);
+                let r = op.execute(&opts, &mut ctx);
+                assert_eq!(r.status, Status::Ok, "{} threads: {}", threads, r.message);
+                ctx.defaults.get("duplicate_zero_count").cloned()
+            })
+        })
+        .collect();
+
+    // Even ordinals 0..64 that are also multiples of 3: 0,6,12,…,60 → 11.
+    assert_eq!(counts[0].as_deref(), Some("11"), "single-threaded");
+    assert!(
+        counts.iter().all(|c| *c == counts[0]),
+        "thread count changed the answer: {counts:?}"
+    );
+}
+
+/// No duplicates file at all is a normal state — the count is zero and
+/// nothing is reported, rather than the step failing.
+#[test]
+fn an_absent_duplicates_file_counts_nothing() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+    let sources: Vec<Vec<f32>> = (0..4).map(|i| vec![i as f32, 1.0]).collect();
+
+    let source = ws.join("base.fvecs");
+    write_test_fvec(&source, &sources);
+    let index = ws.join("shuffle.ivecs");
+    write_test_ivec_1d(&index, &[0, 1, 2, 3]);
+
+    let mut opts = Options::new();
+    opts.set("source", source.to_string_lossy().to_string());
+    opts.set("ivec-file", index.to_string_lossy().to_string());
+    opts.set("output", ws.join("out.fvecs").to_string_lossy().to_string());
+
+    let mut op = veks_pipeline::pipeline::commands::gen_extract::extract_factory();
+    let mut ctx = test_ctx(ws);
+    let result = op.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "{}", result.message);
+    assert_eq!(ctx.defaults.get("duplicate_zero_count"), None);
+}
