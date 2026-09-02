@@ -1817,7 +1817,23 @@ neither when nothing was declared.
 fixtures: the pipeline runs, the enriched M facet carries all eight
 columns, `predicates.slab` carries both namespaces with matching
 counts, and every generated predicate returns a non-empty match set at
-a profile above the threshold (TS-42).
+a profile above the threshold (TS-42). *Realised 2026-09-02* as
+`veks/tests/e2e_topic_predicates.rs`: a planted corpus of 200 passages
+in 50 papers around six leaf directions with matching vocabulary and
+metadata is bootstrapped by `veks prepare bootstrap`, extended exactly
+as tessera's definition is, and run through the binary; every retained
+adjunct of §8 exists, the M facet carries every derived column, the
+query metadata facet has one row per query, the predicate facet one
+labelled record per query, the strata verification reports no
+violation, and the dataset's own `veks check` passes. Building it
+exposed three defects outside the design that would have failed the
+tessera build's acceptance: the SQLite oracle declared every column
+`TEXT` and so compared numeric ranges lexicographically; the runner
+recorded output paths relative to the process's working directory
+rather than the workspace; and the manifest projection behind the
+extraneous-files check did not read the variables a run records, so
+every step naming `${vector_count}` or `${base_count}` was silently
+dropped from it. All three are fixed and tested.
 
 **TS-121.** The acceptance criterion of TS-43 — realised selectivity
 within the assigned band — is checked **against the R facet after
