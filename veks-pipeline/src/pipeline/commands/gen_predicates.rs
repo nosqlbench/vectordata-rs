@@ -29,10 +29,6 @@ use std::time::Instant;
 use rand::Rng;
 use slabtastic::{SlabWriter, WriterConfig};
 
-use veks_core::formats::pnode::{
-    Comparand, ConjugateNode, ConjugateType, FieldRef, OpType, PNode, PredicateNode,
-};
-use veks_core::formats::pnode::PNode as FmtPNode;
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     Status, StreamContext, render_options_table,
@@ -41,12 +37,16 @@ use crate::pipeline::commands::survey::{
     CardinalityRegime, FieldProfile, MeasureReport, NumberKind, SemanticType,
 };
 use crate::pipeline::rng;
+use veks_core::formats::pnode::PNode as FmtPNode;
+use veks_core::formats::pnode::{
+    Comparand, ConjugateNode, ConjugateType, FieldRef, OpType, PNode, PredicateNode,
+};
 
 use super::gen_predicates_common::{error_result, opt, resolve_path};
 use super::gen_predicates_proto::{
-    materialize_predicate, parse_template, PredicateProto, PredicateTemplate, SelectivitySpec,
+    PredicateProto, PredicateTemplate, SelectivitySpec, materialize_predicate, parse_template,
 };
-use super::gen_predicates_wizard::{run_wizard, WizardInputs};
+use super::gen_predicates_wizard::{WizardInputs, run_wizard};
 use super::slab::{survey_report_from_json, survey_report_inline};
 
 /// Pipeline command: synthesize predicates from metadata slab field distributions.
@@ -58,7 +58,12 @@ pub fn factory() -> Box<dyn CommandOp> {
 }
 
 impl GenPredicatesOp {
-    fn execute_survey(&mut self, options: &Options, ctx: &mut StreamContext, start: Instant) -> CommandResult {
+    fn execute_survey(
+        &mut self,
+        options: &Options,
+        ctx: &mut StreamContext,
+        start: Instant,
+    ) -> CommandResult {
         // Wizard mode: interactively build a `PredicateProto`,
         // save it to disk, then fall into the proto-driven
         // generation path BY RE-LOADING THE SAVED FILE. The
@@ -77,14 +82,23 @@ impl GenPredicatesOp {
             // resolved output slab when --proto-file isn't given,
             // so the two artefacts stay co-located. A CLI
             // override (--proto-file) wins over that default.
-            let cli_output: Option<PathBuf> = options.get("output")
+            let cli_output: Option<PathBuf> = options
+                .get("output")
                 .map(|s| resolve_path(s, &ctx.workspace));
-            let cli_proto: Option<PathBuf> = options.get("proto-file")
+            let cli_proto: Option<PathBuf> = options
+                .get("proto-file")
                 .map(|s| resolve_path(s, &ctx.workspace));
             let inputs = WizardInputs {
-                survey_path: options.get("survey").map(|s| resolve_path(s, &ctx.workspace)),
-                source_path: options.get("source").map(|s| resolve_path(s, &ctx.workspace)),
-                samples: options.get("samples").and_then(|s| s.parse().ok()).unwrap_or(1000),
+                survey_path: options
+                    .get("survey")
+                    .map(|s| resolve_path(s, &ctx.workspace)),
+                source_path: options
+                    .get("source")
+                    .map(|s| resolve_path(s, &ctx.workspace)),
+                samples: options
+                    .get("samples")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000),
                 output_proto: cli_proto,
                 output_slab: cli_output,
                 search_root: Some(ctx.workspace.clone()),
@@ -109,7 +123,9 @@ impl GenPredicatesOp {
                 }
                 Err(e) => return error_result(format!("wizard: {e}"), start),
             }
-        } else { None };
+        } else {
+            None
+        };
 
         // Proto-driven mode: if `--proto-file` is supplied (or
         // was just produced by the wizard), load a
@@ -119,9 +135,12 @@ impl GenPredicatesOp {
         // seed) so a saved proto is reproducible without having
         // to also re-pass every flag. The flat flags continue
         // to work when no proto is supplied.
-        let proto: Option<PredicateProto> = if let Some(path) = proto_file_from_wizard
-            .or_else(|| options.get("proto-file").map(|s| resolve_path(s, &ctx.workspace)))
-        {
+        let proto: Option<PredicateProto> = if let Some(path) =
+            proto_file_from_wizard.or_else(|| {
+                options
+                    .get("proto-file")
+                    .map(|s| resolve_path(s, &ctx.workspace))
+            }) {
             match PredicateProto::load_from_path(&path) {
                 Ok(p) => Some(p),
                 Err(e) => return error_result(e, start),
@@ -140,24 +159,37 @@ impl GenPredicatesOp {
                 Ok(p) => Some(p),
                 Err(e) => return error_result(e, start),
             }
-        } else { None };
+        } else {
+            None
+        };
 
         // Resolve `--source`: CLI > proto > error (if no
         // `--survey` either). The proto's `source` is captured
         // by the wizard so a `--proto-file=<f>` run replays the
         // original survey target.
-        let source_resolved: Option<PathBuf> = options.get("source")
+        let source_resolved: Option<PathBuf> = options
+            .get("source")
             .map(|s| resolve_path(s, &ctx.workspace))
-            .or_else(|| proto.as_ref().and_then(|p| p.source.as_ref())
-                .map(|s| resolve_path(s, &ctx.workspace)));
-        let survey_resolved: Option<PathBuf> = options.get("survey")
+            .or_else(|| {
+                proto
+                    .as_ref()
+                    .and_then(|p| p.source.as_ref())
+                    .map(|s| resolve_path(s, &ctx.workspace))
+            });
+        let survey_resolved: Option<PathBuf> = options
+            .get("survey")
             .map(|s| resolve_path(s, &ctx.workspace))
-            .or_else(|| proto.as_ref().and_then(|p| p.survey.as_ref())
-                .map(|s| resolve_path(s, &ctx.workspace)));
+            .or_else(|| {
+                proto
+                    .as_ref()
+                    .and_then(|p| p.survey.as_ref())
+                    .map(|s| resolve_path(s, &ctx.workspace))
+            });
         if source_resolved.is_none() && survey_resolved.is_none() {
             return error_result(
                 "either --source <slab> or --survey <survey.json> must be provided \
-                 (or carried by --proto-file)".into(),
+                 (or carried by --proto-file)"
+                    .into(),
                 start,
             );
         }
@@ -166,16 +198,22 @@ impl GenPredicatesOp {
         // Resolve `--output`: CLI > proto > error. Captured in
         // the proto by the wizard, so a fresh `--proto-file`
         // replay needs no other flags.
-        let output_path: PathBuf = match options.get("output")
+        let output_path: PathBuf = match options
+            .get("output")
             .map(|s| resolve_path(s, &ctx.workspace))
-            .or_else(|| proto.as_ref().and_then(|p| p.output.as_ref())
-                .map(|s| resolve_path(s, &ctx.workspace)))
-        {
+            .or_else(|| {
+                proto
+                    .as_ref()
+                    .and_then(|p| p.output.as_ref())
+                    .map(|s| resolve_path(s, &ctx.workspace))
+            }) {
             Some(p) => p,
-            None => return error_result(
-                "--output is required (or set `output:` in the proto file)".into(),
-                start,
-            ),
+            None => {
+                return error_result(
+                    "--output is required (or set `output:` in the proto file)".into(),
+                    start,
+                );
+            }
         };
 
         // Pre-validate the template at command launch — a syntax
@@ -192,23 +230,42 @@ impl GenPredicatesOp {
         // Flat-flag fallbacks, used either as the direct values
         // (no proto) or as overrides for fields the proto doesn't
         // pin (no count → count flag, no sel → selectivity flag).
-        let count: usize = proto.as_ref().map(|p| p.count)
+        let count: usize = proto
+            .as_ref()
+            .map(|p| p.count)
             .or_else(|| options.get("count").and_then(|s| s.parse().ok()))
             .unwrap_or(100);
         let selectivity_spec: SelectivitySpec = match proto.as_ref() {
             Some(p) => p.selectivity,
             None => {
-                let sel: f64 = options.get("selectivity")
-                    .and_then(|s| s.parse().ok()).unwrap_or(0.1);
-                let sel_max: Option<f64> = options.get("selectivity-max")
-                    .and_then(|s| s.parse().ok());
+                let sel: f64 = options
+                    .get("selectivity")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.1);
+                let sel_max: Option<f64> =
+                    options.get("selectivity-max").and_then(|s| s.parse().ok());
                 SelectivitySpec::from_flags(sel, sel_max)
             }
         };
-        let max_samples: usize = options.get("samples").and_then(|s| s.parse().ok()).unwrap_or(1000);
+        let max_samples: usize = options
+            .get("samples")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
         let strategy = options.get("strategy").unwrap_or("eq").to_string();
-        let seed: u64 = proto.as_ref().map(|p| p.seed)
+        let seed: u64 = proto
+            .as_ref()
+            .map(|p| p.seed)
             .unwrap_or_else(|| rng::parse_seed(options.get("seed")));
+        if strategy == "stratified" {
+            return super::gen_predicates_stratified::run(
+                options,
+                ctx,
+                start,
+                &output_path,
+                survey_resolved.as_deref(),
+                seed,
+            );
+        }
 
         // Field-selection filters (CLI surface):
         //  --fields a,b,c       → whitelist (only these names are eligible)
@@ -216,7 +273,8 @@ impl GenPredicatesOp {
         // Both are case-sensitive, comma-separated, optional. Whitespace
         // around commas is trimmed.
         let field_whitelist: Option<Vec<String>> = options.get("fields").map(parse_csv_field_list);
-        let field_blacklist: Vec<String> = options.get("exclude-fields")
+        let field_blacklist: Vec<String> = options
+            .get("exclude-fields")
             .map(parse_csv_field_list)
             .unwrap_or_default();
 
@@ -267,7 +325,8 @@ impl GenPredicatesOp {
             .collect();
 
         if eligible.is_empty() {
-            ctx.ui.log("synthesize predicates: 0 eligible fields, producing 0 predicates");
+            ctx.ui
+                .log("synthesize predicates: 0 eligible fields, producing 0 predicates");
             let config = match WriterConfig::new(512, 4096, u32::MAX, false) {
                 Ok(c) => c,
                 Err(e) => return error_result(format!("{}", e), start),
@@ -277,8 +336,13 @@ impl GenPredicatesOp {
                 Err(e) => return error_result(format!("failed to create output: {}", e), start),
             };
             let _ = w.finish();
-            let var_name = format!("verified_count:{}",
-                output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+            let var_name = format!(
+                "verified_count:{}",
+                output_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("output")
+            );
             let _ = crate::pipeline::variables::set_and_save(&ctx.workspace, &var_name, "0");
             ctx.defaults.insert(var_name, "0".to_string());
             return CommandResult {
@@ -294,8 +358,11 @@ impl GenPredicatesOp {
         // Build a quick name → profile lookup for the proto path
         // — `materialize_predicate` resolves field names against
         // the survey's fields map.
-        let fields_map: std::collections::HashMap<String, FieldProfile> = report.fields.iter()
-            .map(|(k, v)| (k.clone(), v.clone())).collect();
+        let fields_map: std::collections::HashMap<String, FieldProfile> = report
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
         // Diversity guard knobs. Default to a conservative
         // floor of 5% — a 10K-emission run must produce ≥500
@@ -304,11 +371,14 @@ impl GenPredicatesOp {
         // The "10K identical MATCHES predicates" failure that
         // motivated this guard had a unique ratio of 0.0001;
         // any defensible generation run sits above ~0.10.
-        let min_unique_ratio: f64 = options.get("min-unique-ratio")
+        let min_unique_ratio: f64 = options
+            .get("min-unique-ratio")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.05);
-        let strict_unique_ratio: bool = options.get("strict-unique-ratio")
-            .map(|s| s == "true").unwrap_or(false);
+        let strict_unique_ratio: bool = options
+            .get("strict-unique-ratio")
+            .map(|s| s == "true")
+            .unwrap_or(false);
 
         let pb = ctx.ui.bar(count as u64, "generating predicates");
         let mut predicates: Vec<Vec<u8>> = Vec::with_capacity(count);
@@ -323,18 +393,27 @@ impl GenPredicatesOp {
                 }
             } else {
                 match strategy.as_str() {
-                    "eq" | "single" => generate_eq_predicate(&eligible, target_sel, op_mask, &mut rng_inst),
-                    "compound" => generate_compound_predicate(&eligible, target_sel, op_mask, &mut rng_inst),
+                    "eq" | "single" => {
+                        generate_eq_predicate(&eligible, target_sel, op_mask, &mut rng_inst)
+                    }
+                    "compound" => {
+                        generate_compound_predicate(&eligible, target_sel, op_mask, &mut rng_inst)
+                    }
                     other => {
                         return error_result(
-                            format!("unknown strategy '{}', expected 'eq' (or 'single') or 'compound'", other),
+                            format!(
+                                "unknown strategy '{}', expected 'eq' (or 'single') or 'compound'",
+                                other
+                            ),
                             start,
                         );
                     }
                 }
             };
             predicates.push(pnode.to_bytes_named());
-            if (pred_i + 1) % 1_000 == 0 { pb.set_position((pred_i + 1) as u64); }
+            if (pred_i + 1) % 1_000 == 0 {
+                pb.set_position((pred_i + 1) as u64);
+            }
         }
         pb.finish();
 
@@ -342,14 +421,20 @@ impl GenPredicatesOp {
         // emissions from one heavy-hitter candidate (the
         // pre-fix bug) writes 10K byte-identical PNode records.
         // Count distinct byte-sequences and gate on the ratio.
-        let unique_count: usize = predicates.iter()
+        let unique_count: usize = predicates
+            .iter()
             .collect::<std::collections::HashSet<_>>()
             .len();
-        let unique_ratio = if predicates.is_empty() { 1.0 }
-            else { unique_count as f64 / predicates.len() as f64 };
+        let unique_ratio = if predicates.is_empty() {
+            1.0
+        } else {
+            unique_count as f64 / predicates.len() as f64
+        };
         let diversity_msg = format!(
             "generation diversity: {}/{} distinct predicates ({:.2}% unique)",
-            unique_count, predicates.len(), unique_ratio * 100.0,
+            unique_count,
+            predicates.len(),
+            unique_ratio * 100.0,
         );
         ctx.ui.log(&diversity_msg);
         if predicates.len() >= 10 && unique_ratio < min_unique_ratio {
@@ -363,7 +448,8 @@ impl GenPredicatesOp {
                  widen the candidate range, or pass \
                  --min-unique-ratio=<lower> to acknowledge a \
                  genuinely-narrow predicate set.",
-                diversity_msg, min_unique_ratio * 100.0,
+                diversity_msg,
+                min_unique_ratio * 100.0,
             );
             if strict_unique_ratio {
                 return error_result(detail, start);
@@ -399,12 +485,20 @@ impl GenPredicatesOp {
         // template by rendering the predicate fingerprint
         // (structural shape with concrete-value slots replaced
         // by `?`).
-        let schema_template = parsed_template.as_ref()
-            .map(|_| proto.as_ref().map(|p| p.template.clone()).unwrap_or_default())
-            .or_else(|| predicates.first().and_then(|rec| {
-                let pnode = FmtPNode::from_bytes_named(rec).ok()?;
-                Some(render_template_from_pnode(&pnode))
-            }))
+        let schema_template = parsed_template
+            .as_ref()
+            .map(|_| {
+                proto
+                    .as_ref()
+                    .map(|p| p.template.clone())
+                    .unwrap_or_default()
+            })
+            .or_else(|| {
+                predicates.first().and_then(|rec| {
+                    let pnode = FmtPNode::from_bytes_named(rec).ok()?;
+                    Some(render_template_from_pnode(&pnode))
+                })
+            })
             .unwrap_or_else(|| "<empty>".to_string());
         let schema_selectivity = match selectivity_spec {
             SelectivitySpec::Scalar(v) => format!("{v}"),
@@ -416,9 +510,7 @@ impl GenPredicatesOp {
             seed,
             predicates.len() as u64,
         );
-        if let Err(e) = writer.start_namespace(
-            vectordata::metadata_schema::SCHEMA_NAMESPACE,
-        ) {
+        if let Err(e) = writer.start_namespace(vectordata::metadata_schema::SCHEMA_NAMESPACE) {
             return error_result(format!("schema namespace: {}", e), start);
         }
         if let Err(e) = writer.add_record(&schema.to_json_bytes()) {
@@ -431,9 +523,7 @@ impl GenPredicatesOp {
         // needing the original survey JSON. This is for
         // explanation / provenance only — the predicate
         // evaluator doesn't read it.
-        if let Err(e) = writer.start_namespace(
-            vectordata::metadata_schema::SURVEY_NAMESPACE,
-        ) {
+        if let Err(e) = writer.start_namespace(vectordata::metadata_schema::SURVEY_NAMESPACE) {
             return error_result(format!("survey namespace: {}", e), start);
         }
         let survey_json = match serde_json::to_vec(&report) {
@@ -447,10 +537,18 @@ impl GenPredicatesOp {
             return error_result(format!("finish error: {}", e), start);
         }
 
-        let var_name = format!("verified_count:{}",
-            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let var_name = format!(
+            "verified_count:{}",
+            output_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("output")
+        );
         let _ = crate::pipeline::variables::set_and_save(
-            &ctx.workspace, &var_name, &predicates.len().to_string());
+            &ctx.workspace,
+            &var_name,
+            &predicates.len().to_string(),
+        );
         ctx.defaults.insert(var_name, predicates.len().to_string());
 
         let message = format!(
@@ -471,7 +569,6 @@ impl GenPredicatesOp {
     }
 }
 
-
 impl CommandOp for GenPredicatesOp {
     fn command_path(&self) -> &str {
         "generate predicates"
@@ -481,7 +578,9 @@ impl CommandOp for GenPredicatesOp {
         &crate::pipeline::command::CAT_GENERATE
     }
 
-    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+    fn level(&self) -> &'static dyn veks_completion::LevelTag {
+        &crate::pipeline::command::LVL_PRIMARY
+    }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
@@ -506,31 +605,179 @@ impl CommandOp for GenPredicatesOp {
     }
 
     fn describe_options(&self) -> Vec<OptionDesc> {
-        vec![
-            opt("source", "Path", false, None, "Metadata source to survey (optional when --survey or --proto-file carries it)", OptionRole::Input),
-            opt("output", "Path", false, None, "Output slab of generated predicates (optional when --proto-file carries it; CLI wins on conflict)", OptionRole::Output),
-            opt("survey", "Path", false, None, "Pre-computed survey JSON from `analyze survey` (skips re-surveying)", OptionRole::Input),
-            opt("count", "int", false, Some("100"), "Number of predicates to generate", OptionRole::Config),
-            opt("selectivity", "float", false, Some("0.1"), "Target selectivity", OptionRole::Config),
-            opt("selectivity-max", "float", false, None, "Upper selectivity bound (random per-predicate within [selectivity, selectivity-max])", OptionRole::Config),
-            opt("samples", "int", false, Some("1000"), "Inline survey sample count when --survey is not supplied", OptionRole::Config),
-            opt("max-distinct", "int", false, Some("100"), "Max distinct values tracked per field (compat shim — actual cap comes from `analyze survey`)", OptionRole::Config),
-            opt("strategy", "string", false, Some("eq"), "Predicate strategy: 'eq' (alias 'single') or 'compound'", OptionRole::Config),
-            opt("fields", "string", false, None, "Comma-separated whitelist of metadata field names (default: all eligible fields)", OptionRole::Config),
-            opt("exclude-fields", "string", false, None, "Comma-separated blacklist of metadata field names (applied after --fields)", OptionRole::Config),
-            opt("ops", "string", false, None, "Comma-separated operator families to emit: eq, lt, gt, le, ge, range, matches (default: all)", OptionRole::Config),
-            opt("proto-file", "Path", false, None, "Replay file produced by the wizard (e.g. predicates.slab.proto.json). Carries the template, source, and output paths so a single --proto-file invocation reproduces the run. Accepts .proto.json or .proto.yaml.", OptionRole::Input),
-            opt("proto", "string", false, None, "Inline predicate prototype (JSON or YAML, same schema as --proto-file). Format inferred from leading `{`.", OptionRole::Config),
-            opt("wizard", "bool", false, None, "Interactively build a predicate prototype and save it to <output>.proto.json (or --proto-file). Re-run later with --proto-file to replay the same config. Auto-detects metadata source from CWD when --source is omitted.", OptionRole::Config),
-            opt("seed", "int", false, Some("42"), "RNG seed", OptionRole::Config),
-            opt("min-unique-ratio", "float", false, Some("0.05"), "Minimum distinct/total predicate ratio; below this is logged as a WARNING or aborted with --strict-unique-ratio", OptionRole::Config),
-            opt("strict-unique-ratio", "bool", false, Some("false"), "When true, abort generation if unique-ratio falls below --min-unique-ratio instead of just warning", OptionRole::Config),
-        ]
+        let mut options = vec![
+            opt(
+                "source",
+                "Path",
+                false,
+                None,
+                "Metadata source to survey (optional when --survey or --proto-file carries it)",
+                OptionRole::Input,
+            ),
+            opt(
+                "output",
+                "Path",
+                false,
+                None,
+                "Output slab of generated predicates (optional when --proto-file carries it; CLI wins on conflict)",
+                OptionRole::Output,
+            ),
+            opt(
+                "survey",
+                "Path",
+                false,
+                None,
+                "Pre-computed survey JSON from `analyze survey` (skips re-surveying)",
+                OptionRole::Input,
+            ),
+            opt(
+                "count",
+                "int",
+                false,
+                Some("100"),
+                "Number of predicates to generate",
+                OptionRole::Config,
+            ),
+            opt(
+                "selectivity",
+                "float",
+                false,
+                Some("0.1"),
+                "Target selectivity",
+                OptionRole::Config,
+            ),
+            opt(
+                "selectivity-max",
+                "float",
+                false,
+                None,
+                "Upper selectivity bound (random per-predicate within [selectivity, selectivity-max])",
+                OptionRole::Config,
+            ),
+            opt(
+                "samples",
+                "int",
+                false,
+                Some("1000"),
+                "Inline survey sample count when --survey is not supplied",
+                OptionRole::Config,
+            ),
+            opt(
+                "max-distinct",
+                "int",
+                false,
+                Some("100"),
+                "Max distinct values tracked per field (compat shim — actual cap comes from `analyze survey`)",
+                OptionRole::Config,
+            ),
+            opt(
+                "strategy",
+                "string",
+                false,
+                Some("eq"),
+                "Predicate strategy: 'eq' (alias 'single'), 'compound', or 'stratified' (drawn per family and selectivity decade from the survey's census; see the stratified options)",
+                OptionRole::Config,
+            ),
+            opt(
+                "fields",
+                "string",
+                false,
+                None,
+                "Comma-separated whitelist of metadata field names (default: all eligible fields)",
+                OptionRole::Config,
+            ),
+            opt(
+                "exclude-fields",
+                "string",
+                false,
+                None,
+                "Comma-separated blacklist of metadata field names (applied after --fields)",
+                OptionRole::Config,
+            ),
+            opt(
+                "ops",
+                "string",
+                false,
+                None,
+                "Comma-separated operator families to emit: eq, lt, gt, le, ge, range, matches (default: all)",
+                OptionRole::Config,
+            ),
+            opt(
+                "proto-file",
+                "Path",
+                false,
+                None,
+                "Replay file produced by the wizard (e.g. predicates.slab.proto.json). Carries the template, source, and output paths so a single --proto-file invocation reproduces the run. Accepts .proto.json or .proto.yaml.",
+                OptionRole::Input,
+            ),
+            opt(
+                "proto",
+                "string",
+                false,
+                None,
+                "Inline predicate prototype (JSON or YAML, same schema as --proto-file). Format inferred from leading `{`.",
+                OptionRole::Config,
+            ),
+            opt(
+                "wizard",
+                "bool",
+                false,
+                None,
+                "Interactively build a predicate prototype and save it to <output>.proto.json (or --proto-file). Re-run later with --proto-file to replay the same config. Auto-detects metadata source from CWD when --source is omitted.",
+                OptionRole::Config,
+            ),
+            opt(
+                "seed",
+                "int",
+                false,
+                Some("42"),
+                "RNG seed",
+                OptionRole::Config,
+            ),
+            opt(
+                "min-unique-ratio",
+                "float",
+                false,
+                Some("0.05"),
+                "Minimum distinct/total predicate ratio; below this is logged as a WARNING or aborted with --strict-unique-ratio",
+                OptionRole::Config,
+            ),
+            opt(
+                "strict-unique-ratio",
+                "bool",
+                false,
+                Some("false"),
+                "When true, abort generation if unique-ratio falls below --min-unique-ratio instead of just warning",
+                OptionRole::Config,
+            ),
+        ];
+        options.extend(super::gen_predicates_stratified::describe_options());
+        options
+    }
+
+    fn check_artifact(
+        &self,
+        output: &std::path::Path,
+        options: &Options,
+    ) -> crate::pipeline::command::ArtifactState {
+        use crate::pipeline::command::ArtifactState;
+        if options.get("strategy") == Some("stratified") {
+            if !output.exists() {
+                return ArtifactState::Absent;
+            }
+            return match super::gen_predicates_stratified::check_artifact(output) {
+                Some(true) => ArtifactState::Complete,
+                _ => ArtifactState::Partial,
+            };
+        }
+        crate::pipeline::bound::check_artifact_default(output, options)
     }
 
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
         crate::pipeline::command::manifest_from_keys(
-            step_id, self.command_path(), options,
+            step_id,
+            self.command_path(),
+            options,
             &["source", "survey"],
             &["output"],
         )
@@ -554,19 +801,23 @@ impl CommandOp for GenPredicatesOp {
 pub(crate) struct OperatorMask(u32);
 
 impl OperatorMask {
-    const EQ:      u32 = 1 << 0;
-    const LT:      u32 = 1 << 1;
-    const GT:      u32 = 1 << 2;
-    const LE:      u32 = 1 << 3;
-    const GE:      u32 = 1 << 4;
-    const RANGE:   u32 = 1 << 5; // numeric Range (two-sided) – currently emits Lt at low/high
+    const EQ: u32 = 1 << 0;
+    const LT: u32 = 1 << 1;
+    const GT: u32 = 1 << 2;
+    const LE: u32 = 1 << 3;
+    const GE: u32 = 1 << 4;
+    const RANGE: u32 = 1 << 5; // numeric Range (two-sided) – currently emits Lt at low/high
     const MATCHES: u32 = 1 << 6;
 
     /// All families allowed — matches pre-flag behaviour so an
     /// invocation without `--ops` runs unchanged.
-    pub(crate) fn all() -> Self { Self(u32::MAX) }
+    pub(crate) fn all() -> Self {
+        Self(u32::MAX)
+    }
 
-    fn allows(self, bit: u32) -> bool { self.0 & bit != 0 }
+    fn allows(self, bit: u32) -> bool {
+        self.0 & bit != 0
+    }
 
     /// Parse a comma-separated list of family names. Returns
     /// `Err(msg)` for unknown tokens so the operator-typo case
@@ -576,7 +827,9 @@ impl OperatorMask {
         let mut bits: u32 = 0;
         for raw in s.split(',') {
             let tok = raw.trim().to_ascii_lowercase();
-            if tok.is_empty() { continue; }
+            if tok.is_empty() {
+                continue;
+            }
             bits |= match tok.as_str() {
                 "eq" => Self::EQ,
                 "lt" => Self::LT,
@@ -585,10 +838,12 @@ impl OperatorMask {
                 "ge" => Self::GE,
                 "range" => Self::RANGE,
                 "matches" => Self::MATCHES,
-                other => return Err(format!(
-                    "unknown operator family '{other}'. \
+                other => {
+                    return Err(format!(
+                        "unknown operator family '{other}'. \
                      Expected one of: eq, lt, gt, le, ge, range, matches",
-                )),
+                    ));
+                }
             };
         }
         if bits == 0 {
@@ -601,13 +856,19 @@ impl OperatorMask {
     /// inequality (Lt/Gt/Le/Ge/Range) — the family numeric
     /// fields with quantile sketches emit.
     fn allows_numeric_inequality(self) -> bool {
-        self.allows(Self::LT) || self.allows(Self::GT)
-            || self.allows(Self::LE) || self.allows(Self::GE)
+        self.allows(Self::LT)
+            || self.allows(Self::GT)
+            || self.allows(Self::LE)
+            || self.allows(Self::GE)
             || self.allows(Self::RANGE)
     }
 
-    fn allows_eq(self) -> bool { self.allows(Self::EQ) }
-    fn allows_matches(self) -> bool { self.allows(Self::MATCHES) }
+    fn allows_eq(self) -> bool {
+        self.allows(Self::EQ)
+    }
+    fn allows_matches(self) -> bool {
+        self.allows(Self::MATCHES)
+    }
 
     /// Translate a `PNode::Predicate.op` to its mask bit. Used by
     /// the generators to filter their internal op-pick draws.
@@ -643,10 +904,19 @@ fn parse_csv_field_list(s: &str) -> Vec<String> {
 /// only listed names; blacklist drops named entries
 /// unconditionally. Both filters compare case-sensitive exact
 /// names — the metadata schema is authoritative.
-fn field_passes_name_filter(name: &str, whitelist: Option<&[String]>, blacklist: &[String]) -> bool {
+fn field_passes_name_filter(
+    name: &str,
+    whitelist: Option<&[String]>,
+    blacklist: &[String],
+) -> bool {
     if let Some(allowed) = whitelist
-        && !allowed.iter().any(|n| n == name) { return false; }
-    if blacklist.iter().any(|n| n == name) { return false; }
+        && !allowed.iter().any(|n| n == name)
+    {
+        return false;
+    }
+    if blacklist.iter().any(|n| n == name) {
+        return false;
+    }
     true
 }
 
@@ -666,8 +936,10 @@ fn field_supports_any_op(profile: &FieldProfile, mask: OperatorMask) -> bool {
                 || (profile.measures.contains_key("HeavyHitters") && mask.allows_eq())
                 || (profile.measures.contains_key("Reservoir") && mask.allows_eq())
         }
-        Some(SemanticType::Identifier(_)) | Some(SemanticType::FreeText)
-        | Some(SemanticType::Structured(_)) | Some(SemanticType::Categorical(_)) => {
+        Some(SemanticType::Identifier(_))
+        | Some(SemanticType::FreeText)
+        | Some(SemanticType::Structured(_))
+        | Some(SemanticType::Categorical(_)) => {
             (profile.measures.contains_key("TrigramHeavyHitters") && mask.allows_matches())
                 || (profile.measures.contains_key("LabelsetHeavyHitters") && mask.allows_matches())
                 || (exact_value_counts(profile).is_some() && mask.allows_eq())
@@ -684,7 +956,9 @@ fn field_supports_any_op(profile: &FieldProfile, mask: OperatorMask) -> bool {
 /// canonical value key, so every consumer of one reads the other and
 /// a censused field's selectivities become exact without any change
 /// here (SRD TS-144).
-pub(super) fn exact_value_counts(profile: &FieldProfile) -> Option<&indexmap::IndexMap<String, u64>> {
+pub(super) fn exact_value_counts(
+    profile: &FieldProfile,
+) -> Option<&indexmap::IndexMap<String, u64>> {
     match profile.measures.get("ExactValueCensus") {
         Some(MeasureReport::ExactValueCensus(c)) => Some(&c.counts),
         _ => match profile.measures.get("ExactFrequencyTable") {
@@ -728,12 +1002,13 @@ fn generate_eq_predicate(
     let idx = pick_target_field(eligible, target_sel, rng);
     let (name, profile) = eligible[idx];
     let field = FieldRef::Named(name.to_string());
-    build_predicate_for_field(field, profile, target_sel, op_mask, rng)
-        .unwrap_or_else(|| PNode::Predicate(PredicateNode {
+    build_predicate_for_field(field, profile, target_sel, op_mask, rng).unwrap_or_else(|| {
+        PNode::Predicate(PredicateNode {
             field: FieldRef::Named(name.to_string()),
             op: OpType::Eq,
             comparands: vec![Comparand::Null],
-        }))
+        })
+    })
 }
 
 /// AND together 2-3 `generate_eq_predicate` calls — selectivity
@@ -747,7 +1022,11 @@ fn generate_compound_predicate(
     op_mask: OperatorMask,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> PNode {
-    let arity = if eligible.len() >= 3 { rng.random_range(2..=3) } else { 2.min(eligible.len()) };
+    let arity = if eligible.len() >= 3 {
+        rng.random_range(2..=3)
+    } else {
+        2.min(eligible.len())
+    };
     if arity < 2 {
         return generate_eq_predicate(eligible, target_sel, op_mask, rng);
     }
@@ -856,16 +1135,23 @@ fn field_can_hit_target(profile: &FieldProfile, target_sel: f64) -> bool {
     let target_count = (total * target_sel).max(1.0);
     let tolerance = (target_count * 2.0).max(1.0);
     if let Some(counts) = exact_value_counts(profile) {
-        let closest = counts.values()
+        let closest = counts
+            .values()
             .map(|c| (*c as f64 - target_count).abs())
             .fold(f64::MAX, f64::min);
-        if closest < tolerance { return true; }
+        if closest < tolerance {
+            return true;
+        }
     }
     if let Some(MeasureReport::HeavyHitters(h)) = profile.measures.get("HeavyHitters") {
-        let closest = h.items.iter()
+        let closest = h
+            .items
+            .iter()
             .map(|e| (e.count_lower_bound as f64 - target_count).abs())
             .fold(f64::MAX, f64::min);
-        if closest < tolerance { return true; }
+        if closest < tolerance {
+            return true;
+        }
     }
     false
 }
@@ -882,14 +1168,18 @@ fn build_predicate_for_field(
 ) -> Option<PNode> {
     match profile.semantic_type.as_ref()? {
         SemanticType::Boolean => {
-            if !op_mask.allows_eq() { return None; }
+            if !op_mask.allows_eq() {
+                return None;
+            }
             Some(boolean_predicate(field, rng))
         }
         SemanticType::Number(kind) => {
             if op_mask.allows_numeric_inequality()
-                && let Some(p) = numeric_predicate(field.clone(), profile, *kind, target_sel, op_mask, rng) {
-                    return Some(p);
-                }
+                && let Some(p) =
+                    numeric_predicate(field.clone(), profile, *kind, target_sel, op_mask, rng)
+            {
+                return Some(p);
+            }
             if op_mask.allows_eq() {
                 if let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
                     return Some(p);
@@ -900,9 +1190,17 @@ fn build_predicate_for_field(
         }
         SemanticType::Temporal(_) => {
             if op_mask.allows_numeric_inequality()
-                && let Some(p) = numeric_predicate(field.clone(), profile, NumberKind::Floating, target_sel, op_mask, rng) {
-                    return Some(p);
-                }
+                && let Some(p) = numeric_predicate(
+                    field.clone(),
+                    profile,
+                    NumberKind::Floating,
+                    target_sel,
+                    op_mask,
+                    rng,
+                )
+            {
+                return Some(p);
+            }
             if op_mask.allows_eq() {
                 return reservoir_predicate(field, profile, false);
             }
@@ -921,20 +1219,28 @@ fn build_predicate_for_field(
             // chain handles it.
             let try_matches = op_mask.allows_matches();
             let try_eq = op_mask.allows_eq();
-            let prefer_matches = if try_matches && try_eq { rng.random_bool(0.5) }
-                else { try_matches };
-            if prefer_matches && try_matches
-                && let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng) {
-                    return Some(p);
-                }
+            let prefer_matches = if try_matches && try_eq {
+                rng.random_bool(0.5)
+            } else {
+                try_matches
+            };
+            if prefer_matches
+                && try_matches
+                && let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng)
+            {
+                return Some(p);
+            }
             if try_eq
-                && let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
-                    return Some(p);
-                }
-            if !prefer_matches && try_matches
-                && let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng) {
-                    return Some(p);
-                }
+                && let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng)
+            {
+                return Some(p);
+            }
+            if !prefer_matches
+                && try_matches
+                && let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng)
+            {
+                return Some(p);
+            }
             if try_eq {
                 return reservoir_predicate(field, profile, true);
             }
@@ -988,7 +1294,11 @@ fn numeric_predicate(
     // gap; floats stay on strict Lt / Gt because float equality
     // is brittle.
     let is_integer = matches!(kind, NumberKind::Integer { .. });
-    let (lt_op, gt_op) = if is_integer { (OpType::Le, OpType::Ge) } else { (OpType::Lt, OpType::Gt) };
+    let (lt_op, gt_op) = if is_integer {
+        (OpType::Le, OpType::Ge)
+    } else {
+        (OpType::Lt, OpType::Gt)
+    };
 
     // Constrain the three-way pick to ops the mask permits. The
     // mask was already verified at field-eligibility time
@@ -996,10 +1306,18 @@ fn numeric_predicate(
     // numeric inequalities, so this list is non-empty.
     let candidate_picks: Vec<u8> = {
         let mut c: Vec<u8> = Vec::with_capacity(3);
-        if op_mask.permits_op(lt_op) { c.push(0); }
-        if op_mask.permits_op(gt_op) { c.push(1); }
-        if op_mask.allows(OperatorMask::RANGE) || op_mask.permits_op(lt_op) { c.push(2); }
-        if c.is_empty() { return None; }
+        if op_mask.permits_op(lt_op) {
+            c.push(0);
+        }
+        if op_mask.permits_op(gt_op) {
+            c.push(1);
+        }
+        if op_mask.allows(OperatorMask::RANGE) || op_mask.permits_op(lt_op) {
+            c.push(2);
+        }
+        if c.is_empty() {
+            return None;
+        }
         c
     };
     let op_pick = candidate_picks[rng.random_range(0..candidate_picks.len())];
@@ -1025,7 +1343,11 @@ fn numeric_predicate(
             (lt_op, vec![make_comparand(v)])
         }
     };
-    Some(PNode::Predicate(PredicateNode { field, op, comparands }))
+    Some(PNode::Predicate(PredicateNode {
+        field,
+        op,
+        comparands,
+    }))
 }
 
 /// Look up the sketch value at the requested quantile, falling back
@@ -1042,14 +1364,24 @@ fn quantile_at(
     let parsed: Vec<(f64, f64)> = qs
         .quantiles
         .iter()
-        .filter_map(|(k, v)| k.strip_prefix('p').and_then(|n| n.parse::<f64>().ok()).map(|p| (p / 100.0, *v)))
+        .filter_map(|(k, v)| {
+            k.strip_prefix('p')
+                .and_then(|n| n.parse::<f64>().ok())
+                .map(|p| (p / 100.0, *v))
+        })
         .collect();
-    if parsed.is_empty() { return None; }
+    if parsed.is_empty() {
+        return None;
+    }
     // Find bracketing pair.
     let mut lo = parsed[0];
     let mut hi = *parsed.last().unwrap();
-    if target <= lo.0 { return Some(lo.1); }
-    if target >= hi.0 { return Some(hi.1); }
+    if target <= lo.0 {
+        return Some(lo.1);
+    }
+    if target >= hi.0 {
+        return Some(hi.1);
+    }
     for w in parsed.windows(2) {
         if w[0].0 <= target && target <= w[1].0 {
             lo = w[0];
@@ -1078,10 +1410,7 @@ fn categorical_predicate(
     // present; fall back to heavy hitters. All report (value_string,
     // count).
     let candidates: Vec<(String, f64)> = match exact_value_counts(profile) {
-        Some(counts) => counts
-            .iter()
-            .map(|(k, c)| (k.clone(), *c as f64))
-            .collect(),
+        Some(counts) => counts.iter().map(|(k, c)| (k.clone(), *c as f64)).collect(),
         None => match profile.measures.get("HeavyHitters") {
             Some(MeasureReport::HeavyHitters(h)) => h
                 .items
@@ -1139,17 +1468,22 @@ fn labelset_matches_predicate(
     target_sel: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> Option<PNode> {
-    let MeasureReport::LabelsetHeavyHitters(l) =
-        profile.measures.get("LabelsetHeavyHitters")?
-    else { return None };
-    if l.items.is_empty() || l.observed_records == 0 { return None; }
+    let MeasureReport::LabelsetHeavyHitters(l) = profile.measures.get("LabelsetHeavyHitters")?
+    else {
+        return None;
+    };
+    if l.items.is_empty() || l.observed_records == 0 {
+        return None;
+    }
 
     // Per-record sel ≈ count_lower_bound / observed_records,
     // assuming each record contains at most one occurrence of the
     // target label (labelsets typically dedupe).
     let total = l.observed_records.max(1) as f64;
     let target_count = (total * target_sel).max(1.0);
-    let candidates: Vec<(&str, f64)> = l.items.iter()
+    let candidates: Vec<(&str, f64)> = l
+        .items
+        .iter()
         .map(|e| (e.label.as_str(), e.count_lower_bound as f64))
         .collect();
     let label = sample_by_target_proximity(&candidates, target_count, rng)?;
@@ -1181,10 +1515,12 @@ fn trigram_matches_predicate(
     target_sel: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> Option<PNode> {
-    let MeasureReport::TrigramHeavyHitters(t) =
-        profile.measures.get("TrigramHeavyHitters")?
-    else { return None };
-    if t.items.is_empty() || t.sampled_trigrams == 0 { return None; }
+    let MeasureReport::TrigramHeavyHitters(t) = profile.measures.get("TrigramHeavyHitters")? else {
+        return None;
+    };
+    if t.items.is_empty() || t.sampled_trigrams == 0 {
+        return None;
+    }
 
     // Normalize by *records*, not trigram windows. Each record
     // contributes ~`avg_chars - 2` trigrams; using the larger
@@ -1192,7 +1528,9 @@ fn trigram_matches_predicate(
     // selectivity by exactly that ratio.
     let denom = profile.presence.present.max(1) as f64;
     let target_count = (denom * target_sel).max(1.0);
-    let candidates: Vec<(&str, f64)> = t.items.iter()
+    let candidates: Vec<(&str, f64)> = t
+        .items
+        .iter()
         .map(|e| (e.trigram.as_str(), e.count_lower_bound as f64))
         .collect();
     let trigram = sample_by_target_proximity(&candidates, target_count, rng)?;
@@ -1222,16 +1560,23 @@ fn sample_by_target_proximity<T: Copy>(
     target_count: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> Option<T> {
-    if candidates.is_empty() { return None; }
-    let weights: Vec<f64> = candidates.iter()
+    if candidates.is_empty() {
+        return None;
+    }
+    let weights: Vec<f64> = candidates
+        .iter()
         .map(|(_, c)| 1.0 / ((c - target_count).abs() + 1.0))
         .collect();
     let total: f64 = weights.iter().sum();
-    if total <= 0.0 { return Some(candidates[0].0); }
+    if total <= 0.0 {
+        return Some(candidates[0].0);
+    }
     let mut pick = rng.random_range(0.0..total);
     for ((value, _), w) in candidates.iter().zip(weights.iter()) {
         pick -= *w;
-        if pick <= 0.0 { return Some(*value); }
+        if pick <= 0.0 {
+            return Some(*value);
+        }
     }
     Some(candidates.last().unwrap().0)
 }
@@ -1239,11 +1584,7 @@ fn sample_by_target_proximity<T: Copy>(
 /// `Eq` predicate against a value drawn at random from the
 /// reservoir sample. Used when no frequency table or sketch is
 /// available — typical for `HighCardOrUnique` identifier fields.
-fn reservoir_predicate(
-    field: FieldRef,
-    profile: &FieldProfile,
-    text_only: bool,
-) -> Option<PNode> {
+fn reservoir_predicate(field: FieldRef, profile: &FieldProfile, text_only: bool) -> Option<PNode> {
     let MeasureReport::ReservoirSample(r) = profile.measures.get("ReservoirSample")? else {
         return None;
     };
@@ -1252,7 +1593,9 @@ fn reservoir_predicate(
         serde_json::Value::String(s) => Comparand::Text(s.clone()),
         serde_json::Value::Bool(b) => Comparand::Bool(*b),
         serde_json::Value::Number(n) => {
-            if text_only { return None; }
+            if text_only {
+                return None;
+            }
             if let Some(i) = n.as_i64() {
                 Comparand::Int(i)
             } else if let Some(f) = n.as_f64() {
@@ -1308,8 +1651,10 @@ pub(super) fn draw_comparand_for_field(
             _ => return None,
         };
         let v = quantile_at(qs, q)?;
-        let as_int = matches!(profile.semantic_type,
-            Some(SemanticType::Number(NumberKind::Integer { .. })));
+        let as_int = matches!(
+            profile.semantic_type,
+            Some(SemanticType::Number(NumberKind::Integer { .. }))
+        );
         return Some(if as_int {
             Comparand::Int(v.round() as i64)
         } else {
@@ -1336,9 +1681,7 @@ pub(super) fn draw_comparand_for_field(
     // MATCHES — trigram / labelset.
     if matches!(op, OpType::Matches) {
         let dummy = FieldRef::Named(String::new());
-        if let Some(PNode::Predicate(p)) =
-            matches_predicate(dummy, profile, target_sel, rng)
-        {
+        if let Some(PNode::Predicate(p)) = matches_predicate(dummy, profile, target_sel, rng) {
             return p.comparands.into_iter().next();
         }
         return None;
@@ -1349,30 +1692,93 @@ pub(super) fn draw_comparand_for_field(
     None
 }
 
-/// Convert a frequency-table key string back into a `Comparand`
-/// of the right kind. The keys are stable `Debug`-formatted MValues
-/// (mirroring `canonical_distinct_key`), so a `Text("foo")` key
-/// shows up as `Text("foo")` and we recover the inner literal.
-fn value_to_eq_predicate(field: FieldRef, key: &str) -> PNode {
-    let comparand = if let Some(inner) = key.strip_prefix("Text(").and_then(|s| s.strip_suffix(')')) {
-        // Strip the surrounding "..." quotes if present.
-        let trimmed = inner.trim_matches('"');
-        Comparand::Text(trimmed.to_string())
-    } else if let Some(inner) = key.strip_prefix("Int(").and_then(|s| s.strip_suffix(')')) {
-        inner.parse::<i64>().map(Comparand::Int).unwrap_or(Comparand::Text(inner.to_string()))
-    } else if let Some(inner) = key.strip_prefix("Int32(").and_then(|s| s.strip_suffix(')')) {
-        inner.parse::<i32>().map(|v| Comparand::Int(v as i64)).unwrap_or(Comparand::Text(inner.to_string()))
-    } else if let Some(inner) = key.strip_prefix("Float(").and_then(|s| s.strip_suffix(')')) {
-        inner.parse::<f64>().map(Comparand::Float).unwrap_or(Comparand::Text(inner.to_string()))
-    } else if let Some(inner) = key.strip_prefix("Bool(").and_then(|s| s.strip_suffix(')')) {
-        Comparand::Bool(inner == "true")
-    } else {
-        Comparand::Text(key.to_string())
+/// Convert a canonical value key — the stable `Debug`-formatted
+/// `MValue` that `canonical_distinct_key` renders, shared by the
+/// survey's frequency tables and census tables — back into a
+/// `Comparand` of the right kind. Text-shaped variants recover the
+/// inner literal, including the escapes `Debug` applied; integer
+/// variants of every width become `Int`, which the evaluator compares
+/// against any integer wire width.
+pub(super) fn comparand_from_key(key: &str) -> Comparand {
+    let inner_of = |variant: &str| -> Option<&str> {
+        key.strip_prefix(variant)
+            .and_then(|s| s.strip_prefix('('))
+            .and_then(|s| s.strip_suffix(')'))
     };
+    let unquote = |inner: &str| -> String {
+        // `Debug` of a string: quoted, with escapes.
+        let body = inner
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(inner);
+        let mut out = String::with_capacity(body.len());
+        let mut chars = body.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('0') => out.push('\0'),
+                    Some('u') => {
+                        // \u{XXXX}
+                        let mut hex = String::new();
+                        if chars.next() == Some('{') {
+                            for h in chars.by_ref() {
+                                if h == '}' {
+                                    break;
+                                }
+                                hex.push(h);
+                            }
+                        }
+                        if let Some(ch) =
+                            u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                        {
+                            out.push(ch);
+                        }
+                    }
+                    Some(other) => out.push(other),
+                    None => {}
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    for variant in ["Text", "Ascii", "EnumStr", "Date", "Time", "DateTime"] {
+        if let Some(inner) = inner_of(variant) {
+            return Comparand::Text(unquote(inner));
+        }
+    }
+    for variant in ["Int", "Int32", "Short", "EnumOrd", "Millis"] {
+        if let Some(inner) = inner_of(variant) {
+            return inner
+                .parse::<i64>()
+                .map(Comparand::Int)
+                .unwrap_or(Comparand::Text(inner.to_string()));
+        }
+    }
+    for variant in ["Float", "Float32"] {
+        if let Some(inner) = inner_of(variant) {
+            return inner
+                .parse::<f64>()
+                .map(Comparand::Float)
+                .unwrap_or(Comparand::Text(inner.to_string()));
+        }
+    }
+    if let Some(inner) = inner_of("Bool") {
+        return Comparand::Bool(inner == "true");
+    }
+    Comparand::Text(key.to_string())
+}
+
+/// An equality predicate on `field` for a canonical value key.
+fn value_to_eq_predicate(field: FieldRef, key: &str) -> PNode {
     PNode::Predicate(PredicateNode {
         field,
         op: OpType::Eq,
-        comparands: vec![comparand],
+        comparands: vec![comparand_from_key(key)],
     })
 }
 
@@ -1411,12 +1817,12 @@ fn render_template_from_pnode(node: &PNode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use veks_core::formats::mnode::{MNode, MValue};
-    use veks_core::formats::pnode::PNode as FmtPNode;
     use crate::pipeline::command::StreamContext;
     use crate::pipeline::progress::ProgressLog;
     use indexmap::IndexMap;
     use slabtastic::SlabReader;
+    use veks_core::formats::mnode::{MNode, MValue};
+    use veks_core::formats::pnode::PNode as FmtPNode;
 
     fn test_ctx(dir: &std::path::Path) -> StreamContext {
         StreamContext {
@@ -1438,7 +1844,11 @@ mod tests {
         }
     }
 
-    fn create_test_metadata_slab(dir: &std::path::Path, name: &str, records: Vec<MNode>) -> std::path::PathBuf {
+    fn create_test_metadata_slab(
+        dir: &std::path::Path,
+        name: &str,
+        records: Vec<MNode>,
+    ) -> std::path::PathBuf {
         let path = dir.join(name);
         let config = WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
         let mut writer = SlabWriter::new(&path, config).unwrap();
@@ -1481,15 +1891,29 @@ mod tests {
 
         let mut op = GenPredicatesOp;
         let result = op.execute(&opts, &mut ctx);
-        assert_eq!(result.status, Status::Ok, "gen predicates failed: {}", result.message);
-        assert!(result.message.contains("10 predicates generated"), "message: {}", result.message);
+        assert_eq!(
+            result.status,
+            Status::Ok,
+            "gen predicates failed: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("10 predicates generated"),
+            "message: {}",
+            result.message
+        );
 
         // Verify output slab has decodable PNodes
         let reader = SlabReader::open(&output_path).unwrap();
         for i in 0..10 {
             let data = reader.get(i).unwrap();
             let pnode = FmtPNode::from_bytes_named(&data);
-            assert!(pnode.is_ok(), "predicate {} failed to decode: {:?}", i, pnode.err());
+            assert!(
+                pnode.is_ok(),
+                "predicate {} failed to decode: {:?}",
+                i,
+                pnode.err()
+            );
             // Check that the pnode references field names from the schema
             let pnode = pnode.unwrap();
             let text = format!("{}", pnode);
@@ -1497,7 +1921,11 @@ mod tests {
                 || text.contains("name")
                 || text.contains("score")
                 || text.contains("active");
-            assert!(has_field, "predicate {} doesn't mention any field: {}", i, text);
+            assert!(
+                has_field,
+                "predicate {} doesn't mention any field: {}",
+                i, text
+            );
         }
     }
 
@@ -1521,8 +1949,17 @@ mod tests {
 
         let mut op = GenPredicatesOp;
         let result = op.execute(&opts, &mut ctx);
-        assert_eq!(result.status, Status::Ok, "gen predicates failed: {}", result.message);
-        assert!(result.message.contains("20 predicates generated"), "message: {}", result.message);
+        assert_eq!(
+            result.status,
+            Status::Ok,
+            "gen predicates failed: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("20 predicates generated"),
+            "message: {}",
+            result.message
+        );
 
         // Verify we can read all 20
         let reader = SlabReader::open(&output_path).unwrap();
@@ -1553,8 +1990,17 @@ mod tests {
 
         let mut op = GenPredicatesOp;
         let result = op.execute(&opts, &mut ctx);
-        assert_eq!(result.status, Status::Ok, "gen predicates failed: {}", result.message);
-        assert!(result.message.contains("0 predicates"), "message: {}", result.message);
+        assert_eq!(
+            result.status,
+            Status::Ok,
+            "gen predicates failed: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("0 predicates"),
+            "message: {}",
+            result.message
+        );
     }
 
     /// A `Categorical(Labelset)`-shaped text field should yield
@@ -1614,11 +2060,13 @@ mod tests {
             let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
             if let FmtPNode::Predicate(p) = &pnode
                 && p.op == OpType::Matches
-                    && let Some(Comparand::Text(pat)) = p.comparands.first()
-                        && pat.starts_with("(^|, ") && pat.ends_with("(,|$)") {
-                            saw_anchored = true;
-                            break;
-                        }
+                && let Some(Comparand::Text(pat)) = p.comparands.first()
+                && pat.starts_with("(^|, ")
+                && pat.ends_with("(,|$)")
+            {
+                saw_anchored = true;
+                break;
+            }
         }
         assert!(
             saw_anchored,
@@ -1649,7 +2097,11 @@ mod tests {
             let mut node = MNode::new();
             // 80% of values are <10, 20% are 100..1000 — a long
             // right tail.
-            let v = if i < 1600 { i % 10 } else { 100 + ((i - 1600) % 900) };
+            let v = if i < 1600 {
+                i % 10
+            } else {
+                100 + ((i - 1600) % 900)
+            };
             node.insert("skewed".into(), MValue::Int(v));
             records.push(node);
         }
@@ -1703,12 +2155,16 @@ mod tests {
                         OpType::Ge => *v >= threshold,
                         _ => false,
                     };
-                    if hit { matched += 1; }
+                    if hit {
+                        matched += 1;
+                    }
                 }
             }
             total_matches += matched;
         }
-        if pred_count == 0 { return; }
+        if pred_count == 0 {
+            return;
+        }
         let observed_sel = total_matches as f64 / (pred_count as f64 * raw_count as f64);
         let target_sel = 0.10;
         let err = (observed_sel - target_sel).abs();
@@ -1743,17 +2199,24 @@ mod tests {
         //  - `skewed_int`      — 80% in [0,10], 20% in [100,1000]
         //  - `category`        — 8 distinct labels, weighted
         let labels = [
-            "alpha", "beta", "gamma", "delta",
-            "epsilon", "zeta", "eta", "theta",
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
         ];
         let mut records = Vec::with_capacity(5_000);
         for i in 0..5_000i64 {
             let mut node = MNode::new();
             node.insert("uniform_int".into(), MValue::Int(i % 10_000));
-            let skewed = if i < 4_000 { i % 10 } else { 100 + ((i - 4_000) % 900) };
+            let skewed = if i < 4_000 {
+                i % 10
+            } else {
+                100 + ((i - 4_000) % 900)
+            };
             node.insert("skewed_int".into(), MValue::Int(skewed));
             // Weighted: half are "alpha", the rest spread across the others.
-            let label_idx = if i < 2_500 { 0 } else { ((i - 2_500) as usize) % 7 + 1 };
+            let label_idx = if i < 2_500 {
+                0
+            } else {
+                ((i - 2_500) as usize) % 7 + 1
+            };
             node.insert("category".into(), MValue::Text(labels[label_idx].into()));
             records.push(node);
         }
@@ -1772,7 +2235,8 @@ mod tests {
             let mut op = GenPredicatesOp;
             let r = op.execute(&opts, &mut ctx);
             assert_eq!(
-                r.status, Status::Ok,
+                r.status,
+                Status::Ok,
                 "generate predicates @sel={target_sel}: {}",
                 r.message,
             );
@@ -1790,7 +2254,9 @@ mod tests {
             for ord in 0..pred_count {
                 let bytes = preds.get(ord as i64).unwrap();
                 let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
-                let FmtPNode::Predicate(p) = &pnode else { continue };
+                let FmtPNode::Predicate(p) = &pnode else {
+                    continue;
+                };
                 // Capture field name + op + threshold for numeric
                 // assertions; non-numeric predicates contribute
                 // through their evaluator-side outcomes too.
@@ -1800,7 +2266,9 @@ mod tests {
                     let hit = evaluate_simple_predicate(p, &node);
                     if hit.is_some() {
                         scored += 1;
-                        if hit == Some(true) { hits += 1; }
+                        if hit == Some(true) {
+                            hits += 1;
+                        }
                     } else {
                         // Operator we don't handle in this assertion harness
                         // (e.g. MATCHES with a regex pattern) — just count
@@ -1810,7 +2278,9 @@ mod tests {
                     }
                 }
             }
-            if scored == 0 { continue; }
+            if scored == 0 {
+                continue;
+            }
             let observed_sel = hits as f64 / scored as f64;
             let err = (observed_sel - target_sel).abs();
             assert!(
@@ -1825,7 +2295,10 @@ mod tests {
     /// `Some(true)` / `Some(false)` for operators this harness
     /// supports, `None` for anything else (so the caller can
     /// account for it separately).
-    fn evaluate_simple_predicate(p: &veks_core::formats::pnode::PredicateNode, node: &MNode) -> Option<bool> {
+    fn evaluate_simple_predicate(
+        p: &veks_core::formats::pnode::PredicateNode,
+        node: &MNode,
+    ) -> Option<bool> {
         use veks_core::formats::pnode::FieldRef;
         let field_name = match &p.field {
             FieldRef::Named(n) => n.as_str(),
@@ -1858,13 +2331,18 @@ mod tests {
     /// field-filter and op-filter tests.
     fn make_mixed_records() -> Vec<MNode> {
         let labels = ["alpha", "beta", "gamma", "delta", "epsilon"];
-        (0..500i64).map(|i| {
-            let mut node = MNode::new();
-            node.insert("age".into(), MValue::Int(i % 100));
-            node.insert("score".into(), MValue::Int(i % 50 + 1));
-            node.insert("name".into(), MValue::Text(labels[(i as usize) % labels.len()].into()));
-            node
-        }).collect()
+        (0..500i64)
+            .map(|i| {
+                let mut node = MNode::new();
+                node.insert("age".into(), MValue::Int(i % 100));
+                node.insert("score".into(), MValue::Int(i % 50 + 1));
+                node.insert(
+                    "name".into(),
+                    MValue::Text(labels[(i as usize) % labels.len()].into()),
+                );
+                node
+            })
+            .collect()
     }
 
     fn read_emitted_ops(output_path: &std::path::Path) -> Vec<OpType> {
@@ -1873,7 +2351,9 @@ mod tests {
         for i in 0..reader.total_records() {
             let bytes = reader.get(i as i64).unwrap();
             let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
-            if let FmtPNode::Predicate(p) = pnode { ops.push(p.op); }
+            if let FmtPNode::Predicate(p) = pnode {
+                ops.push(p.op);
+            }
         }
         ops
     }
@@ -1886,7 +2366,10 @@ mod tests {
             let bytes = reader.get(i as i64).unwrap();
             let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
             if let FmtPNode::Predicate(p) = pnode
-                && let FieldRef::Named(n) = p.field { names.push(n); }
+                && let FieldRef::Named(n) = p.field
+            {
+                names.push(n);
+            }
         }
         names
     }
@@ -1940,8 +2423,10 @@ mod tests {
         let names = read_emitted_field_names(&output_path);
         assert!(!names.is_empty(), "expected some predicates");
         for n in &names {
-            assert!(n != "age" && n != "score",
-                "exclude-fields must drop both numeric fields, got {n}");
+            assert!(
+                n != "age" && n != "score",
+                "exclude-fields must drop both numeric fields, got {n}"
+            );
         }
     }
 
@@ -1994,8 +2479,11 @@ mod tests {
         let ops = read_emitted_ops(&output_path);
         assert!(!ops.is_empty(), "expected some predicates");
         for op in &ops {
-            assert_eq!(*op, OpType::Matches,
-                "ops=matches must yield only MATCHES, saw {op:?}");
+            assert_eq!(
+                *op,
+                OpType::Matches,
+                "ops=matches must yield only MATCHES, saw {op:?}"
+            );
         }
     }
 
@@ -2023,14 +2511,17 @@ mod tests {
         let ops = read_emitted_ops(&output_path);
         assert!(!ops.is_empty(), "expected some predicates");
         for op in &ops {
-            assert!(matches!(*op,
-                OpType::Lt | OpType::Le | OpType::Gt | OpType::Ge),
-                "ops=lt,gt,le,ge,range must yield only numeric inequalities, saw {op:?}");
+            assert!(
+                matches!(*op, OpType::Lt | OpType::Le | OpType::Gt | OpType::Ge),
+                "ops=lt,gt,le,ge,range must yield only numeric inequalities, saw {op:?}"
+            );
         }
         let names = read_emitted_field_names(&output_path);
         for n in &names {
-            assert!(n != "name",
-                "text field 'name' shouldn't appear with numeric-only --ops, saw {n}");
+            assert!(
+                n != "name",
+                "text field 'name' shouldn't appear with numeric-only --ops, saw {n}"
+            );
         }
     }
 
@@ -2050,10 +2541,16 @@ mod tests {
         opts.set("ops", "eq,not-a-real-op".to_string());
 
         let r = GenPredicatesOp.execute(&opts, &mut ctx);
-        assert_eq!(r.status, Status::Error,
-            "unknown operator family must error at launch");
-        assert!(r.message.contains("not-a-real-op"),
-            "error should mention the bad token, got '{}'", r.message);
+        assert_eq!(
+            r.status,
+            Status::Error,
+            "unknown operator family must error at launch"
+        );
+        assert!(
+            r.message.contains("not-a-real-op"),
+            "error should mention the bad token, got '{}'",
+            r.message
+        );
     }
 
     /// End-to-end: a `--proto` (inline YAML) with a Display-form
@@ -2111,13 +2608,17 @@ source: "{}"
                         // we only pin what the template said.
                         assert_eq!(p.op, OpType::Ge);
                         assert!(matches!(p.comparands.first(), Some(Comparand::Int(_))));
-                    } else { panic!("child 0 must be a leaf predicate"); }
+                    } else {
+                        panic!("child 0 must be a leaf predicate");
+                    }
                     // second child: name MATCHES text
                     if let PNode::Predicate(p) = &c.children[1] {
                         assert_eq!(p.field, FieldRef::Named("name".into()));
                         assert_eq!(p.op, OpType::Matches);
                         assert!(matches!(p.comparands.first(), Some(Comparand::Text(_))));
-                    } else { panic!("child 1 must be a leaf predicate"); }
+                    } else {
+                        panic!("child 1 must be a leaf predicate");
+                    }
                 }
                 _ => panic!("proto template was AND of two predicates — got non-conjugate"),
             }
@@ -2160,8 +2661,11 @@ source: "{}"
                 PNode::Predicate(p) => {
                     assert_eq!(p.field, FieldRef::Named("age".into()));
                     assert_eq!(p.op, OpType::Eq);
-                    assert_eq!(p.comparands, vec![Comparand::Int(50)],
-                        "literal pinned comparand must be emitted verbatim");
+                    assert_eq!(
+                        p.comparands,
+                        vec![Comparand::Int(50)],
+                        "literal pinned comparand must be emitted verbatim"
+                    );
                 }
                 _ => panic!("expected leaf predicate"),
             }
@@ -2192,9 +2696,9 @@ source: "{}"
 
         // The :survey namespace must hold exactly one record:
         // the serialised SurveyReport.
-        let survey_reader = slabtastic::SlabReader::open_namespace(
-            &output_path, Some(SURVEY_NAMESPACE),
-        ).expect("survey namespace must be present");
+        let survey_reader =
+            slabtastic::SlabReader::open_namespace(&output_path, Some(SURVEY_NAMESPACE))
+                .expect("survey namespace must be present");
         assert_eq!(survey_reader.total_records(), 1);
         let bytes = survey_reader.get(0).unwrap();
         // Round-trip through SurveyReport — same JSON contract
@@ -2202,8 +2706,10 @@ source: "{}"
         // consumes a survey.json can consume this too.
         let parsed: crate::pipeline::commands::survey::SurveyReport =
             serde_json::from_slice(&bytes).expect("survey JSON parses");
-        assert!(!parsed.fields.is_empty(),
-            "embedded survey must carry at least one field profile");
+        assert!(
+            !parsed.fields.is_empty(),
+            "embedded survey must carry at least one field profile"
+        );
     }
 
     /// Every predicate slab emitted by `generate predicates`
@@ -2237,11 +2743,14 @@ source: "{}"
         assert_eq!(content_reader.total_records(), 10);
 
         // The schema namespace holds exactly one record.
-        let schema_reader = slabtastic::SlabReader::open_namespace(
-            &output_path, Some(SCHEMA_NAMESPACE),
-        ).expect("schema namespace must be present");
-        assert_eq!(schema_reader.total_records(), 1,
-            "schema namespace should hold exactly one descriptor");
+        let schema_reader =
+            slabtastic::SlabReader::open_namespace(&output_path, Some(SCHEMA_NAMESPACE))
+                .expect("schema namespace must be present");
+        assert_eq!(
+            schema_reader.total_records(),
+            1,
+            "schema namespace should hold exactly one descriptor"
+        );
         let bytes = schema_reader.get(0).unwrap();
         let schema = PredicateSchema::from_json_bytes(&bytes)
             .expect("schema record must parse as PredicateSchema");
@@ -2255,8 +2764,11 @@ source: "{}"
         // — that's the templating signature of "fill from
         // survey", and confirms render_template_from_pnode did
         // its substitution.
-        assert!(schema.template.contains('?'),
-            "template should contain `?` placeholder(s), got {:?}", schema.template);
+        assert!(
+            schema.template.contains('?'),
+            "template should contain `?` placeholder(s), got {:?}",
+            schema.template
+        );
     }
 
     /// Proto-driven generation must persist the *proto's*
@@ -2289,9 +2801,8 @@ source: "{}"
         let r = GenPredicatesOp.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok, "{}", r.message);
 
-        let schema_reader = slabtastic::SlabReader::open_namespace(
-            &output_path, Some(SCHEMA_NAMESPACE),
-        ).unwrap();
+        let schema_reader =
+            slabtastic::SlabReader::open_namespace(&output_path, Some(SCHEMA_NAMESPACE)).unwrap();
         let bytes = schema_reader.get(0).unwrap();
         let schema = PredicateSchema::from_json_bytes(&bytes).unwrap();
         assert_eq!(schema.template, "(age >= ? AND name MATCHES ?)");
@@ -2310,10 +2821,14 @@ source: "{}"
         let mut ctx = test_ctx(ws);
         let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
         let proto_path = ws.join("p.proto.yaml");
-        std::fs::write(&proto_path, format!(
-            "template: \"age >= ?\"\ncount: 5\nselectivity: 0.1\nseed: 17\nsource: \"{}\"\n",
-            input_path.to_string_lossy()
-        )).unwrap();
+        std::fs::write(
+            &proto_path,
+            format!(
+                "template: \"age >= ?\"\ncount: 5\nselectivity: 0.1\nseed: 17\nsource: \"{}\"\n",
+                input_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
 
         let output_path = ws.join("preds.slab");
         let mut opts = Options::new();
@@ -2356,8 +2871,10 @@ source: "{}"
 
         let r = GenPredicatesOp.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok, "{}", r.message);
-        assert!(SlabReader::open(&output_path).unwrap().total_records() > 0,
-            "output slab from proto-only invocation should contain predicates");
+        assert!(
+            SlabReader::open(&output_path).unwrap().total_records() > 0,
+            "output slab from proto-only invocation should contain predicates"
+        );
     }
 
     /// CLI `--output` beats the proto's `output` field. The
@@ -2389,10 +2906,14 @@ source: "{}"
 
         let r = GenPredicatesOp.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok, "{}", r.message);
-        assert!(SlabReader::open(&cli_output).unwrap().total_records() > 0,
-            "CLI --output should be the write target");
-        assert!(!proto_output.exists(),
-            "proto's `output` should NOT be written when CLI --output is set");
+        assert!(
+            SlabReader::open(&cli_output).unwrap().total_records() > 0,
+            "CLI --output should be the write target"
+        );
+        assert!(
+            !proto_output.exists(),
+            "proto's `output` should NOT be written when CLI --output is set"
+        );
     }
 
     /// Helpful error when neither CLI nor proto supplies an
@@ -2411,10 +2932,16 @@ source: "{}"
 
         let r = GenPredicatesOp.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Error);
-        assert!(r.message.contains("--output"),
-            "error must mention --output flag: {}", r.message);
-        assert!(r.message.contains("proto"),
-            "error must mention proto file alternative: {}", r.message);
+        assert!(
+            r.message.contains("--output"),
+            "error must mention --output flag: {}",
+            r.message
+        );
+        assert!(
+            r.message.contains("proto"),
+            "error must mention proto file alternative: {}",
+            r.message
+        );
     }
 
     /// `sample_by_target_proximity` returns a distribution over
@@ -2425,18 +2952,21 @@ source: "{}"
     fn proximity_sampler_produces_diverse_picks() {
         let mut rng = rng::seeded_rng(42);
         let candidates: Vec<(&str, f64)> = vec![
-            ("alpha",   95.0),
-            ("beta",    100.0),
-            ("gamma",   105.0),
-            ("delta",   110.0),
+            ("alpha", 95.0),
+            ("beta", 100.0),
+            ("gamma", 105.0),
+            ("delta", 110.0),
             ("epsilon", 90.0),
         ];
         let target = 100.0;
         let picks: std::collections::HashSet<&str> = (0..100)
             .map(|_| sample_by_target_proximity(&candidates, target, &mut rng).unwrap())
             .collect();
-        assert!(picks.len() >= 3,
-            "expected ≥3 distinct picks across 100 draws, got {:?}", picks);
+        assert!(
+            picks.len() >= 3,
+            "expected ≥3 distinct picks across 100 draws, got {:?}",
+            picks
+        );
     }
 
     /// Weighting still favours the closest candidate — out of
@@ -2445,11 +2975,8 @@ source: "{}"
     #[test]
     fn proximity_sampler_favours_closer_candidates() {
         let mut rng = rng::seeded_rng(123);
-        let candidates: Vec<(&str, f64)> = vec![
-            ("on_target",   100.0),
-            ("near",        110.0),
-            ("far",         200.0),
-        ];
+        let candidates: Vec<(&str, f64)> =
+            vec![("on_target", 100.0), ("near", 110.0), ("far", 200.0)];
         let target = 100.0;
         let mut hist: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for _ in 0..1000 {
@@ -2479,12 +3006,16 @@ source: "{}"
         opts.set("count", "20".to_string());
         let r = GenPredicatesOp.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok, "{}", r.message);
-        assert!(r.message.contains("distinct"),
+        assert!(
+            r.message.contains("distinct"),
             "success message must report distinct/unique ratio, got: {}",
-            r.message);
-        assert!(r.message.contains("% unique"),
+            r.message
+        );
+        assert!(
+            r.message.contains("% unique"),
             "success message must include percent-unique, got: {}",
-            r.message);
+            r.message
+        );
     }
 
     /// `--strict-unique-ratio=true` flips the diversity warning
@@ -2501,11 +3032,13 @@ source: "{}"
         // 100 records, all with a single boolean field — every
         // emitted predicate is `bool_field = true` or
         // `bool_field = false`, so at most 2 distinct.
-        let records: Vec<MNode> = (0..100i64).map(|i| {
-            let mut n = MNode::new();
-            n.insert("flag".into(), MValue::Bool(i % 2 == 0));
-            n
-        }).collect();
+        let records: Vec<MNode> = (0..100i64)
+            .map(|i| {
+                let mut n = MNode::new();
+                n.insert("flag".into(), MValue::Bool(i % 2 == 0));
+                n
+            })
+            .collect();
         let input_path = create_test_metadata_slab(ws, "meta.slab", records);
         let output_path = ws.join("preds.slab");
         let mut opts = Options::new();
@@ -2516,10 +3049,17 @@ source: "{}"
         opts.set("fields", "flag".to_string());
         opts.set("strict-unique-ratio", "true".to_string());
         let r = GenPredicatesOp.execute(&opts, &mut ctx);
-        assert_eq!(r.status, Status::Error,
-            "strict mode should abort: {}", r.message);
-        assert!(r.message.contains("unique-ratio") || r.message.contains("min-unique-ratio"),
-            "error message should mention the diversity floor: {}", r.message);
+        assert_eq!(
+            r.status,
+            Status::Error,
+            "strict mode should abort: {}",
+            r.message
+        );
+        assert!(
+            r.message.contains("unique-ratio") || r.message.contains("min-unique-ratio"),
+            "error message should mention the diversity floor: {}",
+            r.message
+        );
     }
 
     /// Generator-level diversity regression: across 50
@@ -2537,16 +3077,24 @@ source: "{}"
         // 200 text records with varied content so the trigram
         // measure has multiple competing heavy hitters.
         let phrases = [
-            "the quick brown fox", "the lazy dog naps",
-            "rain falls on the meadow", "sunshine after the rain",
-            "kittens play with yarn", "the dog chases its tail",
-            "rivers flow to the sea", "the night is dark and full",
-            "stars shine in the sky", "the wind whispers softly",
+            "the quick brown fox",
+            "the lazy dog naps",
+            "rain falls on the meadow",
+            "sunshine after the rain",
+            "kittens play with yarn",
+            "the dog chases its tail",
+            "rivers flow to the sea",
+            "the night is dark and full",
+            "stars shine in the sky",
+            "the wind whispers softly",
         ];
         let mut records = Vec::new();
         for i in 0..200i64 {
             let mut node = MNode::new();
-            node.insert("text".into(), MValue::Text(phrases[(i as usize) % phrases.len()].into()));
+            node.insert(
+                "text".into(),
+                MValue::Text(phrases[(i as usize) % phrases.len()].into()),
+            );
             records.push(node);
         }
         let input_path = create_test_metadata_slab(ws, "meta.slab", records);
@@ -2573,8 +3121,11 @@ source: "{}"
                 patterns.insert(s.clone());
             }
         }
-        assert!(patterns.len() >= 3,
+        assert!(
+            patterns.len() >= 3,
             "expected ≥3 distinct MATCHES patterns across 50 emissions, got {} ({:?})",
-            patterns.len(), patterns);
+            patterns.len(),
+            patterns
+        );
     }
 }

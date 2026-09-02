@@ -313,6 +313,9 @@ impl StandardFacet {
     pub fn namespaces(self) -> &'static [&'static str] {
         match self {
             Self::MetadataLayout => &["layout", ""],
+            // Written by the stratified generator; older predicate sets
+            // carry neither, and absence means one unlabelled family.
+            Self::MetadataPredicates => &["families", "generation", ""],
             _ => &[""],
         }
     }

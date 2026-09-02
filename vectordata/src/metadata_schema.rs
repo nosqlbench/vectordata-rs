@@ -43,6 +43,22 @@ pub const SCHEMA_NAMESPACE: &str = "schema";
 /// slab; payload is the raw `SurveyReport` JSON bytes.
 pub const SURVEY_NAMESPACE: &str = "survey";
 
+/// Slab namespace of a predicate facet holding, per predicate ordinal,
+/// what the predicate *is*: its family, the selectivity it was
+/// measured at, and for topical predicates the topic level and query
+/// placement. Written by `generate predicates --strategy stratified`.
+/// Absent from every predicate set written before it, and absence
+/// means one unlabelled family rather than none — the `forms`
+/// precedent.
+pub const FAMILIES_NAMESPACE: &str = "families";
+
+/// Slab namespace of a predicate facet holding, per predicate ordinal,
+/// why the predicate was *selected*: the cell it filled, the pool it
+/// was drawn from, the census source and the expected match count.
+/// Kept apart from `families` so a consumer can read what a predicate
+/// is without also reading the experimental design.
+pub const GENERATION_NAMESPACE: &str = "generation";
+
 /// `kind` discriminator value for metadata-slab schemas.
 pub const SCHEMA_KIND_METADATA: &str = "metadata";
 
