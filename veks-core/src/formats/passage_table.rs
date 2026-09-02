@@ -94,8 +94,10 @@ pub fn parents_schema() -> SchemaRef {
 }
 
 /// Shared staged-file plumbing: an [`ArrowWriter`] over `<path>.partial`,
-/// renamed to `path` on finish.
-struct StagedParquetWriter {
+/// renamed to `path` on finish. Public so a command producing a
+/// derived table writes it the same way the passage tables are
+/// written: staged, deterministic, never torn.
+pub struct StagedParquetWriter {
     writer: ArrowWriter<File>,
     final_path: PathBuf,
     partial_path: PathBuf,
@@ -103,7 +105,7 @@ struct StagedParquetWriter {
 }
 
 impl StagedParquetWriter {
-    fn create(path: &Path, schema: SchemaRef) -> Result<Self, String> {
+    pub fn create(path: &Path, schema: SchemaRef) -> Result<Self, String> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -126,14 +128,14 @@ impl StagedParquetWriter {
         })
     }
 
-    fn write_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
+    pub fn write_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
         self.rows_written += batch.num_rows() as u64;
         self.writer
             .write(&batch)
             .map_err(|e| format!("parquet write failed: {}", e))
     }
 
-    fn finish(self) -> Result<u64, String> {
+    pub fn finish(self) -> Result<u64, String> {
         self.writer
             .close()
             .map_err(|e| format!("parquet close failed: {}", e))?;
@@ -278,10 +280,14 @@ impl ParentTableWriter {
 
 /// Row count of any parquet file, read from footer metadata only.
 pub fn parquet_row_count(path: &Path) -> Result<u64, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| format!("failed to read parquet metadata from {}: {}", path.display(), e))?;
+    let file = File::open(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        format!(
+            "failed to read parquet metadata from {}: {}",
+            path.display(),
+            e
+        )
+    })?;
     let rows = builder.metadata().file_metadata().num_rows();
     if rows < 0 {
         return Err(format!("negative row count in {}", path.display()));
@@ -291,8 +297,7 @@ pub fn parquet_row_count(path: &Path) -> Result<u64, String> {
 
 /// Read a complete `passages.parquet` back into rows (schema-checked).
 pub fn read_passages(path: &Path) -> Result<Vec<PassageRow>, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let file = File::open(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| format!("failed to read parquet {}: {}", path.display(), e))?
         .build()
@@ -326,8 +331,7 @@ pub fn read_passages(path: &Path) -> Result<Vec<PassageRow>, String> {
 /// preserve the ordinal contract: element i is row i's value.
 pub fn read_text_column(path: &Path, column: &str) -> Result<Vec<String>, String> {
     use parquet::arrow::ProjectionMask;
-    let file = File::open(path)
-        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let file = File::open(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| format!("failed to read parquet {}: {}", path.display(), e))?;
     let schema = builder.parquet_schema();
@@ -354,10 +358,193 @@ pub fn read_text_column(path: &Path, column: &str) -> Result<Vec<String>, String
     Ok(values)
 }
 
-/// Read a complete `parents.parquet` back into rows (schema-checked).
-pub fn read_parents(path: &Path) -> Result<Vec<ParentRow>, String> {
+/// Row-group layout of a parquet file: each group's first row and
+/// its row count, in file order. A reader that samples row groups
+/// needs the first row to turn a position within a group into the
+/// global passage ordinal.
+pub fn parquet_row_groups(path: &Path) -> Result<Vec<(u64, u64)>, String> {
+    let file = File::open(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        format!(
+            "failed to read parquet metadata from {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    let mut out = Vec::new();
+    let mut start = 0u64;
+    for rg in builder.metadata().row_groups() {
+        let rows = rg.num_rows().max(0) as u64;
+        out.push((start, rows));
+        start += rows;
+    }
+    Ok(out)
+}
+
+/// Read one text column from a single row group. Returns the group's
+/// first global row and its values, so a caller sampling row groups
+/// can address every value by passage ordinal without reading the
+/// rest of the file.
+pub fn read_text_column_row_group(
+    path: &Path,
+    column: &str,
+    row_group: usize,
+) -> Result<(u64, Vec<String>), String> {
+    use parquet::arrow::ProjectionMask;
+    let file = File::open(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("failed to read parquet {}: {}", path.display(), e))?;
+    let groups = builder.metadata().row_groups();
+    if row_group >= groups.len() {
+        return Err(format!(
+            "row group {} out of range: {} has {} row groups",
+            row_group,
+            path.display(),
+            groups.len()
+        ));
+    }
+    let start: u64 = groups[..row_group]
+        .iter()
+        .map(|g| g.num_rows().max(0) as u64)
+        .sum();
+    let expected = groups[row_group].num_rows().max(0) as usize;
+    let schema = builder.parquet_schema();
+    let indices: Vec<usize> = (0..schema.num_columns())
+        .filter(|&i| schema.column(i).name() == column)
+        .collect();
+    if indices.is_empty() {
+        return Err(format!("no column '{}' in {}", column, path.display()));
+    }
+    let mask = ProjectionMask::leaves(schema, indices);
+    let reader = builder
+        .with_row_groups(vec![row_group])
+        .with_projection(mask)
+        .build()
+        .map_err(|e| format!("failed to build parquet reader: {}", e))?;
+    let mut values = Vec::with_capacity(expected);
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("parquet read failed: {}", e))?;
+        let col = column_as::<StringArray>(&batch, column)?;
+        for i in 0..batch.num_rows() {
+            values.push(col.value(i).to_string());
+        }
+    }
+    Ok((start, values))
+}
+
+/// Read the named columns of one row group as record batches, with
+/// the group's first global row. Any parquet file, not only a passage
+/// table: the enrichment pass reads passages and metadata this way.
+pub fn read_columns_row_group(
+    path: &Path,
+    columns: &[&str],
+    row_group: usize,
+) -> Result<(u64, Vec<RecordBatch>), String> {
+    use parquet::arrow::ProjectionMask;
     let file = File::open(path)
         .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("failed to read parquet {}: {}", path.display(), e))?;
+    let groups = builder.metadata().row_groups();
+    if row_group >= groups.len() {
+        return Err(format!(
+            "row group {} out of range: {} has {} row groups",
+            row_group,
+            path.display(),
+            groups.len()
+        ));
+    }
+    let start: u64 = groups[..row_group]
+        .iter()
+        .map(|g| g.num_rows().max(0) as u64)
+        .sum();
+    let schema = builder.parquet_schema();
+    let mut indices = Vec::with_capacity(columns.len());
+    for column in columns {
+        let idx = (0..schema.num_columns())
+            .find(|&i| schema.column(i).name() == *column)
+            .ok_or_else(|| format!("no column '{}' in {}", column, path.display()))?;
+        indices.push(idx);
+    }
+    let mask = ProjectionMask::leaves(schema, indices);
+    let reader = builder
+        .with_row_groups(vec![row_group])
+        .with_projection(mask)
+        .build()
+        .map_err(|e| format!("failed to build parquet reader: {}", e))?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(|e| format!("parquet read failed: {}", e))?);
+    }
+    Ok((start, batches))
+}
+
+/// Read every column of rows `start..end` as record batches, whatever
+/// row groups the range crosses. This is how a pass driven by one
+/// table's row groups reads the aligned rows of another table whose
+/// row groups fall elsewhere.
+pub fn read_row_range(path: &Path, start: u64, end: u64) -> Result<Vec<RecordBatch>, String> {
+    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+    if end <= start {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path)
+        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("failed to read parquet {}: {}", path.display(), e))?;
+    let groups = builder.metadata().row_groups();
+    // The groups covering the range, and the range relative to the
+    // first of them — a row selection counts rows of the selected
+    // groups only.
+    let mut covering = Vec::new();
+    let mut first_start = 0u64;
+    let mut cursor = 0u64;
+    for (i, g) in groups.iter().enumerate() {
+        let rows = g.num_rows().max(0) as u64;
+        let (gs, ge) = (cursor, cursor + rows);
+        if ge > start && gs < end {
+            if covering.is_empty() {
+                first_start = gs;
+            }
+            covering.push(i);
+        }
+        cursor = ge;
+    }
+    if covering.is_empty() {
+        return Err(format!(
+            "rows {}..{} lie outside {} ({} rows)",
+            start,
+            end,
+            path.display(),
+            cursor
+        ));
+    }
+    let covered_rows: u64 = covering
+        .iter()
+        .map(|&i| groups[i].num_rows().max(0) as u64)
+        .sum();
+    let skip = start - first_start;
+    let take = end.min(first_start + covered_rows) - start;
+    let mut selectors = Vec::new();
+    if skip > 0 {
+        selectors.push(RowSelector::skip(skip as usize));
+    }
+    selectors.push(RowSelector::select(take as usize));
+    let reader = builder
+        .with_row_groups(covering)
+        .with_row_selection(RowSelection::from(selectors))
+        .build()
+        .map_err(|e| format!("failed to build parquet reader: {}", e))?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(|e| format!("parquet read failed: {}", e))?);
+    }
+    Ok(batches)
+}
+
+/// Read a complete `parents.parquet` back into rows (schema-checked).
+pub fn read_parents(path: &Path) -> Result<Vec<ParentRow>, String> {
+    let file = File::open(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| format!("failed to read parquet {}: {}", path.display(), e))?
         .build()
@@ -397,11 +584,99 @@ fn column_as<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T
 mod tests {
     use super::*;
 
+    /// A passage table written in small row groups, so range and
+    /// row-group reads can be checked across group boundaries.
+    fn write_grouped(path: &Path, rows: usize, group_rows: usize) {
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(group_rows)
+            .build();
+        let file = File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, passages_schema(), Some(props)).unwrap();
+        let mut corpusid = Int64Builder::new();
+        let mut section = StringBuilder::new();
+        let mut ordinal = Int32Builder::new();
+        let mut cs = Int64Builder::new();
+        let mut ce = Int64Builder::new();
+        let mut text = StringBuilder::new();
+        for i in 0..rows {
+            corpusid.append_value(i as i64 / 7);
+            section.append_value("s");
+            ordinal.append_value((i % 7) as i32);
+            cs.append_value(0);
+            ce.append_value(1);
+            text.append_value(format!("row {}", i));
+        }
+        let batch = RecordBatch::try_new(
+            passages_schema(),
+            vec![
+                Arc::new(corpusid.finish()),
+                Arc::new(section.finish()),
+                Arc::new(ordinal.finish()),
+                Arc::new(cs.finish()),
+                Arc::new(ce.finish()),
+                Arc::new(text.finish()),
+            ],
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    fn texts(batches: &[RecordBatch]) -> Vec<String> {
+        let mut out = Vec::new();
+        for b in batches {
+            let col = column_as::<StringArray>(b, "text").unwrap();
+            for i in 0..b.num_rows() {
+                out.push(col.value(i).to_string());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn row_groups_and_ranges_address_rows_across_group_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grouped.parquet");
+        write_grouped(&path, 1000, 300);
+        let groups = parquet_row_groups(&path).unwrap();
+        assert_eq!(groups, vec![(0, 300), (300, 300), (600, 300), (900, 100)]);
+
+        let (start, values) = read_text_column_row_group(&path, "text", 2).unwrap();
+        assert_eq!(start, 600);
+        assert_eq!(values.len(), 300);
+        assert_eq!(values[0], "row 600");
+        assert_eq!(values[299], "row 899");
+
+        let (start, batches) = read_columns_row_group(&path, &["ordinal", "text"], 3).unwrap();
+        assert_eq!(start, 900);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 100);
+        assert_eq!(batches[0].schema().fields().len(), 2);
+        assert_eq!(texts(&batches)[99], "row 999");
+
+        // A range that starts inside one group and ends inside another.
+        let batches = read_row_range(&path, 250, 650).unwrap();
+        let t = texts(&batches);
+        assert_eq!(t.len(), 400);
+        assert_eq!(t[0], "row 250");
+        assert_eq!(t[399], "row 649");
+        assert_eq!(batches[0].schema().fields().len(), 6, "every column");
+
+        // Whole file, and an empty range.
+        assert_eq!(texts(&read_row_range(&path, 0, 1000).unwrap()).len(), 1000);
+        assert!(read_row_range(&path, 10, 10).unwrap().is_empty());
+        assert!(read_row_range(&path, 1000, 1001).is_err());
+        assert!(read_text_column_row_group(&path, "text", 4).is_err());
+    }
+
     fn sample_passages() -> Vec<PassageRow> {
         (0..10_000i64)
             .map(|i| PassageRow {
                 corpusid: i / 100,
-                section: if i % 2 == 0 { "Introduction".into() } else { "".into() },
+                section: if i % 2 == 0 {
+                    "Introduction".into()
+                } else {
+                    "".into()
+                },
                 ordinal: (i % 100) as i32,
                 char_start: i * 10,
                 char_end: i * 10 + 9,
@@ -433,7 +708,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("parents.parquet");
         let rows: Vec<ParentRow> = (0..100)
-            .map(|i| ParentRow { corpusid: i, passage_count: (i % 7) as i32, row_start: i * 5 })
+            .map(|i| ParentRow {
+                corpusid: i,
+                passage_count: (i % 7) as i32,
+                row_start: i * 5,
+            })
             .collect();
 
         let mut w = ParentTableWriter::create(&path).unwrap();
