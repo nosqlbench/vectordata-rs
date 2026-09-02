@@ -76,12 +76,20 @@ pub fn project_workspace(
         });
     }
 
-    // Build defaults from upstream config
+    // Variables the way the runner sees them: upstream defaults, then
+    // the dataset's `variables:` section, then `variables.yaml` — the
+    // values earlier steps recorded. Without them a step whose options
+    // name a runtime variable (`${vector_count}`, `${base_count}`)
+    // cannot be projected, and its outputs would look extraneous.
     let mut defaults = IndexMap::new();
     if let Some(ref pipe) = config.upstream
         && let Some(ref defs) = pipe.defaults {
             defaults.extend(defs.clone());
         }
+    defaults.extend(config.variables.clone());
+    if let Ok(vars) = super::variables::load(workspace) {
+        defaults.extend(vars);
+    }
 
     let mut all_final: HashSet<String> = HashSet::new();
     let mut all_intermediate: HashSet<String> = HashSet::new();
@@ -148,3 +156,25 @@ pub fn project_workspace(
 
 // collect_all_steps, expand_per_profile_steps, and filter_steps_for_profile
 // are now in vectordata::dataset::expansion (shared code).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A step whose options name a variable that only `variables.yaml`
+    /// defines is projected once that file exists, and its output is a
+    /// final artifact rather than an extraneous file.
+    #[test]
+    fn projection_reads_recorded_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("dataset.yaml");
+        std::fs::write(&yaml, "format_version: 2\nname: t\nupstream:\n  defaults:\n    query_count: '10'\n  steps:\n  - id: extract-margin\n    run: transform extract\n    source: ${cache}/m.mvecs\n    ivec-file: ${cache}/shuffle.ivecs\n    output: profiles/base/topic_margin.mvecs\n    range: '[${query_count},${vector_count})'\nprofiles:\n  default:\n    base_vectors: profiles/base/base_vectors.fvecs\n").unwrap();
+        let config = DatasetConfig::load(&yaml).unwrap();
+        let registry = CommandRegistry::with_builtins();
+        let before = project_workspace(&yaml, &config, &registry).unwrap();
+        assert!(!before.final_artifacts.contains("profiles/base/topic_margin.mvecs"), "nothing recorded yet: the step cannot be projected");
+        std::fs::write(dir.path().join("variables.yaml"), "vector_count: '200'\n").unwrap();
+        let after = project_workspace(&yaml, &config, &registry).unwrap();
+        assert!(after.final_artifacts.contains("profiles/base/topic_margin.mvecs"), "{:?}", after.final_artifacts);
+    }
+}

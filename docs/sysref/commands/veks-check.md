@@ -56,3 +56,9 @@ index of it, or a shard of it. The shards of a sharded facet
 (`base_vectors__0000.fvecs`, `base_vectors__0001.fvecs`, …) are
 accounted for by the series the manifest knows as `base_vectors.fvecs`
 or declares as `base_vectors__NNNN.fvecs`.
+
+The manifest is projected from the pipeline definition with the same
+variables a run sees: the upstream defaults, the dataset's `variables:`
+section, and `variables.yaml`. A step whose options name a variable a
+run records, such as `${vector_count}`, is therefore projected once the
+run has recorded it, and cannot be before.
