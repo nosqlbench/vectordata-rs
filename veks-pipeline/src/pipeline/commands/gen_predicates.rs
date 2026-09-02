@@ -774,6 +774,29 @@ impl CommandOp for GenPredicatesOp {
     }
 
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        if options.get("strategy") == Some("stratified") {
+            // The stratified strategy reads the placement inputs and
+            // writes its generation report beside the facet (TS-34).
+            let mut manifest = crate::pipeline::command::manifest_from_keys(
+                step_id,
+                self.command_path(),
+                options,
+                &["survey", "queries", "centroids", "model", "labels", "query-metadata"],
+                &["output", "report"],
+            );
+            if options.get("report").is_none()
+                && let Some(out) = options.get("output")
+            {
+                let report = std::path::PathBuf::from(out).with_extension("json");
+                let report = report.to_string_lossy().to_string();
+                if crate::pipeline::command::is_cache_path(&report) {
+                    manifest.intermediates.push(report);
+                } else {
+                    manifest.outputs.push(report);
+                }
+            }
+            return manifest;
+        }
         crate::pipeline::command::manifest_from_keys(
             step_id,
             self.command_path(),
