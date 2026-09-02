@@ -288,10 +288,40 @@ query than either conjunct alone.
 
 **TS-19.** For a topical predicate, whether the query vector lies
 inside or outside the filtered topic determines whether the case
-measures high-recall filtering or the adversarial extreme. This is
-currently left to chance. The generator must label each topical
-predicate with the relation between its topic and the query set, and
-the sampler must draw a configured mix of both.
+measures high-recall filtering or the adversarial extreme. This was
+left to chance. The relation is a property of the **pair** — the query
+at ordinal *i* and the predicate at ordinal *i*, which is what the
+filtered ground truth evaluates (TS-156) — never of the predicate
+against the query set as a whole. The generator must decide it per
+pair from the query's own descent (TS-137), record it beside the pair,
+and draw a configured mix of both.
+
+**TS-156.** **One predicate per query ordinal.** The filtered facets
+pair query *i* with predicate *i*, so `predicates.slab` holds exactly
+as many records as there are queries, in query order, and record *i*
+is *the* predicate of query *i*. A predicate set of another size
+leaves queries without a predicate, which the filtered KNN would
+silently evaluate as an empty match set. The stratification is
+therefore over **query slots**: the slots are shared equally by the
+families and split over the decades by the per-cell spec (TS-159);
+each cell draws its distinct predicates and pairs them with slots, a
+distinct predicate repeating only when the cell's pool is smaller than
+its slots; and every slot no cell can fill takes a control predicate,
+so no query is without one. The families namespace records the
+distinct predicate a record carries so results can be grouped by
+predicate as well as by query.
+
+**TS-157.** **Placement is decided per pair.** A topical cell whose
+queries' topics are known fills an in-topic slot by pairing a predicate
+with a free query whose descent lands in the predicate's topic, and an
+out-of-topic slot with one whose descent does not; the mix is the
+configured placement, in-topic first, and a share that cannot be met
+falls to the other side and is reported. Topical cells fill before the
+other families, finest decade first, because they are the ones that
+need particular queries — a level-3 topic holds about one query in ten
+thousand. The other families pair with queries in seeded draw order,
+which is the zero correlation they exist to measure (TS-6), and their
+records say so by carrying no placement.
 
 ### 3.7 Sampling for a decade ladder
 
@@ -362,6 +392,21 @@ decade from 10⁻³ down — the same total storage as a flat count of 10,
 but five times the predicates where the resolution matters. Against
 today's 174.5 GB for the same ladder, that is a **4.3× reduction**
 alongside the coverage improvement.
+
+**TS-159.** The mass is a property of the **records**, not of the
+distinct predicates: with one record per query (TS-156) it is
+Σ over records of selectivity, and 10,000 records apportioned in the
+proportions above would put 356 of them in the 10⁻¹ decade and spend
+285 GB there alone. The per-cell spec is therefore read as **slots per
+decade per family** with two forms: numbers alone are weights, and a
+list with `rest` names absolute counts for the decades it numbers and
+shares the remaining slots equally among the `rest` decades. `tapered`
+is `10, 20, 50, rest…`: the three coarsest decades keep exactly the
+counts above, whose predicates are the expensive ones, and every
+decade below 10⁻³ takes an equal share of the rest — for tessera's four
+families and 10,000 queries, 605 slots each — where a record costs
+next to nothing. The mass is then 5.3, 21 B/base, and 42 GB over the
+ladder: the budget of the table, with every query paired.
 
 ## 4. Derived columns, encoding, and adjunct data
 
@@ -640,6 +685,31 @@ failure mode: "nothing in dataset.log or runlog.jsonl would show the
 difference" if another host resolved the model tag differently. A trace
 that does not travel with the data it describes is a trace that will
 eventually describe something else.
+
+### 4.7 Only a passage's own data is ever attached to its ordinal
+
+**TS-158.** Every field a base ordinal carries in the M facet is either
+the passage's **source metadata** — the row of the metadata table that
+is row-aligned with its embedding — or a **derivative computed from
+that passage's own data**: its embedding (the topic labels, through the
+same centroid model that will place the queries), its text (the word
+count), its heading (the section class), its position in its paper and
+its paper's records (the citation percentile, ranked among the papers
+of the same year). Nothing is synthesised, sampled from elsewhere, or
+assigned by position. The one column that is not a property of the
+passage, `sample_bucket`, is a seeded hash whose only purpose is the
+control family (TS-115), is named for what it is, and is never read by
+a semantic predicate (TS-149). A pipeline change that attaches a column
+to an ordinal by any other route than the passage's own data violates
+this document.
+
+**TS-162.** The same holds across the query ↔ predicate boundary: the
+predicate at ordinal *i* is evaluated against those authentic fields
+and its relation to query *i* is decided from query *i*'s own
+embedding (TS-157), or it is drawn independently of the query by
+design and recorded as such (TS-6). Both are measurements of something
+real; a predicate affixed to a query by position alone is neither, and
+TS-161 refuses it.
 
 ## 5. Topic hierarchy
 
@@ -1050,9 +1120,15 @@ selection process travels with the dataset rather than only with the
 run that produced it. Its record carries `cell` (`family:1e-d`), `pool`
 (candidates in that cell), `source` (which census table: hierarchy,
 histogram, values, pair, or control), `expected_count` (the exact
-matches over the census population) and `vernacular` (the predicate
-rendered), so a reader can check any predicate's claim against the R
-facet without the generator.
+matches over the census population), `vernacular` (the predicate
+rendered) and `backfill` (whether the record took a control predicate
+because no cell could fill its slot, TS-156), so a reader can check any
+predicate's claim against the R facet without the generator. The
+families record carries, besides the family and selectivity, the
+distinct `predicate` index (TS-156), and for a topical record its
+`topic` label, `query_placement` and the query's own `query_topic` at
+that level (TS-157), so the pair's relation is auditable from the
+record alone.
 
 ### 6.5 Recording embedding provenance
 
@@ -1508,12 +1584,13 @@ divergence and would surface only as inexplicable benchmark results.
 | `structural-fields` | Config | no | `section_class,passage_position,word_count` | censused passage-level fields |
 | `control-field` | Config | no | `sample_bucket` | the hash field (TS-115) |
 | `buckets` | Config | no | `16777216` | its modulus |
+| `count` | Config | no | the number of `queries` | records to write, one per query ordinal (TS-156); required without `queries` |
 | `decades` | Config | no | `1e-1..1e-7` | target range, or a comma list |
-| `per-cell` | Config | no | tapered | per-decade counts (TS-54): `tapered`, one count, or one per decade |
+| `per-cell` | Config | no | tapered | a family's slots per decade (TS-159): `tapered`, one weight, or one entry per decade — numbers are weights, with `rest` they are counts |
 | `min-matches` | Config | no | `100` | *M* in TS-11 |
 | `reliability-threshold` | Config | no | `10000000` | *N*ᵣ (TS-46) |
-| `query-placement` | Config | no | mixed | `mixed`, `in-topic`, `out-of-topic` or `any` (TS-19); needs `queries` |
-| `queries` | Input | no | — | query vectors, for placement |
+| `query-placement` | Config | no | mixed | mix of topical pairs whose query lies inside its predicate's topic: `mixed`, `in-topic`, `out-of-topic` or `any` (TS-19, TS-157); needs `queries` |
+| `queries` | Input | no | — | the query vectors; record *i* is query *i*'s predicate and placement is decided per pair |
 | `centroids` | Input | no | — | with `queries` (TS-137) |
 | `model` | Input | no | — | with `queries`: the model report, for the branching |
 | `labels` | Input | no | — | with `queries`: code → label, so placement is by label |
@@ -1525,9 +1602,11 @@ outputs share nothing with `eq` and `compound` beyond the slab they
 write. The other strategies' options are ignored under it.
 
 **TS-111.** `check_artifact` is Complete when the content namespace
-holds at least one predicate **and** the `families` namespace holds
-exactly as many records. An unequal count means annotation and
-predicates disagree, which TS-64 exists to prevent.
+holds exactly the expected number of predicates — the number of
+`queries`, or `count` (TS-156) — **and** the `families` and
+`generation` namespaces hold as many records each. An unequal count
+means the pairing with queries or the annotation is off, which TS-64
+exists to prevent.
 
 **TS-137.** Query placement needs the fitted model, not only the query
 vectors. The queries are perturbed copies of source vectors
@@ -1630,11 +1709,12 @@ not declared yields no conjunctions and is reported as a shortfall
 (TS-16) rather than estimated.
 
 **TS-117.** Query placement (TS-19) requires the query vectors and the
-centroids (TS-137). Each query is assigned to a topic by the same
-descent as TS-96, and a
-topical predicate is labelled `in-topic` when at least one query falls
-in its cluster, `out-of-topic` otherwise. Without `queries` the
-generator omits the field rather than guessing.
+centroids (TS-137). Each query is assigned to a topic at every level by
+the same descent as TS-96, and a topical record is labelled `in-topic`
+when *its own* query falls in the predicate's topic, `out-of-topic`
+otherwise (TS-157); the query's own label at that level is recorded
+with it. Without `queries` the generator omits the fields rather than
+guessing, and needs `count` to know how many records to write.
 
 ## 12. Test strategy
 
@@ -1668,6 +1748,14 @@ a profile above the threshold (TS-42).
 within the assigned band — is checked **against the R facet after
 evaluation**, not against the generator's own estimate. A generator
 that mis-measures would otherwise validate itself.
+
+**TS-160.** Pairing is tested with a planted topic model whose leaves
+are unambiguous directions and queries built from them, so every
+query's topic is known in advance: the predicate facet holds one record
+per query, every in-topic record's query lies in its predicate's topic
+and every out-of-topic record's does not, the recorded `query_topic`
+is the query's own, a `count` that disagrees with the queries is
+refused, and without either there is an error rather than a guess.
 
 ## 13. Work breakdown
 
@@ -1798,6 +1886,12 @@ evaluation rather than asserted at generation.
 
 **TS-44.** Regenerating with the same seed and configuration produces
 an identical predicate facet, byte for byte.
+
+**TS-161.** Every query ordinal has a predicate, and for every topical
+record the recorded placement is what the query's own descent says.
+A filtered result whose predicate was affixed to its query by position
+alone is not a measurement of anything, so this is checked before the
+R facet is built, not inferred from it.
 
 **TS-45.** A reader of the predicate set, given only the vernacular
 form of each predicate, can state what each one is asking for without
@@ -2016,6 +2110,24 @@ output, a reader wants a row's levels together, and codes are
 positional so the tree is implicit. A model report is retained beside
 the centroids because reproducing the fit needs the levels, seed and
 sample the centroid file cannot carry. → TS-150 … TS-152.
+
+**D-23 — One predicate per query, placement per pair.** The facet
+contract every consumer relies on pairs query *i* with predicate *i*.
+An earlier draft sized the predicate set by the per-cell counts alone
+(≈1,120 records for the ladder) and labelled placement against the
+query set as a whole; the filtered KNN would have evaluated 8,880
+queries against nothing and called it a result. The stratification is
+now over query slots, placement is decided per pair from the query's
+own descent, distinct predicates repeat only under pool exhaustion, and
+the control family backfills any slot no cell can fill. → TS-156,
+TS-157, TS-159, TS-161.
+
+**D-24 — Authenticity is a standing requirement, not a property of the
+current columns.** Every field attached to a base ordinal is that
+passage's own source metadata or a derivative of that passage's own
+data, and every predicate paired with a query relates to that query's
+own data or is independent of it by design and says so. The control
+hash is the single, labelled exception. → TS-158, TS-162.
 
 ### 16.1 What changed while this was written
 
