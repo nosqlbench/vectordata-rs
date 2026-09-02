@@ -440,7 +440,7 @@ fn capable_op_families(profile: &FieldProfile) -> Vec<OpType> {
             if has("QuantileSketch") {
                 ops.extend([OpType::Lt, OpType::Le, OpType::Gt, OpType::Ge]);
             }
-            if has("ExactFrequencyTable") || has("HeavyHitters") || has("ReservoirSample") {
+            if has("ExactValueCensus") || has("ExactFrequencyTable") || has("HeavyHitters") || has("ReservoirSample") {
                 ops.push(OpType::Eq);
                 ops.push(OpType::Ne);
             }
@@ -450,7 +450,7 @@ fn capable_op_families(profile: &FieldProfile) -> Vec<OpType> {
             if has("TrigramHeavyHitters") || has("LabelsetHeavyHitters") {
                 ops.push(OpType::Matches);
             }
-            if has("ExactFrequencyTable") || has("HeavyHitters") || has("ReservoirSample") {
+            if has("ExactValueCensus") || has("ExactFrequencyTable") || has("HeavyHitters") || has("ReservoirSample") {
                 ops.push(OpType::Eq);
                 ops.push(OpType::Ne);
             }

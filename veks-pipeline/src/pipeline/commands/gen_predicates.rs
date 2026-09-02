@@ -662,7 +662,7 @@ fn field_supports_any_op(profile: &FieldProfile, mask: OperatorMask) -> bool {
             // Quantile-driven numeric → inequality family.
             // Frequency-table / reservoir fallback → Eq.
             (profile.measures.contains_key("QuantileSketch") && mask.allows_numeric_inequality())
-                || (profile.measures.contains_key("ExactFrequencyTable") && mask.allows_eq())
+                || (exact_value_counts(profile).is_some() && mask.allows_eq())
                 || (profile.measures.contains_key("HeavyHitters") && mask.allows_eq())
                 || (profile.measures.contains_key("Reservoir") && mask.allows_eq())
         }
@@ -670,11 +670,27 @@ fn field_supports_any_op(profile: &FieldProfile, mask: OperatorMask) -> bool {
         | Some(SemanticType::Structured(_)) | Some(SemanticType::Categorical(_)) => {
             (profile.measures.contains_key("TrigramHeavyHitters") && mask.allows_matches())
                 || (profile.measures.contains_key("LabelsetHeavyHitters") && mask.allows_matches())
-                || (profile.measures.contains_key("ExactFrequencyTable") && mask.allows_eq())
+                || (exact_value_counts(profile).is_some() && mask.allows_eq())
                 || (profile.measures.contains_key("HeavyHitters") && mask.allows_eq())
                 || (profile.measures.contains_key("Reservoir") && mask.allows_eq())
         }
         _ => false,
+    }
+}
+
+/// Exact value counts for a field: the census table when the survey
+/// counted the field over every record, else the sampled frequency
+/// table. Both carry the same `value → count` map keyed by the
+/// canonical value key, so every consumer of one reads the other and
+/// a censused field's selectivities become exact without any change
+/// here (SRD TS-144).
+pub(super) fn exact_value_counts(profile: &FieldProfile) -> Option<&indexmap::IndexMap<String, u64>> {
+    match profile.measures.get("ExactValueCensus") {
+        Some(MeasureReport::ExactValueCensus(c)) => Some(&c.counts),
+        _ => match profile.measures.get("ExactFrequencyTable") {
+            Some(MeasureReport::ExactFrequencyTable(t)) => Some(&t.counts),
+            _ => None,
+        },
     }
 }
 
@@ -839,8 +855,8 @@ fn field_can_hit_target(profile: &FieldProfile, target_sel: f64) -> bool {
     let total = profile.presence.present.max(1) as f64;
     let target_count = (total * target_sel).max(1.0);
     let tolerance = (target_count * 2.0).max(1.0);
-    if let Some(MeasureReport::ExactFrequencyTable(t)) = profile.measures.get("ExactFrequencyTable") {
-        let closest = t.counts.values()
+    if let Some(counts) = exact_value_counts(profile) {
+        let closest = counts.values()
             .map(|c| (*c as f64 - target_count).abs())
             .fold(f64::MAX, f64::min);
         if closest < tolerance { return true; }
@@ -1058,15 +1074,15 @@ fn categorical_predicate(
     let total = profile.presence.present.max(1) as f64;
     let target_count = (total * target_sel).max(1.0);
 
-    // Prefer ExactFrequencyTable when present; fall back to heavy
-    // hitters. Both report (value_string, count).
-    let candidates: Vec<(String, f64)> = match profile.measures.get("ExactFrequencyTable") {
-        Some(MeasureReport::ExactFrequencyTable(t)) => t
-            .counts
+    // Prefer exact counts (census, else frequency table) when
+    // present; fall back to heavy hitters. All report (value_string,
+    // count).
+    let candidates: Vec<(String, f64)> = match exact_value_counts(profile) {
+        Some(counts) => counts
             .iter()
             .map(|(k, c)| (k.clone(), *c as f64))
             .collect(),
-        _ => match profile.measures.get("HeavyHitters") {
+        None => match profile.measures.get("HeavyHitters") {
             Some(MeasureReport::HeavyHitters(h)) => h
                 .items
                 .iter()
