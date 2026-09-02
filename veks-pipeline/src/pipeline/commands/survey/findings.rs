@@ -141,6 +141,7 @@ fn collect_findings(report: &SurveyReport, cfg: &FindingsConfig) -> Vec<Finding>
     predicate_candidate_findings(report, &mut out);
     identifier_findings(report, &mut out);
     cross_field_findings(report, cfg, &mut out);
+    census_findings(report, cfg, &mut out);
     quality_findings(report, cfg, &mut out);
     out
 }
@@ -237,15 +238,21 @@ fn unstable_findings(report: &SurveyReport, cfg: &FindingsConfig, out: &mut Vec<
 
 fn partition_candidate_findings(report: &SurveyReport, cfg: &FindingsConfig, out: &mut Vec<Finding>) {
     for (name, profile) in &report.fields {
-        let suitable = matches!(
+        let small = matches!(
             profile.cardinality_regime,
             super::types::CardinalityRegime::Binary
                 | super::types::CardinalityRegime::LowCard { .. }
-        ) && profile.semantic_type.is_some()
+        ) || matches!(
+            profile.cardinality_regime,
+            super::types::CardinalityRegime::Censused { exact_distinct }
+                if exact_distinct <= PARTITION_CANDIDATE_MAX_DISTINCT
+        );
+        let suitable = small && profile.semantic_type.is_some()
             && !matches!(profile.semantic_type, Some(SemanticType::Unstable));
         if !suitable { continue; }
         let distinct = match profile.cardinality_regime {
             super::types::CardinalityRegime::LowCard { exact_distinct } => exact_distinct,
+            super::types::CardinalityRegime::Censused { exact_distinct } => exact_distinct,
             super::types::CardinalityRegime::Binary => 2,
             _ => 0,
         };
@@ -408,6 +415,125 @@ fn cross_field_findings(report: &SurveyReport, cfg: &FindingsConfig, out: &mut V
     }
 }
 
+/// Censused fields with at most this many distinct values are still
+/// surfaced as partition candidates — the same bound as the default
+/// `low-card-threshold` that gates `LowCard` in Pass 1, which the
+/// census verdict replaces.
+const PARTITION_CANDIDATE_MAX_DISTINCT: u32 = 64;
+
+/// Pass 3 results: what was counted exactly, what left the census,
+/// and the hierarchy and pair tables.
+fn census_findings(report: &SurveyReport, cfg: &FindingsConfig, out: &mut Vec<Finding>) {
+    let Some(info) = report.source.census.as_ref() else { return };
+    let section = "Census (exact counts)";
+    out.push(Finding {
+        section: section.into(),
+        severity: Severity::Info,
+        field: None,
+        title: format!(
+            "Census counted {} record(s) exactly for {} field(s)",
+            info.records,
+            info.fields.len()
+        ),
+        body: format!(
+            "Fields: {}. Selectivity of a value is its count divided by {} (source.total_records). {}",
+            if info.fields.is_empty() { "none".to_string() } else { info.fields.join(", ") },
+            report.source.total_records,
+            if info.auto {
+                "Regime-selected (`auto`) fields included."
+            } else {
+                "Only named fields were censused."
+            },
+        ),
+        samples: vec![],
+        json_path: Some("source.census".into()),
+    });
+    for name in &info.fields {
+        let Some(profile) = report.fields.get(name) else { continue };
+        let Some(MeasureReport::ExactValueCensus(c)) = profile.measures.get("ExactValueCensus")
+        else {
+            continue;
+        };
+        let top: Vec<String> = c
+            .counts
+            .iter()
+            .take(cfg.max_samples_per_finding)
+            .map(|(k, n)| format!("{} ({})", k, n))
+            .collect();
+        let histogram = match profile.measures.get("ExactIntegerHistogram") {
+            Some(MeasureReport::ExactIntegerHistogram(h)) => {
+                format!(" Dense histogram over {}..={}.", h.min, h.max)
+            }
+            _ => String::new(),
+        };
+        out.push(Finding {
+            section: section.into(),
+            severity: Severity::Info,
+            field: Some(name.clone()),
+            title: format!(
+                "`{}` has {} distinct value(s) over {} record(s)",
+                name, c.distinct, c.population
+            ),
+            body: format!("Exact. Top: {}.{}", top.join(", "), histogram),
+            samples: vec![],
+            json_path: Some(format!("fields.{}.measures.ExactValueCensus", name)),
+        });
+    }
+    for d in &info.dropped {
+        out.push(Finding {
+            section: section.into(),
+            severity: Severity::Warning,
+            field: Some(d.field.clone()),
+            title: format!("`{}` left the census", d.field),
+            body: format!(
+                "{}. Its sampled measures stand; name it under `census` with a higher `census-cap` to count it exactly.",
+                d.reason
+            ),
+            samples: vec![],
+            json_path: Some("source.census.dropped".into()),
+        });
+    }
+    for (i, h) in report.hierarchies.iter().enumerate() {
+        let sizes: Vec<String> = h
+            .fields
+            .iter()
+            .zip(h.level_sizes.iter())
+            .map(|(f, n)| format!("{} ({})", f, n))
+            .collect();
+        out.push(Finding {
+            section: section.into(),
+            severity: Severity::Notable,
+            field: None,
+            title: format!("Hierarchy {} verified", h.fields.join(">")),
+            body: format!(
+                "Nesting holds. Levels: {}. {} record(s) placed, {} incomplete.",
+                sizes.join(" > "),
+                h.population,
+                h.incomplete
+            ),
+            samples: vec![],
+            json_path: Some(format!("hierarchies[{}]", i)),
+        });
+    }
+    for (i, p) in report.pair_census.iter().enumerate() {
+        out.push(Finding {
+            section: section.into(),
+            severity: Severity::Info,
+            field: None,
+            title: format!("Joint table {} × {}", p.a, p.b),
+            body: format!(
+                "{} × {} cells over {} record(s); a conjunction's selectivity is a cell or row sum divided by {}.",
+                p.a_values.len(),
+                p.b_values.len(),
+                p.population,
+                report.source.total_records
+            ),
+            samples: vec![],
+            json_path: Some(format!("pair_census[{}]", i)),
+        });
+    }
+}
+
 fn quality_findings(report: &SurveyReport, cfg: &FindingsConfig, out: &mut Vec<Finding>) {
     for (name, profile) in &report.fields {
         let total = profile.presence.present + profile.presence.absent_in_record;
@@ -545,9 +671,12 @@ mod tests {
                 total_records: 0,
                 sampled_records: 0,
                 sampling: SamplingInfo { mode: "page_stride".into(), page_count: 0 },
+                census: None,
             },
             fields: IndexMap::new(),
             cross_field: CrossFieldReport::default(),
+            hierarchies: vec![],
+            pair_census: vec![],
             warnings: vec![],
         }
     }
@@ -572,6 +701,7 @@ mod tests {
             })),
             semantic_confidence: 1.0,
             cardinality_regime: CardinalityRegime::LowCard { exact_distinct: 8 },
+            censused: false,
             presence: PresenceReport {
                 present: n,
                 null_count: 0,
@@ -630,6 +760,7 @@ mod tests {
             semantic_type: Some(SemanticType::Unstable),
             semantic_confidence: 0.0,
             cardinality_regime: CardinalityRegime::Unknown,
+            censused: false,
             presence: PresenceReport { present: 10, null_count: 0, absent_in_record: 0 },
             measures,
         };

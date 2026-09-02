@@ -537,7 +537,9 @@ fn default_measures_for(
             // hitters would mostly chase noise; skip.
             out.push(MeasureKind::HyperLogLog);
         }
-        CardinalityRegime::Unknown => {}
+        // The census verdict is assigned after Pass 3, never at template
+        // synthesis; there is nothing to plan for it here.
+        CardinalityRegime::Censused { .. } | CardinalityRegime::Unknown => {}
     }
     out
 }

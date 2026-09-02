@@ -18,14 +18,19 @@
 //! relationships.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use indexmap::IndexMap;
 use slabtastic::{SlabWriter, WriterConfig};
-
+use veks_core::ui::{TestSink, UiHandle};
+use veks_pipeline::pipeline::command::{ArtifactState, CommandOp, Options, Status, StreamContext};
 use veks_pipeline::pipeline::commands::survey::{
-    self, findings, BinaryKind, CardinalityRegime, IdentifierKind, NumberKind,
-    SemanticType, StructuredKind, SurveyConfig, TemporalKind,
+    self, findings, BinaryKind, CardinalityRegime, CensusConfig, IdentifierKind, MeasureReport,
+    NumberKind, SemanticType, StructuredKind, SurveyConfig, SurveyOp, SurveyReport, TemporalKind,
 };
+use veks_pipeline::pipeline::progress::ProgressLog;
+use veks_pipeline::pipeline::resource::ResourceGovernor;
 
 use veks_core::formats::anode;
 use veks_core::formats::mnode::{MNode, MValue};
@@ -93,13 +98,19 @@ fn full_survey_pipeline_classifies_all_fields_correctly() {
     let slab_path = dir.path().join("fixture.slab");
     write_fixture_slab(&slab_path, 200);
 
-    let cfg = SurveyConfig::default();
+    // Passes 1 and 2 only: this test is about the sampled verdicts,
+    // which the census would replace for every enumerable field.
+    let cfg = SurveyConfig {
+        census: CensusConfig { auto: false, ..CensusConfig::default() },
+        ..SurveyConfig::default()
+    };
     let report = survey::survey(&slab_path, &cfg, None).expect("survey");
 
     // ── Source bookkeeping ──────────────────────────────────────────
     assert_eq!(report.source.total_records, 200);
     assert!(report.source.sampled_records > 0);
-    assert_eq!(report.schema_version, 1);
+    assert_eq!(report.schema_version, 2);
+    assert!(report.source.census.is_none());
 
     // ── Per-field semantic classifications ──────────────────────────
     let country = report.fields.get("country").expect("country present");
@@ -290,6 +301,249 @@ fn full_survey_report_round_trips_through_json() {
     let back: survey::SurveyReport = serde_json::from_str(&s).expect("deserialize");
     assert_eq!(back.fields.len(), report.fields.len());
     assert_eq!(back.source.sampled_records, report.source.sampled_records);
+}
+
+/// Create a tempdir under `target/tmp/`.
+fn tmp_dir() -> tempfile::TempDir {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::tempdir_in(&base).unwrap()
+}
+
+/// Minimal `StreamContext` rooted at `dir`.
+fn test_ctx(dir: &Path) -> StreamContext {
+    StreamContext {
+        dataset_name: String::new(),
+        profile: String::new(),
+        profile_names: vec![],
+        workspace: dir.to_path_buf(),
+        cache: dir.join(".cache"),
+        defaults: IndexMap::new(),
+        dry_run: false,
+        progress: ProgressLog::new(),
+        threads: 1,
+        step_id: String::new(),
+        governor: ResourceGovernor::default_governor(),
+        ui: UiHandle::new(Arc::new(TestSink::new())),
+        status_interval: Duration::from_secs(1),
+        estimated_total_steps: 0,
+        provenance_selector: veks_pipeline::pipeline::provenance::ProvenanceFlags::STRICT,
+    }
+}
+
+/// A slab shaped like an enriched passage corpus: a three-level topic
+/// hierarchy nested by construction (2 roots × 3 branches × 2 leaves),
+/// a paper-level integer, a boolean, and a per-record id whose
+/// cardinality exceeds a small census cap.
+fn write_census_fixture(path: &Path, n: usize) {
+    let config = WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
+    let mut w = SlabWriter::new(path, config).unwrap();
+    for i in 0..n {
+        let mut fields: IndexMap<String, MValue> = IndexMap::new();
+        let l1 = i % 2;
+        let l2 = l1 * 3 + (i / 2) % 3;
+        let l3 = l2 * 2 + (i / 6) % 2;
+        fields.insert("topic_l1".into(), MValue::Text(format!("root-{}", l1)));
+        fields.insert("topic_l2".into(), MValue::Text(format!("branch-{}", l2)));
+        fields.insert("topic_l3".into(), MValue::Text(format!("leaf-{}", l3)));
+        fields.insert("year".into(), MValue::Int32(2015 + (i % 8) as i32));
+        fields.insert("isopenaccess".into(), MValue::Bool(i % 3 == 0));
+        fields.insert("corpusid".into(), MValue::Int(i as i64));
+        w.add_record(&anode::encode(&anode::ANode::MNode(MNode { fields }))).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+fn census_options(source: &Path, output: &Path) -> Options {
+    let mut o = Options::new();
+    o.set("source", source.display().to_string());
+    o.set("output", output.display().to_string());
+    o.set("samples", "50");
+    o.set("census-cap", "100");
+    o.set("hierarchy", "topic_l1>topic_l2>topic_l3");
+    o.set("census-pair", "topic_l3:year, topic_l1:isopenaccess");
+    o.set("findings-markdown", "");
+    o.set("findings-json", "");
+    o
+}
+
+/// The census pass end to end: declared hierarchy and pairs are
+/// counted exactly over every record, the field census agrees with
+/// the tree and the joint tables, an `auto` field over the cap leaves
+/// the census with a warning, and the whole report round-trips.
+#[test]
+fn census_pass_counts_declarations_exactly() {
+    let dir = tmp_dir();
+    let slab_path = dir.path().join("enriched.slab");
+    let n = 480;
+    write_census_fixture(&slab_path, n);
+
+    let cfg = SurveyConfig {
+        samples: 50,
+        census: CensusConfig {
+            auto: true,
+            listed: vec![],
+            cap: 100,
+            hierarchies: vec![vec!["topic_l1".into(), "topic_l2".into(), "topic_l3".into()]],
+            pairs: vec![
+                ("topic_l3".into(), "year".into()),
+                ("topic_l1".into(), "isopenaccess".into()),
+            ],
+            ..CensusConfig::default()
+        },
+        ..SurveyConfig::default()
+    };
+    let report = survey::survey(&slab_path, &cfg, None).expect("survey");
+
+    // The sample was small; the census was not.
+    assert_eq!(report.source.sampled_records, 50);
+    let info = report.source.census.as_ref().expect("census ran");
+    assert_eq!(info.records, n as u64);
+    for f in ["topic_l1", "topic_l2", "topic_l3", "year", "isopenaccess"] {
+        assert!(info.fields.iter().any(|x| x == f), "{} censused: {:?}", f, info.fields);
+        let profile = report.fields.get(f).unwrap();
+        assert!(profile.censused);
+        assert_eq!(profile.presence.present, n as u64);
+        assert!(!profile.measures.contains_key("ExactFrequencyTable"));
+        assert!(!profile.measures.contains_key("HeavyHitters"));
+    }
+    // corpusid has 480 distinct values: MidCard by sample, over the
+    // cap of 100, so it leaves the census and keeps its sampled view.
+    assert_eq!(info.dropped.len(), 1);
+    assert_eq!(info.dropped[0].field, "corpusid");
+    assert!(!report.fields.get("corpusid").unwrap().censused);
+    assert!(report.warnings.iter().any(|w| w.field.as_deref() == Some("corpusid")));
+
+    // Field census: exact, and the regime says so.
+    let l3 = report.fields.get("topic_l3").unwrap();
+    assert_eq!(l3.cardinality_regime, CardinalityRegime::Censused { exact_distinct: 12 });
+    let l3_counts = match l3.measures.get("ExactValueCensus") {
+        Some(MeasureReport::ExactValueCensus(c)) => {
+            assert_eq!(c.population, n as u64);
+            assert_eq!(c.missing, 0);
+            assert!(c.counts.values().all(|v| *v == 40), "{:?}", c.counts);
+            c.counts.clone()
+        }
+        other => panic!("{:?}", other),
+    };
+    match report.fields.get("year").unwrap().measures.get("ExactIntegerHistogram") {
+        Some(MeasureReport::ExactIntegerHistogram(h)) => {
+            assert_eq!((h.min, h.max), (2015, 2022));
+            assert_eq!(h.counts, vec![60; 8]);
+        }
+        other => panic!("{:?}", other),
+    }
+    match report.fields.get("isopenaccess").unwrap().measures.get("ExactValueCensus") {
+        Some(MeasureReport::ExactValueCensus(c)) => {
+            assert_eq!(c.counts.get("Bool(true)"), Some(&160));
+            assert_eq!(c.counts.get("Bool(false)"), Some(&320));
+        }
+        other => panic!("{:?}", other),
+    }
+
+    // Hierarchy: nesting verified, every node's count is the field
+    // census of its value, and the roots sum to the population.
+    assert_eq!(report.hierarchies.len(), 1);
+    let h = &report.hierarchies[0];
+    assert_eq!(h.level_sizes, vec![2, 6, 12]);
+    assert_eq!(h.population, n as u64);
+    assert_eq!(h.incomplete, 0);
+    assert_eq!(h.nodes.iter().map(|r| r.count).sum::<u64>(), n as u64);
+    for root in &h.nodes {
+        assert_eq!(root.count, 240);
+        assert_eq!(root.children.len(), 3);
+        for branch in &root.children {
+            assert_eq!(branch.count, 80);
+            assert_eq!(branch.children.len(), 2);
+            for leaf in &branch.children {
+                assert_eq!(l3_counts.get(&leaf.value), Some(&leaf.count), "{}", leaf.value);
+                assert!(leaf.children.is_empty());
+            }
+        }
+    }
+
+    // Pairs: dense tables whose row sums are the row field's census.
+    assert_eq!(report.pair_census.len(), 2);
+    let p = &report.pair_census[0];
+    assert_eq!((p.a.as_str(), p.b.as_str()), ("topic_l3", "year"));
+    assert_eq!((p.a_values.len(), p.b_values.len()), (12, 8));
+    assert_eq!(p.population, n as u64);
+    for (i, row) in p.counts.iter().enumerate() {
+        assert_eq!(row.iter().sum::<u64>(), *l3_counts.get(&p.a_values[i]).unwrap());
+    }
+    let q = &report.pair_census[1];
+    assert_eq!((q.a.as_str(), q.b.as_str()), ("topic_l1", "isopenaccess"));
+    assert_eq!(q.counts.iter().flatten().sum::<u64>(), n as u64);
+
+    // Round trip: sections and the census regime survive JSON.
+    let text = serde_json::to_string(&report).unwrap();
+    let back: SurveyReport = serde_json::from_str(&text).unwrap();
+    assert_eq!(back.hierarchies, report.hierarchies);
+    assert_eq!(back.pair_census, report.pair_census);
+    assert_eq!(back.fields.get("topic_l3").unwrap().cardinality_regime, l3.cardinality_regime);
+    assert_eq!(back.source.census, report.source.census);
+
+    // Findings carry the census section.
+    let (md, _) = findings::render_findings(&report, &findings::FindingsConfig::default());
+    assert!(md.contains("Census (exact counts)"), "{}", md);
+    assert!(md.contains("topic_l1>topic_l2>topic_l3"), "{}", md);
+}
+
+/// The command surface: declarations arrive as options, the report is
+/// written, `check_artifact` judges it against the declarations, and a
+/// listed field over the cap is an error rather than a report.
+#[test]
+fn census_command_writes_checks_and_refuses_over_cap_listing() {
+    let dir = tmp_dir();
+    let slab_path = dir.path().join("enriched.slab");
+    write_census_fixture(&slab_path, 480);
+    let output = dir.path().join("survey.json");
+
+    let mut op = SurveyOp;
+    let mut ctx = test_ctx(dir.path());
+    let opts = census_options(&slab_path, &output);
+    let result = op.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "{}", result.message);
+    assert!(
+        result.message.contains("census: 5 fields exact over 480 records"),
+        "{}",
+        result.message
+    );
+    assert!(result.message.contains("1 dropped"), "{}", result.message);
+    assert!(output.exists());
+
+    // The artifact satisfies its declarations.
+    assert_eq!(op.check_artifact(&output, &opts), ArtifactState::Complete);
+
+    // A declaration the report does not carry makes it Partial.
+    let mut more = census_options(&slab_path, &output);
+    more.set("census-pair", "topic_l3:year, topic_l1:isopenaccess, topic_l2:year");
+    assert_eq!(op.check_artifact(&output, &more), ArtifactState::Partial);
+    let mut listed = census_options(&slab_path, &output);
+    listed.set("census", "auto,corpusid");
+    assert_eq!(op.check_artifact(&output, &listed), ArtifactState::Partial);
+
+    // No declarations at all: any parseable report is complete.
+    let mut none = Options::new();
+    none.set("source", slab_path.display().to_string());
+    none.set("output", output.display().to_string());
+    none.set("census", "none");
+    assert_eq!(op.check_artifact(&output, &none), ArtifactState::Complete);
+
+    // Listing a field the cap cannot hold is refused outright.
+    let result = op.execute(&listed, &mut ctx);
+    assert_eq!(result.status, Status::Error);
+    assert!(result.message.contains("corpusid"), "{}", result.message);
+
+    // The written report is the same shape the library returns.
+    let text = std::fs::read_to_string(&output).unwrap();
+    let report: SurveyReport = serde_json::from_str(&text).unwrap();
+    assert_eq!(report.hierarchies.len(), 1);
+    assert_eq!(report.pair_census.len(), 2);
+    assert!(report.fields.get("topic_l3").unwrap().censused);
 }
 
 #[test]

@@ -325,6 +325,12 @@ fn uniqueness_score(regime: &CardinalityRegime) -> f64 {
         CardinalityRegime::HighCardOrUnique { uniqueness_ratio } => {
             uniqueness_ratio.clamp(0.5, 1.0)
         }
+        // Pair planning runs on Pass 1 verdicts, so a census verdict
+        // never reaches here; scored like a mid-cardinality field of
+        // the same size for completeness.
+        CardinalityRegime::Censused { exact_distinct } => {
+            ((*exact_distinct as f64).ln_1p() / 16.0).clamp(0.0, 0.9)
+        }
         CardinalityRegime::Unknown => 0.0,
     }
 }

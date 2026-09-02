@@ -1,7 +1,8 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Two-pass survey orchestrator.
+//! Survey orchestrator: two sampled passes and an optional exhaustive
+//! census.
 //!
 //! Drives the full survey pipeline end-to-end:
 //!
@@ -12,14 +13,16 @@
 //! 4. **Pass 2** — re-iterate the same sample; per field,
 //!    instantiate the measure suite chosen by its template and
 //!    dispatch each observation.
-//! 5. Finalize every measure and assemble the [`SurveyReport`].
-//!
-//! Cross-field analyzers and findings rendering land in subsequent
-//! build-plan steps; the orchestrator emits the structured JSON
-//! contract from §13.8 with `cross_field` empty.
+//! 5. Finalize every measure and assemble the per-field profiles.
+//! 6. **Pass 3** — when anything is declared, the census: one
+//!    exhaustive pass counting declared fields, hierarchies and pairs
+//!    exactly over every record (`census.rs`). Its results replace the
+//!    sampled cardinality verdicts of the fields it covers.
+//! 7. Finalize cross-field analyzers and assemble the [`SurveyReport`].
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use indexmap::IndexMap;
@@ -36,6 +39,10 @@ use super::crossfield::{
     NumericCorrelationAnalyzer, NumericCorrelationEntry, PairAnalyzer, PairAnalyzerKind,
     PairPlanEntry, PairReport, TrendAnalyzer, TrendEntry,
 };
+use super::census::{
+    run_census_pass, CensusConfig, CensusFieldPlan, CensusInfo, CensusPlan, DroppedField,
+    FieldCensusResult, HierarchyCensusReport, PairCensusReport,
+};
 use super::measure::{
     Measure, MeasureCtx, MeasureKind, MeasureReport, PresenceReport,
 };
@@ -48,8 +55,9 @@ use super::measures::{
     ReservoirSample, TemporalRangeMeasure, TrigramHeavyHittersMeasure, TypeStabilityMeasure,
     WireEncodingHistogramMeasure, DEFAULT_LABELSET_TOP_K, DEFAULT_TRIGRAM_TOP_K,
 };
+use super::progress::{ProgressDriver, SurveyProgress};
 use super::template::{ExplorationProbe, FieldTemplate, TemplateConfig};
-use super::types::{CardinalityRegime, SemanticType, WireEncoding};
+use super::types::{CardinalityRegime, SemanticType, WireEncoding, WireEncodingKind};
 
 use crate::pipeline::commands::slab::{open_slab_with_ui, sample_page_indices};
 
@@ -86,6 +94,8 @@ pub struct SurveyConfig {
     /// match at this rate or higher across the field's reservoir to
     /// commit its verdict; otherwise the encoding-only floor wins.
     pub semantic_confidence: f64,
+    /// Pass 3 census declarations (sysref §13.4, Pass 3).
+    pub census: CensusConfig,
 }
 
 impl Default for SurveyConfig {
@@ -102,6 +112,7 @@ impl Default for SurveyConfig {
             quantile_k: 1000,
             max_pair_analyses: 1_024,
             semantic_confidence: 0.95,
+            census: CensusConfig::default(),
         }
     }
 }
@@ -131,6 +142,12 @@ pub struct SurveyReport {
     pub source: SourceInfo,
     pub fields: IndexMap<String, FieldProfile>,
     pub cross_field: CrossFieldReport,
+    /// Verified, counted trees for each declared hierarchy (Pass 3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hierarchies: Vec<HierarchyCensusReport>,
+    /// Exact joint tables for each declared pair (Pass 3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pair_census: Vec<PairCensusReport>,
     pub warnings: Vec<Warning>,
 }
 
@@ -141,6 +158,9 @@ pub struct SourceInfo {
     pub total_records: u64,
     pub sampled_records: u64,
     pub sampling: SamplingInfo,
+    /// Present when the census pass ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub census: Option<CensusInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +176,12 @@ pub struct FieldProfile {
     pub semantic_confidence: f64,
     pub cardinality_regime: CardinalityRegime,
     pub presence: PresenceReport,
+    /// True when the census pass counted this field: `presence` and
+    /// the cardinality regime are then exact over every record, and
+    /// the sampled cardinality measures have been replaced by the
+    /// census tables.
+    #[serde(default)]
+    pub censused: bool,
     /// Open map keyed by [`MeasureKind::as_str`].
     ///
     /// `#[serde(untagged)]` on [`MeasureReport`] is correct for
@@ -285,6 +311,12 @@ where
             }
             s if s == MeasureKind::ProbeAttempt.as_str() => {
                 MeasureReport::ProbeAttempt(serde_json::from_value::<ProbeAttemptReport>(value).map_err(D::Error::custom)?)
+            }
+            s if s == MeasureKind::ExactValueCensus.as_str() => {
+                MeasureReport::ExactValueCensus(serde_json::from_value::<super::census::ExactValueCensusReport>(value).map_err(D::Error::custom)?)
+            }
+            s if s == MeasureKind::ExactIntegerHistogram.as_str() => {
+                MeasureReport::ExactIntegerHistogram(serde_json::from_value::<super::census::ExactIntegerHistogramReport>(value).map_err(D::Error::custom)?)
             }
             _ => continue, // unknown kind — silently drop so older readers can ignore new measures
         };
@@ -540,6 +572,7 @@ pub fn survey(
                 semantic_confidence: template.semantic_confidence,
                 cardinality_regime: template.cardinality_regime,
                 presence,
+                censused: false,
                 measures: measure_reports,
             },
         );
@@ -566,11 +599,120 @@ pub fn survey(
         });
     }
 
+    // ── Pass 3: census ──────────────────────────────────────────────
+    // Exhaustive and exact over every record, for what was declared.
+    // Runs after the profiles exist because `auto` selects fields by
+    // their Pass 1 regime, and merges into them because the census
+    // supersedes every sampled cardinality verdict it covers.
+    let (census_info, hierarchies, pair_census) = if config.census.is_noop() {
+        (None, Vec::new(), Vec::new())
+    } else {
+        let plan = plan_census(&config.census, &fields)?;
+        if let Some(u) = ui {
+            u.log(&format!(
+                "survey: Pass 3 (census) over all {} records — {} fields, {} hierarchies, {} pairs",
+                total_records, plan.fields.len(), plan.hierarchies.len(), plan.pairs.len(),
+            ));
+        }
+        let mut driver = ProgressDriver::new(
+            Arc::new(SurveyProgress::new()),
+            ui.cloned(),
+            CENSUS_LOG_EVERY_PAGES,
+        );
+        let outcome = run_census_pass(
+            &reader,
+            &page_entries,
+            total_records as u64,
+            &plan,
+            config.census.threads,
+            &mut driver,
+        )?;
+        let mut kept = Vec::new();
+        let mut dropped = Vec::new();
+        for result in outcome.fields {
+            let FieldCensusResult {
+                name, present, nulls, absent, value, histogram, dropped: reasons, ..
+            } = result;
+            let Some(profile) = fields.get_mut(&name) else { continue };
+            let Some(value) = value else {
+                // One entry per field, whatever combination of its
+                // accumulators overflowed.
+                dropped.push(DroppedField { field: name.clone(), reason: reasons.join("; ") });
+                continue;
+            };
+            // The census supersedes every sampled cardinality measure
+            // it covers; leaving them beside it would offer a reader
+            // two answers, one of them an estimate.
+            profile.measures.swap_remove(MeasureKind::ExactFrequencyTable.as_str());
+            profile.measures.swap_remove(MeasureKind::HeavyHitters.as_str());
+            profile.measures.swap_remove(MeasureKind::HyperLogLog.as_str());
+            profile.cardinality_regime =
+                CardinalityRegime::Censused { exact_distinct: value.distinct };
+            profile.presence = PresenceReport {
+                present: present + nulls,
+                null_count: nulls,
+                absent_in_record: absent,
+            };
+            profile.censused = true;
+            profile.measures.insert(
+                MeasureKind::ExactValueCensus.as_str().to_string(),
+                MeasureReport::ExactValueCensus(value),
+            );
+            if let Some(h) = histogram {
+                profile.measures.insert(
+                    MeasureKind::ExactIntegerHistogram.as_str().to_string(),
+                    MeasureReport::ExactIntegerHistogram(h),
+                );
+            }
+            for reason in reasons {
+                warnings.push(Warning {
+                    severity: "warning".into(),
+                    field: Some(name.clone()),
+                    message: format!("census: {}", reason),
+                });
+            }
+            kept.push(name);
+        }
+        for d in &dropped {
+            warnings.push(Warning {
+                severity: "warning".into(),
+                field: Some(d.field.clone()),
+                message: format!("census: field left the census — {}", d.reason),
+            });
+        }
+        if outcome.decode_errors > 0 {
+            warnings.push(Warning {
+                severity: "warning".into(),
+                field: None,
+                message: format!(
+                    "census: {} records failed ANode decode and were skipped",
+                    outcome.decode_errors
+                ),
+            });
+        }
+        if let Some(u) = ui {
+            u.log(&format!(
+                "survey: Pass 3 complete in {:.1}s — {} records, {} fields censused, {} dropped",
+                started.elapsed().as_secs_f64(), outcome.records, kept.len(), dropped.len(),
+            ));
+        }
+        (
+            Some(CensusInfo {
+                records: outcome.records,
+                auto: config.census.auto,
+                fields: kept,
+                dropped,
+            }),
+            outcome.hierarchies,
+            outcome.pairs,
+        )
+    };
+
     // ── Finalize cross-field analyzers ──────────────────────────────
     let cross_field = collect_pair_reports(pair_analyzers, planned_pairs);
 
     Ok(SurveyReport {
-        schema_version: 1,
+        schema_version: 2,
         produced_by: "veks-pipeline analyze survey".into(),
         source: SourceInfo {
             path: path.display().to_string(),
@@ -581,11 +723,113 @@ pub fn survey(
                 mode: "page_stride".into(),
                 page_count: sample_pages.len() as u64,
             },
+            census: census_info,
         },
         fields,
         cross_field,
+        hierarchies,
+        pair_census,
         warnings,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Pass-3 planning
+// ---------------------------------------------------------------------------
+
+/// Pages between census milestone log lines. Slab pages of a metadata
+/// facet hold a few hundred records each, so this is a line every few
+/// million records — a few dozen lines over half a billion.
+const CENSUS_LOG_EVERY_PAGES: u32 = 16_384;
+
+/// Resolve the census declarations against the surveyed fields.
+///
+/// `auto` takes every field whose Pass 1 regime already shows it to be
+/// enumerable; a listed field is taken regardless of regime and must
+/// exist. Hierarchy and pair fields must exist too: a declaration
+/// naming a field the records do not carry is a configuration error,
+/// not an empty table.
+fn plan_census(
+    config: &CensusConfig,
+    fields: &IndexMap<String, FieldProfile>,
+) -> Result<CensusPlan, String> {
+    let mut planned: Vec<CensusFieldPlan> = Vec::new();
+    if config.auto {
+        for (name, profile) in fields {
+            let enumerable = matches!(
+                profile.cardinality_regime,
+                CardinalityRegime::Constant
+                    | CardinalityRegime::Binary
+                    | CardinalityRegime::LowCard { .. }
+                    | CardinalityRegime::MidCard { .. }
+            );
+            let typed = profile
+                .semantic_type
+                .as_ref()
+                .is_some_and(|t| !matches!(t, SemanticType::Unstable));
+            if enumerable && typed {
+                planned.push(CensusFieldPlan {
+                    name: name.clone(),
+                    listed: false,
+                    integer: is_integer_encoded(profile),
+                });
+            }
+        }
+    }
+    for name in &config.listed {
+        let profile = fields.get(name).ok_or_else(|| {
+            format!("census: listed field `{}` is not present in the surveyed records", name)
+        })?;
+        if let Some(existing) = planned.iter_mut().find(|f| &f.name == name) {
+            existing.listed = true;
+            continue;
+        }
+        planned.push(CensusFieldPlan {
+            name: name.clone(),
+            listed: true,
+            integer: is_integer_encoded(profile),
+        });
+    }
+    for levels in &config.hierarchies {
+        for field in levels {
+            if !fields.contains_key(field) {
+                return Err(format!(
+                    "hierarchy {}: field `{}` is not present in the surveyed records",
+                    levels.join(">"),
+                    field
+                ));
+            }
+        }
+    }
+    for (a, b) in &config.pairs {
+        for field in [a, b] {
+            if !fields.contains_key(field) {
+                return Err(format!(
+                    "census-pair {}:{}: field `{}` is not present in the surveyed records",
+                    a, b, field
+                ));
+            }
+        }
+    }
+    Ok(CensusPlan {
+        fields: planned,
+        hierarchies: config.hierarchies.clone(),
+        pairs: config.pairs.clone(),
+        cap: config.cap,
+        pair_cells_cap: config.pair_cells_cap,
+    })
+}
+
+/// A field every one of whose Pass 1 tags is an integer variant gets a
+/// dense histogram beside its value table.
+fn is_integer_encoded(profile: &FieldProfile) -> bool {
+    matches!(profile.wire_encoding.kind, WireEncodingKind::Numeric)
+        && !profile.wire_encoding.tag_histogram.is_empty()
+        && profile
+            .wire_encoding
+            .tag_histogram
+            .keys()
+            .all(|tag| matches!(tag.as_str(), "Int" | "Int32" | "Short" | "EnumOrd"))
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +1057,9 @@ fn instantiate_measure(
         MeasureKind::ProbeAttempt => Some(Box::new(ProbeAttemptMeasure::from_tallies(
             template.probe_tallies.clone(),
         ))),
+        // Census measures are produced by Pass 3 (`census.rs`), never
+        // instantiated as Pass 2 observers.
+        MeasureKind::ExactValueCensus | MeasureKind::ExactIntegerHistogram => None,
     }
 }
 
@@ -853,6 +1100,329 @@ mod tests {
         w.finish().unwrap();
     }
 
+    fn census_config(auto: bool, listed: &[&str], cap: usize) -> SurveyConfig {
+        SurveyConfig {
+            census: CensusConfig {
+                auto,
+                listed: listed.iter().map(|s| s.to_string()).collect(),
+                cap,
+                ..CensusConfig::default()
+            },
+            ..SurveyConfig::default()
+        }
+    }
+
+    /// `auto` censuses a low-cardinality field exactly: the sampled
+    /// frequency table is replaced, the regime becomes `Censused`,
+    /// and presence covers every record.
+    #[test]
+    fn census_auto_counts_low_card_field_exactly() {
+        let path = tmp_path("census_auto.slab");
+        let countries = ["US", "GB", "DE", "FR", "JP"];
+        let mut records: Vec<HashMap<&str, MValue>> = Vec::new();
+        for i in 0..300 {
+            let mut r = HashMap::new();
+            r.insert("country", MValue::Text(countries[i % 5].into()));
+            records.push(r);
+        }
+        write_slab(&path, &records);
+        let r = survey(&path, &SurveyConfig::default(), None).unwrap();
+        let f = r.fields.get("country").unwrap();
+        assert!(f.censused);
+        assert_eq!(f.cardinality_regime, CardinalityRegime::Censused { exact_distinct: 5 });
+        assert_eq!(f.presence.present, 300);
+        assert!(!f.measures.contains_key("ExactFrequencyTable"));
+        match f.measures.get("ExactValueCensus") {
+            Some(MeasureReport::ExactValueCensus(c)) => {
+                assert_eq!(c.population, 300);
+                assert_eq!(c.missing, 0);
+                assert_eq!(c.distinct, 5);
+                assert!(c.counts.values().all(|n| *n == 60), "{:?}", c.counts);
+            }
+            other => panic!("expected ExactValueCensus, got {:?}", other),
+        }
+        let info = r.source.census.as_ref().expect("census info");
+        assert_eq!(info.records, 300);
+        assert!(info.auto);
+        assert_eq!(info.fields, vec!["country".to_string()]);
+        assert!(info.dropped.is_empty());
+        assert_eq!(r.schema_version, 2);
+    }
+
+    /// `census: none` is exactly the two-pass survey.
+    #[test]
+    fn census_none_leaves_report_unchanged() {
+        let path = tmp_path("census_none.slab");
+        let mut records: Vec<HashMap<&str, MValue>> = Vec::new();
+        for i in 0..50 {
+            let mut r = HashMap::new();
+            r.insert("k", MValue::Text(format!("v{}", i % 3)));
+            records.push(r);
+        }
+        write_slab(&path, &records);
+        let r = survey(&path, &census_config(false, &[], 10), None).unwrap();
+        let f = r.fields.get("k").unwrap();
+        assert!(!f.censused);
+        assert!(f.measures.contains_key("ExactFrequencyTable"));
+        assert!(matches!(f.cardinality_regime, CardinalityRegime::LowCard { .. }));
+        assert!(r.source.census.is_none());
+        assert!(r.hierarchies.is_empty());
+        assert!(r.pair_census.is_empty());
+    }
+
+    /// The census counts every record even when the sampled passes
+    /// saw a handful of them.
+    #[test]
+    fn census_counts_everything_when_sample_is_small() {
+        let path = tmp_path("census_small_sample.slab");
+        let mut records: Vec<HashMap<&str, MValue>> = Vec::new();
+        for i in 0..500 {
+            let mut r = HashMap::new();
+            r.insert(
+                "k",
+                MValue::Text(if i % 10 == 0 { "rare".into() } else { "common".into() }),
+            );
+            records.push(r);
+        }
+        write_slab(&path, &records);
+        let cfg = SurveyConfig { samples: 10, ..SurveyConfig::default() };
+        let r = survey(&path, &cfg, None).unwrap();
+        assert_eq!(r.source.sampled_records, 10);
+        let f = r.fields.get("k").unwrap();
+        match f.measures.get("ExactValueCensus") {
+            Some(MeasureReport::ExactValueCensus(c)) => {
+                assert_eq!(c.population, 500);
+                assert_eq!(c.counts.get("Text(\"rare\")"), Some(&50));
+                assert_eq!(c.counts.get("Text(\"common\")"), Some(&450));
+            }
+            other => panic!("expected ExactValueCensus, got {:?}", other),
+        }
+        assert_eq!(f.presence.present, 500);
+    }
+
+    /// A listed field over the cap is an error: a truncated table
+    /// presented as exact would be a wrong selectivity.
+    #[test]
+    fn census_listed_field_over_cap_errors() {
+        let path = tmp_path("census_listed_cap.slab");
+        let mut records: Vec<HashMap<&str, MValue>> = Vec::new();
+        for i in 0..100 {
+            let mut r = HashMap::new();
+            r.insert("uid", MValue::Text(format!("u{}", i)));
+            records.push(r);
+        }
+        write_slab(&path, &records);
+        let err = survey(&path, &census_config(false, &["uid"], 10), None).unwrap_err();
+        assert!(err.contains("uid") && err.contains("census-cap"), "{}", err);
+    }
+
+    /// An `auto` field over the cap leaves the census with a warning
+    /// and keeps its sampled measures.
+    #[test]
+    fn census_auto_field_over_cap_is_dropped_with_warning() {
+        let path = tmp_path("census_auto_cap.slab");
+        let mut records: Vec<HashMap<&str, MValue>> = Vec::new();
+        for i in 0..100 {
+            let mut r = HashMap::new();
+            r.insert("uid", MValue::Text(format!("u{}", i)));
+            r.insert("k", MValue::Text(format!("v{}", i % 3)));
+            records.push(r);
+        }
+        write_slab(&path, &records);
+        let r = survey(&path, &census_config(true, &[], 10), None).unwrap();
+        let uid = r.fields.get("uid").unwrap();
+        assert!(!uid.censused);
+        assert!(!uid.measures.contains_key("ExactValueCensus"));
+        assert!(
+            uid.measures.contains_key("HeavyHitters") || uid.measures.contains_key("HyperLogLog"),
+            "sampled measures stay: {:?}",
+            uid.measures.keys().collect::<Vec<_>>()
+        );
+        let info = r.source.census.as_ref().unwrap();
+        assert_eq!(info.fields, vec!["k".to_string()]);
+        assert_eq!(info.dropped.len(), 1);
+        assert_eq!(info.dropped[0].field, "uid");
+        assert!(r.warnings.iter().any(|w| w.field.as_deref() == Some("uid") && w.message.contains("census")));
+    }
+
+    /// Integer fields get a dense histogram beside the value table.
+    #[test]
+    fn census_integer_field_gets_dense_histogram() {
+        let path = tmp_path("census_int.slab");
+        let mut records: Vec<HashMap<&str, MValue>> = Vec::new();
+        for i in 0..120 {
+            let mut r = HashMap::new();
+            r.insert("year", MValue::Int32(2000 + (i % 12)));
+            records.push(r);
+        }
+        write_slab(&path, &records);
+        let r = survey(&path, &SurveyConfig::default(), None).unwrap();
+        let f = r.fields.get("year").unwrap();
+        assert!(f.censused);
+        match f.measures.get("ExactIntegerHistogram") {
+            Some(MeasureReport::ExactIntegerHistogram(h)) => {
+                assert_eq!((h.min, h.max), (2000, 2011));
+                assert_eq!(h.counts.len(), 12);
+                assert!(h.counts.iter().all(|n| *n == 10));
+                assert_eq!(h.population, 120);
+            }
+            other => panic!("expected ExactIntegerHistogram, got {:?}", other),
+        }
+    }
+
+    /// Hierarchy and pair declarations produce a verified tree and a
+    /// dense joint table whose margins agree with the field census,
+    /// and both survive a JSON round trip.
+    #[test]
+    fn census_hierarchy_and_pair_end_to_end() {
+        let path = tmp_path("census_hier_pair.slab");
+        let mut records: Vec<HashMap<&str, MValue>> = Vec::new();
+        for i in 0..240 {
+            let l1 = if i % 3 == 0 { "a" } else { "b" };
+            let l2 = format!("{}{}", l1, i % 2);
+            let mut r = HashMap::new();
+            r.insert("l1", MValue::Text(l1.into()));
+            r.insert("l2", MValue::Text(l2));
+            r.insert("year", MValue::Int(2000 + (i % 4) as i64));
+            records.push(r);
+        }
+        write_slab(&path, &records);
+        let cfg = SurveyConfig {
+            census: CensusConfig {
+                hierarchies: vec![vec!["l1".into(), "l2".into()]],
+                pairs: vec![("l2".into(), "year".into())],
+                ..CensusConfig::default()
+            },
+            ..SurveyConfig::default()
+        };
+        let r = survey(&path, &cfg, None).unwrap();
+        assert_eq!(r.hierarchies.len(), 1);
+        let h = &r.hierarchies[0];
+        assert_eq!(h.fields, vec!["l1".to_string(), "l2".to_string()]);
+        assert_eq!(h.population, 240);
+        assert_eq!(h.incomplete, 0);
+        assert_eq!(h.level_sizes, vec![2, 4]);
+        assert_eq!(h.nodes[0].value, "Text(\"b\")");
+        assert_eq!(h.nodes[0].count, 160);
+        assert_eq!(h.nodes[0].children.iter().map(|c| c.count).sum::<u64>(), 160);
+        assert_eq!(h.nodes[1].count, 80);
+        // Every node's count equals the field census for that value.
+        let l2 = match r.fields.get("l2").unwrap().measures.get("ExactValueCensus") {
+            Some(MeasureReport::ExactValueCensus(c)) => c.counts.clone(),
+            other => panic!("{:?}", other),
+        };
+        for node in &h.nodes {
+            for child in &node.children {
+                assert_eq!(l2.get(&child.value), Some(&child.count), "{}", child.value);
+            }
+        }
+        assert_eq!(r.pair_census.len(), 1);
+        let p = &r.pair_census[0];
+        assert_eq!((p.a.as_str(), p.b.as_str()), ("l2", "year"));
+        assert_eq!(p.population, 240);
+        assert_eq!(p.a_values.len(), 4);
+        assert_eq!(p.b_values.len(), 4);
+        for (i, row) in p.counts.iter().enumerate() {
+            assert_eq!(
+                row.iter().sum::<u64>(),
+                *l2.get(&p.a_values[i]).unwrap(),
+                "row {}",
+                p.a_values[i]
+            );
+        }
+        let s = serde_json::to_string(&r).unwrap();
+        let back: SurveyReport = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.hierarchies, r.hierarchies);
+        assert_eq!(back.pair_census, r.pair_census);
+        let l2_back = back.fields.get("l2").unwrap();
+        assert_eq!(l2_back.cardinality_regime, CardinalityRegime::Censused { exact_distinct: 4 });
+        assert!(l2_back.censused);
+        assert!(l2_back.measures.contains_key("ExactValueCensus"));
+    }
+
+    /// A value with two parents fails the survey: a declared
+    /// hierarchy is an invariant of the data that produced it.
+    #[test]
+    fn census_hierarchy_violation_fails_survey() {
+        let path = tmp_path("census_hier_bad.slab");
+        let mut records: Vec<HashMap<&str, MValue>> = Vec::new();
+        for i in 0..40 {
+            let mut r = HashMap::new();
+            r.insert("l1", MValue::Text(if i % 2 == 0 { "a".into() } else { "b".into() }));
+            r.insert("l2", MValue::Text("shared".into()));
+            records.push(r);
+        }
+        write_slab(&path, &records);
+        let cfg = SurveyConfig {
+            census: CensusConfig {
+                hierarchies: vec![vec!["l1".into(), "l2".into()]],
+                ..CensusConfig::default()
+            },
+            ..SurveyConfig::default()
+        };
+        let err = survey(&path, &cfg, None).unwrap_err();
+        assert!(err.contains("nesting violated"), "{}", err);
+    }
+
+    /// Decoding is parallel and counting is sequential, so the report
+    /// is byte-identical whatever the thread count.
+    #[test]
+    fn census_is_identical_across_thread_counts() {
+        let path = tmp_path("census_threads.slab");
+        let mut records: Vec<HashMap<&str, MValue>> = Vec::new();
+        for i in 0..3_000 {
+            let l1 = if i % 7 == 0 { "a" } else { "b" };
+            let mut r = HashMap::new();
+            r.insert("l1", MValue::Text(l1.into()));
+            r.insert("l2", MValue::Text(format!("{}{}", l1, i % 5)));
+            r.insert("k", MValue::Int(i % 13));
+            records.push(r);
+        }
+        write_slab(&path, &records);
+        let run = |threads: usize| {
+            let cfg = SurveyConfig {
+                census: CensusConfig {
+                    hierarchies: vec![vec!["l1".into(), "l2".into()]],
+                    pairs: vec![("l2".into(), "k".into())],
+                    threads,
+                    ..CensusConfig::default()
+                },
+                ..SurveyConfig::default()
+            };
+            serde_json::to_string(&survey(&path, &cfg, None).unwrap()).unwrap()
+        };
+        let one = run(1);
+        assert_eq!(one, run(4));
+        assert_eq!(one, run(0));
+        let back: SurveyReport = serde_json::from_str(&one).unwrap();
+        assert_eq!(back.source.census.as_ref().unwrap().records, 3_000);
+        assert!(back.source.sampling.page_count < 3_000, "fixture spans several pages");
+    }
+
+    /// A declaration naming a field the records do not carry is a
+    /// configuration error, not an empty table.
+    #[test]
+    fn census_unknown_field_in_declaration_errors() {
+        let path = tmp_path("census_unknown.slab");
+        let mut records: Vec<HashMap<&str, MValue>> = Vec::new();
+        for i in 0..10 {
+            let mut r = HashMap::new();
+            r.insert("k", MValue::Int(i));
+            records.push(r);
+        }
+        write_slab(&path, &records);
+        let err = survey(&path, &census_config(true, &["nope"], 100), None).unwrap_err();
+        assert!(err.contains("nope"), "{}", err);
+        let cfg = SurveyConfig {
+            census: CensusConfig {
+                pairs: vec![("k".into(), "nope".into())],
+                ..CensusConfig::default()
+            },
+            ..SurveyConfig::default()
+        };
+        assert!(survey(&path, &cfg, None).unwrap_err().contains("nope"));
+    }
+
     /// Empty slab survey: produces a report with no fields, zero
     /// records, no warnings.
     #[test]
@@ -864,7 +1434,7 @@ mod tests {
         assert_eq!(r.source.sampled_records, 0);
         assert!(r.fields.is_empty());
         assert!(r.warnings.is_empty());
-        assert_eq!(r.schema_version, 1);
+        assert_eq!(r.schema_version, 2);
     }
 
     /// A single-field integer column: classified as Number(Integer),

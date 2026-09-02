@@ -58,6 +58,10 @@ pub enum MeasureKind {
     HeavyHitters,
     /// Exact frequency table for low-cardinality fields.
     ExactFrequencyTable,
+    /// Exact value → count over every record (Pass 3 census).
+    ExactValueCensus,
+    /// Dense exact histogram of an integer field (Pass 3 census).
+    ExactIntegerHistogram,
 
     // ── textual ───────────────────────────────────────────────
     /// Exact moments over text length (bytes + chars).
@@ -112,6 +116,8 @@ impl MeasureKind {
             MeasureKind::HyperLogLog => "HyperLogLog",
             MeasureKind::HeavyHitters => "HeavyHitters",
             MeasureKind::ExactFrequencyTable => "ExactFrequencyTable",
+            MeasureKind::ExactValueCensus => "ExactValueCensus",
+            MeasureKind::ExactIntegerHistogram => "ExactIntegerHistogram",
             MeasureKind::ExactLengthMoments => "ExactLengthMoments",
             MeasureKind::LengthQuantiles => "LengthQuantiles",
             MeasureKind::CharClassMix => "CharClassMix",
@@ -204,6 +210,10 @@ pub enum MeasureReport {
     HeavyHitters(super::measures::cardinality::HeavyHittersReport),
     /// `MeasureKind::ExactFrequencyTable`.
     ExactFrequencyTable(super::measures::cardinality::ExactFrequencyTableReport),
+    /// `MeasureKind::ExactValueCensus`.
+    ExactValueCensus(super::census::ExactValueCensusReport),
+    /// `MeasureKind::ExactIntegerHistogram`.
+    ExactIntegerHistogram(super::census::ExactIntegerHistogramReport),
     /// `MeasureKind::ExactLengthMoments`.
     ExactLengthMoments(super::measures::textual::ExactLengthMomentsReport),
     /// `MeasureKind::LengthQuantiles`.
@@ -310,6 +320,8 @@ impl MeasureReport {
             MeasureReport::HyperLogLog(_) => MeasureKind::HyperLogLog,
             MeasureReport::HeavyHitters(_) => MeasureKind::HeavyHitters,
             MeasureReport::ExactFrequencyTable(_) => MeasureKind::ExactFrequencyTable,
+            MeasureReport::ExactValueCensus(_) => MeasureKind::ExactValueCensus,
+            MeasureReport::ExactIntegerHistogram(_) => MeasureKind::ExactIntegerHistogram,
             MeasureReport::ExactLengthMoments(_) => MeasureKind::ExactLengthMoments,
             MeasureReport::LengthQuantiles(_) => MeasureKind::LengthQuantiles,
             MeasureReport::CharClassMix(_) => MeasureKind::CharClassMix,

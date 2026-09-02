@@ -3,15 +3,13 @@
 
 //! `analyze survey` — incremental metadata survey.
 //!
-//! Two-pass, type-driven, sketch-backed survey of an ANode/MNode slab
-//! file. See `docs/sysref/13-metadata-survey.md` for the full design.
-//!
-//! This module is being built incrementally per §13.13 of the sysref.
-//! At the time of this commit, only the bounded-memory streaming
-//! sketches that everything else builds on are present. The
-//! orchestrator, measure trait, per-type measure suites, and
-//! cross-field analyzers land in subsequent steps.
+//! Type-driven, sketch-backed survey of an ANode/MNode slab file in
+//! two sampled passes — discovery, then profiling — followed by an
+//! optional exhaustive third pass, the census, that counts declared
+//! fields, hierarchies and pairs exactly over every record. See
+//! `docs/sysref/13-metadata-survey.md` for the full design.
 
+pub mod census;
 pub mod command;
 pub mod crossfield;
 pub mod findings;
@@ -25,6 +23,11 @@ pub mod sketches;
 pub mod template;
 pub mod types;
 
+pub use census::{
+    CensusConfig, CensusInfo, DroppedField, ExactIntegerHistogramReport, ExactValueCensusReport,
+    HierarchyCensusReport, HierarchyNode, PairCensusReport, DEFAULT_CENSUS_CAP,
+    DEFAULT_PAIR_CELLS_CAP,
+};
 pub use command::{factory, SurveyOp};
 pub use findings::{render_findings, Finding, FindingsConfig, FindingsReport, Severity};
 pub use governor::{Downscaler, DownscaleAction, GovernorAdapter};

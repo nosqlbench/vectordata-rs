@@ -482,6 +482,7 @@ fn print_field_table(eligible: &[(String, &FieldProfile)]) {
             CardinalityRegime::LowCard { .. } => "low".into(),
             CardinalityRegime::MidCard { .. } => "mid".into(),
             CardinalityRegime::HighCardOrUnique { .. } => "high".into(),
+            CardinalityRegime::Censused { .. } => "exact".into(),
             CardinalityRegime::Unknown => "?".into(),
         }
     };

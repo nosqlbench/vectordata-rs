@@ -276,6 +276,10 @@ pub enum CardinalityRegime {
     MidCard { hll_estimate_at_pass1: f64 },
     /// Cardinality above `mid_card_threshold` (or essentially unique).
     HighCardOrUnique { uniqueness_ratio: f64 },
+    /// Counted exactly by the Pass 3 census over every record. Replaces
+    /// the sampled verdict for censused fields: `exact_distinct` is a
+    /// fact, not an estimate.
+    Censused { exact_distinct: u32 },
     /// Cardinality unknown (Unstable field; nothing meaningful tracked).
     Unknown,
 }

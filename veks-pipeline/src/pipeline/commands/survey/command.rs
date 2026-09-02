@@ -4,23 +4,31 @@
 //! `analyze survey` — pipeline command-op.
 //!
 //! Parses CLI/YAML options into a [`SurveyConfig`], invokes the
-//! two-pass [`super::orchestrator::survey`] driver, and writes the
+//! [`super::orchestrator::survey`] driver — two sampled passes and,
+//! when anything is declared, the exhaustive census — and writes the
 //! report to the configured output path.
 //!
 //! This is the operator-facing surface. The driver itself is a
 //! library function so tests and downstream tooling can invoke it
 //! directly without going through the pipeline runner.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    render_options_table, ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc,
-    OptionRole, Options, Status, StreamContext,
+    render_options_table, ArtifactManifest, ArtifactState, CommandDoc, CommandOp, CommandResult,
+    OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
 };
 
+use super::census::{CensusConfig, DEFAULT_CENSUS_CAP, DEFAULT_PAIR_CELLS_CAP};
 use super::findings::{render_findings, FindingsConfig, Severity};
-use super::orchestrator::{survey, SurveyConfig};
+use super::measure::MeasureReport;
+use super::orchestrator::{survey, SurveyConfig, SurveyReport};
+use super::types::CardinalityRegime;
+
+/// `auto` census fields are unknown until Pass 1 has run; the memory
+/// declared to the governor allows for this many of them.
+const CENSUS_AUTO_FIELD_ALLOWANCE: usize = 32;
 
 /// `analyze survey` — incremental metadata survey.
 pub struct SurveyOp;
@@ -46,14 +54,16 @@ impl CommandOp for SurveyOp {
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Two-pass type-driven metadata survey".into(),
+            summary: "Type-driven metadata survey with an exact census pass".into(),
             body: format!(
                 r#"# analyze survey
 
-Two-pass incremental metadata survey. Pass 1 explores each field's
-encoding and cardinality regime; Pass 2 runs a measure suite
-tailored to that verdict. See `docs/sysref/13-metadata-survey.md`
-for the full design.
+Incremental metadata survey. Pass 1 explores each field's encoding
+and cardinality regime on a sample; Pass 2 runs a measure suite
+tailored to that verdict on the same sample; Pass 3, the census,
+counts declared fields, hierarchies and field pairs exactly over
+every record (`--census`, `--hierarchy`, `--census-pair`). See
+`docs/sysref/13-metadata-survey.md` for the full design.
 
 Out of scope: this command surveys ANode → MNode slab files only.
 Other formats (ivec metadata, Parquet, NPY) are not supported.
@@ -80,7 +90,7 @@ Other formats (ivec metadata, Parquet, NPY) are not supported.
             None => ctx.workspace.join("survey.json"),
         };
 
-        let cfg = SurveyConfig {
+        let mut cfg = SurveyConfig {
             samples: parse_opt(options, "samples", 100_000),
             distinct_cap: parse_opt::<u32>(options, "distinct-cap", 4_096),
             low_card_threshold: parse_opt::<u32>(options, "low-card-threshold", 64),
@@ -92,7 +102,35 @@ Other formats (ivec metadata, Parquet, NPY) are not supported.
             quantile_k: parse_opt(options, "quantile-k", 1000),
             max_pair_analyses: parse_opt(options, "max-pair-analyses", 1_024),
             semantic_confidence: parse_opt(options, "semantic-confidence", 0.95),
+            census: match parse_census_config(options) {
+                Ok(c) => c,
+                Err(e) => return err(e, start),
+            },
         };
+
+        // Page decoding in the census pass is the governor's `threads`;
+        // counting is sequential regardless (census.rs).
+        cfg.census.threads = ctx.governor.current_or("threads", 0) as usize;
+
+        if !cfg.census.is_noop() {
+            // Declare the census tables' ceiling before the pass runs
+            // (SRD TS-145). `auto` fields are unknown until Pass 1, so
+            // the declaration allows for a fixed number of them.
+            let field_hint = cfg.census.listed.len() + CENSUS_AUTO_FIELD_ALLOWANCE;
+            let needed = cfg.census.estimated_memory_bytes(field_hint);
+            let granted = ctx.governor.request("mem", needed);
+            if granted < needed {
+                return err(
+                    format!(
+                        "census tables may need up to {} MiB but the mem budget grants {} MiB; \
+                         raise the budget, lower census-cap or pair-cells-cap, or narrow the declarations",
+                        needed >> 20,
+                        granted >> 20
+                    ),
+                    start,
+                );
+            }
+        }
 
         let report = match survey(&input_path, &cfg, Some(&ctx.ui)) {
             Ok(r) => r,
@@ -162,7 +200,7 @@ Other formats (ivec metadata, Parquet, NPY) are not supported.
             }
         }
 
-        let message = format!(
+        let mut message = format!(
             "{} records sampled, {} fields ({} unstable)",
             report.source.sampled_records,
             report.fields.len(),
@@ -175,6 +213,20 @@ Other formats (ivec metadata, Parquet, NPY) are not supported.
                 ))
                 .count(),
         );
+        if let Some(census) = &report.source.census {
+            message.push_str(&format!(
+                "; census: {} fields exact over {} records, {} hierarchies, {} pairs{}",
+                census.fields.len(),
+                census.records,
+                report.hierarchies.len(),
+                report.pair_census.len(),
+                if census.dropped.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} dropped", census.dropped.len())
+                },
+            ));
+        }
 
         CommandResult {
             status: Status::Ok,
@@ -215,7 +267,64 @@ Other formats (ivec metadata, Parquet, NPY) are not supported.
             opt("findings-markdown", "Path", false, None, "Markdown findings output (default: survey.findings.md alongside --output; empty string disables)", OptionRole::Output),
             opt("findings-json", "Path", false, None, "JSON findings output (default: survey.findings.json alongside --output; empty string disables)", OptionRole::Output),
             opt("findings-severity", "string", false, Some("info"), "Minimum severity to include in findings: info|notable|warning|error", OptionRole::Config),
+            opt("census", "string", false, Some("auto"), "Pass 3 census fields: `auto` (every field Pass 1 found enumerable), `none`, or a comma-separated field list; `auto` may be combined with names", OptionRole::Config)
+                .with_extended_description(
+                    "The census is an exhaustive third pass that counts declared \
+                     fields exactly over every record, where Passes 1 and 2 are \
+                     sampled. A censused field's presence, cardinality regime \
+                     (`Censused`) and value table are then exact, and its \
+                     sampled cardinality measures are replaced by \
+                     `ExactValueCensus` (plus `ExactIntegerHistogram` for \
+                     integer fields).\n\n\
+                     `auto` takes every field whose Pass 1 regime is Constant, \
+                     Binary, LowCard or MidCard. Name a field to census it \
+                     regardless of regime — the way a 10,000-value field that \
+                     the sample misjudged as high-cardinality enters. `none` \
+                     skips the pass entirely.",
+                ),
+            opt("census-cap", "int", false, Some("65536"), "Distinct values (or integer histogram width) a censused field may have; a listed field over the cap is an error, an auto field leaves the census with a warning", OptionRole::Config),
+            opt("hierarchy", "string", false, None, "Comma-separated hierarchy declarations `outer>inner>innermost`; each is counted as an exact tree and its nesting verified", OptionRole::Config),
+            opt("census-pair", "string", false, None, "Comma-separated pair declarations `a:b`; each is counted as an exact joint table", OptionRole::Config),
+            opt("pair-cells-cap", "int", false, Some("4194304"), "Cells (|a| x |b|) a pair's joint table may have before the pair is an error", OptionRole::Config),
         ]
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc {
+                name: "mem".into(),
+                description: "Census tables: interned values, histograms, hierarchy and pair counts".into(),
+                adjustable: false,
+            },
+            ResourceDesc {
+                name: "threads".into(),
+                description: "Parallel page decoding in the census pass".into(),
+                adjustable: true,
+            },
+        ]
+    }
+
+    fn check_artifact(&self, output: &Path, options: &Options) -> ArtifactState {
+        if !output.exists() {
+            return ArtifactState::Absent;
+        }
+        let text = match std::fs::read_to_string(output) {
+            Ok(t) => t,
+            Err(_) => return ArtifactState::Partial,
+        };
+        let report: SurveyReport = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(_) => return ArtifactState::Partial,
+        };
+        let census = match parse_census_config(options) {
+            Ok(c) => c,
+            Err(_) => return ArtifactState::Partial,
+        };
+        if census_is_complete(&report, &census) {
+            ArtifactState::Complete
+        } else {
+            ArtifactState::Partial
+        }
     }
 
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
@@ -261,6 +370,76 @@ fn opt(
 
 fn parse_opt<T: std::str::FromStr>(options: &Options, key: &str, fallback: T) -> T {
     options.get(key).and_then(|s| s.parse().ok()).unwrap_or(fallback)
+}
+
+/// Parse the census declarations from the step's options.
+fn parse_census_config(options: &Options) -> Result<CensusConfig, String> {
+    let (auto, listed) = match options.get("census") {
+        Some(spec) => CensusConfig::parse_fields(spec)?,
+        None => (true, Vec::new()),
+    };
+    let cap = options.parse_or::<usize>("census-cap", DEFAULT_CENSUS_CAP)?;
+    let hierarchies = match options.get("hierarchy") {
+        Some(spec) => CensusConfig::parse_hierarchies(spec)?,
+        None => Vec::new(),
+    };
+    let pairs = match options.get("census-pair") {
+        Some(spec) => CensusConfig::parse_pairs(spec)?,
+        None => Vec::new(),
+    };
+    let pair_cells_cap = options.parse_or::<usize>("pair-cells-cap", DEFAULT_PAIR_CELLS_CAP)?;
+    if cap == 0 || pair_cells_cap == 0 {
+        return Err("census-cap and pair-cells-cap must be positive".into());
+    }
+    Ok(CensusConfig {
+        auto,
+        listed,
+        cap,
+        hierarchies,
+        pairs,
+        pair_cells_cap,
+        threads: 0,
+    })
+}
+
+/// Whether a report satisfies its census declarations (SRD TS-129):
+/// every listed field is censused, every declared hierarchy and pair
+/// is present, and every censused field's counts account for every
+/// record of the source.
+pub(crate) fn census_is_complete(report: &SurveyReport, census: &CensusConfig) -> bool {
+    if census.is_noop() {
+        return true;
+    }
+    let Some(info) = report.source.census.as_ref() else { return false };
+    for name in &census.listed {
+        if !report.fields.get(name).is_some_and(|f| f.censused) {
+            return false;
+        }
+    }
+    for levels in &census.hierarchies {
+        if !report.hierarchies.iter().any(|h| &h.fields == levels) {
+            return false;
+        }
+    }
+    for (a, b) in &census.pairs {
+        if !report.pair_census.iter().any(|p| &p.a == a && &p.b == b) {
+            return false;
+        }
+    }
+    for name in &info.fields {
+        let Some(profile) = report.fields.get(name) else { return false };
+        let Some(MeasureReport::ExactValueCensus(c)) = profile.measures.get("ExactValueCensus")
+        else {
+            return false;
+        };
+        if c.population + c.missing != report.source.total_records {
+            return false;
+        }
+        if !matches!(profile.cardinality_regime, CardinalityRegime::Censused { .. }) {
+            return false;
+        }
+    }
+    true
 }
 
 fn parse_severity(s: &str) -> Severity {

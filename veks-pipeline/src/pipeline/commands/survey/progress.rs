@@ -36,20 +36,23 @@ pub enum SurveyPass {
     Pass1 = 1,
     /// Pass 2 — measure-suite profiling.
     Pass2 = 2,
+    /// Pass 3 — exhaustive census over every record.
+    Census = 3,
     /// Cross-field analyzer finalize.
-    CrossField = 3,
+    CrossField = 4,
     /// Findings rendering.
-    Findings = 4,
+    Findings = 5,
     /// Complete.
-    Done = 5,
+    Done = 6,
 }
 
 impl SurveyPass {
     fn label(self) -> &'static str {
         match self {
             SurveyPass::Setup => "setup",
-            SurveyPass::Pass1 => "Pass 1/2 — surveying",
-            SurveyPass::Pass2 => "Pass 2/2 — profiling",
+            SurveyPass::Pass1 => "Pass 1 — surveying",
+            SurveyPass::Pass2 => "Pass 2 — profiling",
+            SurveyPass::Census => "Pass 3 — census",
             SurveyPass::CrossField => "cross-field finalize",
             SurveyPass::Findings => "rendering findings",
             SurveyPass::Done => "done",
@@ -95,8 +98,9 @@ impl SurveyProgress {
             0 => SurveyPass::Setup,
             1 => SurveyPass::Pass1,
             2 => SurveyPass::Pass2,
-            3 => SurveyPass::CrossField,
-            4 => SurveyPass::Findings,
+            3 => SurveyPass::Census,
+            4 => SurveyPass::CrossField,
+            5 => SurveyPass::Findings,
             _ => SurveyPass::Done,
         }
     }
@@ -272,9 +276,29 @@ mod tests {
 
     #[test]
     fn pass_labels_match() {
-        assert_eq!(SurveyPass::Pass1.label(), "Pass 1/2 — surveying");
-        assert_eq!(SurveyPass::Pass2.label(), "Pass 2/2 — profiling");
+        assert_eq!(SurveyPass::Pass1.label(), "Pass 1 — surveying");
+        assert_eq!(SurveyPass::Pass2.label(), "Pass 2 — profiling");
+        assert_eq!(SurveyPass::Census.label(), "Pass 3 — census");
         assert_eq!(SurveyPass::CrossField.label(), "cross-field finalize");
+    }
+
+    /// Every pass survives the atomic round trip, including the
+    /// census pass inserted between profiling and cross-field.
+    #[test]
+    fn pass_round_trips_through_atomic() {
+        let p = SurveyProgress::new();
+        for pass in [
+            SurveyPass::Setup,
+            SurveyPass::Pass1,
+            SurveyPass::Pass2,
+            SurveyPass::Census,
+            SurveyPass::CrossField,
+            SurveyPass::Findings,
+            SurveyPass::Done,
+        ] {
+            p.set_pass(pass);
+            assert_eq!(p.current_pass(), pass);
+        }
     }
 
     #[test]
@@ -313,7 +337,7 @@ mod tests {
         p.set_fields_classified(42);
         p.set_unstable_count(3);
         let line = p.status_line();
-        assert!(line.contains("Pass 1/2"));
+        assert!(line.contains("Pass 1 —"), "{}", line);
         assert!(line.contains("records=250/1000"));
         assert!(line.contains("fields=42"));
         assert!(line.contains("unstable=3"));

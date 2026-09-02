@@ -317,7 +317,7 @@ Numeric and Bytes inputs immediately).
 
 ---
 
-## 13.4 Two-Pass Orchestration
+## 13.4 Orchestration: Two Sampled Passes, Then the Census
 
 ### Input contract
 
@@ -406,8 +406,68 @@ Both passes use the **same sample set** (deterministic page indices,
 as today). The two-pass cost is therefore ~2× a single-pass survey
 on the sample, not on the full corpus. For corpora small enough to
 survey exhaustively (`samples >= total_records`), the cost is
-exactly 2× a full scan. Two passes are the survey shape; there is
-no single-pass mode.
+exactly 2× a full scan. Two sampled passes are the survey shape;
+there is no single-pass mode. The census below is the one pass that
+is never sampled.
+
+### Pass 3 — Census (exhaustive, declared, exact)
+
+Passes 1 and 2 are sampled and capped by design. A consumer that
+stratifies predicates by selectivity needs counts, not estimates, and
+a 100,000-row sample cannot see a value at 10⁻⁵ at all. The census is
+a third pass that reads **every page and every record** — the same
+reader as Passes 1 and 2, without the page stride — for a declared
+set of fields, hierarchies and pairs. It runs after the per-field
+profiles exist, because `census: auto` selects fields by their Pass 1
+regime, and it merges into them, because an exact count supersedes a
+sampled verdict.
+
+| declaration | option | yields |
+|---|---|---|
+| field | `census: auto` (default), `none`, or a field list; `auto` may be combined with names | `ExactValueCensus` per field, plus `ExactIntegerHistogram` for integer-encoded fields |
+| hierarchy | `hierarchy: a>b>c` (comma-separated declarations) | an exact tree with a count at every node; nesting verified |
+| pair | `census-pair: a:b` (comma-separated declarations) | an exact dense joint table |
+
+`auto` takes every field whose Pass 1 regime is `Constant`, `Binary`,
+`LowCard` or `MidCard`. A named field is censused regardless of
+regime — the way a 10,000-value field the sample misjudged as
+high-cardinality enters.
+
+Bounds are declared, never inferred from the sample: `census-cap`
+(default 65,536) bounds distinct values and histogram width per field;
+`pair-cells-cap` (default 4,194,304) bounds a pair's cells. A
+**named** field whose distinct values exceed the cap is an error — a
+truncated table presented as exact would be a wrong selectivity. An
+`auto` field over the cap leaves the census with a warning and keeps
+its sampled measures. An integer field whose range alone exceeds the
+cap keeps its value table and drops only the histogram, with a
+warning. A hierarchy whose nesting is violated (a value with two
+parents) fails the survey: a declared hierarchy is an invariant of
+the data that produced it. A pair over its cells cap fails the survey.
+
+For a censused field the survey **replaces** what the sample said:
+`cardinality_regime` becomes `Censused { exact_distinct }`, `presence`
+is exact over every record, `censused: true` is set on the profile,
+and `ExactFrequencyTable`, `HeavyHitters` and `HyperLogLog` are
+removed from its `measures` — leaving them would offer a reader two
+answers, one of them an estimate. Every consumer that accepts an
+`ExactFrequencyTable` accepts an `ExactValueCensus` in its place: same
+`value → count` map, same canonical keys.
+
+Workers walk each record with the zero-allocation MNode scanner
+(`scan::fields`) and extract only the declared fields into a per-page
+slot array plus one text arena — two allocations per page, none per
+record; a declared field of a wire type the scanner does not read
+directly (float, bytes, uuid, collection) falls back to materialising
+that record. The consumer interns values on first sight — text by the
+borrowed arena slice, integers by value — so the per-record cost is
+one hash probe per declared use. Extraction, the dominant cost, runs
+on the governor's `threads` in parallel; the consumer applies pages
+strictly in page order on one thread, so the report is identical for
+any thread count. The command declares the
+tables' memory ceiling to the governor from the caps before the pass
+runs (§13.11.1) and drives the progress bar by page. `census: none`
+with no hierarchy or pair is exactly the two-pass survey.
 
 ---
 
@@ -458,6 +518,13 @@ Each measure here is independent and addressable by `MeasureKind`. A
 - **ExactFrequencyTable**: enabled only when Pass 1 verified
   cardinality ≤ `low_card_threshold` (default 64). Provides exact
   mode, entropy, Gini, full distinct count.
+- **ExactValueCensus** (Pass 3): exact `value → count` over every
+  record, ordered by count; `population`, `distinct`, `missing`.
+  Replaces the three measures above for censused fields.
+- **ExactIntegerHistogram** (Pass 3): dense `counts[]` from `min` to
+  `max` for integer-encoded fields, so a range's selectivity is a
+  prefix-sum difference. Dropped with a warning when the range is
+  wider than `census-cap`; the value table stands on its own.
 
 ### 13.5.4 Temporal (Millis, parseable Date/Time/DateTime)
 
@@ -603,6 +670,22 @@ co-presence and uniqueness metrics:
 Cross-field measures share the streaming pipeline — they observe
 pairs as the orchestrator emits them, then publish in §13.8's report.
 
+### Declared exact tables (Pass 3)
+
+Two cross-field products are counted exactly by the census rather
+than estimated by an analyzer, because their consumers need counts:
+
+- **Hierarchy census** (`hierarchy: a>b>c`): every path tuple over the
+  declared levels, folded into a tree (`hierarchies[]` in §13.8) with
+  a count at every node and per-level distinct sizes. Nesting is
+  verified as the pass runs; a violation fails the survey.
+- **Pair census** (`census-pair: a:b`): the dense joint table
+  (`pair_census[]` in §13.8) with rows `a_values` and columns
+  `b_values`. A conjunction `a = x AND b ≥ t` is a row-segment sum.
+
+Both are declared only. Their cost is a product of cardinalities, and
+nothing in a sample says which products a consumer wants.
+
 ### Output: correlation matrices
 
 The report includes pre-rendered matrices for the common cases:
@@ -628,28 +711,37 @@ there is no prior version of this schema to read.
 
 ```jsonc
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "produced_by": "veks-pipeline analyze survey",
   "source": {
     "path": "metadata_content.slab",
     "format": "slab",
     "total_records": 10000000,
     "sampled_records": 100000,
-    "sampling": { "mode": "page_stride", "page_count": 1024 }
+    "sampling": { "mode": "page_stride", "page_count": 1024 },
+    "census": {
+      "records": 10000000, "auto": true,
+      "fields": ["field_0", "topic_l1", "topic_l2", "topic_l3"],
+      "dropped": [ { "field": "corpusid", "reason": "more than 65536 distinct values; not enumerable at this cap" } ]
+    }
   },
   "fields": {
     "field_0": {
       "wire_encoding": { "kind": "Numeric", "storage_width": "I32", "narrowest_width": "I8" },
       "semantic_type": { "kind": "Number", "subkind": "Integer", "signed": false, "bit_width_hint": 8 },
       "semantic_confidence": 1.00,
-      "cardinality_regime": { "kind": "LowCard", "exact_distinct": 7 },
+      "cardinality_regime": { "kind": "Censused", "exact_distinct": 7 },
       "monotonicity_hint": "Random",
-      "presence":   { "present": 100000, "null": 12, "absent_in_record": 0 },
+      "presence":   { "present": 10000000, "null": 1200, "absent_in_record": 0 },
+      "censused": true,
       "measures": {
-        "ExactMoments":        { "mean": …, "stddev": …, "skewness": …, "kurtosis": … },
-        "ExactExtrema":        { "min": 0, "max": 6 },
-        "ExactFrequencyTable": { "0": 14200, "1": 14210, …, "entropy": 2.807, "gini": 0.857 },
-        "ReservoirSample":     [0,3,1,4,1,5,9,2,6,5,3,5]
+        "ExactMoments":          { "mean": …, "stddev": …, "skewness": …, "kurtosis": … },
+        "ExactExtrema":          { "min": 0, "max": 6 },
+        "ExactValueCensus":      { "population": 9998800, "distinct": 7, "missing": 1200,
+                                   "counts": { "Int32(0)": 1420000, "Int32(1)": 1421000, … } },
+        "ExactIntegerHistogram": { "population": 9998800, "missing": 1200, "min": 0, "max": 6,
+                                   "counts": [1420000, 1421000, …] },
+        "ReservoirSample":       [0,3,1,4,1,5,9,2,6,5,3,5]
       }
     },
     "string_encoded_int": {
@@ -710,9 +802,27 @@ there is no prior version of this schema to read.
       { "lhs": "country_code", "rhs": "currency", "support": 0.998 }
     ]
   },
-  "warnings": [ ... per-field surprises, decode errors, etc. ... ]
+  "hierarchies": [
+    { "fields": ["topic_l1", "topic_l2", "topic_l3"],
+      "population": 9998800, "incomplete": 1200, "level_sizes": [10, 300, 10000],
+      "nodes": [ { "value": "Text(\"physics\")", "count": 1200000,
+                   "children": [ { "value": "Text(\"optics\")", "count": 40000,
+                                   "children": [ { "value": "Text(\"optics-lasers\")", "count": 1300 }, … ] }, … ] }, … ] }
+  ],
+  "pair_census": [
+    { "a": "topic_l3", "b": "year", "population": 9998800,
+      "a_values": ["Text(\"optics-lasers\")", …], "b_values": ["Int32(1990)", …],
+      "counts": [[12, 40, …], …] }
+  ],
+  "warnings": [ ... per-field surprises, decode errors, census drops, etc. ... ]
 }
 ```
+
+`schema_version` became 2 with the census. Everything it added —
+`source.census`, `fields.*.censused`, the `Censused` regime, the two
+census measures, and the `hierarchies` / `pair_census` sections — is
+additive and absent when nothing was declared, so a version-1 reader
+that ignores unknown keys reads a version-2 report unchanged.
 
 `generate predicates --survey path/to/survey.json` consumes this
 schema directly. The richer selectivity-driven synthesis described
@@ -753,6 +863,11 @@ Every CLI flag below has a congruent YAML key under
 | `--correlations` | `correlations` | `auto` | `auto` / `none` / `numeric` / `categorical` / `all` |
 | `--measures` | `measures` (map) | `auto` | per-field measure overrides (`field: [Measure, …]`) |
 | `--semantic-confidence` | `semantic-confidence` | `0.95` | per-field threshold for committing to a `SemanticType` |
+| `--census` | `census` | `auto` | Pass 3 census fields: `auto` (every field Pass 1 found enumerable), `none`, or a field list; `auto` may be combined with names |
+| `--census-cap` | `census-cap` | `65536` | distinct values or histogram width per censused field; a named field over it is an error, an `auto` field leaves the census with a warning |
+| `--hierarchy` | `hierarchy` | empty | comma-separated `a>b>c` declarations; each an exact tree with nesting verified |
+| `--census-pair` | `census-pair` | empty | comma-separated `a:b` declarations; each an exact joint table |
+| `--pair-cells-cap` | `pair-cells-cap` | `4194304` | cells (row values × column values) a pair's table may have |
 | `--force-semantic-type` | `force-semantic-type` (map) | empty | force a field's `SemanticType` (`field: Number(Integer)`); bypasses the probe verdict |
 | `--memory-budget-mb` | `memory-budget-mb` | `256` | initial sketch-memory ceiling; the governor (`--resources mem=…`) supersedes this at runtime if set |
 | `--batch-size` | `batch-size` | governor `segmentsize` or auto | records per batch; batch boundary is where the governor is consulted, sketches are checked, and progress reports update |
@@ -775,6 +890,9 @@ survey:
   measures:
     user_email: [StructuredFormatDetectors, HyperLogLog, HeavyHitters]
   findings-severity: notable
+  census: auto,topic_l3
+  hierarchy: topic_l1>topic_l2>topic_l3
+  census-pair: topic_l3:citation_percentile,topic_l3:year
 ```
 
 ### Programmatic API
@@ -793,9 +911,12 @@ pub fn survey(
 ### Downstream consumers
 
 - `generate predicates`: uses `QuantileSketch` for range-bucket
-  selection, `ExactFrequencyTable` or `HeavyHitters` for value
-  picking, and `categorical_association` to choose **correlated**
-  field combinations for conjugates. The current `gen_predicates`
+  selection, `ExactValueCensus` (preferred, exact) or
+  `ExactFrequencyTable` or `HeavyHitters` for value picking, and
+  `categorical_association` to choose **correlated** field
+  combinations for conjugates. The stratified strategy of the
+  topic-stratified predicate SRD reads only the census tables,
+  hierarchies and pair tables. The current `gen_predicates`
   independence assumption (n-th-root rule for joint selectivity) is
   replaced with cross-field-aware selection in the same change that
   lands this survey.
