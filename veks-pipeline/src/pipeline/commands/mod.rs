@@ -41,6 +41,7 @@ pub mod cleanup_overlap;
 pub mod clean_ordinals;
 pub mod compute_dedup;
 pub mod compute_topics;
+pub mod compute_topic_labels;
 pub mod dataset_json;
 pub mod compute_prefiltered_knn;
 pub mod compute_postfiltered_knn;
@@ -195,6 +196,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("compute knn-faiss", compute_knn_faiss::factory);
     registry.register("compute sort", compute_dedup::factory);
     registry.register("compute topics", compute_topics::factory);
+    registry.register("compute topic-labels", compute_topic_labels::factory);
     #[cfg(feature = "knnutils")]
     registry.register("compute sort-knnutils", compute_sort_knnutils::factory);
 
