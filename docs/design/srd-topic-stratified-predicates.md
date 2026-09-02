@@ -9,7 +9,9 @@ augment an existing dataset in place rather than rebuild it.
 [metadata-facets-and-layout-namespace.md](metadata-facets-and-layout-namespace.md)
 for the M / P / R facet shapes, and
 [prefilter-postfilter-facets.md](prefilter-postfilter-facets.md) for
-what E and F measure and why the difference between them matters.
+what E and F measure and why the difference between them matters, and
+[sysref §13](../sysref/13-metadata-survey.md) for the survey this design
+extends.
 
 ## 1. Problem
 
@@ -480,7 +482,7 @@ any other.
 are not prosaic and are not meant to be:
 
 ```
-sample_bucket = 37
+sample_bucket < 16778
 ```
 
 It must be labelled as a control wherever the predicate set is
@@ -659,7 +661,37 @@ they must not be load-bearing for correctness.
 
 ## 6. Pipeline commands to add
 
-Four new commands. Existing `evaluate-predicates` is unchanged.
+Four new commands, one command extended (`analyze survey`, which gains
+the census), one reused (`transform extract`, for the margin adjunct),
+and two ordinal spaces that every one of them must be explicit about.
+Existing `evaluate-predicates` is unchanged.
+
+**TS-130.** Two ordinal spaces exist in this dataset, and each artifact
+below belongs to exactly one:
+
+| space | population | rows | what lives in it |
+|---|---|---:|---|
+| **source order** | every passage as chunked | 531,869,985 | `_base_all.fvecs`, `_metadata.parquet`, `passages.parquet` — row-aligned |
+| **base order** | shuffled, minus 10,000 queries and 35,929,249 duplicates | 495,930,736 | everything under `profiles/base/` |
+
+`extract-metadata` is the bridge: `transform extract` applies
+`shuffle.ivecs` over `[query_count, clean_count)` to carry a
+source-order artifact into base order. **Topic assignment and
+enrichment happen in source order**, because they feed
+`convert-metadata` (TS-32) and because the join to the passage table is
+a row-aligned join in that order and in no other. **Adjuncts published
+under `profiles/base/` are in base order**, because "ordinal-aligned"
+(TS-70) means nothing unless the ordinal is the facet's own. An adjunct
+computed in source order crosses the bridge the same way M does — the
+margin through the mvec mode of `transform extract` — never by a
+mapping of its own.
+
+**TS-131.** Consequently `compute topics` reads `_base_all.fvecs`, not
+`profiles/base/base_vectors.fvecs`, and emits one assignment per source
+row. The fitting sample is drawn from the same file and so includes the
+6.75% of rows later removed as duplicates. Accepted: a passage repeated
+across papers is a real region of the embedding space, and it is the
+census (TS-132), not the fit, that decides selectivity.
 
 ### 6.1 `compute topics`
 
@@ -678,38 +710,259 @@ per passage, as a packed `f16` adjunct facet (TS-74). Both distances are
 already computed to make the assignment; recovering them later would
 cost a second pass over 531,869,985 × 1024 floats. Optional output —
 absence is legal (TS-72) — but it is nearly free at the point where the
-numbers exist and unaffordable anywhere else.
+numbers exist and unaffordable anywhere else. It is written in source
+order under `.cache/` and carried into base order by `transform extract`
+(TS-130); the retained facet is the extracted one.
 
-### 6.2 `analyze topic-sizes`
+### 6.2 `analyze survey`: the census pass
 
-**TS-30.** Reads the assignments and emits the measured size of every
-cluster at every level, as the table the sampler selects from (TS-9).
-This is a counting pass, cheap, and its output is the artifact that
-makes TS-1 true.
+**TS-30.** The survey gains a third, **exhaustive** pass that emits the
+exact member count of every value of every enumerable predicate target
+over the full base population — each topic at each level, each
+`section_class`, each `year`, and the distributions behind the range
+families — structured so that the fitting phase (§11) reads selectivity
+by lookup and never scans M. This is the table the sampler selects from
+(TS-9) and the artifact that makes TS-1 true. The survey is the
+dataset's content-and-distribution assay and the one artifact the
+generator and the evaluator already read; exact counting is an
+extension of it, not a sibling of it (D-19).
+
+**TS-124.** **The survey's sampled passes cannot supply this, and cannot
+be configured into supplying it.** Three of their properties are
+structural, not defaults to raise:
+
+| survey property | value | consequence for selectivity mapping |
+|---|---|---|
+| `samples` | 100,000 | 0.019% of the corpus |
+| `low-card-threshold` | 64 | exact counts only at or below 64 distinct values |
+| `top-k` | 64 | above that, only the 64 most frequent values are kept |
+
+tessera's own pipeline sets `samples: 10000`, a tenth of the default,
+so the first row reads 0.0019% there.
+
+Of the 10,310 topics needing an exact count, the sampled passes can
+enumerate 64. `venue` already demonstrates the failure on tessera
+today: 4,195 distinct values, classified `MidCard`, and only its heavy
+hitters retained.
+
+Sampling is the harder limit. A topic's expected membership in a
+100,000-row sample, against the decades this design targets:
+
+| selectivity | expected members in sample | relative error |
+|---|---:|---|
+| 10⁻³ | 100 | 10% |
+| 10⁻⁴ | 10 | 32% |
+| 10⁻⁵ | 1 | 100% |
+| 10⁻⁶ | 0.1 | invisible |
+| 10⁻⁷ | 0.01 | invisible |
+
+The design's floor reaches 10⁻⁷ (§3.3). A sampled pass cannot see three
+of those decades at all, and TS-1 requires the selectivity be *known*,
+not estimated.
+
+**TS-125.** Raising the sampled passes' caps is rejected rather than
+untried. It would disable the sampling that makes the survey
+affordable, widen every bounded tracker, and still run a dozen measures
+— trigram statistics, character-class mixes, semantic probes,
+cross-field pair analyses — that exact counting does not need, over
+every record. Worse, Pass 1 decides a field's *regime* from a sample
+and Pass 2 selects its measures from that verdict (sysref §13.6), so a
+misclassification there cannot be corrected by a larger cap later.
+Passes 1 and 2 stay what they are. The census is a **third pass with
+its own measures**, exhaustive by definition and bounded by declaration
+rather than by a sampled verdict.
+
+**TS-139.** **What the census pass counts is declared, with a default.**
+Three declaration kinds, each an option of the step (§10.2) and
+therefore a YAML key:
+
+| declaration | form | yields |
+|---|---|---|
+| census field | `census: auto` (default), `none`, or a field list | an exact value table per field |
+| hierarchy | `hierarchy: topic_l1>topic_l2>topic_l3` | an exact nested tree with a count at every node |
+| pair | `census-pair: topic_l3:citation_percentile` | an exact joint table for the pair |
+
+`auto` censuses every field whose Pass 1 regime is `Constant`, `Binary`,
+`LowCard` or `MidCard` — fields the sample already showed to be
+enumerable — so every survey gains exact counts for its enumerable
+fields without being told. A **listed** field is censused regardless of
+regime; this is how `topic_l3` (10,000 distinct, `HighCardOrUnique` by
+sample) enters, and `auto` may be combined with a list. Hierarchies and
+pairs are declared only: they are the parts of the census whose cost is
+a product, and nothing in a sample says which products a consumer
+wants.
+
+**TS-140.** Two exact measures, chosen by wire encoding:
+
+| measure | fields | report |
+|---|---|---|
+| `ExactValueCensus` | text, bool, and any non-integer enumerable | `population`, `distinct`, `counts: value → n` ordered by `n` descending |
+| `ExactIntegerHistogram` | integers | `population`, `min`, `max`, `counts[]` dense from `min` to `max` |
+
+The histogram is dense and ordered so a range's selectivity is a
+prefix-sum difference — exact, with no interpolation (TS-128). Each is
+bounded by `census-cap` (default 65,536 distinct values or histogram
+width). For a field the operator **listed**, exceeding the cap is an
+**error**: the operator asserted the field is enumerable, the data
+disagrees, and a truncated table would be a wrong selectivity presented
+as an exact one. For an `auto` field it is a `Warning` finding and the
+field leaves the census — the sample misjudged it, which the survey
+reports rather than fails on.
+
+**TS-141.** A **hierarchy** is counted as exact path tuples — each
+`(l1, l2, l3)` combination that occurs, with its count — folded into a
+tree whose every node carries its own count. The pass also **verifies
+nesting**: every value at level *k*+1 must occur under exactly one path
+at level *k*. A violation is an `Error` finding and fails the step,
+because a declared hierarchy is an invariant of the data that produced
+it — for tessera, of `enrich-metadata` — and a tree that is not a tree
+would give the sampler two selectivities for one label. The tree is
+what makes "multi-layer" concrete for the fitting phase: a topic at any
+level is a node, its selectivity is the node's count, and a query's
+placement (TS-117) at any level is a walk up from its L3 assignment.
+
+**TS-142.** A **pair** is counted as an exact joint table: `a_values`,
+`b_values`, and a dense row-major `counts[|a|][|b|]`. Its memory is the
+product of two cardinalities, so the pass enforces `pair-cells-cap`
+(default 4,194,304 cells — 32 MB of `u64`) and errors when a table would
+exceed it. For tessera the nine declared pairs — each topic level
+against `citation_percentile`, `year` and `isopenaccess` — total ~2.25M
+cells, dominated by `topic_l3 × year` (1.16M) and
+`topic_l3 × citation_percentile` (1.0M). This is what makes a
+conjunction's selectivity **exact rather than estimated** (TS-18,
+TS-116): `topic_l3 = X AND citation_percentile ≥ t` is row *X* summed
+over the columns at or above *t*.
+
+**TS-126.** The survey moves to read **`profiles/base/metadata_content.slab`**
+— the M facet, after `extract-metadata` — rather than the source-order
+slab it reads today. Passes 1 and 2 are indifferent to which; the
+census is not (TS-132). One pass then covers topics and every other
+derived field at once, keyed by the **label** a predicate compares
+against (TS-56), so no code-to-label reconciliation stands between the
+survey and the sampler.
+
+**TS-132.** Counting M is a **population** choice, not a convenience. M
+holds the base population: the source rows minus the 10,000 that became
+queries and the 35,929,249 that `prepare-vectors` found to be
+duplicates — 495,930,736 of 531,869,985 (TS-130). That is the population
+every predicate is evaluated over and every profile is a prefix of
+(TS-10). A census of the source parquet would count 6.75% of rows that
+no predicate can ever match, and there is no reason to expect them to
+be spread evenly over topics or sections — a boilerplate passage
+repeated across papers is exactly the kind that clusters — so it would
+carry a bias the base does not have, and TS-43 would then be checking
+the sampler against the wrong denominator. Decoding 495,930,736 MNode
+records is one pass of the same order as `extract-metadata` (~207 s
+measured per pass), which is the price of counting the right thing.
+
+**TS-127.** The census is exact and **global**. Per-profile counts are
+not censused: selectivity is scale-free (TS-10), so a profile's expected
+count is `s · N`, and its *realised* count is known exactly from the R
+facet after evaluation, which is where TS-43 checks it.
+
+**TS-143.** **The report is structured for the fitting phase.**
+Selectivity is `count / source.total_records`, with the denominator
+recorded once in the report and never a stored fraction, so nothing
+rounds. Where each candidate of §11 reads:
+
+| candidate | reads | selectivity |
+|---|---|---|
+| `field = v` | `fields[field].measures.ExactValueCensus.counts[v]` | `n / N` |
+| `field BETWEEN lo AND hi` | `fields[field].measures.ExactIntegerHistogram.counts` | prefix-sum difference `/ N` |
+| topic at level *k* | the node in `hierarchies` | node count `/ N` |
+| `a = x AND b ≥ t` | `pair_census[a:b].counts[x][t..]` | row-sum `/ N` |
+| `sample_bucket < m` | nothing — uniform by construction (TS-115) | `m / K`, verified by TS-43 |
+
+`hierarchies` and `pair_census` are new top-level sections of
+`survey.json` beside `fields` and `cross_field` (sysref §13.8), absent
+when nothing was declared. A field's census measures live in its
+`measures` map like every other measure, keyed by kind, so the map's
+key-routed deserialisation gains two variants and nothing else changes
+shape.
+
+**TS-144.** A censused field's `cardinality_regime` is replaced by
+**`Censused { exact_distinct }`**. Pass 1's verdict was an estimate; the
+census is the fact, and a consumer choosing an operator family from the
+regime must see the fact. Every consumer that accepts an
+`ExactFrequencyTable` accepts an `ExactValueCensus` in its place — the
+existing strategies' eligibility checks read measure presence — and
+this contract is what lets `eq` and `compound` gain exact selectivity
+without change.
+
+**TS-145.** The census pass declares its memory to the governor from
+the caps (sysref §13.11.1) — `census-cap` × entry size per censused
+field plus `pair-cells-cap` × 8 B — before it begins, and drives the
+standard progress sink by page, because it is a full scan of the
+largest record facet in the dataset and must say so while it runs.
+
+**TS-148.** **What the pass scans, and how.** It reads every page of M
+in ordinal order and decodes each MNode exactly once — the same reader
+Passes 1 and 2 use, without the page stride that samples them. Per
+record it does one thing per declaration: looks up each censused
+field's value in that field's table, folds each hierarchy's value tuple
+into its tree, and increments each pair's cell. Values are **interned
+on first sight** — a label maps to a small integer id in a per-field
+table — so the hierarchy and pair accumulators index by id and the
+per-record cost is one hash probe per declared field, not a string
+copy; labels are written out only when the report is serialised. The
+pass needs Pass 1 only for `auto` (TS-139) and nothing from Pass 2, so
+a survey configured with `census: none` is exactly today's survey, and
+one with declarations adds one sequential read of M — 206 GB after
+enrichment, a single slab under the 1 TB shard cap, opened as the
+survey opens any slab today.
+
+**TS-146.** sysref §13 is updated in the same change: the pass (§13.4),
+the two measures (§13.5.3), the hierarchy and pair census (§13.7), the
+report sections (§13.8) and the options (§13.9). The survey has a
+system reference, and a survey extension the reference does not
+describe is not finished.
 
 ### 6.3 `transform enrich-metadata`
 
 **TS-31.** Joins the derived columns of §4 onto the metadata source,
-emitting an enriched artifact in the same format. Inputs: the metadata
-parquet, the topic assignments, and the passage table for `ordinal`,
-`char_start`, `char_end`.
+emitting an enriched parquet in source order (TS-130) that
+`convert-metadata` then reads in place of the original. Inputs, all
+row-aligned or keyed by `corpusid`: `metadata.parquet` (the paper
+fields), `passages.parquet` (`ordinal`, `text`), `parents.parquet`
+(`passage_count` and `row_start` per paper), the topic assignments, and
+the topic labels.
+
+**TS-135.** The labels input is **optional**. Without it, enrichment
+writes the positional label (TS-102) for every cluster, so the whole
+chain can be exercised — and the census taken — before labelling has
+run. Re-running enrichment once labels exist is what the option's
+`Input` role is for: M, the survey with its census tables, and the
+predicates are all marked stale, which is correct, because every
+topical comparand changes.
 
 **TS-78.** The command is **not a pure row-wise map**, and the plan must
-say so rather than let an implementation discover it. Three of the six
-derivations are row-local; two need an aggregate over the corpus first:
+say so rather than let an implementation discover it. Five of the six
+derivations are row-local given a table; one needs an aggregate over
+the papers first:
 
 | column | derivation | pass |
 |---|---|---|
-| `word_count` | `char_end − char_start` | row-local |
+| `word_count` | whitespace tokens of `text` (TS-106) | row-local |
 | `sample_bucket` | `hash(corpusid ‖ ordinal) mod K` | row-local |
 | `section_class` | heading → class lookup | row-local, given the table |
-| `topic_l1/l2/l3` | assignment lookup by ordinal | row-local, given assignments |
-| `passage_position` | `ordinal ÷ passages_in_paper` | **needs a group-by on `corpusid`** |
-| `citation_percentile` | rank of `citationcount` within `year` | **needs a group-by on `year`** |
+| `topic_l1/l2/l3` | assignment lookup by row, then code → label | row-local, given assignments and labels |
+| `passage_position` | `ordinal ÷ passage_count` | row-local, given `parents.parquet` |
+| `citation_percentile` | rank of `citationcount` within `year` | **needs the per-year distribution over papers** |
 
-Both aggregates are small — 17,457,121 paper lengths and 116 per-year
-citation distributions — so each is one counting pass and an in-memory
-table, not a sort of the corpus.
+`parents.parquet` already carries `passage_count` and `row_start` for
+each of the 17,457,121 papers, so the paper-length aggregate an earlier
+draft planned is a 200 MB lookup, not a pass. The one real aggregate is
+the per-year citation distribution over **papers** (TS-104): one
+columnar read of `corpusid`, `year`, `citationcount`, taking the first
+row of each paper — rows are grouped by paper, which is what `row_start`
+records — into 116 per-year tables. Then a single pass over the three
+parquet files in row order emits the enriched rows.
+
+**TS-136.** That single pass reads the `text` column, which is nearly
+all of the 241 GB `passages.parquet`. This is the dominant cost of
+enrichment and is paid for `word_count` alone. It is accepted because
+TS-106 wants the unit a person filters in, and it is stated here so the
+estimate in TS-123 is not read as a parquet-to-parquet copy.
 
 **TS-79.** The heading → `section_class` mapping is published as an
 adjunct (TS-71). It is a judgement call applied 531,869,985 times across
@@ -768,6 +1021,9 @@ the dataset and are not:
 | artifact | where | why |
 |---|---|---|
 | topic assignments | `.cache/` | consumed by `enrich-metadata`; the values then live in M |
+| enriched metadata | `.cache/` | consumed by `convert-metadata`; the values then live in M |
+| survey, with census tables | `.cache/` | recomputable from M in one pass; the selectivity that matters is retained per predicate (TS-62) |
+| topic labels | dataset | the comparand every topical predicate names (TS-56) |
 | topic centroids | dataset | reproducing the labelling requires them (TS-26) |
 | assignment margin | dataset | explains filter crispness; a second pass to recover |
 | heading → class table | dataset | a judgement call worth auditing |
@@ -778,6 +1034,29 @@ the dataset and are not:
 **TS-85.** An adjunct must never be written under `.cache/`. It would
 be correct until the first `cache-gc`, and its loss would be silent —
 the failure mode TS-76 rejects, arrived at by a different route.
+
+### 6.7 `compute topic-labels`
+
+**TS-133.** Labelling is its **own command**, not a mode of `compute
+topics`. It reads text where `compute topics` reads vectors, it needs
+memory for term tables where the fit needs the GPU, and it is the one
+phase whose output can be absent without blocking anything (TS-102,
+TS-135). Coupling it to the fit would make the largest GPU step re-run
+whenever a labelling parameter changed.
+
+**TS-138.** Labelling reads a **seeded subset of row groups**, not a
+sample of rows. `passages.parquet` is 508 row groups of ~1.05M rows, so
+2,000 uniformly sampled members of a typical L3 cluster fall in ~20
+distinct groups, and a sample that touches every group is a full read of
+241 GB (TS-136). Instead the command reads `row-groups` groups chosen by
+seed (default 64, an eighth of the file) and takes up to
+`sample-per-cluster` members of each cluster from what it finds there.
+The cap is a ceiling, not a floor: a cluster at 10⁻⁶ meets ~67 members
+in 67M rows, which is enough for term statistics, and a cluster that
+meets fewer than `min-sample` (default 20) is given a positional label
+rather than a label fitted to noise.
+
+Full surface in §10.5.
 
 ## 7. Augmenting tessera in place
 
@@ -790,26 +1069,42 @@ stay fresh.
 What re-runs is the metadata and predicate chain:
 
 ```
-compute-topics          NEW    one GPU pass over base_vectors
-                               -> assignments (.cache), centroids +
-                                  margins (dataset)
-analyze-topic-sizes     NEW    counting pass over assignments
-enrich-metadata         NEW    two counting passes (paper lengths,
-                               per-year citation ranks) then one
-                               pass over metadata + passages parquet
-record-embed-provenance NEW    back-fill; dataset attribute only
-convert-metadata        re-run ~300 s (measured)
-extract-metadata        re-run ~2 passes (measured ~207 s each)
-survey-metadata         re-run
-generate-predicates     re-run with --strategy stratified
-evaluate-predicates     re-run per profile   ← the expensive one
+compute-topics             NEW    one GPU pass over _base_all.fvecs, source
+                                  order (TS-131) -> assignments + margin
+                                  (.cache), centroids (dataset)
+compute-topic-labels       NEW    seeded row-group sample of passages.parquet
+                                  (TS-138) -> topic_labels.slab (dataset)
+enrich-metadata            NEW    one paper-level aggregate, two lookups,
+                                  one pass over the three parquet files
+                                  -> .cache/metadata_enriched.parquet
+record-embed-provenance    NEW    back-fill; dataset attribute only
+convert-metadata           re-run source repointed at the enriched
+                                  parquet; ~300 s (measured)
+extract-metadata           re-run ~207 s per pass (measured)
+extract-topic-margin       NEW    transform extract, mvec mode, with the
+                                  shuffle: margin from source order to
+                                  base order (TS-130)
+survey-metadata            re-run moved after extract-metadata, onto M;
+                                  passes 1–2 as today plus the exhaustive
+                                  census pass with tessera's declarations
+                                  (TS-126, TS-139)
+generate-predicates        re-run --strategy stratified
+evaluate-predicates        re-run per profile   ← the expensive one
 ```
 
 **TS-36.** Steps are appended to `upstream.steps` with `after:`
-declaring `compute-topics` before `enrich-metadata`, and
-`enrich-metadata` before `convert-metadata`. No existing step
-definition changes except `generate-predicates`' options, which is what
-correctly marks it and its dependents stale.
+declaring the order above: `compute-topics` → `compute-topic-labels` →
+`enrich-metadata` → `convert-metadata`; `extract-topic-margin` after
+`compute-topics` and `generate-shuffle`; `survey-metadata` after
+`extract-metadata`; `generate-predicates` after `survey-metadata` as
+today. Exactly three existing step definitions change:
+`convert-metadata`'s `source` moves from `_metadata.parquet` to the
+enriched parquet (TS-32); `survey-metadata` gains `after:
+extract-metadata`, its `source` becomes the M facet, and it carries the
+census declarations (TS-139); and `generate-predicates`' options change
+for the new strategy. Each change is what correctly marks that step and
+its dependents stale; nothing above `convert-metadata` in the metadata
+chain, and nothing in the vector chain, is touched.
 
 **TS-37.** The R facet must be regenerated for every profile. Its size
 scales linearly with base count at 87.45 B/base under the current
@@ -827,15 +1122,28 @@ start without it.
 
 **TS-86.**
 
-| artifact | path | format | lifetime |
-|---|---|---|---|
-| topic assignments | `.cache/topic_assign_l{1,2,3}.u16` | `ScalarPacked` u16 | cache |
-| topic centroids | `profiles/base/topic_centroids.fvecs` | `FloatXvec` f32, dim 1024 | retained |
-| cluster margin | `profiles/base/topic_margin.mvecs` | `FloatXvec` f16, dim 2 | retained |
-| section-class map | `profiles/base/section_class_map.slab` | `Slab`, MNode | retained |
-| predicate families | `predicates.slab` ns `families` | `Slab`, MNode | retained |
-| generation trace | `predicates.slab` ns `generation` | `Slab`, MNode | retained |
-| embed provenance | `dataset.yaml` attributes | yaml | retained |
+| artifact | path | order (TS-130) | format | lifetime |
+|---|---|---|---|---|
+| topic assignments | `.cache/topic_assign_l{1,2,3}.u16` | source | `ScalarPacked` u16 | cache |
+| topic centroids | `profiles/base/topic_centroids.fvecs` | by cluster | `FloatXvec` f32, dim 1024 | retained |
+| topic labels | `profiles/base/topic_labels.slab` | by cluster | `Slab`, MNode | retained |
+| cluster margin, as computed | `.cache/topic_margin_all.mvecs` | source | `FloatXvec` f16, dim 2 | cache |
+| cluster margin | `profiles/base/topic_margin.mvecs` | base | `FloatXvec` f16, dim 2 | retained |
+| enriched metadata | `.cache/metadata_enriched.parquet` | source | parquet | cache |
+| section-class map | `profiles/base/section_class_map.slab` | by heading | `Slab`, MNode | retained |
+| survey, with census tables | `${cache}/metadata_survey.json` | counts over base | JSON, sysref §13.8 | cache |
+| predicate families | `predicates.slab` ns `families` | by predicate | `Slab`, MNode | retained |
+| generation trace | `predicates.slab` ns `generation` | by predicate | `Slab`, MNode | retained |
+| embed provenance | `dataset.yaml` attributes | — | yaml | retained |
+
+The census tables are cache rather than retained by TS-84's rule: they
+are recomputable from M in one pass, exactly, and the selectivity each
+admitted predicate was measured at is retained where it matters — in
+the families namespace (TS-62). They live inside `metadata_survey.json`,
+which the pipeline already keeps under `${cache}` for the same reason.
+The centroids and labels are keyed by cluster, not passage — record *i*
+of each is cluster *i* in level order — so they carry no ordinal space
+and are the same file whichever side of the bridge reads them.
 
 **TS-87.** The retained adjuncts are declared as **ordinary views with
 non-standard keys**, not as new `StandardFacet` variants.
@@ -931,8 +1239,9 @@ top terms joined with hyphens into a slug.
 
 **TS-100.** Labelling reads `passages.parquet`, not the metadata — the
 passage text is not in M and never will be (TS-69). It runs on a
-**sample** of each cluster's members (default 2,000), because term
-statistics converge long before the member list is exhausted.
+**sample** of each cluster's members (default 2,000, drawn from a seeded
+subset of row groups — TS-138), because term statistics converge long
+before the member list is exhausted.
 
 **TS-101.** Labels must be **unique within a level**, since TS-56 stores
 them as the predicate's comparand and two clusters sharing a label would
@@ -969,8 +1278,9 @@ passage is at the start.
 **TS-106.** `word_count` is whitespace-delimited tokens of the passage
 text, not `char_end − char_start`. Character span is a proxy that
 diverges with language and markup, and the field exists so a person can
-filter on "long passages" in the unit they think in. It is computed
-during the same pass that reads `passages.parquet` for labelling.
+filter on "long passages" in the unit they think in. It is computed in
+enrichment's pass over `passages.parquet` (TS-78, TS-136), not in
+labelling's, which reads only a subset of the file (TS-138).
 
 ## 10. Command surfaces
 
@@ -983,7 +1293,7 @@ inspects.
 
 | option | role | req | default | notes |
 |---|---|---|---|---|
-| `base` | Input | yes | — | base vectors; accepts a series (SH-35) |
+| `base` | Input | yes | — | `_base_all.fvecs`, **source order** (TS-131); accepts a series (SH-35) |
 | `levels` | Config | no | `10,30,33` | branching per level |
 | `sample-size` | Config | no | `5000000` | passages used to fit |
 | `iterations` | Config | no | `50` | convergence cap (TS-93) |
@@ -991,11 +1301,11 @@ inspects.
 | `seed` | Config | no | `42` | k-means++ and sampling |
 | `centroids` | Output | yes | — | `topic_centroids.fvecs` |
 | `assignments` | Output | yes | — | `.cache/topic_assign_l*.u16` |
-| `margin` | Output | no | — | omit to skip (TS-72) |
+| `margin` | Output | no | — | `.cache/topic_margin_all.mvecs`, source order; omit to skip (TS-72) |
 
 **TS-107.** `check_artifact` is Complete when the centroid file holds
 `Σ levels` records of the base's dimension **and** every assignment
-column has one record per base ordinal. Either alone is insufficient:
+column has one record per source row (TS-131). Either alone is insufficient:
 centroids without assignments is a fit that never finished, and
 assignments without centroids cannot be reproduced or extended.
 
@@ -1003,29 +1313,53 @@ assignments without centroids cannot be reproduced or extended.
 `sample-size × 1024 × 4` bytes — 20 GB at the default — and must
 request it rather than discover it.
 
-### 10.2 `analyze topic-sizes`
+### 10.2 `analyze survey` — census options
+
+Added to the existing surface (sysref §13.9). Nothing existing changes.
 
 | option | role | req | default | notes |
 |---|---|---|---|---|
-| `assignments` | Input | yes | — | from `compute topics` |
-| `output` | Output | yes | — | size table per level |
-| `min-members` | Config | no | `0` | report clusters below this |
+| `census` | Config | no | `auto` | `auto`, `none`, or a field list; `auto` may be combined with a list (TS-139) |
+| `census-cap` | Config | no | `65536` | distinct values or histogram width per field (TS-140) |
+| `hierarchy` | Config | no | — | repeatable, `a>b>c` (TS-141) |
+| `census-pair` | Config | no | — | repeatable, `a:b` (TS-142) |
+| `pair-cells-cap` | Config | no | `4194304` | joint-table cells per pair (TS-142) |
 
-**TS-109.** Emits, per cluster: level, code, member count, and the
-member count as a fraction of the corpus. That fraction is the
-`selectivity` the sampler stratifies on (TS-14) and the value written
-into the families namespace (TS-62).
+For tessera: `source` becomes the M facet (TS-126); `census:
+auto,topic_l3`; `hierarchy: topic_l1>topic_l2>topic_l3`; and the nine
+`census-pair` declarations of TS-142.
+
+**TS-109.** For every censused field the report carries, per value, the
+exact member count over the base population; the fraction is derived
+(TS-143). That fraction is the `selectivity` the sampler stratifies on
+(TS-14) and the value written into the families namespace (TS-62).
+
+**TS-128.** For the numeric range families — `citation_percentile`,
+`passage_position`, `word_count` — the `ExactIntegerHistogram` is the
+census, so a range predicate's selectivity is a sum over bins rather
+than an interpolation from a quantile sketch. All three have small
+integer domains (0–99, 0–99, and word counts bounded by the chunker at
+230), so exactness is affordable.
+
+**TS-129.** `check_artifact` for the survey step is Complete when the
+report's schema version carries the census sections, every declared
+field, hierarchy and pair is present, and for every censused field
+`population + missing` equals `source.total_records`. A field whose
+counts do not sum to the population has silently dropped values, and a
+sampler reading it would stratify on a distribution that does not
+exist.
 
 ### 10.3 `transform enrich-metadata`
 
 | option | role | req | default | notes |
 |---|---|---|---|---|
 | `metadata` | Input | yes | — | source parquet |
-| `passages` | Input | yes | — | for `ordinal`, text, word count |
-| `assignments` | Input | yes | — | topic codes |
-| `labels` | Input | yes | — | code → label, from `compute topics` |
+| `passages` | Input | yes | — | `passages.parquet`: `ordinal`, `text` |
+| `parents` | Input | yes | — | `parents.parquet`: `passage_count`, `row_start` |
+| `assignments` | Input | yes | — | topic codes, source order (TS-131) |
+| `labels` | Input | no | positional | code → label, from `compute topic-labels` (TS-135) |
 | `section-map` | Input | no | built-in | override the prefix table |
-| `buckets` | Config | no | `1000` | *K* for `sample_bucket` |
+| `buckets` | Config | no | `16777216` | *K* for `sample_bucket`, 2²⁴ (TS-115) |
 | `seed` | Config | no | `42` | hash seed |
 | `output` | Output | yes | — | enriched parquet |
 | `section-map-out` | Output | no | — | the table actually applied (TS-79) |
@@ -1038,10 +1372,10 @@ divergence and would surface only as inexplicable benchmark results.
 
 | option | role | req | default | notes |
 |---|---|---|---|---|
-| `survey` | Input | yes | — | existing metadata survey |
+| `survey` | Input | yes | — | schema, distributions **and** the census tables (TS-143) |
 | `base-count` | Config | yes | — | *N*, for the per-profile floor |
 | `query-placement` | Config | no | mixed | in-topic / out-of-topic mix (TS-19) |
-| `topic-sizes` | Input | yes | — | from `analyze topic-sizes` |
+| `centroids` | Input | no | — | required with `queries`, for placement (TS-137) |
 | `queries` | Input | no | — | required for `query-placement` |
 | `families` | Config | no | all four | which families, and their mix |
 | `per-cell` | Config | no | tapered | per-decade counts (TS-54) |
@@ -1055,42 +1389,84 @@ holds at least one predicate **and** the `families` namespace holds
 exactly as many records. An unequal count means annotation and
 predicates disagree, which TS-64 exists to prevent.
 
+**TS-137.** Query placement needs the fitted model, not only the query
+vectors. The queries are perturbed copies of source vectors
+(`extract-queries`), so their topics cannot be looked up from the
+source-order assignments; each is assigned by the descent of TS-96
+against `centroids`. `queries` without `centroids` is a configuration
+error, not a silent omission.
+
+### 10.5 `compute topic-labels`
+
+| option | role | req | default | notes |
+|---|---|---|---|---|
+| `passages` | Input | yes | — | `passages.parquet`, source order |
+| `assignments` | Input | yes | — | from `compute topics` |
+| `row-groups` | Config | no | `64` | seeded subset read (TS-138) |
+| `sample-per-cluster` | Config | no | `2000` | cap on members per cluster |
+| `min-sample` | Config | no | `20` | below this, positional label (TS-102) |
+| `top-terms` | Config | no | `3` | terms joined into the slug |
+| `seed` | Config | no | `42` | row-group and member selection |
+| `output` | Output | yes | — | `topic_labels.slab` |
+
+**TS-134.** `check_artifact` is Complete when the slab holds exactly
+`Σ levels` records — one per cluster, in level order, matching the
+centroid file — and every label is unique within its level (TS-101). A
+record carries `level`, `code`, `label`, `terms` (the ranked terms the
+slug was cut from) and `sample_size`, so a reader can see how much
+evidence stood behind each name.
+
 ## 11. Candidate enumeration
 
 The sampler draws from candidate pools (TS-14). Nothing yet says what
 is in them.
 
 **TS-112.** **Topical.** Every cluster at every level is a candidate:
-10 + 300 + 10,000 = 10,310, each with a measured selectivity from
-TS-109. No enumeration cost — the size table *is* the pool.
+10 + 300 + 10,000 = 10,310, each a node of the hierarchy census
+(TS-141) with its exact count. No enumeration cost — the tree *is* the
+pool.
 
-**TS-113.** **Bibliographic.** Enumerated from the survey as threshold
+**TS-113.** **Bibliographic.** Enumerated from the survey's census
+tables (TS-143) as threshold
 and range predicates over `citation_percentile`, `year` and
 `isopenaccess`. `citation_percentile` is uniform by construction, so a
-threshold at *t* has selectivity `(100−t)/100` exactly and the pool is
-dense across the coarse decades. `year` ranges are enumerated from the
-observed distribution, which is skewed, so their selectivities are
-measured rather than assumed.
+threshold at *t* has selectivity near `(100−t)/100` and the pool is
+dense across the coarse decades; the exact figure comes from the
+`ExactIntegerHistogram` (TS-128), which is what tie-rounding (TS-104)
+makes necessary. `year` ranges are enumerated from the census's
+per-year counts, which are skewed, so their selectivities are read
+rather than assumed. The sampled measures contribute field types and
+nothing else (TS-124).
 
 **TS-114.** **Structural.** Enumerated over `section_class` values
-(eight, measured), `passage_position` ranges (uniform by construction),
-and `word_count` ranges (measured from the distribution).
+(eight, censused), `passage_position` ranges (uniform by construction,
+census-exact), and `word_count` ranges (from the census histogram).
 
-**TS-115.** **Control.** Generated, not enumerated: for a target
-selectivity *s*, emit `sample_bucket = c` with `K = round(1/s)` and *c*
-drawn seeded. The only family that can fill any cell on demand, which is
-what TS-47 relies on.
+**TS-115.** **Control.** Generated, not enumerated. `sample_bucket`
+holds a seeded hash of the passage reduced modulo *K* = 2²⁴ (§10.3),
+uniform by construction, so a target selectivity *s* is the threshold
+`sample_bucket < ⌈s · K⌉`, at a resolution of 6×10⁻⁸ — below the
+design's finest decade. Distinct predicates for one cell are disjoint
+ranges `sample_bucket BETWEEN a AND b` of the same width, drawn seeded.
+A single modulus of 1,000 with equality predicates, as an earlier draft
+had it, reaches 10⁻³ and nothing finer. The column is **not censused**:
+its width exceeds `census-cap` by design, and its selectivity is known
+by construction rather than by count — which is exactly why TS-43
+verifies it against R like every other family. The only family that can
+fill any cell on demand, which is what TS-47 relies on.
 
 **TS-116.** **Conjunctions** (TS-17) are formed only after the single-
 field pools are exhausted for a cell, pairing a topical candidate with a
-bibliographic one. Their selectivity is **measured, not multiplied**
-(TS-18): evaluated over a uniform sample of the corpus (default 10M
-passages) sized so the estimate's relative error at the cell's target
-decade is under 10%, then admitted to whichever band the estimate lands
-in.
+bibliographic one, and **only over pairs the survey censused** (TS-142).
+Their selectivity is **read, not multiplied** (TS-18): the joint table
+gives the exact count over the base population, and the candidate is
+admitted to whichever band that lands in. A pair that was not declared
+yields no conjunctions and is reported as a shortfall (TS-16) rather
+than estimated.
 
-**TS-117.** Query placement (TS-19) requires the query vectors. Each
-query is assigned to a topic by the same descent as TS-96, and a
+**TS-117.** Query placement (TS-19) requires the query vectors and the
+centroids (TS-137). Each query is assigned to a topic by the same
+descent as TS-96, and a
 topical predicate is labelled `in-topic` when at least one query falls
 in its cluster, `out-of-topic` otherwise. Without `queries` the
 generator omits the field rather than guessing.
@@ -1104,9 +1480,18 @@ rather than golden. Determinism (TS-94) is tested by fitting the same
 sample at 1, 4 and 16 threads and comparing centroids bit-for-bit.
 
 **TS-119.** The sampler is tested without any clustering: given a
-synthetic size table, every `(family, decade)` cell above the floor is
+synthetic census tables, every `(family, decade)` cell above the floor is
 populated, cells below it are reported unpopulated rather than filled,
 and the same seed reproduces the same set (TS-15, TS-44).
+
+**TS-147.** The census pass is tested on a synthetic slab with known
+counts: every `auto` field's table sums to the population; a listed
+field over `census-cap` errors and an `auto` field over it warns and
+leaves the census; a declared hierarchy with a planted nesting
+violation fails the step; a pair over `pair-cells-cap` errors; a
+censused field reports the `Censused` regime; and the report
+round-trips through JSON with both new sections present, and with
+neither when nothing was declared.
 
 **TS-120.** End-to-end, on a small dataset built by the existing
 fixtures: the pipeline runs, the enriched M facet carries all eight
@@ -1126,18 +1511,28 @@ the tree green.
 
 **Phase 1 — clustering.** `compute topics` (§10.1) with §9.1–9.2:
 spherical k-means, deterministic reduction, hierarchical assignment,
-margin output. The largest single piece and the only one needing GPU
-work. Testable in isolation against planted clusters (TS-118).
+margin output, all in source order (TS-131). The largest single piece
+and the only one needing GPU work. Testable in isolation against
+planted clusters (TS-118).
 
-**Phase 2 — measurement.** `analyze topic-sizes` (§10.2). Small, and it
-unblocks the sampler.
+**Phase 2 — labelling.** `compute topic-labels` (§10.5) with §9.3.
+Independent of everything after it: positional labels (TS-102, TS-135)
+let the chain proceed while this is unfinished, at the price of
+re-running the chain once it is.
 
-**Phase 3 — labelling.** §9.3, as a mode of `compute topics` or a
-sibling command. Independent of Phases 4–6: positional labels (TS-102)
-let everything downstream proceed while this is unfinished.
+**Phase 3 — enrichment.** `transform enrich-metadata` (§10.3) with
+§9.4, plus the `extract-topic-margin` wiring that carries the margin
+into base order (TS-130). One paper-level aggregate, two lookups, one
+pass. No new formats.
 
-**Phase 4 — enrichment.** `transform enrich-metadata` (§10.3) with
-§9.4. Two counting passes plus a map. No new formats.
+**Phase 4 — survey census pass.** `analyze survey` extended (§6.2,
+§10.2): the exhaustive pass, `ExactValueCensus` and
+`ExactIntegerHistogram`, the hierarchy and pair census, the `Censused`
+regime, the two report sections, and sysref §13 (TS-146). Larger than
+the sibling command an earlier draft proposed, because it must fit the
+survey's measure, template, governor and findings machinery rather than
+stand beside it — which is the point. It must follow extraction
+(TS-126), which is why it is not Phase 2.
 
 **Phase 5 — sampling.** `generate predicates --strategy stratified`
 (§10.4) with §11, plus the two namespaces (TS-88). The most intricate
@@ -1146,21 +1541,25 @@ logic and the least I/O.
 **Phase 6 — provenance.** Embedding provenance (TS-83) and the
 cache/retained split (TS-84). Small, and separable.
 
-**TS-122.** Phases 1–2 and 4 can be validated on tessera without
-regenerating any predicate: they produce artifacts that nothing yet
-consumes. The first irreversible step is Phase 5, because it invalidates
-`evaluate-predicates` across every profile.
+**TS-122.** Phases 1–4 can each be run against tessera by hand and
+checked without regenerating any predicate: nothing consumes their
+outputs until the steps are wired in. The first irreversible act is the
+wiring of TS-36 — repointing `convert-metadata` marks M and everything
+below it stale — and the first expensive one is Phase 5, whose new
+predicate set invalidates `evaluate-predicates` across every profile.
 
 **TS-123.** Estimated cost on tessera, from measured comparable steps:
 
 | phase | pass | estimate |
 |---|---|---|
 | 1 fit | 5M × 1024, 50 iterations | GPU minutes |
-| 1 assign | 531.9M × 73 inner products | one sequential pass over 2.03 TB |
-| 2 | count 531.9M u16 | minutes |
-| 3 | text of 10,310 × 2,000 passages | one indexed pass over `passages.parquet` |
-| 4 | 2 counting passes + 1 map over 531.9M | comparable to `convert-metadata`, ~300 s measured |
-| 5 | sampling + conjunction measurement on 10M | minutes |
+| 1 assign | 531.9M × 73 inner products | one sequential pass over 2.18 TB |
+| 2 | text of 64 row groups, ~67M passages | ~30 GB read; minutes |
+| 3 aggregate | 3 columns of `metadata.parquet`, first row per paper | minutes |
+| 3 map | 531.9M rows including the 241 GB `text` column | tens of minutes, I/O bound (TS-136) |
+| 3 margin | `transform extract`, mvec, 495.9M × 4 B | comparable to `extract-metadata` |
+| 4 | census pass: decode 495.9M MNode records of M | ~207 s per pass, measured |
+| 5 | sampling by lookup over the census tables (TS-143) | seconds |
 | — | `evaluate-predicates` re-run | per profile; the dominant cost |
 
 ## 14. Open questions
@@ -1186,12 +1585,13 @@ predicate's family, and TS-7 requires results be grouped by one.
 
 **TS-41.** *Sampling the fit.* 5M of 531.9M is ~1%. Whether that is
 enough to place 10,000 L3 centroids stably is untested; the failure
-mode is unstable small clusters, which the size table would expose.
+mode is unstable small clusters, which the census would expose.
 
 ## 15. Acceptance
 
-**TS-42.** At every profile with *N* ≥ *N*ᵣ: no predicate returns zero
-matches, and every `(family, decade)` cell above the floor is populated
+**TS-42.** At every profile with *N* ≥ *N*ᵣ: no predicate that applies
+to the profile (TS-51) returns zero matches, and every
+`(family, decade)` cell above the floor is populated
 or its shortfall reported. Below *N*ᵣ the acceptance is weaker and
 deliberately so — the hash family is present and returns non-empty
 results, and nothing else is required.
@@ -1363,6 +1763,50 @@ nearest. Accepted for the 140× saving, but stated explicitly so nobody
 later reads a topic assignment as "the nearest cluster" — and the margin
 facet is what makes the discrepancy measurable rather than invisible.
 → TS-97, TS-98.
+
+**D-19 — Selectivity is censused by the survey's own exhaustive pass:
+not by its sampled passes, and not by a separate instrument.** The
+sampled passes are a capped content-and-distribution assay: 100,000
+rows (10,000 on tessera), exact frequency tables only at or below 64
+distinct values, heavy-hitters top-64 above that. Of 10,310 topics they
+can enumerate 64, and a topic at 10⁻⁵ has one expected member in the
+sample. *Rejected:* raising their caps, which would disable the sampling
+that makes the survey affordable, widen every bounded tracker, run a
+dozen measures exact counting does not need over half a billion records
+— and still leave the regime decided from a sample before the measures
+are chosen. *Also rejected:* a separate census command, which an earlier
+draft proposed. The survey is the dataset's content-and-distribution
+assay and the one artifact the generator and the evaluator already
+read; a second instrument would describe the same fields in a second
+file with a second schema and a second staleness chain, and the fitting
+phase would have to reconcile the two. The census is therefore a third
+pass inside the survey, exhaustive by definition, bounded by
+declaration, with hierarchy and pair tables shaped for lookup during
+fitting. **The survey also moves downstream, to the M facet after
+extraction**, so that it counts the base population rather than the
+source (D-21). → TS-30, TS-124 … TS-129, TS-139 … TS-146.
+
+**D-20 — Labelling is its own command, and it samples row groups, not
+rows.** *Rejected:* a mode of `compute topics`, which couples a text
+pass to the GPU step so that a labelling change re-fits the model; and a
+uniform row sample, which touches every row group and turns a 20M-row
+sample into a 241 GB read. A seeded subset of row groups bounds the read
+at an eighth of the file and still meets ~67 members of a 10⁻⁶ cluster.
+→ TS-133, TS-134, TS-138.
+
+**D-21 — Compute in source order, publish in base order, count in base
+order.** The three parquet files and `_base_all.fvecs` are row-aligned
+in source order and in no other, so assignment and enrichment happen
+there. `profiles/base/` is base order, and "ordinal-aligned" has no
+other meaning for an adjunct, so the margin crosses the same bridge M
+does, by `transform extract`. The survey's census pass counts M because
+M is the population predicates are evaluated over: the source holds
+35,929,249
+duplicates and 10,000 queries that no predicate can match, and nothing
+says they are spread evenly. *Rejected:* a mapping of the pipeline's own
+for the margin (a second way to do what `extract-metadata` already
+does), and censusing the enriched parquet (cheaper by a columnar read,
+wrong by 6.75% of rows unevenly distributed). → TS-130 … TS-132.
 
 ### 16.1 What changed while this was written
 
