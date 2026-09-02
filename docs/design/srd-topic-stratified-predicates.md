@@ -799,15 +799,21 @@ wants.
 | `ExactValueCensus` | text, bool, and any non-integer enumerable | `population`, `distinct`, `counts: value → n` ordered by `n` descending |
 | `ExactIntegerHistogram` | integers | `population`, `min`, `max`, `counts[]` dense from `min` to `max` |
 
-The histogram is dense and ordered so a range's selectivity is a
-prefix-sum difference — exact, with no interpolation (TS-128). Each is
-bounded by `census-cap` (default 65,536 distinct values or histogram
-width). For a field the operator **listed**, exceeding the cap is an
-**error**: the operator asserted the field is enumerable, the data
-disagrees, and a truncated table would be a wrong selectivity presented
-as an exact one. For an `auto` field it is a `Warning` finding and the
-field leaves the census — the sample misjudged it, which the survey
-reports rather than fails on.
+Value keys use the survey's canonical value key — the same rendering
+`ExactFrequencyTable` uses and the generator already decodes — so the
+substitution TS-144 promises holds byte for byte. The histogram is
+dense and ordered so a range's selectivity is a prefix-sum difference —
+exact, with no interpolation (TS-128). An integer field gets both
+tables. Each is bounded by `census-cap` (default 65,536 distinct values
+or histogram width). For a field the operator **listed**, more distinct
+values than the cap is an **error**: the operator asserted the field is
+enumerable, the data disagrees, and a truncated table would be a wrong
+selectivity presented as an exact one. For an `auto` field it is a
+`Warning` finding and the field leaves the census — the sample
+misjudged it, which the survey reports rather than fails on. A
+histogram whose range alone exceeds the cap is dropped with a warning
+while the value table stands: enumerability is the gate, density a
+convenience.
 
 **TS-141.** A **hierarchy** is counted as exact path tuples — each
 `(l1, l2, l3)` combination that occurs, with its count — folded into a
@@ -851,9 +857,11 @@ no predicate can ever match, and there is no reason to expect them to
 be spread evenly over topics or sections — a boilerplate passage
 repeated across papers is exactly the kind that clusters — so it would
 carry a bias the base does not have, and TS-43 would then be checking
-the sampler against the wrong denominator. Decoding 495,930,736 MNode
-records is one pass of the same order as `extract-metadata` (~207 s
-measured per pass), which is the price of counting the right thing.
+the sampler against the wrong denominator. Walking 495,930,736 records
+is one pass, and with TS-148's extraction it costs less than a minute
+on tessera — 57.8 s measured over the current M facet on 128 threads,
+against 615.6 s for the same count done single-threaded with full
+record decoding — which is a small price for counting the right thing.
 
 **TS-127.** The census is exact and **global**. Per-profile counts are
 not censused: selectivity is scale-free (TS-10), so a profile's expected
@@ -881,9 +889,15 @@ key-routed deserialisation gains two variants and nothing else changes
 shape.
 
 **TS-144.** A censused field's `cardinality_regime` is replaced by
-**`Censused { exact_distinct }`**. Pass 1's verdict was an estimate; the
-census is the fact, and a consumer choosing an operator family from the
-regime must see the fact. Every consumer that accepts an
+**`Censused { exact_distinct }`** and its profile marked `censused`.
+Pass 1's verdict was an estimate; the census is the fact, and a
+consumer choosing an operator family from the regime must see the
+fact. Its `presence` is exact too — the generator divides a value's
+count by the field's presence, so both must come from the same
+population — and its sampled cardinality measures
+(`ExactFrequencyTable`, `HeavyHitters`, `HyperLogLog`) are **removed**
+rather than left beside the census: two answers, one of them an
+estimate, is worse than one. Every consumer that accepts an
 `ExactFrequencyTable` accepts an `ExactValueCensus` in its place — the
 existing strategies' eligibility checks read measure presence — and
 this contract is what lets `eq` and `compound` gain exact selectivity
@@ -893,19 +907,31 @@ without change.
 the caps (sysref §13.11.1) — `census-cap` × entry size per censused
 field plus `pair-cells-cap` × 8 B — before it begins, and drives the
 standard progress sink by page, because it is a full scan of the
-largest record facet in the dataset and must say so while it runs.
+largest record facet in the dataset and must say so while it runs. The
+number of `auto` fields is unknown until Pass 1, so the declaration
+allows for a fixed 32 of them beyond those listed; a budget that
+cannot grant the ceiling fails the step before the pass rather than
+during it.
 
 **TS-148.** **What the pass scans, and how.** It reads every page of M
-in ordinal order and decodes each MNode exactly once — the same reader
-Passes 1 and 2 use, without the page stride that samples them. Per
-record it does one thing per declaration: looks up each censused
-field's value in that field's table, folds each hierarchy's value tuple
-into its tree, and increments each pair's cell. Values are **interned
-on first sight** — a label maps to a small integer id in a per-field
-table — so the hierarchy and pair accumulators index by id and the
-per-record cost is one hash probe per declared field, not a string
-copy; labels are written out only when the report is serialised. The
-pass needs Pass 1 only for `auto` (TS-139) and nothing from Pass 2, so
+in ordinal order — the same reader Passes 1 and 2 use, without the page
+stride that samples them — and walks each record once with the
+zero-allocation MNode scanner, extracting **only the declared fields**
+into a per-page slot array and one text arena: two allocations per
+page, none per record. Per record the consumer then does one thing per
+declaration: looks up each censused field's value in that field's
+table, folds each hierarchy's value tuple into its tree, and
+increments each pair's cell. Values are **interned on first sight** —
+a label maps to a small integer id in a per-field table, looked up by
+the borrowed arena slice — so the hierarchy and pair accumulators
+index by id and the per-record cost is one hash probe per declared
+field, not a string copy; canonical keys are built once per distinct
+value and written out only when the report is serialised. Extraction,
+which is the cost, runs on the governor's `threads` in parallel across
+pages; counting applies extracted pages strictly in page order on one
+thread, so interned ids, first-seen parents and report order never
+depend on scheduling and the report is identical for any thread count.
+The pass needs Pass 1 only for `auto` (TS-139) and nothing from Pass 2, so
 a survey configured with `census: none` is exactly today's survey, and
 one with declarations adds one sequential read of M — 206 GB after
 enrichment, a single slab under the 1 TB shard cap, opened as the
@@ -974,6 +1000,18 @@ to `other`; an unmapped heading is never an error.
 `(corpusid, ordinal)` — the **passage**, not the paper. Keying it on
 `corpusid` would reproduce the paper-blocking of §1.1 in the one family
 that exists to be free of it.
+
+**TS-149.** `sample_bucket` is an **auxiliary** element of M.
+Enrichment always computes it — it is the one column whose distribution
+is exactly uniform by construction, and it costs one hash per row — but
+**no semantic family may reference it**. Topical, structural and
+bibliographic predicates, and the conjunctions of TS-17, are drawn from
+the labelled and derived fields alone; the control family is the only
+consumer of the hash, and it is labelled as such wherever it is
+published (TS-59). The default predicate set is therefore
+semantic-first: the hash carries the sub-threshold profiles (TS-47) and
+supplies the labelled null hypothesis above them (D-3), and nothing a
+person would read as a query depends on it.
 
 **TS-32.** Enrichment happens **upstream of** `convert-metadata`, so
 the M facet, the survey, and everything downstream flow from it without
@@ -1321,8 +1359,8 @@ Added to the existing surface (sysref §13.9). Nothing existing changes.
 |---|---|---|---|---|
 | `census` | Config | no | `auto` | `auto`, `none`, or a field list; `auto` may be combined with a list (TS-139) |
 | `census-cap` | Config | no | `65536` | distinct values or histogram width per field (TS-140) |
-| `hierarchy` | Config | no | — | repeatable, `a>b>c` (TS-141) |
-| `census-pair` | Config | no | — | repeatable, `a:b` (TS-142) |
+| `hierarchy` | Config | no | — | comma-separated `a>b>c` declarations (TS-141) |
+| `census-pair` | Config | no | — | comma-separated `a:b` declarations (TS-142) |
 | `pair-cells-cap` | Config | no | `4194304` | joint-table cells per pair (TS-142) |
 
 For tessera: `source` becomes the M facet (TS-126); `census:
@@ -1377,7 +1415,7 @@ divergence and would surface only as inexplicable benchmark results.
 | `query-placement` | Config | no | mixed | in-topic / out-of-topic mix (TS-19) |
 | `centroids` | Input | no | — | required with `queries`, for placement (TS-137) |
 | `queries` | Input | no | — | required for `query-placement` |
-| `families` | Config | no | all four | which families, and their mix |
+| `families` | Config | no | all four | which families, and their mix; the semantic three never read the hash (TS-149) |
 | `per-cell` | Config | no | tapered | per-decade counts (TS-54) |
 | `decades` | Config | no | `1e-1..1e-7` | target range |
 | `min-matches` | Config | no | `100` | *M* in TS-11 |
@@ -1558,7 +1596,7 @@ predicate set invalidates `evaluate-predicates` across every profile.
 | 3 aggregate | 3 columns of `metadata.parquet`, first row per paper | minutes |
 | 3 map | 531.9M rows including the 241 GB `text` column | tens of minutes, I/O bound (TS-136) |
 | 3 margin | `transform extract`, mvec, 495.9M × 4 B | comparable to `extract-metadata` |
-| 4 | census pass: decode 495.9M MNode records of M | ~207 s per pass, measured |
+| 4 | census pass over 495.9M records of M | 58 s measured on tessera, 128 threads (TS-148) |
 | 5 | sampling by lookup over the census tables (TS-143) | seconds |
 | — | `evaluate-predicates` re-run | per profile; the dominant cost |
 
