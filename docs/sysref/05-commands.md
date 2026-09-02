@@ -69,6 +69,7 @@ each run against the synthetic-1k test fixture.
 | `verify predicates-sqlite` | SQLite oracle verification for predicate results |
 | `verify filtered-knn-consolidated` | Verify filtered KNN with tie-break handling |
 | `verify predicate-results` | Consolidated predicate verification (slab mode) |
+| `verify predicate-strata` | Hold a stratified predicate set's recorded counts, bands and query_in_filter labels against its answer keys at every profile |
 
 ---
 

@@ -117,6 +117,7 @@ pub mod transform_remove_zeros_knnutils;
 pub mod verify_dataset_knnutils;
 pub mod verify_engine_parity;
 pub mod verify_knn;
+pub mod verify_predicate_strata;
 pub mod verify_predicates;
 pub mod verify_predicates_sqlite;
 
@@ -298,6 +299,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // E facet (post-filter) verifier — derives G ∩ R and byte-compares.
     registry.register("verify postfiltered-knn-consolidated", verify_consolidated::postfiltered_knn_consolidated_factory);
     registry.register("verify predicates-consolidated", verify_consolidated::predicates_consolidated_factory);
+    registry.register("verify predicate-strata", verify_predicate_strata::factory);
     registry.register("verify predicates-sqlite", verify_predicates_sqlite::factory);
 
     // ── catalog ──────────────────────────────────────────────────────

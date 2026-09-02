@@ -61,6 +61,7 @@ Every command with a working example run against the
 | [verify knn-consolidated](./verify-knn-consolidated.md) | Multi-threaded KNN verification |
 | [verify predicates-sqlite](./verify-predicates-sqlite.md) | SQLite oracle verification |
 | [verify alignment](./verify-alignment.md) | Row-count/ordinal alignment between artifacts (embed-contract gate) |
+| [verify predicate-strata](./verify-predicate-strata.md) | A stratified predicate set's claims against its answer keys, per profile |
 
 ## Merkle
 
