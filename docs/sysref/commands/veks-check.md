@@ -46,3 +46,13 @@ veks check --check-extraneous
 veks check --clean          # list extraneous files
 veks check --clean-files    # remove extraneous files
 ```
+
+## What counts as accounted for
+
+A publishable file passes the extraneous-files check when a pipeline
+step or profile view names it, when it is known infrastructure, or when
+it is a derivative of something named: a `.mref` of it, an `IDXFOR__`
+index of it, or a shard of it. The shards of a sharded facet
+(`base_vectors__0000.fvecs`, `base_vectors__0001.fvecs`, …) are
+accounted for by the series the manifest knows as `base_vectors.fvecs`
+or declares as `base_vectors__NNNN.fvecs`.

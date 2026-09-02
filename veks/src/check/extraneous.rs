@@ -133,44 +133,10 @@ pub fn check(
                 .to_string_lossy()
                 .to_string();
 
-            // Skip known infrastructure
             let filename = file.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            if KNOWN_INFRA.contains(&filename.as_str()) {
-                continue;
-            }
-
-            // Skip .mref if base file is accounted for
-            if rel.ends_with(".mref") {
-                let base = &rel[..rel.len() - 5];
-                if accounted.contains(base) {
-                    continue;
-                }
-            }
-
-            // Skip .mrkl files (local merkle state)
-            if rel.ends_with(".mrkl") {
-                continue;
-            }
-
-            // Skip IDXFOR__ index files if their data file is accounted for
-            if filename.starts_with("IDXFOR__") {
-                // IDXFOR__metadata_results.ivvec.i32 → metadata_results.ivvec
-                let data_name = filename.strip_prefix("IDXFOR__")
-                    .and_then(|s| s.rsplit_once('.'))  // strip .i32/.i64
-                    .map(|(base, _)| base);
-                if let Some(dn) = data_name {
-                    let data_rel = rel.rsplit_once('/')
-                        .map(|(dir, _)| format!("{}/{}", dir, dn))
-                        .unwrap_or_else(|| dn.to_string());
-                    if accounted.contains(&data_rel) {
-                        continue;
-                    }
-                }
-            }
-
-            if !accounted.contains(&rel) {
+            if !is_accounted(&rel, &filename, &accounted) {
                 let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
                 all_extraneous.push(format!("{} ({})", rel, format_size(size)));
             }
@@ -268,37 +234,7 @@ pub fn find_extraneous(
         let filename = file.file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if KNOWN_INFRA.contains(&filename.as_str()) {
-            continue;
-        }
-
-        if rel.ends_with(".mref") {
-            let base = &rel[..rel.len() - 5];
-            if accounted.contains(base) {
-                continue;
-            }
-        }
-
-        if rel.ends_with(".mrkl") {
-            continue;
-        }
-
-        // Skip IDXFOR__ index files if their data file is accounted for
-        if filename.starts_with("IDXFOR__") {
-            let data_name = filename.strip_prefix("IDXFOR__")
-                .and_then(|s| s.rsplit_once('.'))
-                .map(|(base, _)| base);
-            if let Some(dn) = data_name {
-                let data_rel = rel.rsplit_once('/')
-                    .map(|(dir, _)| format!("{}/{}", dir, dn))
-                    .unwrap_or_else(|| dn.to_string());
-                if accounted.contains(&data_rel) {
-                    continue;
-                }
-            }
-        }
-
-        if !accounted.contains(&rel) {
+        if !is_accounted(&rel, &filename, &accounted) {
             result.push(file.clone());
         }
     }
@@ -326,6 +262,57 @@ pub fn retained_cache_paths(
     }
 }
 
+/// Whether a publishable file at workspace-relative `rel` (whose last
+/// component is `filename`) is accounted for by the pipeline — the one
+/// rule both the check and the clean path apply.
+///
+/// A file is accounted for when the manifest names it, when it is
+/// known infrastructure, when it is local merkle state, or when it is a
+/// derivative of something the manifest names: a `.mref` of it, an
+/// `IDXFOR__` index of it, or a **shard of it** — `base_vectors__0003.fvecs`
+/// belongs to the series the manifest knows as `base_vectors.fvecs`
+/// or declares as `base_vectors__NNNN.fvecs`.
+fn is_accounted(rel: &str, filename: &str, accounted: &HashSet<String>) -> bool {
+    if accounted.contains(rel) || KNOWN_INFRA.contains(&filename) || rel.ends_with(".mrkl") {
+        return true;
+    }
+    let dir = rel.rsplit_once('/').map(|(d, _)| d);
+    let in_dir = |name: &str| match dir {
+        Some(d) => format!("{}/{}", d, name),
+        None => name.to_string(),
+    };
+    // A .mref of an accounted file.
+    if let Some(base) = rel.strip_suffix(".mref")
+        && accounted.contains(base)
+    {
+        return true;
+    }
+    // IDXFOR__metadata_results.ivvec.i32 → metadata_results.ivvec
+    if let Some(data_name) = filename
+        .strip_prefix("IDXFOR__")
+        .and_then(|s| s.rsplit_once('.'))
+        .map(|(base, _)| base)
+        && accounted.contains(&in_dir(data_name))
+    {
+        return true;
+    }
+    // A shard of a series the manifest names by its unsharded name or
+    // by its declared pattern.
+    if let Some(series) = vectordata::dataset::shards::series_of_shard(filename) {
+        if accounted.contains(&in_dir(&series)) {
+            return true;
+        }
+        let (stem, ext) = match series.rsplit_once('.') {
+            Some((s, e)) => (s.to_string(), e.to_string()),
+            None => (series.clone(), String::new()),
+        };
+        if accounted.contains(&in_dir(&vectordata::dataset::shards::shard_source_spec(&stem, &ext))) {
+            return true;
+        }
+    }
+    false
+}
+
 fn format_size(bytes: u64) -> String {
     if bytes >= 1_073_741_824 {
         format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0)
@@ -337,3 +324,40 @@ fn format_size(bytes: u64) -> String {
         format!("{} B", bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The shards of a series the manifest names are accounted for;
+    /// shards of a series it does not name are not.
+    #[test]
+    fn shards_are_accounted_for_by_their_series() {
+        let accounted = set(&["profiles/base/base_vectors.fvecs"]);
+        assert!(is_accounted("profiles/base/base_vectors__0000.fvecs", "base_vectors__0000.fvecs", &accounted));
+        assert!(is_accounted("profiles/base/base_vectors__0004.fvecs", "base_vectors__0004.fvecs", &accounted));
+        assert!(!is_accounted("profiles/base/other__0000.fvecs", "other__0000.fvecs", &accounted));
+        assert!(!is_accounted("profiles/base/base_vectors.mvecs", "base_vectors.mvecs", &accounted));
+        // A declared pattern accounts for its shards too.
+        let declared = set(&["profiles/base/base_vectors__NNNN.fvecs"]);
+        assert!(is_accounted("profiles/base/base_vectors__0001.fvecs", "base_vectors__0001.fvecs", &declared));
+    }
+
+    /// The other derivative rules are unchanged by the refactor.
+    #[test]
+    fn derivatives_and_infrastructure_are_accounted_for() {
+        let accounted = set(&["profiles/default/metadata_results.ivvec", "a.fvecs"]);
+        assert!(is_accounted("profiles/default/IDXFOR__metadata_results.ivvec.i32", "IDXFOR__metadata_results.ivvec.i32", &accounted));
+        assert!(!is_accounted("profiles/default/IDXFOR__other.ivvec.i32", "IDXFOR__other.ivvec.i32", &accounted));
+        assert!(is_accounted("a.fvecs.mref", "a.fvecs.mref", &accounted));
+        assert!(!is_accounted("b.fvecs.mref", "b.fvecs.mref", &accounted));
+        assert!(is_accounted("state.mrkl", "state.mrkl", &accounted));
+        assert!(is_accounted("dataset.yaml", "dataset.yaml", &accounted));
+        assert!(!is_accounted("stray.bin", "stray.bin", &accounted));
+    }
+}
+
