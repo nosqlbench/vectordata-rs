@@ -226,7 +226,9 @@ pub struct StepRecord {
 /// Record of a single output artifact at completion time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputRecord {
-    /// Path to the output file.
+    /// Path to the output file, relative to the workspace when it lies
+    /// inside it (absolute otherwise), so the record reads the same from
+    /// any working directory.
     pub path: String,
     /// File size in bytes at completion.
     pub size: u64,

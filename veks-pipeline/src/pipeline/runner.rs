@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -634,7 +634,7 @@ pub fn run_steps(
 
         // 8. Record result with the original (unmunged) options
         ctx.ui.clear();
-        let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(provenance.clone()));
+        let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(provenance.clone()), &ctx.workspace);
         ctx.progress.record_step(&step.id, record);
 
         // If this step modified files that were outputs of previous steps
@@ -642,7 +642,7 @@ pub fn run_steps(
         // stored sizes in those earlier step records so freshness checks
         // don't flag them as stale.
         for produced_path in &result.produced {
-            let rel = veks_core::paths::rel_display(produced_path);
+            let rel = workspace_relative(produced_path, &ctx.workspace);
             if let Ok(meta) = std::fs::metadata(produced_path) {
                 ctx.progress.update_output_size(&rel, meta.len());
             }
@@ -821,11 +821,23 @@ pub fn run_steps(
 
 
 /// Build a `StepRecord` from a `CommandResult`.
+/// A produced path as the progress log records it: relative to the
+/// workspace when it lies inside it, so a record reads the same from
+/// any working directory and `veks check` can find the file; absolute
+/// otherwise.
+fn workspace_relative(path: &Path, workspace: &Path) -> String {
+    match path.strip_prefix(workspace) {
+        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
+        _ => path.to_string_lossy().into_owned(),
+    }
+}
+
 fn step_record_from_result(
     result: &CommandResult,
     resolved_opts: &indexmap::IndexMap<String, String>,
     resource_summary: Option<ResourceSummary>,
     provenance: Option<Address>,
+    workspace: &Path,
 ) -> StepRecord {
     let outputs: Vec<OutputRecord> = result
         .produced
@@ -841,7 +853,7 @@ fn step_record_from_result(
                     Some(dt.to_rfc3339())
                 });
             OutputRecord {
-                path: veks_core::paths::rel_display(p),
+                path: workspace_relative(p, workspace),
                 size,
                 mtime,
             }

@@ -91,7 +91,9 @@ record points at a **`ProvenanceNode`** capturing every component that
   the DAG (the hash recurses through addresses)
 
 A step is fresh when:
-- The output file exists with the recorded size, AND
+- The output file exists with the recorded size (output paths are
+  recorded relative to the workspace, so a record reads the same from
+  any working directory), AND
 - The step's node hashes under the **active selector** to the same
   value as the node recorded for it
 
