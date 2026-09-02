@@ -11,7 +11,9 @@ for the M / P / R facet shapes, and
 [prefilter-postfilter-facets.md](prefilter-postfilter-facets.md) for
 what E and F measure and why the difference between them matters, and
 [sysref §13](../sysref/13-metadata-survey.md) for the survey this design
-extends.
+extends. Query-relative pivots for the non-topical families and a
+per-pivot control share are deferred to
+[srd-predicate-pivot-regimes.md](srd-predicate-pivot-regimes.md).
 
 ## 1. Problem
 
@@ -310,6 +312,17 @@ its slots; and every slot no cell can fill takes a control predicate,
 so no query is without one. The families namespace records the
 distinct predicate a record carries so results can be grouped by
 predicate as well as by query.
+
+**TS-163.** **The families share the query slots evenly**, the control
+family included, in one global hash space: 2,500 of tessera's 10,000
+queries carry a hash predicate. That is an even share for diagnostics,
+not a weighting of the null case against the semantic case it
+accompanies; weighting the control share per semantic pivot, and
+pivoting the structural and bibliographic families on the query's own
+passage, are deferred to
+[srd-predicate-pivot-regimes.md](srd-predicate-pivot-regimes.md)
+until the dataset inventory can hold several predicate regimes as
+distinct artifacts.
 
 **TS-157.** **Placement is decided per pair.** A topical cell whose
 queries' topics are known fills an in-topic slot by pairing a predicate
@@ -1871,6 +1884,16 @@ worth measuring: the median gap between a passage's leaf and its best
 sibling is 0.029 in cosine distance, and 20.8% of passages sit within
 0.01 of a sibling.
 
+**TS-164.** *Should the non-topical families pivot on the query's own
+passage, and should the control share follow the pivot?* Yes to both
+in principle — every query is a source passage whose enriched row
+exists, so any predicate can be labelled or constructed against it —
+but each is a further predicate construction regime, and regimes need
+inventory support to be distinct artifacts before they are worth
+building. Deferred to
+[srd-predicate-pivot-regimes.md](srd-predicate-pivot-regimes.md); the
+even global hash share stands meanwhile (TS-163).
+
 ## 15. Acceptance
 
 **TS-42.** At every profile with *N* ≥ *N*ᵣ: no predicate that applies
@@ -2128,6 +2151,14 @@ passage's own source metadata or a derivative of that passage's own
 data, and every predicate paired with a query relates to that query's
 own data or is independent of it by design and says so. The control
 hash is the single, labelled exception. → TS-158, TS-162.
+
+**D-25 — Even control share now, pivot-weighted later.** The hash
+family takes the same share of query slots as each semantic family, in
+one global hash space, because an even share is the simplest to read
+in diagnostics and the alternative — a control share weighted per
+semantic pivot — is one of several predicate regimes that need the
+inventory to hold them as distinct artifacts first. → TS-163, TS-164,
+and the deferred SRD.
 
 ### 16.1 What changed while this was written
 
