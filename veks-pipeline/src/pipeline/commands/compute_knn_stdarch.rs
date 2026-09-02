@@ -41,7 +41,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Distance function type.
-type DistFn = fn(&[f32], &[f32]) -> f32;
+pub(crate) type DistFn = fn(&[f32], &[f32]) -> f32;
 
 // Metric enum, cache helpers, and segment discovery are shared across
 // all brute-force KNN engines via `super::knn_segment`.
@@ -79,6 +79,36 @@ fn select_dist_fn(metric: Metric) -> (DistFn, &'static str) {
         Metric::Cosine => cosine_scalar as DistFn,
     };
     (f, "scalar")
+}
+
+/// Inner product `a · b` with the same runtime kernel selection as
+/// [`select_dist_fn`]. Shared with `compute topics`, whose spherical
+/// k-means and hierarchical descent are argmaxes of this.
+pub(crate) fn select_dot_fn() -> (DistFn, &'static str) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return (dot_avx512 as DistFn, "AVX-512");
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return (dot_avx2 as DistFn, "AVX2+FMA");
+        }
+    }
+    (dot_scalar as DistFn, "scalar")
+}
+
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+    -neg_dot_scalar(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
+    -neg_dot_avx512(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    -neg_dot_avx2(a, b)
 }
 
 // -- Scalar fallback ----------------------------------------------------------
