@@ -724,6 +724,30 @@ design and recorded as such (TS-6). Both are measurements of something
 real; a predicate affixed to a query by position alone is neither, and
 TS-161 refuses it.
 
+**TS-165.** **The queries' own metadata rows are a facet**,
+`profiles/base/query_metadata.slab`, in query order: row *i* is the
+source-order metadata row of the passage query *i* was derived from,
+carried across the bridge by the same shuffle over `[0, query_count)`
+that `extract-queries` applies to the vectors. It is produced by
+`transform extract` exactly as the base metadata is (TS-130), so it
+cannot disagree with it, and it is retained (TS-84): it is what makes
+any query-relative statement checkable without the generator.
+
+**TS-166.** **Every pair is labelled against its own query.** When the
+query metadata is given, the generator evaluates record *i*'s predicate
+against row *i* and records `query_in_filter` in the families
+namespace for every family, not only the topical one: whether the
+query's own passage would pass its own filter. For a topical single
+predicate this agrees with the descent-based placement except at a
+margin the perturbed query vector crossed (TS-89); for the other
+families it is the one relation the pair has to the query, and it is
+recorded rather than assumed. The generation report tallies both sides
+per cell. Selection is unchanged by the label: the structural and
+bibliographic draws stay independent of the query (TS-6), so the
+label measures how often independence happens to coincide with the
+query's own passage, which is the base rate any query-relative regime
+(the deferred SRD) would be read against.
+
 ## 5. Topic hierarchy
 
 **TS-24.** Three levels, branching ~10 / ~30 / ~33, giving 10 / 300 /
@@ -1143,6 +1167,23 @@ distinct `predicate` index (TS-156), and for a topical record its
 that level (TS-157), so the pair's relation is auditable from the
 record alone.
 
+**TS-167.** A verification step, `verify predicate-strata`, holds the
+generator's claims against the answer keys rather than trusting them:
+one record per query and both namespaces the same length (TS-156,
+TS-111); at the profile whose base is the census population, every
+censused record's realised match count equals its recorded
+`expected_count` exactly, and a control record's lies in its band
+(TS-115); at every other profile above the reliability threshold the
+realised selectivity lies in the record's half-decade band and no
+record is empty (TS-42, TS-43), while below the threshold only the
+control family is held to a non-empty result; and every
+`query_in_filter` label re-derives from the query's own row (TS-166).
+Realised counts are the results records' lengths, so the pass reads
+each profile's R facet once and decodes nothing. It writes a report
+per profile and per family and fails the pipeline on any violation,
+which is what TS-121 asked for: the acceptance is checked against R,
+not against the generator.
+
 ### 6.5 Recording embedding provenance
 
 **TS-83.** The model identity and **resolved** revision that produced
@@ -1176,6 +1217,7 @@ the dataset and are not:
 | topic model report | dataset | levels, seed and sample, without which the centroids cannot be re-fitted (TS-152) |
 | assignment margin | dataset | explains filter crispness; a second pass to recover |
 | heading → class table | dataset | a judgement call worth auditing |
+| query metadata | dataset | every query-relative claim is checked against it (TS-165) |
 | families namespace | in `predicates.slab` | TS-64 |
 | generation trace | dataset | selection provenance |
 | embed provenance | dataset | irrecoverable once the host cache turns over |
@@ -1289,8 +1331,10 @@ start without it.
 | enriched metadata | `.cache/metadata_enriched.parquet` | source | parquet | cache |
 | section-class map | `profiles/base/section_class_map.slab` | by heading | `Slab`, MNode | retained |
 | survey, with census tables | `${cache}/metadata_survey.json` | counts over base | JSON, sysref §13.8 | cache |
-| predicate families | `predicates.slab` ns `families` | by predicate | `Slab`, MNode | retained |
-| generation trace | `predicates.slab` ns `generation` | by predicate | `Slab`, MNode | retained |
+| query metadata | `profiles/base/query_metadata.slab` | query | `Slab`, MNode (TS-165) | retained |
+| predicate families | `predicates.slab` ns `families` | by query (TS-156) | `Slab`, MNode | retained |
+| generation trace | `predicates.slab` ns `generation` | by query (TS-156) | `Slab`, MNode | retained |
+| strata verification | `${cache}/verify_predicate_strata.json` | per profile | JSON (TS-167) | cache |
 | embed provenance | `dataset.yaml` attributes | — | yaml | retained |
 
 The census tables are cache rather than retained by TS-84's rule: they
@@ -1604,6 +1648,7 @@ divergence and would surface only as inexplicable benchmark results.
 | `reliability-threshold` | Config | no | `10000000` | *N*ᵣ (TS-46) |
 | `query-placement` | Config | no | mixed | mix of topical pairs whose query lies inside its predicate's topic: `mixed`, `in-topic`, `out-of-topic` or `any` (TS-19, TS-157); needs `queries` |
 | `queries` | Input | no | — | the query vectors; record *i* is query *i*'s predicate and placement is decided per pair |
+| `query-metadata` | Input | no | — | the queries' own metadata rows in query order (TS-165); every pair gets `query_in_filter` (TS-166) |
 | `centroids` | Input | no | — | with `queries` (TS-137) |
 | `model` | Input | no | — | with `queries`: the model report, for the branching |
 | `labels` | Input | no | — | with `queries`: code → label, so placement is by label |
@@ -1668,6 +1713,23 @@ that is a prefix of one already used, or shares its first five
 characters, so `robot`, `robots` and `robotic` do not make a label
 between them — and a collision within the level extends the slug with
 the next ranked terms and, failing that, appends the code.
+
+### 10.6 `verify predicate-strata`
+
+| option | role | req | default | notes |
+|---|---|---|---|---|
+| `predicates` | Input | yes | — | the stratified facet, with both namespaces |
+| `results` | Config | no | `metadata_results.slab` | the results facet's file name under each profile |
+| `queries` | Input | no | — | to check one record per query |
+| `query-metadata` | Input | no | — | to re-derive every `query_in_filter` label (TS-166) |
+| `reliability-threshold` | Config | no | `10000000` | *N*ᵣ (TS-46): above it every family holds its band and is non-empty |
+| `output` | Output | yes | — | report: per profile, per family, first violations |
+
+Profiles come from `dataset.yaml`, partition profiles excluded, or
+from the `profiles/` directory when the file does not load, with a
+sized profile's base count read from its name; the census profile is
+the one with no declared count. The step fails on any violation
+(TS-167).
 
 ## 11. Candidate enumeration
 
@@ -1769,6 +1831,14 @@ per query, every in-topic record's query lies in its predicate's topic
 and every out-of-topic record's does not, the recorded `query_topic`
 is the query's own, a `count` that disagrees with the queries is
 refused, and without either there is an error rather than a guess.
+
+**TS-168.** The verification is tested on answer keys computed by the
+test itself over the fixture rows: a census profile and a sized
+profile pass; one ordinal removed from one censused record fails the
+census profile with exactly one mismatch; the same rows shifted by one
+query fail the label check; a query facet of another size fails the
+count check; and the control family, whose count is by construction,
+is held to its band rather than to an exact count.
 
 ## 13. Work breakdown
 

@@ -59,6 +59,9 @@ all of them at no cost beyond one predicate evaluation per pair, and
 gives the structural and bibliographic families a meaningful
 relationship to pivot on: a filter on the query's own year, or its own
 section class, is the realistic "search within my kind of paper" case.
+*The labelling half of this is built* (TS-165, TS-166): the query
+metadata facet exists and every record carries `query_in_filter`.
+What remains of PR-2 is drawing *toward* the label, which is PR-3.
 
 **PR-3. Anchored construction.** Beyond labelling, a regime may
 **construct** the predicate from the query's own row — the query's
