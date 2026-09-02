@@ -765,7 +765,7 @@ impl CommandOp for GenPredicatesOp {
             if !output.exists() {
                 return ArtifactState::Absent;
             }
-            return match super::gen_predicates_stratified::check_artifact(output) {
+            return match super::gen_predicates_stratified::check_artifact(output, options) {
                 Some(true) => ArtifactState::Complete,
                 _ => ArtifactState::Partial,
             };

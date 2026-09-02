@@ -32,7 +32,7 @@
 //! See the topic-stratified predicate SRD, §3, §4.4–4.5, §6.4, §10.4
 //! and §11.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -68,8 +68,10 @@ use super::slab::survey_report_from_json;
 /// narrower than the field's span are used.
 const RANGE_WIDTHS: [i64; 5] = [2, 5, 10, 20, 50];
 
-/// Default per-decade counts, decade 10⁻¹ first: the taper of TS-54.
-const TAPERED: [usize; 3] = [10, 20, 50];
+/// Default slots per decade, decade 10⁻¹ first: the taper of TS-54 as
+/// absolute counts for the three coarsest decades, every decade below
+/// them sharing the rest of the query slots (TS-159).
+const TAPERED: [Slots; 3] = [Slots::Absolute(10), Slots::Absolute(20), Slots::Absolute(50)];
 
 /// Default modulus of the control field.
 const DEFAULT_BUCKETS: u64 = 16_777_216;
@@ -148,28 +150,89 @@ pub fn parse_decades(spec: &str) -> Result<Vec<i32>, String> {
 
 /// Parse `per-cell`: `tapered`, one count, or one count per decade
 /// (coarsest first; the last repeats).
-pub fn parse_per_cell(spec: &str, decades: usize) -> Result<Vec<usize>, String> {
-    let taper = |list: &[usize]| -> Vec<usize> {
-        (0..decades)
-            .map(|i| *list.get(i).or(list.last()).unwrap_or(&1))
-            .collect()
-    };
-    if spec.trim().eq_ignore_ascii_case("tapered") {
-        return Ok(taper(&TAPERED));
+/// How many of a family's query slots one decade gets (TS-159).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slots {
+    /// This many, when any decade says `rest`; otherwise a weight.
+    Absolute(usize),
+    /// An equal share of what the absolute decades leave.
+    Rest,
+}
+
+impl std::fmt::Display for Slots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Slots::Absolute(n) => write!(f, "{}", n),
+            Slots::Rest => write!(f, "rest"),
+        }
     }
-    let list: Vec<usize> = spec
-        .split(',')
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            s.trim()
-                .parse::<usize>()
-                .map_err(|_| format!("per-cell: `{}` is not a count", s.trim()))
-        })
-        .collect::<Result<_, _>>()?;
-    if list.is_empty() || list.contains(&0) {
+}
+
+/// Parse `per-cell`: `tapered`, one count, or one entry per decade
+/// (coarsest first), each a count or `rest`. Numbers alone are weights;
+/// with a `rest` anywhere they are absolute and the `rest` decades
+/// share what remains.
+pub fn parse_per_cell(spec: &str, decades: usize) -> Result<Vec<Slots>, String> {
+    if decades == 0 {
+        return Err("per-cell: no decades to fill".into());
+    }
+    let spec = spec.trim();
+    if spec.eq_ignore_ascii_case("tapered") {
+        return Ok((0..decades)
+            .map(|i| TAPERED.get(i).copied().unwrap_or(Slots::Rest))
+            .collect());
+    }
+    let parts: Vec<&str> = spec.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let parse_one = |s: &str| -> Result<Slots, String> {
+        if s.eq_ignore_ascii_case("rest") {
+            return Ok(Slots::Rest);
+        }
+        let n: usize = s
+            .parse()
+            .map_err(|_| format!("per-cell: `{}` is not a count or `rest`", s))?;
+        Ok(Slots::Absolute(n))
+    };
+    let out: Vec<Slots> = match parts.len() {
+        0 => return Err("per-cell: empty".into()),
+        1 => vec![parse_one(parts[0])?; decades],
+        n if n == decades => parts.iter().map(|s| parse_one(s)).collect::<Result<_, _>>()?,
+        n => {
+            return Err(format!(
+                "per-cell: {} entries for {} decades; give one, or one per decade",
+                n, decades
+            ))
+        }
+    };
+    if out.iter().all(|s| *s == Slots::Absolute(0)) {
         return Err("per-cell: counts must be positive".into());
     }
-    Ok(taper(&list))
+    Ok(out)
+}
+
+/// A family's slots per decade from its share `count` and the
+/// per-cell spec (TS-159): weights are apportioned; absolute counts
+/// are taken as they are, capped at the share, and the `rest` decades
+/// split what is left evenly. Absolute counts that exceed the share
+/// are scaled down as weights.
+pub fn slots_per_decade(count: usize, spec: &[Slots]) -> Vec<usize> {
+    let has_rest = spec.contains(&Slots::Rest);
+    let weights: Vec<usize> = spec
+        .iter()
+        .map(|s| match s {
+            Slots::Absolute(n) => *n,
+            Slots::Rest => 0,
+        })
+        .collect();
+    if !has_rest {
+        return apportion(count, &weights);
+    }
+    let fixed: usize = weights.iter().sum();
+    if fixed >= count {
+        return apportion(count, &weights);
+    }
+    let rest_weights: Vec<usize> = spec.iter().map(|s| usize::from(*s == Slots::Rest)).collect();
+    let shared = apportion(count - fixed, &rest_weights);
+    weights.iter().zip(shared).map(|(w, s)| w + s).collect()
 }
 
 fn parse_fields(spec: &str) -> Vec<String> {
@@ -483,13 +546,41 @@ fn control_candidates(field: &str, decade: i32, c: usize, buckets: u64, n: f64) 
 // Query placement
 // ---------------------------------------------------------------------------
 
-/// The `(level, label)` topics the query set falls in.
+/// Where every query lies in the topic hierarchy: for query *i*, its
+/// `(level, label)` at each level, by the same descent that assigned
+/// the base (TS-137). Placement is decided per (query, predicate) pair
+/// from this (TS-19).
+pub struct QueryTopics {
+    /// `per_query[i][l]` is query *i*'s topic at level *l* + 1.
+    pub per_query: Vec<Vec<(usize, String)>>,
+}
+
+impl QueryTopics {
+    pub fn count(&self) -> usize {
+        self.per_query.len()
+    }
+
+    /// Whether query `q` lies in `topic`.
+    fn query_in(&self, q: usize, topic: &(usize, String)) -> bool {
+        self.per_query[q].iter().any(|t| t == topic)
+    }
+
+    /// Query `q`'s own label at `level`.
+    fn label_at(&self, q: usize, level: usize) -> Option<&str> {
+        self.per_query[q]
+            .iter()
+            .find(|(l, _)| *l == level)
+            .map(|(_, s)| s.as_str())
+    }
+}
+
+/// Descend every query through the fitted model and name its topics.
 fn query_topics(
     queries: &Path,
     centroids: &Path,
     model: &Path,
     labels: &Path,
-) -> Result<(HashSet<(usize, String)>, usize), String> {
+) -> Result<QueryTopics, String> {
     let report: TopicModelReport = serde_json::from_str(
         &std::fs::read_to_string(model)
             .map_err(|e| format!("failed to read {}: {}", model.display(), e))?,
@@ -550,7 +641,7 @@ fn query_topics(
     }
     let (dot, _) = select_dot_fn();
     let mut codes = vec![0u16; report.levels.len()];
-    let mut topics = HashSet::new();
+    let mut per_query = Vec::with_capacity(q.count());
     for i in 0..q.count() {
         let mut v = q.get(i).map_err(|e| format!("query {}: {}", i, e))?;
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -560,20 +651,22 @@ fn query_topics(
             }
         }
         topic_model.descend(&v, dot, &mut codes);
+        let mut topics = Vec::with_capacity(codes.len());
         for (l, &code) in codes.iter().enumerate() {
             let label = label_table[l]
                 .get(code as usize)
                 .filter(|s| !s.is_empty())
                 .cloned()
                 .unwrap_or_else(|| format!("l{}-{:05}", l + 1, code));
-            topics.insert((l + 1, label));
+            topics.push((l + 1, label));
         }
+        per_query.push(topics);
     }
-    Ok((topics, q.count()))
+    Ok(QueryTopics { per_query })
 }
 
 // ---------------------------------------------------------------------------
-// Drawing
+// Drawing and pairing
 // ---------------------------------------------------------------------------
 
 /// What one cell did.
@@ -581,21 +674,34 @@ fn query_topics(
 pub struct CellReport {
     pub family: Family,
     pub decade: i32,
+    /// Query slots apportioned to the cell (TS-156).
     pub target: usize,
     pub candidates: usize,
+    /// Distinct predicates drawn.
     pub drawn: usize,
+    /// Slots the cell filled; `target − filled` went to backfill.
+    pub filled: usize,
+    /// Slots the cell could not fill.
     pub shortfall: usize,
     pub conjunctions: usize,
     pub in_topic: usize,
     pub out_of_topic: usize,
 }
 
-/// A drawn predicate with everything both namespaces record.
+/// One query's predicate with everything both namespaces record.
 struct Drawn {
     candidate: Candidate,
     cell: String,
     pool: usize,
+    /// In-topic or out-of-topic, for a topical pair whose query's
+    /// topics are known.
     placement: Option<&'static str>,
+    /// The query's own label at the predicate's level, when known.
+    query_topic: Option<String>,
+    /// Index of the distinct predicate among all distinct predicates.
+    predicate: usize,
+    /// Drawn from the control family to fill a slot no cell could.
+    backfill: bool,
 }
 
 fn cell_seed(seed: u64, family: Family, decade: i32) -> u64 {
@@ -607,114 +713,244 @@ fn cell_seed(seed: u64, family: Family, decade: i32) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Draw one cell. Single-field candidates first, conjunctions only to
-/// make up a shortfall (TS-116); topical cells honour the placement
-/// mix when query topics are known.
-fn draw_cell(
-    family: Family,
-    decade: i32,
-    target: usize,
-    pool: &[Candidate],
-    seed: u64,
-    placement: Placement,
-    query_topics: Option<&HashSet<(usize, String)>>,
-) -> (Vec<Drawn>, CellReport) {
-    let mut rng = rng::seeded_rng(cell_seed(seed, family, decade));
-    let cell = format!("{}:1e{}", family.as_str(), decade);
-    let in_topic = |c: &Candidate| -> Option<bool> {
-        let qt = query_topics?;
-        c.topic.as_ref().map(|t| qt.contains(t))
-    };
+/// Apportion `total` slots over `weights` by largest remainder, so the
+/// shares sum to `total` exactly and each is within one of its ideal
+/// (TS-156). All-zero weights yield all-zero shares.
+pub fn apportion(total: usize, weights: &[usize]) -> Vec<usize> {
+    let sum: usize = weights.iter().sum();
+    if sum == 0 || weights.is_empty() {
+        return vec![0; weights.len()];
+    }
+    let mut shares: Vec<usize> = weights.iter().map(|w| total * w / sum).collect();
+    let mut given: usize = shares.iter().sum();
+    let mut by_remainder: Vec<(usize, usize)> = weights
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| **w > 0)
+        .map(|(i, w)| ((total * w) % sum, i))
+        .collect();
+    by_remainder.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut i = 0;
+    while given < total {
+        shares[by_remainder[i % by_remainder.len()].1] += 1;
+        given += 1;
+        i += 1;
+    }
+    shares
+}
+
+/// Draw the distinct predicates of one cell: single-field candidates
+/// first, conjunctions only to make up a shortfall (TS-116), in seeded
+/// order, at most `target`.
+fn draw_distinct(pool: &[Candidate], target: usize, seed: u64) -> Vec<&Candidate> {
+    let mut rng = rng::seeded_rng(seed);
     let mut singles: Vec<&Candidate> = pool.iter().filter(|c| !c.conjunct).collect();
     let mut conjuncts: Vec<&Candidate> = pool.iter().filter(|c| c.conjunct).collect();
     singles.shuffle(&mut rng);
     conjuncts.shuffle(&mut rng);
     let mut take: Vec<&Candidate> = Vec::with_capacity(target);
-    let use_placement =
-        family == Family::Topical && query_topics.is_some() && placement != Placement::Any;
-    if use_placement {
-        let mut ordered: Vec<&Candidate> = singles
-            .iter()
-            .copied()
-            .chain(conjuncts.iter().copied())
-            .collect();
-        // Stable partition by placement, singles before conjunctions
-        // within each side.
-        let ins: Vec<&Candidate> = ordered
-            .iter()
-            .copied()
-            .filter(|c| in_topic(c) == Some(true))
-            .collect();
-        let outs: Vec<&Candidate> = ordered
-            .iter()
-            .copied()
-            .filter(|c| in_topic(c) == Some(false))
-            .collect();
-        ordered.clear();
-        let (want_in, want_out) = match placement {
-            Placement::InTopic => (target, 0),
-            Placement::OutOfTopic => (0, target),
-            _ => (target.div_ceil(2), target / 2),
+    take.extend(singles.iter().take(target));
+    if take.len() < target {
+        let need = target - take.len();
+        take.extend(conjuncts.iter().take(need));
+    }
+    take
+}
+
+/// The unassigned queries, in a seeded order, with an index by topic
+/// so an in-topic pair is found without a scan.
+struct QueryPool {
+    /// Queries not yet given a predicate, in draw order.
+    free: Vec<usize>,
+    taken: Vec<bool>,
+    /// Topic → free queries in it, in draw order.
+    by_topic: HashMap<(usize, String), Vec<usize>>,
+}
+
+impl QueryPool {
+    fn new(count: usize, topics: Option<&QueryTopics>, seed: u64) -> Self {
+        let mut rng = rng::seeded_rng(seed ^ 0x51_6C_6F_74_73);
+        let mut free: Vec<usize> = (0..count).collect();
+        free.shuffle(&mut rng);
+        let mut by_topic: HashMap<(usize, String), Vec<usize>> = HashMap::new();
+        if let Some(t) = topics {
+            for &q in &free {
+                for topic in &t.per_query[q] {
+                    by_topic.entry(topic.clone()).or_default().push(q);
+                }
+            }
+        }
+        QueryPool {
+            free,
+            taken: vec![false; count],
+            by_topic,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.free.len()
+    }
+
+    /// Take the next free query satisfying `accept`.
+    fn take_where(&mut self, accept: impl Fn(usize) -> bool) -> Option<usize> {
+        let pos = self.free.iter().position(|&q| accept(q))?;
+        let q = self.free.remove(pos);
+        self.taken[q] = true;
+        Some(q)
+    }
+
+    /// Take a free query lying in `topic`.
+    fn take_in(&mut self, topic: &(usize, String)) -> Option<usize> {
+        let list = self.by_topic.get_mut(topic)?;
+        while let Some(q) = list.pop() {
+            if !self.taken[q] {
+                self.taken[q] = true;
+                if let Some(pos) = self.free.iter().position(|&f| f == q) {
+                    self.free.remove(pos);
+                }
+                return Some(q);
+            }
+        }
+        None
+    }
+}
+
+/// Fill one cell's slots: draw its distinct predicates and pair each
+/// with a query. A topical cell whose queries' topics are known honours
+/// the placement mix per pair (TS-19, TS-157): an in-topic slot pairs a
+/// predicate with a query inside its topic, an out-of-topic slot with
+/// one outside it. Any other cell pairs with queries in draw order,
+/// which is the zero correlation those families measure. Distinct
+/// predicates repeat only when the pool is smaller than the slots.
+#[allow(clippy::too_many_arguments)]
+fn fill_cell(
+    family: Family,
+    decade: i32,
+    slots: usize,
+    pool: &[Candidate],
+    seed: u64,
+    placement: Placement,
+    topics: Option<&QueryTopics>,
+    queries: &mut QueryPool,
+    next_predicate: &mut usize,
+    out: &mut Vec<(usize, Drawn)>,
+) -> CellReport {
+    let cell = format!("{}:1e{}", family.as_str(), decade);
+    let distinct = draw_distinct(pool, slots, cell_seed(seed, family, decade));
+    let mut report = CellReport {
+        family,
+        decade,
+        target: slots,
+        candidates: pool.len(),
+        drawn: distinct.len(),
+        filled: 0,
+        shortfall: 0,
+        conjunctions: 0,
+        in_topic: 0,
+        out_of_topic: 0,
+    };
+    if distinct.is_empty() || slots == 0 {
+        report.shortfall = slots;
+        return report;
+    }
+    // Distinct ids are assigned in draw order the first time a
+    // predicate is paired.
+    let mut ids: Vec<Option<usize>> = vec![None; distinct.len()];
+    let mut push = |di: usize, q: usize, placement: Option<&'static str>, report: &mut CellReport| {
+        let c = distinct[di];
+        let id = *ids[di].get_or_insert_with(|| {
+            let id = *next_predicate;
+            *next_predicate += 1;
+            id
+        });
+        let query_topic = match (&c.topic, topics) {
+            (Some((level, _)), Some(t)) => t.label_at(q, *level).map(str::to_string),
+            _ => None,
         };
-        let got_in = want_in.min(ins.len());
-        let got_out = want_out.min(outs.len());
-        take.extend(ins.iter().take(got_in));
-        take.extend(outs.iter().take(got_out));
-        // Backfill from whichever side has more, up to the target.
-        let mut extra_in = ins.iter().skip(got_in);
-        let mut extra_out = outs.iter().skip(got_out);
-        while take.len() < target {
-            match (extra_in.next(), extra_out.next()) {
-                (Some(c), _) if placement != Placement::OutOfTopic => take.push(c),
-                (_, Some(c)) if placement != Placement::InTopic => take.push(c),
-                (Some(c), None) | (None, Some(c)) => take.push(c),
-                (None, None) => break,
-                _ => break,
+        out.push((
+            q,
+            Drawn {
+                candidate: c.clone(),
+                cell: cell.clone(),
+                pool: pool.len(),
+                placement,
+                query_topic,
+                predicate: id,
+                backfill: false,
+            },
+        ));
+        report.filled += 1;
+        if c.conjunct {
+            report.conjunctions += 1;
+        }
+        match placement {
+            Some("in-topic") => report.in_topic += 1,
+            Some("out-of-topic") => report.out_of_topic += 1,
+            _ => {}
+        }
+    };
+    let placed = family == Family::Topical && topics.is_some() && placement != Placement::Any;
+    if placed {
+        let t = topics.unwrap();
+        let (want_in, want_out) = match placement {
+            Placement::InTopic => (slots, 0),
+            Placement::OutOfTopic => (0, slots),
+            _ => (slots.div_ceil(2), slots / 2),
+        };
+        // In-topic pairs: cycle the distinct predicates, each taking a
+        // free query inside its topic, until the share is met or no
+        // predicate has one left.
+        let mut got_in = 0;
+        let mut progress = true;
+        while got_in < want_in && progress {
+            progress = false;
+            for di in 0..distinct.len() {
+                if got_in >= want_in {
+                    break;
+                }
+                let Some(topic) = &distinct[di].topic else { continue };
+                if let Some(q) = queries.take_in(topic) {
+                    push(di, q, Some("in-topic"), &mut report);
+                    got_in += 1;
+                    progress = true;
+                }
+            }
+        }
+        // Out-of-topic pairs, then whatever the in-topic side could not
+        // fill, from any free query outside the predicate's topic.
+        let mut got_out = 0;
+        let want_out = want_out + (want_in - got_in);
+        progress = true;
+        while got_out < want_out && progress {
+            progress = false;
+            for di in 0..distinct.len() {
+                if got_out >= want_out {
+                    break;
+                }
+                let Some(topic) = &distinct[di].topic else { continue };
+                if let Some(q) = queries.take_where(|q| !t.query_in(q, topic)) {
+                    push(di, q, Some("out-of-topic"), &mut report);
+                    got_out += 1;
+                    progress = true;
+                }
             }
         }
     } else {
-        take.extend(singles.iter().take(target));
-        if take.len() < target {
-            let need = target - take.len();
-            take.extend(conjuncts.iter().take(need));
+        let mut i = 0;
+        while report.filled < slots {
+            let di = i % distinct.len();
+            let Some(q) = queries.take_where(|_| true) else { break };
+            let placement = match (&distinct[di].topic, topics) {
+                (Some(topic), Some(t)) => Some(if t.query_in(q, topic) { "in-topic" } else { "out-of-topic" }),
+                _ => None,
+            };
+            push(di, q, placement, &mut report);
+            i += 1;
         }
     }
-    let drawn: Vec<Drawn> = take
-        .iter()
-        .map(|c| Drawn {
-            candidate: (*c).clone(),
-            cell: cell.clone(),
-            pool: pool.len(),
-            placement: match in_topic(c) {
-                Some(true) => Some("in-topic"),
-                Some(false) => Some("out-of-topic"),
-                None => None,
-            },
-        })
-        .collect();
-    let report = CellReport {
-        family,
-        decade,
-        target,
-        candidates: pool.len(),
-        drawn: drawn.len(),
-        shortfall: target.saturating_sub(drawn.len()),
-        conjunctions: drawn.iter().filter(|d| d.candidate.conjunct).count(),
-        in_topic: drawn
-            .iter()
-            .filter(|d| d.placement == Some("in-topic"))
-            .count(),
-        out_of_topic: drawn
-            .iter()
-            .filter(|d| d.placement == Some("out-of-topic"))
-            .count(),
-    };
-    (drawn, report)
+    report.shortfall = slots - report.filled;
+    report
 }
-
-// ---------------------------------------------------------------------------
-// Report
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FloorReport {
@@ -732,10 +968,18 @@ pub struct GenerationReport {
     pub census_population: u64,
     pub families: Vec<Family>,
     pub decades: Vec<i32>,
-    pub per_cell_targets: Vec<usize>,
+    /// The `per-cell` spec, one entry per decade (TS-159).
+    pub per_cell: Vec<String>,
     pub min_matches: u64,
     pub reliability_threshold: u64,
+    /// Records written: one per query ordinal (TS-156).
     pub predicates: usize,
+    /// Distinct predicates among them.
+    pub distinct_predicates: usize,
+    /// Slots apportioned per cell, in `families` × `decades` order.
+    pub slots_per_cell: Vec<usize>,
+    /// Records filled from the control family because no cell could.
+    pub backfilled: usize,
     pub candidates: HashMap<String, usize>,
     pub cells: Vec<CellReport>,
     pub floors: Vec<FloorReport>,
@@ -757,6 +1001,14 @@ pub fn describe_options() -> Vec<OptionDesc> {
             false,
             None,
             "stratified: N of the full base, for the reliability floors in the report (default: the census population)",
+            OptionRole::Config,
+        ),
+        opt(
+            "count",
+            "int",
+            false,
+            None,
+            "stratified: records to write, one per query ordinal (default: the number of `queries`; required without them)",
             OptionRole::Config,
         ),
         opt(
@@ -820,7 +1072,7 @@ pub fn describe_options() -> Vec<OptionDesc> {
             "string",
             false,
             Some("tapered"),
-            "stratified: predicates per (family, decade) cell — `tapered` (10, 20, then 50), one count, or one per decade coarsest first",
+            "stratified: a family's query slots per decade, coarsest first — `tapered` (10, 20, 50, the rest shared below), one weight, or one entry per decade; numbers alone are weights, with `rest` they are counts",
             OptionRole::Config,
         ),
         opt(
@@ -844,7 +1096,7 @@ pub fn describe_options() -> Vec<OptionDesc> {
             "string",
             false,
             Some("mixed"),
-            "stratified: mixed, in-topic, out-of-topic or any; needs `queries`",
+            "stratified: mix of topical pairs whose query lies inside its predicate's topic — mixed, in-topic, out-of-topic or any; needs `queries`",
             OptionRole::Config,
         ),
         opt(
@@ -852,7 +1104,7 @@ pub fn describe_options() -> Vec<OptionDesc> {
             "Path",
             false,
             None,
-            "stratified: query vectors, for in-topic / out-of-topic placement",
+            "stratified: the query vectors; record i is query i's predicate, and placement is decided per pair",
             OptionRole::Input,
         ),
         opt(
@@ -901,13 +1153,18 @@ fn family_record(d: &Drawn) -> Vec<u8> {
         "selectivity".to_string(),
         MValue::Float(d.candidate.selectivity),
     );
-    if let Some((level, _)) = &d.candidate.topic {
+    if let Some((level, label)) = &d.candidate.topic {
         fields.insert("topic_level".to_string(), MValue::Int(*level as i64));
+        fields.insert("topic".to_string(), MValue::Text(label.clone()));
         fields.insert("conjunct".to_string(), MValue::Bool(d.candidate.conjunct));
     }
     if let Some(p) = d.placement {
         fields.insert("query_placement".to_string(), MValue::Text(p.to_string()));
     }
+    if let Some(qt) = &d.query_topic {
+        fields.insert("query_topic".to_string(), MValue::Text(qt.clone()));
+    }
+    fields.insert("predicate".to_string(), MValue::Int(d.predicate as i64));
     anode::encode(&ANode::MNode(MNode { fields }))
 }
 
@@ -928,6 +1185,7 @@ fn generation_record(d: &Drawn) -> Vec<u8> {
         "vernacular".to_string(),
         MValue::Text(format!("{}", d.candidate.pnode)),
     );
+    fields.insert("backfill".to_string(), MValue::Bool(d.backfill));
     anode::encode(&ANode::MNode(MNode { fields }))
 }
 
@@ -1036,12 +1294,12 @@ pub(super) fn run(
         .iter()
         .map(|k| options.get(k).map(|s| resolve_path(s, &ctx.workspace)))
         .collect();
-    let (query_topics, query_count) = match placement_inputs.as_slice() {
+    let topics: Option<QueryTopics> = match placement_inputs.as_slice() {
         [Some(q), Some(c), Some(m), Some(l)] => match query_topics(q, c, m, l) {
-            Ok((t, n)) => (Some(t), Some(n)),
+            Ok(t) => Some(t),
             Err(e) => return error_result(e, start),
         },
-        [None, None, None, None] => (None, None),
+        [None, None, None, None] => None,
         _ => {
             return error_result(
                 "query placement needs all of --queries, --centroids, --model and --labels; none of them, or all".into(),
@@ -1049,6 +1307,28 @@ pub(super) fn run(
             )
         }
     };
+    let query_count = topics.as_ref().map(QueryTopics::count);
+    // One record per query ordinal (TS-156): the count is the number of
+    // queries, or `count` when the queries are not given.
+    let count = match (options.parse_opt::<usize>("count"), query_count) {
+        (Err(e), _) => return error_result(e, start),
+        (Ok(Some(c)), Some(q)) if c != q => {
+            return error_result(
+                format!("count {} does not equal the {} queries; record i is query i's predicate", c, q),
+                start,
+            )
+        }
+        (Ok(Some(c)), _) | (Ok(None), Some(c)) => c,
+        (Ok(None), None) => {
+            return error_result(
+                "stratified writes one predicate per query ordinal: give `queries` (with centroids, model and labels) or `count`".into(),
+                start,
+            )
+        }
+    };
+    if count == 0 {
+        return error_result("count must be positive".into(), start);
+    }
 
     // ── Candidate pools ─────────────────────────────────────────────
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -1169,53 +1449,103 @@ pub(super) fn run(
         }
     }
     ctx.ui.log(&format!(
-        "stratified: {} candidates in {} cells from {} census sources; population {}, base {}",
+        "stratified: {} candidates in {} cells from {} census sources; population {}, base {}; {} query slots",
         pools.values().map(Vec::len).sum::<usize>(),
         pools.len(),
         sources.len(),
         population,
         base_count,
+        count,
     ));
 
-    // ── Draw ───────────────────────────────────────────────────────
-    let mut drawn: Vec<Drawn> = Vec::new();
-    let mut cells: Vec<CellReport> = Vec::new();
-    for &family in &families {
+    // ── Apportion the query slots and fill the cells ───────────────
+    // Families share the slots equally; within a family the per-cell
+    // spec says how the decades split them (TS-156, TS-159). Topical
+    // cells fill first, finest decade first: they need particular
+    // queries (TS-157). The other families take any query, which is
+    // the point of them.
+    let family_shares = apportion(count, &vec![1; families.len()]);
+    let mut slots: Vec<usize> = Vec::with_capacity(families.len() * decades.len());
+    for share in &family_shares {
+        slots.extend(slots_per_decade(*share, &per_cell));
+    }
+    let mut order: Vec<(usize, Family, i32)> = Vec::new();
+    for (fi, &family) in families.iter().enumerate() {
         for (di, &decade) in decades.iter().enumerate() {
-            let target = per_cell[di];
-            let (d, report) = if family == Family::Control {
-                let pool = control_candidates(&control_field, decade, target, buckets, n);
-                draw_cell(family, decade, target, &pool, seed, placement, None)
-            } else {
-                let pool = pools
-                    .get(&(family, decade))
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                draw_cell(
-                    family,
-                    decade,
-                    target,
-                    pool,
-                    seed,
-                    placement,
-                    query_topics.as_ref(),
-                )
-            };
-            drawn.extend(d);
-            cells.push(report);
+            order.push((fi * decades.len() + di, family, decade));
         }
     }
+    order.sort_by_key(|&(_, family, decade)| (family != Family::Topical, decade));
+    let mut queries = QueryPool::new(count, topics.as_ref(), seed);
+    let mut paired: Vec<(usize, Drawn)> = Vec::with_capacity(count);
+    let mut cells_by_index: BTreeMap<usize, CellReport> = BTreeMap::new();
+    let mut next_predicate = 0usize;
+    for &(ci, family, decade) in &order {
+        let target = slots[ci];
+        let report = if family == Family::Control {
+            let pool = control_candidates(&control_field, decade, target, buckets, n);
+            fill_cell(family, decade, target, &pool, seed, placement, None, &mut queries, &mut next_predicate, &mut paired)
+        } else {
+            let pool = pools
+                .get(&(family, decade))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            fill_cell(family, decade, target, pool, seed, placement, topics.as_ref(), &mut queries, &mut next_predicate, &mut paired)
+        };
+        cells_by_index.insert(ci, report);
+    }
+    let cells: Vec<CellReport> = cells_by_index.into_values().collect();
     let shortfalls: usize = cells.iter().map(|c| c.shortfall).sum();
     for c in cells.iter().filter(|c| c.shortfall > 0) {
         ctx.ui.log(&format!(
-            "stratified: cell {}:1e{} short by {} ({} candidates for {})",
+            "stratified: cell {}:1e{} short by {} of {} slots ({} candidates)",
             c.family.as_str(),
             c.decade,
             c.shortfall,
-            c.candidates,
             c.target,
+            c.candidates,
         ));
     }
+    // Backfill: every query left over takes a control predicate, at
+    // the decades in turn, so no query is without one (TS-156).
+    let mut backfilled = 0usize;
+    if queries.remaining() > 0 {
+        let need = queries.remaining();
+        let per_decade = need.div_ceil(decades.len());
+        let mut pools_by_decade: Vec<(i32, Vec<Candidate>, usize)> = decades
+            .iter()
+            .map(|&d| (d, control_candidates(&control_field, d, per_decade, buckets, n), 0usize))
+            .collect();
+        let mut di = 0usize;
+        while let Some(q) = queries.take_where(|_| true) {
+            let (decade, pool, used) = &mut pools_by_decade[di % decades.len()];
+            let c = &pool[*used % pool.len()];
+            *used += 1;
+            paired.push((
+                q,
+                Drawn {
+                    candidate: c.clone(),
+                    cell: format!("control:1e{}", decade),
+                    pool: pool.len(),
+                    placement: None,
+                    query_topic: None,
+                    predicate: next_predicate,
+                    backfill: true,
+                },
+            ));
+            next_predicate += 1;
+            backfilled += 1;
+            di += 1;
+        }
+        ctx.ui.log(&format!(
+            "stratified: {} query slot(s) no cell could fill took a control predicate",
+            backfilled
+        ));
+    }
+    paired.sort_by_key(|(q, _)| *q);
+    debug_assert!(paired.iter().enumerate().all(|(i, (q, _))| i == *q));
+    let drawn: Vec<Drawn> = paired.into_iter().map(|(_, d)| d).collect();
+    let distinct_predicates = next_predicate;
 
     // ── Write the slab: content, schema, survey, families, generation.
     if let Some(parent) = output_path.parent()
@@ -1316,10 +1646,13 @@ pub(super) fn run(
         census_population: population,
         families: families.clone(),
         decades: decades.clone(),
-        per_cell_targets: per_cell.clone(),
+        per_cell: per_cell.iter().map(|s| s.to_string()).collect(),
         min_matches,
         reliability_threshold,
         predicates: drawn.len(),
+        distinct_predicates,
+        slots_per_cell: slots,
+        backfilled,
         candidates: sources,
         cells,
         floors,
@@ -1344,14 +1677,16 @@ pub(super) fn run(
     CommandResult {
         status: Status::Ok,
         message: format!(
-            "{} predicates drawn over {} families × {} decades ({} cells short by {} in total){}",
+            "{} predicates, one per query, {} distinct, over {} families × {} decades ({} cells short by {} slots in total, {} backfilled){}",
             drawn.len(),
+            distinct_predicates,
             families.len(),
             decades.len(),
             report.cells.iter().filter(|c| c.shortfall > 0).count(),
             shortfalls,
+            backfilled,
             match query_count {
-                Some(q) => format!("; placement from {} queries", q),
+                Some(q) => format!("; placement per pair from {} queries", q),
                 None => String::new(),
             },
         ),
@@ -1360,12 +1695,24 @@ pub(super) fn run(
     }
 }
 
-/// Complete when the content namespace holds at least one predicate
-/// and the `families` namespace holds exactly as many records
-/// (TS-111). Absence of the namespace is one unlabelled family, which
-/// is what every earlier predicate set is; this check applies to a
-/// stratified step only.
-pub(super) fn check_artifact(output: &Path) -> Option<bool> {
+/// Complete when the content namespace holds exactly the expected
+/// number of predicates — one per query, from `count` or the `queries`
+/// facet (TS-156) — **and** the `families` and `generation` namespaces
+/// hold as many records each (TS-111). An unequal count means the
+/// pairing with queries or the annotation is off, which TS-64 exists
+/// to prevent. Absence of the namespace is one unlabelled family,
+/// which is what every earlier predicate set is; this check applies
+/// to a stratified step only.
+pub(super) fn check_artifact(output: &Path, options: &Options) -> Option<bool> {
+    let workspace = super::compute_topics::workspace_of(output, options.get("output"));
+    let expected: Option<u64> = match options.get("count") {
+        Some(c) => c.trim().parse::<u64>().ok(),
+        None => options.get("queries").and_then(|q| {
+            XvecReader::<f32>::open_path(&resolve_path(q, &workspace))
+                .ok()
+                .map(|r| r.count() as u64)
+        }),
+    };
     let content = SlabReader::open(output).ok()?.total_records();
     let families = SlabReader::open_namespace(output, Some(FAMILIES_NAMESPACE))
         .ok()?
@@ -1373,7 +1720,11 @@ pub(super) fn check_artifact(output: &Path) -> Option<bool> {
     let generation = SlabReader::open_namespace(output, Some(GENERATION_NAMESPACE))
         .ok()?
         .total_records();
-    Some(content > 0 && families == content && generation == content)
+    let count_ok = match expected {
+        Some(e) => content == e,
+        None => content > 0,
+    };
+    Some(count_ok && families == content && generation == content)
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,10 +1756,9 @@ mod tests {
         assert!(parse_decades("").is_err());
         assert_eq!(
             parse_per_cell("tapered", 5).unwrap(),
-            vec![10, 20, 50, 50, 50]
+            vec![Slots::Absolute(10), Slots::Absolute(20), Slots::Absolute(50), Slots::Rest, Slots::Rest]
         );
-        assert_eq!(parse_per_cell("7", 3).unwrap(), vec![7, 7, 7]);
-        assert_eq!(parse_per_cell("1,2", 4).unwrap(), vec![1, 2, 2, 2]);
+        assert_eq!(parse_per_cell("7", 3).unwrap(), vec![Slots::Absolute(7); 3]);
         assert!(parse_per_cell("0", 2).is_err());
     }
 
@@ -1460,91 +1810,120 @@ mod tests {
     }
 
     #[test]
-    fn drawing_is_seeded_and_backfills_with_conjunctions() {
-        let single = |i: i64| Candidate {
+    fn apportionment_is_exact_and_proportional() {
+        assert_eq!(apportion(10_000, &[10, 20, 50, 50, 50, 50, 50]).iter().sum::<usize>(), 10_000);
+        assert_eq!(apportion(100, &[10, 20, 50, 50, 50, 50, 50]), vec![3, 7, 18, 18, 18, 18, 18], "largest remainders first, ties by position");
+        assert_eq!(apportion(7, &[0, 0]), vec![0, 0]);
+        assert_eq!(apportion(3, &[1, 1]), vec![2, 1]);
+        assert_eq!(apportion(5, &[0, 1]), vec![0, 5], "a zero weight never gets a remainder slot");
+    }
+
+    /// The taper keeps the coarse decades at their absolute counts and
+    /// hands everything else to the decades below; plain numbers are
+    /// weights.
+    #[test]
+    fn slots_follow_the_per_cell_spec() {
+        let tapered = parse_per_cell("tapered", 7).unwrap();
+        assert_eq!(tapered[..3], [Slots::Absolute(10), Slots::Absolute(20), Slots::Absolute(50)]);
+        assert!(tapered[3..].iter().all(|s| *s == Slots::Rest));
+        let s = slots_per_decade(2_500, &tapered);
+        assert_eq!(s, vec![10, 20, 50, 605, 605, 605, 605]);
+        assert_eq!(slots_per_decade(40, &tapered), vec![5, 10, 25, 0, 0, 0, 0], "a share below the fixed counts scales them as weights");
+        assert_eq!(slots_per_decade(75, &parse_per_cell("4,6,8", 3).unwrap()), vec![17, 25, 33]);
+        assert_eq!(slots_per_decade(9, &parse_per_cell("3", 3).unwrap()), vec![3, 3, 3]);
+        assert_eq!(slots_per_decade(10, &parse_per_cell("2,rest,rest", 3).unwrap()), vec![2, 4, 4]);
+        assert!(parse_per_cell("1,2", 3).is_err());
+        assert!(parse_per_cell("0,0", 2).is_err());
+        assert!(parse_per_cell("1,x", 2).is_err());
+    }
+
+    fn topical(i: i64, label: &str, conjunct: bool) -> Candidate {
+        Candidate {
             pnode: cmp("x", OpType::Eq, i),
             family: Family::Topical,
             count: 1,
             selectivity: 1e-3,
             source: "t",
-            topic: Some((1, format!("t{}", i))),
-            conjunct: false,
-        };
-        let conj = |i: i64| Candidate {
-            conjunct: true,
-            ..single(100 + i)
-        };
-        let pool: Vec<Candidate> = (0..3).map(single).chain((0..5).map(conj)).collect();
-        let (a, ra) = draw_cell(Family::Topical, -3, 6, &pool, 7, Placement::Any, None);
-        let (b, _) = draw_cell(Family::Topical, -3, 6, &pool, 7, Placement::Any, None);
-        assert_eq!(ra.drawn, 6);
-        assert_eq!(
-            ra.conjunctions, 3,
-            "singles first, conjunctions make up the rest"
-        );
-        assert_eq!(ra.shortfall, 0);
-        let names = |v: &[Drawn]| {
-            v.iter()
-                .map(|d| d.candidate.pnode.to_string())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(names(&a), names(&b), "same seed, same draw");
-        let (c, _) = draw_cell(Family::Topical, -3, 6, &pool, 8, Placement::Any, None);
-        assert_ne!(names(&a), names(&c), "different seed, different order");
-        let (_, short) = draw_cell(Family::Topical, -3, 20, &pool, 7, Placement::Any, None);
-        assert_eq!(short.shortfall, 12);
+            topic: Some((1, label.to_string())),
+            conjunct,
+        }
     }
 
     #[test]
-    fn placement_mixes_in_and_out_of_topic() {
-        let mk = |i: usize, label: &str| Candidate {
-            pnode: cmp("x", OpType::Eq, i as i64),
-            family: Family::Topical,
-            count: 1,
-            selectivity: 1e-2,
-            source: "t",
-            topic: Some((1, label.to_string())),
-            conjunct: false,
-        };
-        let pool: Vec<Candidate> = (0..4)
-            .map(|i| mk(i, "in"))
-            .chain((4..10).map(|i| mk(i, "out")))
+    fn drawing_is_seeded_and_backfills_with_conjunctions() {
+        let pool: Vec<Candidate> = (0..3)
+            .map(|i| topical(i, &format!("t{i}"), false))
+            .chain((0..5).map(|i| topical(100 + i, &format!("c{i}"), true)))
             .collect();
-        let qt: HashSet<(usize, String)> = [(1usize, "in".to_string())].into_iter().collect();
-        let (d, r) = draw_cell(
-            Family::Topical,
-            -2,
-            6,
-            &pool,
-            1,
-            Placement::Mixed,
-            Some(&qt),
-        );
-        assert_eq!((r.in_topic, r.out_of_topic), (3, 3));
-        assert!(d.iter().all(|x| x.placement.is_some()));
-        let (_, r) = draw_cell(
-            Family::Topical,
-            -2,
-            8,
-            &pool,
-            1,
-            Placement::Mixed,
-            Some(&qt),
-        );
+        let names = |v: &[&Candidate]| v.iter().map(|c| c.pnode.to_string()).collect::<Vec<_>>();
+        let a = draw_distinct(&pool, 6, 7);
+        let b = draw_distinct(&pool, 6, 7);
+        assert_eq!(a.len(), 6);
+        assert_eq!(a.iter().filter(|c| c.conjunct).count(), 3, "singles first, conjunctions make up the rest");
+        assert_eq!(names(&a), names(&b), "same seed, same draw");
+        let c = draw_distinct(&pool, 6, 8);
+        assert_ne!(names(&a), names(&c), "different seed, different order");
+        assert_eq!(draw_distinct(&pool, 20, 7).len(), 8, "no more than the pool");
+    }
+
+    /// Twelve queries, six in topic `in`, six elsewhere; a cell of four
+    /// `in` predicates and six `out` ones, ten slots, mixed placement:
+    /// every in-topic pair's query really is in the topic, every
+    /// out-of-topic pair's is not, no query is used twice, and the draw
+    /// is reproducible.
+    #[test]
+    fn placement_is_decided_per_pair() {
+        let pool: Vec<Candidate> = (0..4)
+            .map(|i| topical(i, "in", false))
+            .chain((4..10).map(|i| topical(i, "out", false)))
+            .collect();
+        let per_query: Vec<Vec<(usize, String)>> = (0..12)
+            .map(|q| vec![(1usize, if q % 2 == 0 { "in".to_string() } else { "elsewhere".to_string() })])
+            .collect();
+        let topics = QueryTopics { per_query };
+        let run = |seed: u64, placement: Placement| {
+            let mut queries = QueryPool::new(12, Some(&topics), seed);
+            let mut out = Vec::new();
+            let mut next = 0;
+            let r = fill_cell(Family::Topical, -3, 10, &pool, seed, placement, Some(&topics), &mut queries, &mut next, &mut out);
+            (r, out, queries.remaining())
+        };
+        let (r, out, left) = run(1, Placement::Mixed);
+        assert_eq!((r.filled, r.in_topic, r.out_of_topic, r.shortfall), (10, 5, 5, 0));
+        assert_eq!(left, 2);
+        let mut seen = std::collections::HashSet::new();
+        for (q, d) in &out {
+            assert!(seen.insert(*q), "query {q} paired twice");
+            let in_topic = q % 2 == 0 && d.candidate.topic.as_ref().unwrap().1 == "in";
+            assert_eq!(d.placement, Some(if in_topic { "in-topic" } else { "out-of-topic" }), "query {q} with {}", d.candidate.pnode);
+            assert_eq!(d.query_topic.as_deref(), Some(if q % 2 == 0 { "in" } else { "elsewhere" }));
+        }
+        assert!(out.iter().map(|(_, d)| d.predicate).max().unwrap() < r.drawn);
+        let (_, again, _) = run(1, Placement::Mixed);
         assert_eq!(
-            (r.in_topic, r.out_of_topic),
-            (4, 4),
-            "backfilled from the larger side"
+            out.iter().map(|(q, d)| (*q, d.candidate.pnode.to_string())).collect::<Vec<_>>(),
+            again.iter().map(|(q, d)| (*q, d.candidate.pnode.to_string())).collect::<Vec<_>>(),
         );
-        let (_, r) = draw_cell(
-            Family::Topical,
-            -2,
-            3,
-            &pool,
-            1,
-            Placement::OutOfTopic,
-            Some(&qt),
-        );
-        assert_eq!((r.in_topic, r.out_of_topic), (0, 3));
+        // In-topic only: the six `in` queries pair in-topic, the rest
+        // of the slots fall back to out-of-topic pairs.
+        let (r, _, _) = run(3, Placement::InTopic);
+        assert_eq!((r.in_topic, r.out_of_topic, r.filled), (6, 4, 10));
+    }
+
+    /// Without query topics a cell pairs its distinct predicates with
+    /// queries in draw order, repeating only when the pool is smaller
+    /// than the slots.
+    #[test]
+    fn a_cell_without_topics_repeats_only_under_pool_exhaustion() {
+        let pool: Vec<Candidate> = (0..3).map(|i| topical(i, "t", false)).collect();
+        let mut queries = QueryPool::new(8, None, 5);
+        let mut out = Vec::new();
+        let mut next = 0;
+        let r = fill_cell(Family::Structural, -2, 8, &pool, 5, Placement::Mixed, None, &mut queries, &mut next, &mut out);
+        assert_eq!((r.drawn, r.filled, r.shortfall), (3, 8, 0));
+        assert_eq!(out.iter().map(|(_, d)| d.predicate).collect::<std::collections::HashSet<_>>().len(), 3);
+        assert!(out.iter().all(|(_, d)| d.placement.is_none()));
+        let r = fill_cell(Family::Structural, -2, 4, &[], 5, Placement::Mixed, None, &mut queries, &mut next, &mut out);
+        assert_eq!((r.filled, r.shortfall), (0, 4), "an empty pool fills nothing and reports it");
     }
 }
