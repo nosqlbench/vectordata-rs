@@ -33,6 +33,8 @@
 //! and §11.
 
 use std::collections::{BTreeMap, HashMap};
+
+use veks_core::formats::pnode::eval::evaluate;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -686,6 +688,10 @@ pub struct CellReport {
     pub conjunctions: usize,
     pub in_topic: usize,
     pub out_of_topic: usize,
+    /// Pairs whose query's own passage satisfies the predicate, when
+    /// the queries' metadata rows are given (TS-166).
+    pub in_filter: usize,
+    pub out_of_filter: usize,
 }
 
 /// One query's predicate with everything both namespaces record.
@@ -702,6 +708,9 @@ struct Drawn {
     predicate: usize,
     /// Drawn from the control family to fill a slot no cell could.
     backfill: bool,
+    /// Whether the query's own passage satisfies the predicate, when
+    /// the queries' metadata rows are given (TS-166).
+    query_in_filter: Option<bool>,
 }
 
 fn cell_seed(seed: u64, family: Family, decade: i32) -> u64 {
@@ -848,6 +857,8 @@ fn fill_cell(
         conjunctions: 0,
         in_topic: 0,
         out_of_topic: 0,
+        in_filter: 0,
+        out_of_filter: 0,
     };
     if distinct.is_empty() || slots == 0 {
         report.shortfall = slots;
@@ -877,6 +888,7 @@ fn fill_cell(
                 query_topic,
                 predicate: id,
                 backfill: false,
+                query_in_filter: None,
             },
         ));
         report.filled += 1;
@@ -985,6 +997,10 @@ pub struct GenerationReport {
     pub floors: Vec<FloorReport>,
     pub query_count: Option<usize>,
     pub placement: Placement,
+    /// Pairs labelled against the queries' own metadata rows (TS-166);
+    /// absent when `query-metadata` was not given.
+    pub in_filter: Option<usize>,
+    pub out_of_filter: Option<usize>,
     pub seconds: f64,
 }
 
@@ -1108,6 +1124,14 @@ pub fn describe_options() -> Vec<OptionDesc> {
             OptionRole::Input,
         ),
         opt(
+            "query-metadata",
+            "Path",
+            false,
+            None,
+            "stratified: the queries' own metadata rows, in query order; every pair is labelled query_in_filter by evaluating its predicate against its query's row",
+            OptionRole::Input,
+        ),
+        opt(
             "centroids",
             "Path",
             false,
@@ -1164,6 +1188,9 @@ fn family_record(d: &Drawn) -> Vec<u8> {
     if let Some(qt) = &d.query_topic {
         fields.insert("query_topic".to_string(), MValue::Text(qt.clone()));
     }
+    if let Some(v) = d.query_in_filter {
+        fields.insert("query_in_filter".to_string(), MValue::Bool(v));
+    }
     fields.insert("predicate".to_string(), MValue::Int(d.predicate as i64));
     anode::encode(&ANode::MNode(MNode { fields }))
 }
@@ -1187,6 +1214,42 @@ fn generation_record(d: &Drawn) -> Vec<u8> {
     );
     fields.insert("backfill".to_string(), MValue::Bool(d.backfill));
     anode::encode(&ANode::MNode(MNode { fields }))
+}
+
+/// The queries' own metadata rows, in query order (TS-165).
+fn read_query_rows(path: &Path) -> Result<Vec<MNode>, String> {
+    let reader = SlabReader::open(path)
+        .map_err(|e| format!("failed to open query metadata {}: {}", path.display(), e))?;
+    let mut rows = Vec::with_capacity(reader.total_records() as usize);
+    for entry in reader.page_entries() {
+        let page = reader
+            .read_data_page(&entry)
+            .map_err(|e| format!("query metadata {}: {}", path.display(), e))?;
+        for i in 0..page.record_count() {
+            let bytes = page.get_record(i).ok_or_else(|| {
+                format!("query metadata {}: record {} is missing", path.display(), rows.len())
+            })?;
+            match anode::decode(bytes) {
+                Ok(ANode::MNode(m)) => rows.push(m),
+                Ok(_) => {
+                    return Err(format!(
+                        "query metadata {}: record {} is not an MNode",
+                        path.display(),
+                        rows.len()
+                    ))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "query metadata {}: record {}: {}",
+                        path.display(),
+                        rows.len(),
+                        e
+                    ))
+                }
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /// Run the stratified strategy. Called by `generate predicates` once
@@ -1329,6 +1392,28 @@ pub(super) fn run(
     if count == 0 {
         return error_result("count must be positive".into(), start);
     }
+    // The queries' own metadata rows, for labelling every pair (TS-166).
+    let query_rows: Option<Vec<MNode>> = match options.get("query-metadata") {
+        Some(s) => {
+            let path = resolve_path(s, &ctx.workspace);
+            match read_query_rows(&path) {
+                Ok(rows) if rows.len() == count => Some(rows),
+                Ok(rows) => {
+                    return error_result(
+                        format!(
+                            "query metadata {} holds {} rows but there are {} query slots; record i must be query i's own row",
+                            path.display(),
+                            rows.len(),
+                            count
+                        ),
+                        start,
+                    )
+                }
+                Err(e) => return error_result(e, start),
+            }
+        }
+        None => None,
+    };
 
     // ── Candidate pools ─────────────────────────────────────────────
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -1531,6 +1616,7 @@ pub(super) fn run(
                     query_topic: None,
                     predicate: next_predicate,
                     backfill: true,
+                    query_in_filter: None,
                 },
             ));
             next_predicate += 1;
@@ -1544,8 +1630,41 @@ pub(super) fn run(
     }
     paired.sort_by_key(|(q, _)| *q);
     debug_assert!(paired.iter().enumerate().all(|(i, (q, _))| i == *q));
-    let drawn: Vec<Drawn> = paired.into_iter().map(|(_, d)| d).collect();
+    let mut drawn: Vec<Drawn> = paired.into_iter().map(|(_, d)| d).collect();
     let distinct_predicates = next_predicate;
+    // Label every pair against its query's own row (TS-166) and tally
+    // the labels per cell.
+    let mut cells = cells;
+    let (mut in_filter, mut out_of_filter) = (None, None);
+    if let Some(rows) = &query_rows {
+        let mut cell_index: HashMap<String, usize> = HashMap::new();
+        for (i, c) in cells.iter().enumerate() {
+            cell_index.insert(format!("{}:1e{}", c.family.as_str(), c.decade), i);
+        }
+        let (mut yes, mut no) = (0usize, 0usize);
+        for (q, d) in drawn.iter_mut().enumerate() {
+            let hit = evaluate(&d.candidate.pnode, &rows[q]);
+            d.query_in_filter = Some(hit);
+            if let Some(&i) = cell_index.get(&d.cell) {
+                if hit {
+                    cells[i].in_filter += 1;
+                } else {
+                    cells[i].out_of_filter += 1;
+                }
+            }
+            if hit {
+                yes += 1;
+            } else {
+                no += 1;
+            }
+        }
+        in_filter = Some(yes);
+        out_of_filter = Some(no);
+        ctx.ui.log(&format!(
+            "stratified: {} pairs are in-filter for their own query, {} out-of-filter",
+            yes, no
+        ));
+    }
 
     // ── Write the slab: content, schema, survey, families, generation.
     if let Some(parent) = output_path.parent()
@@ -1658,6 +1777,8 @@ pub(super) fn run(
         floors,
         query_count,
         placement,
+        in_filter,
+        out_of_filter,
         seconds: start.elapsed().as_secs_f64(),
     };
     let mut produced = vec![output_path.to_path_buf()];
@@ -1689,7 +1810,10 @@ pub(super) fn run(
                 Some(q) => format!("; placement per pair from {} queries", q),
                 None => String::new(),
             },
-        ),
+        ) + &match (in_filter, out_of_filter) {
+            (Some(y), Some(n)) => format!("; {} in-filter, {} out-of-filter for their own query", y, n),
+            _ => String::new(),
+        },
         produced,
         elapsed: start.elapsed(),
     }

@@ -545,6 +545,23 @@ fn write_topic_model(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     (centroids_path, model_path, labels_path)
 }
 
+/// The queries' own metadata rows in query order (TS-165): query i is
+/// given base row `i * 97 % N`, so its section, year and topic labels
+/// are real rows of the fixture.
+fn write_query_metadata(dir: &Path, rows: &[MNode], count: usize) -> Vec<MNode> {
+    let path = dir.join("profiles/base/query_metadata.slab");
+    let config = WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
+    let mut w = SlabWriter::new(&path, config).unwrap();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let row = rows[(i * 97) % rows.len()].clone();
+        w.add_record(&anode::encode(&ANode::MNode(row.clone()))).unwrap();
+        out.push(row);
+    }
+    w.finish().unwrap();
+    out
+}
+
 /// With the queries given, record i is query i's predicate and every
 /// topical pair's placement is what the query's own descent says:
 /// an in-topic pair's query lies in the predicate's topic, an
@@ -554,10 +571,11 @@ fn write_topic_model(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
 fn placement_is_decided_from_each_querys_own_descent() {
     let dir = tmp_dir();
     let slab = dir.path().join("metadata_content.slab");
-    write_enriched_slab(&slab);
+    let rows = write_enriched_slab(&slab);
     write_survey(dir.path(), &slab);
     std::fs::create_dir_all(dir.path().join("profiles/base")).unwrap();
     write_topic_model(dir.path());
+    let query_rows = write_query_metadata(dir.path(), &rows, 60);
     let mut o = options();
     o.0.shift_remove("count");
     o.set("queries", "profiles/base/query_vectors.fvecs");
@@ -565,6 +583,7 @@ fn placement_is_decided_from_each_querys_own_descent() {
     o.set("model", "profiles/base/topic_centroids.json");
     o.set("labels", "profiles/base/topic_labels.slab");
     o.set("query-placement", "mixed");
+    o.set("query-metadata", "profiles/base/query_metadata.slab");
     let mut op = GenPredicatesOp;
     let mut ctx = test_ctx(dir.path());
     let r = op.execute(&o, &mut ctx);
@@ -599,10 +618,25 @@ fn placement_is_decided_from_each_querys_own_descent() {
         }
     }
     assert!(ins > 0 && outs > 0, "mixed placement gives both kinds: {ins} in, {outs} out");
+    // Every pair is labelled against its query's own row (TS-166), for
+    // every family, and the label is what evaluating the predicate on
+    // that row says.
+    let (mut in_filter, mut out_of_filter) = (0, 0);
+    for (q, f) in families.iter().enumerate() {
+        let recorded = match f.fields.get("query_in_filter") {
+            Some(MValue::Bool(b)) => *b,
+            other => panic!("query {q}: query_in_filter = {other:?}"),
+        };
+        assert_eq!(recorded, evaluate(&preds[q], &query_rows[q]), "query {q}: {}", preds[q]);
+        if recorded { in_filter += 1 } else { out_of_filter += 1 }
+    }
     let report: GenerationReport = serde_json::from_str(
         &std::fs::read_to_string(dir.path().join("profiles/base/predicates.json")).unwrap(),
     )
     .unwrap();
+    assert_eq!(report.in_filter, Some(in_filter));
+    assert_eq!(report.out_of_filter, Some(out_of_filter));
+    assert_eq!(report.cells.iter().map(|c| c.in_filter + c.out_of_filter).sum::<usize>(), 60);
     assert_eq!(report.query_count, Some(60));
     assert_eq!(report.predicates, 60);
     assert_eq!(report.cells.iter().map(|c| c.in_topic).sum::<usize>(), ins);
@@ -617,6 +651,24 @@ fn placement_is_decided_from_each_querys_own_descent() {
     let r = op.execute(&bad, &mut test_ctx(dir.path()));
     assert_eq!(r.status, Status::Error);
     assert!(r.message.contains("59"), "{}", r.message);
+}
+
+/// Query metadata with a row count other than the query count is a
+/// misalignment, and refused.
+#[test]
+fn query_metadata_must_have_one_row_per_query() {
+    let dir = tmp_dir();
+    let slab = dir.path().join("metadata_content.slab");
+    let rows = write_enriched_slab(&slab);
+    write_survey(dir.path(), &slab);
+    std::fs::create_dir_all(dir.path().join("profiles/base")).unwrap();
+    write_query_metadata(dir.path(), &rows, 59);
+    let mut o = options();
+    o.set("query-metadata", "profiles/base/query_metadata.slab");
+    let mut op = GenPredicatesOp;
+    let r = op.execute(&o, &mut test_ctx(dir.path()));
+    assert_eq!(r.status, Status::Error);
+    assert!(r.message.contains("59") && r.message.contains("300"), "{}", r.message);
 }
 
 /// Without queries and without `count` there is nothing to pair with.

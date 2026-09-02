@@ -51,7 +51,13 @@ out-of-topic pair's does not. The `families` namespace records, per
 query, the family, selectivity, distinct predicate index, topic label,
 placement and the query's own topic; the `generation` namespace records
 the cell, pool, census source, expected count, vernacular form and
-whether the record was backfilled.
+whether the record was backfilled. With `query-metadata` (the queries'
+own metadata rows, as `transform extract` writes them over the query
+range of the shuffle), every record also carries `query_in_filter`:
+whether the query's own passage satisfies its predicate. That is the
+one relation a structural or bibliographic pair has to its query, and
+it is recorded rather than assumed; `verify predicate-strata`
+re-derives it.
 
 ```yaml
 - id: generate-predicates
@@ -85,6 +91,7 @@ whether the record was backfilled.
 | `--reliability-threshold` | config | no | `10000000` | Base count above which the floor is promised |
 | `--query-placement` | config | no | `mixed` | Mix of topical pairs whose query lies inside its predicate's topic: `mixed`, `in-topic`, `out-of-topic` or `any`; needs `queries` |
 | `--queries` | input | no | — | The query vectors; record i is query i's predicate, and placement is decided per pair |
+| `--query-metadata` | input | no | — | The queries' own metadata rows, in query order; every pair is labelled `query_in_filter` by evaluating its predicate against its query's row |
 | `--centroids` | input | no | — | Topic centroids, required with `queries` |
 | `--model` | input | no | — | Topic model report, required with `queries` |
 | `--labels` | input | no | — | Topic label slab, required with `queries` |
