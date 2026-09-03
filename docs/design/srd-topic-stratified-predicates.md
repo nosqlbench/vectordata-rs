@@ -1327,6 +1327,23 @@ edge from an older build, or a neighbour since removed by
 had marked the nine largest KNN answer keys stale — 128mi through
 `default` — purely through the chain; with this, all 49 remain fresh.
 
+**TS-170.** **A source rewritten in place is a different source.**
+Repointing `convert-metadata` at the enriched table rewrites
+`${cache}/metadata_all.slab` under its old path (TS-32); the extract
+that carries it into base order resumes from cached partitions when
+it can, and those partitions must be keyed on the source's
+**identity** — its provenance address, from the sidecar its producer
+wrote or from its size and mtime — and on the output they belong to,
+never on the path alone. *Measured on tessera, 2026-09-03:* the first
+run after enrichment resumed both partitions cached from the
+un-enriched slab, produced a base facet byte-identical to the old one
+(85,697,052,998 bytes) beneath a 209 GB source, and the survey
+failed on the missing `topic_l3` — the failure that caught it. The
+extract now records both identities and keeps one cache per output; a
+facet produced by the earlier behaviour is not detected by
+freshness, since its step's record is intact, and must be removed by
+hand for the step to run again.
+
 ## 8. Artifact register
 
 Every artifact this design introduces, named, located and formatted.

@@ -2815,10 +2815,43 @@ fn sorted_index_extract_fvec(
 struct SlabExtractMeta {
     slab_path: String,
     ivec_path: String,
+    /// Identity of the source slab: the address of its provenance —
+    /// the producing step's node when the source has a sidecar, else a
+    /// size-and-mtime node. A source rewritten in place under the same
+    /// path (the metadata slab after enrichment) changes this, and the
+    /// partitions cached from its predecessor must not be resumed.
+    #[serde(default)]
+    source_identity: String,
+    /// The same for the index file.
+    #[serde(default)]
+    index_identity: String,
     range_start: usize,
     effective_end: usize,
     num_partitions: usize,
     page_size: u32,
+}
+
+/// The resume cache of one slab extract: under `<cache>/slab-extract/`,
+/// one directory per **output**, so two extracts of the same dataset
+/// (the base facet and the query facet) never share partitions.
+fn slab_extract_cache_dir(cache: &Path, output_path: &Path) -> PathBuf {
+    let mut h = crate::pipeline::progress::FnvHasher::new();
+    h.write(output_path.to_string_lossy().as_bytes());
+    let stem = output_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_string());
+    cache.join("slab-extract").join(format!("{}-{:016x}", stem, h.finish()))
+}
+
+/// The identity a resume cache is keyed on for an input: its provenance
+/// address, from the sidecar its producer wrote or from the file's own
+/// size and mtime (see [`crate::pipeline::provenance::ProvenanceGraph::for_input`]).
+fn input_identity(cache: &Path, workspace: &Path, path: &Path) -> String {
+    let mut graph = crate::pipeline::provenance::ProvenanceGraph::new();
+    graph
+        .for_input(cache, workspace, path)
+        .unwrap_or_else(|_| String::from("unreadable"))
 }
 
 /// SPLAT extraction for slab files (see docs/sysref/splat/).
@@ -2879,7 +2912,11 @@ fn sorted_index_extract_slab(
     ));
 
     // ---- cache / resume validation ----
-    let cache_dir = ctx.cache.join("slab-extract");
+    // Partitions are reusable only for the same source *content*, the
+    // same index, the same range and the same partitioning: the meta
+    // records the inputs' identities, not merely their paths, so a
+    // source rewritten in place is a different source.
+    let cache_dir = slab_extract_cache_dir(&ctx.cache, output_path);
     if let Err(e) = std::fs::create_dir_all(&cache_dir) {
         return Err(format!("failed to create cache dir {}: {}", cache_dir.display(), e));
     }
@@ -2888,6 +2925,8 @@ fn sorted_index_extract_slab(
     let current_meta = SlabExtractMeta {
         slab_path: slab_path.to_string_lossy().into_owned(),
         ivec_path: ivec_path.to_string_lossy().into_owned(),
+        source_identity: input_identity(&ctx.cache, &ctx.workspace, slab_path),
+        index_identity: input_identity(&ctx.cache, &ctx.workspace, ivec_path),
         range_start,
         effective_end,
         num_partitions,
@@ -2900,6 +2939,8 @@ fn sorted_index_extract_slab(
                 Ok(prev) => {
                     prev.slab_path == current_meta.slab_path
                         && prev.ivec_path == current_meta.ivec_path
+                        && prev.source_identity == current_meta.source_identity
+                        && prev.index_identity == current_meta.index_identity
                         && prev.range_start == current_meta.range_start
                         && prev.effective_end == current_meta.effective_end
                         && prev.num_partitions == current_meta.num_partitions
@@ -2914,7 +2955,7 @@ fn sorted_index_extract_slab(
     };
 
     if !can_resume {
-        // Parameters changed — invalidate all existing partition caches.
+        // Inputs or parameters changed — invalidate the cached partitions.
         if let Ok(entries) = std::fs::read_dir(&cache_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -4161,5 +4202,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A source rewritten in place under the same path is a different
+    /// source: the partitions cached from its predecessor must not be
+    /// resumed. And two extracts to different outputs keep separate
+    /// caches.
+    #[test]
+    fn slab_extract_does_not_resume_partitions_of_a_rewritten_source() {
+        use crate::pipeline::commands::gen_shuffle::GenerateIvecShuffleOp;
+        use crate::pipeline::progress::ProgressLog;
+        use indexmap::IndexMap;
+        use veks_core::formats::anode::{self, ANode};
+        use veks_core::formats::mnode::{MNode, MValue};
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let mut ctx = StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+            provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
+        };
+        let slab_path = workspace.join("source.slab");
+        let write_source = |tag: &str| {
+            let config = slabtastic::WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
+            let mut w = slabtastic::SlabWriter::new(&slab_path, config).unwrap();
+            for i in 0..40 {
+                let mut fields = IndexMap::new();
+                fields.insert("v".to_string(), MValue::Int(i));
+                fields.insert("tag".to_string(), MValue::Text(tag.to_string()));
+                w.add_record(&anode::encode(&ANode::MNode(MNode { fields }))).unwrap();
+            }
+            w.finish().unwrap();
+        };
+        let tags = |path: &Path| -> Vec<String> {
+            let reader = slabtastic::SlabReader::open(path).unwrap();
+            let mut out = Vec::new();
+            for entry in reader.page_entries() {
+                let page = reader.read_data_page(&entry).unwrap();
+                for i in 0..page.record_count() {
+                    if let Ok(ANode::MNode(m)) = anode::decode(page.get_record(i).unwrap()) {
+                        match m.fields.get("tag") {
+                            Some(MValue::Text(t)) => out.push(t.clone()),
+                            other => panic!("{:?}", other),
+                        }
+                    }
+                }
+            }
+            out
+        };
+        write_source("before");
+        let ivec_path = workspace.join("shuffle.ivecs");
+        let mut opts = Options::new();
+        opts.set("output", ivec_path.to_string_lossy().to_string());
+        opts.set("interval", "40");
+        opts.set("seed", "7");
+        assert_eq!(GenerateIvecShuffleOp.execute(&opts, &mut ctx).status, Status::Ok);
+        let out_a = workspace.join("profiles/base/a.slab");
+        std::fs::create_dir_all(out_a.parent().unwrap()).unwrap();
+        let extract = |ctx: &mut StreamContext, out: &Path, range: &str| {
+            let mut opts = Options::new();
+            opts.set("source", slab_path.to_string_lossy().to_string());
+            opts.set("ivec-file", ivec_path.to_string_lossy().to_string());
+            opts.set("output", out.to_string_lossy().to_string());
+            opts.set("range", range);
+            let r = extract_factory().execute(&opts, ctx);
+            assert_eq!(r.status, Status::Ok, "{}", r.message);
+            r.message
+        };
+        extract(&mut ctx, &out_a, "[0,20)");
+        assert_eq!(tags(&out_a).len(), 20);
+        assert!(tags(&out_a).iter().all(|t| t == "before"));
+        // The same inputs again: the cached partitions are reused.
+        let msg = extract(&mut ctx, &out_a, "[0,20)");
+        assert!(msg.contains("2 resumed"), "{msg}");
+        // The source rewritten in place, same path and record count:
+        // nothing may be resumed, and the output must be the new content.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_source("after");
+        let msg = extract(&mut ctx, &out_a, "[0,20)");
+        assert!(msg.contains("0 resumed"), "{msg}");
+        assert!(tags(&out_a).iter().all(|t| t == "after"), "stale partitions were reused");
+        // A second output has its own cache directory.
+        let out_b = workspace.join("profiles/base/b.slab");
+        extract(&mut ctx, &out_b, "[20,40)");
+        let dirs: Vec<_> = std::fs::read_dir(workspace.join(".cache/slab-extract")).unwrap().flatten().collect();
+        assert_eq!(dirs.len(), 2, "one cache directory per output");
+        assert_ne!(slab_extract_cache_dir(&ctx.cache, &out_a), slab_extract_cache_dir(&ctx.cache, &out_b));
     }
 }
