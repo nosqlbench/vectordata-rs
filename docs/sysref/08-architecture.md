@@ -207,7 +207,7 @@ Memory pressure is classified into bands that drive governor decisions:
 |----------|------------|
 | RSS exceeds budget | Reduce batch size, switch to streaming |
 | Thread contention | Governor caps thread pool size |
-| Mmap pressure | Advise sequential/random as appropriate |
+| Mmap pressure | Advise sequential/random as appropriate; a partitioned pass releases each finished partition's pages, shard by shard when the base is a series |
 | Page cache thrashing | Detect storage type, adjust prefetch |
 
 ---

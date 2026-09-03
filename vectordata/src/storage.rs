@@ -1101,6 +1101,18 @@ impl Storage {
     /// larger windows callers pass in. Without alignment, madvise
     /// rejects with EINVAL silently.
     pub(crate) fn release_range_bytes(&self, byte_start: u64, byte_end: u64) {
+        // A series has no single mapping: the range is split over the
+        // shards it touches and each releases its own part. Without
+        // this a sharded base never drops a partition's pages, and a
+        // pass that touches most of the base carries most of it as
+        // resident file-backed memory (tessera, 2026-09-03: 667 GB at
+        // 200m rows, aborted by the governor).
+        if let Storage::Series { parts, .. } = self {
+            for (i, local_start, local_end) in self.part_ranges(byte_start, byte_end) {
+                parts[i].release_range_bytes(local_start, local_end);
+            }
+            return;
+        }
         // `m` is bound only inside the `#[cfg(unix)]` block — leading
         // underscore keeps the non-Unix build clean of "unused
         // variable" warnings.
@@ -1146,6 +1158,13 @@ impl Storage {
         byte_end: u64,
         bytes_paged: Option<&AtomicU64>,
     ) {
+        // A series prefetches shard by shard, like it releases.
+        if let Storage::Series { parts, .. } = self {
+            for (i, local_start, local_end) in self.part_ranges(byte_start, byte_end) {
+                parts[i].prefetch_pages_bytes(local_start, local_end, bytes_paged);
+            }
+            return;
+        }
         let Some(m) = self.promoted_mmap() else {
             return;
         };
@@ -1169,6 +1188,35 @@ impl Storage {
                 counter.fetch_add(page_size as u64, std::sync::atomic::Ordering::Relaxed);
             }
         }
+    }
+
+    /// The shards a byte range of the joined space touches, each with
+    /// the range's part local to it: `(part index, local start, local
+    /// end)`, in order. A single file is one part covering the range
+    /// clipped to its size; an empty or inverted range is no parts.
+    pub(crate) fn part_ranges(&self, byte_start: u64, byte_end: u64) -> Vec<(usize, u64, u64)> {
+        let mut out = Vec::new();
+        let end = byte_end.min(self.total_size());
+        if byte_start >= end {
+            return out;
+        }
+        match self {
+            Storage::Series { parts, starts, .. } => {
+                let mut want = byte_start;
+                while want < end {
+                    let i = match starts.binary_search(&want) {
+                        Ok(i) => i,
+                        Err(i) => i - 1,
+                    };
+                    let within = want - starts[i];
+                    let take = (parts[i].total_size() - within).min(end - want);
+                    out.push((i, within, within + take));
+                    want += take;
+                }
+            }
+            _ => out.push((0, byte_start, end)),
+        }
+        out
     }
 
     /// Path to the cache file, when this storage is `Cached`. Used by
@@ -1592,5 +1640,76 @@ mod series_tests {
         std::fs::write(tmp.path().join("f.fvecs"), [1u8; 4]).unwrap();
         assert!(crate::dataset::shards::discover_shards(&tmp.path().join("f.fvecs")).is_empty());
         assert!(crate::dataset::shards::discover_shards(&tmp.path().join("absent.fvecs")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod part_range_tests {
+    use super::Storage;
+    use std::path::PathBuf;
+
+    fn series(dir: &std::path::Path, sizes: &[usize]) -> std::sync::Arc<Storage> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for (i, size) in sizes.iter().enumerate() {
+            let p = dir.join(format!("s__{:04}.bin", i));
+            std::fs::write(&p, vec![i as u8 + 1; *size]).unwrap();
+            paths.push(p);
+        }
+        Storage::open_series(&paths).unwrap()
+    }
+
+    /// A range over the joined space maps onto the shards it touches,
+    /// each in its own coordinates.
+    #[test]
+    fn a_joined_range_splits_over_the_shards_it_touches() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = series(dir.path(), &[100, 50, 80]);
+        assert_eq!(s.part_ranges(0, 100), vec![(0, 0, 100)]);
+        assert_eq!(s.part_ranges(90, 120), vec![(0, 90, 100), (1, 0, 20)]);
+        assert_eq!(s.part_ranges(100, 150), vec![(1, 0, 50)]);
+        assert_eq!(s.part_ranges(120, 230), vec![(1, 20, 50), (2, 0, 80)]);
+        assert_eq!(s.part_ranges(0, 1000), vec![(0, 0, 100), (1, 0, 50), (2, 0, 80)], "clipped to the series");
+        assert!(s.part_ranges(50, 50).is_empty());
+        assert!(s.part_ranges(60, 40).is_empty());
+        assert!(s.part_ranges(230, 300).is_empty());
+        let one = Storage::open_series(&[dir.path().join("s__0000.bin")]).unwrap();
+        assert_eq!(one.part_ranges(10, 500), vec![(0, 10, 100)]);
+    }
+
+    /// Releasing a range of a series reaches the shards: the pages
+    /// leave the process's resident set (they stay in the page cache).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn releasing_a_series_range_drops_its_resident_pages() {
+        fn rss_file_kb() -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|l| l.strip_prefix("RssFile:"))
+                .and_then(|v| v.trim().trim_end_matches(" kB").trim().parse().ok())
+                .unwrap()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shard = 16 << 20;
+        let s = series(dir.path(), &[shard, shard]);
+        // Touch every page of both shards through the mapping.
+        let total = s.total_size();
+        let mut sum = 0u64;
+        let mut off = 0u64;
+        while off < total {
+            sum += s.read_bytes(off, 1).unwrap()[0] as u64;
+            off += 4096;
+        }
+        assert!(sum > 0);
+        let before = rss_file_kb();
+        s.release_range_bytes(0, total);
+        let after = rss_file_kb();
+        // Two shards of 16 MiB were resident; at least one shard's
+        // worth must have gone, whatever else the test process maps.
+        assert!(
+            before.saturating_sub(after) >= (shard as u64 / 1024),
+            "RssFile {} kB → {} kB after releasing {} bytes",
+            before, after, total
+        );
     }
 }
