@@ -1565,11 +1565,20 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
             );
         }
 
+        // One tick per query whose candidates in this partition were
+        // searched; the total is the query count, so the bar reads as
+        // the partition's progress and not as an open count.
+        let query_pb = ctx.ui.bar_with_unit(
+            query_count as u64,
+            format!("queries in partition {}/{}", pi + 1, num_partitions),
+            "queries",
+        );
         let results = compute_fn(
             query_reader, query_count, base_reader, keys_reader,
             part.start, part.end, k, dist_fn, threads,
-            &ctx.ui.bar(0, "partition compute"),
+            &query_pb,
         );
+        query_pb.finish();
 
         // Wait for previous background writer
         if let Some(handle) = prev_writer.take() {
