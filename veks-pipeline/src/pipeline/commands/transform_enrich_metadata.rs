@@ -14,10 +14,10 @@
 //! |---|---|---|
 //! | `topic_l1` … `topic_lN` | topic assignment, code → label | topical |
 //! | `section_class` | the section heading, through an ordered prefix table | structural |
-//! | `passage_position` | `ordinal ÷ passage_count`, 0–99 | structural |
+//! | `passage_position` | the passage's index within its paper ÷ `passage_count`, 0–99 | structural |
 //! | `word_count` | whitespace tokens of the passage text | structural |
 //! | `citation_percentile` | rank of the paper's citations within its year, 0–99 | bibliographic |
-//! | `sample_bucket` | a seeded hash of `(corpusid, ordinal)` | control |
+//! | `sample_bucket` | a seeded hash of `(corpusid, source row)` — the passage, not the paper | control |
 //!
 //! It is not a pure row-wise map. `citation_percentile` needs the
 //! per-year distribution over **papers** first — over papers, not
@@ -281,14 +281,20 @@ pub fn section_class(raw: &str) -> &'static str {
     "other"
 }
 
-/// `sample_bucket`: splitmix64 over `(seed, corpusid, ordinal)`, reduced
-/// modulo `buckets`. Keyed on the passage, not the paper, so the
-/// control family is free of paper blocking.
-pub fn sample_bucket(seed: u64, corpusid: i64, ordinal: i32, buckets: u32) -> u32 {
+/// `sample_bucket`: splitmix64 over `(seed, corpusid, row)`, reduced
+/// modulo `buckets`, where `row` is the passage's source row — its
+/// ordinal in `passages.parquet`, unique per passage. Keyed on the
+/// passage, not the paper, so the control family is free of paper
+/// blocking (TS-80). The upstream `ordinal` column is **not** the
+/// passage's identity: it restarts at zero in every section of a
+/// paper, so keying on `(corpusid, ordinal)` — as this hash once did —
+/// gave the passages of a paper's sections the same bucket and put
+/// paper blocking back into the one family built to be free of it
+/// (TS-174).
+pub fn sample_bucket(seed: u64, corpusid: i64, row: u64, buckets: u32) -> u32 {
     let mut z = seed
         ^ (corpusid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ ((ordinal as u32 as u64) << 32 | ordinal as u32 as u64)
-            .wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        ^ row.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
@@ -302,11 +308,11 @@ pub fn word_count(text: &str) -> i16 {
 
 /// `passage_position`: `⌊100 · ordinal / passage_count⌋`, so 0–99. A
 /// single-passage paper yields 0.
-pub fn passage_position(ordinal: i32, passage_count: i32) -> i16 {
-    if passage_count <= 0 || ordinal < 0 {
+pub fn passage_position(index_in_paper: i64, passage_count: i32) -> i16 {
+    if passage_count <= 0 || index_in_paper < 0 {
         return 0;
     }
-    ((100 * ordinal as i64) / passage_count as i64).clamp(0, 99) as i16
+    ((100 * index_in_paper) / passage_count as i64).clamp(0, 99) as i16
 }
 
 /// Per-year citation ranks over papers: for each year, the distinct
@@ -573,7 +579,7 @@ fn map_group_inner(
     rows: u64,
 ) -> Result<(RecordBatch, HashMap<String, (&'static str, u64)>), String> {
     let end = start + rows;
-    let (pstart, pbatches) = read_columns_row_group(&ctx.passages, &["ordinal", "text"], index)?;
+    let (pstart, pbatches) = read_columns_row_group(&ctx.passages, &["text"], index)?;
     if pstart != start {
         return Err(format!(
             "passages row group {} starts at {} but was planned at {}",
@@ -606,7 +612,6 @@ fn map_group_inner(
     let assignments = XvecReader::<u16>::open_path(&ctx.assignments)
         .map_err(|e| format!("failed to open assignments: {}", e))?;
 
-    let ordinal_col = column(&passages, "ordinal")?;
     let text_col = column(&passages, "text")?;
     let paper_col = column(&metadata, &ctx.columns.paper)?;
     let section_col = column(&metadata, &ctx.columns.section)?;
@@ -648,6 +653,12 @@ fn map_group_inner(
         let passage_count = paper_ix
             .map(|p| ctx.papers.rows[p].passage_count)
             .unwrap_or(0);
+        // The passage's index within its paper comes from the paper's
+        // row span, not from the upstream `ordinal`, which is
+        // section-local (TS-174).
+        let index_in_paper = paper_ix
+            .map(|p| row as i64 - ctx.papers.rows[p].row_start)
+            .unwrap_or(0);
 
         let codes = assignments
             .get(row as usize)
@@ -670,11 +681,10 @@ fn map_group_inner(
         let year = int_at(year_col, i).unwrap_or(0) as i32;
         let cits = int_at(cit_col, i).unwrap_or(0);
         pct_b.append_value(ctx.ranks.percentile(year, cits));
-        let ordinal = int_at(ordinal_col, i).unwrap_or(0) as i32;
-        pos_b.append_value(passage_position(ordinal, passage_count));
+        pos_b.append_value(passage_position(index_in_paper, passage_count));
         words_b.append_value(word_count(str_at(text_col, i).unwrap_or("")));
         let corpusid = int_at(paper_col, i).unwrap_or(0);
-        bucket_b.append_value(sample_bucket(ctx.seed, corpusid, ordinal, ctx.buckets) as i32);
+        bucket_b.append_value(sample_bucket(ctx.seed, corpusid, row, ctx.buckets) as i32);
     }
 
     let mut columns: Vec<ArrayRef> = metadata.columns().to_vec();
@@ -878,7 +888,7 @@ enriched table in the same row order: `topic_l1`…`topic_lN` (labels
 from the topic assignment), `section_class` (the heading through an
 ordered prefix table), `citation_percentile` (rank within publication
 year over papers, ties at the midpoint), `passage_position`
-(`ordinal ÷ passage_count`, 0–99), `word_count` (whitespace tokens of
+(the passage's index within its paper ÷ `passage_count`, 0–99), `word_count` (whitespace tokens of
 the passage text) and `sample_bucket` (a seeded hash of the passage,
 modulo `buckets`).
 
@@ -912,7 +922,7 @@ auditable table.
                 "Path",
                 true,
                 None,
-                "Passage table (parquet): `ordinal` and `text`",
+                "Passage table (parquet): `text`, row-aligned with the metadata",
                 OptionRole::Input,
             ),
             opt(
@@ -1507,11 +1517,35 @@ mod tests {
         // Roughly uniform over a small modulus.
         let mut hist = [0u32; 10];
         for c in 0..2000i64 {
-            for o in 0..5 {
+            for o in 0..5u64 {
                 hist[sample_bucket(1, c, o, 10) as usize] += 1;
             }
         }
         assert!(hist.iter().all(|h| (800..1200).contains(h)), "{:?}", hist);
+    }
+
+    /// TS-80/TS-174: bucket occupancy is Poisson — index of dispersion
+    /// one — over a corpus whose upstream `ordinal` restarts in every
+    /// section, because the key is the source row, not that column.
+    #[test]
+    fn buckets_are_not_dispersed_by_section_local_ordinals() {
+        const BUCKETS: u32 = 4096;
+        let mut counts = vec![0u32; BUCKETS as usize];
+        let mut row = 0u64;
+        for paper in 0..20_000i64 {
+            let sections = 1 + (paper % 6) as usize;
+            for _section in 0..sections {
+                for _ordinal in 0..3 {
+                    // A key of (paper, ordinal) would repeat `sections` times.
+                    counts[sample_bucket(7, 100_000 + paper, row, BUCKETS) as usize] += 1;
+                    row += 1;
+                }
+            }
+        }
+        let mean = row as f64 / BUCKETS as f64;
+        let var = counts.iter().map(|&c| (c as f64 - mean).powi(2)).sum::<f64>() / BUCKETS as f64;
+        let dispersion = var / mean;
+        assert!((0.9..1.1).contains(&dispersion), "index of dispersion {} at mean {}", dispersion, mean);
     }
 
     #[test]

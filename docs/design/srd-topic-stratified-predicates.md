@@ -435,9 +435,9 @@ except the topic levels is derivable from data already on disk.
 | `topic_l3` | text label | 47 | embeddings, k-means | topical |
 | `section_class` | text label | 29 | `section` heading | structural |
 | `citation_percentile` | int16 | 24 | `citationcount` × `year` | bibliographic |
-| `passage_position` | int16 | 21 | `ordinal` ÷ paper length | structural |
+| `passage_position` | int16 | 21 | index within the paper ÷ paper length | structural |
 | `word_count` | int16 | 15 | `char_end − char_start` | structural |
-| `sample_bucket` | int32 | 20 | hash of `(corpusid, ordinal)` | control |
+| `sample_bucket` | int32 | 20 | hash of `(corpusid, source row)` | control |
 
 **226 bytes per record** — 120 GB across 531,869,985 passages, taking
 the M facet from 85.7 GB to **206 GB**.
@@ -1086,10 +1086,10 @@ the papers first:
 | column | derivation | pass |
 |---|---|---|
 | `word_count` | whitespace tokens of `text` (TS-106) | row-local |
-| `sample_bucket` | `hash(corpusid ‖ ordinal) mod K` | row-local |
+| `sample_bucket` | `hash(corpusid ‖ source row) mod K` | row-local |
 | `section_class` | heading → class lookup | row-local, given the table |
 | `topic_l1/l2/l3` | assignment lookup by row, then code → label | row-local, given assignments and labels |
-| `passage_position` | `ordinal ÷ passage_count` | row-local, given `parents.parquet` |
+| `passage_position` | `(row − row_start) ÷ passage_count` | row-local, given `parents.parquet` |
 | `citation_percentile` | rank of `citationcount` within `year` | **needs the per-year distribution over papers** |
 
 `parents.parquet` already carries `passage_count` and `row_start` for
@@ -1114,9 +1114,29 @@ predicate will want to audit it. Headings the table does not cover fall
 to `other`; an unmapped heading is never an error.
 
 **TS-80.** The hash keyed for `sample_bucket` is over
-`(corpusid, ordinal)` — the **passage**, not the paper. Keying it on
-`corpusid` would reproduce the paper-blocking of §1.1 in the one family
-that exists to be free of it.
+`(corpusid, row)` — the **passage**, identified by its source row in
+`passages.parquet`, not the paper. Keying it on `corpusid` would
+reproduce the paper-blocking of §1.1 in the one family that exists to
+be free of it.
+
+**TS-174.** **The upstream `ordinal` is not the passage's identity.**
+`passages.parquet` carries an `ordinal` that restarts at zero in every
+section of a paper, so `(corpusid, ordinal)` names a passage only
+within its section. *Measured on tessera, 2026-09-03, over 50.3 M rows
+of 48 row groups:* 45.4 M rows share their `(corpusid, ordinal)` key
+with another passage of the same paper, with keys repeated up to 531
+times, and the buckets of a hash keyed that way had an index of
+dispersion of 12.15 against the 1.0 of a uniform hash. The first
+verifier that held the control family to its binomial construction
+(TS-173) refused 223 of its 3,710 records at the census profile — a
+two-bucket 10⁻⁷ range holding 149 rows against 59 expected, twelve
+sigma out — and the same records by the same ratio at every profile,
+which is the signature of blocking, not of noise. The hash is keyed on
+the source row, and `passage_position` is the passage's index within
+the paper's row span (`row − row_start`, TS-105), not that column.
+Both are what TS-80 and TS-105 always meant; the column's name misled
+the first implementation, and the verifier caught it because it
+checks the construction and not the claim.
 
 **TS-149.** `sample_bucket` is an **auxiliary** element of M.
 Enrichment always computes it — it is the one column whose distribution
@@ -1583,9 +1603,11 @@ the large mass of zero-citation papers maps to a single value rather
 than being spread arbitrarily. A year with fewer than 100 papers still
 produces valid percentiles; the resolution is simply coarser.
 
-**TS-105.** `passage_position`. `⌊100 · ordinal / passages_in_paper⌋`,
-so 0–99. A single-passage paper yields 0, which is correct: its one
-passage is at the start.
+**TS-105.** `passage_position`. `⌊100 · (row − row_start) / passages_in_paper⌋`,
+so 0–99, with `row_start` and `passages_in_paper` the paper's span
+from `parents.parquet`. A single-passage paper yields 0, which is
+correct: its one passage is at the start. The upstream `ordinal` is
+section-local and is not the numerator (TS-174).
 
 **TS-106.** `word_count` is whitespace-delimited tokens of the passage
 text, not `char_end − char_start`. Character span is a proxy that

@@ -9,9 +9,9 @@ input row:
 | `topic_l1` … `topic_lN` | string | the assignments, named through the label slab |
 | `section_class` | string | the heading, through an ordered prefix table |
 | `citation_percentile` | int16 | the paper's rank among papers of the same year |
-| `passage_position` | int16 | the passage's percent position within its paper |
+| `passage_position` | int16 | the passage's percent position within its paper, from the paper's row span in `parents.parquet` |
 | `word_count` | int16 | the passage text |
-| `sample_bucket` | int32 | `splitmix64(seed, paper, ordinal) mod buckets` — the control family's hash field, never a semantic predicate |
+| `sample_bucket` | int32 | `splitmix64(seed, paper, source row) mod buckets` — the control family's hash field, keyed on the passage (its row in `passages.parquet`, unique) and never a semantic predicate. The upstream `ordinal` is section-local and is not the key |
 
 Beside the output it writes a slab of every distinct heading with the
 class it received and how many passages carry it, which is what an
@@ -44,7 +44,7 @@ source table, so every downstream facet carries the new columns.
 | Option | Role | Required | Default | Description |
 |--------|------|----------|---------|-------------|
 | `--metadata` | input | yes | — | Source metadata table (parquet), one row per passage |
-| `--passages` | input | yes | — | Passage table (parquet): `ordinal` and `text` |
+| `--passages` | input | yes | — | Passage table (parquet): `text`, row-aligned with the metadata |
 | `--parents` | input | yes | — | Parent table (parquet): `passage_count` and `row_start` per paper |
 | `--assignments` | input | yes | — | Topic assignments (u16vecs, one code per level), row-aligned |
 | `--labels` | input | no | positional | Topic label slab from `compute topic-labels`; absent means positional labels |

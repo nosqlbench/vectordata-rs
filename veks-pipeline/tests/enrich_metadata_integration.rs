@@ -69,7 +69,11 @@ fn test_ctx(dir: &Path, threads: usize) -> StreamContext {
 #[derive(Clone)]
 struct Planted {
     corpusid: i64,
+    /// The upstream `ordinal`: section-local, restarting at zero in
+    /// every section, as the real passage table has it (TS-174).
     ordinal: i32,
+    /// The passage's index within its paper.
+    index_in_paper: i32,
     passage_count: i32,
     year: i32,
     citations: i64,
@@ -98,7 +102,10 @@ fn plan(papers: usize) -> Vec<Planted> {
             let leaf = ((p + o as usize) % 6) as u16;
             out.push(Planted {
                 corpusid: 1000 + p as i64,
-                ordinal: o,
+                // Two passages per section: the section-local ordinal
+                // repeats within a paper.
+                ordinal: o % 2,
+                index_in_paper: o,
                 passage_count: count,
                 year,
                 citations,
@@ -373,15 +380,15 @@ fn enrichment_derives_every_column_from_what_was_planted() {
         assert_eq!(pct[i], expected_pct(r.year, r.citations), "row {}", i);
         assert_eq!(
             pos[i],
-            ((100 * r.ordinal as i64) / r.passage_count as i64).min(99) as i16,
-            "row {}",
+            ((100 * r.index_in_paper as i64) / r.passage_count as i64).min(99) as i16,
+            "row {}: position is within the paper, not the section",
             i
         );
         assert_eq!(words[i], r.words as i16, "row {}", i);
         assert_eq!(
             buckets[i],
-            sample_bucket(42, r.corpusid, r.ordinal, DEFAULT_BUCKETS) as i32,
-            "row {}",
+            sample_bucket(42, r.corpusid, i as u64, DEFAULT_BUCKETS) as i32,
+            "row {}: keyed on the source row, not the section-local ordinal",
             i
         );
         assert_eq!(
