@@ -88,7 +88,7 @@ pub fn build_dag(steps: &[StepDef]) -> Result<PipelineDag, String> {
     }
 
     for (i, step) in resolved.iter().enumerate() {
-        for dep_id in &step.def.after {
+        for dep_id in step.def.after.iter().chain(step.def.sequence_after.iter()) {
             let dep_idx = id_to_index.get(dep_id.as_str()).ok_or_else(|| {
                 format!(
                     "step '{}' depends on '{}' which is not defined",
@@ -225,7 +225,7 @@ pub fn build_dag(steps: &[StepDef]) -> Result<PipelineDag, String> {
                 .filter(|&(_, &d)| d > 0)
                 .map(|(i, _)| {
                     let step = &resolved[i];
-                    let deps: Vec<&str> = step.def.after.iter().map(|s| s.as_str()).collect();
+                    let deps: Vec<&str> = step.def.after.iter().chain(step.def.sequence_after.iter()).map(|s| s.as_str()).collect();
                     format!("  {} (profiles: {:?}, after: {:?})", step.id, step.def.profiles, deps)
                 })
                 .collect();
@@ -281,7 +281,7 @@ pub fn build_dag_partial(steps: &[StepDef]) -> Result<PipelineDag, String> {
     }
 
     for (i, step) in resolved.iter().enumerate() {
-        for dep_id in &step.def.after {
+        for dep_id in step.def.after.iter().chain(step.def.sequence_after.iter()) {
             // Silently skip references to steps not in this subset
             if let Some(&dep_idx) = id_to_index.get(dep_id.as_str()) {
                 graph.add_edge(node_indices[dep_idx], node_indices[i], ());
@@ -352,6 +352,7 @@ mod tests {
             run: run.to_string(),
             description: None,
             after: after.into_iter().map(String::from).collect(),
+            sequence_after: vec![],
             profiles: vec![],
             per_profile: false,
             phase: 0,
@@ -406,6 +407,7 @@ mod tests {
                 run: "generate fvec-extract".to_string(),
                 description: None,
                 after: vec![],
+                sequence_after: vec![],
                 profiles: vec![],
                 per_profile: false,
                 phase: 0,
@@ -467,6 +469,7 @@ mod tests {
             run: "generate ivec-shuffle".to_string(),
             description: None,
             after: vec![],
+            sequence_after: vec![],
             profiles: vec![],
             per_profile: false,
             phase: 0,

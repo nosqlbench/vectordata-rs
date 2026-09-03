@@ -396,8 +396,16 @@ impl ProgressLog {
         match self.steps.get(step_id) {
             Some(record) => match record.provenance.as_deref() {
                 Some(stored) => {
-                    let stored_hash = self.provenance.hash(stored, selector);
-                    let current_hash = self.provenance.hash(current, selector);
+                    // Compare over the upstreams the step declares now: an
+                    // upstream only the recorded node names cannot make the
+                    // step stale (TS-169).
+                    let keys: std::collections::BTreeSet<&str> = self
+                        .provenance
+                        .get(current)
+                        .map(|n| n.upstream.keys().map(String::as_str).collect())
+                        .unwrap_or_default();
+                    let stored_hash = self.provenance.hash_restricted(stored, selector, &keys);
+                    let current_hash = self.provenance.hash_restricted(current, selector, &keys);
                     if stored_hash.is_some() && stored_hash == current_hash {
                         None
                     } else {
@@ -1344,6 +1352,39 @@ mod tests {
             vec![("profiles/base/base_vectors__0000.fvecs", 40), ("profiles/base/base_vectors__0001.fvecs", 24)]
         );
         assert!(migrated.check_step_freshness("extract-base", None, Some(dir.path())).is_none());
+    }
+
+    /// A recorded upstream the definition no longer declares — the
+    /// sequencing edge to a profile since removed — cannot make a step
+    /// stale; a declared upstream that changed still does.
+    #[test]
+    fn an_upstream_no_longer_declared_does_not_make_a_step_stale() {
+        let mut log = ProgressLog::new();
+        let opts = HashMap::new();
+        let base = log.build_provenance("count-base", "state set", &opts, &[], "2.0.0+abc");
+        log.record_step("count-base", rec(Some(base.clone())));
+        let prev = log.build_provenance("compute-knn-120m", "compute knn", &opts, &["count-base"], "2.0.0+abc");
+        log.record_step("compute-knn-120m", rec(Some(prev)));
+        // Recorded with the chain edge to the previous profile.
+        let recorded = log.build_provenance("compute-knn-128mi", "compute knn", &opts, &["count-base", "compute-knn-120m"], "2.0.0+abc");
+        log.record_step("compute-knn-128mi", rec(Some(recorded)));
+        // The previous profile is gone: the step now declares count-base only.
+        let current = log.build_provenance("compute-knn-128mi", "compute knn", &opts, &["count-base"], "2.0.0+abc");
+        assert!(log.check_provenance("compute-knn-128mi", &current, ProvenanceFlags::CONFIG_ONLY).is_none());
+        assert!(log.check_provenance("compute-knn-128mi", &current, ProvenanceFlags::STRICT).is_none());
+        // But a declared upstream that changed still counts.
+        let mut other = HashMap::new();
+        other.insert("value".to_string(), "changed".to_string());
+        let base2 = log.build_provenance("count-base", "state set", &other, &[], "2.0.0+abc");
+        log.record_step("count-base", rec(Some(base2)));
+        let current = log.build_provenance("compute-knn-128mi", "compute knn", &opts, &["count-base"], "2.0.0+abc");
+        assert!(log.check_provenance("compute-knn-128mi", &current, ProvenanceFlags::CONFIG_ONLY).is_some());
+        // And a newly declared upstream the record never had is a change.
+        let extra = log.build_provenance("extract-queries", "transform extract", &opts, &[], "2.0.0+abc");
+        log.record_step("extract-queries", rec(Some(extra)));
+        log.record_step("count-base", rec(Some(base)));
+        let current = log.build_provenance("compute-knn-128mi", "compute knn", &opts, &["count-base", "extract-queries"], "2.0.0+abc");
+        assert!(log.check_provenance("compute-knn-128mi", &current, ProvenanceFlags::CONFIG_ONLY).is_some());
     }
 
     /// An unknown older schema still clears the log, as before.

@@ -1312,6 +1312,21 @@ files and their `.cache/*.predkeys.slab` segments become garbage and
 should be removed by `veks prepare cache-gc` before the run to reclaim
 space.
 
+**TS-169.** **Removing a profile invalidates nothing but itself.**
+The per-profile answer keys are computed one profile at a time in size
+order, and the runner orders them with a chain from each profile's
+step to the previous profile's. That chain is sequencing, not
+dependence: a profile's neighbours' answer keys do not change because
+it was added, removed or recomputed. So the chain is carried as
+`sequence_after`, which orders the run and contributes nothing to
+provenance, and the staleness comparison is made over the upstreams a
+step declares *now*, so a recorded node that still names a sequencing
+edge from an older build, or a neighbour since removed by
+`veks prepare cleanup-profiles`, compares equal. *Measured on tessera,
+2026-09-03:* dropping the 36 profiles of the removed `linear` stratum
+had marked the nine largest KNN answer keys stale — 128mi through
+`default` — purely through the chain; with this, all 49 remain fresh.
+
 ## 8. Artifact register
 
 Every artifact this design introduces, named, located and formatted.

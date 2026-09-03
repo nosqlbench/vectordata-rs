@@ -62,8 +62,19 @@ pub struct StepDef {
     pub description: Option<String>,
 
     /// Steps that must complete before this one (explicit ordering).
+    /// These are the step's **upstreams**: their provenance is part of
+    /// this step's, so a change in one makes this step stale.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<String>,
+    /// Steps that must complete before this one **for ordering only** —
+    /// the chain per-profile expansion adds so compute-heavy steps run
+    /// one profile at a time, and the phase boundaries between them.
+    /// Nothing about this step's output depends on theirs, so they are
+    /// not provenance upstreams: dropping or re-running one never makes
+    /// this step stale. Never written to `dataset.yaml`; expansion fills
+    /// it in memory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sequence_after: Vec<String>,
 
     /// Optional profile gate: when present, this step only runs if the active
     /// profile name is in the list. Steps with no `profiles` field are shared
@@ -206,6 +217,7 @@ mod tests {
             run: "generate vectors".to_string(),
             description: None,
             after: vec![],
+            sequence_after: vec![],
             profiles: vec![],
             per_profile: false,
             phase: 0,
@@ -223,6 +235,7 @@ mod tests {
             run: "generate ivec-shuffle".to_string(),
             description: None,
             after: vec![],
+            sequence_after: vec![],
             profiles: vec![],
             per_profile: false,
             phase: 0,
@@ -279,6 +292,7 @@ steps:
             run: "convert file".to_string(),
             description: None,
             after: vec![],
+            sequence_after: vec![],
             profiles: vec![],
             per_profile: false,
             phase: 0,
@@ -316,6 +330,7 @@ steps:
             run: "import".to_string(),
             description: None,
             after: vec![],
+            sequence_after: vec![],
             profiles: vec![],
             per_profile: false,
             phase: 0,
@@ -334,6 +349,7 @@ steps:
             run: "compute knn".to_string(),
             description: None,
             after: vec![],
+            sequence_after: vec![],
             profiles: vec!["10M".to_string(), "100M".to_string()],
             per_profile: false,
             phase: 0,

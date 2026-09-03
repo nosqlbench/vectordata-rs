@@ -540,7 +540,7 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
                 let id = s.effective_id();
                 if deferred.contains(&id) { continue; }
                 if s.finalize { continue; }
-                if s.after.iter().any(|d| deferred.contains(d)) {
+                if s.after.iter().chain(s.sequence_after.iter()).any(|d| deferred.contains(d)) {
                     deferred.insert(id);
                     added = true;
                 }
@@ -1306,8 +1306,12 @@ fn explain_staleness(
                 stale_count += 1;
             }
             Some(stored) => {
-                let stored_hash = graph.hash(stored, selector);
-                if stored_hash.is_some() && stored_hash == graph.hash(&current, selector) {
+                let keys: std::collections::BTreeSet<&str> = graph
+                    .get(&current)
+                    .map(|n| n.upstream.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                let stored_hash = graph.hash_restricted(stored, selector, &keys);
+                if stored_hash.is_some() && stored_hash == graph.hash_restricted(&current, selector, &keys) {
                     println!("  {} {} — fresh", term::ok("✓"), step.id);
                     fresh_count += 1;
                 } else {
@@ -1683,6 +1687,7 @@ fn resolve_pipeline_yaml(
             run: step.def.run.clone(),
             description: step.def.description.clone(),
             after: step.def.after.clone(),
+            sequence_after: vec![],
             profiles: step.def.profiles.clone(),
             per_profile: step.def.per_profile,
             phase: step.def.phase,
@@ -2207,6 +2212,7 @@ mod tests {
             run: run.to_string(),
             description: None,
             after: after.into_iter().map(String::from).collect(),
+            sequence_after: vec![],
             profiles: profiles.into_iter().map(String::from).collect(),
             per_profile: false,
             phase: 0,

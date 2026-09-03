@@ -349,6 +349,40 @@ impl ProvenanceGraph {
         Some(out)
     }
 
+    /// The staleness hash of the node at `address` under `selector`, with
+    /// its **own** upstream map restricted to `keys` — the upstreams a
+    /// step declares *now*. A recorded node may name an upstream the
+    /// definition no longer declares (a sequencing edge an older build
+    /// recorded, a dependency since removed); that upstream cannot make
+    /// the step stale, so it is left out of the comparison. Deeper
+    /// levels hash as they are. `None` if the graph has no such node.
+    pub fn hash_restricted(
+        &self,
+        address: &str,
+        selector: ProvenanceFlags,
+        keys: &std::collections::BTreeSet<&str>,
+    ) -> Option<String> {
+        let node = self.nodes.get(address)?;
+        let mut h = FnvHasher::new();
+        node.hash_own_into(selector, &mut h);
+        if selector.contains(ProvenanceFlags::UPSTREAM) {
+            h.write(b"upstream:");
+            for (id, up_address) in &node.upstream {
+                if !keys.contains(id.as_str()) {
+                    continue;
+                }
+                h.write(id.as_bytes());
+                h.write(b":");
+                let up_hash = self
+                    .hash(up_address, selector)
+                    .unwrap_or_else(|| up_address.clone());
+                h.write(up_hash.as_bytes());
+                h.write(b"\0");
+            }
+        }
+        Some(format!("{:016x}", h.finish()))
+    }
+
     /// The addresses reachable from `roots`, roots included.
     fn reachable_from<'a>(&self, roots: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
         let mut seen: HashSet<String> = HashSet::new();

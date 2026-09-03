@@ -289,6 +289,7 @@ pub fn expand_per_profile_steps_scoped(
                 run: template.run.clone(),
                 description: template.description.clone(),
                 after: expanded_after,
+                sequence_after: vec![],
                 profiles: vec![profile_name.to_string()],
                 per_profile: false,
                 phase: template.phase,
@@ -338,12 +339,13 @@ pub fn expand_per_profile_steps_scoped(
                     if suffix.is_empty() { tid } else { format!("{}{}", tid, suffix) }
                 });
 
-                // Add dependency on previous profile's last step in this phase
+                // Order after the previous profile's last step in this
+                // phase — a sequencing edge, not a provenance upstream.
                 if let (Some(prev), Some(first)) = (&prev_last_id, &first_id) {
                     for step in result.iter_mut() {
                         if step.effective_id() == *first {
-                            if !step.after.contains(prev) {
-                                step.after.push(prev.clone());
+                            if !step.after.contains(prev) && !step.sequence_after.contains(prev) {
+                                step.sequence_after.push(prev.clone());
                             }
                             break;
                         }
@@ -376,8 +378,9 @@ pub fn expand_per_profile_steps_scoped(
             .position(|s| s.phase == phase && !s.finalize && expanded_ids.contains(&s.effective_id()));
 
         if let (Some(prev_id), Some(idx)) = (prev_phase_last, this_phase_first_idx)
-            && !result[idx].after.contains(&prev_id) {
-                result[idx].after.push(prev_id);
+            && !result[idx].after.contains(&prev_id)
+            && !result[idx].sequence_after.contains(&prev_id) {
+                result[idx].sequence_after.push(prev_id);
             }
     }
 
@@ -420,6 +423,7 @@ mod tests {
             run: "import".into(),
             description: None,
             after: vec![],
+            sequence_after: vec![],
             profiles: vec![],
             per_profile: false,
             phase: 0,
@@ -438,6 +442,7 @@ mod tests {
             run: "compute knn".into(),
             description: None,
             after: vec![],
+            sequence_after: vec![],
             profiles: vec!["10m".into()],
             per_profile: false,
             phase: 0,
@@ -456,6 +461,61 @@ mod tests {
     /// per-profile expander used to auto-prefix it with
     /// `profiles/default/`. The disambiguation rule: if the step has
     /// an explicit `output:` key, `indices` is treated as an input.
+    /// The chain that runs profiles one at a time and the phase boundary
+    /// are ordering edges, not upstreams: they land in `sequence_after`,
+    /// while `after` keeps only what the template declared.
+    #[test]
+    fn chain_and_phase_edges_are_sequencing_not_upstreams() {
+        use indexmap::IndexMap;
+        let profiles: DSProfileGroup = serde_yaml::from_str(r#"
+default:
+  base_vectors: profiles/base/base_vectors.fvecs
+100k:
+  base_count: 100000
+  base_vectors: profiles/base/base_vectors.fvecs[0..100000]
+200k:
+  base_count: 200000
+  base_vectors: profiles/base/base_vectors.fvecs[0..200000]
+"#).unwrap();
+        let step = |id: &str, run: &str, after: &[&str], phase: u32| StepDef {
+            id: Some(id.into()),
+            run: run.into(),
+            description: None,
+            after: after.iter().map(|s| s.to_string()).collect(),
+            sequence_after: vec![],
+            profiles: vec![],
+            per_profile: true,
+            phase,
+            finalize: false,
+            on_partial: crate::dataset::pipeline::OnPartial::default(),
+            options: IndexMap::new(),
+        };
+        let expanded = expand_per_profile_steps(
+            vec![step("compute-knn", "compute knn", &["count-base"], 0), step("compute-prefiltered-knn", "compute prefiltered-knn", &["compute-knn"], 1)],
+            &profiles,
+            10_000,
+        );
+        let by_id = |id: &str| expanded.iter().find(|s| s.effective_id() == id).unwrap_or_else(|| panic!("{id} missing"));
+        // Sized profiles run in size order: each KNN step is sequenced
+        // after the previous profile's, and declares only count-base.
+        let knn_100k = by_id("compute-knn-100k");
+        let knn_200k = by_id("compute-knn-200k");
+        let knn_default = by_id("compute-knn");
+        assert_eq!(knn_100k.after, vec!["count-base"]);
+        assert_eq!(knn_200k.after, vec!["count-base"]);
+        assert_eq!(knn_default.after, vec!["count-base"]);
+        assert_eq!(knn_200k.sequence_after, vec!["compute-knn-100k"]);
+        assert_eq!(knn_default.sequence_after, vec!["compute-knn-200k"]);
+        assert!(knn_100k.sequence_after.is_empty(), "{:?}", knn_100k.sequence_after);
+        // The phase boundary is a sequencing edge on the first phase-1 step.
+        let first_phase1 = expanded.iter().find(|s| s.phase == 1).unwrap();
+        assert_eq!(first_phase1.sequence_after, vec!["compute-knn"], "{}", first_phase1.effective_id());
+        // A phase-1 step's declared upstream is expanded to its own profile.
+        let pre_200k = by_id("compute-prefiltered-knn-200k");
+        assert_eq!(pre_200k.after, vec!["compute-knn-200k"]);
+        assert!(expanded.iter().all(|s| s.after.iter().all(|a| !s.sequence_after.contains(a))));
+    }
+
     #[test]
     fn test_knn_distances_indices_is_input_not_output() {
         use indexmap::IndexMap;
@@ -477,6 +537,7 @@ default:
             run: "compute knn-distances".into(),
             description: None,
             after: vec![],
+            sequence_after: vec![],
             profiles: vec![],
             per_profile: true,
             phase: 0,
@@ -526,6 +587,7 @@ default:
             run: "compute knn".into(),
             description: None,
             after: vec![],
+            sequence_after: vec![],
             profiles: vec![],
             per_profile: true,
             phase: 0,

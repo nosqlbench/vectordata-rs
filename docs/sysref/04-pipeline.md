@@ -88,14 +88,24 @@ record points at a **`ProvenanceNode`** capturing every component that
 - **Resolved options** — sorted `BTreeMap<String, String>`
 - **Upstream provenance** — the *address* of each upstream step's node
   in the log's graph, so a relaxed selector cascades correctly through
-  the DAG (the hash recurses through addresses)
+  the DAG (the hash recurses through addresses). Upstreams are the
+  steps a definition names in `after:`. The chain that runs sized
+  profiles one at a time and the phase boundaries between them are
+  **sequencing edges** (`sequence_after`, filled in memory by
+  per-profile expansion, never written): they order the run and are not
+  provenance, so dropping a profile or re-running one never makes its
+  neighbours stale.
 
 A step is fresh when:
 - The output file exists with the recorded size (output paths are
   recorded relative to the workspace, so a record reads the same from
   any working directory), AND
 - The step's node hashes under the **active selector** to the same
-  value as the node recorded for it
+  value as the node recorded for it, compared over the upstreams the
+  step **declares now**: an upstream only the recorded node names (a
+  dependency since removed, or a sequencing edge an older build
+  recorded as one) cannot make the step stale, while a newly declared
+  upstream, or a declared one that changed, does
 
 #### Selectors and presets
 
