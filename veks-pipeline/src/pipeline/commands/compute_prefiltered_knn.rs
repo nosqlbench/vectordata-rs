@@ -95,6 +95,128 @@ impl Ord for Neighbor {
 }
 
 /// Read a metadata-indices slab record as a Vec of i32 base ordinals.
+/// Packed little-endian `i32` ordinals in strictly ascending order —
+/// the wire form of a predicate results record (TS-175). Searches
+/// work on the bytes; nothing is decoded that is not returned.
+pub(crate) mod sorted_ordinals {
+    /// The ordinal at position `i`.
+    #[inline]
+    pub fn at(bytes: &[u8], i: usize) -> i32 {
+        i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("four bytes"))
+    }
+
+    /// How many ordinals the record holds.
+    #[inline]
+    pub fn len(bytes: &[u8]) -> usize {
+        bytes.len() / 4
+    }
+
+    /// Position of the first ordinal that is not below `value`.
+    pub fn lower_bound(bytes: &[u8], value: i64) -> usize {
+        let (mut lo, mut hi) = (0usize, len(bytes));
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if (at(bytes, mid) as i64) < value {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Whether the record holds `ordinal`. Checks that the record is
+    /// ascending around the probe and reports the offending position
+    /// otherwise.
+    pub fn contains(bytes: &[u8], ordinal: i32) -> Result<bool, usize> {
+        let n = len(bytes);
+        let i = lower_bound(bytes, ordinal as i64);
+        for p in i.saturating_sub(1)..(i + 2).min(n) {
+            if p > 0 && at(bytes, p) <= at(bytes, p - 1) {
+                return Err(p);
+            }
+        }
+        Ok(i < n && at(bytes, i) == ordinal)
+    }
+
+    /// The ordinals in `[start, end)`, checked ascending across the
+    /// slice and at its edges; the offending position otherwise.
+    pub fn in_range(bytes: &[u8], start: usize, end: usize) -> Result<Vec<i32>, usize> {
+        let n = len(bytes);
+        let lo = lower_bound(bytes, start as i64);
+        let hi = lower_bound(bytes, end.max(start) as i64);
+        let mut out = Vec::with_capacity(hi - lo);
+        let check_from = lo.saturating_sub(1).max(1);
+        let check_to = (hi + 1).min(n);
+        for p in check_from..check_to {
+            if at(bytes, p) <= at(bytes, p - 1) {
+                return Err(p);
+            }
+        }
+        for i in lo..hi {
+            out.push(at(bytes, i));
+        }
+        Ok(out)
+    }
+
+    /// The first position where the order breaks, if any.
+    pub fn first_disorder(bytes: &[u8]) -> Option<usize> {
+        (1..len(bytes)).find(|&i| at(bytes, i) <= at(bytes, i - 1))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packed(ords: &[i32]) -> Vec<u8> {
+            ords.iter().flat_map(|o| o.to_le_bytes()).collect()
+        }
+
+        #[test]
+        fn searches_answer_on_the_bytes_without_decoding() {
+            let b = packed(&[3, 7, 8, 20, 21, 100]);
+            assert_eq!(lower_bound(&b, 0), 0);
+            assert_eq!(lower_bound(&b, 7), 1);
+            assert_eq!(lower_bound(&b, 9), 3);
+            assert_eq!(lower_bound(&b, 100), 5);
+            assert_eq!(lower_bound(&b, 101), 6);
+            for o in [3, 7, 8, 20, 21, 100] {
+                assert_eq!(contains(&b, o), Ok(true), "{}", o);
+            }
+            for o in [-1, 0, 4, 9, 22, 99, 101, i32::MAX] {
+                assert_eq!(contains(&b, o), Ok(false), "{}", o);
+            }
+            assert_eq!(in_range(&b, 0, 3), Ok(vec![]));
+            assert_eq!(in_range(&b, 0, 4), Ok(vec![3]));
+            assert_eq!(in_range(&b, 7, 21), Ok(vec![7, 8, 20]));
+            assert_eq!(in_range(&b, 21, 1000), Ok(vec![21, 100]));
+            assert_eq!(in_range(&b, 1000, 2000), Ok(vec![]));
+            assert_eq!(in_range(&b, 20, 20), Ok(vec![]));
+            let empty = packed(&[]);
+            assert_eq!(contains(&empty, 5), Ok(false));
+            assert_eq!(in_range(&empty, 0, 10), Ok(vec![]));
+            assert_eq!(first_disorder(&b), None);
+        }
+
+        #[test]
+        fn a_record_out_of_order_is_an_error_where_it_is_read() {
+            let b = packed(&[1, 5, 4, 9, 12]);
+            assert_eq!(first_disorder(&b), Some(2));
+            assert_eq!(in_range(&b, 0, 100), Err(2));
+            assert_eq!(in_range(&b, 4, 10), Err(2), "the slice edge sees the break");
+            assert_eq!(contains(&b, 4), Err(2));
+            assert_eq!(contains(&b, 5), Err(2));
+            // Far from the break the probe does not see it, and the
+            // write-time check is what holds the whole record.
+            assert_eq!(contains(&b, 12), Ok(true));
+            assert_eq!(in_range(&b, 12, 13), Ok(vec![12]));
+            let dup = packed(&[1, 2, 2, 3]);
+            assert_eq!(first_disorder(&dup), Some(2));
+            assert_eq!(in_range(&dup, 0, 10), Err(2));
+        }
+    }
+}
+
 fn read_ordinals(data: &[u8]) -> Vec<i32> {
     let mut cursor = std::io::Cursor::new(data);
     let mut result = Vec::with_capacity(data.len() / 4);
@@ -139,19 +261,46 @@ impl PredicateIndices {
         }
     }
 
-    /// Get ordinals for predicate at the given index.
-    pub fn get_ordinals(&self, index: usize) -> Result<Vec<i32>, String> {
+    /// The record's packed little-endian ordinals: borrowed from the
+    /// mapping when the reader has one, copied otherwise.
+    fn record(&self, index: usize) -> Result<std::borrow::Cow<'_, [u8]>, String> {
         match self {
-            Self::Slab(reader) => {
-                let data = reader.get(index as i64)
-                    .map_err(|e| format!("read slab record {}: {}", index, e))?;
-                Ok(read_ordinals(&data))
-            }
-            Self::Ivec(reader) => {
-                reader.get_i32(index)
-                    .map_err(|e| format!("read ivec record {}: {}", index, e))
-            }
+            Self::Slab(reader) => reader
+                .get_ref(index as i64)
+                .map(std::borrow::Cow::Borrowed)
+                .map_err(|e| format!("read slab record {}: {}", index, e)),
+            Self::Ivec(reader) => match reader.get_raw(index) {
+                Some(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
+                None => reader
+                    .get_bytes(index)
+                    .map(std::borrow::Cow::Owned)
+                    .map_err(|e| format!("read ivec record {}: {}", index, e)),
+            },
         }
+    }
+
+    /// Every ordinal of the record, decoded.
+    pub fn get_ordinals(&self, index: usize) -> Result<Vec<i32>, String> {
+        Ok(read_ordinals(&self.record(index)?))
+    }
+
+    /// Whether `ordinal` is in the record: a binary search over the
+    /// packed bytes, which are ascending by construction (TS-175).
+    /// The order is checked around the probe; a record out of order
+    /// there is an error, not a wrong answer.
+    pub fn contains(&self, index: usize, ordinal: i32) -> Result<bool, String> {
+        let bytes = self.record(index)?;
+        sorted_ordinals::contains(&bytes, ordinal)
+            .map_err(|at| format!("results record {} is not in ascending order at position {}", index, at))
+    }
+
+    /// The record's ordinals in `[start, end)`: the slice between two
+    /// partition-point searches, decoded and checked ascending
+    /// (TS-175). Nothing outside the slice is decoded.
+    pub fn ordinals_in_range(&self, index: usize, start: usize, end: usize) -> Result<Vec<i32>, String> {
+        let bytes = self.record(index)?;
+        sorted_ordinals::in_range(&bytes, start, end)
+            .map_err(|at| format!("results record {} is not in ascending order at position {}", index, at))
     }
 
     /// Number of predicate records.

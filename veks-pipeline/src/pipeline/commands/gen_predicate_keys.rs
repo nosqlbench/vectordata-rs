@@ -1986,7 +1986,7 @@ sweep.
         const MERGE_CHUNK: usize = 256;
         for chunk_start in (0..pred_len).step_by(MERGE_CHUNK) {
             let chunk_end = (chunk_start + MERGE_CHUNK).min(pred_len);
-            let bufs: Vec<Vec<u8>> = (chunk_start..chunk_end)
+            let bufs: Vec<Result<Vec<u8>, String>> = (chunk_start..chunk_end)
                 .into_par_iter()
                 .map(|pi| {
                     let mut buf: Vec<u8> = Vec::new();
@@ -2019,11 +2019,26 @@ sweep.
                             }
                         }
                     }
-                    buf
+                    // The record is ascending by construction — every
+                    // segment sorted, segments in range order — and
+                    // the readers of this facet search it as such
+                    // (TS-175). Hold it here, once, where the whole
+                    // record is in hand.
+                    match super::compute_prefiltered_knn::sorted_ordinals::first_disorder(&buf) {
+                        None => Ok(buf),
+                        Some(at) => Err(format!(
+                            "results record {} is not in ascending order at position {}",
+                            pi, at
+                        )),
+                    }
                 })
                 .collect();
             for (offset, buf) in bufs.into_iter().enumerate() {
                 let pi = chunk_start + offset;
+                let buf = match buf {
+                    Ok(buf) => buf,
+                    Err(e) => return error_result(e, start),
+                };
                 let count: usize = buf.len() / 4;
                 total_matches += count as u64;
                 if count == 0 { zero_match_count += 1; }
