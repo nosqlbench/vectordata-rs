@@ -15,41 +15,11 @@
 use std::path::{Path, PathBuf};
 use std::io::{self, Write};
 
-use indexmap::IndexMap;
 use vectordata::dataset::config::DatasetConfig;
-use vectordata::dataset::profile::{DSProfile, DSView};
-use vectordata::dataset::source::{DSSource, DSWindow, DSInterval};
 
 use crate::formats::VecFormat;
 
 /// Classification of how a facet participates in sized profiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FacetRole {
-    /// Windowed by base_count range (e.g., base_vectors, metadata_content)
-    Windowed,
-    /// Each sized profile gets its own directory (e.g., neighbor_indices)
-    PerProfile,
-    /// Shared across all profiles (e.g., query_vectors, predicates)
-    Shared,
-}
-
-/// Classify a facet by its role in sized profiles.
-///
-/// Both canonical (`prefiltered_*`, `postfiltered_*`) and legacy
-/// (`filtered_*`) F/E facet keys are per-profile — they are
-/// recomputed per profile from the corresponding base/query window.
-pub(crate) fn classify_facet(name: &str) -> FacetRole {
-    match name {
-        "base_vectors" | "metadata_content" => FacetRole::Windowed,
-        "neighbor_indices" | "neighbor_distances"
-        | "prefiltered_neighbor_indices" | "prefiltered_neighbor_distances"
-        | "postfiltered_neighbor_indices" | "postfiltered_neighbor_distances"
-        | "filtered_neighbor_indices" | "filtered_neighbor_distances"
-        | "metadata_results" | "metadata_indices" => FacetRole::PerProfile,
-        _ => FacetRole::Shared,
-    }
-}
-
 /// Run the stratify command.
 pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
     let (dataset_dir, dataset_path) = resolve_dataset_path(path);
@@ -186,74 +156,16 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
         }
     }
 
-    // Build sized profile views from the default profile
+    // Derive every sized profile from the default one, the way the
+    // loader's expansion does: one derivation, one classification.
+    let default = config.profiles.profile("default").cloned().unwrap_or_else(|| {
+        eprintln!("Error: the dataset has no default profile to derive sized profiles from");
+        std::process::exit(1);
+    });
     for (prof_name, count) in &pairs {
-        let mut views = IndexMap::new();
-
-        for (facet_name, view) in &default.views {
-            let role = classify_facet(facet_name);
-            let path_str = &view.source.path;
-
-            match role {
-                FacetRole::Windowed => {
-                    // Window the source path with the profile's range
-                    let windowed_source = DSSource {
-                        path: path_str.clone(),
-                        namespace: view.source.namespace.clone(),
-                        window: DSWindow(vec![DSInterval {
-                            min_incl: 0,
-                            max_excl: *count,
-                        }]),
-                        // The window this imposes is new, so any count
-                        // the original source declared describes a
-                        // different range and must not be carried over.
-                        declared_count: None,
-                    };
-                    views.insert(facet_name.clone(), DSView {
-                        source: windowed_source,
-                        window: None,
-                        ..Default::default()
-                    });
-                }
-                FacetRole::PerProfile => {
-                    // Replace "profiles/default/" with "profiles/{name}/"
-                    let new_path = path_str.replace(
-                        "profiles/default/",
-                        &format!("profiles/{}/", prof_name),
-                    );
-                    let source = DSSource {
-                        path: new_path,
-                        namespace: view.source.namespace.clone(),
-                        window: DSWindow::default(),
-                        // A different file: the original's count does not
-                        // describe it.
-                        declared_count: None,
-                    };
-                    views.insert(facet_name.clone(), DSView {
-                        source,
-                        window: None,
-                        ..Default::default()
-                    });
-                }
-                FacetRole::Shared => {
-                    views.insert(facet_name.clone(), view.clone());
-                }
-            }
-        }
-
-        let profile = DSProfile {
-            maxk: default.maxk,
-            base_count: Some(*count),
-            partition: false,
-            views,
-            // A stratum is a size of the default corpus, which is the
-            // axis default-inheritance already describes: no parent to
-            // name, and nothing yet measured to record.
-            ..Default::default()
-        };
+        let profile = vectordata::dataset::profile::derive_sized_profile(&default, prof_name, *count);
         config.profiles.profiles.insert(prof_name.clone(), profile);
     }
-
     // Backup the existing file
     let backup = crate::check::fix::create_backup(&dataset_path);
     match backup {

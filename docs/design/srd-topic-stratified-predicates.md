@@ -1471,7 +1471,15 @@ which reads each profile's own G, refused six of fifty sampled queries
 at every sized profile and none at the census profile. Query 400, a
 ten-percent control range, has eleven matching neighbours at 100k and
 an E with none. The verifier caught it because it re-derives E from
-the profile's own facets; the producer now does the same.
+the profile's own facets; the producer now does the same. Two more
+things had to hold for the fix to reach a dataset. A sized profile
+materialised by `veks prepare stratify` was re-derived from `default`
+whenever the dataset was loaded with resolution, by a derivation
+that dropped the per-profile facets and inherited `metadata_results`
+from `default`, so every consumer that resolved a sized profile read
+the census profile's answer keys; one derivation now serves both, a
+materialised profile is the authority at load, and a per-profile
+facet the profile does not declare is absent rather than `default`'s.
 
 ## 8. Artifact register
 

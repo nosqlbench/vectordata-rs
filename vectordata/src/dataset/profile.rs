@@ -592,58 +592,12 @@ impl DSProfileGroup {
                     None
                 };
 
-                let base_views = scaffold_views.unwrap_or_default();
-
-                let merged = if let Some(ref dp) = default_profile {
-                    let mut merged_views: IndexMap<String, DSView> = dp.views.iter()
-                        .filter(|(k, _)| !is_per_profile_output_view(k))
-                        .map(|(k, v)| {
-                            // For per-vector shared facets (base_vectors,
-                            // metadata_content), the sized profile is
-                            // genuinely the first `count` rows of the
-                            // shared file — record that as a windowed
-                            // reference into the inherited path. This is
-                            // the documented sub-ordinal suffix model:
-                            // the source path stays the same as default,
-                            // but `source.window` carries `[0..count)` so
-                            // the `vectordata` reader API can clip
-                            // accesses without the consumer having to
-                            // remember `base_count`.
-                            //
-                            // Other shared facets (query_vectors, etc.)
-                            // are NOT windowed — query sets are the
-                            // same across profiles.
-                            if is_windowed_shared_view(k) && v.source.window.is_empty() {
-                                let mut windowed = v.clone();
-                                windowed.source.window = DSWindow(vec![DSInterval {
-                                    min_incl: 0,
-                                    max_excl: count,
-                                }]);
-                                (k.clone(), windowed)
-                            } else {
-                                (k.clone(), v.clone())
-                            }
-                        })
-                        .collect();
-                    for (k, v) in base_views {
-                        merged_views.insert(k, v);
-                    }
-                    DSProfile {
-                        maxk: dp.maxk,
-                        base_count: Some(count),
-                        partition: false,
-                        views: merged_views,
-                        ..Default::default()
-                    }
-                } else {
-                    DSProfile {
-                        maxk: None,
-                        base_count: Some(count),
-                        partition: false,
-                        views: base_views,
-                        ..Default::default()
-                    }
-                };
+                let merged = sized_profile_with_scaffold(
+                    default_profile.as_ref(),
+                    &prof_name,
+                    count,
+                    scaffold_views.unwrap_or_default(),
+                );
                 pending.push((count, prof_name, merged));
             }
         }
@@ -656,6 +610,16 @@ impl DSProfileGroup {
         // have the same count this is moot for display).
         pending.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         for (_count, prof_name, merged) in pending {
+            // A profile already in the group — materialised by
+            // `stratify`, or declared by hand — is the authority: it
+            // carries the views the pipeline wrote and anything
+            // measured since. Expansion fills what is missing and
+            // never overwrites it. Overwriting it is what resolved
+            // every sized profile of a stratified dataset to the
+            // census profile's answer keys.
+            if self.profiles.contains_key(&prof_name) {
+                continue;
+            }
             self.profiles.insert(prof_name, merged);
             added += 1;
         }
@@ -981,8 +945,120 @@ impl<'de> Deserialize<'de> for DSProfile {
 /// across all profiles, not a prefix of anything. Per-profile output
 /// views (`neighbor_indices`, etc.) are also not in this list — they
 /// have their own windowing handled separately.
-fn is_windowed_shared_view(key: &str) -> bool {
-    matches!(key, "base_vectors" | "metadata_content")
+/// What a facet is to a sized profile: a window of a shared file, a
+/// file of the profile's own, or the same file for every profile.
+/// The one classification `veks prepare stratify` and the loader's
+/// expansion both derive sized profiles from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FacetRole {
+    /// The first `base_count` rows of the shared file: `base_vectors`,
+    /// `metadata_content`.
+    Windowed,
+    /// Computed per profile into `profiles/<name>/`: the unfiltered,
+    /// pre-filter and post-filter neighbours and distances, and the
+    /// predicate results.
+    PerProfile,
+    /// The same file for every profile: queries, predicates, anything
+    /// else.
+    Shared,
+}
+
+/// The [`FacetRole`] of a facet key, canonical or legacy.
+pub fn facet_role(key: &str) -> FacetRole {
+    match key {
+        "base_vectors" | "metadata_content" => FacetRole::Windowed,
+        "neighbor_indices" | "neighbor_distances"
+        | "prefiltered_neighbor_indices" | "prefiltered_neighbor_distances"
+        | "postfiltered_neighbor_indices" | "postfiltered_neighbor_distances"
+        | "filtered_neighbor_indices" | "filtered_neighbor_distances"
+        | "metadata_results" | "metadata_indices" => FacetRole::PerProfile,
+        _ => FacetRole::Shared,
+    }
+}
+
+/// A sized profile of `count` rows named `name`, derived from the
+/// default profile: windowed facets keep their path and gain the
+/// window `[0, count)`; per-profile facets point into
+/// `profiles/<name>/`; shared facets are the same view. An earlier
+/// derivation dropped the per-profile facets and inherited
+/// `metadata_results` from `default`, so a resolved sized profile had
+/// no neighbours of its own and the census profile's answer keys.
+pub fn derive_sized_profile(default: &DSProfile, name: &str, count: u64) -> DSProfile {
+    let mut views: IndexMap<String, DSView> = IndexMap::new();
+    for (facet, view) in &default.views {
+        let derived = match facet_role(facet) {
+            FacetRole::Windowed => {
+                let mut v = view.clone();
+                if v.source.window.is_empty() {
+                    v.source.window = DSWindow(vec![DSInterval { min_incl: 0, max_excl: count }]);
+                    // The window is new; a count the source declared
+                    // describes the whole file, not this range.
+                    v.source.declared_count = None;
+                }
+                v
+            }
+            FacetRole::PerProfile => {
+                let own = format!("profiles/{}/", name);
+                let path = if view.source.path.contains("profiles/default/") {
+                    view.source.path.replace("profiles/default/", &own)
+                } else {
+                    let file = std::path::Path::new(&view.source.path)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| view.source.path.clone());
+                    format!("{}{}", own, file)
+                };
+                DSView {
+                    source: DSSource {
+                        path,
+                        namespace: view.source.namespace.clone(),
+                        window: DSWindow::default(),
+                        // A different file: the original's count does
+                        // not describe it.
+                        declared_count: None,
+                    },
+                    window: None,
+                    ..Default::default()
+                }
+            }
+            FacetRole::Shared => view.clone(),
+        };
+        views.insert(facet.clone(), derived);
+    }
+    DSProfile {
+        maxk: default.maxk,
+        base_count: Some(count),
+        partition: false,
+        views,
+        ..Default::default()
+    }
+}
+
+/// A sized profile from the default one, with a scaffold of
+/// template-declared views laid over the derivation; with no default,
+/// the scaffold alone.
+fn sized_profile_with_scaffold(
+    default: Option<&DSProfile>,
+    name: &str,
+    count: u64,
+    scaffold: IndexMap<String, DSView>,
+) -> DSProfile {
+    match default {
+        Some(dp) => {
+            let mut profile = derive_sized_profile(dp, name, count);
+            for (k, v) in scaffold {
+                profile.views.insert(k, v);
+            }
+            profile
+        }
+        None => DSProfile {
+            maxk: None,
+            base_count: Some(count),
+            partition: false,
+            views: scaffold,
+            ..Default::default()
+        },
+    }
 }
 
 /// Why a generated name cannot be interpolated into this template, if
@@ -1102,15 +1178,6 @@ fn apply_named_parent_inheritance(profiles: &mut IndexMap<String, DSProfile>) {
 /// Filtered KNN outputs follow the same per-profile pattern. Both
 /// canonical (`prefiltered_*`, `postfiltered_*`) and legacy
 /// (`filtered_*`) F/E facet keys are recognised here.
-fn is_per_profile_output_view(key: &str) -> bool {
-    matches!(key,
-        "neighbor_indices" | "neighbor_distances"
-        | "prefiltered_neighbor_indices" | "prefiltered_neighbor_distances"
-        | "postfiltered_neighbor_indices" | "postfiltered_neighbor_distances"
-        | "filtered_neighbor_indices" | "filtered_neighbor_distances"
-    )
-}
-
 /// Compute a numeric sort key for a profile.
 ///
 /// Uses `base_count` if available, otherwise parses the profile name as a
@@ -1766,55 +1833,12 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                         None
                     };
 
-                    let base_views = scaffold_views.unwrap_or_default();
-
-                    // Inherit from default, then overlay scaffold views.
-                    // Per-profile output views (neighbor_indices, etc.) are
-                    // excluded — sized profiles compute their own KNN
-                    // outputs into `profiles/{name}/`, so inheriting
-                    // default's path would mis-route every verify and
-                    // every external consumer to default's full-base GT.
-                    let merged = if let Some(ref dp) = default_profile {
-                        let mut merged_views: IndexMap<String, DSView> = dp.views.iter()
-                            .filter(|(k, _)| !is_per_profile_output_view(k))
-                            .map(|(k, v)| {
-                                // Same windowed-share treatment as
-                                // `expand_deferred_sized` — see comments
-                                // there. base_vectors / metadata_content
-                                // get a `[0..count)` window when
-                                // inherited; everything else copies
-                                // through unchanged.
-                                if is_windowed_shared_view(k) && v.source.window.is_empty() {
-                                    let mut windowed = v.clone();
-                                    windowed.source.window = DSWindow(vec![DSInterval {
-                                        min_incl: 0,
-                                        max_excl: count,
-                                    }]);
-                                    (k.clone(), windowed)
-                                } else {
-                                    (k.clone(), v.clone())
-                                }
-                            })
-                            .collect();
-                        for (k, v) in base_views {
-                            merged_views.insert(k, v);
-                        }
-                        DSProfile {
-                            maxk: dp.maxk,
-                            base_count: Some(count),
-                            partition: false,
-                            views: merged_views,
-                            ..Default::default()
-                        }
-                    } else {
-                        DSProfile {
-                            maxk: None,
-                            base_count: Some(count),
-                            partition: false,
-                            views: base_views,
-                            ..Default::default()
-                        }
-                    };
+                    let merged = sized_profile_with_scaffold(
+                        default_profile.as_ref(),
+                        &prof_name,
+                        count,
+                        scaffold_views.unwrap_or_default(),
+                    );
                     if profiles.contains_key(&prof_name) {
                         if generated_names.contains(&prof_name) {
                             // The same name emitted by more than one
@@ -1884,10 +1908,10 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                 // through unchanged.
                 let child_bc = child.base_count;
                 let mut merged_views: IndexMap<String, DSView> = dp.views.iter()
-                    .filter(|(k, _)| !is_per_profile_output_view(k))
+                    .filter(|(k, _)| facet_role(k) != FacetRole::PerProfile)
                     .map(|(k, v)| {
                         if let Some(bc) = child_bc
-                            && is_windowed_shared_view(k) && v.source.window.is_empty() {
+                            && facet_role(k) == FacetRole::Windowed && v.source.window.is_empty() {
                                 let mut windowed = v.clone();
                                 windowed.source.window = DSWindow(vec![DSInterval {
                                     min_incl: 0,

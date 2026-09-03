@@ -964,6 +964,86 @@ impl DatasetConfig {
 mod tests {
     use super::*;
 
+    /// A sized profile generated from a stratum takes every facet in
+    /// its role: the base and metadata windowed, the neighbours and the
+    /// predicate results in its own directory, the queries and
+    /// predicates shared. Nothing of it points at `default`'s own
+    /// files.
+    #[test]
+    fn a_generated_sized_profile_owns_its_per_profile_facets() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("dataset.yaml"), r#"
+name: test
+strata:
+  decade:
+    spec: "decade"
+profiles:
+  default:
+    maxk: 100
+    base_vectors: profiles/base/base_vectors.fvecs
+    query_vectors: profiles/base/query_vectors.fvecs
+    metadata_content: profiles/base/metadata_content.slab
+    metadata_predicates: profiles/base/predicates.slab
+    neighbor_indices: profiles/default/neighbor_indices.ivecs
+    neighbor_distances: profiles/default/neighbor_distances.fvecs
+    metadata_results: profiles/default/metadata_results.slab
+    postfiltered_neighbor_indices: profiles/default/postfiltered_neighbor_indices.ivec
+"#).unwrap();
+        std::fs::write(tmp.path().join("variables.yaml"), "base_count: '2500000'\n").unwrap();
+        let config = DatasetConfig::load_and_resolve(&tmp.path().join("dataset.yaml")).expect("load_and_resolve");
+        let p = config.profiles.profile("1m").unwrap_or_else(|| panic!("1m in {:?}", config.profiles.profiles.keys().collect::<Vec<_>>()));
+        assert_eq!(p.base_count, Some(1_000_000));
+        let path = |k: &str| p.views.get(k).map(|v| v.source.path.clone()).unwrap_or_else(|| panic!("{k} missing: {:?}", p.views.keys().collect::<Vec<_>>()));
+        assert_eq!(path("neighbor_indices"), "profiles/1m/neighbor_indices.ivecs");
+        assert_eq!(path("neighbor_distances"), "profiles/1m/neighbor_distances.fvecs");
+        assert_eq!(path("metadata_results"), "profiles/1m/metadata_results.slab");
+        assert_eq!(path("postfiltered_neighbor_indices"), "profiles/1m/postfiltered_neighbor_indices.ivec");
+        assert_eq!(path("query_vectors"), "profiles/base/query_vectors.fvecs");
+        assert_eq!(path("metadata_predicates"), "profiles/base/predicates.slab");
+        let base = p.views.get("base_vectors").unwrap();
+        assert_eq!(base.source.path, "profiles/base/base_vectors.fvecs");
+        assert_eq!(base.source.window.0.len(), 1);
+        assert_eq!((base.source.window.0[0].min_incl, base.source.window.0[0].max_excl), (0, 1_000_000));
+        assert!(p.views.values().all(|v| !v.source.path.contains("profiles/default/")), "{:?}", p.views);
+    }
+
+    /// A profile already in the file — materialised by stratify, with
+    /// the views the pipeline wrote — is kept as it is when the
+    /// strata expand at load; expansion adds only what is missing.
+    #[test]
+    fn a_materialised_sized_profile_is_not_overwritten_by_expansion() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("dataset.yaml"), r#"
+name: test
+strata:
+  decade:
+    spec: "decade"
+    series: ["1m", "2m"]
+profiles:
+  default:
+    maxk: 100
+    base_vectors: profiles/base/base_vectors.fvecs
+    neighbor_indices: profiles/default/neighbor_indices.ivecs
+    metadata_results: profiles/default/metadata_results.slab
+  1m:
+    maxk: 100
+    base_count: 1000000
+    base_vectors:
+      source: profiles/base/base_vectors.fvecs
+      window: "[0..1000000]"
+    neighbor_indices: profiles/1m/neighbor_indices.ivecs
+    prefiltered_neighbor_indices: profiles/1m/prefiltered_neighbor_indices.ivec
+"#).unwrap();
+        std::fs::write(tmp.path().join("variables.yaml"), "base_count: '2500000'\n").unwrap();
+        let config = DatasetConfig::load_and_resolve(&tmp.path().join("dataset.yaml")).expect("load_and_resolve");
+        let one = config.profiles.profile("1m").unwrap();
+        assert_eq!(one.views.get("neighbor_indices").unwrap().source.path, "profiles/1m/neighbor_indices.ivecs");
+        assert_eq!(one.views.get("prefiltered_neighbor_indices").unwrap().source.path, "profiles/1m/prefiltered_neighbor_indices.ivec");
+        assert!(one.views.get("metadata_results").is_none(), "an undeclared per-profile facet is not default's: {:?}", one.views.keys().collect::<Vec<_>>());
+        let two = config.profiles.profile("2m").expect("the missing member of the series is generated");
+        assert_eq!(two.views.get("metadata_results").unwrap().source.path, "profiles/2m/metadata_results.slab");
+    }
+
     /// `load_and_resolve` must expand sized profiles when only
     /// `vector_count` is available in `variables.yaml` (no `base_count`).
     /// This is the post-clean-bootstrap state: the early
