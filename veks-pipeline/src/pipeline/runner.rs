@@ -83,6 +83,9 @@ pub fn run_steps(
     let total = steps.len();
 
     // Build a display prefix with dataset name and profile context
+    // The run's own profile selection (`all`, a name, or nothing); a
+    // per-profile step narrows `ctx.profile` to its own while it runs.
+    let run_profile = ctx.profile.clone();
     let ctx_label = match (ctx.dataset_name.is_empty(), ctx.profile.is_empty()) {
         (false, false) => format!("{} [{}]", ctx.dataset_name, ctx.profile),
         (false, true) => ctx.dataset_name.clone(),
@@ -527,6 +530,15 @@ pub fn run_steps(
             chrono::Local::now().format("%H:%M:%S"), step.id, step.def.run));
         dlog.flush();
         ctx.step_id = step.id.clone();
+        // A per-profile step is scoped to its profile: every facet it
+        // resolves by default comes from that profile, not from
+        // `default`. A shared step keeps the run's own selection.
+        ctx.profile = step
+            .def
+            .profiles
+            .first()
+            .cloned()
+            .unwrap_or_else(|| run_profile.clone());
         ctx.governor.set_step_id(&step.id);
 
         // Resource status — updated by background thread via ui.resource_status()

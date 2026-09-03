@@ -306,6 +306,24 @@ fn records(path: &Path, namespace: Option<&str>) -> Vec<Vec<u8>> {
     out
 }
 
+/// Rows of an ivec file: a 4-byte count then that many `i32`s, each.
+fn ivec_rows(path: &Path) -> Vec<Vec<i32>> {
+    let bytes = std::fs::read(path).unwrap();
+    let mut rows = Vec::new();
+    let mut at = 0usize;
+    while at + 4 <= bytes.len() {
+        let n = i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        at += 4;
+        let row: Vec<i32> = bytes[at..at + n * 4]
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        at += n * 4;
+        rows.push(row);
+    }
+    rows
+}
+
 fn mnodes(path: &Path, namespace: Option<&str>) -> Vec<MNode> {
     records(path, namespace)
         .iter()
@@ -385,6 +403,41 @@ fn e2e_topic_stratified_predicates() {
 
     // The answer keys: one results record per query; filtered facets sized to the queries.
     assert_eq!(records(&dataset.join("profiles/default/metadata_results.slab"), None).len(), QUERIES);
+
+    // A sized profile of 100 base rows, materialised the way an
+    // operator does it, then the run expands the per-profile steps for
+    // it: the KNN, the evaluation, and both filtered facets.
+    let out = Command::new(veks_bin())
+        .args(["prepare", "stratify"])
+        .arg(&dataset)
+        .args(["--spec", "100", "--yes"])
+        .output()
+        .expect("failed to execute veks prepare stratify");
+    assert!(out.status.success(), "stratify failed:\n{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let (ok, log) = run_pipeline(&dataset_yaml);
+    assert!(ok, "second run failed:\n{}", log);
+
+    // The sized profile's E is its own G intersected with its own R,
+    // in G's rank order, padded with -1 (SRD TS-176).
+    {
+        let g = ivec_rows(&dataset.join("profiles/100/neighbor_indices.ivecs"));
+        let e = ivec_rows(&dataset.join("profiles/100/postfiltered_neighbor_indices.ivec"));
+        let r = SlabReader::open(dataset.join("profiles/100/metadata_results.slab")).unwrap();
+        assert_eq!(g.len(), QUERIES);
+        assert_eq!(e.len(), QUERIES);
+        let mut survivors = 0usize;
+        for q in 0..QUERIES {
+            let rec = r.get(q as i64).unwrap();
+            let matches: Vec<i32> = rec.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+            assert!(matches.windows(2).all(|w| w[0] < w[1]), "R record {} is ascending", q);
+            assert!(matches.iter().all(|&o| (0..100).contains(&o)), "R record {} lies in the sized window", q);
+            let mut expected: Vec<i32> = g[q].iter().copied().filter(|o| *o >= 0 && matches.contains(o)).collect();
+            survivors += expected.len();
+            expected.resize(g[q].len(), -1);
+            assert_eq!(e[q], expected, "query {} E is G ∩ R of the sized profile", q);
+        }
+        assert!(survivors > 0, "the fixture's coarse cells give the sized profile survivors");
+    }
 
     // The strata verification passed with the labels re-derived.
     let report: serde_json::Value = serde_json::from_str(

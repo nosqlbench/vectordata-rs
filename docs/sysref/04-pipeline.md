@@ -256,6 +256,13 @@ evaluate-predicates (template, output: metadata_indices.ivvecs)
 The `phase` field controls ordering within expansion: all phase-0
 steps for all profiles run before any phase-1 steps.
 
+An expanded step is **scoped to its profile**: any facet it resolves
+by default — a `ground-truth` it does not name, say — comes from that
+profile's views, not from `default`. An explicit `profile` option
+still wins. Before this, the post-filter step of every sized profile
+intersected the census profile's neighbours with its own predicate
+results (SRD TS-176).
+
 ---
 
 ## 4.6 Resource Governance

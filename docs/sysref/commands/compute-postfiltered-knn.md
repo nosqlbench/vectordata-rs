@@ -71,6 +71,14 @@ facet would conflate algorithm error with semantic mismatch (F is
 *always* full K; the engine cannot deliver K when the predicate
 excludes its top-K candidates without expanding the scope).
 
+## Inputs by profile
+
+`ground-truth` and `ground-truth-distances`, when not given, are the
+`neighbor_indices` and `neighbor_distances` facets of the profile the
+step is scoped to: its own profile for an expanded per-profile step,
+the `profile` option or `default` otherwise. E for a sized profile is
+that profile's G intersected with that profile's R.
+
 ## Cost
 
 O(K log |R_q|) per query: each of the K unfiltered neighbours is

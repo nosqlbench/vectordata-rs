@@ -63,7 +63,10 @@ pub fn resolve_path_option(
     }
     let canonical = resolve_standard_key(facet_alias)
         .unwrap_or_else(|| facet_alias.to_string());
-    let profile_name = options.get("profile").unwrap_or("default");
+    let profile_name = options
+        .get("profile")
+        .or_else(|| (!ctx.profile.is_empty() && ctx.profile != "all").then_some(ctx.profile.as_str()))
+        .unwrap_or("default");
     Err(format!(
         "required option '{}' not set. The dataset's `{}` profile does not expose a `{}` facet — \
          either pass `--{} <path>`, choose a different profile with `--profile <name>`, \
@@ -86,10 +89,20 @@ fn lookup_facet(
     if !yaml_path.exists() {
         return Ok(None);
     }
-    let Ok(cfg) = DatasetConfig::load_and_resolve(&yaml_path) else {
-        return Ok(None);
-    };
-    let profile_name = options.get("profile").unwrap_or("default");
+    // A dataset that does not load is an error to report, not a facet
+    // that happens to be missing.
+    let cfg = DatasetConfig::load_and_resolve(&yaml_path)
+        .map_err(|e| format!("cannot load {}: {}", yaml_path.display(), e))?;
+    // An explicit `profile` option wins; otherwise the profile the
+    // step is scoped to — the runner narrows `ctx.profile` to a
+    // per-profile step's own profile — when the dataset has it; and
+    // `default` last. Resolving a sized profile's step against
+    // `default` gave every sized profile an E facet intersected with
+    // the census profile's neighbours (TS-176).
+    let profile_name = options
+        .get("profile")
+        .or_else(|| cfg.profiles.profile(&ctx.profile).map(|_| ctx.profile.as_str()))
+        .unwrap_or("default");
     let Some(profile) = cfg.profiles.profile(profile_name) else {
         return Ok(None);
     };
@@ -622,6 +635,55 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("dataset.yaml"), yaml).unwrap();
         tmp
+    }
+
+    /// A step scoped to a sized profile resolves that profile's facet;
+    /// a run-level selection that names no profile, or nothing, falls
+    /// to `default`; an explicit `profile` option wins over both.
+    #[test]
+    fn a_scoped_step_resolves_its_own_profiles_facet() {
+        let tmp = workspace_with(
+            "name: d\nprofiles:\n  default:\n    neighbor_indices: profiles/default/g.ivecs\n  100k:\n    base_count: 100000\n    neighbor_indices: profiles/100k/g.ivecs\n",
+        );
+        let mut ctx = ctx_at(tmp.path());
+        ctx.profile = "100k".into();
+        let got = resolve_path_option(&ctx, &Options::new(), "ground-truth", "neighbor_indices").unwrap();
+        assert!(got.ends_with("profiles/100k/g.ivecs"), "{got}");
+        ctx.profile = "all".into();
+        let got = resolve_path_option(&ctx, &Options::new(), "ground-truth", "neighbor_indices").unwrap();
+        assert!(got.ends_with("profiles/default/g.ivecs"), "{got}");
+        ctx.profile = String::new();
+        let got = resolve_path_option(&ctx, &Options::new(), "ground-truth", "neighbor_indices").unwrap();
+        assert!(got.ends_with("profiles/default/g.ivecs"), "{got}");
+        ctx.profile = "100k".into();
+        let mut o = Options::new();
+        o.set("profile", "default");
+        let got = resolve_path_option(&ctx, &o, "ground-truth", "neighbor_indices").unwrap();
+        assert!(got.ends_with("profiles/default/g.ivecs"), "{got}");
+    }
+
+    /// A profile materialised by `veks prepare stratify` — numeric
+    /// name, windowed base and metadata views — resolves its own
+    /// per-profile facets.
+    #[test]
+    fn a_materialised_sized_profile_resolves_its_own_facets() {
+        let tmp = workspace_with(
+            "name: d\nstrata:\n  one:\n    spec: \"100\"\n    series: [\"100\"]\nprofiles:\n  default:\n    maxk: 5\n    base_vectors: profiles/base/base_vectors.fvecs\n    neighbor_indices: profiles/default/neighbor_indices.ivecs\n    metadata_results: profiles/default/metadata_results.slab\n  100:\n    maxk: 5\n    base_count: 100\n    base_vectors:\n      source: profiles/base/base_vectors.fvecs\n      window: \"[0..100]\"\n    metadata_content:\n      source: profiles/base/metadata_content.slab\n      window: \"[0..100]\"\n    neighbor_indices: profiles/100/neighbor_indices.ivecs\n    neighbor_distances: profiles/100/neighbor_distances.fvecs\n",
+        );
+        let cfg = vectordata::dataset::DatasetConfig::load_and_resolve(&tmp.path().join("dataset.yaml"))
+            .unwrap_or_else(|e| panic!("load_and_resolve: {e}"));
+        let names: Vec<&String> = cfg.profiles.profiles.keys().collect();
+        assert!(cfg.profiles.profile("100").is_some(), "profile 100 missing; profiles are {names:?}");
+        let views: Vec<String> = cfg.profiles.profile("100").unwrap().views().map(|(k, _)| k.to_string()).collect();
+        assert!(views.iter().any(|k| k == "neighbor_indices"), "views of 100: {views:?}");
+        let mut ctx = ctx_at(tmp.path());
+        ctx.profile = "100".into();
+        let got = resolve_path_option(&ctx, &Options::new(), "ground-truth", "neighbor_indices").unwrap();
+        assert!(got.ends_with("profiles/100/neighbor_indices.ivecs"), "{got}");
+        // The materialised entry declares no predicate results; they
+        // are not default's either.
+        let err = resolve_path_option(&ctx, &Options::new(), "metadata-indices", "metadata_results").unwrap_err();
+        assert!(err.contains("`100` profile does not expose"), "{err}");
     }
 
     /// A single-file facet resolves to that file, as it always has.

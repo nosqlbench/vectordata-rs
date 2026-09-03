@@ -1458,6 +1458,21 @@ engine decoded every query's whole list once per partition, two
 hundred times at 200m. Both were the same mistake against the same
 fact.
 
+**TS-176.** **A per-profile step resolves its facets from its own
+profile.** When an expanded step does not name an input that a
+profile exposes as a facet — the unfiltered neighbours a post-filter
+step intersects with — the runner resolves it from the profile the
+step was expanded for, never from `default`; an explicit `profile`
+option still wins. *Measured on tessera, 2026-09-03:* the post-filter
+step of all 48 sized profiles took the census profile's neighbours,
+whose ordinals mostly lie beyond a sized window, so E at 100k had no
+survivor at all in a tenth of a second, and the post-filter verifier,
+which reads each profile's own G, refused six of fifty sampled queries
+at every sized profile and none at the census profile. Query 400, a
+ten-percent control range, has eleven matching neighbours at 100k and
+an E with none. The verifier caught it because it re-derives E from
+the profile's own facets; the producer now does the same.
+
 ## 8. Artifact register
 
 Every artifact this design introduces, named, located and formatted.
