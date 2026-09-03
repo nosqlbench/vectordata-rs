@@ -57,6 +57,11 @@ index of it, or a shard of it. The shards of a sharded facet
 accounted for by the series the manifest knows as `base_vectors.fvecs`
 or declares as `base_vectors__NNNN.fvecs`.
 
+A profile directory the definition no longer names — typically one a
+removed stratum generated — shows up here as extraneous; `veks prepare
+cleanup-profiles` is the remedy, since it also drops the profile's entry from
+the definition.
+
 The manifest is projected from the pipeline definition with the same
 variables a run sees: the upstream defaults, the dataset's `variables:`
 section, and `variables.yaml`. A step whose options name a variable a

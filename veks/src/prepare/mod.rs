@@ -10,6 +10,7 @@
 
 pub(crate) mod cache_compress;
 pub(crate) mod cache_gc;
+pub(crate) mod cleanup_profiles;
 pub(crate) mod cleanup;
 pub(crate) mod infer_manifest;
 pub mod import;
@@ -372,6 +373,17 @@ pub enum PrepareCommand {
         path: PathBuf,
 
         /// Dry run — show what would be removed without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove sized profiles that no stratum names — their entries under
+    /// `profiles:` and their `profiles/<name>/` directories — and profile
+    /// directories no entry names. The cache is left alone.
+    CleanupProfiles {
+        /// Dataset directory or path to dataset.yaml
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Dry run — show what would be removed without changing anything
         #[arg(long)]
         dry_run: bool,
     },
@@ -1058,6 +1070,9 @@ pub fn run(args: PrepareArgs) {
         }
         PrepareCommand::CacheGc { path, dry_run } => {
             cache_gc::run(&path, dry_run);
+        }
+        PrepareCommand::CleanupProfiles { path, dry_run } => {
+            cleanup_profiles::run(&path, dry_run);
         }
         PrepareCommand::CacheCompress { cache_dir, level, dry_run } => {
             crate::pipeline::gz_cache::set_compression_level(level);

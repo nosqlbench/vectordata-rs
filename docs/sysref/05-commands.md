@@ -122,6 +122,7 @@ palette.
 | `state set` / `state clear` | Pipeline variable management; `state set` with `attribute: true` writes a dataset attribute instead |
 | `download huggingface` | Download from Hugging Face Hub |
 | `download bulk` | Parallel bulk download (see config below) |
+| `veks prepare cleanup-profiles` | Housekeeping: drop sized profiles no stratum names and profile directories no entry names, without touching the cache |
 
 ### Bulkdl configuration
 
