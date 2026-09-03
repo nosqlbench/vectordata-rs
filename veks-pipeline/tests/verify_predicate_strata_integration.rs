@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `verify predicate-strata` holds a stratified predicate set's claims
-//! against the answer keys: exact counts at the census profile, bands
-//! at sized profiles above the threshold, one record per query, and
-//! every `query_in_filter` label re-derived from the queries' own rows
-//! (TS-167, TS-168).
+//! against the answer keys: exact counts at the census profile,
+//! credible counts under each record's sampling model at sized
+//! profiles, non-empty results above the floor and the threshold, one
+//! record per query, and every `query_in_filter` label re-derived from
+//! the queries' own rows (TS-167, TS-168, TS-173).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -127,23 +128,37 @@ fn predicates(path: &Path) -> Vec<PNode> {
 /// `drop` removes one ordinal from the first non-empty record, to plant
 /// a mismatch.
 fn write_results(path: &Path, preds: &[PNode], rows: &[MNode], n: usize, drop: bool) {
+    let mut dropped = false;
+    write_results_with(path, preds, rows, n, &mut |_, p, ordinals| {
+        // The planted mismatch goes on a censused predicate: a control
+        // predicate's count is by construction and is held to its draw.
+        if drop && !dropped && !ordinals.is_empty() && !p.to_string().contains("sample_bucket") {
+            ordinals.pop();
+            dropped = true;
+        }
+    });
+}
+
+/// Answer keys over the first `n` rows, each record's ordinals passed
+/// through `tamper` before they are written.
+fn write_results_with(
+    path: &Path,
+    preds: &[PNode],
+    rows: &[MNode],
+    n: usize,
+    tamper: &mut dyn FnMut(usize, &PNode, &mut Vec<i32>),
+) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let config = WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
     let mut w = SlabWriter::new(path, config).unwrap();
-    let mut dropped = false;
-    for p in preds {
+    for (i, p) in preds.iter().enumerate() {
         let mut ordinals: Vec<i32> = rows[..n]
             .iter()
             .enumerate()
             .filter(|(_, r)| evaluate(p, r))
             .map(|(i, _)| i as i32)
             .collect();
-        // The planted mismatch goes on a censused predicate: a control
-        // predicate's count is by construction and is band-checked.
-        if drop && !dropped && !ordinals.is_empty() && !p.to_string().contains("sample_bucket") {
-            ordinals.pop();
-            dropped = true;
-        }
+        tamper(i, p, &mut ordinals);
         let mut bytes = Vec::with_capacity(ordinals.len() * 4);
         for o in ordinals {
             bytes.extend_from_slice(&o.to_le_bytes());
@@ -189,6 +204,7 @@ fn verify(dir: &Path, extra: &[(&str, &str)]) -> (Status, String, StrataReport) 
     let mut o = Options::new();
     o.set("predicates", "profiles/base/predicates.slab");
     o.set("reliability-threshold", "1000");
+    o.set("min-matches", "5");
     o.set("output", ".cache/verify_predicate_strata.json");
     for (k, v) in extra {
         o.set(*k, *v);
@@ -203,7 +219,7 @@ fn verify(dir: &Path, extra: &[(&str, &str)]) -> (Status, String, StrataReport) 
 }
 
 #[test]
-fn claims_hold_at_the_census_profile_and_in_band_at_a_sized_one() {
+fn claims_hold_at_the_census_profile_and_are_credible_at_a_sized_one() {
     let dir = tmp_dir();
     build(dir.path());
     let (status, message, report) = verify(
@@ -221,10 +237,14 @@ fn claims_hold_at_the_census_profile_and_in_band_at_a_sized_one() {
     let census = report.profiles.iter().find(|p| p.profile == "default").unwrap();
     assert!(!sized.census_profile && sized.above_threshold);
     assert!(census.census_profile);
-    assert_eq!((census.exact_mismatches, sized.band_violations, sized.zero_matches), (0, 0, 0));
+    assert_eq!((census.exact_mismatches, sized.incredible_counts, sized.applicable_empty), (0, 0, 0));
+    assert!(sized.applicable > 0, "{:?}", sized);
+    assert!((sized.floor - (5.0 + 3.0 * 5f64.sqrt())).abs() < 1e-9);
+    assert_eq!(census.out_of_band, 0, "cells are assigned from the census count: {:?}", census);
+    assert_eq!(report.min_matches, 5);
     for (family, f) in &census.per_family {
         // Censused families are exact; the control family's count is by
-        // construction and lands within its band.
+        // construction and lands within its draw.
         let tolerance = if family == "control" { 1e-3 } else { 1e-12 };
         assert!(
             (f.mean_claimed_selectivity - f.mean_realised_selectivity).abs() < tolerance,
@@ -278,4 +298,72 @@ fn a_predicate_count_other_than_the_query_count_fails() {
     let (status, message, _) = verify(dir.path(), &[("queries", "profiles/base/query_vectors.fvecs")]);
     assert_eq!(status, Status::Error, "{}", message);
     assert!(message.contains("119"), "{}", message);
+}
+
+/// Below the threshold nothing is promised but the sampling model:
+/// empties where few matches are expected are predicted, not failed,
+/// and no record applies.
+#[test]
+fn below_the_threshold_counts_are_credible_and_empties_are_predicted() {
+    let dir = tmp_dir();
+    let (preds, rows, _) = build(dir.path());
+    write_results(&dir.path().join("profiles/300/metadata_results.slab"), &preds, &rows, 300, false);
+    let (status, message, report) = verify(dir.path(), &[]);
+    assert_eq!(status, Status::Ok, "{}", message);
+    let small = report.profiles.iter().find(|p| p.profile == "300").unwrap();
+    assert!(!small.above_threshold && !small.census_profile);
+    assert_eq!((small.incredible_counts, small.applicable, small.applicable_empty), (0, 0, 0));
+    assert!(small.empties_expected > 0.0, "{:?}", small);
+    assert!(
+        (small.empties as f64 - small.empties_expected).abs() <= 6.0 * small.empties_expected.sqrt() + 1.0,
+        "{} empties against {:.2} expected",
+        small.empties,
+        small.empties_expected
+    );
+    let control = &small.per_family["control"];
+    assert!((control.mean_claimed_selectivity - control.mean_realised_selectivity).abs() < 0.05);
+}
+
+/// A count the model cannot produce fails wherever it is, threshold
+/// or not: an empty record where thirty matches are expected.
+#[test]
+fn an_incredible_count_fails_even_below_the_threshold() {
+    let dir = tmp_dir();
+    let (preds, rows, _) = build(dir.path());
+    let mut emptied = None;
+    write_results_with(&dir.path().join("profiles/300/metadata_results.slab"), &preds, &rows, 300, &mut |i, _, ordinals| {
+        if emptied.is_none() && ordinals.len() >= 25 {
+            ordinals.clear();
+            emptied = Some(i);
+        }
+    });
+    assert!(emptied.is_some());
+    let (status, message, report) = verify(dir.path(), &[]);
+    assert_eq!(status, Status::Error, "{}", message);
+    assert!(message.contains("incredible"), "{}", message);
+    let small = report.profiles.iter().find(|p| p.profile == "300").unwrap();
+    assert_eq!((small.incredible_counts, small.applicable_empty), (1, 0));
+    assert!(small.first_violations[0].contains(&format!("query {} ", emptied.unwrap())), "{:?}", small.first_violations);
+}
+
+/// Above the threshold an empty record that clears the floor is named
+/// as such (TS-42), not merely as incredible.
+#[test]
+fn an_applicable_record_that_is_empty_fails_above_the_threshold() {
+    let dir = tmp_dir();
+    let (preds, rows, _) = build(dir.path());
+    let mut emptied = None;
+    write_results_with(&dir.path().join("profiles/3000/metadata_results.slab"), &preds, &rows, 3000, &mut |i, _, ordinals| {
+        if emptied.is_none() && ordinals.len() >= 60 {
+            ordinals.clear();
+            emptied = Some(i);
+        }
+    });
+    assert!(emptied.is_some());
+    let (status, message, report) = verify(dir.path(), &[]);
+    assert_eq!(status, Status::Error, "{}", message);
+    assert!(message.contains("1 empty among"), "{}", message);
+    let sized = report.profiles.iter().find(|p| p.profile == "3000").unwrap();
+    assert_eq!((sized.applicable_empty, sized.incredible_counts, sized.exact_mismatches), (1, 0, 0));
+    assert!(sized.first_violations[0].contains("above the floor"), "{:?}", sized.first_violations);
 }

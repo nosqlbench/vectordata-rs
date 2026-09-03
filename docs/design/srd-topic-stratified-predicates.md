@@ -1172,17 +1172,50 @@ generator's claims against the answer keys rather than trusting them:
 one record per query and both namespaces the same length (TS-156,
 TS-111); at the profile whose base is the census population, every
 censused record's realised match count equals its recorded
-`expected_count` exactly, and a control record's lies in its band
-(TS-115); at every other profile above the reliability threshold the
-realised selectivity lies in the record's half-decade band and no
-record is empty (TS-42, TS-43), while below the threshold only the
-control family is held to a non-empty result; and every
-`query_in_filter` label re-derives from the query's own row (TS-166).
-Realised counts are the results records' lengths, so the pass reads
-each profile's R facet once and decodes nothing. It writes a report
-per profile and per family and fails the pipeline on any violation,
-which is what TS-121 asked for: the acceptance is checked against R,
-not against the generator.
+`expected_count` exactly, and a control record's is credible under its
+binomial construction (TS-115); at every other profile every record's
+count is credible under its sampling model (TS-173), and above the
+reliability threshold a record that clears the profile's floor (TS-11,
+TS-51) is non-empty (TS-42); and every `query_in_filter` label
+re-derives from the query's own row (TS-166). Empties and
+out-of-band counts are reported at every profile, the empties against
+the number the models predict, so the reader sees the noise the
+design allows without the step failing on it. Realised counts are the
+results records' lengths, so the pass reads each profile's R facet
+once and decodes nothing. It writes a report per profile and per
+family and fails the pipeline on any violation, which is what TS-121
+asked for: the acceptance is checked against R, not against the
+generator.
+
+**TS-173.** **A sized profile's count is a draw, and is verified as
+one.** The base is a seeded shuffle of the population (TS-1), so the
+matches of a censused predicate with *K* matches in a population of
+*P*, seen through the first *N* rows, are distributed
+`Hypergeometric(P, K, N)`, mean *K·N/P*; the matches of a control
+predicate of selectivity *s* are `Binomial(N, s)` (TS-115). A realised
+count is **credible** when it lies inside the model's two-sided
+`1 − 10⁻⁹` region — the tail beyond it, away from the mean, holds at
+least `5·10⁻¹⁰` — computed exactly from the log-probability mass, not
+from a normal approximation, so that an empty record is credible up
+to about twenty-one expected matches and a count six sigma from a
+mean of a million is not. At the census profile the hypergeometric
+model degenerates to the exact count, so one rule covers the ladder.
+The floor *M + 3√M* (TS-11) decides which records apply to a profile
+(TS-51); above the threshold, an applicable record that is empty is a
+violation in its own right, though no credible draw produces it. The
+credibility level is set so that a correct build of ten thousand
+records at fifty profiles fails by chance once in two thousand
+builds; a count outside it is an evaluation error, a misaligned facet
+or a shuffle that is not one. *Measured on tessera, 2026-09-03, the
+build that exposed the earlier rule:* every profile below the
+threshold failed on empty control records — 1,769 at 100k, 967 at
+1m, 313 at 8m — the number the ladder predicts once the 1,210
+backfilled control records are counted, with the control family's
+mean realised selectivity within 0.06% of its claim at every profile;
+and every profile above it failed on band edges — a 10⁻⁵ record at
+3.59×10⁻⁵ against a band top of 3.16×10⁻⁵ at 10m, about two sigma —
+and on empty 10⁻⁷ records below the floor at that size. Nothing was
+wrong with the answer keys.
 
 ### 6.5 Recording embedding provenance
 
@@ -1796,8 +1829,9 @@ the next ranked terms and, failing that, appends the code.
 | `results` | Config | no | `metadata_results.slab` | the results facet's file name under each profile |
 | `queries` | Input | no | — | to check one record per query |
 | `query-metadata` | Input | no | — | to re-derive every `query_in_filter` label (TS-166) |
-| `reliability-threshold` | Config | no | `10000000` | *N*ᵣ (TS-46): above it every family holds its band and is non-empty |
-| `output` | Output | yes | — | report: per profile, per family, first violations |
+| `reliability-threshold` | Config | no | `10000000` | *N*ᵣ (TS-46): above it an applicable record is non-empty (TS-42) |
+| `min-matches` | Config | no | `100` | *M* in the floor *M + 3√M* that decides which records apply (TS-11, TS-51); the sampler's value |
+| `output` | Output | yes | — | report: per profile, per family, first violations, empties against their prediction |
 
 Profiles come from `dataset.yaml`, partition profiles excluded, or
 from the `profiles/` directory when the file does not load, with a
@@ -1927,8 +1961,14 @@ test itself over the fixture rows: a census profile and a sized
 profile pass; one ordinal removed from one censused record fails the
 census profile with exactly one mismatch; the same rows shifted by one
 query fail the label check; a query facet of another size fails the
-count check; and the control family, whose count is by construction,
-is held to its band rather than to an exact count.
+count check; the control family, whose count is by construction, is
+held to its draw rather than to an exact count; a profile below the
+threshold passes with its empties within the predicted number and no
+record applicable; an emptied record where thirty matches are expected
+fails there as not credible; and an emptied applicable record above
+the threshold fails as empty above the floor. The models themselves
+are tested to sum to one, to have their means, and to admit and refuse
+the counts TS-173 names.
 
 ## 13. Work breakdown
 
@@ -2060,12 +2100,24 @@ even global hash share stands meanwhile (TS-163).
 to the profile (TS-51) returns zero matches, and every
 `(family, decade)` cell above the floor is populated
 or its shortfall reported. Below *N*ᵣ the acceptance is weaker and
-deliberately so — the hash family is present and returns non-empty
-results, and nothing else is required.
+deliberately so — the hash family is present, every record's count is
+credible under its sampling model (TS-173), and nothing else is
+required. A control record whose expected count at *N* is small is
+empty as often as its draw says: at 100k a 10⁻⁷ record expects 0.01
+matches and is empty ninety-nine times in a hundred. An earlier
+revision of this requirement asked the control family to be non-empty
+below *N*ᵣ, which is impossible, and the verifier that held it failed
+every profile of a correct build (TS-173).
 
-**TS-43.** Realised selectivity of each predicate lies within its
-assigned half-decade band, verified against the R facet after
-evaluation rather than asserted at generation.
+**TS-43.** Each predicate's cell is assigned from its census count, so
+at the census profile its realised selectivity lies within the cell's
+half-decade band by construction, and the count is verified exactly
+against the R facet after evaluation rather than trusted at
+generation. At a sized profile the realised count is the shuffle's
+draw of that census count (TS-173): a predicate whose population
+selectivity sits near a band edge lands outside the band at a sized
+profile as often as sampling says, so the band is reported there, not
+required.
 
 **TS-44.** Regenerating with the same seed and configuration produces
 an identical predicate facet, byte for byte.

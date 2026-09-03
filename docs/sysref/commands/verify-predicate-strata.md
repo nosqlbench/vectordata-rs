@@ -13,12 +13,26 @@ wrote:
 - one record per query, and both annotation namespaces the same length;
 - at the profile whose base is the census population, every censused
   record's realised match count equals the recorded one exactly, and a
-  control record's lies in its half-decade band;
-- at every other profile above the reliability threshold, the realised
-  selectivity lies in the record's band and no record is empty; below
-  the threshold only the control family must be non-empty;
+  control record's is credible under its binomial construction;
+- at every other profile, every record's count is **credible** under
+  its sampling model: the base is a seeded shuffle, so a censused
+  predicate's matches in the first *N* rows are a hypergeometric draw
+  of its census count from the population, and a control predicate's
+  are a binomial draw at its constructed selectivity. A count is
+  credible when it lies inside the model's two-sided `1 − 1e-9`
+  region, computed exactly, so an empty record is credible up to about
+  twenty-one expected matches and a count six sigma from a mean of a
+  million is not;
+- above the reliability threshold, a record that clears the profile's
+  floor `M + 3√M` (`min-matches`) is non-empty;
 - every `query_in_filter` label agrees with evaluating the predicate
   against the query's own row.
+
+Sampling noise around a cell's half-decade band and empties where few
+matches are expected are what the models predict at a sized profile.
+They are reported — the empties against the number the models predict
+— and not failed. A control record at 1e-7 expects 0.01 matches at a
+100k base and is empty ninety-nine times in a hundred.
 
 Realised counts are the results records' lengths, so the pass reads each
 profile's results facet once and decodes nothing. It fails on any
@@ -40,6 +54,10 @@ predicate set.
   output: ${cache}/verify_predicate_strata.json
 ```
 
+`min-matches` defaults to the sampler's default; give it the sampler's
+value when that was changed, so both agree on which records apply to a
+profile.
+
 ## Options
 
 | Option | Role | Required | Default | Description |
@@ -48,27 +66,41 @@ predicate set.
 | `--results` | config | no | `metadata_results.slab` | Results facet file name under each profile directory |
 | `--queries` | input | no | — | Query vectors, to check that there is one predicate per query |
 | `--query-metadata` | input | no | — | The queries' own metadata rows, to re-derive every `query_in_filter` label |
-| `--reliability-threshold` | config | no | `10000000` | Base count from which every family must hold its band and be non-empty |
+| `--reliability-threshold` | config | no | `10000000` | Base count from which a record that clears the floor must be non-empty |
+| `--min-matches` | config | no | `100` | `M` in the floor `s·N ≥ M + 3√M` that decides which records apply to a profile |
 | `--output` | output | yes | — | JSON report: per profile, per family, first violations |
 
 ## Report
 
 ```json
 {
+  "schema_version": 2,
   "predicates": 10000,
   "query_count": 10000,
   "census_population": 495930736,
+  "reliability_threshold": 10000000,
+  "min_matches": 100,
   "label_checks": 10000,
   "label_disagreements": 0,
   "profiles": [
     {"profile": "100k", "base_count": 100000, "census_profile": false, "above_threshold": false,
-     "records": 10000, "exact_mismatches": 0, "band_violations": 0, "zero_matches": 0,
-     "control_zero_below_threshold": 0,
-     "per_family": {"control": {"records": 2500, "mean_claimed_selectivity": 0.0053, "mean_realised_selectivity": 0.0053}}}
+     "floor": 130.0, "records": 10000,
+     "exact_mismatches": 0, "incredible_counts": 0,
+     "applicable": 0, "applicable_empty": 0,
+     "empties": 1769, "empties_expected": 1761.4, "out_of_band": 4312,
+     "per_family": {"control": {"records": 3710, "mean_claimed_selectivity": 0.005536, "mean_realised_selectivity": 0.005539,
+                                "out_of_band": 1180, "empties": 1769}},
+     "first_violations": []}
   ],
   "violations": 0
 }
 ```
+
+`exact_mismatches`, `incredible_counts` and `applicable_empty` are
+violations. `empties`, `empties_expected`, `out_of_band` and
+`applicable` describe the profile: below the threshold nothing
+applies, and at a small base most of the finest cells are empty, as
+predicted.
 
 Profiles come from `dataset.yaml` (partition profiles excluded) or, when
 it does not load, from the `profiles/` directory with a sized profile's
