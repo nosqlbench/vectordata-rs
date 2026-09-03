@@ -101,22 +101,26 @@ A step is fresh when:
   recorded relative to the workspace, so a record reads the same from
   any working directory), AND
 - The step's node hashes under the **active selector** to the same
-  value as the node recorded for it, compared over the upstreams the
-  step **declares now**: an upstream only the recorded node names (a
+  value as the node recorded for it, compared over the upstreams
+  **both** nodes declare: an upstream only the recorded node names (a
   dependency since removed, or a sequencing edge an older build
-  recorded as one) cannot make the step stale, while a newly declared
-  upstream, or a declared one that changed, does, AND
-- No step it declares as an upstream (`after`) executed earlier in
-  this session, in any phase of the run — `after` is the data
-  dependency, so what the upstream just wrote is what this step
-  reads; sequencing edges do not count, AND
+  recorded as one) cannot make the step stale, a declared one that
+  changed does, and one declared since the record is judged by the
+  next rule, not by a hash the record never had, AND
+- No step it declares as an upstream (`after`) wrote a recorded
+  output after the step's own record — an upstream that ran again,
+  in this session or another, or one declared since and run later:
+  `after` is the data dependency, so what the upstream wrote is what
+  this step reads. An upstream without outputs, a variable set,
+  reaches its dependents through their resolved options instead;
+  sequencing edges do not count, AND
 - No input-role path is newer than the output (the Make rule), which
   carries a cascade across sessions: an upstream rebuilt yesterday
   makes its dependents stale today.
 
-A dry run applies the same rules to its plan: a step that would run
-counts as executed for its dependents, and a step whose input a
-planned step produces is shown as following it.
+A dry run applies the same rules to its plan: a planned step with
+outputs stands for outputs newer than its dependents' records, and a
+step whose input a planned step produces is shown as following it.
 
 #### Selectors and presets
 

@@ -1910,7 +1910,7 @@ fn e2e_rerun_cascades_to_dependents() {
     let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &["--rerun", "generate-shuffle"]);
     assert!(success, "{}", output);
     assert!(output.contains("--rerun generate-shuffle: record set aside"), "{}", output);
-    assert!(output.contains("extract-base — stale: upstream 'generate-shuffle' ran this session"), "{}", output);
+    assert!(output.contains("extract-base — stale: upstream 'generate-shuffle' wrote '"), "{}", output);
     assert!(output.contains("compute-knn — stale: upstream '"), "{}", output);
     assert!(mtime(&knn) > built, "the KNN output was not rebuilt");
 

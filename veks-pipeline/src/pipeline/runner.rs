@@ -124,6 +124,8 @@ pub fn run_steps(
     // would run too. Without this a dry run shows only the first hop
     // of a cascade.
     let mut planned_outputs: HashMap<PathBuf, String> = HashMap::new();
+    // Dry run: the planned steps that have outputs to write.
+    let mut planned_with_outputs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Summary counters for the final report.
     let mut skipped_count: usize = 0;
@@ -230,19 +232,32 @@ pub fn run_steps(
         // dependency (sequencing edges live apart), so what the
         // upstream just wrote is what this step reads. In a dry run
         // the steps that would run count the same way.
-        let upstream_ran: Option<String> = step
-            .def
-            .after
-            .iter()
-            .find(|u| ctx.progress.executed.contains(u.as_str()))
-            .cloned();
+        // In a dry run nothing is written, so a planned upstream with
+        // outputs stands for outputs newer than this step's record.
+        // An upstream without outputs — a variable set — cascades
+        // through the dependent's own resolved options instead.
+        let upstream_planned: Option<String> = if ctx.dry_run {
+            step.def.after.iter().find(|u| planned_with_outputs.contains(u.as_str())).cloned()
+        } else {
+            None
+        };
+        // An upstream that wrote a recorded output after this step's
+        // record — it ran again, in this session or another, or was
+        // declared since and ran later — makes the step stale: what it
+        // read is not what the upstream now holds.
+        let upstream_wrote: Option<(String, String)> = if ctx.dry_run {
+            None
+        } else {
+            ctx.progress.upstream_wrote_after(&step.id, &step.def.after, Some(&ctx.workspace))
+        };
         let progress_fresh = match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
-            None if provenance_reason.is_none() && upstream_ran.is_none() && planned_input.is_none() => true,
+            None if provenance_reason.is_none() && upstream_planned.is_none() && upstream_wrote.is_none() && planned_input.is_none() => true,
             None if provenance_reason.is_none() => {
-                let reason = match (&upstream_ran, &planned_input) {
-                    (Some(u), _) => format!("upstream '{}' ran this session", u),
-                    (None, Some((input, producer))) => format!("input '{}' is produced by '{}' in this plan", input, producer),
-                    (None, None) => unreachable!("one of the two made the step stale"),
+                let reason = match (&upstream_planned, &upstream_wrote, &planned_input) {
+                    (Some(u), _, _) => format!("upstream '{}' runs in this plan", u),
+                    (None, Some((u, path)), _) => format!("upstream '{}' wrote '{}' after this step's record", u, path),
+                    (None, None, Some((input, producer))) => format!("input '{}' is produced by '{}' in this plan", input, producer),
+                    (None, None, None) => unreachable!("one of the three made the step stale"),
                 };
                 ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id, reason));
                 false
@@ -401,9 +416,11 @@ pub fn run_steps(
             ctx.progress.executed.insert(step.id.clone());
             if let Some(ref output_path) = resolved_output {
                 planned_outputs.insert(resolve_in(output_path, &ctx.workspace), step.id.clone());
+                planned_with_outputs.insert(step.id.clone());
             }
             for produced in cmd.project_artifacts(&step.id, &options).outputs {
                 planned_outputs.insert(resolve_in(&produced, &ctx.workspace), step.id.clone());
+                planned_with_outputs.insert(step.id.clone());
             }
             let opts_summary: Vec<String> = resolved_opts
                 .iter()

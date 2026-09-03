@@ -1373,10 +1373,13 @@ step to the previous profile's. That chain is sequencing, not
 dependence: a profile's neighbours' answer keys do not change because
 it was added, removed or recomputed. So the chain is carried as
 `sequence_after`, which orders the run and contributes nothing to
-provenance, and the staleness comparison is made over the upstreams a
-step declares *now*, so a recorded node that still names a sequencing
-edge from an older build, or a neighbour since removed by
-`veks prepare cleanup-profiles`, compares equal. *Measured on tessera,
+provenance, and the staleness comparison is made over the upstreams
+the recorded node and the current one *both* declare, so a recorded
+node that still names a sequencing edge from an older build, or a
+neighbour since removed by `veks prepare cleanup-profiles`, compares
+equal; an upstream declared since the record is judged by whether it
+wrote an output after the record, which is also how an upstream that
+ran again in another session is caught. *Measured on tessera,
 2026-09-03:* dropping the 36 profiles of the removed `linear` stratum
 had marked the nine largest KNN answer keys stale — 128mi through
 `default` — purely through the chain; with this, all 49 remain fresh.
@@ -1482,7 +1485,15 @@ materialised profile is the authority at load, and a per-profile
 facet the profile does not declare is absent rather than `default`'s.
 And a shared step naming a per-profile template as its upstream — the
 verifiers, the finalize steps — depended on the default instance
-alone; it now depends on every instance.
+alone; it now depends on every instance, and an upstream declared
+since a step's record makes it stale by having written an output
+later, not by a hash the record never held, so declaring the fan-in
+on a built dataset re-runs nothing that already saw its upstreams.
+A record's own time is not that signal: a record is rewritten for
+reasons that reproduce nothing, and on tessera the count of the base
+was recorded before the extraction it follows had finished its last
+pass, with the same value — judged by record time it would have
+re-run, and every KNN step behind it.
 
 ## 8. Artifact register
 

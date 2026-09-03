@@ -1349,10 +1349,7 @@ fn explain_staleness(
                 stale_count += 1;
             }
             Some(stored) => {
-                let keys: std::collections::BTreeSet<&str> = graph
-                    .get(&current)
-                    .map(|n| n.upstream.keys().map(String::as_str).collect())
-                    .unwrap_or_default();
+                let keys = graph.shared_upstream_keys(&current, stored);
                 let stored_hash = graph.hash_restricted(stored, selector, &keys);
                 if stored_hash.is_some() && stored_hash == graph.hash_restricted(&current, selector, &keys) {
                     println!("  {} {} — fresh", term::ok("✓"), step.id);

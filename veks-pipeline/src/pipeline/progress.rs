@@ -70,10 +70,9 @@ pub struct ProgressLog {
     /// first `save` keeps the original file beside the rewritten one.
     migrated_from: Option<u32>,
     /// Steps that executed in this session — or, in a dry run, would
-    /// — across every phase of the run. A step whose declared upstream
-    /// is here is stale whatever its record says: `after` is the data
-    /// dependency, so what the upstream just wrote is what this step
-    /// reads. Never persisted.
+    /// — across every phase of the run. Never persisted. Staleness
+    /// itself follows what an upstream wrote (`upstream_wrote_after`);
+    /// this is the record of the session.
     pub executed: HashSet<String>,
 }
 
@@ -404,14 +403,14 @@ impl ProgressLog {
         match self.steps.get(step_id) {
             Some(record) => match record.provenance.as_deref() {
                 Some(stored) => {
-                    // Compare over the upstreams the step declares now: an
-                    // upstream only the recorded node names cannot make the
-                    // step stale (TS-169).
-                    let keys: std::collections::BTreeSet<&str> = self
-                        .provenance
-                        .get(current)
-                        .map(|n| n.upstream.keys().map(String::as_str).collect())
-                        .unwrap_or_default();
+                    // Compare over the upstreams both nodes declare: an
+                    // upstream only the recorded node names cannot make
+                    // the step stale (TS-169), and one only the current
+                    // node names — a dependency declared since the
+                    // record — is judged by when it completed, not by a
+                    // hash the record never had (see
+                    // `upstream_completed_after`).
+                    let keys = self.provenance.shared_upstream_keys(current, stored);
                     let stored_hash = self.provenance.hash_restricted(stored, selector, &keys);
                     let current_hash = self.provenance.hash_restricted(current, selector, &keys);
                     if stored_hash.is_some() && stored_hash == current_hash {
@@ -439,6 +438,35 @@ impl ProgressLog {
             },
             None => Some("not recorded".to_string()),
         }
+    }
+
+    /// The first of `after` that wrote a recorded output after this
+    /// step's own record — an upstream that ran again since, in this
+    /// session or another, or one declared since the record and run
+    /// later — with the output that shows it. What this step read is
+    /// not what the upstream now holds. A step or upstream without a
+    /// record, an upstream without outputs (a variable set), or an
+    /// output no longer on disk is nothing to compare: a variable's
+    /// change shows in the dependent's own resolved options.
+    pub fn upstream_wrote_after(
+        &self,
+        step_id: &str,
+        after: &[String],
+        workspace: Option<&Path>,
+    ) -> Option<(String, String)> {
+        let mine: std::time::SystemTime = self.steps.get(step_id)?.completed_at.into();
+        for upstream in after {
+            let Some(record) = self.steps.get(upstream.as_str()) else { continue };
+            for output in &record.outputs {
+                let written = std::fs::metadata(resolve_path(&output.path, workspace))
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                if written.is_some_and(|w| w > mine) {
+                    return Some((upstream.clone(), output.path.clone()));
+                }
+            }
+        }
+        None
     }
 
     /// Derive the progress log path from a dataset.yaml path.
@@ -1387,12 +1415,52 @@ mod tests {
         log.record_step("count-base", rec(Some(base2)));
         let current = log.build_provenance("compute-knn-128mi", "compute knn", &opts, &["count-base"], "2.0.0+abc");
         assert!(log.check_provenance("compute-knn-128mi", &current, ProvenanceFlags::CONFIG_ONLY).is_some());
-        // And a newly declared upstream the record never had is a change.
+        // A newly declared upstream the record never had is not a change
+        // by provenance: it is judged by when it completed.
         let extra = log.build_provenance("extract-queries", "transform extract", &opts, &[], "2.0.0+abc");
         log.record_step("extract-queries", rec(Some(extra)));
         log.record_step("count-base", rec(Some(base)));
         let current = log.build_provenance("compute-knn-128mi", "compute knn", &opts, &["count-base", "extract-queries"], "2.0.0+abc");
-        assert!(log.check_provenance("compute-knn-128mi", &current, ProvenanceFlags::CONFIG_ONLY).is_some());
+        assert!(log.check_provenance("compute-knn-128mi", &current, ProvenanceFlags::CONFIG_ONLY).is_none());
+    }
+
+    /// An upstream that wrote a recorded output after the step's own
+    /// record makes the step stale; an older output, an upstream
+    /// without outputs, or one without a record does not.
+    #[test]
+    fn an_upstream_that_wrote_after_the_record_makes_a_step_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let write_at = |name: &str, when: std::time::SystemTime| {
+            let p = ws.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(when).unwrap();
+        };
+        let now = std::time::SystemTime::now();
+        let ago = |secs: u64| now - std::time::Duration::from_secs(secs);
+        write_at("old.bin", ago(120));
+        write_at("new.bin", ago(10));
+        let mut log = ProgressLog::new();
+        let with_output = |path: &str| {
+            let mut r = rec(None);
+            r.outputs = vec![OutputRecord { path: path.to_string(), size: 1, mtime: None }];
+            r.completed_at = chrono::Utc::now() - chrono::Duration::seconds(300);
+            r
+        };
+        let mut mine = rec(None);
+        mine.completed_at = chrono::DateTime::<chrono::Utc>::from(ago(60));
+        log.record_step("verify-knn", mine);
+        log.record_step("extract-base", with_output("old.bin"));
+        log.record_step("compute-knn-100k", with_output("new.bin"));
+        log.record_step("count-base", rec(None)); // a variable set: no outputs
+        let after = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(log.upstream_wrote_after("verify-knn", &after(&["extract-base", "count-base"]), Some(ws)), None);
+        assert_eq!(
+            log.upstream_wrote_after("verify-knn", &after(&["extract-base", "compute-knn-100k"]), Some(ws)),
+            Some(("compute-knn-100k".to_string(), "new.bin".to_string()))
+        );
+        assert_eq!(log.upstream_wrote_after("verify-knn", &after(&["never-ran"]), Some(ws)), None);
+        assert_eq!(log.upstream_wrote_after("no-record", &after(&["compute-knn-100k"]), Some(ws)), None);
     }
 
     /// An unknown older schema still clears the log, as before.

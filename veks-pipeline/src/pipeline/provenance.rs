@@ -383,6 +383,18 @@ impl ProvenanceGraph {
         Some(format!("{:016x}", h.finish()))
     }
 
+    /// The upstream ids two nodes both declare: the keys a restricted
+    /// comparison between them is made over.
+    pub fn shared_upstream_keys(&self, a: &str, b: &str) -> std::collections::BTreeSet<&str> {
+        let keys_of = |addr: &str| -> std::collections::BTreeSet<&str> {
+            self.nodes
+                .get(addr)
+                .map(|n| n.upstream.keys().map(String::as_str).collect())
+                .unwrap_or_default()
+        };
+        keys_of(a).intersection(&keys_of(b)).copied().collect()
+    }
+
     /// The addresses reachable from `roots`, roots included.
     fn reachable_from<'a>(&self, roots: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
         let mut seen: HashSet<String> = HashSet::new();
