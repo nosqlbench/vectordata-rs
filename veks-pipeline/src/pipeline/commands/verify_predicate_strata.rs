@@ -215,6 +215,19 @@ fails on any violation.
         vec![]
     }
 
+    /// The facets named by option are the manifest's inputs; the
+    /// per-profile results facets are discovered, not named, and are
+    /// other steps' outputs. The report is the one output.
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> crate::pipeline::command::ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id,
+            self.command_path(),
+            options,
+            &["predicates", "queries", "query-metadata"],
+            &["output"],
+        )
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
         let predicates_path = match options.require("predicates") {
