@@ -105,7 +105,18 @@ A step is fresh when:
   step **declares now**: an upstream only the recorded node names (a
   dependency since removed, or a sequencing edge an older build
   recorded as one) cannot make the step stale, while a newly declared
-  upstream, or a declared one that changed, does
+  upstream, or a declared one that changed, does, AND
+- No step it declares as an upstream (`after`) executed earlier in
+  this session, in any phase of the run — `after` is the data
+  dependency, so what the upstream just wrote is what this step
+  reads; sequencing edges do not count, AND
+- No input-role path is newer than the output (the Make rule), which
+  carries a cascade across sessions: an upstream rebuilt yesterday
+  makes its dependents stale today.
+
+A dry run applies the same rules to its plan: a step that would run
+counts as executed for its dependents, and a step whose input a
+planned step produces is shown as following it.
 
 #### Selectors and presets
 
@@ -201,8 +212,8 @@ starts from a known-correct state.
 - **`veks run --rerun STEP[,STEP...]`** — run the named steps again
   whether or not they look fresh. Their records are set aside for the
   run, so the freshness check finds nothing recorded and the step
-  executes; everything downstream that reads its outputs follows
-  through the input-newer rule. This is the tool for a build that
+  executes; every step that declares it as an upstream follows, and
+  so does anything whose input it rewrites. This is the tool for a build that
   changed what one step computes without changing any option: the
   config-only selector cannot see it, and `strict` would re-run the
   whole ladder, ground truth included.

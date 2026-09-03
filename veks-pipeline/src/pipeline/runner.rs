@@ -11,7 +11,7 @@
 //! - Dry-run mode: prints the execution plan without running anything
 //! - Progress tracking: records each step's result in the progress log
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -113,8 +113,6 @@ pub fn run_steps(
     }
 
     // Track which steps actually executed (not skipped) for cascade invalidation.
-    // If an upstream step ran, all downstream dependents must also run.
-    let mut executed_steps: HashSet<String> = HashSet::new();
     // Dry run: the outputs the plan would produce, by absolute path,
     // with the step producing each. At run time a step whose input is
     // newer than its output re-executes (the Make rule below); a dry
@@ -224,22 +222,27 @@ pub fn run_steps(
         } else {
             None
         };
+        // A declared upstream that executed in this session makes the
+        // step stale whatever its record says: `after` is the data
+        // dependency (sequencing edges live apart), so what the
+        // upstream just wrote is what this step reads. In a dry run
+        // the steps that would run count the same way.
+        let upstream_ran: Option<String> = step
+            .def
+            .after
+            .iter()
+            .find(|u| ctx.progress.executed.contains(u.as_str()))
+            .cloned();
         let progress_fresh = match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
-            None if provenance_reason.is_none() && planned_input.is_some() => {
-                let (input, producer) = planned_input.as_ref().expect("planned input");
-                ctx.ui.log(&format!(
-                    "{} {} — would follow: input '{}' is produced by '{}' in this plan",
-                    prefix, step.id, input, producer
-                ));
-                false
-            }
+            None if provenance_reason.is_none() && upstream_ran.is_none() && planned_input.is_none() => true,
             None if provenance_reason.is_none() => {
-                skipped_count += 1;
-                step_outcomes.push((step.id.clone(), false, "fresh".into()));
-                ctx.ui.log(&format!("{} {} — fresh, skipping", prefix, step.id));
-                dlog.log(&format!("  [skip] {} — fresh", step.id));
-                overall_pb.inc(1);
-                continue;
+                let reason = match (&upstream_ran, &planned_input) {
+                    (Some(u), _) => format!("upstream '{}' ran this session", u),
+                    (None, Some((input, producer))) => format!("input '{}' is produced by '{}' in this plan", input, producer),
+                    (None, None) => unreachable!("one of the two made the step stale"),
+                };
+                ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id, reason));
+                false
             }
             None => {
                 // Outputs/options match but provenance changed — upstream config or build changed
@@ -263,75 +266,45 @@ pub fn run_steps(
         // 5. Check artifact state — only when progress log confirmed the step
         //    succeeded previously. Without provenance, artifact existence alone
         //    is not trustworthy (could be stale from a different configuration).
+        //    A fresh step with no output to check is simply fresh.
         let resolved_output = resolved_opts.get("output").cloned();
+        if progress_fresh && resolved_output.is_none() {
+            skipped_count += 1;
+            step_outcomes.push((step.id.clone(), false, "fresh".into()));
+            ctx.ui.log(&format!("{} {} — fresh, skipping", prefix, step.id));
+            dlog.log(&format!("  [skip] {} — fresh", step.id));
+            overall_pb.inc(1);
+            continue;
+        }
         if progress_fresh && let Some(ref output_path) = resolved_output {
-            let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
-                PathBuf::from(output_path)
-            } else {
-                ctx.workspace.join(output_path)
-            };
-
-            let state = cmd.check_artifact(&full_path, &options);
-            match state {
-                ArtifactState::Complete => {
-                    // Make-style freshness: if any input is newer than the
-                    // output, the artifact is stale even if structurally valid.
-                    let output_mtime = std::fs::metadata(&full_path)
-                        .ok()
-                        .and_then(|m| m.modified().ok());
-                    let input_newer = output_mtime.is_some_and(|out_t| {
-                        let descs = cmd.describe_options();
-                        resolved_opts.iter().any(|(key, val)| {
-                            // Check if this option is an Input-role path
-                            let is_input = descs.iter().any(|d| d.name == *key && d.role == super::command::OptionRole::Input);
-                            if !is_input { return false; }
-                            // Strip window notation for path check
-                            let clean_path = PathBuf::from(val.split('[').next().unwrap_or(val));
-                            let check_path = if clean_path.is_absolute() { clean_path } else { ctx.workspace.join(clean_path) };
-                            std::fs::metadata(&check_path)
-                                .ok()
-                                .and_then(|m| m.modified().ok())
-                                .is_some_and(|in_t| in_t > out_t)
-                        })
-                    });
-
-                    if input_newer {
-                        ctx.ui.log(&format!("{} {} — artifact exists but input is newer, re-executing", prefix, step.id));
-                        // Fall through to execution
-                    } else {
-                    skipped_count += 1;
-                    step_outcomes.push((step.id.clone(), false, "artifact complete".into()));
-                    ctx.ui.log(&format!("{} {} — artifact complete, skipping", prefix, step.id));
-                    dlog.log(&format!("  [skip] {} — artifact complete", step.id));
-                    ctx.progress.record_step(
-                        &step.id,
-                        StepRecord {
-                            status: Status::Ok,
-                            message: "artifact already complete".to_string(),
-                            completed_at: Utc::now(),
-                            elapsed_secs: 0.0,
-                            outputs: vec![OutputRecord {
-                                path: output_path.clone(),
-                                size: std::fs::metadata(&full_path)
-                                    .map(|m| m.len())
-                                    .unwrap_or(0),
-                                mtime: None,
-                            }],
-                            resolved_options: resolved_opts.iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect(),
-                            error: None,
-                            resource_summary: None,
-                            provenance: Some(provenance.clone()),
-                        },
-                    );
-                    if let Err(e) = ctx.progress.save() {
-                        ctx.ui.log(&format!("  warning: failed to save progress: {}", e));
+            let full_path = resolve_in(output_path, &ctx.workspace);
+            // The output's time: the file's, or the newest shard's when
+            // the option names a sharded series.
+            let output_mtime = std::fs::metadata(&full_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .or_else(|| {
+                    vectordata::dataset::shards::discover_shards(&full_path)
+                        .iter()
+                        .filter_map(|s| std::fs::metadata(s).ok().and_then(|m| m.modified().ok()))
+                        .max()
+                });
+            // Make-style freshness: an input newer than the output makes
+            // the step stale even when the record and the artifact agree.
+            let newer_input: Option<String> = output_mtime.and_then(|out_t| {
+                let descs = cmd.describe_options();
+                resolved_opts.iter().find_map(|(key, val)| {
+                    let is_input = descs.iter().any(|d| d.name == *key && d.role == super::command::OptionRole::Input);
+                    if !is_input {
+                        return None;
                     }
-                    overall_pb.inc(1);
-                    continue;
-                    } // end else (not input_newer)
-                }
+                    let in_t = std::fs::metadata(resolve_in(val, &ctx.workspace))
+                        .ok()
+                        .and_then(|m| m.modified().ok())?;
+                    (in_t > out_t).then(|| val.clone())
+                })
+            });
+            match cmd.check_artifact(&full_path, &options) {
                 ArtifactState::Partial => {
                     match step.def.on_partial {
                         OnPartial::Restart => {
@@ -359,25 +332,28 @@ pub fn run_steps(
                         prefix, step.id, output_path
                     ));
                 }
-                ArtifactState::Absent => {
-                    if let Some(parent) = full_path.parent()
-                        && !parent.exists() && !ctx.dry_run {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                }
-                ArtifactState::Unknown(ref reason) => {
-                    let msg = format!(
-                        "step '{}': artifact check failed: {}",
-                        step.id, reason,
-                    );
-                    if ctx.dry_run {
-                        ctx.ui.log(&format!("{} {} — ERROR: {}", prefix, step.id, msg));
+                _ => {
+                    // Complete — or nothing the command can judge at
+                    // the option path: a sharded series, an output
+                    // named another way. The record verified every
+                    // recorded output by size, so it stands, unless an
+                    // input is newer.
+                    if let Some(input) = newer_input {
+                        ctx.ui.log(&format!(
+                            "{} {} — stale: input '{}' is newer than the output",
+                            prefix, step.id, input
+                        ));
                     } else {
-                        return Err(msg);
+                        skipped_count += 1;
+                        step_outcomes.push((step.id.clone(), false, "fresh".into()));
+                        ctx.ui.log(&format!("{} {} — fresh, skipping", prefix, step.id));
+                        dlog.log(&format!("  [skip] {} — fresh", step.id));
+                        overall_pb.inc(1);
+                        continue;
                     }
                 }
             }
-        } // close if !upstream_ran + if let Some(output_path)
+        }
 
         // Ensure output directory exists even when skipping artifact check
         if let Some(ref output_path) = resolved_output {
@@ -419,6 +395,7 @@ pub fn run_steps(
 
         // 6b. Dry-run: print plan line and continue
         if ctx.dry_run {
+            ctx.progress.executed.insert(step.id.clone());
             if let Some(ref output_path) = resolved_output {
                 planned_outputs.insert(resolve_in(output_path, &ctx.workspace), step.id.clone());
             }
@@ -685,7 +662,7 @@ pub fn run_steps(
 
         match result.status {
             Status::Ok | Status::Warning => {
-                executed_steps.insert(step.id.clone());
+                ctx.progress.executed.insert(step.id.clone());
                 executed_count += 1;
                 overall_pb.inc(1);
                 total_elapsed += elapsed;

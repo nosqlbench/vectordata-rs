@@ -350,11 +350,18 @@ fn read_fvec_vectors(path: &Path) -> Vec<Vec<f32>> {
 
 /// Run `veks run` on a dataset directory and return (success, output).
 fn run_pipeline(dataset_yaml: &Path) -> (bool, String) {
+    run_pipeline_with(dataset_yaml, "batch", &[])
+}
+
+/// `veks run` with an output mode and extra flags; `basic` output
+/// carries every per-step decision line.
+fn run_pipeline_with(dataset_yaml: &Path, output_mode: &str, extra: &[&str]) -> (bool, String) {
     let output = Command::new(veks_bin())
         .arg("run")
-        .arg("--output").arg("batch")
+        .arg("--output").arg(output_mode)
         .arg("--threads")
         .arg("2")
+        .args(extra)
         .arg(dataset_yaml)
         .output()
         .expect("failed to execute veks");
@@ -1869,3 +1876,51 @@ fn e2e_partition_profile_config() {
     // (may not be present in legacy fixtures — skip if absent)
 }
 
+
+/// A step that ran makes every step declaring it as an upstream stale,
+/// across the run's phases, and `--rerun` is how a fresh step is made
+/// to run again: the shuffle re-runs, the extracts and the KNN follow,
+/// and a plain run in between touches nothing.
+#[test]
+fn e2e_rerun_cascades_to_dependents() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
+    let out = tmp.path().join("dataset");
+    let mut args = default_args("e2e-rerun", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    veks::prepare::import::run(args);
+    let dataset_yaml = out.join("dataset.yaml");
+    let (success, output) = run_pipeline(&dataset_yaml);
+    assert!(success, "pipeline failed:\n{}", output);
+    let knn = out.join("profiles/default/neighbor_indices.ivecs");
+    let mtime = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+    let built = mtime(&knn);
+
+    // Nothing changed: nothing runs.
+    let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &[]);
+    assert!(success, "{}", output);
+    assert!(output.contains("compute-knn — fresh, skipping"), "{}", output);
+    assert!(!output.contains("— stale:"), "{}", output);
+    assert_eq!(mtime(&knn), built, "a plain run rewrote the KNN output");
+
+    // Re-run the shuffle: what reads it follows, down to the KNN.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &["--rerun", "generate-shuffle"]);
+    assert!(success, "{}", output);
+    assert!(output.contains("--rerun generate-shuffle: record set aside"), "{}", output);
+    assert!(output.contains("extract-base — stale: upstream 'generate-shuffle' ran this session"), "{}", output);
+    assert!(output.contains("compute-knn — stale: upstream '"), "{}", output);
+    assert!(mtime(&knn) > built, "the KNN output was not rebuilt");
+
+    // And once more, everything is fresh again.
+    let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &[]);
+    assert!(success, "{}", output);
+    assert!(!output.contains("— stale:"), "{}", output);
+
+    // A name that matches no step is refused.
+    let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &["--rerun", "no-such-step"]);
+    assert!(!success, "an unknown step was accepted:\n{}", output);
+    assert!(output.contains("names no step"), "{}", output);
+}

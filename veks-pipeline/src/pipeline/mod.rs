@@ -308,8 +308,9 @@ pub struct RunArgs {
 
     /// Re-run these steps (by expanded id, comma-separated or repeated)
     /// whether or not they look fresh: their records are set aside for
-    /// this run, so they execute again and everything that reads their
-    /// outputs follows through the input-newer rule. This is how a
+    /// this run, so they execute again, every step that declares them
+    /// as an upstream follows, and so does anything whose input they
+    /// rewrite. This is how a
     /// step is repeated after a build changed what it computes without
     /// changing any option — the case `--provenance` cannot express
     /// without re-running the whole ladder.
@@ -887,11 +888,13 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         let known: std::collections::HashSet<&str> = pipeline_dag.steps.iter().map(|s| s.id.as_str()).collect();
         let unknown: Vec<&String> = rerun.iter().filter(|id| !known.contains(id.as_str())).collect();
         if !unknown.is_empty() {
-            return Err(format!(
+            let msg = format!(
                 "--rerun names no step: {}; steps are {}",
                 unknown.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", "),
                 pipeline_dag.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", ")
-            ));
+            );
+            ctx.ui.log(&format!("Error: {}", msg));
+            return Err(msg);
         }
         for id in &rerun {
             if ctx.progress.steps.remove(id).is_some() {

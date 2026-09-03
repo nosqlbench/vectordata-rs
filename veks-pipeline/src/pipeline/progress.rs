@@ -18,6 +18,7 @@
 //! rebuilt from the records they duplicated.
 
 use std::collections::{BTreeMap, HashMap};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -68,6 +69,12 @@ pub struct ProgressLog {
     /// The schema version `load` migrated this log from, if any. The
     /// first `save` keeps the original file beside the rewritten one.
     migrated_from: Option<u32>,
+    /// Steps that executed in this session — or, in a dry run, would
+    /// — across every phase of the run. A step whose declared upstream
+    /// is here is stale whatever its record says: `after` is the data
+    /// dependency, so what the upstream just wrote is what this step
+    /// reads. Never persisted.
+    pub executed: HashSet<String>,
 }
 
 /// The on-disk log: the graph, then the records by step id in sorted
@@ -262,6 +269,7 @@ impl ProgressLog {
             steps: HashMap::new(),
             provenance: ProvenanceGraph::new(),
             migrated_from: None,
+            executed: HashSet::new(),
         };
         if !path.exists() {
             return Ok((empty(), None));
