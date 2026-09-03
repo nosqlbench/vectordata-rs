@@ -78,3 +78,4 @@ Every command with a working example run against the
 | [veks check](./veks-check.md) | Preflight checks |
 | [veks run](./veks-run.md) | Execute pipeline |
 | [veks prepare cleanup-profiles](./veks-prepare-cleanup-profiles.md) | Remove sized profiles no stratum names, and profile directories no entry names; the cache is left alone |
+| [veks prepare cache-gc](./veks-prepare-cache-gc.md) | Remove cache files nothing in the definition can use; liveness from the manifest, recorded outputs and each command's cache claims |

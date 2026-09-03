@@ -1204,8 +1204,9 @@ where they are known to be correct.
 ### 6.6 What is cache and what is retained
 
 **TS-84.** Intermediates that can be recomputed live under `.cache/`
-and are removable by `veks prepare cache-gc`. Retained adjuncts live in
-the dataset and are not:
+and are removable by `veks prepare cache-gc` once nothing in the
+definition can use them (TS-172). Retained adjuncts live in the dataset
+and are not:
 
 | artifact | where | why |
 |---|---|---|
@@ -1364,6 +1365,26 @@ held 82 distinct prefixes, one per profile, and the segment for rows
 0–1,000,000 sixty-four times over; 49 profiles would have evaluated
 about 3.5 G rows for a facet of 496 M. Cached segments of the old
 keying are orphans for `cache-gc`.
+
+**TS-172.** **Housekeeping keeps everything the current definition
+can use.** `veks prepare cache-gc` decides liveness from the pipeline's
+own knowledge, never from a list of names it carries: the manifest
+projection (every cache path a step names, whether or not the registry
+knows the command or its variables resolve yet), the recorded outputs
+of steps still in the definition, and the cache claims each command
+declares for what it keeps under the cache beyond its manifest — a KNN
+engine's segments for a `(base, query)` pair across every `k` and
+metric, a facet's predicate-key segments under their content key
+(TS-171), an extract's resume partitions (TS-170) — together with the
+sidecar and gzip twins of anything live. A directory holding a live
+entry is walked, not removed. *Measured on tessera, 2026-09-02, the
+reason for this requirement:* the previous rule, a fixed name list plus
+a text scan of the progress log that matched none of its recorded
+outputs, removed the topic assignments, the assignment margin, the
+enriched metadata, the survey, the consolidated KNN verification
+report, every `knn-blas` segment and the extract resume directories;
+the run that followed recomputed all of them, the KNN verification by
+brute force.
 
 ## 8. Artifact register
 

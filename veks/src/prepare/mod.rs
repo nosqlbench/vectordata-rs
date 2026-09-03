@@ -365,8 +365,11 @@ pub enum PrepareCommand {
         #[command(subcommand)]
         command: CatalogSubcommand,
     },
-    /// Remove orphaned cache files from .cache/ that are no longer
-    /// referenced by the current pipeline configuration.
+    /// Remove files under .cache/ that nothing in the current pipeline
+    /// can use: not named by any step, not recorded as an output of a
+    /// step still defined, not claimed by a command's cache (KNN engine
+    /// segments, predicate-key segments, extract resume partitions),
+    /// and not the sidecar or gzip twin of any of those.
     CacheGc {
         /// Dataset directory or path to dataset.yaml
         #[arg(default_value = ".")]

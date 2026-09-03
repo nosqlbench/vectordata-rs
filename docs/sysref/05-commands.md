@@ -123,6 +123,7 @@ palette.
 | `download huggingface` | Download from Hugging Face Hub |
 | `download bulk` | Parallel bulk download (see config below) |
 | `veks prepare cleanup-profiles` | Housekeeping: drop sized profiles no stratum names and profile directories no entry names, without touching the cache |
+| `veks prepare cache-gc` | Housekeeping: remove cache files nothing in the definition can use — not named by a step, not recorded by a defined step, not claimed by an engine's cache, not a twin of those |
 
 ### Bulkdl configuration
 
