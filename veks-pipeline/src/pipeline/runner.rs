@@ -115,6 +115,14 @@ pub fn run_steps(
     // Track which steps actually executed (not skipped) for cascade invalidation.
     // If an upstream step ran, all downstream dependents must also run.
     let mut executed_steps: HashSet<String> = HashSet::new();
+    // Dry run: the outputs the plan would produce, by absolute path,
+    // with the step producing each. At run time a step whose input is
+    // newer than its output re-executes (the Make rule below); a dry
+    // run has no new timestamps, so it plays the same rule against
+    // the plan — a step reading what an earlier planned step writes
+    // would run too. Without this a dry run shows only the first hop
+    // of a cascade.
+    let mut planned_outputs: HashMap<PathBuf, String> = HashMap::new();
 
     // Summary counters for the final report.
     let mut skipped_count: usize = 0;
@@ -203,7 +211,28 @@ pub fn run_steps(
         //    if an upstream's recorded provenance differs (under the
         //    same selector), this step's hash differs.
         let provenance_reason = ctx.progress.check_provenance(&step.id, &provenance, selector);
+        let planned_input: Option<(String, String)> = if ctx.dry_run && !planned_outputs.is_empty() {
+            let descs = cmd.describe_options();
+            resolved_opts.iter().find_map(|(key, val)| {
+                let is_input = descs.iter().any(|d| d.name == *key && d.role == super::command::OptionRole::Input);
+                if !is_input {
+                    return None;
+                }
+                let path = resolve_in(val, &ctx.workspace);
+                planned_outputs.get(&path).map(|producer| (val.clone(), producer.clone()))
+            })
+        } else {
+            None
+        };
         let progress_fresh = match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
+            None if provenance_reason.is_none() && planned_input.is_some() => {
+                let (input, producer) = planned_input.as_ref().expect("planned input");
+                ctx.ui.log(&format!(
+                    "{} {} — would follow: input '{}' is produced by '{}' in this plan",
+                    prefix, step.id, input, producer
+                ));
+                false
+            }
             None if provenance_reason.is_none() => {
                 skipped_count += 1;
                 step_outcomes.push((step.id.clone(), false, "fresh".into()));
@@ -390,6 +419,12 @@ pub fn run_steps(
 
         // 6b. Dry-run: print plan line and continue
         if ctx.dry_run {
+            if let Some(ref output_path) = resolved_output {
+                planned_outputs.insert(resolve_in(output_path, &ctx.workspace), step.id.clone());
+            }
+            for produced in cmd.project_artifacts(&step.id, &options).outputs {
+                planned_outputs.insert(resolve_in(&produced, &ctx.workspace), step.id.clone());
+            }
             let opts_summary: Vec<String> = resolved_opts
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, v))
@@ -880,4 +915,11 @@ fn step_record_from_result(
         resource_summary,
         provenance,
     }
+}
+
+/// A path as an option names it — relative to the workspace or
+/// absolute, with any `[window]` stripped — as an absolute path.
+fn resolve_in(value: &str, workspace: &Path) -> PathBuf {
+    let clean = PathBuf::from(value.split('[').next().unwrap_or(value));
+    if clean.is_absolute() { clean } else { workspace.join(clean) }
 }

@@ -41,7 +41,7 @@ Pipeline: 18 steps in topological order (profile: all)
 | Option | Description |
 |--------|-------------|
 | `--clean` | Reset pipeline (remove generated artifacts, preserve symlinks) |
-| `--dry-run` | Show plan without executing |
+| `--dry-run` | Show the plan without executing; a step whose input a planned step produces is shown as following it |
 | `--output tui\|basic\|batch` | Display mode |
 | `--resources 'mem:25%-50%'` | Resource governance |
 | `--governor maximize\|conservative\|fixed` | Governor strategy |
