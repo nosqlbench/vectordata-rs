@@ -735,9 +735,26 @@ fn get_system_ram() -> Option<u64> {
 /// Point-in-time snapshot of system resource usage.
 #[derive(Debug, Clone, Serialize)]
 pub struct SystemSnapshot {
-    /// Resident set size in bytes.
+    /// Resident set size in bytes, everything mapped and resident:
+    /// anonymous memory, shared memory, and file-backed pages of
+    /// mapped files.
     pub rss_bytes: u64,
-    /// RSS as percentage of system RAM.
+    /// Anonymous resident memory in bytes: heap, stacks, private
+    /// pages — what the process owns and the kernel cannot reclaim.
+    pub rss_anon_bytes: u64,
+    /// File-backed resident pages in bytes: pages of mapped files the
+    /// process has touched. They are the page cache seen through a
+    /// mapping, reclaimable at any moment, and a pass over an mmap'd
+    /// base counts as much of the base here as it has touched.
+    pub rss_file_bytes: u64,
+    /// Shared memory resident in bytes.
+    pub rss_shmem_bytes: u64,
+    /// Memory the process holds — anonymous plus shared — as a
+    /// percentage of system RAM. This, not `rss_bytes`, is what the
+    /// governor's bands and ceiling are held against: file-backed
+    /// pages are the kernel's to drop, and counting them aborted a
+    /// step that had touched 667 GB of a mapped base while owning a
+    /// few gigabytes (tessera, 2026-09-03).
     pub rss_pct: f64,
     /// CPU user time percentage (0-100 per core × num cores).
     pub cpu_user_pct: f64,
@@ -775,11 +792,19 @@ pub struct SystemSnapshot {
 }
 
 impl SystemSnapshot {
+    /// Memory the process holds: anonymous plus shared resident pages,
+    /// or the total when the kernel gives no breakdown.
+    pub fn held(&self) -> u64 {
+        held_bytes(self.rss_bytes, self.rss_anon_bytes, self.rss_shmem_bytes)
+    }
+
     /// Sample current system state (Linux: from /proc/self/stat and /proc/self/io).
     pub fn sample() -> Self {
         let (rss_bytes, major_faults, minor_faults, utime, stime) = read_proc_self_stat_full();
+        let (rss_anon_bytes, rss_file_bytes, rss_shmem_bytes) = read_proc_self_status_rss();
         let system_ram = get_system_ram().unwrap_or(1);
-        let rss_pct = (rss_bytes as f64 / system_ram as f64) * 100.0;
+        let held = held_bytes(rss_bytes, rss_anon_bytes, rss_shmem_bytes);
+        let rss_pct = (held as f64 / system_ram as f64) * 100.0;
         let (io_read, io_write) = read_proc_self_io();
         let active_threads = read_proc_self_threads();
         let (io_inflight_read, io_inflight_write) = read_diskstats_inflight();
@@ -811,6 +836,9 @@ impl SystemSnapshot {
 
         SystemSnapshot {
             rss_bytes,
+            rss_anon_bytes,
+            rss_file_bytes,
+            rss_shmem_bytes,
             rss_pct,
             cpu_user_pct,
             cpu_system_pct,
@@ -850,6 +878,46 @@ impl SystemSnapshot {
 /// Read RSS, page fault counts, and CPU times from /proc/self/stat.
 ///
 /// Returns (rss_bytes, major_faults, minor_faults, utime_ticks, stime_ticks).
+/// Memory the process holds: anonymous plus shared resident pages.
+/// When the breakdown is unavailable (a kernel without `RssAnon` in
+/// `/proc/self/status`, or another OS), the total is all there is.
+fn held_bytes(rss_bytes: u64, rss_anon_bytes: u64, rss_shmem_bytes: u64) -> u64 {
+    if rss_anon_bytes == 0 && rss_shmem_bytes == 0 {
+        rss_bytes
+    } else {
+        rss_anon_bytes + rss_shmem_bytes
+    }
+}
+
+/// `(RssAnon, RssFile, RssShmem)` in bytes from `/proc/self/status`;
+/// zeros where the kernel does not report them.
+fn read_proc_self_status_rss() -> (u64, u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/self/status") {
+            return parse_status_rss(&content);
+        }
+        (0, 0, 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (0, 0, 0)
+    }
+}
+
+/// Parse the `Rss*` lines of a `/proc/<pid>/status` text.
+fn parse_status_rss(content: &str) -> (u64, u64, u64) {
+    let kb = |key: &str| -> u64 {
+        content
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024
+    };
+    (kb("RssAnon:"), kb("RssFile:"), kb("RssShmem:"))
+}
+
 fn read_proc_self_stat_full() -> (u64, u64, u64, u64, u64) {
     #[cfg(target_os = "linux")]
     {
@@ -1346,6 +1414,10 @@ enum GovernorLogEntry {
         ts: String,
         step_id: String,
         rss_bytes: u64,
+        #[serde(default)]
+        rss_anon_bytes: u64,
+        #[serde(default)]
+        rss_file_bytes: u64,
         rss_pct: f64,
         cpu_user_pct: f64,
         cpu_system_pct: f64,
@@ -1582,10 +1654,11 @@ impl ResourceGovernor {
 
                     let snapshot = SystemSnapshot::sample();
 
-                    // Quick RSS-based throttle/emergency check
+                    // Quick RSS-based throttle/emergency check, against
+                    // the memory the process holds (see `rss_pct`).
                     if mem_ceiling > 0 {
                         let rss_pct_of_ceiling =
-                            (snapshot.rss_bytes as f64 / mem_ceiling as f64) * 100.0;
+                            (snapshot.held() as f64 / mem_ceiling as f64) * 100.0;
 
                         if rss_pct_of_ceiling >= MEM_EMERGENCY {
                             emergency.store(true, Ordering::Relaxed);
@@ -1845,6 +1918,8 @@ impl ResourceGovernor {
                 ts: chrono::Utc::now().to_rfc3339(),
                 step_id: step_id.clone(),
                 rss_bytes: snapshot.rss_bytes,
+                rss_anon_bytes: snapshot.rss_anon_bytes,
+                rss_file_bytes: snapshot.rss_file_bytes,
                 rss_pct: snapshot.rss_pct,
                 cpu_user_pct: snapshot.cpu_user_pct,
                 cpu_system_pct: snapshot.cpu_system_pct,
@@ -2061,9 +2136,12 @@ impl ResourceStatusSource {
         if let Some(mem_budget) = self.budget.get("mem") {
             let ceiling = mem_budget.ceiling();
             metrics.rss_ceiling_bytes = ceiling;
-            parts.push(format!("rss: {}/{}", format_value("mem", snapshot.rss_bytes), format_value("mem", ceiling)));
+            parts.push(format!("rss: {}/{}", format_value("mem", snapshot.held()), format_value("mem", ceiling)));
         } else {
-            parts.push(format!("rss: {}", format_value("mem", snapshot.rss_bytes)));
+            parts.push(format!("rss: {}", format_value("mem", snapshot.held())));
+        }
+        if snapshot.rss_file_bytes > 0 {
+            parts.push(format!("mapped: {}", format_value("mem", snapshot.rss_file_bytes)));
         }
 
         // CPU usage — instantaneous % from tick deltas between samples
@@ -2207,7 +2285,7 @@ impl ResourceStatusSource {
             let ceiling = mem_budget.ceiling();
             if ceiling > 0 {
                 let snapshot = SystemSnapshot::sample();
-                let pct = (snapshot.rss_bytes as f64 / ceiling as f64) * 100.0;
+                let pct = (snapshot.held() as f64 / ceiling as f64) * 100.0;
                 (pct - 100.0).max(0.0)
             } else {
                 0.0
@@ -2254,6 +2332,19 @@ fn format_value(name: &str, value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ceiling is held against anonymous plus shared memory; the
+    /// file-backed pages of a mapped base are reported, not counted.
+    #[test]
+    fn held_memory_excludes_mapped_file_pages() {
+        let status = "Name:\tveks\nVmRSS:\t  700000000 kB\nRssAnon:\t   4000000 kB\nRssFile:\t 695000000 kB\nRssShmem:\t   1000000 kB\n";
+        let (anon, file, shmem) = parse_status_rss(status);
+        assert_eq!((anon, file, shmem), (4_000_000 * 1024, 695_000_000 * 1024, 1_000_000 * 1024));
+        assert_eq!(held_bytes(700_000_000 * 1024, anon, shmem), 5_000_000 * 1024);
+        // No breakdown: the total is all there is.
+        assert_eq!(held_bytes(123, 0, 0), 123);
+        assert_eq!(parse_status_rss("Name:\tx\n"), (0, 0, 0));
+    }
 
     #[test]
     fn test_parse_plain_integers() {
@@ -2402,6 +2493,9 @@ mod tests {
         // RSS at 75% — nominal, no adjustments
         let snapshot = SystemSnapshot {
             rss_bytes: 0,
+            rss_anon_bytes: 0,
+            rss_file_bytes: 0,
+            rss_shmem_bytes: 0,
             rss_pct: 75.0,
             cpu_user_pct: 50.0,
             cpu_system_pct: 5.0,
@@ -2435,6 +2529,9 @@ mod tests {
 
         let snapshot = SystemSnapshot {
             rss_bytes: 0,
+            rss_anon_bytes: 0,
+            rss_file_bytes: 0,
+            rss_shmem_bytes: 0,
             rss_pct: 96.0,
             cpu_user_pct: 80.0,
             cpu_system_pct: 5.0,
@@ -2468,6 +2565,9 @@ mod tests {
 
         let snapshot = SystemSnapshot {
             rss_bytes: 0,
+            rss_anon_bytes: 0,
+            rss_file_bytes: 0,
+            rss_shmem_bytes: 0,
             rss_pct: 99.0,
             cpu_user_pct: 100.0,
             cpu_system_pct: 0.0,
@@ -2628,7 +2728,7 @@ mod tests {
     #[test]
     fn test_page_cache_hit_ratio() {
         let prev = SystemSnapshot {
-            rss_bytes: 0, rss_pct: 0.0,
+            rss_bytes: 0, rss_anon_bytes: 0, rss_file_bytes: 0, rss_shmem_bytes: 0, rss_pct: 0.0,
             cpu_user_pct: 0.0, cpu_system_pct: 0.0,
             io_read_bps: 0, io_write_bps: 0,
             major_faults: 0, minor_faults: 0,
@@ -2653,7 +2753,7 @@ mod tests {
     #[test]
     fn test_page_cache_hit_ratio_no_faults() {
         let s = SystemSnapshot {
-            rss_bytes: 0, rss_pct: 0.0,
+            rss_bytes: 0, rss_anon_bytes: 0, rss_file_bytes: 0, rss_shmem_bytes: 0, rss_pct: 0.0,
             cpu_user_pct: 0.0, cpu_system_pct: 0.0,
             io_read_bps: 0, io_write_bps: 0,
             major_faults: 0, minor_faults: 0,

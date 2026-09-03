@@ -193,6 +193,15 @@ Memory pressure is classified into bands that drive governor decisions:
 | THROTTLE | 90–95% | Commands told to slow down |
 | EMERGENCY | > 95% | Aggressive reclamation to prevent OOM |
 
+"RSS" here is the memory the process holds: anonymous plus shared
+resident pages (`RssAnon` + `RssShmem`). The file-backed pages of a
+mapped file that the process has touched are the page cache seen
+through a mapping, reclaimable by the kernel at any moment; the status
+line reports them as `mapped:` and the bands never count them. A pass
+over an mmap'd base once counted every page it touched, and the
+governor aborted a step that held a few gigabytes because it had
+touched 667 GB of a 820 GB base.
+
 ### Strategies
 
 | Strategy | Behavior |
