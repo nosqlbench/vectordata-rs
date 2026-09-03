@@ -30,11 +30,7 @@ pub fn check_artifact_default(output: &Path, _options: &Options) -> ArtifactStat
         // the format, so each is checked as one.
         let shards = vectordata::dataset::discover_shards(output);
         if !shards.is_empty() {
-            return shards
-                .iter()
-                .map(|s| check_artifact_default(s, _options))
-                .find(|state| *state != ArtifactState::Complete)
-                .unwrap_or(ArtifactState::Complete);
+            return check_series(output, &shards, _options);
         }
         return ArtifactState::Absent;
     }
@@ -163,13 +159,47 @@ fn check_xvec_completeness(file_size: u64, format: VecFormat) -> ArtifactState {
 /// 2. Count marker: if a `.count` sidecar exists, the file's record count
 ///    must match. This catches interruptions at record boundaries.
 pub fn check_xvec_alignment(path: &Path) -> ArtifactState {
+    match xvec_record_count(path) {
+        Ok(records) => verified_count_state(path, records),
+        Err(state) => state,
+    }
+}
+
+/// A facet written across shards (SH-35): every shard must be a
+/// structurally complete file of the format, and the series as a
+/// whole — not any one shard — is held to the verified count recorded
+/// for its unsharded name. Holding each shard to the series' count, or
+/// to an entry of its own that no producer writes, called every
+/// complete series partial.
+fn check_series(series: &Path, shards: &[std::path::PathBuf], options: &Options) -> ArtifactState {
+    let xvec = VecFormat::detect(series).is_some_and(|f| f.is_xvec());
+    if !xvec {
+        return shards
+            .iter()
+            .map(|s| check_artifact_default(s, options))
+            .find(|state| *state != ArtifactState::Complete)
+            .unwrap_or(ArtifactState::Complete);
+    }
+    let mut total = 0u64;
+    for shard in shards {
+        match xvec_record_count(shard) {
+            Ok(records) => total += records,
+            Err(state) => return state,
+        }
+    }
+    verified_count_state(series, total)
+}
+
+/// The records in an xvec file whose size is record-aligned; the state
+/// it is in otherwise.
+fn xvec_record_count(path: &Path) -> Result<u64, ArtifactState> {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(_) => return ArtifactState::Absent,
+        Err(_) => return Err(ArtifactState::Absent),
     };
     let file_size = meta.len();
     if file_size < 4 {
-        return if file_size == 0 { ArtifactState::Complete } else { ArtifactState::Partial };
+        return if file_size == 0 { Ok(0) } else { Err(ArtifactState::Partial) };
     }
 
     // Read dimension from first 4 bytes
@@ -177,60 +207,56 @@ pub fn check_xvec_alignment(path: &Path) -> ArtifactState {
         Ok(mut f) => {
             use std::io::Read;
             let mut buf = [0u8; 4];
-            if f.read_exact(&mut buf).is_err() { return ArtifactState::Partial; }
+            if f.read_exact(&mut buf).is_err() {
+                return Err(ArtifactState::Partial);
+            }
             i32::from_le_bytes(buf) as u64
         }
-        Err(_) => return ArtifactState::Absent,
+        Err(_) => return Err(ArtifactState::Absent),
     };
 
     if dim == 0 || dim > 100_000 {
-        return ArtifactState::Partial;
+        return Err(ArtifactState::Partial);
     }
 
     let format = match VecFormat::detect(path) {
         Some(f) => f,
-        None => return ArtifactState::Complete,
+        None => return Ok(0),
     };
     let elem_size = format.element_size() as u64;
-    if elem_size == 0 { return ArtifactState::Complete; }
+    if elem_size == 0 {
+        return Ok(0);
+    }
 
     let record_stride = 4 + dim * elem_size;
     if file_size % record_stride != 0 {
-        return ArtifactState::Partial;
+        return Err(ArtifactState::Partial);
     }
+    Ok(file_size / record_stride)
+}
 
-    let actual_records = file_size / record_stride;
-
-    // Check verified count from variables.yaml — written by pipeline
-    // commands after successful output. If the variable exists, the file's
-    // record count must match. This catches interruptions at record
-    // boundaries that pass the alignment check.
-    //
-    // Walk up from the output file to find variables.yaml — outputs may
-    // be in .cache/ (1 level), profiles/name/ (2 levels), or deeper.
+/// Hold an xvec artifact's record count to the `verified_count:<name>`
+/// its producer recorded in `variables.yaml`, when it recorded one — a
+/// count written after the output, so a mismatch is an interruption at
+/// a record boundary that alignment cannot see. No entry is no
+/// evidence: an older producer wrote none, a shard of a series has
+/// none of its own, and the runner's own record already guards a
+/// completed step against interruption.
+///
+/// `variables.yaml` is looked for up to four directories above the
+/// artifact — outputs may be in `.cache/`, `profiles/name/`, or
+/// deeper.
+fn verified_count_state(path: &Path, actual_records: u64) -> ArtifactState {
     let var_name = format!("verified_count:{}",
         path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
     if let Some(workspace) = find_workspace_with_variables(path)
-        && let Ok(vars) = crate::pipeline::variables::load(&workspace) {
-            if let Some(expected_str) = vars.get(&var_name)
-                && let Ok(expected) = expected_str.parse::<u64>() {
-                    if actual_records != expected {
-                        return ArtifactState::Partial;
-                    }
-                    return ArtifactState::Complete;
-                }
-            // variables.yaml exists but has no entry for this file.
-            // The command either didn't write one (older code) or was
-            // interrupted after creating the file but before writing
-            // the count. Treat as Partial — the failsafe catches
-            // record-boundary truncations.
-            return ArtifactState::Partial;
-        }
-
-    // No variables.yaml found at all (e.g., after --restart, or first
-    // run). Fall back to record-alignment check only — a record-aligned
-    // file is likely complete. Requiring verified_count here would force
-    // re-execution of every step after any variables.yaml deletion.
+        && let Ok(vars) = crate::pipeline::variables::load(&workspace)
+        && let Some(expected_str) = vars.get(&var_name)
+        && let Ok(expected) = expected_str.parse::<u64>()
+        && actual_records != expected
+    {
+        return ArtifactState::Partial;
+    }
     ArtifactState::Complete
 }
 
@@ -328,6 +354,67 @@ mod tests {
         std::fs::write(&path, b"numpy data").unwrap();
         let state = check_artifact_default(&path, &Options::new());
         assert_eq!(state, ArtifactState::Complete);
+    }
+
+    fn write_fvecs(path: &Path, dim: usize, records: usize) {
+        let mut bytes = Vec::new();
+        for r in 0..records {
+            bytes.extend_from_slice(&(dim as i32).to_le_bytes());
+            for d in 0..dim {
+                bytes.extend_from_slice(&((r * dim + d) as f32).to_le_bytes());
+            }
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn workspace_with(vars: &[(&str, &str)]) -> tempfile::TempDir {
+        let ws = tempfile::tempdir().unwrap();
+        let mut map = indexmap::IndexMap::new();
+        for (k, v) in vars {
+            map.insert((*k).to_string(), (*v).to_string());
+        }
+        crate::pipeline::variables::save(ws.path(), &map).unwrap();
+        ws
+    }
+
+    /// A sharded series is complete when every shard aligns and the
+    /// shards together hold the count verified for the series' own
+    /// name; no shard is held to that count, and none needs an entry
+    /// of its own.
+    #[test]
+    fn a_sharded_series_is_judged_as_a_whole() {
+        let ws = workspace_with(&[("verified_count:base.fvecs", "6"), ("base_count", "6")]);
+        let series = ws.path().join("profiles/base/base.fvecs");
+        write_fvecs(&ws.path().join("profiles/base/base__0000.fvecs"), 2, 4);
+        write_fvecs(&ws.path().join("profiles/base/base__0001.fvecs"), 2, 2);
+        assert_eq!(check_artifact_default(&series, &Options::new()), ArtifactState::Complete);
+
+        // Fewer records than verified: an interruption at a shard boundary.
+        std::fs::remove_file(ws.path().join("profiles/base/base__0001.fvecs")).unwrap();
+        assert_eq!(check_artifact_default(&series, &Options::new()), ArtifactState::Partial);
+
+        // A misaligned shard is partial whatever the count says.
+        write_fvecs(&ws.path().join("profiles/base/base__0001.fvecs"), 2, 2);
+        let mut bytes = std::fs::read(ws.path().join("profiles/base/base__0001.fvecs")).unwrap();
+        bytes.pop();
+        std::fs::write(ws.path().join("profiles/base/base__0001.fvecs"), bytes).unwrap();
+        assert_eq!(check_artifact_default(&series, &Options::new()), ArtifactState::Partial);
+    }
+
+    /// A record-aligned xvec with no verified count on file is
+    /// complete: the absence of an entry is not evidence.
+    #[test]
+    fn an_aligned_xvec_without_a_verified_count_is_complete() {
+        let ws = workspace_with(&[("base_count", "3")]);
+        let path = ws.path().join(".cache/other.fvecs");
+        write_fvecs(&path, 3, 3);
+        assert_eq!(check_artifact_default(&path, &Options::new()), ArtifactState::Complete);
+        // With an entry that disagrees, it is partial.
+        let ws = workspace_with(&[("verified_count:other.fvecs", "4")]);
+        let path = ws.path().join(".cache/other.fvecs");
+        write_fvecs(&path, 3, 3);
+        assert_eq!(check_artifact_default(&path, &Options::new()), ArtifactState::Partial);
     }
 
     #[test]
