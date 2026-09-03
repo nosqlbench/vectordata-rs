@@ -16,15 +16,17 @@
 //!
 //! Cheap to compute: the producer reads `G` (neighbor_indices), `D`
 //! (neighbor_distances, optional), and `R` (metadata_indices) only —
-//! no base/query rereads, no distance recomputation. Cost is O(K) per
-//! query for the intersection test plus an O(|R|) membership-set
-//! construction.
+//! no base/query rereads, no distance recomputation. Cost is O(K log
+//! |R|) per query: each of the K neighbours is looked up by binary
+//! search in the query's results record, which is ascending by
+//! construction (TS-175), on the record's bytes as mapped. Nothing of
+//! R is decoded or copied; an earlier version hashed every matching
+//! ordinal of every query to answer the same K questions.
 //!
 //! See `docs/design/prefilter-postfilter-facets.md` for context, and
 //! `compute prefiltered-knn` for the perfect-recall pre-filter sibling
 //! (F facet).
 
-use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -287,12 +289,6 @@ sign convention (FAISS publication convention for KNN outputs from
         for q in 0..n {
             let g_row = gt_reader.get_slice(q);
             let d_row: Option<&[f32]> = gt_dist_reader.as_ref().map(|r| r.get_slice(q));
-            let r_ords = match keys_reader.get_ordinals(q) {
-                Ok(v) => v,
-                Err(e) => return error_result(format!("read R record {}: {}", q, e), start),
-            };
-            // Hash-set membership: O(K) tests * O(1) hash.
-            let r_set: HashSet<i32> = r_ords.into_iter().collect();
 
             if let Err(e) = idx_writer.write_all(&dim_le) {
                 return error_result(format!("write indices header: {}", e), start);
@@ -310,7 +306,12 @@ sign convention (FAISS publication convention for KNN outputs from
             let mut emitted = 0usize;
             for (i, &ord) in g_row.iter().enumerate() {
                 if ord < 0 { continue; } // G sentinel
-                if !r_set.contains(&ord) { continue; }
+                // Membership by binary search on the ascending record.
+                match keys_reader.contains(q, ord) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => return error_result(e, start),
+                }
                 if let Err(e) = idx_writer.write_all(&ord.to_le_bytes()) {
                     return error_result(format!("write F index q={}: {}", q, e), start);
                 }

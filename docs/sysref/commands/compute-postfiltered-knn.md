@@ -73,7 +73,14 @@ excludes its top-K candidates without expanding the scope).
 
 ## Cost
 
-Single-pass O(|R_q|) per query for set construction plus O(K) per
-query for the membership tests. The producer does **not** open base
-or query vectors and does **not** recompute distances. On a 10K-query
-dataset this typically completes in under a second.
+O(K log |R_q|) per query: each of the K unfiltered neighbours is
+looked up by binary search in the query's results record, which is
+ascending by construction (SRD TS-175), on the record's bytes as
+mapped. Nothing of R is decoded or copied, and the record's order is
+checked around every probe. The producer does **not** open base or
+query vectors and does **not** recompute distances.
+
+An earlier version decoded each query's whole match list and hashed
+every ordinal to answer the same K questions, so it cost the sum of
+all match lists: 251 s at a 144M base on tessera, growing with the
+base.
