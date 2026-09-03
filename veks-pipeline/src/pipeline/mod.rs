@@ -305,6 +305,16 @@ pub struct RunArgs {
     /// understanding *why* a step is going to re-run.
     #[arg(long)]
     pub explain_staleness: bool,
+
+    /// Re-run these steps (by expanded id, comma-separated or repeated)
+    /// whether or not they look fresh: their records are set aside for
+    /// this run, so they execute again and everything that reads their
+    /// outputs follows through the input-newer rule. This is how a
+    /// step is repeated after a build changed what it computes without
+    /// changing any option — the case `--provenance` cannot express
+    /// without re-running the whole ladder.
+    #[arg(long, value_name = "STEP[,STEP...]")]
+    pub rerun: Vec<String>,
 }
 
 /// CLI arguments for `veks script`.
@@ -860,6 +870,36 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
             // Then show the panic
             prev_hook(info);
         }));
+    }
+
+    // Steps the user asked to run again: set their records aside so
+    // the freshness check finds nothing recorded. A name that matches
+    // no step is an error, not a silent no-op.
+    let rerun: Vec<String> = args
+        .rerun
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !rerun.is_empty() {
+        let known: std::collections::HashSet<&str> = pipeline_dag.steps.iter().map(|s| s.id.as_str()).collect();
+        let unknown: Vec<&String> = rerun.iter().filter(|id| !known.contains(id.as_str())).collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "--rerun names no step: {}; steps are {}",
+                unknown.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", "),
+                pipeline_dag.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        for id in &rerun {
+            if ctx.progress.steps.remove(id).is_some() {
+                ctx.ui.log(&format!("--rerun {}: record set aside; the step runs again", id));
+            } else {
+                ctx.ui.log(&format!("--rerun {}: no record; the step runs anyway", id));
+            }
+        }
     }
 
     // Explain-staleness mode: walk every step under the active

@@ -174,6 +174,7 @@ run), the command returns immediately without re-running anything.
             output: "auto".to_string(),
             provenance: crate::pipeline::provenance::ProvenanceFlags::DEFAULT_NAME.to_string(),
             explain_staleness: false,
+            rerun: vec![],
         };
 
         if let Err(e) = crate::pipeline::run_pipeline(run_args) {

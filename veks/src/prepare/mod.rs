@@ -1166,6 +1166,7 @@ fn run_recursive(args: crate::pipeline::RunArgs) {
             output: args.output.clone(),
             provenance: args.provenance.clone(),
             explain_staleness: args.explain_staleness,
+            rerun: args.rerun.clone(),
         };
 
         // Catch panics so one dataset failure doesn't abort the rest.

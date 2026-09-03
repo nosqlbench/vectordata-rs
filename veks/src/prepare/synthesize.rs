@@ -162,6 +162,7 @@ pub(crate) fn run(args: SynthesizeArgs) {
         provenance: veks_pipeline::pipeline::provenance::ProvenanceFlags::DEFAULT_NAME
             .to_string(),
         explain_staleness: false,
+        rerun: vec![],
     };
     if crate::pipeline::run_pipeline(run_args).is_err() {
         std::process::exit(1);

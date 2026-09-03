@@ -198,6 +198,14 @@ starts from a known-correct state.
 
 #### Tools
 
+- **`veks run --rerun STEP[,STEP...]`** — run the named steps again
+  whether or not they look fresh. Their records are set aside for the
+  run, so the freshness check finds nothing recorded and the step
+  executes; everything downstream that reads its outputs follows
+  through the input-newer rule. This is the tool for a build that
+  changed what one step computes without changing any option: the
+  config-only selector cannot see it, and `strict` would re-run the
+  whole ladder, ground truth included.
 - **`veks run --explain-staleness`** — walk every step under the active
   selector and print `fresh` / `STALE` plus per-component diff lines
   (`binary_version_major: 1 → 2`, `option 'k': "100" → "200"`,
