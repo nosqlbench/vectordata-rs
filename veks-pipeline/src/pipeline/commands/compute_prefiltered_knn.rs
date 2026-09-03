@@ -24,8 +24,10 @@
 //!
 //! 1. The base vector space is split into contiguous partitions.
 //! 2. Each partition is processed sequentially: for every query, the
-//!    metadata-index ordinals that fall within the partition's range are
-//!    filtered and distance-computed against the mmap'd base vectors.
+//!    metadata-index ordinals that fall within the partition's range —
+//!    the slice of its ascending results record between two
+//!    partition-point searches, decoded once (TS-175) — are
+//!    distance-computed against the mmap'd base vectors.
 //! 3. A prefetch thread pages in upcoming partitions for sequential I/O.
 //! 4. A background writer flushes completed partition results to cache
 //!    while the next partition is being computed.
@@ -712,10 +714,9 @@ fn compute_partition_filtered_f64(
                 scope.spawn(move || {
                     for qi in 0..chunk_len {
                         let global_qi = chunk_start + qi;
-                        let ordinals = keys_reader.get_ordinals(global_qi as usize).unwrap_or_default();
-                        let filtered: Vec<i32> = ordinals.into_iter()
-                            .filter(|&o| (o as usize) >= start && (o as usize) < end)
-                            .collect();
+                        let filtered: Vec<i32> = keys_reader
+                            .ordinals_in_range(global_qi as usize, start, end)
+                            .unwrap_or_default();
                         chunk[qi] = find_top_k_filtered_f64(
                             query_reader.get_slice(global_qi),
                             &base_ref, &filtered, k, dist_fn,
@@ -727,10 +728,9 @@ fn compute_partition_filtered_f64(
         });
     } else {
         for qi in 0..query_count {
-            let ordinals = keys_reader.get_ordinals(qi).unwrap_or_default();
-            let filtered: Vec<i32> = ordinals.into_iter()
-                .filter(|&o| (o as usize) >= start && (o as usize) < end)
-                .collect();
+            let filtered: Vec<i32> = keys_reader
+                .ordinals_in_range(qi, start, end)
+                .unwrap_or_default();
             results[qi] = find_top_k_filtered_f64(
                 query_reader.get_slice(qi),
                 base_reader, &filtered, k, dist_fn,
@@ -778,10 +778,9 @@ fn compute_partition_filtered_f32(
                 scope.spawn(move || {
                     for qi in 0..chunk_len {
                         let global_qi = chunk_start + qi;
-                        let ordinals = keys_reader.get_ordinals(global_qi as usize).unwrap_or_default();
-                        let filtered: Vec<i32> = ordinals.into_iter()
-                            .filter(|&o| (o as usize) >= start && (o as usize) < end)
-                            .collect();
+                        let filtered: Vec<i32> = keys_reader
+                            .ordinals_in_range(global_qi as usize, start, end)
+                            .unwrap_or_default();
                         chunk[qi] = find_top_k_filtered_f32(
                             query_reader.get_slice(global_qi),
                             &base_ref,
@@ -796,10 +795,9 @@ fn compute_partition_filtered_f32(
         });
     } else {
         for qi in 0..query_count {
-            let ordinals = keys_reader.get_ordinals(qi).unwrap_or_default();
-            let filtered: Vec<i32> = ordinals.into_iter()
-                .filter(|&o| (o as usize) >= start && (o as usize) < end)
-                .collect();
+            let filtered: Vec<i32> = keys_reader
+                .ordinals_in_range(qi, start, end)
+                .unwrap_or_default();
             results[qi] = find_top_k_filtered_f32(
                 query_reader.get_slice(qi),
                 base_reader,
@@ -845,10 +843,9 @@ fn compute_partition_filtered_f16(
                 scope.spawn(move || {
                     for qi in 0..chunk_len {
                         let global_qi = chunk_start + qi;
-                        let ordinals = keys_reader.get_ordinals(global_qi as usize).unwrap_or_default();
-                        let filtered: Vec<i32> = ordinals.into_iter()
-                            .filter(|&o| (o as usize) >= start && (o as usize) < end)
-                            .collect();
+                        let filtered: Vec<i32> = keys_reader
+                            .ordinals_in_range(global_qi as usize, start, end)
+                            .unwrap_or_default();
                         chunk[qi] = find_top_k_filtered_f16(
                             query_reader.get_slice(global_qi),
                             &base_ref,
@@ -863,10 +860,9 @@ fn compute_partition_filtered_f16(
         });
     } else {
         for qi in 0..query_count {
-            let ordinals = keys_reader.get_ordinals(qi).unwrap_or_default();
-            let filtered: Vec<i32> = ordinals.into_iter()
-                .filter(|&o| (o as usize) >= start && (o as usize) < end)
-                .collect();
+            let filtered: Vec<i32> = keys_reader
+                .ordinals_in_range(qi, start, end)
+                .unwrap_or_default();
             results[qi] = find_top_k_filtered_f16(
                 query_reader.get_slice(qi),
                 base_reader,

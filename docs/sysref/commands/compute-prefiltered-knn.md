@@ -52,6 +52,18 @@ to this command — existing pipeline.yaml files keep working unchanged.
 - **Distances** are in FAISS publication convention (smaller is better
   for L2, larger is better for IP/cosine).
 
+## Cost
+
+The base is walked in partitions of `partition_size` rows. For each
+partition, a query's candidates are the slice of its results record
+between two partition-point searches, decoded once: the record is
+ascending by construction (SRD TS-175) and the slice's order is
+checked as it is read. Distance work is then the sum of all match
+lists, once. An earlier version decoded every query's whole match
+list for every partition and filtered it by range, so the lists were
+decoded as many times as there were partitions: two hundred times at
+a 200M base.
+
 ## Role in evaluation
 
 F is the verification target for any filtered ANN engine that aspires
