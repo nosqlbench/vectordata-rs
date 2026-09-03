@@ -270,6 +270,14 @@ pub(super) fn resolve_cosine_mode_for(
 /// responsible for either regenerating through the pipeline (which
 /// bumps the pipeline fingerprint), pointing the engine at a fresh
 /// workspace, or clearing `<workspace>/.cache`.
+/// The cache-claim prefix of an engine's segment files for a
+/// `(base, query)` pair: every segment of every `k` and metric the
+/// engine cached for them starts with it. `base` and `query` are the
+/// resolved paths the engine itself uses, window notation stripped.
+pub fn engine_cache_claim(engine: &str, base_path: &Path, query_path: &Path) -> String {
+    format!("{}.{}.{}.", engine, CACHE_VERSION, cache_prefix_for(base_path, query_path))
+}
+
 pub(super) fn cache_prefix_for(base_path: &Path, query_path: &Path) -> String {
     let base_stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
     let query_stem = query_path.file_stem().unwrap_or_default().to_string_lossy();

@@ -195,6 +195,26 @@ pub trait CommandOp: Send {
             intermediates: vec![],
         }
     }
+
+    /// The cache files this step keeps that no manifest names: engine
+    /// caches keyed by content — KNN segment results, predicate-key
+    /// segments, an extract's resume partitions. Housekeeping treats
+    /// every file a claim covers as live for as long as the step is in
+    /// the definition, and everything else under the cache directory
+    /// as orphaned. Default: no claims.
+    fn project_cache_claims(&self, _options: &Options, _cache: &std::path::Path, _workspace: &std::path::Path) -> Vec<CacheClaim> {
+        vec![]
+    }
+}
+
+/// A claim a command lays on files under the cache directory, relative
+/// to it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum CacheClaim {
+    /// Every top-level entry whose name starts with this.
+    Prefix(String),
+    /// This top-level entry, a directory, and everything under it.
+    Dir(String),
 }
 
 /// Check if a path looks like a cache/intermediate artifact.

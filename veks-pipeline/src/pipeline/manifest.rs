@@ -13,7 +13,7 @@ use std::path::Path;
 use indexmap::IndexMap;
 use vectordata::dataset::DatasetConfig;
 
-use super::command::{ArtifactManifest, Options};
+use super::command::{ArtifactManifest, CacheClaim, Options};
 use super::interpolate;
 use super::registry::CommandRegistry;
 
@@ -28,6 +28,16 @@ pub struct WorkspaceManifest {
     pub inputs: HashSet<String>,
     /// Per-step manifests.
     pub steps: Vec<ArtifactManifest>,
+    /// Cache files the steps claim beyond what their manifests name
+    /// (engine caches keyed by content), relative to the cache directory.
+    pub cache_claims: Vec<CacheClaim>,
+    /// Every option value of every step that mentions the cache, raw
+    /// and interpolated — kept even for a step the registry does not
+    /// know or whose variables cannot yet be resolved, so what a step
+    /// names is never lost to a projection gap.
+    pub cache_references: HashSet<String>,
+    /// The effective id of every expanded step, known to the registry or not.
+    pub step_ids: HashSet<String>,
 }
 
 impl WorkspaceManifest {
@@ -52,6 +62,9 @@ impl WorkspaceManifest {
         for p in &self.final_artifacts {
             if is_cache(p) { retained.insert(p.clone()); }
         }
+        for p in &self.cache_references {
+            if is_cache(p) { retained.insert(p.clone()); }
+        }
         retained
     }
 }
@@ -73,6 +86,9 @@ pub fn project_workspace(
             intermediates: HashSet::new(),
             inputs: HashSet::new(),
             steps: Vec::new(),
+            cache_claims: Vec::new(),
+            cache_references: HashSet::new(),
+            step_ids: HashSet::new(),
         });
     }
 
@@ -95,9 +111,24 @@ pub fn project_workspace(
     let mut all_intermediate: HashSet<String> = HashSet::new();
     let mut all_inputs: HashSet<String> = HashSet::new();
     let mut step_manifests: Vec<ArtifactManifest> = Vec::new();
+    let mut cache_claims: Vec<CacheClaim> = Vec::new();
+    let mut cache_references: HashSet<String> = HashSet::new();
+    let mut step_ids: HashSet<String> = HashSet::new();
+    let cache_dir = workspace.join(".cache");
+    let mentions_cache = |v: &str| {
+        v.starts_with("${cache}") || v.starts_with(".cache/") || v.contains("/.cache/")
+    };
 
     for step in &steps {
         let step_id = step.effective_id();
+        step_ids.insert(step_id.clone());
+        for v in step.options.values() {
+            if let Some(s) = v.as_str()
+                && mentions_cache(s)
+            {
+                cache_references.insert(s.to_string());
+            }
+        }
 
         // Resolve command
         let factory = match registry.get(&step.run) {
@@ -117,9 +148,17 @@ pub fn project_workspace(
         let mut options = Options::new();
         for (k, v) in &resolved_opts {
             options.set(k, v);
+            if mentions_cache(v) {
+                cache_references.insert(v.clone());
+            }
         }
 
         let manifest = cmd.project_artifacts(&step_id, &options);
+        for claim in cmd.project_cache_claims(&options, &cache_dir, workspace) {
+            if !cache_claims.contains(&claim) {
+                cache_claims.push(claim);
+            }
+        }
 
         for f in &manifest.outputs {
             all_final.insert(f.clone());
@@ -151,6 +190,9 @@ pub fn project_workspace(
         intermediates: all_intermediate,
         inputs: all_inputs,
         steps: step_manifests,
+        cache_claims,
+        cache_references,
+        step_ids,
     })
 }
 

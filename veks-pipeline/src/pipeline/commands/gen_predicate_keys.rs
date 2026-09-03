@@ -2257,6 +2257,29 @@ sweep.
             &["output"],
         )
     }
+
+    /// The predicate-key segments this step reads and writes: every
+    /// file under the segment key its inputs and content options give
+    /// (TS-171), shared with every other profile of the same facet.
+    fn project_cache_claims(&self, options: &Options, cache: &Path, workspace: &Path) -> Vec<crate::pipeline::command::CacheClaim> {
+        let (Some(source), Some(predicates)) = (options.get("source"), options.get("predicates")) else {
+            return vec![];
+        };
+        let source = resolve_path(source.split('[').next().unwrap_or(source), workspace);
+        let predicates = resolve_path(predicates, workspace);
+        if !source.exists() || !predicates.exists() {
+            return vec![];
+        }
+        let (_, root) = segment_provenance(
+            self.build_version(),
+            self.command_path(),
+            options,
+            cache,
+            workspace,
+            &[("source", &source), ("predicates", &predicates)],
+        );
+        vec![crate::pipeline::command::CacheClaim::Prefix(format!("keys.{}.", root))]
+    }
 }
 
 // ---------------------------------------------------------------------------

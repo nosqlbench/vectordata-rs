@@ -3703,6 +3703,23 @@ impl CommandOp for TransformExtractOp {
             intermediates,
         }
     }
+
+    /// A slab extract's resume partitions live under one directory per
+    /// output; they stay while the step exists.
+    fn project_cache_claims(&self, options: &Options, cache: &Path, workspace: &Path) -> Vec<crate::pipeline::command::CacheClaim> {
+        let (Some(source), Some(output)) = (options.get("source"), options.get("output")) else {
+            return vec![];
+        };
+        if !source.trim_end().ends_with(".slab") {
+            return vec![];
+        }
+        let output = resolve_path(output, workspace);
+        let dir = slab_extract_cache_dir(cache, &output);
+        match dir.strip_prefix(cache) {
+            Ok(rel) => vec![crate::pipeline::command::CacheClaim::Dir(rel.to_string_lossy().into_owned())],
+            Err(_) => vec![],
+        }
+    }
 }
 
 #[cfg(test)]

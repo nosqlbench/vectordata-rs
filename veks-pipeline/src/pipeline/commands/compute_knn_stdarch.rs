@@ -1306,6 +1306,21 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             &["indices", "distances"],
         )
     }
+
+    /// The engine's segment cache for this step's base and query — every
+    /// `k` and metric — stays live while the step exists.
+    fn project_cache_claims(&self, options: &Options, _cache: &std::path::Path, workspace: &std::path::Path) -> Vec<crate::pipeline::command::CacheClaim> {
+        let (Some(base), Some(query)) = (options.get("base"), options.get("query")) else {
+            return vec![];
+        };
+        let Ok(base) = super::source_window::resolve_source(base, workspace) else {
+            return vec![];
+        };
+        let query = super::gen_predicates_common::resolve_path(query, workspace);
+        vec![crate::pipeline::command::CacheClaim::Prefix(
+            super::knn_segment::engine_cache_claim(ENGINE_NAME, &base.path, &query),
+        )]
+    }
 }
 
 #[cfg(test)]
