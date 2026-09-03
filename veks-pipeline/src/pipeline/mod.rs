@@ -318,6 +318,46 @@ pub struct RunArgs {
     pub rerun: Vec<String>,
 }
 
+/// Whether a `--rerun` entry names the step `id`: an exact id, or a
+/// pattern whose `*` stands for any run of characters.
+pub fn step_pattern_matches(pattern: &str, id: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == id;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !id.starts_with(first) || !id.ends_with(last) || id.len() < first.len() + last.len() {
+        return false;
+    }
+    let mut rest = &id[first.len()..id.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        match rest.find(part) {
+            Some(i) => rest = &rest[i + part.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod rerun_pattern_tests {
+    use super::step_pattern_matches;
+
+    #[test]
+    fn a_pattern_names_every_step_it_matches() {
+        assert!(step_pattern_matches("compute-knn", "compute-knn"));
+        assert!(!step_pattern_matches("compute-knn", "compute-knn-100k"));
+        assert!(step_pattern_matches("compute-postfiltered-knn*", "compute-postfiltered-knn"));
+        assert!(step_pattern_matches("compute-postfiltered-knn*", "compute-postfiltered-knn-100k"));
+        assert!(!step_pattern_matches("compute-postfiltered-knn*", "compute-prefiltered-knn-100k"));
+        assert!(step_pattern_matches("*-100k", "compute-knn-100k"));
+        assert!(step_pattern_matches("compute-*-knn-*", "compute-postfiltered-knn-100k"));
+        assert!(!step_pattern_matches("compute-*-knn-*", "compute-knn-100k"));
+        assert!(step_pattern_matches("*", "anything"));
+        assert!(!step_pattern_matches("ab*ab", "ab"));
+    }
+}
+
 /// CLI arguments for `veks script`.
 #[derive(veks_completion_derive::VeksCli)]
 pub struct ScriptArgs {
@@ -885,8 +925,29 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         .map(str::to_string)
         .collect();
     if !rerun.is_empty() {
-        let known: std::collections::HashSet<&str> = pipeline_dag.steps.iter().map(|s| s.id.as_str()).collect();
-        let unknown: Vec<&String> = rerun.iter().filter(|id| !known.contains(id.as_str())).collect();
+        // Each entry names a step, or a pattern with `*` that names
+        // every step it matches — `compute-postfiltered-knn*` names the
+        // step of every profile. An entry that names nothing is an
+        // error, not a silent no-op.
+        let mut named: Vec<String> = Vec::new();
+        let mut unknown: Vec<&String> = Vec::new();
+        for entry in &rerun {
+            let matched: Vec<String> = pipeline_dag
+                .steps
+                .iter()
+                .map(|s| s.id.as_str())
+                .filter(|id| step_pattern_matches(entry, id))
+                .map(str::to_string)
+                .collect();
+            if matched.is_empty() {
+                unknown.push(entry);
+            }
+            for id in matched {
+                if !named.contains(&id) {
+                    named.push(id);
+                }
+            }
+        }
         if !unknown.is_empty() {
             let msg = format!(
                 "--rerun names no step: {}; steps are {}",
@@ -896,7 +957,7 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
             ctx.ui.log(&format!("Error: {}", msg));
             return Err(msg);
         }
-        for id in &rerun {
+        for id in &named {
             if ctx.progress.steps.remove(id).is_some() {
                 ctx.ui.log(&format!("--rerun {}: record set aside; the step runs again", id));
             } else {
