@@ -1767,8 +1767,14 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             eval_opts.push(("mode".into(), "simple-int-eq".into()));
             eval_opts.push(("fields".into(), args.metadata_fields.to_string()));
         }
+        // The metadata facet is in base order with no queries in it, so a
+        // profile evaluates exactly its own base: `[0, base_count)`, not
+        // `base_end`, which is the combined-source bound and would run
+        // `query_count` rows past the profile. Ends that coincide with the
+        // profile boundaries are what let sibling profiles share the
+        // evaluation's cached segments.
         eval_opts.push(("range".into(), if slots.base_count.is_some() {
-            "[0,${base_end})".into()
+            "[0,${base_count})".into()
         } else if slots.prepare.is_materialized() {
             "[0,${clean_count})".into()
         } else {

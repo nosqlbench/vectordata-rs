@@ -281,17 +281,32 @@ struct SegmentInfo {
     cached: bool,
 }
 
-/// Build the provenance of this run, suitable for cache keying:
-/// a graph holding the run's node and everything it reaches, and the
-/// node's address. Captures binary version, resolved options, and the
-/// upstream cascade — for each input artifact listed in `inputs`,
-/// looks for a sidecar (written by the producing step) and falls back
-/// to a degenerate `(path, size, mtime)` node when none exists.
+/// The options that determine what a segment of match lists
+/// **contains**. Everything else the step takes — the range it
+/// evaluates, where it writes, how it sizes segments, the thresholds it
+/// validates against — changes which segments a run touches or how it
+/// reports, never the content of a segment at a given boundary, and so
+/// must not be part of the segment cache key (TS-171).
+const SEGMENT_CONTENT_OPTIONS: &[&str] = &["mode", "fields", "limit"];
+
+/// Build the provenance a cached **segment** is keyed on: a graph
+/// holding the node and everything it reaches, and the node's address,
+/// which is the cache prefix. The node captures the binary version,
+/// the content-determining options ([`SEGMENT_CONTENT_OPTIONS`]) and the
+/// upstream cascade — for each input artifact listed in `inputs`, the
+/// sidecar its producer wrote, or a degenerate `(path, size, mtime)`
+/// node when none exists.
+///
+/// Because neither the range nor the output nor the step id enters the
+/// key, every profile of a dataset evaluating the same predicates over
+/// the same facet keys its segments identically, and a larger profile
+/// reuses every full segment a smaller one already produced; only the
+/// partial segment at a profile's own end is its own.
 ///
 /// `inputs` is a slice of `(role_name, artifact_path)` pairs; the
 /// role name keys the entry in `upstream` so the diff output
 /// names *which* input drifted, not just "an upstream changed".
-fn build_run_provenance(
+fn segment_provenance(
     build_version: &str,
     command_path: &str,
     options: &crate::pipeline::command::Options,
@@ -314,11 +329,14 @@ fn build_run_provenance(
         };
         upstream.insert((*role).to_string(), address);
     }
-    let opts_map: std::collections::HashMap<String, String> =
-        options.0.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    let step_id = options.get("id").unwrap_or(command_path);
+    let opts_map: std::collections::HashMap<String, String> = options
+        .0
+        .iter()
+        .filter(|(k, _)| SEGMENT_CONTENT_OPTIONS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let root = graph
-        .insert(ProvenanceNode::build(step_id, command_path, &binary, &opts_map, upstream))
+        .insert(ProvenanceNode::build(command_path, command_path, &binary, &opts_map, upstream))
         .expect("every input was just absorbed into this graph");
     (graph, root)
 }
@@ -1299,7 +1317,7 @@ sweep.
         // That keeps hand-curated dataset files invalidating
         // downstream caches on overwrite/touch without ever
         // hashing the file content.
-        let (run_graph, run_root) = build_run_provenance(
+        let (run_graph, run_root) = segment_provenance(
             self.build_version(),
             self.command_path(),
             options,
@@ -2553,14 +2571,14 @@ mod tests {
         let opts_a = build_opts(ws, &meta_path, &pred_path_a, "keys_a.slab");
         let opts_b = build_opts(ws, &meta_path, &pred_path_b, "keys_b.slab");
 
-        let (_, hash_a) = build_run_provenance(
+        let (_, hash_a) = segment_provenance(
             "1.0.0+abcd",
             "compute evaluate-predicates",
             &opts_a,
             ws, ws,
             &[("source", &meta_path), ("predicates", &pred_path_a)],
         );
-        let (_, hash_b) = build_run_provenance(
+        let (_, hash_b) = segment_provenance(
             "1.0.0+abcd",
             "compute evaluate-predicates",
             &opts_b,
@@ -2591,14 +2609,14 @@ mod tests {
         let pred_path = create_predicates_slab(ws, "preds.slab", &[p]);
 
         let opts = build_opts(ws, &meta_path, &pred_path, "keys.slab");
-        let (_, h1) = build_run_provenance(
+        let (_, h1) = segment_provenance(
             "1.0.0+abcd1234",
             "compute evaluate-predicates",
             &opts,
             ws, ws,
             &[("source", &meta_path), ("predicates", &pred_path)],
         );
-        let (_, h2) = build_run_provenance(
+        let (_, h2) = segment_provenance(
             "1.0.0+ffff5678", // same version, different git hash
             "compute evaluate-predicates",
             &opts,
@@ -2608,6 +2626,38 @@ mod tests {
         assert_ne!(h1, h2,
             "git-hash bump must invalidate cache under STRICT — \
              this is what would have caught the MATCHES regression");
+    }
+
+    /// Segments are keyed on their content, not on the range a profile
+    /// evaluates or where it writes: two profiles share every segment
+    /// at the same boundaries (TS-171). What does change the content —
+    /// the match limit, the mode — changes the key.
+    #[test]
+    fn segments_are_shared_across_ranges_and_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let meta_path = create_metadata_slab(ws, "meta.slab", &make_test_records());
+        let p = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("user_id".into()),
+            op: OpType::Gt,
+            comparands: vec![Comparand::Int(3)],
+        });
+        let pred_path = create_predicates_slab(ws, "preds.slab", &[p]);
+        let inputs: [(&str, &Path); 2] = [("source", &meta_path), ("predicates", &pred_path)];
+        let mut small = build_opts(ws, &meta_path, &pred_path, "keys_small.slab");
+        small.set("range", "[0,100)");
+        small.set("id", "evaluate-predicates-100");
+        let mut large = build_opts(ws, &meta_path, &pred_path, "keys_large.slab");
+        large.set("range", "[0,1000)");
+        large.set("id", "evaluate-predicates-1000");
+        large.set("segment_size", "10");
+        let (_, key_small) = segment_provenance("1.0.0+abcd", "compute evaluate-predicates", &small, ws, ws, &inputs);
+        let (_, key_large) = segment_provenance("1.0.0+abcd", "compute evaluate-predicates", &large, ws, ws, &inputs);
+        assert_eq!(key_small, key_large, "range, output, id and segment size do not enter the key");
+        let mut limited = large.clone();
+        limited.set("limit", "5");
+        let (_, key_limited) = segment_provenance("1.0.0+abcd", "compute evaluate-predicates", &limited, ws, ws, &inputs);
+        assert_ne!(key_large, key_limited, "a match limit changes what a segment holds");
     }
 
     /// Sidecar present + matches: `is_cache_valid` returns true.

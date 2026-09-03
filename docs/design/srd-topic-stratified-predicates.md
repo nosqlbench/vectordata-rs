@@ -1344,6 +1344,27 @@ facet produced by the earlier behaviour is not detected by
 freshness, since its step's record is intact, and must be removed by
 hand for the step to run again.
 
+**TS-171.** **Evaluation segments are shared across profiles.**
+`evaluate-predicates` walks the M facet in segments at fixed ordinal
+boundaries, caches each segment's match lists under `${cache}` with a
+provenance sidecar, and recombines a profile's results from them — the
+same shape as the ground-truth engine's per-window reuse. For that to
+share anything, a segment's cache key must depend only on what
+determines its **content**: the source and predicate identities, the
+binary, and the evaluation options that change a match list (`mode`,
+`fields`, `limit`) — never the range a profile evaluates, where it
+writes, its step id or how segments are sized. With such a key every
+profile names the same segments, and a larger profile reuses every
+full segment a smaller one produced; only its own final partial
+segment is new. Each profile evaluates `[0, base_count)`, the base it
+holds — not `base_end`, the combined-source bound that runs
+`query_count` rows past it — so profile ends and segment boundaries
+coincide. *Measured on tessera, 2026-09-03, before this:* the cache
+held 82 distinct prefixes, one per profile, and the segment for rows
+0–1,000,000 sixty-four times over; 49 profiles would have evaluated
+about 3.5 G rows for a facet of 496 M. Cached segments of the old
+keying are orphans for `cache-gc`.
+
 ## 8. Artifact register
 
 Every artifact this design introduces, named, located and formatted.
@@ -1946,7 +1967,7 @@ predicate set invalidates `evaluate-predicates` across every profile.
 | 3 margin | `transform extract`, mvec, 495.9M × 4 B | comparable to `extract-metadata` |
 | 4 | census pass over 495.9M records of M | 58 s measured on tessera, 128 threads (TS-148) |
 | 5 | sampling by lookup over the census tables (TS-143) | seconds |
-| — | `evaluate-predicates` re-run | per profile; the dominant cost |
+| — | `evaluate-predicates` re-run | one pass over the 496 M-row facet, shared by every profile (TS-171); the dominant cost before sharing |
 
 ## 14. Open questions
 
