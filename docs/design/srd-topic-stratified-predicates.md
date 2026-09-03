@@ -1439,6 +1439,25 @@ report, every `knn-blas` segment and the extract resume directories;
 the run that followed recomputed all of them, the KNN verification by
 brute force.
 
+**TS-175.** **A results record is ascending, and is read as such.**
+`compute evaluate-predicates` writes each record's ordinals in
+ascending order by construction — every segment sorts its matches,
+and segments are concatenated in range order — and holds that order
+at the merge, once, where the whole record is in hand: a record out of
+order fails the step. Every reader of the facet then searches the
+record's bytes instead of decoding it. The post-filter intersection
+`F = G ∩ R` looks each of the K unfiltered neighbours up by binary
+search, O(K log |R|) per query on the mapped bytes, with the order
+checked around every probe; the pre-filter engine takes a partition's
+candidates as the slice between two partition-point searches, decoded
+once, with the slice's order checked as it is read. *Measured on
+tessera, 2026-09-03, before this:* the intersection decoded and hashed
+every ordinal of every query — 5.3 G at 144m, 251 s — to answer ten
+thousand times a hundred membership questions, and the pre-filter
+engine decoded every query's whole list once per partition, two
+hundred times at 200m. Both were the same mistake against the same
+fact.
+
 ## 8. Artifact register
 
 Every artifact this design introduces, named, located and formatted.
