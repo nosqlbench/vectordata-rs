@@ -263,6 +263,14 @@ still wins. Before this, the post-filter step of every sized profile
 intersected the census profile's neighbours with its own predicate
 results (SRD TS-176).
 
+A step that is not expanded but names a template as its upstream —
+a verifier that reads every profile's answer keys, a finalize step
+that publishes them all — depends on **every instance** of it: its
+`after` fans in to the instances in profile order. Left as the
+template's bare id it would name the default instance alone, and a
+sized profile added or recomputed later would reach nothing
+downstream.
+
 ---
 
 ## 4.6 Resource Governance

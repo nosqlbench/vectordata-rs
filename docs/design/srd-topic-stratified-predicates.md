@@ -1480,6 +1480,9 @@ from `default`, so every consumer that resolved a sized profile read
 the census profile's answer keys; one derivation now serves both, a
 materialised profile is the authority at load, and a per-profile
 facet the profile does not declare is absent rather than `default`'s.
+And a shared step naming a per-profile template as its upstream — the
+verifiers, the finalize steps — depended on the default instance
+alone; it now depends on every instance.
 
 ## 8. Artifact register
 

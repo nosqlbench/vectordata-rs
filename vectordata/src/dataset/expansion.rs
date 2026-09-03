@@ -384,6 +384,48 @@ pub fn expand_per_profile_steps_scoped(
             }
     }
 
+    // A shared step that names a per-profile template as its upstream
+    // consumes every instance of it — the verifier that reads every
+    // profile's answer keys, the finalize steps that publish them all —
+    // so its dependency fans in to every instance, in profile order.
+    // Left as the template's bare id it would name the default instance
+    // alone, and a sized profile added or recomputed later would reach
+    // nothing downstream. Oracle partitions are not sizes of the
+    // corpus and no shared consumer reads them; they stay out.
+    let instances_of = |template: &str| -> Vec<String> {
+        all_profiles
+            .iter()
+            .filter(|(profile_name, _)| {
+                profiles.profiles.get(*profile_name).is_none_or(|p| !p.partition)
+            })
+            .map(|(profile_name, _)| {
+                if *profile_name == "default" {
+                    template.to_string()
+                } else {
+                    format!("{}-{}", template, profile_name)
+                }
+            })
+            .collect()
+    };
+    for step in result.iter_mut() {
+        if expanded_ids.contains(&step.effective_id()) {
+            continue;
+        }
+        let mut fanned: Vec<String> = Vec::new();
+        for dep in &step.after {
+            if template_ids.contains(dep.as_str()) {
+                for id in instances_of(dep) {
+                    if !fanned.contains(&id) {
+                        fanned.push(id);
+                    }
+                }
+            } else if !fanned.contains(dep) {
+                fanned.push(dep.clone());
+            }
+        }
+        step.after = fanned;
+    }
+
     result
 }
 
@@ -491,7 +533,11 @@ default:
             options: IndexMap::new(),
         };
         let expanded = expand_per_profile_steps(
-            vec![step("compute-knn", "compute knn", &["count-base"], 0), step("compute-prefiltered-knn", "compute prefiltered-knn", &["compute-knn"], 1)],
+            vec![
+                step("compute-knn", "compute knn", &["count-base"], 0),
+                step("compute-prefiltered-knn", "compute prefiltered-knn", &["compute-knn"], 1),
+                StepDef { per_profile: false, ..step("verify-knn", "verify knn-consolidated", &["compute-knn", "extract-queries"], 0) },
+            ],
             &profiles,
             10_000,
         );
@@ -514,6 +560,10 @@ default:
         let pre_200k = by_id("compute-prefiltered-knn-200k");
         assert_eq!(pre_200k.after, vec!["compute-knn-200k"]);
         assert!(expanded.iter().all(|s| s.after.iter().all(|a| !s.sequence_after.contains(a))));
+        // A shared consumer of a template fans in to every instance.
+        let verify = expanded.iter().find(|s| s.effective_id() == "verify-knn").expect("verify-knn");
+        assert_eq!(verify.after, vec!["compute-knn-100k", "compute-knn-200k", "compute-knn", "extract-queries"]);
+        assert!(!verify.per_profile && verify.profiles.is_empty());
     }
 
     #[test]
