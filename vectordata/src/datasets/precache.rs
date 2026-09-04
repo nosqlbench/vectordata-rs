@@ -459,19 +459,38 @@ fn drive_selective(
         facets.to_vec()
     };
 
-    let empty = crate::dataset::source::DSWindow(Vec::new());
-    let window = window.unwrap_or(&empty);
-    let window_label = if window.is_empty() {
-        "whole facet".to_string()
-    } else {
-        format!("records {window}")
+    // A requested window overrides every selected facet's own. Absent
+    // one, each facet is planned against the window it declares — the
+    // same plan the whole-profile precache runs — so `--plan` and
+    // `--facet` describe and fetch what the profile addresses, never
+    // a sized profile's whole base.
+    let window_label = match window {
+        Some(w) => format!("records {w}"),
+        None => "each facet's declared window".to_string(),
     };
     eprintln!("Precache {label} — {window_label}");
 
     let mut plans = Vec::new();
+    // The window each plan was made against, so the fetch that follows
+    // asks for exactly what was planned and printed.
+    let mut windows: Vec<crate::dataset::source::DSWindow> = Vec::new();
     for name in &selected {
-        match view.prefetch_plan(name, window) {
-            Ok(plan) => plans.push((name.clone(), plan)),
+        let facet_window = match window {
+            Some(w) => w.clone(),
+            None => match manifest.get(name).map(crate::view::facet_declared_window) {
+                Some(Ok(w)) => w,
+                Some(Err(e)) => {
+                    eprintln!("error: facet '{name}': {e}");
+                    return 1;
+                }
+                None => crate::dataset::source::DSWindow(Vec::new()),
+            },
+        };
+        match view.prefetch_plan(name, &facet_window) {
+            Ok(plan) => {
+                plans.push((name.clone(), plan));
+                windows.push(facet_window);
+            }
             Err(e) => {
                 eprintln!("error: facet '{name}': {e}");
                 return 1;
@@ -501,13 +520,13 @@ fn drive_selective(
         }
     }
 
-    for (name, plan) in &plans {
+    for ((name, plan), facet_window) in plans.iter().zip(&windows) {
         if plan.is_resident() {
             eprintln!("  {name}: already resident");
             continue;
         }
         let mut ctx = LiveCtx::new(1, plan.bytes_to_fetch());
-        let result = view.prefetch_with_progress(name, window, fallback, &mut |p| {
+        let result = view.prefetch_with_progress(name, facet_window, fallback, &mut |p| {
             // The prefetch callback carries transport progress; the
             // renderer speaks the per-facet shape, so adapt.
             ctx.on_progress(

@@ -2056,6 +2056,39 @@ fn the_precache_driver_fetches_only_a_sized_profiles_window() {
     assert_only_the_window_is_resident(&*view);
 }
 
+/// The selective driver (`--facet`, `--plan`) plans each facet against
+/// its declared window when none is requested, so its plan agrees with
+/// the run: `--plan` on tessera:10m once announced the whole 1.8 TiB
+/// base while the run would have fetched the 10m window.
+#[test]
+fn the_selective_driver_honours_a_profiles_window_when_none_is_requested() {
+    let tmp = make_tmp();
+    make_series_with_sized_profile(tmp.path());
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let base_req = || vectordata::datasets::precache::PrecacheRequest {
+        dataset_spec: server.base_url(),
+        profile: Some("small".to_string()),
+        facets: vec!["base_vectors".to_string()],
+        ..vectordata::datasets::precache::PrecacheRequest::default()
+    };
+    // Plan only: nothing but the plan's own probes lands.
+    let plan = vectordata::datasets::precache::PrecacheRequest { plan_only: true, ..base_req() };
+    assert_eq!(vectordata::datasets::precache::run(plan), 0);
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("small").unwrap();
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+    let stats = storage.cache_stats().unwrap();
+    assert!(
+        (stats.valid_chunks as u64) * stats.chunk_size < 500 * 36,
+        "a plan-only run fetched the window"
+    );
+
+    assert_eq!(vectordata::datasets::precache::run(base_req()), 0);
+    assert_only_the_window_is_resident(&*view);
+}
+
 /// **A facet byte range prebuffers the shard it lives in** (SH-38).
 ///
 /// `FacetStorage::prebuffer_range_with_progress` takes the facet's byte
