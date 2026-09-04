@@ -931,13 +931,14 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         // error, not a silent no-op.
         let mut named: Vec<String> = Vec::new();
         let mut unknown: Vec<&String> = Vec::new();
+        // Every step is nameable, the finalize steps included: they
+        // run in their own pass, but a record set aside here is set
+        // aside for the whole run.
         for entry in &rerun {
-            let matched: Vec<String> = pipeline_dag
-                .steps
+            let matched: Vec<String> = steps
                 .iter()
-                .map(|s| s.id.as_str())
+                .map(|s| s.effective_id())
                 .filter(|id| step_pattern_matches(entry, id))
-                .map(str::to_string)
                 .collect();
             if matched.is_empty() {
                 unknown.push(entry);
@@ -952,7 +953,7 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
             let msg = format!(
                 "--rerun names no step: {}; steps are {}",
                 unknown.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", "),
-                pipeline_dag.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", ")
+                steps.iter().map(|s| s.effective_id()).collect::<Vec<_>>().join(", ")
             );
             ctx.ui.log(&format!("Error: {}", msg));
             return Err(msg);

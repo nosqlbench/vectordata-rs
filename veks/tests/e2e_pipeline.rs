@@ -1919,6 +1919,11 @@ fn e2e_rerun_cascades_to_dependents() {
     assert!(success, "{}", output);
     assert!(!output.contains("— stale:"), "{}", output);
 
+    // A finalize step is nameable too; it runs in its own pass.
+    let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &["--rerun", "generate-merkle"]);
+    assert!(success, "{}", output);
+    assert!(output.contains("--rerun generate-merkle: record set aside"), "{}", output);
+
     // A name that matches no step is refused.
     let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &["--rerun", "no-such-step"]);
     assert!(!success, "an unknown step was accepted:\n{}", output);
