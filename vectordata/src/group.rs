@@ -320,6 +320,7 @@ impl TestDataGroup {
     /// of the warning — the callback is purely advisory.
     pub fn prebuffer_all_profiles(&self) -> crate::Result<()> {
         self.prebuffer_all_profiles_with_progress(
+            crate::view::WholeFacetFallback::Refuse,
             &mut |_, _, _| {},
             &mut |_| {},
         )
@@ -337,6 +338,7 @@ impl TestDataGroup {
     /// regardless.
     pub fn prebuffer_all_profiles_with_progress(
         &self,
+        fallback: crate::view::WholeFacetFallback,
         progress_cb: &mut dyn FnMut(&str, &str, &crate::PrebufferProgress),
         warn_cb: &mut dyn FnMut(u64),
     ) -> crate::Result<()> {
@@ -351,15 +353,19 @@ impl TestDataGroup {
         profiles.dedup();
         for profile_name in &profiles {
             if let Some(view) = self.profile(profile_name) {
-                for (facet, _desc) in view.facet_manifest() {
+                for (facet, desc) in view.facet_manifest() {
                     if view.facet_element_type(&facet).is_err() { continue; }
-                    if let Ok(storage) = view.open_facet_storage(&facet) {
-                        // Only count cached/http facets toward the
-                        // download tally; local-mmap facets are
-                        // already resident.
-                        if !storage.is_local() {
-                            total_bytes += storage.total_size();
-                        }
+                    // The plan the precache will run: each facet's own
+                    // window, decomposed across its shards, net of what
+                    // is already resident.
+                    if let Ok(window) = crate::view::facet_declared_window(&desc)
+                        && let Ok(plan) = view.prefetch_plan(&facet, &window)
+                    {
+                        total_bytes += if plan.degrades_to_full_download {
+                            plan.facet_bytes
+                        } else {
+                            plan.bytes_to_fetch()
+                        };
                     }
                 }
             }
@@ -372,7 +378,7 @@ impl TestDataGroup {
             let view = self.profile(profile_name)
                 .ok_or_else(|| crate::Error::Other(format!(
                     "profile '{profile_name}' missing during precache")))?;
-            view.prebuffer_all_with_progress(&mut |facet, prog| {
+            view.prebuffer_all_with_progress(fallback, &mut |facet, prog| {
                 progress_cb(profile_name, facet, prog);
             })?;
         }

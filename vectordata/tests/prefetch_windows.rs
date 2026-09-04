@@ -705,6 +705,43 @@ fn a_windowless_run_still_precaches_everything() {
     assert_eq!(run(request(group_dir.to_str().unwrap())), 0);
 }
 
+/// **A profile's own window is honoured or refused, never widened.**
+///
+/// A windowed facet the planner cannot map to bytes makes a
+/// whole-profile precache of that profile refuse up front, with the
+/// same message a `--window` request gets, and proceed only with
+/// `--allow-whole-facet`. Silently fetching the whole facet is what a
+/// declared window exists to prevent.
+#[test]
+fn a_profile_whose_window_cannot_be_mapped_is_refused_not_widened() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
+    write_fvec(&ds.join("profiles/default/base_vectors.fvec"), 4, 10);
+    // A slab without a record index: a data facet whose records the
+    // planner cannot place, so a window on it cannot be honoured.
+    std::fs::write(ds.join("profiles/default/metadata_content.slab"), [0u8; 64]).unwrap();
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: refuse\nprofiles:\n  default:\n    base_vectors: profiles/default/base_vectors.fvec\n    \
+         metadata_content: profiles/default/metadata_content.slab\n  small:\n    base_count: 4\n    \
+         base_vectors: profiles/default/base_vectors.fvec[0..4]\n    metadata_content:\n      \
+         source: profiles/default/metadata_content.slab\n      window: \"[0..4]\"\n",
+    )
+    .unwrap();
+    let refused = PrecacheRequest {
+        profile: Some("small".to_string()),
+        ..request(ds.to_str().unwrap())
+    };
+    assert_eq!(run(refused), 2, "an unmappable declared window is a refusal, not a download");
+    let accepted = PrecacheRequest {
+        profile: Some("small".to_string()),
+        allow_whole_facet: true,
+        ..request(ds.to_str().unwrap())
+    };
+    assert_eq!(run(accepted), 0, "accepting the whole facet lets the precache run");
+}
+
 /// `--plan` reports without fetching, and reports success.
 #[test]
 fn plan_only_reports_and_succeeds() {

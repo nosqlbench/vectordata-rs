@@ -214,7 +214,7 @@ pub fn run(req: PrecacheRequest) -> i32 {
                 );
             }
             eprintln!("Prebuffering {descriptor}:{profile_name}");
-            drive_prebuffer(&*view)
+            drive_prebuffer(&*view, req.allow_whole_facet)
         }
         ProfileSelection::AllProfiles if req.is_selective() => {
             // A facet or window selection needs one profile to resolve
@@ -248,7 +248,7 @@ pub fn run(req: PrecacheRequest) -> i32 {
                 "Prebuffering {descriptor} — all profiles ({})",
                 names.join(", ")
             );
-            drive_prebuffer_all(&group)
+            drive_prebuffer_all(&group, req.allow_whole_facet)
         }
     }
 }
@@ -374,7 +374,7 @@ fn resolve_spec(
 
 // ─── Drivers ─────────────────────────────────────────────────────────
 
-fn drive_prebuffer(view: &dyn TestDataView) -> i32 {
+fn drive_prebuffer(view: &dyn TestDataView, allow_whole_facet: bool) -> i32 {
     let plan = match plan_prebuffer(view) {
         Ok(p) => p,
         Err(e) => {
@@ -386,6 +386,10 @@ fn drive_prebuffer(view: &dyn TestDataView) -> i32 {
         println!("Precache: profile declared no facets.");
         return 0;
     }
+    if !allow_whole_facet && !plan.unresolvable.is_empty() {
+        report_unresolvable(&plan.unresolvable);
+        return 2;
+    }
     eprintln!(
         "Prebuffering {} facet(s), {} to download. ({} streams × {} HTTP runtimes)",
         plan.facets.len(),
@@ -394,7 +398,10 @@ fn drive_prebuffer(view: &dyn TestDataView) -> i32 {
         crate::transport::http_runtimes()
     );
     let mut ctx = LiveCtx::new(plan.facets.len(), plan.total_bytes);
-    let result = view.prebuffer_all_with_progress(&mut |facet, p| ctx.on_progress(facet, p));
+    let result = view.prebuffer_all_with_progress(
+        whole_facet_fallback(allow_whole_facet),
+        &mut |facet, p| ctx.on_progress(facet, p),
+    );
     ctx.finalize(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
     if result.is_err() { 1 } else { 0 }
 }
@@ -481,33 +488,15 @@ fn drive_selective(
     // facets that can be windowed and then failing on one that cannot
     // would leave the run half done for a reason the user could have
     // been told up front.
-    let fallback = if allow_whole_facet {
-        crate::view::WholeFacetFallback::Allow
-    } else {
-        crate::view::WholeFacetFallback::Refuse
-    };
+    let fallback = whole_facet_fallback(allow_whole_facet);
     if !allow_whole_facet {
-        let refused: Vec<&String> = plans
+        let refused: Vec<String> = plans
             .iter()
             .filter(|(_, p)| p.degrades_to_full_download)
-            .map(|(n, _)| n)
+            .map(|(n, _)| n.clone())
             .collect();
         if !refused.is_empty() {
-            eprintln!(
-                "error: the window cannot be resolved for {}, so honouring it \
-                 means fetching {} whole.",
-                refused
-                    .iter()
-                    .map(|s| format!("'{s}'"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                if refused.len() == 1 {
-                    "that facet"
-                } else {
-                    "those facets"
-                }
-            );
-            eprintln!("Pass --allow-whole-facet to accept that, or drop --window.");
+            report_unresolvable(&refused);
             return 2;
         }
     }
@@ -591,9 +580,10 @@ fn render_plan(plans: &[(String, crate::PrefetchPlan)]) -> String {
     s
 }
 
-fn drive_prebuffer_all(group: &crate::TestDataGroup) -> i32 {
+fn drive_prebuffer_all(group: &crate::TestDataGroup, allow_whole_facet: bool) -> i32 {
     let mut all_facets: Vec<FacetPlanRow> = Vec::new();
     let mut total_bytes = 0u64;
+    let mut unresolvable: Vec<String> = Vec::new();
     for profile_name in group.profile_names() {
         if let Some(view) = group.profile(&profile_name) {
             let plan = match plan_prebuffer(&*view) {
@@ -604,6 +594,7 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup) -> i32 {
                 }
             };
             total_bytes += plan.total_bytes;
+            unresolvable.extend(plan.unresolvable.iter().map(|f| format!("{profile_name}/{f}")));
             for row in plan.facets {
                 all_facets.push(FacetPlanRow {
                     qualified_name: format!("{profile_name}/{}", row.qualified_name),
@@ -614,6 +605,10 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup) -> i32 {
     if all_facets.is_empty() {
         println!("Precache: no facets across any profile.");
         return 0;
+    }
+    if !allow_whole_facet && !unresolvable.is_empty() {
+        report_unresolvable(&unresolvable);
+        return 2;
     }
     if total_bytes >= crate::PREBUFFER_LARGE_WARNING_BYTES {
         eprintln!(
@@ -635,6 +630,7 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup) -> i32 {
 
     let mut ctx = LiveCtx::new(all_facets.len(), total_bytes);
     let result = group.prebuffer_all_profiles_with_progress(
+        whole_facet_fallback(allow_whole_facet),
         &mut |profile, facet, p| {
             let qualified = format!("{profile}/{facet}");
             ctx.on_progress(&qualified, p);
@@ -654,13 +650,50 @@ struct FacetPlanRow {
 
 struct PrebufferPlan {
     facets: Vec<FacetPlanRow>,
-    /// Sum of `total_bytes` across *remote* facets only — local
-    /// facets are already resident so they don't contribute to the
-    /// download tally.
+    /// Bytes the precache will fetch: each facet's declared window,
+    /// decomposed across its shards, net of chunks already resident.
     total_bytes: u64,
+    /// Facets whose declared window the format cannot map, so
+    /// honouring it means fetching the facet whole. Refused up front
+    /// unless the caller accepts that.
+    unresolvable: Vec<String>,
 }
 
-/// Size a prebuffer before any of it runs.
+/// The fallback a caller's `--allow-whole-facet` selects.
+fn whole_facet_fallback(allow_whole_facet: bool) -> crate::view::WholeFacetFallback {
+    if allow_whole_facet {
+        crate::view::WholeFacetFallback::Allow
+    } else {
+        crate::view::WholeFacetFallback::Refuse
+    }
+}
+
+/// Say which facets a window cannot be honoured for, and what to do
+/// about it, before anything is fetched. Fetching the facets that can
+/// be windowed and then failing on one that cannot would leave the run
+/// half done for a reason the user could have been told up front.
+fn report_unresolvable(refused: &[String]) {
+    eprintln!(
+        "error: the window cannot be resolved for {}, so honouring it \
+         means fetching {} whole.",
+        refused
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if refused.len() == 1 {
+            "that facet"
+        } else {
+            "those facets"
+        }
+    );
+    eprintln!("Pass --allow-whole-facet to accept that, or drop --window.");
+}
+
+/// Size a prebuffer before any of it runs, with the plan the precache
+/// will execute: each facet against the window it declares, a series
+/// decomposed across its shards. One planner for the headline and the
+/// fetch, so the number printed is the number downloaded.
 ///
 /// Fails rather than guessing when a facet's window cannot be
 /// interpreted. Reporting the whole file for a malformed window would
@@ -669,6 +702,7 @@ struct PrebufferPlan {
 fn plan_prebuffer(view: &dyn TestDataView) -> crate::Result<PrebufferPlan> {
     let mut facets = Vec::new();
     let mut total_bytes = 0u64;
+    let mut unresolvable = Vec::new();
     for (name, desc) in view.facet_manifest() {
         // The spec's formats, not an element width: a slab holds
         // data and has no element type, and asking the wrong question
@@ -676,19 +710,15 @@ fn plan_prebuffer(view: &dyn TestDataView) -> crate::Result<PrebufferPlan> {
         if !view.facet_holds_data(&name) {
             continue;
         }
-        if let Ok(storage) = view.open_facet_storage(&name) {
-            // Windowed facets contribute their window size, not the
-            // shared base file's full size — otherwise a sized
-            // profile against a 1.3 TiB base announces "1.3 TiB to
-            // download" even though the windowed precache only
-            // pulls a fraction. `facet_download_bytes` handles the
-            // local/remote and windowed/full split in one call.
-            total_bytes += crate::view::facet_download_bytes(
-                desc.source_path.as_deref(),
-                desc.window.as_deref(),
-                &storage,
-            )
+        let window = crate::view::facet_declared_window(&desc)
             .map_err(|e| crate::Error::Other(format!("facet '{name}': {e}")))?;
+        if let Ok(plan) = view.prefetch_plan(&name, &window) {
+            if plan.degrades_to_full_download {
+                total_bytes += plan.facet_bytes;
+                unresolvable.push(name.clone());
+            } else {
+                total_bytes += plan.bytes_to_fetch();
+            }
             facets.push(FacetPlanRow {
                 qualified_name: name,
             });
@@ -697,17 +727,10 @@ fn plan_prebuffer(view: &dyn TestDataView) -> crate::Result<PrebufferPlan> {
     Ok(PrebufferPlan {
         facets,
         total_bytes,
+        unresolvable,
     })
 }
 
-/// In-place stderr renderer for precache progress.
-///
-/// Tracks per-facet `verified_bytes` (last callback wins) and
-/// aggregates across all facets. Updates the status line at ~4 Hz
-/// via carriage-return so the output stays on a single line. When
-/// stderr isn't a tty (piped, captured), the updates still write
-/// but the terminal won't reflow them — acceptable, since piped
-/// output usually wants a log rather than a meter.
 pub(super) struct LiveCtx {
     facet_count: usize,
     total_bytes: u64,

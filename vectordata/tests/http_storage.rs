@@ -654,7 +654,7 @@ fn prebuffer_all_drives_every_facet_complete() {
 
     let mut facets_seen: Vec<String> = Vec::new();
     let mut chunks_total = 0u32;
-    view.prebuffer_all_with_progress(&mut |facet, p| {
+    view.prebuffer_all_with_progress(vectordata::WholeFacetFallback::Refuse, &mut |facet, p| {
         if !facets_seen.contains(&facet.to_string()) {
             facets_seen.push(facet.to_string());
         }
@@ -722,7 +722,7 @@ fn windowed_precache_only_fetches_window_chunks() {
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("windowed").unwrap();
 
-    view.prebuffer_all_with_progress(&mut |_facet, _p| {}).unwrap();
+    view.prebuffer_all_with_progress(vectordata::WholeFacetFallback::Refuse, &mut |_facet, _p| {}).unwrap();
 
     // The base.fvec storage must NOT be fully fetched — only the
     // chunks covering bytes [0..5200) should be valid.
@@ -1545,6 +1545,7 @@ profiles:
     let mut visited: Vec<(String, String)> = Vec::new();
     let mut warned_bytes: Option<u64> = None;
     group.prebuffer_all_profiles_with_progress(
+        vectordata::WholeFacetFallback::Refuse,
         &mut |profile, facet, _p| {
             let key = (profile.to_string(), facet.to_string());
             if !visited.contains(&key) { visited.push(key); }
@@ -1601,6 +1602,7 @@ profiles:
 
     let mut warned: Option<u64> = None;
     let result = group.prebuffer_all_profiles_with_progress(
+        vectordata::WholeFacetFallback::Refuse,
         &mut |_p, _f, _prog| {},
         &mut |total| { warned = Some(total); },
     );
@@ -1974,6 +1976,86 @@ fn a_windowed_prefetch_of_a_series_fetches_far_less_than_the_facet() {
     );
 }
 
+/// Three shards of 400 records plus a sized profile over the first
+/// 500, spelled the way sized profiles are published (SH-102).
+fn make_series_with_sized_profile(root: &Path) {
+    make_big_remote_series(root, 3, 400);
+    std::fs::write(
+        root.join("dataset.yaml"),
+        "name: big-series\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: big__NNNN.fvec\n      shard_stride: 400\n      shard_count: 3\n      \
+         record_count: 1200\n  small:\n    base_count: 500\n    base_vectors:\n      \
+         source: big__NNNN.fvec[0..500]\n      shard_stride: 400\n      shard_count: 3\n      \
+         record_count: 1200\n",
+    )
+    .unwrap();
+}
+
+/// After precaching the `small` profile: its 500 records are resident
+/// and the last shard was not dragged in.
+fn assert_only_the_window_is_resident(view: &dyn vectordata::TestDataView) {
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+    let total = storage.total_size();
+    let stats = storage.cache_stats().unwrap();
+    let resident = stats.valid_chunks as u64 * stats.chunk_size;
+    assert!(
+        resident >= 500 * 36,
+        "the window's own bytes must be resident ({resident} of {total})"
+    );
+    assert!(
+        !storage.is_complete() && resident <= total * 2 / 3,
+        "precaching the 500-record window fetched {resident} of {total} bytes: the last shard was dragged in"
+    );
+    let base = view.base_vectors().unwrap();
+    assert_eq!(base.count(), 500);
+    assert_eq!(base.get(499).unwrap()[0], 499.0 * 100.0);
+}
+
+/// **A sized profile over a series precaches its window, not the
+/// base** (SH-14, SH-102).
+///
+/// The whole-profile precache honoured a window only through a facet's
+/// single source path, and a series has none, so it fell through to
+/// the unbounded prebuffer: precaching `tessera:10m` from the explorer
+/// started downloading all five shards of the 400m base. The plan and
+/// the fetch now both come from the shard-aware planner.
+#[test]
+fn precaching_a_sized_profile_of_a_series_fetches_only_its_window() {
+    let tmp = make_tmp();
+    make_series_with_sized_profile(tmp.path());
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("small").unwrap();
+    view.prebuffer_all_with_progress(vectordata::WholeFacetFallback::Refuse, &mut |_, _| {})
+        .unwrap();
+    assert_only_the_window_is_resident(&*view);
+}
+
+/// The same guarantee through the precache driver the explorer's
+/// Precache action and `vectordata datasets precache` call, which
+/// plans and prints before it fetches: the headline and the fetch
+/// come from one planner.
+#[test]
+fn the_precache_driver_fetches_only_a_sized_profiles_window() {
+    let tmp = make_tmp();
+    make_series_with_sized_profile(tmp.path());
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let req = vectordata::datasets::precache::PrecacheRequest {
+        dataset_spec: server.base_url(),
+        profile: Some("small".to_string()),
+        ..vectordata::datasets::precache::PrecacheRequest::default()
+    };
+    assert_eq!(vectordata::datasets::precache::run(req), 0);
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("small").unwrap();
+    assert_only_the_window_is_resident(&*view);
+}
+
 /// **A facet byte range prebuffers the shard it lives in** (SH-38).
 ///
 /// `FacetStorage::prebuffer_range_with_progress` takes the facet's byte
@@ -2129,7 +2211,7 @@ fn precaching_a_series_downloads_every_shard() {
     assert!(!storage.is_complete(), "nothing fetched yet");
 
     let mut seen_total = 0u64;
-    view.prebuffer_all_with_progress(&mut |_facet: &str,
+    view.prebuffer_all_with_progress(vectordata::WholeFacetFallback::Refuse, &mut |_facet: &str,
                                            p: &vectordata::view::PrebufferProgress| {
         seen_total = seen_total.max(p.total_bytes);
     })

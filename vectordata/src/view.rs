@@ -105,38 +105,6 @@ fn parse_window_first(s: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// Compute the byte range a facet's window covers, for the windowed-
-/// precache path. Returns `Some((byte_start, byte_end))` only when:
-///   - the facet declares a window, via *either* a `[start..end)`
-///     suffix on `raw_source` (the `Simple` sugar, e.g.
-///     `base.fvec[0..1000000)`) *or* an explicit `window:` field
-///     surfaced through `explicit_window` (the `Detailed { source,
-///     window }` form — `source` is suffix-free and the range lives
-///     in a sibling key), AND
-///   - the format is xvec (uniform-stride) so record→byte is
-///     just `4 + dim * elem_size`
-///
-/// Both encodings are honored because that is exactly what the
-/// reader path (`open_uniform`) does — a sized profile synthesized
-/// from `default` serializes to the `Detailed` form, so consulting
-/// only the suffix silently downloaded the *whole* base file for
-/// every windowed sized profile rather than just its window.
-///
-/// Returns `None` for:
-///   - facets that declare no window in either encoding — caller
-///     should use the unbounded prebuffer
-///   - parquet and unrecognized formats. Ordinal windowing of parquet
-///     is **excluded by design**, not unimplemented: its row-group
-///     structure has no record-to-byte mapping a caller could predict,
-///     and giving it one would mean inventing a coordinate system the
-///     format does not have
-///   - degenerate cases (zero dim, empty range, end ≤ start)
-///
-/// The dim is read from the xvec header at byte 0 of the storage
-/// — a 4-byte fetch that triggers a single chunk download in the
-/// remote case. That's the same first-chunk download every reader
-/// would do on first access anyway, so the cost is paid once
-/// regardless of whether the precache is windowed.
 /// Resolve a facet's window bounds from whichever encoding the config
 /// carries, mirroring `open_uniform`: the `[start..end)` suffix on the
 /// source string takes precedence, else the explicit `window:` field.
@@ -168,28 +136,6 @@ fn parse_window_bounds(
         return Ok(None);
     }
     Ok(Some((path_no_window, win_start, win_end)))
-}
-
-pub(crate) fn facet_window_byte_range(
-    raw_source: &str,
-    explicit_window: Option<&str>,
-    storage: &FacetStorage,
-) -> Result<Option<(u64, u64)>> {
-    let Some((path_no_window, win_start, win_end)) =
-        parse_window_bounds(raw_source, explicit_window)?
-    else {
-        return Ok(None);
-    };
-
-    // A single (start, end) is only meaningful for a single-file facet.
-    // A series has one range per shard it touches, so this legacy shape
-    // answers `None` for one rather than naming a span that exists in no
-    // file (SH-28). Callers that must handle a series use
-    // `prefetch_plan`.
-    Ok(
-        record_range_to_bytes(&path_no_window, win_start, win_end, storage)
-            .and_then(|m| (m.ranges.len() == 1).then(|| (m.ranges[0].start, m.ranges[0].end))),
-    )
 }
 
 /// The single source of a facet, or an error naming sharding as the
@@ -252,7 +198,7 @@ pub(crate) fn records_in(path: &str, storage: &crate::storage::Storage) -> Optio
 /// Map a record range to a byte range, for formats where that mapping
 /// is computable from the file alone.
 ///
-/// Split out from [`facet_window_byte_range`] so the mapping can serve
+/// Split out so the mapping can serve
 /// a window the *caller* named as well as one a profile declared. A
 /// profile window is a convenience — a name for a range someone will
 /// want repeatedly — not the only range anyone is allowed to ask for.
@@ -493,83 +439,27 @@ fn map_in_slab(
     (byte_start < byte_end).then_some((byte_start, byte_end, index.prerequisite_bytes()))
 }
 
-/// How many bytes a facet contributes to a precache plan.
-///
-/// Returns `0` for facets already resident locally (mmap-backed) —
-/// they don't enter the download tally. For remote facets, returns
-/// the windowed byte range when [`facet_window_byte_range`] succeeds
-/// (sized-profile xvec with chunk-0 resident), and the full file
-/// size otherwise.
-///
-/// Used by `precache::plan_prebuffer` so the "to download" headline
-/// reflects what will actually fetch, not the full-base size that
-/// every sized profile sharing a base file would otherwise inherit
-/// (a 1m windowed profile against a 1.3 TiB base used to announce
-/// 1.3 TiB even though the windowed precache only pulls ~150 MiB).
-pub(crate) fn facet_download_bytes(
-    raw_source: Option<&str>,
-    explicit_window: Option<&str>,
-    storage: &FacetStorage,
-) -> Result<u64> {
-    // Check the window before the local short-circuit. A malformed
-    // window is a configuration error whether or not the bytes happen
-    // to be on this disk already, and sizing it as "0, nothing to
-    // download" would hide it until read time.
-    if let Some(src) = raw_source {
-        validate_window_spec(src, explicit_window)?;
+/// The window a facet declares for itself, in facet ordinals: a
+/// `[start..end)` suffix on a single source, else the `window:` field
+/// (which is where a series carries it, having no single source), else
+/// none. This is the window the whole-profile precache honours per
+/// facet, and it comes from the same two encodings the reader consults.
+/// A malformed window is an error, not an absent one.
+pub fn facet_declared_window(desc: &FacetDescriptor) -> Result<DSWindow> {
+    match desc.source_path.as_deref() {
+        Some(src) => Ok(match parse_window_bounds(src, desc.window.as_deref())? {
+            Some((_, start, end)) => DSWindow(vec![crate::dataset::source::DSInterval {
+                min_incl: start,
+                max_excl: end,
+            }]),
+            None => DSWindow(Vec::new()),
+        }),
+        None => match desc.window.as_deref() {
+            Some(w) => crate::dataset::source::parse_window(w)
+                .map_err(|e| Error::Other(format!("window '{w}' is malformed: {e}"))),
+            None => Ok(DSWindow(Vec::new())),
+        },
     }
-    if storage.is_local() {
-        return Ok(0);
-    }
-    let Some(raw_source) = raw_source else {
-        return Ok(storage.total_size());
-    };
-    // Summed over every shard the window touches — for a single file
-    // that is the one range it always was, and for a series it is the
-    // only honest answer: the window's bytes live in several files
-    // (SH-28).
-    match facet_window_bytes(raw_source, explicit_window, storage)? {
-        Some(bytes) => Ok(bytes),
-        None => Ok(storage.total_size()),
-    }
-}
-
-/// Bytes a window covers, summed across the shards it touches.
-///
-/// `None` when the window cannot be mapped at all — the caller then
-/// prices the whole facet.
-fn facet_window_bytes(
-    raw_source: &str,
-    explicit_window: Option<&str>,
-    storage: &FacetStorage,
-) -> Result<Option<u64>> {
-    let Some((path_no_window, win_start, win_end)) =
-        parse_window_bounds(raw_source, explicit_window)?
-    else {
-        return Ok(None);
-    };
-    Ok(
-        record_range_to_bytes(&path_no_window, win_start, win_end, storage)
-            .map(|m| m.ranges.iter().map(|r| r.len()).sum()),
-    )
-}
-
-/// Parse-check a facet's window without touching storage.
-///
-/// Split out from [`facet_window_byte_range`] so a window can be
-/// rejected before any I/O and regardless of whether the facet is
-/// local — the two encodings are checked exactly as that function
-/// reads them.
-pub(crate) fn validate_window_spec(raw_source: &str, explicit_window: Option<&str>) -> Result<()> {
-    let parsed = crate::dataset::source::parse_source_string(raw_source)
-        .map_err(|e| Error::Other(format!("source '{raw_source}' has a malformed window: {e}")))?;
-    if parsed.window.is_empty()
-        && let Some(w) = explicit_window
-    {
-        crate::dataset::source::parse_window(w)
-            .map_err(|e| Error::Other(format!("window '{w}' is malformed: {e}")))?;
-    }
-    Ok(())
 }
 
 /// Reader wrapper that clips access to a sub-range of the underlying
@@ -776,7 +666,7 @@ pub trait TestDataView: Send + Sync {
     /// promoted. Per-facet failure surfaces as `Err` — callers
     /// cannot continue with partial state.
     fn prebuffer_all(&self) -> Result<()> {
-        self.prebuffer_all_with_progress(&mut |_, _| {})
+        self.prebuffer_all_with_progress(WholeFacetFallback::Refuse, &mut |_, _| {})
     }
 
     /// Same as [`prebuffer_all`] with a callback fired per facet
@@ -788,101 +678,70 @@ pub trait TestDataView: Send + Sync {
     /// failure is propagated as `Err`, never swallowed — callers
     /// cannot accidentally continue with partial state.
     ///
-    /// `cb` is taken by `&mut dyn` rather than as a generic parameter
-    /// so this trait remains dyn-compatible (consumers receive
-    /// `Arc<dyn TestDataView>` from the catalog API).
+    /// Every facet is fetched against the window it declares, a series
+    /// included; a declared window the format cannot map is refused
+    /// under [`WholeFacetFallback::Refuse`] and fetched whole under
+    /// [`WholeFacetFallback::Allow`]. `cb` is taken by `&mut dyn`
+    /// rather than as a generic parameter so this trait remains
+    /// dyn-compatible (consumers receive `Arc<dyn TestDataView>` from
+    /// the catalog API).
     fn prebuffer_all_with_progress(
         &self,
+        fallback: WholeFacetFallback,
         cb: &mut dyn FnMut(&str, &PrebufferProgress),
     ) -> Result<()> {
         use std::cell::{Cell, RefCell};
 
-        // Fail fast on capacity *before* a single chunk is fetched:
-        // tally the bytes this view will pull into the cache directory
-        // and reject up front if they won't fit. Only remote facets
-        // cost cache space, and only the not-yet-resident portion of
-        // each costs anything — the cache file is pre-sized sparse, so
-        // its allocated (`du`) size is exactly what's already on disk.
-        // Subtracting it keeps a re-precache of resident, partial, or
-        // shared-base data from being rejected for space it doesn't
-        // actually need. Opening here is idempotent (the storage
-        // registry dedupes), so the download loop below re-opens for
-        // free; the `.mref`/header round trips are simply paid now.
-        let mut bytes_to_fetch: u64 = 0;
+        // One plan per facet, from the planner the selective precache
+        // uses, against the window the facet declares for itself. The
+        // per-file mapping this replaced answered "no window" for a
+        // series, which has no single source path, so a sized profile
+        // over a sharded base downloaded the whole base: a "small part"
+        // of tessera came to two terabytes. The planner decomposes a
+        // facet window across shards (SH-14), so a profile pulls what
+        // it can address and nothing more.
+        let mut planned: Vec<(String, FacetStorage, PrefetchPlan)> = Vec::new();
         for (name, desc) in self.facet_manifest() {
             if !self.facet_holds_data(&name) {
                 continue;
             }
-            // Open failures are not diagnosed here — the download loop
-            // re-opens the same facet and surfaces the real error with
-            // its own context. Skipping only under-counts the tally.
-            if let Ok(storage) = self.open_facet_storage(&name)
-                && !storage.is_local()
-            {
-                let download = facet_download_bytes(
-                    desc.source_path.as_deref(),
-                    desc.window.as_deref(),
-                    &storage,
-                )?;
-                let resident = storage.allocated_cache_bytes();
-                bytes_to_fetch += download.saturating_sub(resident);
-            }
-        }
-        crate::cache::ensure_cache_capacity(bytes_to_fetch)
-            .map_err(|e| Error::Other(e.to_string()))?;
-
-        for (name, desc) in self.facet_manifest() {
-            // Skip facets whose format the spec does not name — they
-            // are not data this build knows how to move.
-            if !self.facet_holds_data(&name) {
-                continue;
-            }
-
-            // Pre-open notification: the renderer flips to this
-            // facet's status line *before* `open_facet_storage`
-            // fetches the `.mref`. Without this, the meter shows
-            // the previous facet's last frame for the whole
-            // inter-facet network round trip — which feels stuck
-            // when there are many small facets.
-            {
-                let p = PrebufferProgress {
-                    verified_chunks: 0,
-                    total_chunks: 0,
-                    verified_bytes: 0,
-                    total_bytes: 0,
-                };
-                cb(&name, &p);
-            }
-
             let storage = self
                 .open_facet_storage(&name)
                 .map_err(|e| Error::Other(format!("open '{name}' for precache: {e}")))?;
+            let window = facet_declared_window(&desc)?;
+            let plan = self.prefetch_plan_on(&storage, &name, &window)?;
+            // A declared window the format cannot map is refused unless
+            // the caller accepted the whole facet, exactly as a
+            // requested window is. Widening a profile's own window to
+            // its whole base in silence is not a fallback; it is the
+            // download the window existed to prevent.
+            check_fallback(&name, &plan, fallback)?;
+            planned.push((name, storage, plan));
+        }
+        let bytes_to_fetch: u64 = planned
+            .iter()
+            .map(|(_, storage, plan)| {
+                if plan.degrades_to_full_download {
+                    storage
+                        .total_size()
+                        .saturating_sub(storage.allocated_cache_bytes())
+                } else {
+                    plan.bytes_to_fetch()
+                }
+            })
+            .sum();
+        crate::cache::ensure_cache_capacity(bytes_to_fetch)
+            .map_err(|e| Error::Other(e.to_string()))?;
 
-            // Honor the facet's window for precache: if the profile
-            // only reads vectors [start..end) of an xvec base file,
-            // there's no point downloading the rest. The window may be
-            // encoded as a `[start..end)` suffix on the source string
-            // *or* as the explicit `window:` field (`desc.window`) —
-            // both are passed so a sized profile in either form pulls
-            // just its window. The helper returns `None` for
-            // non-windowed facets and for parquet, whose ordinal
-            // windowing is excluded by design — those fall back to the
-            // unbounded prebuffer below.
-            let window_bytes = match desc.source_path.as_deref() {
-                Some(src) => facet_window_byte_range(src, desc.window.as_deref(), &storage)?,
-                None => None,
+        for (name, storage, plan) in &planned {
+            // The "total" a meter tops out at is what this facet will
+            // hold when done: the window's bytes for a windowed facet,
+            // the file for a whole one.
+            let total_for_display: u64 = if plan.degrades_to_full_download {
+                storage.total_size()
+            } else {
+                plan.byte_ranges.iter().map(|r| r.len()).sum()
             };
-            let total_for_display = match window_bytes {
-                Some((s, e)) => e - s,
-                None => storage.total_size(),
-            };
-
-            // Post-open notification with the known total size, so
-            // the renderer can show "0 / N MiB" instead of "0 / 0"
-            // for the brief window before the first chunk lands.
-            // For windowed facets the "total" is the window's byte
-            // count, not the whole file — meter tops out at 100%
-            // when the window is resident, not at 0.1%.
             {
                 let p = PrebufferProgress {
                     verified_chunks: 0,
@@ -890,18 +749,11 @@ pub trait TestDataView: Send + Sync {
                     verified_bytes: 0,
                     total_bytes: total_for_display,
                 };
-                cb(&name, &p);
+                cb(name, &p);
             }
 
-            // Forward each chunk-level update into the user
-            // callback so consumers can render a live progress
-            // meter, not just a once-per-facet "done" event. The
-            // RefCell holds a reborrow of `cb` so we can also call
-            // `cb` again after the storage call returns (for
-            // already-resident facets that fired no inner updates).
             let cb_cell: RefCell<&mut dyn FnMut(&str, &PrebufferProgress)> = RefCell::new(&mut *cb);
             let fired = Cell::new(false);
-            let name_str = name.to_string();
             let forward = |p: &crate::transport::DownloadProgress| {
                 let progress = PrebufferProgress {
                     verified_chunks: p.completed_chunks(),
@@ -909,21 +761,18 @@ pub trait TestDataView: Send + Sync {
                     verified_bytes: p.downloaded_bytes(),
                     total_bytes: p.total_bytes(),
                 };
-                (cb_cell.borrow_mut())(&name_str, &progress);
+                (cb_cell.borrow_mut())(name, &progress);
                 fired.set(true);
             };
-            let result = match window_bytes {
-                Some((byte_start, byte_end)) => {
-                    storage.prebuffer_range_with_progress(byte_start, byte_end, forward)
-                }
-                None => storage.prebuffer_with_progress(forward),
+            let result = if plan.degrades_to_full_download {
+                storage.prebuffer_with_progress(&forward)
+            } else {
+                plan.byte_ranges
+                    .iter()
+                    .try_for_each(|r| storage.prebuffer_shard_range(r.shard, r.start, r.end, &forward))
             };
             result.map_err(|e| Error::Other(format!("precache '{name}': {e}")))?;
 
-            // For facets that fired no chunk updates (local mmap,
-            // cache already complete) emit one synthetic event so
-            // consumers can rely on "every declared facet was
-            // visited and is resident".
             if !fired.get() {
                 let progress = PrebufferProgress {
                     verified_chunks: 0,
@@ -931,26 +780,12 @@ pub trait TestDataView: Send + Sync {
                     verified_bytes: total_for_display,
                     total_bytes: total_for_display,
                 };
-                (cb_cell.borrow_mut())(&name_str, &progress);
+                (cb_cell.borrow_mut())(name, &progress);
             }
         }
         Ok(())
     }
 
-    /// Open a facet of ordinal-addressed records.
-    ///
-    /// For a slab facet — metadata content, predicates, results, the
-    /// layout — this is the reader. The vector readers above are built
-    /// on fixed-width elements and a slab record is neither fixed nor
-    /// an element run, so it has a container of its own.
-    ///
-    /// The result carries no codec yet. Apply one to get values:
-    ///
-    /// ```rust,ignore
-    /// let facet = view.open_facet_records("metadata_content")?;
-    /// let rows  = facet.decode(vectordata::records::Serde::<MyRow>::new());
-    /// let first = rows.get(0)?;
-    /// ```
     fn open_facet_records(
         &self,
         name: &str,
@@ -3949,46 +3784,36 @@ mod tests {
         (path, FacetStorage::new(storage))
     }
 
-    /// The windowed-precache byte-range gate must honor a window
-    /// declared as the explicit `window:` field (the `Detailed
-    /// { source, window }` form that synthesized sized profiles
-    /// serialize to), not just the `[start..end)` path suffix.
-    /// Consulting only the suffix made the Downloader pull the entire
-    /// base file for every Detailed-form sized profile.
+    /// A facet declares its window in one of two encodings, and the
+    /// whole-profile precache reads both, the way the reader does: the
+    /// `[start..end)` suffix on a single source, else the `window:`
+    /// field. The suffix wins when both are present; neither means no
+    /// window. Consulting only the suffix once made the precache pull
+    /// the entire base file for every field-form sized profile.
     #[test]
-    fn window_byte_range_honors_explicit_window_field() {
-        let tmp = tempfile::tempdir().unwrap();
-        // dim=2, f32 → bytes-per-record = 4 (dim header) + 2*4 = 12.
-        let (path, storage) = fvec_storage(tmp.path(), 2, 4);
-        let bpr = 4 + 2 * 4;
-
-        let src = path.to_string_lossy().to_string();
-        // Suffix form: `base.fvec[1..3)`.
-        let suffixed = format!("{src}[1..3)");
+    fn a_declared_window_is_read_from_either_encoding() {
+        let desc = |source: Option<&str>, window: Option<&str>| FacetDescriptor {
+            name: "base_vectors".into(),
+            source_path: source.map(str::to_string),
+            source_type: None,
+            window: window.map(str::to_string),
+            standard_kind: None,
+        };
+        let bounds = |d: &FacetDescriptor| {
+            let w = facet_declared_window(d).unwrap();
+            w.0.first().map(|iv| (iv.min_incl, iv.max_excl))
+        };
+        assert_eq!(bounds(&desc(Some("base.fvec[1..3)"), None)), Some((1, 3)));
+        assert_eq!(bounds(&desc(Some("base.fvec"), Some("1..3"))), Some((1, 3)));
         assert_eq!(
-            facet_window_byte_range(&suffixed, None, &storage).unwrap(),
-            Some((bpr, 3 * bpr)),
-            "suffix-encoded window must bound the byte range",
+            bounds(&desc(Some("base.fvec[1..3)"), Some("0..4"))),
+            Some((1, 3)),
+            "the path suffix takes precedence over the window field"
         );
-        // Explicit-field form: suffix-free source + `window: \"1..3\"`.
-        assert_eq!(
-            facet_window_byte_range(&src, Some("1..3"), &storage).unwrap(),
-            Some((bpr, 3 * bpr)),
-            "explicit window: field must bound the byte range identically to the suffix",
-        );
-        // The suffix wins when both are present (matches `open_uniform`).
-        assert_eq!(
-            facet_window_byte_range(&suffixed, Some("0..4"), &storage).unwrap(),
-            Some((bpr, 3 * bpr)),
-            "path suffix takes precedence over the explicit window: field",
-        );
-        // No window in either encoding → unbounded (None), so the
-        // caller falls back to a full prebuffer.
-        assert_eq!(
-            facet_window_byte_range(&src, None, &storage).unwrap(),
-            None,
-            "no window in either encoding must fall through to a full download",
-        );
+        assert_eq!(bounds(&desc(Some("base.fvec"), None)), None);
+        // A series has no single source; its window lives in the field.
+        assert_eq!(bounds(&desc(None, Some("[0..500]"))), Some((0, 500)));
+        assert_eq!(bounds(&desc(None, None)), None);
     }
 
     /// **A malformed window is an error, not an absent one.**
@@ -4001,27 +3826,49 @@ mod tests {
     #[test]
     fn a_malformed_window_is_an_error_not_an_absent_window() {
         let tmp = tempfile::tempdir().unwrap();
-        let (path, storage) = fvec_storage(tmp.path(), 2, 4);
+        let (path, _storage) = fvec_storage(tmp.path(), 2, 4);
         let src = path.to_string_lossy().to_string();
 
-        let err = facet_window_byte_range(&format!("{src}[0,1000)"), None, &storage)
-            .expect_err("a comma-for-`..` window must not read as 'no window'");
+        // And the declared-window helper the whole-profile precache
+        // plans from propagates rather than quietly answering "no
+        // window" — which would size, and fetch, the whole file.
+        let desc = FacetDescriptor {
+            name: "base_vectors".into(),
+            source_path: Some(format!("{src}[0,1000)")),
+            source_type: None,
+            window: None,
+            standard_kind: None,
+        };
         assert!(
-            err.to_string().contains("malformed window"),
-            "the error should say what is wrong: {err}"
-        );
-
-        let err = facet_window_byte_range(&src, Some("0,1000"), &storage)
-            .expect_err("the explicit window: field must be checked too");
-        assert!(err.to_string().contains("malformed"), "{err}");
-
-        // And the download-size helper propagates rather than quietly
-        // reporting the whole file — that number is what the precache
-        // plan prints before it starts fetching.
-        assert!(
-            facet_download_bytes(Some(&format!("{src}[0,1000)")), None, &storage).is_err(),
+            facet_declared_window(&desc).is_err(),
             "a plan built on a malformed window must fail, not size the whole file"
         );
+        let series_desc = FacetDescriptor {
+            name: "base_vectors".into(),
+            source_path: None,
+            source_type: None,
+            window: Some("[0..500]".into()),
+            standard_kind: None,
+        };
+        let w = facet_declared_window(&series_desc).unwrap();
+        assert_eq!((w.0[0].min_incl, w.0[0].max_excl), (0, 500), "a series declares its window in the field");
+        let bad_field = FacetDescriptor {
+            name: "base_vectors".into(),
+            source_path: Some(src.clone()),
+            source_type: None,
+            window: Some("0,1000".into()),
+            standard_kind: None,
+        };
+        let err = facet_declared_window(&bad_field).expect_err("the window field is checked too");
+        assert!(err.to_string().contains("malformed"), "{err}");
+        let bad_series = FacetDescriptor {
+            name: "base_vectors".into(),
+            source_path: None,
+            source_type: None,
+            window: Some("0,1000".into()),
+            standard_kind: None,
+        };
+        assert!(facet_declared_window(&bad_series).is_err(), "a series' malformed window is an error too");
     }
 
     // ---- Coalescing -------------------------------------------------

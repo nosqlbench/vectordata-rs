@@ -705,8 +705,12 @@ view.prebuffer_all()?;
 
 // With per-facet progress. Callback fires once per declared facet
 // (after that facet's download completes; for already-resident
-// facets it fires once with total_chunks=0).
-view.prebuffer_all_with_progress(&mut |facet, p| {
+// facets it fires once with total_chunks=0). Every facet is fetched
+// against the window it declares — a series decomposed across its
+// shards — and a declared window the format cannot map is refused
+// under `WholeFacetFallback::Refuse` rather than widened to the
+// whole facet; pass `Allow` to accept the whole facet.
+view.prebuffer_all_with_progress(WholeFacetFallback::Refuse, &mut |facet, p| {
     let pct = if p.total_chunks > 0 {
         100.0 * p.verified_chunks as f64 / p.total_chunks as f64
     } else { 100.0 };
