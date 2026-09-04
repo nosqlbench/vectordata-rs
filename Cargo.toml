@@ -15,7 +15,7 @@
 # the other with -p.
 [package]
 name = "vectordata-rs"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2024"
 description = "Umbrella binary for the vectordata-rs toolkit: the vectordata CLI plus veks, vecd, and slab in one installable multiplexer"
 license = "Apache-2.0"
