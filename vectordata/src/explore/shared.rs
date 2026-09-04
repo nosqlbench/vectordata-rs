@@ -575,11 +575,12 @@ pub(super) fn spawn_chunk_prefetch(
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) { break; }
                 let q = queue.lock().unwrap().pop_front();
                 let Some(q) = q else { break };
-                // Errors are not surfaced here — the serial read path
-                // hits the same chunk next and reports the failure
-                // with full context.
-                if reader.prefetch_byte_range(q * g.chunk_bytes, (q + 1) * g.chunk_bytes).is_err() {
-                    break;
+                // A failed chunk is the reader's to report with full
+                // context when it gets there; the worker says so and
+                // moves on, so one bad chunk does not silence readahead
+                // for the rest of the sample.
+                if let Err(e) = reader.prefetch_byte_range(q * g.chunk_bytes, (q + 1) * g.chunk_bytes) {
+                    log::warn!("explore prefetch: chunk {q} failed: {e}");
                 }
             }
         });

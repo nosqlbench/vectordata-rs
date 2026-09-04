@@ -2409,17 +2409,45 @@ impl FacetStorage {
     /// only pulls the chunks for the window's byte range. The
     /// view layer computes the byte range from the window record
     /// count and the format's bytes-per-record.
+    ///
+    /// **Walks the series.** The facet's byte space is its shards' files
+    /// laid end to end (SH-38), and `self.storage` is only the first of
+    /// them: delegating to it would fetch a range in shard 0 and
+    /// silently do nothing for a range that lives in any later shard.
+    /// The explorer's prefetcher found that out on tessera, where every
+    /// chunk past the first shard fell back to the reader's serial
+    /// on-demand fetch.
     pub fn prebuffer_range_with_progress<F>(
         &self,
         byte_start: u64,
         byte_end: u64,
-        cb: F,
+        mut cb: F,
     ) -> std::io::Result<()>
     where
         F: FnMut(&crate::transport::DownloadProgress),
     {
-        self.storage
-            .prebuffer_range_with_progress(byte_start, byte_end, cb)
+        let Some(s) = &self.series else {
+            return self
+                .storage
+                .prebuffer_range_with_progress(byte_start, byte_end, cb);
+        };
+        let mut file_start = 0u64;
+        for i in 0..s.file_count() {
+            if file_start >= byte_end {
+                break;
+            }
+            let storage = s
+                .file(i)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let file_end = file_start + storage.total_size();
+            if file_end > byte_start && file_start < byte_end {
+                let from = byte_start.saturating_sub(file_start);
+                let to = byte_end.min(file_end) - file_start;
+                storage.prebuffer_range_with_progress(from, to, &mut cb)?;
+            }
+            file_start = file_end;
+        }
+        Ok(())
     }
 
     /// [`Self::prebuffer_range_with_progress`] against a named shard's

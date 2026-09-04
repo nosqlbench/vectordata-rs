@@ -1974,6 +1974,43 @@ fn a_windowed_prefetch_of_a_series_fetches_far_less_than_the_facet() {
     );
 }
 
+/// **A facet byte range prebuffers the shard it lives in** (SH-38).
+///
+/// `FacetStorage::prebuffer_range_with_progress` takes the facet's byte
+/// space. It used to drive only the first shard's storage, so a range
+/// in any later shard was a silent no-op. The explorer's readahead is
+/// built on this call; on tessera every chunk past shard 0 fell back
+/// to the reader's serial on-demand fetch.
+#[test]
+fn a_facet_byte_range_prebuffers_the_shard_it_lives_in() {
+    let tmp = make_tmp();
+    make_big_remote_series(tmp.path(), 3, 400);
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+    let total = storage.total_size();
+    let before = storage.cache_stats().unwrap();
+
+    // Records 1150..1160 sit deep in the last shard, past the chunks
+    // that opening the series faulted in to read dim headers.
+    storage
+        .prebuffer_range_with_progress(1150 * 36, 1160 * 36, |_| {})
+        .unwrap();
+    let after = storage.cache_stats().unwrap();
+    assert!(
+        after.valid_chunks > before.valid_chunks,
+        "a range in the last shard fetched nothing ({} → {} chunks)",
+        before.valid_chunks,
+        after.valid_chunks
+    );
+    assert!(!storage.is_complete(), "only the range's chunks were fetched");
+    let fetched = (after.valid_chunks - before.valid_chunks) as u64 * after.chunk_size;
+    assert!(fetched < total / 4, "fetched {fetched} of {total} bytes for ten records");
+}
+
 /// **Cache statistics are the series', not shard 0's** (SH-81).
 ///
 /// `cache_stats` reads `self.storage`, which for a series is the first
