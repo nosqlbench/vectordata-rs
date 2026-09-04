@@ -375,11 +375,15 @@ fn resolve_spec(
 // ─── Drivers ─────────────────────────────────────────────────────────
 
 fn drive_prebuffer(view: &dyn TestDataView, allow_whole_facet: bool) -> i32 {
-    let plan = match plan_prebuffer(view) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Precache: {e}");
-            return 1;
+    let plan = {
+        let mut status = StatusTicker::start();
+        match plan_prebuffer(view, &mut |e| status.on(e)) {
+            Ok(p) => p,
+            Err(e) => {
+                drop(status);
+                eprintln!("Precache: {e}");
+                return 1;
+            }
         }
     };
     if plan.facets.is_empty() {
@@ -474,7 +478,14 @@ fn drive_selective(
     // The window each plan was made against, so the fetch that follows
     // asks for exactly what was planned and printed.
     let mut windows: Vec<crate::dataset::source::DSWindow> = Vec::new();
-    for name in &selected {
+    let mut status = StatusTicker::start();
+    for (i, name) in selected.iter().enumerate() {
+        status.on(PlanEvent::Begin {
+            index: i + 1,
+            count: selected.len(),
+            name,
+            files: manifest.get(name).and_then(|d| d.shard_count).map(|n| n as usize),
+        });
         let facet_window = match window {
             Some(w) => w.clone(),
             None => match manifest.get(name).map(crate::view::facet_declared_window) {
@@ -488,15 +499,18 @@ fn drive_selective(
         };
         match view.prefetch_plan(name, &facet_window) {
             Ok(plan) => {
+                status.on(PlanEvent::end_of(name, &plan));
                 plans.push((name.clone(), plan));
                 windows.push(facet_window);
             }
             Err(e) => {
+                drop(status);
                 eprintln!("error: facet '{name}': {e}");
                 return 1;
             }
         }
     }
+    drop(status);
 
     print!("{}", render_plan(&plans));
     if plan_only {
@@ -603,11 +617,13 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup, allow_whole_facet: bool) ->
     let mut all_facets: Vec<FacetPlanRow> = Vec::new();
     let mut total_bytes = 0u64;
     let mut unresolvable: Vec<String> = Vec::new();
+    let mut status = StatusTicker::start();
     for profile_name in group.profile_names() {
         if let Some(view) = group.profile(&profile_name) {
-            let plan = match plan_prebuffer(&*view) {
+            let plan = match plan_prebuffer(&*view, &mut |e| status.on_in(&profile_name, e)) {
                 Ok(p) => p,
                 Err(e) => {
+                    drop(status);
                     eprintln!("Precache: profile '{profile_name}': {e}");
                     return 1;
                 }
@@ -621,6 +637,7 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup, allow_whole_facet: bool) ->
             }
         }
     }
+    drop(status);
     if all_facets.is_empty() {
         println!("Precache: no facets across any profile.");
         return 0;
@@ -709,29 +726,89 @@ fn report_unresolvable(refused: &[String]) {
     eprintln!("Pass --allow-whole-facet to accept that, or drop --window.");
 }
 
+/// What the planner is doing, for a caller that prints while it works.
+pub(super) enum PlanEvent<'a> {
+    /// About to open and plan facet `index` of `count`; `files` is the
+    /// number of files a sharded facet spans, `None` for a single file.
+    Begin {
+        index: usize,
+        count: usize,
+        name: &'a str,
+        files: Option<usize>,
+    },
+    /// Facet planned.
+    End {
+        name: &'a str,
+        /// Bytes the fetch will pull, net of resident chunks.
+        bytes: u64,
+        /// Nothing left to fetch.
+        resident: bool,
+        /// The declared window cannot be mapped; the fetch would be the
+        /// whole facet, and only `--allow-whole-facet` lets it happen.
+        unresolvable: bool,
+    },
+}
+
+impl<'a> PlanEvent<'a> {
+    fn end_of(name: &'a str, plan: &crate::PrefetchPlan) -> Self {
+        PlanEvent::End {
+            name,
+            bytes: if plan.degrades_to_full_download {
+                plan.facet_bytes
+            } else {
+                plan.bytes_to_fetch()
+            },
+            resident: plan.is_resident(),
+            unresolvable: plan.degrades_to_full_download,
+        }
+    }
+}
+
 /// Size a prebuffer before any of it runs, with the plan the precache
 /// will execute: each facet against the window it declares, a series
 /// decomposed across its shards. One planner for the headline and the
 /// fetch, so the number printed is the number downloaded.
 ///
+/// `on` hears a [`PlanEvent::Begin`] before each facet is opened and a
+/// [`PlanEvent::End`] once it is planned. Opening is the slow part —
+/// on a sharded remote base it fetches one merkle reference per shard,
+/// tens of megabytes each, and for a slab its offset index — so a
+/// driver that says nothing until the plan returns shows the user a
+/// blank screen for as long as that takes.
+///
 /// Fails rather than guessing when a facet's window cannot be
 /// interpreted. Reporting the whole file for a malformed window would
 /// announce a terabyte, download it, and only then fail on the read —
 /// the plan is the last cheap place to catch it.
-fn plan_prebuffer(view: &dyn TestDataView) -> crate::Result<PrebufferPlan> {
+fn plan_prebuffer(
+    view: &dyn TestDataView,
+    on: &mut dyn FnMut(PlanEvent<'_>),
+) -> crate::Result<PrebufferPlan> {
     let mut facets = Vec::new();
     let mut total_bytes = 0u64;
     let mut unresolvable = Vec::new();
-    for (name, desc) in view.facet_manifest() {
-        // The spec's formats, not an element width: a slab holds
-        // data and has no element type, and asking the wrong question
-        // left metadata out of every precache.
-        if !view.facet_holds_data(&name) {
-            continue;
-        }
-        let window = crate::view::facet_declared_window(&desc)
+    let manifest = view.facet_manifest();
+    // The spec's formats, not an element width: a slab holds data and
+    // has no element type, and asking the wrong question left metadata
+    // out of every precache.
+    let mut names: Vec<&String> = manifest
+        .keys()
+        .filter(|name| view.facet_holds_data(name))
+        .collect();
+    names.sort();
+    let count = names.len();
+    for (i, name) in names.into_iter().enumerate() {
+        let desc = &manifest[name];
+        on(PlanEvent::Begin {
+            index: i + 1,
+            count,
+            name,
+            files: desc.shard_count.map(|n| n as usize),
+        });
+        let window = crate::view::facet_declared_window(desc)
             .map_err(|e| crate::Error::Other(format!("facet '{name}': {e}")))?;
-        if let Ok(plan) = view.prefetch_plan(&name, &window) {
+        if let Ok(plan) = view.prefetch_plan(name, &window) {
+            on(PlanEvent::end_of(name, &plan));
             if plan.degrades_to_full_download {
                 total_bytes += plan.facet_bytes;
                 unresolvable.push(name.clone());
@@ -739,7 +816,7 @@ fn plan_prebuffer(view: &dyn TestDataView) -> crate::Result<PrebufferPlan> {
                 total_bytes += plan.bytes_to_fetch();
             }
             facets.push(FacetPlanRow {
-                qualified_name: name,
+                qualified_name: name.clone(),
             });
         }
     }
@@ -748,6 +825,129 @@ fn plan_prebuffer(view: &dyn TestDataView) -> crate::Result<PrebufferPlan> {
         total_bytes,
         unresolvable,
     })
+}
+
+/// A status line that keeps moving while the planner opens files.
+///
+/// Between "Prebuffering" and the first progress line the planner
+/// opens every facet: on tessera that is five 33 MB merkle references
+/// and a 57 MB slab index, seven seconds during which nothing used to
+/// be printed. The ticker repaints the current step with its elapsed
+/// time four times a second, and closes each step with its result on
+/// its own line, so the screen always says what is happening and how
+/// long it has been happening.
+struct StatusTicker {
+    state: std::sync::Arc<std::sync::Mutex<TickState>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+struct TickState {
+    /// The step being worked on and when it began; `None` between steps.
+    current: Option<(String, std::time::Instant)>,
+    stop: bool,
+}
+
+impl StatusTicker {
+    fn start() -> Self {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(TickState {
+            current: None,
+            stop: false,
+        }));
+        let shared = state.clone();
+        let handle = std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                // Painting under the lock is what keeps a repaint from
+                // landing after the step's closing line.
+                let st = shared.lock().unwrap();
+                if st.stop {
+                    break;
+                }
+                if let Some((label, since)) = &st.current {
+                    use std::io::Write;
+                    eprint!("\r  {label}\u{2026} {:.1}s\u{1b}[K", since.elapsed().as_secs_f64());
+                    let _ = std::io::stderr().flush();
+                }
+            }
+        });
+        StatusTicker {
+            state,
+            handle: Some(handle),
+        }
+    }
+
+    /// Begin a step: paint its label now, then keep painting its age.
+    fn begin(&mut self, label: String) {
+        use std::io::Write;
+        let mut st = self.state.lock().unwrap();
+        eprint!("\r  {label}\u{2026}\u{1b}[K");
+        let _ = std::io::stderr().flush();
+        st.current = Some((label, std::time::Instant::now()));
+    }
+
+    /// Close the current step with its result, on its own line.
+    fn end(&mut self, line: String) {
+        let mut st = self.state.lock().unwrap();
+        st.current = None;
+        eprintln!("\r  {line}\u{1b}[K");
+    }
+
+    fn on(&mut self, event: PlanEvent<'_>) {
+        self.on_in("", event);
+    }
+
+    /// Like [`Self::on`], with the facet qualified by its profile.
+    fn on_in(&mut self, profile: &str, event: PlanEvent<'_>) {
+        let qualify = |name: &str| {
+            if profile.is_empty() {
+                name.to_string()
+            } else {
+                format!("{profile}/{name}")
+            }
+        };
+        match event {
+            PlanEvent::Begin {
+                index,
+                count,
+                name,
+                files,
+            } => {
+                let span = match files {
+                    Some(n) if n > 1 => format!(" ({n} files)"),
+                    _ => String::new(),
+                };
+                self.begin(format!("[{index}/{count}] {}{span}: opening", qualify(name)));
+            }
+            PlanEvent::End {
+                name,
+                bytes,
+                resident,
+                unresolvable,
+            } => {
+                let outcome = if unresolvable {
+                    format!("{} whole, its window cannot be mapped", fmt_bytes(bytes))
+                } else if resident {
+                    "already resident".to_string()
+                } else {
+                    format!("{} to fetch", fmt_bytes(bytes))
+                };
+                self.end(format!("{}: {outcome}", qualify(name)));
+            }
+        }
+    }
+}
+
+impl Drop for StatusTicker {
+    fn drop(&mut self) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.stop = true;
+            st.current = None;
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 pub(super) struct LiveCtx {
@@ -1017,5 +1217,68 @@ mod spec_classification {
         let (head, sel) = classify_spec(spec);
         assert_eq!(head, spec);
         assert_eq!(named(&sel), None);
+    }
+}
+
+#[cfg(test)]
+mod plan_events {
+    use super::*;
+
+    fn write_fvec(path: &Path, dim: i32, records: usize) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).unwrap();
+        for i in 0..records {
+            f.write_all(&dim.to_le_bytes()).unwrap();
+            for d in 0..dim as usize {
+                f.write_all(&((i * 10 + d) as f32).to_le_bytes()).unwrap();
+            }
+        }
+    }
+
+    /// The planner announces each facet before it opens it and closes
+    /// it with its plan, so a driver can keep the screen alive through
+    /// the opens; a series says how many files it spans.
+    #[test]
+    fn planning_announces_each_facet_before_opening_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ds = tmp.path().join("ds");
+        std::fs::create_dir_all(&ds).unwrap();
+        write_fvec(&ds.join("base__0000.fvec"), 4, 10);
+        write_fvec(&ds.join("base__0001.fvec"), 4, 10);
+        write_fvec(&ds.join("base__0002.fvec"), 4, 5);
+        write_fvec(&ds.join("query.fvec"), 4, 3);
+        std::fs::write(
+            ds.join("dataset.yaml"),
+            "name: plan-events\nprofiles:\n  default:\n    base_vectors:\n      \
+             source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 3\n      \
+             record_count: 25\n    query_vectors: query.fvec\n",
+        )
+        .unwrap();
+        let group = crate::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+        let view = group.profile("default").unwrap();
+
+        let mut seen: Vec<String> = Vec::new();
+        let plan = plan_prebuffer(&*view, &mut |e| {
+            seen.push(match e {
+                PlanEvent::Begin { index, count, name, files } => {
+                    format!("begin {index}/{count} {name} files={files:?}")
+                }
+                PlanEvent::End { name, resident, unresolvable, .. } => {
+                    format!("end {name} resident={resident} unresolvable={unresolvable}")
+                }
+            });
+        })
+        .unwrap();
+
+        assert_eq!(plan.facets.len(), 2);
+        assert_eq!(
+            seen,
+            [
+                "begin 1/2 base_vectors files=Some(3)",
+                "end base_vectors resident=true unresolvable=false",
+                "begin 2/2 query_vectors files=None",
+                "end query_vectors resident=true unresolvable=false",
+            ]
+        );
     }
 }

@@ -635,6 +635,15 @@ The directory layout under the resolved root is
 Prebuffering downloads every facet of a profile so subsequent reads
 are zero-copy mmap with no further HTTP requests.
 
+While a precache plans, it prints one line per facet as it opens it,
+`[i/N] facet (k files): opening… 4.8s`, ticking with elapsed time, and
+closes the line with what the facet will cost (`3.9 GiB to fetch`,
+`already resident`, or the whole facet when its window cannot be
+mapped). Opening is where the wait is on a large remote dataset: one
+merkle reference per shard and a slab's offset index are fetched
+before a byte of data is, and until this status existed that phase
+was a blank screen.
+
 #### Strict contract
 
 Every `prebuffer*` API in `vectordata` honours the same strict
