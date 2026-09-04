@@ -6240,7 +6240,7 @@ dependencies = [
 
 [[package]]
 name = "vectordata"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -6285,7 +6285,7 @@ dependencies = [
 
 [[package]]
 name = "vectordata-rs"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "slabtastic",
  "vecd",
@@ -6295,7 +6295,7 @@ dependencies = [
 
 [[package]]
 name = "veks"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "arrow",
  "atty",
@@ -6364,7 +6364,7 @@ dependencies = [
 
 [[package]]
 name = "veks-core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "arrow",
  "atty",
@@ -6407,7 +6407,7 @@ dependencies = [
 
 [[package]]
 name = "veks-pipeline"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "arrow",
  "atty",
