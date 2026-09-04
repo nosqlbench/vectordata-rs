@@ -1341,28 +1341,29 @@ impl std::fmt::Debug for Storage {
 /// keeps only one of the concurrent attempts.
 ///
 /// Two completeness signals are checked: the in-memory state on the
-/// `CachedChannel` (cheap, takes a Mutex), and — only as a
+/// `CachedChannel` (cheap, an atomic bitmap count), and — only as a
 /// fallback when in-memory says incomplete — the on-disk `.mrkl`
-/// state. The latter handles the case where a *sibling* `Storage`
-/// instance has populated the cache without notifying this
-/// channel's in-memory state. Without this fallback, an early
-/// reader opened before `precache` would never see the promotion
-/// triggered by another instance.
+/// state via [`CachedChannel::completed_by_sibling`]. The latter
+/// handles the case where a *sibling* `Storage` instance has
+/// populated the cache without notifying this channel's in-memory
+/// state. Without this fallback, an early reader opened before
+/// `precache` would never see the promotion triggered by another
+/// instance.
 ///
 /// Cheap when already promoted (atomic load on `OnceLock::get`).
-/// One `Mutex` lock per call until promoted; one extra disk
-/// `.mrkl` read per call until promoted *and* the in-memory state
-/// is incomplete. After promotion, all calls are O(1) atomic-load.
+/// Until then each call costs the in-memory count plus one `stat`
+/// of the `.mrkl`; the on-disk bitset is re-read only when that file
+/// changes. This sits under every record read of a partially cached
+/// shard (`mmap_slice` is tried before `read_bytes`), so it must
+/// never load the state file per call: on a 410 GB shard that file
+/// is 32 MB, and doing so held an explorer to about 50 vectors a
+/// second. `cache::tests::reads_on_a_partial_cache_do_not_reload_the_state_file`
+/// guards this.
 fn try_promote_cached(channel: &CachedChannel, mmap: &OnceLock<Mmap>) {
     if mmap.get().is_some() {
         return;
     }
-    let in_memory_complete = channel.is_complete();
-    let on_disk_complete = !in_memory_complete
-        && crate::merkle::MerkleState::load(channel.state_path())
-            .map(|s| s.is_complete())
-            .unwrap_or(false);
-    if !(in_memory_complete || on_disk_complete) {
+    if !(channel.is_complete() || channel.completed_by_sibling()) {
         return;
     }
     if let Ok(file) = std::fs::File::open(channel.cache_path())

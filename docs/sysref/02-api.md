@@ -666,6 +666,16 @@ Downstream code that opens a reader at session-init, runs prebuffer,
 and then accesses per-cycle gets the zero-copy fast path on the
 first cycle.
 
+Until a cached storage is promoted, each access checks for
+completion in two steps: the in-memory validity bitmap, then a `stat`
+of the `.mrkl` sidecar, whose validity bitset is re-read only when
+that file changed (a sibling checkpointed into it) or once per second.
+The state file is never loaded on the read path. That is a hard
+rule with a regression test behind it
+(`reads_on_a_partial_cache_do_not_reload_the_state_file`): on a
+410 GB shard the state file is 32 MB, and loading it per read once
+held `vectordata explore` to about 50 vectors a second.
+
 #### From the CLI
 
 ```bash

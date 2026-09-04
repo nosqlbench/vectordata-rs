@@ -294,7 +294,28 @@ pub struct CachedChannel {
     /// Concurrent readers of the same chunk wait on the Condvar instead
     /// of issuing duplicate requests.
     in_flight: Mutex<HashMap<u32, Arc<Condvar>>>,
+    /// What [`CachedChannel::completed_by_sibling`] last saw of the
+    /// `.mrkl` on disk: the file's (modified time, length), when it
+    /// looked, and the answer it read. `None` until the first probe.
+    sibling_probe: Mutex<Option<SiblingProbe>>,
 }
+
+/// One inspection of the on-disk `.mrkl` by
+/// [`CachedChannel::completed_by_sibling`].
+#[derive(Debug, Clone)]
+struct SiblingProbe {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    at: std::time::Instant,
+    complete: bool,
+}
+
+/// How long [`CachedChannel::completed_by_sibling`] trusts an
+/// unchanged (modified time, length) stamp before re-reading the
+/// bitset anyway. Guards against a final save landing inside the
+/// same coarse timestamp tick as the previous one; bounds the cost
+/// at one bitset read per interval per channel.
+const SIBLING_REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[allow(dead_code)] // pub(crate) helpers retained for Storage and tests
 impl CachedChannel {
@@ -428,7 +449,48 @@ impl CachedChannel {
             retry_policy: RetryPolicy::default(),
             concurrency: download_concurrency(),
             in_flight: Mutex::new(HashMap::new()),
+            sibling_probe: Mutex::new(None),
         })
+    }
+
+    /// Whether the cache on disk is fully verified, counting work done
+    /// by *other* instances.
+    ///
+    /// [`CachedChannel::is_complete`] only knows the chunks this
+    /// channel verified. A sibling channel on the same cache directory
+    /// (another `Storage` in this process, or `precache` in another)
+    /// checkpoints its progress into the same `.mrkl`, so its
+    /// completion has to be read from disk. That read is gated: one
+    /// `stat` per call, and the validity bitset is re-read only when
+    /// the file's modified time or length changed since the last look,
+    /// or the last look is older than [`SIBLING_REPROBE_INTERVAL`].
+    /// The tree hashes ahead of the bitset are never read, so a poll
+    /// costs microseconds on a shard whose state file is tens of
+    /// megabytes. Before this gate, every read of a partially cached
+    /// shard loaded the whole state file.
+    ///
+    /// `false` when the state file is missing or unreadable.
+    pub fn completed_by_sibling(&self) -> bool {
+        let Ok(meta) = fs::metadata(&self.state_path) else {
+            return false;
+        };
+        let (modified, len) = (meta.modified().ok(), meta.len());
+        let mut probe = self.sibling_probe.lock().unwrap();
+        if let Some(seen) = probe.as_ref()
+            && seen.modified == modified
+            && seen.len == len
+            && seen.at.elapsed() < SIBLING_REPROBE_INTERVAL
+        {
+            return seen.complete;
+        }
+        let complete = MerkleState::complete_on_disk(&self.state_path).unwrap_or(false);
+        *probe = Some(SiblingProbe {
+            modified,
+            len,
+            at: std::time::Instant::now(),
+            complete,
+        });
+        complete
     }
 
     /// Set the retry policy.
@@ -945,6 +1007,104 @@ mod tests {
         let transport = Arc::new(MemoryTransport::new(data.to_vec()));
         let channel = CachedChannel::open(transport, mref, dir.path(), "test.dat").unwrap();
         (dir, channel)
+    }
+
+    /// Bytes this thread has read through `read`/`pread` so far
+    /// (`rchar` from `/proc/thread-self/io`). Per thread, so the
+    /// other tests running in this process do not pollute the count.
+    #[cfg(target_os = "linux")]
+    fn thread_rchar() -> u64 {
+        let io = std::fs::read_to_string("/proc/thread-self/io").unwrap();
+        io.lines()
+            .find_map(|l| l.strip_prefix("rchar:"))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("rchar in /proc/thread-self/io")
+    }
+
+    /// Regression guard. Reading a partially cached storage must not
+    /// load the `.mrkl` state file per read. From 2026-04-30 to
+    /// 2026-09-03 the lazy mmap promotion did exactly that, and on a
+    /// tessera shard, whose state file is 32 MB, it held
+    /// `vectordata explore` to about 50 vectors a second. The bound
+    /// is on bytes read, not time: many small reads may cost the data
+    /// returned, a small per-read overhead, and one state-file
+    /// allowance for the gated sibling probe. The old path cost one
+    /// full state file per read, hundreds of times the limit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_on_a_partial_cache_do_not_reload_the_state_file() {
+        use crate::storage::Storage;
+        use std::sync::OnceLock;
+        // 1 MiB of content in 256-byte chunks: 4096 leaves, a state
+        // file of a few hundred KB, large next to a 64-byte read.
+        let data: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 251) as u8).collect();
+        let (dir, channel) = setup_cached_channel(&data, 256);
+        let storage = Storage::Cached { channel, mmap: OnceLock::new() };
+        // Land chunk 0 so the reads below are served from the cache
+        // file, as an explorer's are once its prefetcher is ahead.
+        storage.read_bytes(0, 256).unwrap();
+        assert!(!storage.is_local(), "a partial cache must not report local");
+        let state_len = std::fs::metadata(dir.path().join("test.dat.mrkl")).unwrap().len();
+        assert!(state_len > 100_000, "state file too small for the guard to mean anything: {state_len}");
+
+        // A reader tries the zero-copy entry points first and falls
+        // back to `read_bytes`; every one of them consults the
+        // promotion check, so every one is exercised per iteration.
+        let reads = 400u64;
+        let read_len = 64u64;
+        let before = thread_rchar();
+        for i in 0..reads {
+            let off = (i % 4) * read_len;
+            assert!(storage.mmap_slice(off, read_len).is_none());
+            assert!(storage.mmap_base().is_none());
+            assert!(!storage.is_local());
+            assert!(!storage.is_complete());
+            let got = storage.read_bytes(off, read_len).unwrap();
+            assert_eq!(&got[..], &data[off as usize..(off + read_len) as usize]);
+        }
+        let read = thread_rchar() - before;
+        let allowed = reads * read_len * 4 + state_len + 64 * 1024;
+        assert!(
+            read <= allowed,
+            "read amplification: {read} bytes read for {} bytes of data (state file {state_len} B, limit {allowed}); the read path is loading the .mrkl per call again",
+            reads * read_len
+        );
+        assert!(!storage.is_local());
+    }
+
+    /// The gated probe still does its job: when a sibling channel on
+    /// the same cache directory verifies everything, a storage opened
+    /// earlier promotes to mmap on a later access.
+    #[test]
+    fn a_sibling_completing_the_cache_promotes_an_open_storage() {
+        use crate::storage::Storage;
+        use std::sync::OnceLock;
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 253) as u8).collect();
+        let (dir, channel) = setup_cached_channel(&data, 1024);
+        let storage = Storage::Cached { channel, mmap: OnceLock::new() };
+        storage.read_bytes(0, 16).unwrap();
+        assert!(!storage.is_local());
+
+        let mref = MerkleRef::from_content(&data, 1024);
+        let sibling = CachedChannel::open(
+            Arc::new(MemoryTransport::new(data.clone())),
+            mref,
+            dir.path(),
+            "test.dat",
+        )
+        .unwrap();
+        sibling.ensure_range(0, 7).unwrap();
+        assert!(sibling.is_complete());
+
+        // A checkpoint written inside the same coarse timestamp tick
+        // as the previous one is caught by the re-probe interval, so
+        // wait up to a few of those.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while !storage.is_local() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(storage.is_local(), "storage never saw the sibling's completion");
+        assert_eq!(storage.read_bytes(4096, 8).unwrap(), &data[4096..4104]);
     }
 
     #[test]

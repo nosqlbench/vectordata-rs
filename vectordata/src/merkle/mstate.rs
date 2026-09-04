@@ -211,26 +211,68 @@ impl MerkleState {
     /// atomic bitmap rather than walking chunk-by-chunk via
     /// `is_valid`, so it's O(words) instead of O(chunks).
     pub fn valid_count(&self) -> u32 {
-        let total = self.shape.total_chunks;
-        if total == 0 { return 0; }
-        let full_words = (total as usize) / 64;
-        let tail_bits = (total as usize) % 64;
-        let mut count: u32 = 0;
-        for i in 0..full_words {
-            count = count.saturating_add(
-                self.valid_words[i].load(Ordering::Relaxed).count_ones());
-        }
-        if tail_bits > 0 && full_words < self.valid_words.len() {
-            let mask: u64 = (1u64 << tail_bits) - 1;
-            let w = self.valid_words[full_words].load(Ordering::Relaxed) & mask;
-            count = count.saturating_add(w.count_ones());
-        }
-        count.min(total)
+        count_verified(self.shape.total_chunks, self.valid_words.len(), |i| {
+            self.valid_words[i].load(Ordering::Relaxed)
+        })
     }
 
     /// Are all chunks verified?
     pub fn is_complete(&self) -> bool {
         self.valid_count() == self.shape.total_chunks
+    }
+
+    /// Whether the `.mrkl` at `path` records every chunk as verified,
+    /// answered without loading the tree.
+    ///
+    /// Reads the footer and the validity bitset only, never the
+    /// `node_count * 32` bytes of hashes ahead of them. On a
+    /// terabyte-scale shard the file is tens of megabytes and the
+    /// bitset tens of kilobytes; a reader polling for another
+    /// instance's completion must not pay for the tree on each poll.
+    /// Gives the same answer [`MerkleState::is_complete`] would on the
+    /// loaded state, and the same errors [`MerkleState::load`] would on
+    /// a malformed file.
+    pub fn complete_on_disk(path: &Path) -> io::Result<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = fs::File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        if len < FOOTER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file too short for footer",
+            ));
+        }
+        let tail_len = len.min(FOOTER_SIZE_V2);
+        let mut tail = vec![0u8; tail_len];
+        file.seek(SeekFrom::Start((len - tail_len) as u64))?;
+        file.read_exact(&mut tail)?;
+        let footer_size = if tail[tail_len - 1] as usize == FOOTER_SIZE_V2 {
+            FOOTER_SIZE_V2
+        } else {
+            FOOTER_SIZE
+        };
+        let shape = MerkleShape::read_footer(&tail[tail_len - footer_size..])?;
+
+        let hash_bytes = shape.node_count as usize * HASH_SIZE;
+        let word_count = Self::word_count_for_leaves(shape.leaf_count);
+        let bitset_bytes = word_count * 8;
+        let expected_size = hash_bytes + bitset_bytes + footer_size;
+        if len != expected_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("file size mismatch: expected {} bytes, got {}", expected_size, len),
+            ));
+        }
+
+        let mut bitset = vec![0u8; bitset_bytes];
+        file.seek(SeekFrom::Start(hash_bytes as u64))?;
+        file.read_exact(&mut bitset)?;
+        let word = |i: usize| {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&bitset[i * 8..i * 8 + 8]);
+            u64::from_le_bytes(w)
+        };
+        Ok(count_verified(shape.total_chunks, word_count, word) == shape.total_chunks)
     }
 
     /// Verify chunk data and mark as valid if the hash matches.
@@ -264,6 +306,29 @@ impl MerkleState {
     }
 }
 
+/// Number of verified chunks among the first `total` bits of a
+/// validity bitset of `words` little-endian `u64` words, read through
+/// `word`. Sums `count_ones` per word rather than testing chunk by
+/// chunk, so it is O(words) not O(chunks); bits past `total` in the
+/// last word are masked off. Shared by the in-memory state and the
+/// on-disk probe so both count the same way.
+fn count_verified(total: u32, words: usize, word: impl Fn(usize) -> u64) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    let full_words = (total as usize) / 64;
+    let tail_bits = (total as usize) % 64;
+    let mut count: u32 = 0;
+    for i in 0..full_words.min(words) {
+        count = count.saturating_add(word(i).count_ones());
+    }
+    if tail_bits > 0 && full_words < words {
+        let mask: u64 = (1u64 << tail_bits) - 1;
+        count = count.saturating_add((word(full_words) & mask).count_ones());
+    }
+    count.min(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +337,38 @@ mod tests {
         let data = vec![0u8; 4096];
         let mref = MerkleRef::from_content(&data, 1024);
         (data, mref)
+    }
+
+    #[test]
+    fn complete_on_disk_matches_the_loaded_state() {
+        // Ragged tail: 101 chunks over 100 KiB + 5 bytes.
+        let data = vec![7u8; 100 * 1024 + 5];
+        let mref = MerkleRef::from_content(&data, 1024);
+        let state = MerkleState::from_ref(&mref);
+        let total = state.shape().total_chunks;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.mrkl");
+
+        state.save(&path).unwrap();
+        assert!(!MerkleState::complete_on_disk(&path).unwrap());
+
+        for i in 0..total - 1 {
+            state.mark_valid(i);
+        }
+        state.save(&path).unwrap();
+        assert!(!MerkleState::complete_on_disk(&path).unwrap());
+        assert!(!MerkleState::load(&path).unwrap().is_complete());
+
+        state.mark_valid(total - 1);
+        state.save(&path).unwrap();
+        assert!(MerkleState::complete_on_disk(&path).unwrap());
+        assert!(MerkleState::load(&path).unwrap().is_complete());
+
+        // A malformed file fails the probe the way it fails `load`.
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 7]).unwrap();
+        assert!(MerkleState::complete_on_disk(&path).is_err());
+        assert!(MerkleState::load(&path).is_err());
     }
 
     #[test]
