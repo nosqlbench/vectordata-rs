@@ -795,7 +795,15 @@ if let Some(path) = storage.cache_path() {
    reference is embedded so `.mref` is needed only on first open.
 3. **Read path** — check local cache → fetch chunk if missing →
    SHA-256 hash → compare against the merkle leaf → write to
-   cache → update `.mrkl` → return bytes.
+   cache → checkpoint `.mrkl` → return bytes. A checkpoint writes
+   only the validity bitset into the existing file, merged under an
+   exclusive file lock with whatever other channels on the same
+   cache have recorded; the tree ahead of it never changes after
+   the file is created and is never rewritten. It runs once per
+   fetch call, so it must not scale with the tree: rewriting the
+   whole 33.6 MB file per one-MiB chunk once held tessera downloads
+   to 6 MB/s (guarded by
+   `single_chunk_fetches_do_not_rewrite_the_state_file`).
 4. **Promotion** — once every chunk is verified, the cached
    storage flips into a `Mmap` view of the cache file. Subsequent
    reads (via `read_bytes` / `mmap_slice` / `get_slice`) are

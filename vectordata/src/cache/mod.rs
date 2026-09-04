@@ -713,14 +713,15 @@ impl CachedChannel {
             },
             || {
                 // Calling thread: render progress and run the throttled
-                // `.mrkl` checkpoint. `state.save` reads each bitmap word
-                // with `Relaxed` atomics, so it serialises a
+                // `.mrkl` checkpoint. `state.checkpoint` writes the
+                // bitset only, merged with the bits on disk, and reads
+                // each bitmap word with atomics, so it persists a
                 // consistent-per-word snapshot even while workers are
                 // still flipping bits. !Send callback state is fine — this
                 // never runs on a worker.
                 progress_cb(progress);
                 if last_save.elapsed() >= STATE_SAVE_INTERVAL {
-                    let _ = self.state.save(&self.state_path);
+                    let _ = self.state.checkpoint(&self.state_path);
                     last_save = std::time::Instant::now();
                 }
             },
@@ -730,9 +731,12 @@ impl CachedChannel {
         // snapshot — `drain_parallel` fires no terminal event of its own.
         progress_cb(progress);
 
-        // Final save — even on error so partial progress is
-        // preserved for resume.
-        let _ = self.state.save(&self.state_path);
+        // Final checkpoint — even on error so partial progress is
+        // preserved for resume. Bitset only: this runs once per fetch
+        // call, and the explorer's prefetcher makes one call per
+        // chunk, so a full-file save here wrote 32 MB per 1 MiB chunk
+        // on tessera and held downloads to 6 MB/s.
+        let _ = self.state.checkpoint(&self.state_path);
 
         // On error, clear any in-flight entries that aborted
         // workers didn't get to so blocked readers don't hang.
@@ -1070,6 +1074,43 @@ mod tests {
             reads * read_len
         );
         assert!(!storage.is_local());
+    }
+
+    /// Regression guard, write side. One fetch call persists progress
+    /// once, and that persistence must not scale with the tree: from
+    /// 2026-04-30 to 2026-09-03 every call rewrote the whole `.mrkl`,
+    /// 33.6 MB per 1 MiB chunk on tessera, 4.7 GB of state writes for
+    /// 147 MB of vectors. The bound is on bytes written by this thread
+    /// (checkpoints run on the caller; chunk writes run on workers).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_chunk_fetches_do_not_rewrite_the_state_file() {
+        let thread_wchar = || -> u64 {
+            std::fs::read_to_string("/proc/thread-self/io").unwrap()
+                .lines().find_map(|l| l.strip_prefix("wchar:"))
+                .and_then(|v| v.trim().parse().ok()).unwrap()
+        };
+        let data: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 249) as u8).collect();
+        let (dir, channel) = setup_cached_channel(&data, 256);
+        let state_len = std::fs::metadata(dir.path().join("test.dat.mrkl")).unwrap().len();
+        assert!(state_len > 100_000, "state file too small for the guard to mean anything: {state_len}");
+        let bitset_bytes = (4096 / 64) * 8;
+
+        let calls = 200u32;
+        let before = thread_wchar();
+        for i in 0..calls {
+            channel.ensure_range(i, i).unwrap();
+        }
+        let written = thread_wchar() - before;
+        let allowed = u64::from(calls) * (bitset_bytes + 256) + 64 * 1024;
+        assert!(
+            written <= allowed,
+            "write amplification: {written} bytes written on the calling thread for {calls} single-chunk fetches (state file {state_len} B, limit {allowed}); fetch calls are rewriting the .mrkl again"
+        );
+        for i in 0..calls {
+            assert!(channel.state.is_valid(i));
+        }
+        assert!(MerkleState::load(&dir.path().join("test.dat.mrkl")).unwrap().valid_count() >= calls);
     }
 
     /// The gated probe still does its job: when a sibling channel on

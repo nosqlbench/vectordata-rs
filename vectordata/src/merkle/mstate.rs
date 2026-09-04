@@ -147,6 +147,54 @@ impl MerkleState {
         })
     }
 
+    /// Persist the validity bitset into an existing `.mrkl`, merged
+    /// with the bits already on disk, without rewriting the tree.
+    ///
+    /// The hashes ahead of the bitset never change after the file is
+    /// created, so a checkpoint writes only the bitset (one bit per
+    /// chunk): 49 KB instead of 32 MB on a 410 GB shard. Bits are
+    /// monotone (missing → verified) and several channels may share
+    /// one state file, so the words on disk are OR-ed into memory
+    /// before the union is written back; an exclusive `flock` makes
+    /// that read-merge-write atomic against other checkpointers.
+    /// Falls back to a full [`MerkleState::save`] when the file is
+    /// absent or does not have this tree's layout.
+    ///
+    /// This runs after every fetch call on a cached channel, so its
+    /// cost must not scale with the tree; the cache tests guard that.
+    pub fn checkpoint(&self, path: &Path) -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let hash_bytes = self.hashes.len() * HASH_SIZE;
+        let bitset_bytes = self.bitset_byte_size();
+        let mut file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return self.save(path),
+            Err(e) => return Err(e),
+        };
+        let len = file.metadata()?.len() as usize;
+        let layout_matches = [FOOTER_SIZE, FOOTER_SIZE_V2]
+            .into_iter()
+            .any(|footer| len == hash_bytes + bitset_bytes + footer);
+        if !layout_matches {
+            return self.save(path);
+        }
+        let _lock = FileLock::exclusive(&file)?;
+        let mut on_disk = vec![0u8; bitset_bytes];
+        file.seek(SeekFrom::Start(hash_bytes as u64))?;
+        file.read_exact(&mut on_disk)?;
+        let mut merged = Vec::with_capacity(bitset_bytes);
+        for (i, word) in self.valid_words.iter().enumerate() {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&on_disk[i * 8..i * 8 + 8]);
+            let union = word.fetch_or(u64::from_le_bytes(w), Ordering::AcqRel)
+                | u64::from_le_bytes(w);
+            merged.extend_from_slice(&union.to_le_bytes());
+        }
+        file.seek(SeekFrom::Start(hash_bytes as u64))?;
+        file.write_all(&merged)?;
+        Ok(())
+    }
+
     /// Save state to a `.mrkl` file.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut buf = Vec::with_capacity(
@@ -306,6 +354,51 @@ impl MerkleState {
     }
 }
 
+/// An exclusive advisory lock on an open file, released on drop.
+/// Serialises the read-merge-write of [`MerkleState::checkpoint`]
+/// between processes sharing one state file. Advisory locks are
+/// not available everywhere; where `flock` is missing the lock is a
+/// no-op and concurrent checkpointers may each persist only their
+/// own bits, which costs a re-download, never correctness.
+struct FileLock {
+    #[cfg(unix)]
+    fd: std::os::unix::io::RawFd,
+}
+
+impl FileLock {
+    /// Take the lock on `file`, which must stay open for as long as
+    /// the returned guard lives.
+    fn exclusive(file: &fs::File) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            // SAFETY: flock on a valid, open descriptor; LOCK_EX blocks
+            // until the lock is held.
+            if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(FileLock { fd })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Ok(FileLock {})
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: releasing a lock this guard took on a descriptor
+            // its creator keeps open for the guard's lifetime.
+            unsafe { libc::flock(self.fd, libc::LOCK_UN) };
+        }
+    }
+}
+
 /// Number of verified chunks among the first `total` bits of a
 /// validity bitset of `words` little-endian `u64` words, read through
 /// `word`. Sums `count_ones` per word rather than testing chunk by
@@ -337,6 +430,53 @@ mod tests {
         let data = vec![0u8; 4096];
         let mref = MerkleRef::from_content(&data, 1024);
         (data, mref)
+    }
+
+    #[test]
+    fn checkpoint_merges_sibling_bits_and_writes_only_the_bitset() {
+        // 4096 chunks: 262 KB of hashes, a 512-byte bitset.
+        let data = vec![3u8; 4096 * 1024];
+        let mref = MerkleRef::from_content(&data, 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.mrkl");
+        let a = MerkleState::from_ref(&mref);
+        a.save(&path).unwrap();
+        let b = MerkleState::from_ref(&mref);
+
+        a.mark_valid(0);
+        a.checkpoint(&path).unwrap();
+        b.mark_valid(2);
+        b.checkpoint(&path).unwrap();
+
+        // Disk holds the union; `b` learned `a`'s bit while merging.
+        let on_disk = MerkleState::load(&path).unwrap();
+        assert!(on_disk.is_valid(0) && on_disk.is_valid(2) && !on_disk.is_valid(1));
+        assert_eq!(on_disk.valid_count(), 2);
+        assert!(b.is_valid(0));
+        // The tree ahead of the bitset is intact.
+        assert_eq!(on_disk.hashes, a.hashes);
+
+        #[cfg(target_os = "linux")]
+        {
+            let wchar = || -> u64 {
+                std::fs::read_to_string("/proc/thread-self/io").unwrap()
+                    .lines().find_map(|l| l.strip_prefix("wchar:"))
+                    .and_then(|v| v.trim().parse().ok()).unwrap()
+            };
+            let before = wchar();
+            a.mark_valid(7);
+            a.checkpoint(&path).unwrap();
+            let written = wchar() - before;
+            assert!(written <= 4096, "checkpoint wrote {written} bytes; it must write the bitset, not the tree");
+        }
+
+        // Without a file, or with a foreign layout, it is a full save.
+        std::fs::remove_file(&path).unwrap();
+        a.checkpoint(&path).unwrap();
+        assert!(MerkleState::load(&path).unwrap().is_valid(7));
+        std::fs::write(&path, b"not a state file").unwrap();
+        a.checkpoint(&path).unwrap();
+        assert!(MerkleState::load(&path).unwrap().is_valid(7));
     }
 
     #[test]
