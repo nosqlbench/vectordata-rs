@@ -643,7 +643,7 @@ impl ProfileConfig {
 /// states unrepresentable: "`NNNN` without `shard_stride`" is a parse
 /// failure here rather than a rule someone has to remember to check
 /// (V-21, SH-47).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum ShardedFacet {
     /// Filenames derived from an `NNNN` field, lengths from the stride
@@ -671,6 +671,89 @@ pub enum ShardedFacet {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window: Option<String>,
     },
+}
+
+/// The declaration as written, before the one normalisation the
+/// loader applies (see [`ShardedFacet`]'s `Deserialize`).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ShardedFacetRaw {
+    Uniform {
+        source: String,
+        shard_stride: u64,
+        shard_count: u32,
+        record_count: u64,
+        #[serde(default)]
+        window: Option<String>,
+    },
+    Explicit {
+        source: Vec<String>,
+        record_count: u64,
+        #[serde(default)]
+        window: Option<String>,
+    },
+}
+
+impl<'de> Deserialize<'de> for ShardedFacet {
+    /// A window written on a uniform pattern is the facet's window
+    /// (SH-102). A pattern names no file, so the entry-window reading
+    /// (file ordinals, SH-67) does not exist for it, and the loader
+    /// moves the suffix to `window` so every reader sees one spelling.
+    /// Giving both is a contradiction and is refused.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match ShardedFacetRaw::deserialize(d)? {
+            ShardedFacetRaw::Uniform {
+                source,
+                shard_stride,
+                shard_count,
+                record_count,
+                window,
+            } => {
+                let (source, window) = split_pattern_window(source, window)
+                    .map_err(serde::de::Error::custom)?;
+                ShardedFacet::Uniform {
+                    source,
+                    shard_stride,
+                    shard_count,
+                    record_count,
+                    window,
+                }
+            }
+            ShardedFacetRaw::Explicit {
+                source,
+                record_count,
+                window,
+            } => ShardedFacet::Explicit {
+                source,
+                record_count,
+                window,
+            },
+        })
+    }
+}
+
+/// Split a `[a..b)` suffix off a uniform pattern into the facet
+/// window. The pattern comes back bare; a pattern without a suffix is
+/// returned as it was.
+fn split_pattern_window(
+    pattern: String,
+    window: Option<String>,
+) -> Result<(String, Option<String>), String> {
+    let parsed = crate::dataset::source::parse_source_string(&pattern)?;
+    if parsed.window.is_empty() {
+        return Ok((pattern, window));
+    }
+    if window.is_some() {
+        return Err(format!(
+            "'{pattern}': the facet window is given twice, on the pattern and as 'window'"
+        ));
+    }
+    let facet_window = parsed.window.to_string();
+    let bare = crate::dataset::source::DSSource {
+        window: Default::default(),
+        ..parsed
+    };
+    Ok((bare.to_string(), Some(facet_window)))
 }
 
 impl ShardedFacet {
@@ -864,6 +947,45 @@ impl FacetConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SH-102 at the model layer: the spelling tessera's sized profiles
+    /// were published with reads as a facet window, and the reader that
+    /// opens the profile sees it through `window()`.
+    #[test]
+    fn a_window_on_a_uniform_pattern_loads_as_the_facet_window() {
+        let yaml = r#"
+profiles:
+  default:
+    base_vectors:
+      source: profiles/base/base_vectors__NNNN.fvecs
+      shard_stride: 100
+      shard_count: 5
+      record_count: 496
+  10m:
+    base_count: 10
+    base_vectors:
+      source: profiles/base/base_vectors__NNNN.fvecs[0..10]
+      shard_stride: 100
+      shard_count: 5
+      record_count: 496
+"#;
+        let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        let sized = config.profiles.get("10m").unwrap();
+        let base = sized.base_vectors.as_ref().unwrap();
+        assert_eq!(base.sources(), ["profiles/base/base_vectors__NNNN.fvecs"]);
+        assert_eq!(base.window(), Some("[0..10]"));
+        let twice = r#"
+profiles:
+  default:
+    base_vectors:
+      source: b__NNNN.fvecs[0..10]
+      shard_stride: 100
+      shard_count: 5
+      record_count: 496
+      window: "[0..5]"
+"#;
+        assert!(serde_yaml::from_str::<DatasetConfig>(twice).is_err());
+    }
 
     #[test]
     fn test_parse_simple_config() {

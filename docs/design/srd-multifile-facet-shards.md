@@ -1025,6 +1025,21 @@ one whose filenames are *parsed* for a shard field. Explicit-form
 filenames are read from the declaration and never parsed, so they carry
 no naming constraint at all — including none on digits.
 
+**SH-102.** A window written on a uniform pattern —
+`base__NNNN.fvecs[0..10M]` — is the **facet** window. An entry window
+is in file ordinals (SH-52, SH-67), and a pattern names no file, so
+that reading does not exist for it; the only one left is the facet's
+own, and the loader moves the suffix to `window:` so every reader sees
+one spelling. Writing both the suffix and `window:` is a contradiction
+and is refused. Writers use `window:`; the suffix is read for
+declarations already published with it.
+
+The rule exists because the reader had ignored the suffix: with no
+defined meaning, a uniform declaration carrying one realised the whole
+series, and a sized profile written that way served every record of
+its base rather than the first `base_count`. Prefix-bounded consumers
+never noticed; a sampler did.
+
 ## 20. Acceptance tests
 
 | # | Case | Expect |

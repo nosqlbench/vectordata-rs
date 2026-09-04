@@ -814,9 +814,23 @@ impl<'de> Deserialize<'de> for DSView {
                     parsed.push(src);
                 }
                 let mut it = parsed.into_iter();
-                let source = it.next().ok_or_else(|| {
+                let mut source = it.next().ok_or_else(|| {
                     de::Error::custom("view 'source' must name at least one file")
                 })?;
+
+                // A window written on a uniform pattern is the facet's
+                // window (SH-102): a pattern names no file, so file
+                // ordinals do not exist for it, and the one reading left
+                // is the facet's own. Move it to where readers look.
+                let uniform = shard_stride.is_some() || shard_count.is_some();
+                if uniform && !source.window.is_empty() {
+                    if window.is_some() {
+                        return Err(de::Error::custom(
+                            "the facet window is given twice: on the source pattern and as 'window'",
+                        ));
+                    }
+                    window = Some(std::mem::take(&mut source.window));
+                }
 
                 Ok(DSView {
                     source,
@@ -989,11 +1003,22 @@ pub fn derive_sized_profile(default: &DSProfile, name: &str, count: u64) -> DSPr
         let derived = match facet_role(facet) {
             FacetRole::Windowed => {
                 let mut v = view.clone();
-                if v.source.window.is_empty() {
-                    v.source.window = DSWindow(vec![DSInterval { min_incl: 0, max_excl: count }]);
-                    // The window is new; a count the source declared
-                    // describes the whole file, not this range.
-                    v.source.declared_count = None;
+                if v.window.is_none() && v.source.window.is_empty() {
+                    let window = DSWindow(vec![DSInterval { min_incl: 0, max_excl: count }]);
+                    if v.is_series() {
+                        // A series is windowed in *facet* ordinals, through
+                        // its own field (SH-67). A window on the source
+                        // would be an entry window in file ordinals, and
+                        // on a uniform pattern it names no file at all
+                        // (SH-102): the reader would ignore it and serve
+                        // the whole series.
+                        v.window = Some(window);
+                    } else {
+                        v.source.window = window;
+                        // The window is new; a count the source declared
+                        // describes the whole file, not this range.
+                        v.source.declared_count = None;
+                    }
                 }
                 v
             }
@@ -2007,6 +2032,63 @@ impl fmt::Display for DSView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uniform_view(pattern: &str) -> DSView {
+        let yaml = format!(
+            "source: {pattern}\nshard_stride: 100\nshard_count: 3\nrecord_count: 250\n"
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    /// SH-102: on a uniform pattern the window suffix is the facet
+    /// window, and both spellings read as the same view.
+    #[test]
+    fn a_window_on_a_uniform_pattern_is_the_facet_window() {
+        let suffix = uniform_view("base__NNNN.fvec[0..120]");
+        let keyed: DSView = serde_yaml::from_str(
+            "source: base__NNNN.fvec\nshard_stride: 100\nshard_count: 3\nrecord_count: 250\nwindow: \"[0..120]\"\n",
+        )
+        .unwrap();
+        assert_eq!(suffix, keyed);
+        assert!(suffix.source.window.is_empty(), "the pattern is left bare");
+        assert_eq!(suffix.window.as_ref().unwrap().0[0].max_excl, 120);
+        assert_eq!(suffix.effective_window().0[0].max_excl, 120);
+        // Re-serialised in the canonical spelling.
+        let text = serde_yaml::to_string(&suffix).unwrap();
+        assert!(text.contains("source: base__NNNN.fvec\n"), "{text}");
+        assert!(text.contains("window:"), "{text}");
+        // Given twice is a contradiction, not a choice.
+        let twice: Result<DSView, _> = serde_yaml::from_str(
+            "source: base__NNNN.fvec[0..120]\nshard_stride: 100\nshard_count: 3\nrecord_count: 250\nwindow: \"[0..50]\"\n",
+        );
+        assert!(twice.is_err());
+    }
+
+    /// A sized profile windows a series through the facet field, never
+    /// the pattern; a single file keeps the source window it always had.
+    #[test]
+    fn sized_profiles_window_a_series_in_facet_ordinals() {
+        let mut views: IndexMap<String, DSView> = IndexMap::new();
+        views.insert("base_vectors".into(), uniform_view("profiles/base/base__NNNN.fvec"));
+        views.insert(
+            "metadata_content".into(),
+            serde_yaml::from_str("profiles/base/metadata_content.slab").unwrap(),
+        );
+        let default = DSProfile { views, ..Default::default() };
+        let sized = derive_sized_profile(&default, "10m", 10);
+        let base = &sized.views["base_vectors"];
+        assert!(base.source.window.is_empty());
+        assert_eq!(base.window.as_ref().unwrap().0[0].max_excl, 10);
+        let text = serde_yaml::to_string(base).unwrap();
+        assert!(text.contains("source: profiles/base/base__NNNN.fvec\n"), "{text}");
+        assert!(text.contains("window:"), "{text}");
+        // Round trip: what was written reads back as the same view.
+        let back: DSView = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(&back, base);
+        let meta = &sized.views["metadata_content"];
+        assert_eq!(meta.source.window.0[0].max_excl, 10);
+        assert!(meta.window.is_none());
+    }
 
     #[test]
     fn test_view_from_bare_string() {

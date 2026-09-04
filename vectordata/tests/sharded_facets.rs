@@ -693,6 +693,40 @@ fn a_whole_facet_plan_names_every_shard() {
     assert_eq!(total, plan.facet_bytes);
 }
 
+/// **A window on a uniform pattern is the facet window** (SH-102).
+///
+/// tessera's sized profiles were published as
+/// `base__NNNN.fvecs[0..10M]`, and the reader had ignored the suffix:
+/// it served every record of the series, and a sampler over the "10m"
+/// profile drew from all 496 million.
+#[test]
+fn a_window_on_a_uniform_pattern_bounds_the_reader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    write_fvec(&ds.join("base__0000.fvec"), 4, 10, 0);
+    write_fvec(&ds.join("base__0001.fvec"), 4, 10, 10);
+    write_fvec(&ds.join("base__0002.fvec"), 4, 5, 20);
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: pw\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 3\n      \
+         record_count: 25\n  small:\n    base_count: 12\n    base_vectors:\n      \
+         source: base__NNNN.fvec[0..12]\n      shard_stride: 10\n      shard_count: 3\n      \
+         record_count: 25\n",
+    )
+    .unwrap();
+
+    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let full = g.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(full.count(), 25);
+    let sized = g.profile("small").unwrap().base_vectors().unwrap();
+    assert_eq!(sized.count(), 12, "the window bounds the facet, not a file");
+    assert_eq!(sized.get(0).unwrap()[0], 0.0);
+    assert_eq!(sized.get(11).unwrap()[0], 11.0, "the window crosses the first seam");
+    assert!(sized.get(12).is_err(), "nothing past the window");
+}
+
 /// Prefetching a local series is a no-op that still reports its ranges
 /// — and needs no whole-facet consent, because the window mapped.
 #[test]
