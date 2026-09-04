@@ -90,6 +90,15 @@ pub struct Outcome {
     /// rather than starting a new version.
     pub resumed: bool,
     pub dry_run: bool,
+    /// Dry run: files whose sums are not current and which a real
+    /// push would hash before comparing.
+    pub to_hash_files: usize,
+    /// Dry run: bytes those files hold.
+    pub to_hash_bytes: u64,
+    /// Dry run: files present on the remote whose local digest is not
+    /// yet known, so whether they are unchanged or overwritten waits
+    /// on the hashing.
+    pub undetermined: usize,
 }
 
 /// Failure classes, mapped to exit codes by [`run`].
@@ -115,6 +124,9 @@ enum Decision {
     Add,
     Overwrite { old_digest: String },
     Skip,
+    /// Dry run only: present on the remote, local digest not yet
+    /// computed; a real push hashes first and then decides.
+    Undetermined,
 }
 
 /// How this invocation relates to any open (incomplete) push already on
@@ -177,6 +189,10 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     }
     let mut local_sums: BTreeMap<String, checksums::ChecksumFile> = BTreeMap::new();
     let mut sums_digests: BTreeMap<String, String> = BTreeMap::new();
+    // `(dir, why, files to hash, digests kept, bytes)` for every
+    // directory whose sums are brought current — planned the same way
+    // in both modes; only the hashing and the write are the real run's.
+    let mut pending_sums: Vec<(String, String, usize, usize, u64)> = Vec::new();
     for dir_rel in &scan.content_dirs {
         let dir = dir_join(root, dir_rel);
         let names = dir_files.get(dir_rel).cloned().unwrap_or_default();
@@ -186,13 +202,23 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
                 &std::fs::read_to_string(dir.join(CHECKSUMS_FILE)).map_err(Failure::op)?,
             )
             .map_err(Failure::op)?,
-            (_, ChecksumPolicy::Auto) => {
+            // One plan, either mode: which digests are kept, which
+            // files are hashed. The dry run stops at the plan and
+            // proceeds with the digests it already has; the real run
+            // executes it — the hashing and the write are the only
+            // things a dry run does not do here.
+            (freshness, ChecksumPolicy::Auto) => {
+                let hash_plan = checksums::plan(&dir, &names).map_err(Failure::op)?;
+                let reason = match freshness {
+                    Freshness::Missing => "no SHA256SUMS".to_string(),
+                    Freshness::Stale { reason } => reason,
+                    Freshness::Current => unreachable!("current sums are read above"),
+                };
+                pending_sums.push((dir_rel.clone(), reason, hash_plan.hash.len(), hash_plan.reuse.len(), hash_plan.bytes()));
                 if opts.dry_run {
-                    // Don't mutate the working tree on a dry run; compute
-                    // in memory so the plan is accurate.
-                    compute_in_memory(&dir, &names).map_err(Failure::op)?
+                    checksums::ChecksumFile { entries: hash_plan.reuse }
                 } else {
-                    checksums::generate(&dir, &names).map_err(Failure::op)?
+                    checksums::execute(&dir, &names, hash_plan).map_err(Failure::op)?
                 }
             }
             (Freshness::Missing, ChecksumPolicy::Keep) => {
@@ -292,6 +318,9 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
                     deleted: 0,
                     resumed: false,
                     dry_run: opts.dry_run,
+                    to_hash_files: 0,
+                    to_hash_bytes: 0,
+                    undetermined: 0,
                 });
             }
             if remote_committed.stable_version() == local_log.stable_version() {
@@ -354,15 +383,37 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     let mut overwrites: Vec<Overwrite> = Vec::new();
     let mut to_upload: Vec<String> = Vec::new();
     let mut skipped = 0usize;
+    let mut undetermined: Vec<String> = Vec::new();
+    // The remote sums of a directory are one fetch per directory, not
+    // one per file in it: over the S3 transport every fetch is an
+    // `aws` process, and fetching a directory's sums once per file
+    // made a plan over a few hundred files take a quarter of an hour.
+    let mut remote_sums_by_dir: BTreeMap<String, Option<checksums::ChecksumFile>> = BTreeMap::new();
+    // Whether a file the remote sums do not list is on the remote at
+    // all comes from one listing of the publish root, not from a probe
+    // per file: over the S3 transport every probe is an `aws` process,
+    // and a first publish of a few hundred files probed each of them.
+    // A transport that cannot enumerate (a bare https endpoint) leaves
+    // the probe in place.
+    let inventory: Option<std::collections::HashSet<String>> = match tx.list("") {
+        Ok(keys) => Some(keys.into_iter().collect()),
+        Err(_) => None,
+    };
     for rel in &scan.files {
         let (dir_rel, name) = split_rel(rel);
-        let local_digest = local_sums
-            .get(dir_rel)
-            .and_then(|cf| cf.digest_of(name))
-            .ok_or_else(|| Failure::op(format!("internal: no local digest for {rel}")))?
-            .to_string();
-        match classify_file(tx.as_ref(), rel, dir_rel, &local_digest, &remote_log_or_dir_sums(tx.as_ref(), dir_rel)?)? {
+        let local_digest: Option<String> = local_sums.get(dir_rel).and_then(|cf| cf.digest_of(name)).map(str::to_string);
+        if local_digest.is_none() && !opts.dry_run {
+            return Err(Failure::op(format!("internal: no local digest for {rel}")));
+        }
+        if !remote_sums_by_dir.contains_key(dir_rel) {
+            let fetched = remote_log_or_dir_sums(tx.as_ref(), dir_rel)?;
+            remote_sums_by_dir.insert(dir_rel.to_string(), fetched);
+        }
+        let remote_sums = remote_sums_by_dir.get(dir_rel).expect("just inserted");
+        let listed = inventory.as_ref().map(|inv| inv.contains(rel));
+        match classify_file(tx.as_ref(), rel, dir_rel, local_digest.as_deref(), remote_sums, listed)? {
             Decision::Skip => skipped += 1,
+            Decision::Undetermined => undetermined.push(rel.clone()),
             Decision::Add => {
                 added.push(rel.clone());
                 to_upload.push(rel.clone());
@@ -371,7 +422,7 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
                 overwrites.push(Overwrite {
                     key: rel.clone(),
                     old_digest,
-                    new_digest: format!("sha256:{local_digest}"),
+                    new_digest: format!("sha256:{}", local_digest.as_deref().unwrap_or("unknown")),
                 });
                 to_upload.push(rel.clone());
             }
@@ -433,17 +484,21 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
         deleted: deletes.len(),
         resumed: resuming,
         dry_run: opts.dry_run,
+        to_hash_files: pending_sums.iter().map(|p| p.2).sum(),
+        to_hash_bytes: pending_sums.iter().map(|p| p.4).sum(),
+        undetermined: undetermined.len(),
     };
 
-    // 11. Dry run stops here, after printing the plan.
+    // 11. The plan, printed the same way in both modes. A dry run is
+    //     this run without its effectors, and this is where they begin.
+    print_plan(opts, &outcome, &added, &overwrites, &deletes, &undetermined, &pending_sums, &scan, seq);
     if opts.dry_run {
-        print_plan(opts, &outcome, &added, &overwrites, &deletes, &scan, seq);
         return Ok(outcome);
     }
 
     // 12. Confirmation.
     if !opts.assume_yes {
-        confirm(&outcome, &added, &overwrites, &deletes)?;
+        confirm()?;
     }
 
     // 13. TOCTOU guard: confirm no content file changed since it was
@@ -574,24 +629,33 @@ fn classify_file(
     tx: &dyn PushTransport,
     rel: &str,
     _dir_rel: &str,
-    local_digest: &str,
+    local_digest: Option<&str>,
     remote_sums: &Option<checksums::ChecksumFile>,
+    listed: Option<bool>,
 ) -> Result<Decision, Failure> {
     let (_dir, name) = split_rel(rel);
     if let Some(cf) = remote_sums {
-        match cf.digest_of(name) {
-            Some(remote_digest) if remote_digest == local_digest => return Ok(Decision::Skip),
-            Some(remote_digest) => {
+        match (cf.digest_of(name), local_digest) {
+            (Some(remote_digest), Some(local)) if remote_digest == local => return Ok(Decision::Skip),
+            (Some(remote_digest), Some(_)) => {
                 return Ok(Decision::Overwrite { old_digest: format!("sha256:{remote_digest}") })
             }
-            None => {} // not listed remotely — fall through to existence probe
+            // Listed remotely, local digest not yet computed (dry run).
+            (Some(_), None) => return Ok(Decision::Undetermined),
+            (None, _) => {} // not listed remotely — fall through to existence probe
         }
     }
-    match tx.head(rel).map_err(map_transport)? {
-        None => Ok(Decision::Add),
+    // Existence from the listing when the transport gave one, else a probe.
+    let present = match listed {
+        Some(p) => p,
+        None => tx.head(rel).map_err(map_transport)?.is_some(),
+    };
+    match (present, local_digest) {
+        (false, _) => Ok(Decision::Add),
+        (true, None) => Ok(Decision::Undetermined),
         // Present but we have no trustworthy remote digest → treat as an
         // overwrite (gated, safe) rather than risk a silent clobber.
-        Some(_) => Ok(Decision::Overwrite { old_digest: "unknown".to_string() }),
+        (true, Some(_)) => Ok(Decision::Overwrite { old_digest: "unknown".to_string() }),
     }
 }
 
@@ -642,17 +706,6 @@ fn write_log(
 /// Compute a directory's checksums in memory over exactly `names`,
 /// without writing the file (used for dry-run so the working tree is
 /// untouched).
-fn compute_in_memory(dir: &Path, names: &[String]) -> std::io::Result<checksums::ChecksumFile> {
-    let mut entries = Vec::new();
-    for name in names {
-        entries.push(checksums::ChecksumEntry {
-            hex: checksums::sha256_file(&dir.join(name))?,
-            name: name.clone(),
-        });
-    }
-    Ok(checksums::ChecksumFile { entries })
-}
-
 fn map_transport(e: PushError) -> Failure {
     match e {
         PushError::PreconditionFailed => Failure::Operational(e.to_string()),
@@ -764,25 +817,8 @@ fn display_dir(dir_rel: &str) -> &str {
     if dir_rel.is_empty() { "." } else { dir_rel }
 }
 
-fn confirm(
-    outcome: &Outcome,
-    added: &[String],
-    overwrites: &[Overwrite],
-    deletes: &[String],
-) -> Result<(), Failure> {
+fn confirm() -> Result<(), Failure> {
     use std::io::IsTerminal;
-    println!(
-        "Push to {}\n  version {}  ({} new, {} overwrite, {} delete, {} unchanged)",
-        outcome.destination,
-        outcome.version,
-        added.len(),
-        overwrites.len(),
-        deletes.len(),
-        outcome.skipped
-    );
-    for d in deletes {
-        println!("  - {d}");
-    }
     if !std::io::stdin().is_terminal() {
         return Err(Failure::Usage(
             "refusing to push without confirmation in a non-interactive context; pass -y".to_string(),
@@ -947,10 +983,16 @@ fn print_plan(
     added: &[String],
     overwrites: &[Overwrite],
     deletes: &[String],
+    undetermined: &[String],
+    pending_sums: &[(String, String, usize, usize, u64)],
     scan: &plan::Scan,
     seq: u64,
 ) {
-    println!("DRY RUN — nothing will be written.");
+    if opts.dry_run {
+        println!("DRY RUN — nothing will be written.");
+    } else {
+        println!("PLAN — what this push will do.");
+    }
     println!("Source:      {} [{}]", opts.path.display(), outcome.mode.label());
     println!("Destination: {}", outcome.destination);
     if outcome.resumed {
@@ -963,13 +1005,47 @@ fn print_plan(
         opts.concurrency.max(1)
     );
     println!(
-        "Plan:        {} new, {} overwrite, {} delete, {} unchanged across {} content dir(s)",
+        "Plan:        {} new, {} overwrite, {} delete, {} unchanged{} across {} content dir(s)",
         added.len(),
         overwrites.len(),
         deletes.len(),
         outcome.skipped,
+        if undetermined.is_empty() { String::new() } else { format!(", {} awaiting their digest", undetermined.len()) },
         scan.content_dirs.len()
     );
+    if pending_sums.is_empty() {
+        println!("Checksums:   every SHA256SUMS is current; nothing to hash");
+    } else {
+        println!(
+            "Checksums:   {} dir(s) lacked current SHA256SUMS: {} file(s), {}, {} before uploading:",
+            pending_sums.len(),
+            outcome.to_hash_files,
+            fmt_bytes(outcome.to_hash_bytes),
+            if opts.dry_run { "to be hashed by the push, not by this dry run," } else { "hashed" }
+        );
+        for (dir, why, to_hash, kept, bytes) in pending_sums {
+            println!(
+                "  {}: {} file(s) ({}), {} digest(s) kept — {}",
+                if dir.is_empty() { "." } else { dir },
+                to_hash,
+                fmt_bytes(*bytes),
+                kept,
+                why
+            );
+        }
+        if !undetermined.is_empty() {
+            println!(
+                "  {} file(s) are on the remote and await their digest to be compared: unchanged or overwritten is decided by the hashing",
+                undetermined.len()
+            );
+            for u in undetermined.iter().take(20) {
+                println!("  ? {u}");
+            }
+            if undetermined.len() > 20 {
+                println!("  ? ... and {} more", undetermined.len() - 20);
+            }
+        }
+    }
     for a in added {
         println!("  + {a}");
     }
@@ -1213,3 +1289,15 @@ pub use cli::{ChecksumMode, PushArgs, run};
 
 #[cfg(test)]
 mod tests;
+
+/// Bytes as a short human figure.
+fn fmt_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{} {}", b, UNITS[u]) } else { format!("{:.1} {}", v, UNITS[u]) }
+}

@@ -261,20 +261,99 @@ pub fn freshness(dir: &Path, expected: &[String]) -> std::io::Result<Freshness> 
     Ok(Freshness::Current)
 }
 
-/// Recompute and write `SHA256SUMS` for `dir` over exactly `names`, then
-/// enforce the mtime invariant (checksum file ≥ every described file).
-/// Returns the parsed, freshly written checksum file.
-pub fn generate(dir: &Path, names: &[String]) -> std::io::Result<ChecksumFile> {
-    let mut entries = Vec::with_capacity(names.len());
-    let mut newest = SystemTime::UNIX_EPOCH;
+/// What bringing `SHA256SUMS` up to date over `names` would take:
+/// the digests that can be kept and the files that must be hashed.
+#[derive(Debug, Clone)]
+pub struct HashPlan {
+    /// Entries kept from the existing sums: files the sums list whose
+    /// mtime is not newer than the sums — by the mtime invariant the
+    /// sums were written after them, so what was hashed is what is
+    /// there.
+    pub reuse: Vec<ChecksumEntry>,
+    /// `(name, len)` of every file to hash: newer than the sums, or
+    /// absent from them.
+    pub hash: Vec<(String, u64)>,
+    /// The newest described file's mtime, which the written sums are
+    /// anchored to.
+    pub newest: SystemTime,
+}
+
+impl HashPlan {
+    /// Bytes the plan would read.
+    pub fn bytes(&self) -> u64 {
+        self.hash.iter().map(|(_, len)| *len).sum()
+    }
+}
+
+/// Plan the update of `SHA256SUMS` in `dir` over exactly `names`
+/// without reading any content: which digests are kept, which files
+/// are hashed. A dry run reports this; [`generate`] executes it.
+pub fn plan(dir: &Path, names: &[String]) -> std::io::Result<HashPlan> {
+    let sums_path = dir.join(CHECKSUMS_FILE);
+    let prior: Option<(ChecksumFile, SystemTime)> = if sums_path.is_file() {
+        match ChecksumFile::parse(&std::fs::read_to_string(&sums_path)?) {
+            Ok(cf) => Some((cf, mtime(&sums_path)?)),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let mut out = HashPlan { reuse: Vec::new(), hash: Vec::new(), newest: SystemTime::UNIX_EPOCH };
     for name in names {
         let path = dir.join(name);
-        entries.push(ChecksumEntry { hex: sha256_file(&path)?, name: name.clone() });
-        newest = newest.max(mtime(&path)?);
+        let (len, m) = len_mtime(&path)?;
+        out.newest = out.newest.max(m);
+        if let Some((cf, sums_mtime)) = &prior
+            && m <= *sums_mtime
+            && let Some(hex) = cf.digest_of(name)
+        {
+            out.reuse.push(ChecksumEntry { hex: hex.to_string(), name: name.clone() });
+            continue;
+        }
+        out.hash.push((name.clone(), len));
     }
-    let present = names;
-    let cf = ChecksumFile { entries };
+    Ok(out)
+}
+
+/// Bring `SHA256SUMS` in `dir` up to date over exactly `names`: plan,
+/// then execute. Returns the parsed, freshly written checksum file.
+pub fn generate(dir: &Path, names: &[String]) -> std::io::Result<ChecksumFile> {
+    let hash_plan = plan(dir, names)?;
+    execute(dir, names, hash_plan)
+}
+
+/// Execute a [`HashPlan`]: hash the files it names, write `SHA256SUMS`
+/// over exactly `names`, and enforce the mtime invariant (checksum
+/// file ≥ every described file). This is the effector; the planning
+/// that decides what it does is [`plan`], which a dry run shares.
+///
+/// Kept digests are kept, and only files newer than the sums, or
+/// absent from them, are hashed. One new file in a directory no
+/// longer sends every other file in it back through SHA-256: on
+/// tessera that was two terabytes of base shards untouched for days,
+/// rehashed for one report. Hashing runs across files in parallel and
+/// reports its progress on stderr.
+pub fn execute(dir: &Path, names: &[String], hash_plan: HashPlan) -> std::io::Result<ChecksumFile> {
+    let mut by_name: std::collections::BTreeMap<&str, String> =
+        hash_plan.reuse.iter().map(|e| (e.name.as_str(), e.hex.clone())).collect();
+    if !hash_plan.hash.is_empty() {
+        let work: Vec<(usize, std::path::PathBuf, u64)> = hash_plan
+            .hash
+            .iter()
+            .enumerate()
+            .map(|(i, (name, len))| (i, dir.join(name), *len))
+            .collect();
+        let hashed = hash_files(&work, hash_plan.reuse.len(), dir)?;
+        for ((name, _), hex) in hash_plan.hash.iter().zip(hashed) {
+            by_name.insert(name.as_str(), hex);
+        }
+    }
+    let entries: Vec<ChecksumEntry> = names
+        .iter()
+        .map(|name| ChecksumEntry { hex: by_name.remove(name.as_str()).expect("every name resolved"), name: name.clone() })
+        .collect();
     let sums_path = dir.join(CHECKSUMS_FILE);
+    let cf = ChecksumFile { entries };
     std::fs::write(&sums_path, cf.render())?;
     // Anchor the checksum file's mtime to the newest *described file*,
     // not to `SystemTime::now()`. The mtime invariant (checksums >=
@@ -284,9 +363,101 @@ pub fn generate(dir: &Path, names: &[String]) -> std::io::Result<ChecksumFile> {
     // realtime clock jitters against the filesystem mtime clock, a
     // freshly stamped `now()` can land *after* a content write that
     // happens later in program order, masking a real change.
-    let target = if present.is_empty() { SystemTime::now() } else { newest };
+    let target = if names.is_empty() { SystemTime::now() } else { hash_plan.newest };
     let _ = filetime::set_file_mtime(&sums_path, filetime::FileTime::from_system_time(target));
     Ok(cf)
+}
+
+/// SHA-256 of every file in `work`, in `work`'s order, hashed across
+/// files in parallel with progress on stderr: bytes done of bytes to
+/// do, the rate, and the file count. `reused` is only for the summary.
+fn hash_files(
+    work: &[(usize, std::path::PathBuf, u64)],
+    reused: usize,
+    dir: &Path,
+) -> std::io::Result<Vec<String>> {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let total: u64 = work.iter().map(|(_, _, len)| *len).sum();
+    let done = AtomicU64::new(0);
+    let next = AtomicUsize::new(0);
+    let finished = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<std::io::Result<String>>>> = Mutex::new((0..work.len()).map(|_| None).collect());
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8).min(work.len()).max(1);
+    let started = std::time::Instant::now();
+    let report = |final_line: bool| {
+        let d = done.load(Ordering::Relaxed);
+        let secs = started.elapsed().as_secs_f64().max(1e-3);
+        let line = format!(
+            "  hashing {}: {} / {} ({}/s), {} of {} files{}",
+            dir.display(),
+            fmt_bytes(d),
+            fmt_bytes(total),
+            fmt_bytes((d as f64 / secs) as u64),
+            finished.load(Ordering::Relaxed),
+            work.len(),
+            if reused > 0 { format!(", {} reused", reused) } else { String::new() },
+        );
+        // Clear to the end of the line: a shorter line over a longer
+        // one otherwise leaves the tail of the old one standing.
+        if final_line {
+            eprintln!("\r{line}\x1b[K");
+        } else {
+            eprint!("\r{line}\x1b[K");
+        }
+    };
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= work.len() {
+                    break;
+                }
+                let r = sha256_file_counting(&work[i].1, &done);
+                results.lock().unwrap()[i] = Some(r);
+                finished.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        // The calling thread reports while the workers hash.
+        while finished.load(Ordering::Relaxed) < work.len() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if total >= 1 << 30 {
+                report(false);
+            }
+        }
+    });
+    if total >= 1 << 30 {
+        report(true);
+    }
+    let results = results.into_inner().unwrap();
+    results.into_iter().map(|r| r.expect("every file hashed")).collect()
+}
+
+/// SHA-256 hex of a file, adding every byte read to `done`.
+fn sha256_file_counting(path: &Path, done: &std::sync::atomic::AtomicU64) -> std::io::Result<String> {
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        done.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn fmt_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{} {}", b, UNITS[u]) } else { format!("{:.1} {}", v, UNITS[u]) }
 }
 
 fn mtime(path: &Path) -> std::io::Result<SystemTime> {

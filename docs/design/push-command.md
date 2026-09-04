@@ -313,8 +313,38 @@ equal to** the mtime of every file it describes, and its file set exactly
 matches the content files present at that level. If any described file is newer,
 or files were added/removed, the checksum file is **stale**.
 
-- **Default (`--checksums auto`)** — a stale `SHA256SUMS` is recomputed before
-  the push (which also brings its mtime current). This is the happy path.
+- **Default (`--checksums auto`)** — a stale `SHA256SUMS` is brought up to
+  date before the push (which also brings its mtime current). This is the
+  happy path. The update is **incremental**: a file the existing sums list
+  whose mtime is not newer than the sums keeps its digest, because the
+  invariant says the sums were written after it, and only files newer
+  than the sums, or absent from them, are hashed. One new report in a
+  directory no longer sends the terabytes beside it back through
+  SHA-256. Hashing runs across files in parallel and reports bytes done,
+  rate and file count on stderr. A **dry run hashes nothing**: it reports,
+  per directory, whether the sums are current or what regenerating them
+  would hash — files, bytes, digests kept, and why — and plans the push
+  from the digests it already has. A file absent from the remote is new
+  whatever its digest; a file present on the remote whose digest is not
+  yet known is reported as awaiting comparison, since unchanged or
+  overwritten is decided by the hashing a real push does first. An
+  earlier dry run computed every digest in memory and discarded it, so
+  the real push computed every one again. Planning fetches each
+  directory's remote sums once, and whether a file the remote sums do
+  not list exists at all comes from one listing of the publish root;
+  a transport that cannot enumerate falls back to a probe per file.
+  A dry run is the same run without its effectors, not a second
+  implementation that mirrors the first: the pre-flight checks, the
+  scan, the checksum plan, the classification against the remote and
+  the plan report are one code path in both modes, and only the
+  hashing-and-write of the sums, the conditional-write probe, the
+  confirmation, the uploads and the log are gated on the mode.
+  `veks publish --dry-run` therefore runs the same pre-flight checks a
+  real publish runs, reports what it would refuse on, still prints the
+  plan, and exits non-zero when a check failed. The push bookkeeping itself —
+  `SHA256SUMS`, `.publish_url`, `pushlog.jsonl` — is never publishable
+  content: no check asks it for a merkle sidecar or a catalog entry, and
+  no upload ships it as data.
 - **Override (`--checksums keep`)** — do not recompute; the user owns checksum
   generation (e.g. they produced `SHA256SUMS` with an external pipeline). If it
   is stale under the invariant, `push` **hard-stops** rather than shipping

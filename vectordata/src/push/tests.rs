@@ -161,7 +161,7 @@ fn overwrite_with_message_succeeds_and_logs() {
 }
 
 #[test]
-fn dry_run_writes_nothing() {
+fn dry_run_hashes_nothing_and_reports_what_a_push_would_hash() {
     let src = unique("dry-src");
     let remote = unique("dry-remote");
     make_dataset(&src);
@@ -170,11 +170,69 @@ fn dry_run_writes_nothing() {
     o.dry_run = true;
     let outcome = execute(&o).expect("dry run ok");
     assert!(outcome.dry_run);
+    // Files absent from the remote are new whatever their digest.
     assert!(outcome.added >= 2);
-    // Nothing written to the remote, and no SHA256SUMS minted locally.
+    assert_eq!(outcome.undetermined, 0);
+    // No sums exist, so every content file would be hashed by a real
+    // push; the dry run computes none and writes nothing anywhere.
+    assert_eq!(outcome.to_hash_files, outcome.added);
+    assert!(outcome.to_hash_bytes > 0);
     assert!(!remote.join("base.fvec").exists());
     assert!(!remote.join(pushlog::PUSHLOG_FILE).exists());
     assert!(!src.join("SHA256SUMS").exists());
+    assert!(!src.join("profiles/1m/SHA256SUMS").exists());
+}
+
+/// After a push, a dry run knows every unchanged file from the sums it
+/// kept; a file written since is reported as one a real push would
+/// hash, and — being on the remote — as awaiting its digest.
+#[test]
+fn dry_run_after_a_push_reports_only_what_changed() {
+    let src = unique("dry2-src");
+    let remote = unique("dry2-remote");
+    make_dataset(&src);
+    execute(&opts(&src, &remote)).expect("first push");
+    let sums_mtime = std::fs::metadata(src.join("SHA256SUMS")).unwrap().modified().unwrap();
+    std::fs::write(src.join("base.fvec"), b"BASEDATA-v2").unwrap();
+    filetime::set_file_mtime(src.join("base.fvec"), filetime::FileTime::from_system_time(sums_mtime + std::time::Duration::from_secs(5))).unwrap();
+
+    let mut o = opts(&src, &remote);
+    o.dry_run = true;
+    let outcome = execute(&o).expect("dry run ok");
+    assert_eq!(outcome.to_hash_files, 1, "only the rewritten file would be hashed");
+    assert_eq!(outcome.to_hash_bytes, b"BASEDATA-v2".len() as u64);
+    assert_eq!(outcome.undetermined, 1, "it is on the remote: unchanged or overwritten waits on the hash");
+    assert_eq!(outcome.added, 0);
+    assert_eq!(outcome.overwritten, 0);
+    assert!(outcome.skipped >= 1, "the untouched file is known unchanged from its kept digest");
+    // The sums on disk are exactly as the push left them.
+    assert_eq!(std::fs::metadata(src.join("SHA256SUMS")).unwrap().modified().unwrap(), sums_mtime);
+}
+
+/// Regeneration keeps the digest of every file the existing sums list
+/// and that is not newer than them, and hashes only the rest.
+#[test]
+fn regeneration_hashes_only_what_is_newer_than_the_sums() {
+    let dir = unique("incremental");
+    std::fs::write(dir.join("a.bin"), b"aaaa").unwrap();
+    std::fs::write(dir.join("b.bin"), b"bbbb").unwrap();
+    let names = vec!["a.bin".to_string(), "b.bin".to_string()];
+    let first = checksums::generate(&dir, &names).unwrap();
+    let sums_mtime = std::fs::metadata(dir.join("SHA256SUMS")).unwrap().modified().unwrap();
+    // `a.bin` changes under the sums' mtime: by the invariant it was
+    // hashed as it is, so its digest is kept without a read.
+    std::fs::write(dir.join("a.bin"), b"AAAA").unwrap();
+    filetime::set_file_mtime(dir.join("a.bin"), filetime::FileTime::from_system_time(sums_mtime - std::time::Duration::from_secs(5))).unwrap();
+    // `b.bin` is newer than the sums: hashed again.
+    std::fs::write(dir.join("b.bin"), b"BBBB").unwrap();
+    filetime::set_file_mtime(dir.join("b.bin"), filetime::FileTime::from_system_time(sums_mtime + std::time::Duration::from_secs(5))).unwrap();
+    let second = checksums::generate(&dir, &names).unwrap();
+    assert_eq!(second.digest_of("a.bin"), first.digest_of("a.bin"), "kept without hashing");
+    assert_ne!(second.digest_of("b.bin"), first.digest_of("b.bin"), "hashed again");
+    assert_eq!(second.digest_of("b.bin").unwrap(), &checksums::sha256_bytes(b"BBBB"));
+    // The sums are again anchored to the newest described file.
+    let anchored = std::fs::metadata(dir.join("SHA256SUMS")).unwrap().modified().unwrap();
+    assert_eq!(anchored, sums_mtime + std::time::Duration::from_secs(5));
 }
 
 #[test]
