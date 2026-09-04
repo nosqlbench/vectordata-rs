@@ -34,6 +34,7 @@ use ratatui::{
 use simsimd::SpatialSimilarity;
 
 use super::shared::{
+    SortedMirror,
     UnifiedReader, SampleMode, sample_indices, clump_size_for,
     spawn_chunk_prefetch, install_abort_handler, normalize,
 };
@@ -403,10 +404,8 @@ pub(super) fn run_interactive_explore(
     let mut norm_stats;
     let mut last_cache_stats: Option<CacheStats> = None;
     let mut phase1_done;
-    let mut sorted_norms: Vec<f64> = Vec::new();
-    let mut sorted_norms_len: usize;
-    let mut sorted_dists: Vec<f64> = Vec::new();
-    let mut sorted_dists_len: usize;
+    let mut sorted_norms = SortedMirror::new();
+    let mut sorted_dists = SortedMirror::new();
     let mut all_dists: Vec<f32> = Vec::new();
     let mut dist_stats;
     let mut dist_rx: Option<mpsc::Receiver<DistBatch>>;
@@ -524,8 +523,8 @@ pub(super) fn run_interactive_explore(
     vectors_loaded = 0;
     norm_stats = WelfordStats::new();
     phase1_done = false;
-    sorted_norms_len = 0;
-    sorted_dists_len = 0;
+    sorted_norms.clear();
+    sorted_dists.clear();
     dist_stats = WelfordStats::new();
     dist_rx = None;
     phase2_done = false;
@@ -563,8 +562,6 @@ pub(super) fn run_interactive_explore(
                             all_dists.clear();
                             sorted_norms.clear();
                             sorted_dists.clear();
-                            sorted_norms_len = 0;
-                            sorted_dists_len = 0;
                             eigenvalues.clear();
                             eigenvectors.clear();
                             projected.clear();
@@ -808,17 +805,10 @@ pub(super) fn run_interactive_explore(
 
         let elapsed = compute_start.elapsed().as_secs_f64();
 
-        // ── Update sorted caches if data changed ──
-        if all_norms.len() != sorted_norms_len {
-            sorted_norms = all_norms.clone();
-            sorted_norms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            sorted_norms_len = all_norms.len();
-        }
-        if all_dists.len() != sorted_dists_len {
-            sorted_dists = all_dists.iter().map(|&d| d as f64).collect();
-            sorted_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            sorted_dists_len = all_dists.len();
-        }
+        // ── Keep the sorted mirrors current (merge the new tail only;
+        // never a full re-sort on the UI thread) ──
+        sorted_norms.sync(&all_norms);
+        sorted_dists.sync(&all_dists);
 
         // ── Status ──
         frame_count += 1;
@@ -1061,13 +1051,13 @@ pub(super) fn run_interactive_explore(
                     _ => render_log_decay(frame, chunks[1], &eigenvalues),
                 },
                 V_NORMS => render_histogram(frame, chunks[1], &all_norms, &norm_stats, num_bins, " Norm Distribution ", Color::Green),
-                V_NORMCURVE => render_presorted_curve(frame, chunks[1], &sorted_norms, " Sorted Norms ", Color::Green),
+                V_NORMCURVE => render_presorted_curve(frame, chunks[1], sorted_norms.as_slice(), " Sorted Norms ", Color::Green),
                 V_DISTS => {
                     let dists_f64: Vec<f64> = all_dists.iter().map(|&d| d as f64).collect();
                     render_histogram(frame, chunks[1], &dists_f64, &dist_stats, num_bins, " Distance Distribution (L2) ", Color::Cyan);
                 }
                 V_DISTCURVE => {
-                    render_presorted_curve(frame, chunks[1], &sorted_dists, " Sorted Distances ", Color::Cyan);
+                    render_presorted_curve(frame, chunks[1], sorted_dists.as_slice(), " Sorted Distances ", Color::Cyan);
                 }
                 V_VARBARS => render_variance_bars(frame, chunks[1], &eigenvalues),
                 _ => {}
@@ -1323,8 +1313,6 @@ pub(super) fn run_interactive_explore(
                     // frame recalculates layouts for the new dimensions.
                     if num_bins == 0 { /* auto bins recalculated each frame */ }
                     if loadings_band_size == 0 { /* auto band recalculated each frame */ }
-                    sorted_norms_len = 0; // force re-downsample
-                    sorted_dists_len = 0;
                 }
                 _ => {}
             }

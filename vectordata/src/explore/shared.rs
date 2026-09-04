@@ -659,6 +659,76 @@ pub(super) fn normalize(v: &mut [f64]) {
     }
 }
 
+/// A sorted mirror of a sample that only grows, kept sorted by
+/// merging each new tail instead of re-sorting the whole thing.
+///
+/// The explorer's UI loop keeps sorted copies of the loaded norms and
+/// the sampled pairwise distances for the "sorted curve" views, and
+/// those arrays grow by a batch on most frames while a phase runs.
+/// Re-sorting the full array each time a batch lands is
+/// O(frames × n log n); on a 50 000-vector sample that spent two
+/// thirds of the run's CPU in the standard library sort and gated the
+/// analysis phases behind it. Syncing costs O(n + k log k) for k new
+/// elements: sort the tail, merge it in one pass.
+///
+/// Ordering is [`f64::total_cmp`], so a NaN sorts (last) instead of
+/// panicking the UI thread.
+#[derive(Debug, Default)]
+pub(super) struct SortedMirror {
+    sorted: Vec<f64>,
+    mirrored: usize,
+}
+
+impl SortedMirror {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forget everything; the next `sync` rebuilds from scratch.
+    pub(super) fn clear(&mut self) {
+        self.sorted.clear();
+        self.mirrored = 0;
+    }
+
+    /// Bring the mirror up to date with `source`. Elements already
+    /// mirrored are assumed unchanged; only `source[mirrored..]` is
+    /// sorted and merged. A source shorter than what was mirrored was
+    /// reset behind our back, and is rebuilt in full.
+    pub(super) fn sync<T: Copy + Into<f64>>(&mut self, source: &[T]) {
+        if source.len() < self.mirrored {
+            self.clear();
+        }
+        if source.len() == self.mirrored {
+            return;
+        }
+        let mut tail: Vec<f64> = source[self.mirrored..].iter().map(|&v| v.into()).collect();
+        tail.sort_unstable_by(f64::total_cmp);
+        if self.sorted.is_empty() {
+            self.sorted = tail;
+        } else {
+            let mut merged = Vec::with_capacity(self.sorted.len() + tail.len());
+            let (mut a, mut b) = (0usize, 0usize);
+            while a < self.sorted.len() && b < tail.len() {
+                if tail[b].total_cmp(&self.sorted[a]).is_lt() {
+                    merged.push(tail[b]);
+                    b += 1;
+                } else {
+                    merged.push(self.sorted[a]);
+                    a += 1;
+                }
+            }
+            merged.extend_from_slice(&self.sorted[a..]);
+            merged.extend_from_slice(&tail[b..]);
+            self.sorted = merged;
+        }
+        self.mirrored = source.len();
+    }
+
+    pub(super) fn as_slice(&self) -> &[f64] {
+        &self.sorted
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,5 +853,45 @@ mod tests {
         assert_eq!(chunks_for_indices(&[3], g), vec![0, 1]);
         // Dedup across indices: records 0..=3 touch chunks 0 and 1 once.
         assert_eq!(chunks_for_indices(&[0, 1, 2, 3], g), vec![0, 1]);
+    }
+
+    #[test]
+    fn sorted_mirror_matches_a_full_sort_as_the_source_grows() {
+        let mut rng = crate::explore::seeded_rng(7);
+        use rand::Rng;
+        let mut source: Vec<f32> = Vec::new();
+        let mut mirror = SortedMirror::new();
+        for step in 0..40 {
+            let k = if step % 7 == 0 { 0 } else { rng.random_range(1..500) };
+            source.extend((0..k).map(|_| rng.random_range(-1000.0f32..1000.0)));
+            mirror.sync(&source);
+            let mut expect: Vec<f64> = source.iter().map(|&v| v as f64).collect();
+            expect.sort_by(f64::total_cmp);
+            assert_eq!(mirror.as_slice(), &expect[..], "step {step}");
+        }
+    }
+
+    #[test]
+    fn sorted_mirror_rebuilds_after_the_source_is_reset() {
+        let mut mirror = SortedMirror::new();
+        mirror.sync(&[5.0f64, 1.0, 3.0]);
+        assert_eq!(mirror.as_slice(), &[1.0, 3.0, 5.0]);
+        // Source shrank: whatever was mirrored is stale.
+        mirror.sync(&[9.0f64, 2.0]);
+        assert_eq!(mirror.as_slice(), &[2.0, 9.0]);
+        mirror.clear();
+        assert!(mirror.as_slice().is_empty());
+        mirror.sync(&[0.5f32]);
+        assert_eq!(mirror.as_slice(), &[0.5]);
+    }
+
+    #[test]
+    fn sorted_mirror_orders_nan_last_instead_of_panicking() {
+        let mut mirror = SortedMirror::new();
+        mirror.sync(&[2.0f64, f64::NAN, 1.0]);
+        mirror.sync(&[2.0f64, f64::NAN, 1.0, 0.0]);
+        let s = mirror.as_slice();
+        assert_eq!(&s[..3], &[0.0, 1.0, 2.0]);
+        assert!(s[3].is_nan());
     }
 }
