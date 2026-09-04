@@ -30,6 +30,13 @@ pub fn is_excluded_dir(name: &str) -> bool {
 /// Underscore-prefixed files (`_`) are private/scratch.
 /// Temp/partial/pyc files are build/runtime artifacts.
 pub fn is_excluded_file(name: &str) -> bool {
+    // Push bookkeeping — the per-directory checksum file, the binding,
+    // the provenance log — is never content: never merkled, never
+    // catalogued, never checked for integrity, never uploaded as data.
+    // The push library owns the list.
+    if crate::push::checksums::is_sentinel(name) {
+        return true;
+    }
     name.starts_with('.')
         || name.starts_with('_')
         || name.ends_with(".tmp")

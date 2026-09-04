@@ -140,14 +140,25 @@ pub fn run(args: PublishArgs) {
         }
     }
 
-    // Run pre-flight checks unless --no-check
-    if !args.no_check && !args.dry_run {
+    // Run pre-flight checks unless --no-check. A dry run runs them
+    // too — they read only — and reports what a real publish would
+    // refuse on, then goes on to show the plan; it exits non-zero at
+    // the end so the failure is not lost.
+    let mut preflight_failed = false;
+    if !args.no_check {
         let check_ok = run_preflight_checks(&directory);
         if !check_ok {
             eprintln!();
-            eprintln!("Pre-flight checks failed. Run 'veks check' for details,");
-            eprintln!("or use '--no-check' to override.");
-            std::process::exit(1);
+            if args.dry_run {
+                eprintln!("Pre-flight checks failed: a real publish would refuse here. Run 'veks check' for details;");
+                eprintln!("the plan below is what it would do once they pass.");
+                eprintln!();
+                preflight_failed = true;
+            } else {
+                eprintln!("Pre-flight checks failed. Run 'veks check' for details,");
+                eprintln!("or use '--no-check' to override.");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -272,7 +283,14 @@ pub fn run(args: PublishArgs) {
         actor,
     };
     match vectordata::push::execute(&push_opts) {
-        Ok(o) if o.dry_run => std::process::exit(0),
+        Ok(o) if o.dry_run => {
+            if preflight_failed {
+                eprintln!();
+                eprintln!("Dry run complete; pre-flight checks failed above, so a real publish would refuse.");
+                std::process::exit(2);
+            }
+            std::process::exit(0);
+        }
         Ok(o) => {
             println!(
                 "Published version {} to {} — {} new, {} overwritten, {} deleted, {} unchanged.",
@@ -693,6 +711,29 @@ mod tests {
         assert!(files.contains(&"dataset.yaml".to_string()));
         assert!(files.contains(&"base.fvec".to_string()));
         assert!(files.contains(&"profiles/default/indices.ivec".to_string()));
+    }
+
+    /// Push bookkeeping inside a dataset — the checksum file, the
+    /// binding, the provenance log — is not content: it is not
+    /// enumerated, so no check asks it for a merkle sidecar and no
+    /// upload ships it as data.
+    #[test]
+    fn push_bookkeeping_is_not_publishable_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_dataset_yaml(root, true);
+        touch(&root.join("base.fvec"));
+        touch(&root.join("SHA256SUMS"));
+        touch(&root.join("pushlog.jsonl"));
+        touch(&root.join(".publish_url"));
+        touch(&root.join("profiles/default/indices.ivec"));
+        touch(&root.join("profiles/default/SHA256SUMS"));
+        let files = publishable_rel(root);
+        assert!(files.contains(&"base.fvec".to_string()));
+        assert!(files.contains(&"profiles/default/indices.ivec".to_string()));
+        for bookkeeping in ["SHA256SUMS", "pushlog.jsonl", ".publish_url", "profiles/default/SHA256SUMS"] {
+            assert!(!files.contains(&bookkeeping.to_string()), "{bookkeeping} enumerated: {files:?}");
+        }
     }
 
     #[test]
