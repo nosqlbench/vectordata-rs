@@ -431,3 +431,21 @@ A dataset whose embed step predates these is back-filled with
 `state set` and `attribute: true`, which writes a dataset attribute
 rather than a pipeline variable and refuses a key the dataset does not
 define.
+
+
+## Static payload
+
+A dataset directory may carry files an operator places by hand that
+ship with the data and that no pipeline step produces: `LICENSE`,
+`LICENSE.md`, `LICENSE.txt`, `NOTICE`, `NOTICE.md`, `NOTICE.txt`,
+`README`, `README.md`, `README.txt`, `CITATION.cff`, `CITATION.md`,
+recognised by exact name at any level of the dataset. The
+classification lives in `vectordata::filters::is_static_payload` and
+every tool consults it: the files are publishable content, checksummed
+in `SHA256SUMS`, merkled by the blanket merkle step and uploaded with
+the data; `veks run --clean` keeps them; the extraneous-files check
+accepts them and their `.mref`; the pipeline-coverage check asks no
+step to produce them; catalog staleness does not count them; and
+`analyze describe-dataset` links them from the generated docs under
+"License and Attribution", together with the `license`, `vendor` and
+`notes` attributes of `dataset.yaml`.

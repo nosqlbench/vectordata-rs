@@ -353,6 +353,9 @@ fn e2e_topic_stratified_predicates() {
     let dataset_yaml = dataset.join("dataset.yaml");
     extend_definition(&dataset_yaml, "../src");
 
+    // Static payload placed by hand before the first run: it must
+    // survive the run, pass every check, and be linked from the docs.
+    std::fs::write(dataset.join("LICENSE.md"), "# License\n\nContains information from a fixture, under ODC-By-1.0.\n").unwrap();
     let (ok, output) = run_pipeline(&dataset_yaml);
     assert!(ok, "pipeline failed:\n{}", output);
 
@@ -453,4 +456,9 @@ fn e2e_topic_stratified_predicates() {
     let check = Command::new(veks_bin()).args(["check"]).arg(&dataset).output().unwrap();
     let text = String::from_utf8_lossy(&check.stdout).to_string() + &String::from_utf8_lossy(&check.stderr);
     assert!(check.status.success(), "veks check failed:\n{text}");
+    assert!(dataset.join("LICENSE.md").exists(), "static payload was removed");
+    assert!(dataset.join("LICENSE.md.mref").exists(), "static payload is merkled like content");
+    let docs = std::fs::read_to_string(dataset.join("docs/dataset.md")).unwrap();
+    assert!(docs.contains("## License and Attribution"), "{docs}");
+    assert!(docs.contains("[`LICENSE.md`](../LICENSE.md)"), "{docs}");
 }

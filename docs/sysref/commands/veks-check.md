@@ -50,7 +50,10 @@ veks check --clean-files    # remove extraneous files
 ## What counts as accounted for
 
 A publishable file passes the extraneous-files check when a pipeline
-step or profile view names it, when it is known infrastructure, or when
+step or profile view names it, when it is known infrastructure, when it
+is static payload — `LICENSE`, `NOTICE`, `README`, `CITATION` files an
+operator places by hand, which ship with the data, are merkled like any
+content, and are never cleaned or asked of a step — or when
 it is a derivative of something named: a `.mref` of it, an `IDXFOR__`
 index of it, or a shard of it. The shards of a sharded facet
 (`base_vectors__0000.fvecs`, `base_vectors__0001.fvecs`, …) are

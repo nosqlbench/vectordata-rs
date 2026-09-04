@@ -62,6 +62,35 @@ const INFRASTRUCTURE_FILES: &[&str] = &[
     "variables.json",
 ];
 
+/// Files an operator places in a dataset directory by hand that ship
+/// with the data as content and are never produced by a pipeline step:
+/// the license and attribution notice, a readme, a citation record.
+///
+/// Static payload is publishable content — checksummed, merkled,
+/// uploaded — and is retained by every housekeeping path: `--clean`
+/// keeps it, the extraneous-files check accepts it, the coverage check
+/// asks no step to produce it, and catalog staleness does not count it.
+const STATIC_PAYLOAD_FILES: &[&str] = &[
+    "LICENSE",
+    "LICENSE.md",
+    "LICENSE.txt",
+    "NOTICE",
+    "NOTICE.md",
+    "NOTICE.txt",
+    "README",
+    "README.md",
+    "README.txt",
+    "CITATION.cff",
+    "CITATION.md",
+];
+
+/// Whether `name` is static payload: content placed by hand that ships
+/// with the dataset and is retained, never generated, never cleaned,
+/// never extraneous.
+pub fn is_static_payload(name: &str) -> bool {
+    STATIC_PAYLOAD_FILES.contains(&name)
+}
+
 /// Check if a file is infrastructure metadata.
 ///
 /// Infrastructure files are small, frequently regenerated files that
@@ -93,6 +122,7 @@ pub fn is_intermediate_publishable(name: &str) -> bool {
 /// without indicating actual content changes.
 pub fn is_catalog_staleness_exempt(name: &str) -> bool {
     is_infrastructure_file(name)
+        || is_static_payload(name)
         || name.ends_with(".mref")
 }
 
@@ -133,6 +163,21 @@ mod tests {
         assert!(!is_excluded_dir("profiles"));
         assert!(!is_excluded_dir("datasets"));
         assert!(!is_excluded_dir("docs"), "docs/ is a standard dataset artifact directory");
+    }
+
+    /// Static payload is content — not excluded, not infrastructure,
+    /// merkled like any content — and exempt from catalog staleness.
+    #[test]
+    fn static_payload_is_retained_content() {
+        for name in ["LICENSE.md", "LICENSE", "NOTICE.md", "README.md", "CITATION.cff"] {
+            assert!(is_static_payload(name), "{name}");
+            assert!(!is_excluded_file(name), "{name} ships");
+            assert!(!is_infrastructure_file(name), "{name} is content, not infrastructure");
+            assert!(!is_merkle_exempt(name), "{name} is merkled like any content");
+            assert!(is_catalog_staleness_exempt(name), "{name} does not date the catalog");
+        }
+        assert!(!is_static_payload("license.md"), "exact names only");
+        assert!(!is_static_payload("base.fvec"));
     }
 
     #[test]

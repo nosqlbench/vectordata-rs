@@ -2024,7 +2024,8 @@ pub fn reset_pipeline(workspace: &Path, dataset_path: &Path, config: &DatasetCon
     }
 
     let preserve = |name: &str| -> bool {
-        name == "dataset.yaml" || name == "dataset.yml"
+        vectordata::filters::is_static_payload(name)
+            || name == "dataset.yaml" || name == "dataset.yml"
             || name == ".publish" || name == ".publish_url" || name == ".catalog_root"
             || name == ".do_not_catalog" || name == ".gitignore"
             || name == "catalog.json" || name == "catalog.yaml"

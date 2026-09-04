@@ -116,6 +116,22 @@ pub fn check_coverage(
                 continue;
             }
 
+            // Static payload is placed by hand; no step produces it.
+
+            if file
+
+                .file_name()
+
+                .and_then(|n| n.to_str())
+
+                .is_some_and(vectordata::filters::is_static_payload)
+
+            {
+
+                continue;
+
+            }
+
             let file_rel = super::rel_display(file);
 
             let has_merkle_step = defined_outputs.iter()

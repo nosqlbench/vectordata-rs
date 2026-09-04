@@ -105,6 +105,9 @@ outputs from the explain commands for representative queries.
         write_provenance(&config, &workspace, &mut doc);
 
         // ── Facet Legend ────────────────────────────────────────────
+        // ── License and attribution ─────────────────────────────────
+        write_license_section(&config, &workspace, &mut doc);
+
         write_facet_legend(&config, &mut doc);
 
         // ── Profiles ────────────────────────────────────────────────
@@ -296,6 +299,47 @@ fn write_provenance(_config: &DatasetConfig, workspace: &Path, doc: &mut String)
         doc.push_str(&format!("| `{}` | {} | {} |\n", name, format_size(*size), origin));
     }
     doc.push('\n');
+}
+
+/// The dataset's license and attribution: the declared attributes and
+/// the static payload that carries the full terms.
+fn write_license_section(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
+    let attrs = config.attributes.as_ref();
+    let license = attrs.and_then(|a| a.license.as_deref());
+    let vendor = attrs.and_then(|a| a.vendor.as_deref());
+    let notes = attrs.and_then(|a| a.notes.as_deref());
+    let mut payload: Vec<String> = std::fs::read_dir(workspace)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| vectordata::filters::is_static_payload(n))
+                .collect()
+        })
+        .unwrap_or_default();
+    payload.sort();
+    if license.is_none() && vendor.is_none() && notes.is_none() && payload.is_empty() {
+        return;
+    }
+    doc.push_str("## License and Attribution\n\n");
+    doc.push_str("| Property | Value |\n|----------|-------|\n");
+    if let Some(v) = license {
+        doc.push_str(&format!("| License | {} |\n", v));
+    }
+    if let Some(v) = vendor {
+        doc.push_str(&format!("| Vendor | {} |\n", v));
+    }
+    if let Some(v) = notes {
+        doc.push_str(&format!("| Notes | {} |\n", v));
+    }
+    doc.push('\n');
+    if !payload.is_empty() {
+        doc.push_str("Full terms, upstream attribution and provenance ship with the dataset as static payload:\n\n");
+        for name in &payload {
+            doc.push_str(&format!("- [`{}`](../{})\n", name, name));
+        }
+        doc.push('\n');
+    }
 }
 
 fn write_facet_legend(config: &DatasetConfig, doc: &mut String) {

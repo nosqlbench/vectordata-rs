@@ -40,7 +40,7 @@ Pipeline: 18 steps in topological order (profile: all)
 
 | Option | Description |
 |--------|-------------|
-| `--clean` | Reset pipeline (remove generated artifacts, preserve symlinks) |
+| `--clean` | Reset pipeline (remove generated artifacts; preserve symlinks, the definition, bindings, catalogs, and static payload such as `LICENSE.md`) |
 | `--dry-run` | Show the plan without executing; a step whose input a planned step produces is shown as following it |
 | `--output tui\|basic\|batch` | Display mode |
 | `--resources 'mem:25%-50%'` | Resource governance |

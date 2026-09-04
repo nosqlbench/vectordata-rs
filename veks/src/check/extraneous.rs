@@ -276,6 +276,15 @@ fn is_accounted(rel: &str, filename: &str, accounted: &HashSet<String>) -> bool 
     if accounted.contains(rel) || KNOWN_INFRA.contains(&filename) || rel.ends_with(".mrkl") {
         return true;
     }
+    // Static payload — a license, a notice, a readme placed by hand —
+    // and its merkle reference.
+    if vectordata::filters::is_static_payload(filename)
+        || filename
+            .strip_suffix(".mref")
+            .is_some_and(vectordata::filters::is_static_payload)
+    {
+        return true;
+    }
     let dir = rel.rsplit_once('/').map(|(d, _)| d);
     let in_dir = |name: &str| match dir {
         Some(d) => format!("{}/{}", d, name),
@@ -348,6 +357,15 @@ mod tests {
     }
 
     /// The other derivative rules are unchanged by the refactor.
+    #[test]
+    fn static_payload_is_accounted_for() {
+        let accounted: HashSet<String> = HashSet::new();
+        assert!(is_accounted("LICENSE.md", "LICENSE.md", &accounted));
+        assert!(is_accounted("LICENSE.md.mref", "LICENSE.md.mref", &accounted));
+        assert!(is_accounted("docs/NOTICE.md", "NOTICE.md", &accounted));
+        assert!(!is_accounted("license-draft.md", "license-draft.md", &accounted));
+    }
+
     #[test]
     fn derivatives_and_infrastructure_are_accounted_for() {
         let accounted = set(&["profiles/default/metadata_results.ivvec", "a.fvecs"]);
