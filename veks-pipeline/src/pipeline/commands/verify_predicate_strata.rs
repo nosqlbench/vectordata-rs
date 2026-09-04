@@ -27,6 +27,12 @@
 //!   reported, not failed;
 //! - above the reliability threshold, a record that clears the
 //!   profile's floor `M + 3√M` (TS-11, TS-51) is non-empty (TS-42);
+//! - at the census profile every record's claimed selectivity lies in
+//!   its cell's half-decade band — the generator's own invariant — and
+//!   at every profile above the threshold every cell whose decade
+//!   clears the floor holds at least one record realised inside its
+//!   band, so the ladder is populated where the design promises it
+//!   (TS-42, TS-177); the per-cell tally is reported everywhere;
 //! - every `query_in_filter` label agrees with evaluating the predicate
 //!   against the query's own row (TS-161, TS-166).
 //!
@@ -104,8 +110,35 @@ pub struct ProfileReport {
     /// their cell's half-decade band — sampling noise at a sized
     /// profile, reported for the reader (TS-43).
     pub out_of_band: usize,
+    /// At the census profile: records whose claimed selectivity lies
+    /// outside their cell's band — a generator invariant broken
+    /// (TS-177).
+    pub band_violations: usize,
+    /// Above the threshold: cells whose decade clears the floor and
+    /// which hold records but none realised inside the band (TS-42,
+    /// TS-177).
+    pub uncovered_cells: usize,
+    /// Every `family:1e-d` cell at this profile.
+    pub cells: BTreeMap<String, CellReport>,
     pub per_family: BTreeMap<String, FamilyReport>,
     pub first_violations: Vec<String>,
+}
+
+/// One cell of the ladder at one profile.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CellReport {
+    pub records: usize,
+    /// Whether the cell's decade clears the floor at this base count:
+    /// `10^d · N ≥ M + 3√M`.
+    pub applicable: bool,
+    /// Records realised inside the cell's half-decade band.
+    pub in_band: usize,
+    /// Records realised below the band.
+    pub below_band: usize,
+    /// Records realised above the band.
+    pub above_band: usize,
+    /// Records with no matches.
+    pub empty: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -176,7 +209,10 @@ prefix for a censused predicate, a binomial draw at the constructed
 selectivity for a control predicate — so sampling noise around the
 half-decade band and empties where few matches are expected are
 reported, not failed. Above the `reliability-threshold` a record that
-clears the floor `M + 3√M` (`min-matches`) must be non-empty. With
+clears the floor `M + 3√M` (`min-matches`) must be non-empty, and every
+cell whose decade clears the floor must hold a record realised inside
+its band; at the census profile every claimed selectivity must lie in
+its cell's band. With
 `queries` it checks that there is one record per query;
 with the queries' own metadata rows (`query-metadata`) it re-derives
 every `query_in_filter` label. Writes a JSON report to `output` and
@@ -382,6 +418,9 @@ fails on any violation.
                 empties: 0,
                 empties_expected: 0.0,
                 out_of_band: 0,
+                band_violations: 0,
+                uncovered_cells: 0,
+                cells: BTreeMap::new(),
                 per_family: BTreeMap::new(),
                 first_violations: Vec::new(),
             };
@@ -409,6 +448,19 @@ fails on any violation.
                 let hi = 10f64.powi(claim.decade) * 10f64.sqrt();
                 let in_band = sel >= lo && sel < hi;
                 let applies = report.above_threshold && model.mean() >= floor;
+                let cell = report.cells.entry(claim.cell.clone()).or_default();
+                cell.records += 1;
+                cell.applicable = 10f64.powi(claim.decade) * n >= floor;
+                if count == 0 {
+                    cell.empty += 1;
+                }
+                if in_band {
+                    cell.in_band += 1;
+                } else if sel < lo {
+                    cell.below_band += 1;
+                } else {
+                    cell.above_band += 1;
+                }
                 let f = sums.entry(claim.family.clone()).or_default();
                 f.records += 1;
                 f.claimed += claimed;
@@ -430,6 +482,12 @@ fails on any violation.
                         report.first_violations.push(msg);
                     }
                 };
+                // The cell is the generator's claim about the population
+                // selectivity: at the census profile it must hold.
+                if report.census_profile && !(claimed >= lo && claimed < hi) {
+                    report.band_violations += 1;
+                    note(format!("query {} ({}): claimed selectivity {:.3e} lies outside the cell's band [{:.3e}, {:.3e})", i, claim.cell, claimed, lo, hi), &mut report);
+                }
                 if report.census_profile && claim.family != "control" {
                     if count != claim.expected {
                         report.exact_mismatches += 1;
@@ -465,17 +523,35 @@ fails on any violation.
                     },
                 );
             }
+            // Above the threshold the ladder is populated where the
+            // design promises it: a cell whose decade clears the floor
+            // holds at least one record realised inside its band.
+            if report.above_threshold {
+                let uncovered: Vec<String> = report
+                    .cells
+                    .iter()
+                    .filter(|(_, c)| c.applicable && c.records > 0 && c.in_band == 0)
+                    .map(|(cell, c)| format!("{} ({} records, none in band)", cell, c.records))
+                    .collect();
+                report.uncovered_cells = uncovered.len();
+                for u in uncovered {
+                    if report.first_violations.len() < 8 {
+                        report.first_violations.push(format!("cell {} is applicable at base {} but uncovered", u, base_count));
+                    }
+                }
+            }
             let bad = report.exact_mismatches + report.incredible_counts + report.applicable_empty
+                + report.band_violations + report.uncovered_cells
                 + usize::from(realised.len() != claims.len());
             if bad > 0 {
                 violations.push(format!(
-                    "profile {} (base {}): {} exact mismatch(es), {} incredible count(s), {} empty among {} applicable",
-                    name, base_count, report.exact_mismatches, report.incredible_counts, report.applicable_empty, report.applicable
+                    "profile {} (base {}): {} exact mismatch(es), {} incredible count(s), {} empty among {} applicable, {} claimed outside their band, {} uncovered cell(s)",
+                    name, base_count, report.exact_mismatches, report.incredible_counts, report.applicable_empty, report.applicable, report.band_violations, report.uncovered_cells
                 ));
             }
             ctx.ui.log(&format!(
-                "predicate-strata: {} (base {}): {} records, {} exact mismatch(es), {} incredible, {} empty among {} applicable, {} empty overall ({:.1} expected), {} outside their band",
-                name, base_count, report.records, report.exact_mismatches, report.incredible_counts, report.applicable_empty, report.applicable, report.empties, report.empties_expected, report.out_of_band
+                "predicate-strata: {} (base {}): {} records, {} exact mismatch(es), {} incredible, {} empty among {} applicable, {} empty overall ({:.1} expected), {} outside their band, {} uncovered cell(s)",
+                name, base_count, report.records, report.exact_mismatches, report.incredible_counts, report.applicable_empty, report.applicable, report.empties, report.empties_expected, report.out_of_band, report.uncovered_cells
             ));
             reports.push(report);
             profile_pb.inc(1);
@@ -483,7 +559,7 @@ fails on any violation.
         profile_pb.finish();
 
         let report = StrataReport {
-            schema_version: 2,
+            schema_version: 3,
             predicates: predicates.len(),
             query_count,
             census_population: population,

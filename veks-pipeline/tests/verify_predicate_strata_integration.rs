@@ -241,6 +241,17 @@ fn claims_hold_at_the_census_profile_and_are_credible_at_a_sized_one() {
     assert!(sized.applicable > 0, "{:?}", sized);
     assert!((sized.floor - (5.0 + 3.0 * 5f64.sqrt())).abs() < 1e-9);
     assert_eq!(census.out_of_band, 0, "cells are assigned from the census count: {:?}", census);
+    assert_eq!(census.band_violations, 0, "{:?}", census.first_violations);
+    assert_eq!(sized.uncovered_cells, 0, "{:?}", sized.first_violations);
+    assert!(!sized.cells.is_empty());
+    assert_eq!(sized.cells.values().map(|c| c.records).sum::<usize>(), COUNT);
+    for (cell, c) in &sized.cells {
+        assert_eq!(c.in_band + c.below_band + c.above_band, c.records, "{cell}: {c:?}");
+        if c.applicable {
+            assert!(c.in_band > 0, "{cell} is applicable at 3000 and must be covered: {c:?}");
+        }
+    }
+    assert!(sized.cells.values().any(|c| c.applicable), "the 1e-1 and 1e-2 cells clear a floor of 11.7 at 3000");
     assert_eq!(report.min_matches, 5);
     for (family, f) in &census.per_family {
         // Censused families are exact; the control family's count is by
@@ -366,4 +377,90 @@ fn an_applicable_record_that_is_empty_fails_above_the_threshold() {
     let sized = report.profiles.iter().find(|p| p.profile == "3000").unwrap();
     assert_eq!((sized.applicable_empty, sized.incredible_counts, sized.exact_mismatches), (1, 0, 0));
     assert!(sized.first_violations[0].contains("above the floor"), "{:?}", sized.first_violations);
+}
+
+/// Rewrite the `generation` namespace of a predicate facet in place,
+/// every other namespace copied as it is.
+fn rewrite_generation(path: &Path, f: &mut dyn FnMut(&mut MNode)) {
+    let namespaces: Vec<Option<String>> = std::iter::once(None)
+        .chain(SlabReader::list_namespaces(path).unwrap().into_iter().filter(|n| !n.name.is_empty()).map(|n| Some(n.name)))
+        .collect();
+    let mut copied: Vec<(Option<String>, Vec<Vec<u8>>)> = Vec::new();
+    for ns in &namespaces {
+        let reader = match ns {
+            Some(n) => SlabReader::open_namespace(path, Some(n)).unwrap(),
+            None => SlabReader::open(path).unwrap(),
+        };
+        let mut records = Vec::new();
+        for entry in reader.page_entries() {
+            let page = reader.read_data_page(&entry).unwrap();
+            for i in 0..page.record_count() {
+                let bytes = page.get_record(i).unwrap().to_vec();
+                if ns.as_deref() == Some("generation") {
+                    let mut node = match anode::decode(&bytes) {
+                        Ok(ANode::MNode(m)) => m,
+                        other => panic!("generation record is not an MNode: {:?}", other.map(|_| ())),
+                    };
+                    f(&mut node);
+                    records.push(node.to_bytes());
+                } else {
+                    records.push(bytes);
+                }
+            }
+        }
+        copied.push((ns.clone(), records));
+    }
+    let tmp = path.with_extension("rewrite.slab");
+    let config = WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
+    let mut w = SlabWriter::new(&tmp, config).unwrap();
+    for (ns, records) in copied {
+        if let Some(n) = ns {
+            w.start_namespace(&n).unwrap();
+        }
+        for r in records {
+            w.add_record(&r).unwrap();
+        }
+    }
+    w.finish().unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+/// The cell is the generator's claim about the population selectivity.
+/// With the control family's two cells swapped, every swapped record's
+/// claimed selectivity lies outside its cell's band at the census
+/// profile, and at the sized profile above the threshold both cells
+/// hold records but none realised inside the band: uncovered (TS-177).
+#[test]
+fn swapped_cells_fail_the_census_band_and_uncover_the_ladder() {
+    let dir = tmp_dir();
+    build(dir.path());
+    let mut swapped = 0usize;
+    rewrite_generation(&dir.path().join("profiles/base/predicates.slab"), &mut |node| {
+        let cell = match node.fields.get("cell") {
+            Some(MValue::Text(t)) => t.clone(),
+            _ => return,
+        };
+        let other = match cell.as_str() {
+            "control:1e-1" => "control:1e-2",
+            "control:1e-2" => "control:1e-1",
+            _ => return,
+        };
+        node.fields.insert("cell".to_string(), MValue::Text(other.to_string()));
+        swapped += 1;
+    });
+    assert!(swapped > 0);
+    let (status, message, report) = verify(dir.path(), &[]);
+    assert_eq!(status, Status::Error, "{}", message);
+    assert!(message.contains("claimed outside their band"), "{}", message);
+    assert!(message.contains("uncovered cell(s)"), "{}", message);
+    let census = report.profiles.iter().find(|p| p.profile == "default").unwrap();
+    assert_eq!(census.band_violations, swapped, "{:?}", census.first_violations);
+    assert_eq!((census.exact_mismatches, census.incredible_counts), (0, 0));
+    let sized = report.profiles.iter().find(|p| p.profile == "3000").unwrap();
+    assert_eq!(sized.uncovered_cells, 2, "{:?}", sized.cells);
+    for cell in ["control:1e-1", "control:1e-2"] {
+        let c = &sized.cells[cell];
+        assert!(c.applicable && c.records > 0 && c.in_band == 0, "{cell}: {c:?}");
+    }
+    assert_eq!((sized.incredible_counts, sized.applicable_empty), (0, 0), "counts are untouched: {:?}", sized.first_violations);
 }

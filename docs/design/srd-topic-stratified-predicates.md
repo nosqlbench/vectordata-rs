@@ -1197,7 +1197,10 @@ binomial construction (TS-115); at every other profile every record's
 count is credible under its sampling model (TS-173), and above the
 reliability threshold a record that clears the profile's floor (TS-11,
 TS-51) is non-empty (TS-42); and every `query_in_filter` label
-re-derives from the query's own row (TS-166). Empties and
+re-derives from the query's own row (TS-166); at the census profile
+every record's claimed selectivity lies in its cell's band, and above
+the threshold every applicable cell holds a record realised inside its
+band (TS-177). Empties and
 out-of-band counts are reported at every profile, the empties against
 the number the models predict, so the reader sees the noise the
 design allows without the step failing on it. Realised counts are the
@@ -1494,6 +1497,21 @@ reasons that reproduce nothing, and on tessera the count of the base
 was recorded before the extraction it follows had finished its last
 pass, with the same value — judged by record time it would have
 re-run, and every KNN step behind it.
+
+**TS-177.** **The band is verified where the design claims it.** A
+record's cell is the generator's claim that its population selectivity
+lies in the cell's half-decade band, so at the census profile every
+record's claimed selectivity must lie in its cell's band, and a record
+that does not is a violation: the generator mislabelled it. At a sized
+profile a record's realised selectivity is a draw (TS-173) and the
+band is not required of it; what TS-46 promises above the reliability
+threshold is that the ladder is populated, so at every such profile
+every cell whose decade clears the floor — `10^d · N ≥ M + 3√M` — and
+holds records must hold at least one realised inside its band, and a
+cell that does not is **uncovered**, a violation. The per-cell tally
+— records, in band, below, above, empty, and whether the cell applies
+— is reported at every profile, threshold or not, so a reader sees a
+cell's spread at a size without the step failing on sampling noise.
 
 ## 8. Artifact register
 
@@ -2046,7 +2064,10 @@ record applicable; an emptied record where thirty matches are expected
 fails there as not credible; and an emptied applicable record above
 the threshold fails as empty above the floor. The models themselves
 are tested to sum to one, to have their means, and to admit and refuse
-the counts TS-173 names.
+the counts TS-173 names; and with the control family's two cells
+swapped in the generation namespace, every swapped record fails the
+census band and both cells are uncovered at the sized profile while
+every count still stands (TS-177).
 
 ## 13. Work breakdown
 

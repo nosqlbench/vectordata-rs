@@ -25,6 +25,12 @@ wrote:
   million is not;
 - above the reliability threshold, a record that clears the profile's
   floor `M + 3√M` (`min-matches`) is non-empty;
+- at the census profile, every record's claimed selectivity lies in
+  its cell's half-decade band, the generator's own invariant; and at
+  every profile above the threshold, every cell whose decade clears
+  the floor holds at least one record realised inside its band, so the
+  ladder is populated where the design promises it. A cell that does
+  not is **uncovered**;
 - every `query_in_filter` label agrees with evaluating the predicate
   against the query's own row.
 
@@ -88,6 +94,8 @@ profile.
      "exact_mismatches": 0, "incredible_counts": 0,
      "applicable": 0, "applicable_empty": 0,
      "empties": 1769, "empties_expected": 1761.4, "out_of_band": 4312,
+     "band_violations": 0, "uncovered_cells": 0,
+     "cells": {"control:1e-4": {"records": 605, "applicable": false, "in_band": 590, "below_band": 15, "above_band": 0, "empty": 0}},
      "per_family": {"control": {"records": 3710, "mean_claimed_selectivity": 0.005536, "mean_realised_selectivity": 0.005539,
                                 "out_of_band": 1180, "empties": 1769}},
      "first_violations": []}
@@ -96,11 +104,14 @@ profile.
 }
 ```
 
-`exact_mismatches`, `incredible_counts` and `applicable_empty` are
-violations. `empties`, `empties_expected`, `out_of_band` and
-`applicable` describe the profile: below the threshold nothing
+`exact_mismatches`, `incredible_counts`, `applicable_empty`,
+`band_violations` and `uncovered_cells` are violations. `empties`,
+`empties_expected`, `out_of_band`, `applicable` and the per-cell
+`cells` table describe the profile: below the threshold nothing
 applies, and at a small base most of the finest cells are empty, as
-predicted.
+predicted. The `cells` table is where a cell's realised spread at a
+size is read: how many of its records landed in the band, below it,
+above it, or empty.
 
 Profiles come from `dataset.yaml` (partition profiles excluded) or, when
 it does not load, from the `profiles/` directory with a sized profile's
