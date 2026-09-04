@@ -528,6 +528,11 @@ pub struct FacetDescriptor {
     pub window: Option<String>,
     /// Matching StandardFacet if this is a recognized standard facet.
     pub standard_kind: Option<StandardFacet>,
+    /// How many files a sharded facet spans; `None` for a single file.
+    /// A series has no single source path, and a caller that reports
+    /// what opening the facet will cost needs this number without
+    /// realising the series first.
+    pub shard_count: Option<u32>,
 }
 
 impl FacetDescriptor {
@@ -3205,6 +3210,7 @@ impl GenericTestDataView {
                         source_path: source,
                         window: facet.window().map(|w| w.to_string()),
                         standard_kind: *kind,
+                        shard_count: facet.shard_count(),
                     },
                 );
             }
@@ -3798,6 +3804,7 @@ mod tests {
             source_type: None,
             window: window.map(str::to_string),
             standard_kind: None,
+            shard_count: None,
         };
         let bounds = |d: &FacetDescriptor| {
             let w = facet_declared_window(d).unwrap();
@@ -3838,6 +3845,7 @@ mod tests {
             source_type: None,
             window: None,
             standard_kind: None,
+            shard_count: None,
         };
         assert!(
             facet_declared_window(&desc).is_err(),
@@ -3849,6 +3857,7 @@ mod tests {
             source_type: None,
             window: Some("[0..500]".into()),
             standard_kind: None,
+            shard_count: None,
         };
         let w = facet_declared_window(&series_desc).unwrap();
         assert_eq!((w.0[0].min_incl, w.0[0].max_excl), (0, 500), "a series declares its window in the field");
@@ -3858,6 +3867,7 @@ mod tests {
             source_type: None,
             window: Some("0,1000".into()),
             standard_kind: None,
+            shard_count: None,
         };
         let err = facet_declared_window(&bad_field).expect_err("the window field is checked too");
         assert!(err.to_string().contains("malformed"), "{err}");
@@ -3867,6 +3877,7 @@ mod tests {
             source_type: None,
             window: Some("0,1000".into()),
             standard_kind: None,
+            shard_count: None,
         };
         assert!(facet_declared_window(&bad_series).is_err(), "a series' malformed window is an error too");
     }
