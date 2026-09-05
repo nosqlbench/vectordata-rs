@@ -389,7 +389,7 @@ fails on any violation.
         }
 
         // ── Every profile with a results facet ──────────────────────
-        let profiles = discover_profiles(&ctx.workspace, &results_name);
+        let profiles = discover_profiles(&ctx.workspace, &results_name, &predicates_path);
         if profiles.is_empty() {
             return error_result(
                 format!("no profile holds a {} results facet yet", results_name),
@@ -721,16 +721,30 @@ fn read_record_lengths(path: &Path) -> Result<Vec<u64>, String> {
     Ok(out)
 }
 
-/// Profiles holding a results facet: from `dataset.yaml` when it loads
-/// (partition profiles excluded), else from the `profiles/` directory,
-/// with a sized profile's base count parsed from its name. Sorted by
-/// base count, the census profile (no declared count) last.
-fn discover_profiles(workspace: &Path, results_name: &str) -> Vec<(String, Option<u64>, PathBuf)> {
+/// Profiles holding a results facet **of the slab under verification**:
+/// from `dataset.yaml` when it loads (partition profiles excluded, and
+/// a profile whose predicate facet is another slab — a uniform set
+/// beside the stratified one, PL-2 — excluded too), else from the
+/// `profiles/` directory, with a sized profile's base count parsed
+/// from its name. Sorted by base count, the census profile (no
+/// declared count) last.
+fn discover_profiles(workspace: &Path, results_name: &str, predicates_path: &Path) -> Vec<(String, Option<u64>, PathBuf)> {
     let mut found: IndexMap<String, (Option<u64>, PathBuf)> = IndexMap::new();
+    // A name the definition declares is decided by the definition; the
+    // directory scan is for a workspace without one.
+    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let slab = std::fs::canonicalize(predicates_path).unwrap_or_else(|_| predicates_path.to_path_buf());
     if let Ok(config) = DatasetConfig::load_and_resolve(&workspace.join("dataset.yaml")) {
         for (name, profile) in &config.profiles.profiles {
+            declared.insert(name.clone());
             if profile.partition {
                 continue;
+            }
+            if let Some(view) = config.profiles.effective_view(name, "metadata_predicates") {
+                let declared = workspace.join(vectordata::dataset::catalog::strip_window_suffix(&view.source.path));
+                if std::fs::canonicalize(&declared).unwrap_or(declared) != slab {
+                    continue;
+                }
             }
             let path = workspace.join(format!("profiles/{}/{}", name, results_name));
             if path.exists() {
@@ -744,7 +758,7 @@ fn discover_profiles(workspace: &Path, results_name: &str) -> Vec<(String, Optio
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if found.contains_key(&name) {
+            if found.contains_key(&name) || declared.contains(&name) {
                 continue;
             }
             let path = entry.path().join(results_name);
