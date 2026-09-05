@@ -86,6 +86,7 @@ sufficient and the change needs rethinking (SH-74).
 |---|---|---|
 | 1 | everything before multi-file facets | — |
 | 2 | a sharded facet declaration (uniform or explicit) | cannot resolve the facet; fails at load or open |
+| 3 | a profile naming a parent other than `default` (`inherits:`), with every parent stated and the profile tag schema ([srd-profile-layers.md](srd-profile-layers.md) PL-6, [srd-profile-selectors.md](srd-profile-selectors.md) PS-19) | falls back to `default` and serves the wrong facets **without a word** — the misread V-9 exists to refuse |
 
 **V-8.** Version 2 is emitted **only when a dataset actually contains a
 sharded facet**. A dataset all of whose facets are single files is
@@ -131,18 +132,52 @@ dataset **before fetching** rather than after.
 declaration contradicting itself, and is refused at load — the same
 class of fault as a record count that disagrees with its shards (SH-8).
 
-**V-22.** An **absent** field is not a claim. It means 1 for the version
-gate (V-2), but a dataset that never declared a version has not
-*understated* one, and a reader new enough to notice the omission is new
-enough to read the data. So absence plus higher-version content is a
-note from `veks check` — "declare `format_version: 2` so older readers
-get a diagnosis" — never a load failure. Refusing it would reject every
-hand-written dataset for a field that helps no reader capable of
-reading it anyway.
+**V-22.** *Superseded by V-24 (2026-09-05).* This item read an absent
+field as "not a claim" and let an unversioned dataset carry
+higher-version content with only a note. That reading lets a file that
+never said what it is be read as whatever the newest reader can make of
+it, which is the wrong side to err on once a version can change what an
+inherited facet *means* (version 3). The text is kept for the record:
 
-The distinction matters because V-2 makes absence *mean* 1. Without
-V-22, that equivalence would turn every unannotated sharded dataset into
-a self-contradiction, which is the opposite of what V-2 is for.
+> An absent field is not a claim. It means 1 for the version gate
+> (V-2), but a dataset that never declared a version has not understated
+> one, and a reader new enough to notice the omission is new enough to
+> read the data. So absence plus higher-version content is a note from
+> `veks check`, never a load failure.
+
+**V-24.** An **absent** field means 1, **and the dataset is held to it**.
+An unversioned `dataset.yaml` is presumed to be what every dataset was
+before the field existed: single-file facets, one implicit parent, no
+tag schema — pre-shard, pre-inheritance, pre-tag. Content that needs
+more is refused at load, naming the version to declare:
+
+```
+dataset 'foo' declares no format_version and carries a sharded facet;
+declare format_version: 2.
+```
+
+This is the conservative reading: a reader given no claim assumes the
+least, and refuses what the least cannot hold, rather than assume the
+most it could make of the file. Nothing in circulation is affected —
+every dataset with higher-version content states its version, tessera
+included — and a hand-written dataset adds one line.
+
+**V-25.** A writer **always** emits `format_version`, version 1
+included (amending V-5's "lowest version that describes the dataset" to
+"and always written"). `veks check` refuses an unversioned
+`dataset.yaml` as unsound: soundness includes saying what you are. A
+dataset produced before this rule gains the line from its next
+`veks run`, by the textual edit the layers migration makes
+([srd-profile-layers.md](srd-profile-layers.md) PL-12).
+
+**V-26.** The programmatic surface — `TestDataGroup::load`, catalog
+resolution, and every client built on the contract — applies the same
+gate the command line does: it declares the highest version it
+supports, refuses anything above it before opening a facet (V-9,
+V-10), holds an absent field to 1 (V-24), and exposes the dataset's
+version so a caller can decide before it fetches (V-13). A client that
+reads a dataset above its version, or reads an unversioned one
+generously, is the misread this field exists to end.
 
 **V-23.** A version *higher* than the content requires is merely
 conservative, and is reported as a note rather than an error.
