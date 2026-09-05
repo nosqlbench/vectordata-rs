@@ -1249,7 +1249,7 @@ mod plan_events {
         write_fvec(&ds.join("query.fvec"), 4, 3);
         std::fs::write(
             ds.join("dataset.yaml"),
-            "name: plan-events\nprofiles:\n  default:\n    base_vectors:\n      \
+            "format_version: 2\nname: plan-events\nprofiles:\n  default:\n    base_vectors:\n      \
              source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 3\n      \
              record_count: 25\n    query_vectors: query.fvec\n",
         )

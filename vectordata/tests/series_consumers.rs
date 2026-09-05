@@ -46,7 +46,7 @@ fn explicit_series(dir: &std::path::Path) {
     write_fvec(&dir.join("part_b.fvec"), 4, 100, 100);
     std::fs::write(
         dir.join("dataset.yaml"),
-        "name: series\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
+        "format_version: 2\nname: series\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
         \x20       - part_a.fvec=100\n        - part_b.fvec=100\n      record_count: 200\n",
     )
     .unwrap();
@@ -60,7 +60,7 @@ fn uniform_series(dir: &std::path::Path) {
     }
     std::fs::write(
         dir.join("dataset.yaml"),
-        "name: series\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: series\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 2\n      \
          record_count: 200\n",
     )
@@ -204,7 +204,7 @@ fn deriving_a_windowed_series_slices_the_series() {
     write_fvec(&src.join("part_b.fvec"), 4, 100, 100);
     std::fs::write(
         src.join("dataset.yaml"),
-        "name: series\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
+        "format_version: 2\nname: series\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
         \x20       - part_a.fvec=100\n        - part_b.fvec=100\n      record_count: 200\n      \
          window: 80..130\n",
     )
@@ -253,7 +253,7 @@ fn the_typed_reader_reads_a_series_from_either_entry_point() {
     write_u32(&ds.join("layout__0001.u32"), 100..175);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: scalars\nprofiles:\n  default:\n    metadata_layout:\n      \
+        "format_version: 2\nname: scalars\nprofiles:\n  default:\n    metadata_layout:\n      \
          source: layout__NNNN.u32\n      shard_stride: 100\n      shard_count: 2\n      \
          record_count: 175\n",
     )
@@ -344,7 +344,7 @@ fn a_window_across_the_seam_matches_the_unsplit_file() {
     write_fvec(&split.join("part_b.fvec"), 4, 100, 100);
     std::fs::write(
         split.join("dataset.yaml"),
-        "name: series\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
+        "format_version: 2\nname: series\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
         \x20       - part_a.fvec=100\n        - part_b.fvec=100\n      record_count: 200\n      \
          window: 80..130\n",
     )
@@ -450,7 +450,7 @@ fn a_vvec_series_derives_into_one_facet() {
     write_ivvec(&src.join("meta_b.ivvec"), 30, 30);
     std::fs::write(
         src.join("dataset.yaml"),
-        "name: vv\nprofiles:\n  default:\n    metadata_results:\n      source:\n\
+        "format_version: 2\nname: vv\nprofiles:\n  default:\n    metadata_results:\n      source:\n\
         \x20       - meta_a.ivvec=30\n        - meta_b.ivvec=30\n      record_count: 60\n",
     )
     .unwrap();
@@ -496,7 +496,7 @@ fn a_windowed_vvec_series_slices_the_series() {
     write_ivvec(&src.join("meta_b.ivvec"), 30, 30);
     std::fs::write(
         src.join("dataset.yaml"),
-        "name: vv\nprofiles:\n  default:\n    metadata_results:\n      source:\n\
+        "format_version: 2\nname: vv\nprofiles:\n  default:\n    metadata_results:\n      source:\n\
         \x20       - meta_a.ivvec=30\n        - meta_b.ivvec=30\n      record_count: 60\n      \
          window: 20..45\n",
     )
@@ -540,7 +540,7 @@ fn a_sliced_vvec_shard_contributes_only_its_own_records() {
     write_ivvec(&src.join("part_b.ivvec"), 100, 40);
     std::fs::write(
         src.join("dataset.yaml"),
-        "name: sliced-vv\nprofiles:\n  default:\n    metadata_results:\n      source:\n\
+        "format_version: 2\nname: sliced-vv\nprofiles:\n  default:\n    metadata_results:\n      source:\n\
         \x20       - part_a.ivvec[10..20)=10\n        - part_b.ivvec[0..5)=5\n      \
          record_count: 15\n",
     )

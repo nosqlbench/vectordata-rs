@@ -32,6 +32,7 @@
 
 use std::path::Path;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::config::DatasetAttributes;
@@ -51,15 +52,17 @@ pub struct CatalogLayout {
     /// say so from the listing instead of downloading it and failing on
     /// a type error or a missing shard.
     ///
-    /// Absent means 1, like everywhere else (V-2), and 1 is not written
-    /// out — a catalog gains no new key for the datasets that predate
-    /// versioning.
-    #[serde(default = "crate::model::base_format_version",
-            skip_serializing_if = "crate::model::is_base_format_version")]
+    /// Absent means 1, like everywhere else (V-2). Always written when a
+    /// catalog is generated (V-25), so a consumer can refuse a dataset
+    /// before fetching it (V-13).
+    #[serde(default = "crate::model::base_format_version")]
     pub format_version: u32,
     /// Dataset-level attributes (model, distance function, license, etc.).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub attributes: Option<DatasetAttributes>,
+    /// The profile tag schema (PS-19), naming tags in order.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub profile_tags: IndexMap<String, serde_yaml::Value>,
     /// Named profiles mapping view names to data sources.
     #[serde(default)]
     pub profiles: DSProfileGroup,

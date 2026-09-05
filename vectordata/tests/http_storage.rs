@@ -1793,7 +1793,7 @@ fn make_remote_series(server_root: &Path, mrefs: bool) {
     }
     std::fs::write(
         server_root.join("dataset.yaml"),
-        "name: remote-series\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: remote-series\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 25\n      shard_count: 2\n      \
          record_count: 50\n    query_vectors: query.fvec\n",
     )
@@ -1837,7 +1837,7 @@ fn an_explicit_series_reads_over_http() {
     make_remote_series(tmp.path(), false);
     std::fs::write(
         tmp.path().join("dataset.yaml"),
-        "name: remote-series\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
+        "format_version: 2\nname: remote-series\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
         \x20       - base__0000.fvec=25\n        - base__0001.fvec=25\n      record_count: 50\n",
     )
     .unwrap();
@@ -1920,7 +1920,7 @@ fn make_big_remote_series(server_root: &Path, shards: usize, records: usize) {
     std::fs::write(
         server_root.join("dataset.yaml"),
         format!(
-            "name: big-series\nprofiles:\n  default:\n    base_vectors:\n      \
+            "format_version: 2\nname: big-series\nprofiles:\n  default:\n    base_vectors:\n      \
              source: big__NNNN.fvec\n      shard_stride: {records}\n      \
              shard_count: {shards}\n      record_count: {}\n",
             shards * records
@@ -1982,7 +1982,7 @@ fn make_series_with_sized_profile(root: &Path) {
     make_big_remote_series(root, 3, 400);
     std::fs::write(
         root.join("dataset.yaml"),
-        "name: big-series\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: big-series\nprofiles:\n  default:\n    base_vectors:\n      \
          source: big__NNNN.fvec\n      shard_stride: 400\n      shard_count: 3\n      \
          record_count: 1200\n  small:\n    base_count: 500\n    base_vectors:\n      \
          source: big__NNNN.fvec[0..500]\n      shard_stride: 400\n      shard_count: 3\n      \
@@ -2297,7 +2297,7 @@ fn a_shard_colliding_with_another_facets_file_is_refused() {
     std::fs::write(
         home.path().join("clash/dataset.yaml"),
         format!(
-            "name: clash\nprofiles:\n  default:\n    base_vectors:\n      \
+            "format_version: 2\nname: clash\nprofiles:\n  default:\n    base_vectors:\n      \
              source: {f}left/shared__NNNN.fvec\n      shard_stride: 25\n      \
              shard_count: 2\n      record_count: 50\n    \
              query_vectors: {f}right/shared__0001.fvec\n"

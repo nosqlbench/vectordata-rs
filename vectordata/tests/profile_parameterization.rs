@@ -24,7 +24,7 @@ use vectordata::dataset::DatasetConfig;
 /// The SRD's §8 declaration, with a `1m` size profile and two
 /// selectivities parameterizing it.
 fn selectivity_family() -> &'static str {
-    "name: amazon-reviews-2023\n\
+    "format_version: 3\nname: amazon-reviews-2023\n\
      profiles:\n\
     \x20 default:\n\
     \x20   base_vectors: base_vectors.fvec\n\
@@ -295,7 +295,7 @@ fn a_family_member_reading_a_different_corpus_is_reported() {
 #[test]
 fn an_unresolvable_parent_loads_but_is_reported() {
     let cfg = load(
-        "name: orphan\n\
+        "format_version: 3\nname: orphan\n\
          profiles:\n\
         \x20 default:\n\
         \x20   base_vectors: base.fvec\n\
@@ -321,7 +321,7 @@ fn an_unresolvable_parent_loads_but_is_reported() {
 #[test]
 fn an_inheritance_cycle_terminates_and_is_reported() {
     let cfg = load(
-        "name: loop\n\
+        "format_version: 3\nname: loop\n\
          profiles:\n\
         \x20 default:\n\
         \x20   base_vectors: base.fvec\n\
@@ -454,7 +454,7 @@ fn the_generator_templates_are_the_override_set() {
 #[test]
 fn an_all_digit_name_interpolated_into_a_sharded_template_is_refused() {
     let err = serde_yaml::from_str::<DatasetConfig>(
-        "name: ambiguous\n\
+        "format_version: 2\nname: ambiguous\n\
          profiles:\n\
         \x20 default:\n\
         \x20   base_vectors: base.fvec\n\

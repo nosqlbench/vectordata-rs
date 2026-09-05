@@ -279,6 +279,7 @@ impl DiscoveredDataset {
                 // so a consumer too old for it can say so from the
                 // listing rather than after fetching (V-13).
                 format_version: self.config.format_version,
+                profile_tags: self.config.profile_tags.clone(),
                 attributes: self.config.attributes.clone(),
                 profiles: self.config.profiles.clone(),
             },

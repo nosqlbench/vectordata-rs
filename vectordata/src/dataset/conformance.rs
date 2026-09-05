@@ -366,7 +366,7 @@ mod series_conformance {
     fn a_conformant_series_validates() {
         assert!(
             check(
-                "profiles:\n  default:\n    base_vectors:\n      source: base__NNNN.fvec\n\
+                "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source: base__NNNN.fvec\n\
                  \x20     shard_stride: 100\n      shard_count: 3\n      record_count: 250\n"
             )
             .is_ok()
@@ -379,7 +379,7 @@ mod series_conformance {
     #[test]
     fn a_wrong_format_in_a_later_shard_is_reported() {
         let v = check(
-            "profiles:\n  default:\n    base_vectors:\n      source:\n        \
+            "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source:\n        \
              - a.fvec=10\n        - b.fvec=10\n        - c.parquet=10\n      record_count: 30\n",
         )
         .expect_err("a non-conformant shard must be reported");
@@ -393,7 +393,7 @@ mod series_conformance {
     #[test]
     fn a_one_shard_series_is_reported_as_non_canonical() {
         let v = check(
-            "profiles:\n  default:\n    base_vectors:\n      source:\n        \
+            "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source:\n        \
              - only.fvec=10\n      record_count: 10\n",
         )
         .expect_err("a one-shard series is not canonical");
@@ -406,7 +406,7 @@ mod series_conformance {
     fn a_sharded_filename_is_not_mistaken_for_an_unknown_facet() {
         assert!(
             check(
-                "profiles:\n  default:\n    metadata_results:\n      source:\n        \
+                "format_version: 2\nprofiles:\n  default:\n    metadata_results:\n      source:\n        \
                  - metadata_results__0000.ivvec=5\n        - metadata_results__0001.ivvec=5\n\
                  \x20     record_count: 10\n"
             )

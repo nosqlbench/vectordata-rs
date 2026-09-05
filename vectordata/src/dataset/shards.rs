@@ -1983,7 +1983,7 @@ mod loader_wiring {
     #[test]
     fn a_self_contradicting_declaration_fails_at_load() {
         let err = load(
-            "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n\
+            "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n\
              \x20     shard_stride: 1000\n      shard_count: 3\n      record_count: 99\n",
         )
         .expect_err("a total the layout cannot produce must not load");
@@ -1996,7 +1996,7 @@ mod loader_wiring {
     /// `NNNN` without the numbers is caught at load too (SH-47).
     #[test]
     fn a_half_stated_uniform_form_fails_at_load() {
-        let err = load("profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n")
+        let err = load("format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n")
             .expect_err("NNNN without stride/count must not load");
         assert!(err.to_string().contains("shard_stride"), "{err}");
     }
@@ -2016,7 +2016,7 @@ mod loader_wiring {
     #[test]
     fn a_broken_shard_declaration_is_not_silently_skipped() {
         let err = load(
-            "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n\
+            "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n\
              \x20     shard_stride: not-a-number\n      shard_count: 3\n",
         )
         .expect_err("a malformed shard field must not vanish the profile");
@@ -2032,14 +2032,14 @@ mod loader_wiring {
     #[test]
     fn valid_declarations_load() {
         let uniform = load(
-            "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n\
+            "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n\
              \x20     shard_stride: 1000\n      shard_count: 3\n      record_count: 2500\n",
         )
         .expect("a consistent uniform series loads");
         assert!(uniform.profiles["default"].base_vectors.is_some());
 
         let explicit = load(
-            "profiles:\n  default:\n    metadata_content:\n      source:\n\
+            "format_version: 2\nprofiles:\n  default:\n    metadata_content:\n      source:\n\
              \x20       - a.u8=100\n        - b.u8=40\n      record_count: 140\n",
         )
         .expect("a consistent explicit series loads");
@@ -2124,7 +2124,7 @@ mod loader_parity {
     /// catalog — silently, and differently per transport.
     #[test]
     fn both_loaders_realize_a_uniform_series_identically() {
-        let yaml = "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n\
+        let yaml = "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n\
                     \x20     shard_stride: 1000\n      shard_count: 3\n      record_count: 2500\n";
         let a = via_dataset_config(yaml, "default", "base_vectors").unwrap();
         let b = via_profile_group(yaml, "default", "base_vectors").unwrap();
@@ -2140,7 +2140,7 @@ mod loader_parity {
     /// The same for the explicit form, windows and counts included.
     #[test]
     fn both_loaders_realize_an_explicit_series_identically() {
-        let yaml = "profiles:\n  default:\n    metadata_content:\n      source:\n\
+        let yaml = "format_version: 2\nprofiles:\n  default:\n    metadata_content:\n      source:\n\
                     \x20       - corpus.u8[0..100]=100\n        - corpus.u8[900..1000]=100\n\
                     \x20     record_count: 200\n";
         let a = via_dataset_config(yaml, "default", "metadata_content").unwrap();
@@ -2163,12 +2163,12 @@ mod loader_parity {
     fn both_loaders_reject_the_same_declarations() {
         let bad = [
             // total the layout cannot produce
-            "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n\
+            "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n\
              \x20     shard_stride: 1000\n      shard_count: 3\n      record_count: 99\n",
             // NNNN without the numbers
-            "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n",
+            "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n",
             // a count that contradicts its interval
-            "profiles:\n  default:\n    metadata_content:\n      source:\n\
+            "format_version: 2\nprofiles:\n  default:\n    metadata_content:\n      source:\n\
              \x20       - a.u8[0..100]=99\n        - b.u8=10\n      record_count: 110\n",
         ];
         for yaml in bad {
@@ -2201,7 +2201,7 @@ mod loader_parity {
     /// view, so a catalog can carry one (SH-41).
     #[test]
     fn a_series_view_round_trips_through_yaml() {
-        let yaml = "profiles:\n  default:\n    metadata_content:\n      source:\n\
+        let yaml = "format_version: 2\nprofiles:\n  default:\n    metadata_content:\n      source:\n\
                     \x20       - a.u8=100\n        - b.u8=40\n      record_count: 140\n";
         let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         let group: DSProfileGroup =

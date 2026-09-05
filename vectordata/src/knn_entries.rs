@@ -86,6 +86,7 @@ impl KnnEntries {
                 // Synthesized in memory: version 1 by construction (V-2).
                 format_version: crate::model::FORMAT_VERSION_BASE,
                 attributes: HashMap::new(),
+                profile_tags: Default::default(),
                 profiles: HashMap::new(),
             },
         }
@@ -172,6 +173,7 @@ fn build_dataset_config(profiles_map: IndexMap<String, &KnnEntry>) -> DatasetCon
         // Synthesized in memory: version 1 by construction (V-2).
         format_version: crate::model::FORMAT_VERSION_BASE,
         attributes: HashMap::new(),
+        profile_tags: Default::default(),
         profiles,
     }
 }

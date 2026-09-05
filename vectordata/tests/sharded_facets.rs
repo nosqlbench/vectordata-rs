@@ -51,7 +51,7 @@ fn a_uniform_series_opens_and_reports_the_whole_facet() {
     write_fvec(&ds.join("base__0002.fvec"), 4, 40, 200);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: sharded\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: sharded\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
          record_count: 240\n",
     )
@@ -84,7 +84,7 @@ fn a_series_whose_files_contradict_its_declaration_is_refused() {
     write_fvec(&ds.join("base__0000.fvec"), 4, 100, 0);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: bad\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: bad\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
          record_count: 9999\n",
     )
@@ -109,7 +109,7 @@ fn an_explicit_series_opens_from_named_files() {
     write_u32(&ds.join("part-b.u32"), 100..160);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: explicit\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
+        "format_version: 2\nname: explicit\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
          - part-a.u32=100\n        - part-b.u32=60\n      record_count: 160\n",
     )
     .unwrap();
@@ -143,12 +143,12 @@ fn bare_names_resolve_to_the_same_facet_as_counted_ones() {
 
     let bare = build(
         &tmp.path().join("bare"),
-        "name: b\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
+        "format_version: 2\nname: b\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
          - part-a.u32\n        - part-b.u32\n      record_count: 160\n",
     );
     let counted = build(
         &tmp.path().join("counted"),
-        "name: c\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
+        "format_version: 2\nname: c\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
          - part-a.u32=100\n        - part-b.u32=60\n      record_count: 160\n",
     );
     assert_eq!(bare, counted, "spelling must not change the facet");
@@ -167,7 +167,7 @@ fn two_shards_of_one_file_share_its_storage() {
     write_u32(&ds.join("corpus.u32"), 0..1000);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: sliced\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
+        "format_version: 2\nname: sliced\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
          - corpus.u32[0..100]=100\n        - corpus.u32[900..1000]=100\n      \
          record_count: 200\n",
     )
@@ -228,7 +228,7 @@ fn a_missing_shard_is_named_rather_than_read_as_emptiness() {
     // __0001 deliberately absent.
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: gap\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: gap\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 2\n      \
          record_count: 150\n",
     )
@@ -281,7 +281,7 @@ fn a_series_reads_identically_to_the_single_file_it_was_split_from() {
     write_fvec(&series.join("base__0002.fvec"), 4, 40, 200);
     std::fs::write(
         series.join("dataset.yaml"),
-        "name: many\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: many\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
          record_count: 240\n",
     )
@@ -316,7 +316,7 @@ fn reading_past_the_series_end_is_out_of_bounds() {
     write_fvec(&ds.join("base__0001.fvec"), 4, 5, 10);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: bounds\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: bounds\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 2\n      \
          record_count: 15\n",
     )
@@ -341,7 +341,7 @@ fn a_profile_window_clips_the_series_not_a_shard() {
     write_fvec(&ds.join("base__0001.fvec"), 4, 100, 100);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: win\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: win\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 2\n      \
          record_count: 200\n      window: 50..150\n",
     )
@@ -383,7 +383,7 @@ fn a_series_with_a_disagreeing_shard_is_refused() {
     write_fvec(&ds.join("base__0001.fvec"), 8, 10, 10); // dim 8, not 4
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: mixed\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: mixed\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 2\n      \
          record_count: 20\n",
     )
@@ -411,7 +411,7 @@ fn typed_access_reads_a_scalar_series() {
     write_u32(&ds.join("layout__0001.u32"), 100..175);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: scalars\nprofiles:\n  default:\n    metadata_layout:\n      \
+        "format_version: 2\nname: scalars\nprofiles:\n  default:\n    metadata_layout:\n      \
          source: layout__NNNN.u32\n      shard_stride: 100\n      shard_count: 2\n      \
          record_count: 175\n",
     )
@@ -440,7 +440,7 @@ fn typed_access_reads_a_sliced_series() {
     write_u32(&ds.join("corpus.u32"), 0..1000);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: sliced\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
+        "format_version: 2\nname: sliced\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
          - corpus.u32[0..10]=10\n        - corpus.u32[990..1000]=10\n      record_count: 20\n",
     )
     .unwrap();
@@ -501,7 +501,7 @@ fn a_vvec_series_reads_through_per_file_indexes() {
     write_ivvec_with_index(&ds.join("meta__0001.ivvec"), &b, 1000);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: vv\nprofiles:\n  default:\n    metadata_results:\n      \
+        "format_version: 2\nname: vv\nprofiles:\n  default:\n    metadata_results:\n      \
          source: meta__NNNN.ivvec\n      shard_stride: 10\n      shard_count: 2\n      \
          record_count: 16\n",
     )
@@ -567,7 +567,7 @@ fn a_window_inside_one_shard_plans_only_that_shard() {
     write_fvec(&ds.join("base__0001.fvec"), 4, 100, 100);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: p\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: p\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 2\n      \
          record_count: 200\n",
     )
@@ -602,7 +602,7 @@ fn a_window_across_a_seam_plans_one_range_per_shard() {
     write_fvec(&ds.join("base__0002.fvec"), 4, 50, 200);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: seam\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: seam\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
          record_count: 250\n",
     )
@@ -644,7 +644,7 @@ fn ranges_in_different_shards_never_merge() {
     write_fvec(&ds.join("base__0001.fvec"), 4, 10, 10);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: nm\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: nm\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 2\n      \
          record_count: 20\n",
     )
@@ -674,7 +674,7 @@ fn a_whole_facet_plan_names_every_shard() {
     write_fvec(&ds.join("base__0001.fvec"), 4, 4, 10);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: whole\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: whole\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 2\n      \
          record_count: 14\n",
     )
@@ -709,7 +709,7 @@ fn a_window_on_a_uniform_pattern_bounds_the_reader() {
     write_fvec(&ds.join("base__0002.fvec"), 4, 5, 20);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: pw\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: pw\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 3\n      \
          record_count: 25\n  small:\n    base_count: 12\n    base_vectors:\n      \
          source: base__NNNN.fvec[0..12]\n      shard_stride: 10\n      shard_count: 3\n      \
@@ -738,7 +738,7 @@ fn prefetching_a_mapped_series_window_needs_no_consent() {
     write_fvec(&ds.join("base__0001.fvec"), 4, 10, 10);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: pf\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: pf\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 2\n      \
          record_count: 20\n",
     )
@@ -924,7 +924,7 @@ fn a_published_series_lists_every_shard_and_sidecar() {
     std::fs::write(ds.join("base__0003.fvec.partial"), b"half").unwrap();
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: pub\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: pub\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 3\n      \
          record_count: 30\n",
     )
@@ -1005,7 +1005,7 @@ fn a_series_wider_than_the_descriptor_budget_still_reads() {
     std::fs::write(
         ds.join("dataset.yaml"),
         format!(
-            "name: wide\nprofiles:\n  default:\n    base_vectors:\n      \
+            "format_version: 2\nname: wide\nprofiles:\n  default:\n    base_vectors:\n      \
              source: base__NNNN.fvec\n      shard_stride: 1\n      shard_count: {n}\n      \
              record_count: {n}\n"
         ),
@@ -1065,7 +1065,7 @@ fn a_sliced_facet_is_complete_when_its_window_is() {
     write_u32(&ds.join("corpus.u32"), 0..10_000);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: sliced\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
+        "format_version: 2\nname: sliced\nprofiles:\n  default:\n    metadata_layout:\n      source:\n        \
          - corpus.u32[0..10]=10\n        - corpus.u32[9990..10000]=10\n      record_count: 20\n",
     )
     .unwrap();
@@ -1152,11 +1152,14 @@ fn a_refused_version_opens_no_facet() {
     );
 }
 
-/// **A new build writing an unsharded dataset emits no version** (V-5),
-/// so it stays readable by every build that ever existed. The field is
-/// worthless if adding it changes what older builds can read.
+/// **A new build writing an unsharded dataset states version 1** (V-25).
+///
+/// Every build that ever existed reads version 1, and a stated version
+/// is what lets a reader refuse a dataset it cannot express before
+/// fetching it rather than after; an absent field is held to 1 (V-24),
+/// so a writer that omits it says nothing a reader can rely on.
 #[test]
-fn an_unsharded_derive_emits_no_version() {
+fn an_unsharded_derive_states_version_one() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -1183,7 +1186,7 @@ fn an_unsharded_derive_emits_no_version() {
         0
     );
     let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
-    assert!(!yaml.contains("format_version"), "{yaml}");
+    assert!(yaml.contains("format_version: 1"), "a writer always states the version (V-25):\n{yaml}");
 }
 
 /// A sharded derive declares version 2 (V-8), because that is the
@@ -1241,7 +1244,7 @@ fn the_required_version_is_derived_from_the_declaration() {
     assert!(plain.is_v1(), "a v1 dataset proves its own compatibility");
 
     let sharded: vectordata::model::DatasetConfig = serde_yaml::from_str(
-        "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n      \
+        "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n      \
          shard_stride: 100\n      shard_count: 3\n      record_count: 250\n",
     )
     .unwrap();
@@ -1289,14 +1292,20 @@ fn a_stated_version_below_the_content_is_refused() {
 /// loads: a reader new enough to notice the omission is new enough to
 /// read it, and refusing would reject every hand-written dataset.
 #[test]
-fn an_absent_version_is_not_an_understatement() {
-    let cfg: vectordata::model::DatasetConfig = serde_yaml::from_str(
+fn an_absent_version_is_held_to_one() {
+    let err = serde_yaml::from_str::<vectordata::model::DatasetConfig>(
         "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n      \
          shard_stride: 100\n      shard_count: 3\n      record_count: 250\n",
     )
-    .expect("an unannotated sharded dataset loads");
-    assert_eq!(cfg.format_version, 1, "absent still means 1 for the gate");
-    assert_eq!(cfg.min_format_version(), 2, "but the content needs 2");
+    .expect_err("an unannotated sharded dataset is refused (V-24)");
+    let msg = err.to_string();
+    assert!(msg.contains("no format_version") && msg.contains("format_version: 2"), "{msg}");
+    let cfg: vectordata::model::DatasetConfig = serde_yaml::from_str(
+        "format_version: 2\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n      \
+         shard_stride: 100\n      shard_count: 3\n      record_count: 250\n",
+    )
+    .expect("stated, it loads");
+    assert_eq!(cfg.min_format_version(), 2);
 }
 
 /// **A gap in the middle of a series is an error, not a short read**
@@ -1316,7 +1325,7 @@ fn a_gap_in_the_middle_of_a_series_is_reported_by_name() {
     write_fvec(&ds.join("base__0002.fvec"), 4, 100, 200);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: gap\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: gap\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
          record_count: 300\n",
     )
@@ -1369,7 +1378,7 @@ fn a_shard_sharing_a_basename_with_another_facet_reads_its_own_bytes() {
     // under its basename — and `base__0001.fvec` is claimed twice.
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: clash\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: clash\nprofiles:\n  default:\n    base_vectors:\n      \
          source: a/base__NNNN.fvec\n      shard_stride: 50\n      shard_count: 2\n      \
          record_count: 100\n    query_vectors: b/base__0001.fvec\n",
     )
@@ -1460,7 +1469,7 @@ fn a_sliced_series_publishes_whole_files() {
     write_fvec(&ds.join("part_b.fvec"), 4, 100, 100);
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: sliced\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
+        "format_version: 2\nname: sliced\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
         \x20       - part_a.fvec[20..60)=40\n        - part_b.fvec[0..30)=30\n      \
          record_count: 70\n",
     )
@@ -1501,7 +1510,7 @@ fn validation_reports_a_non_canonical_series_without_rewriting_it() {
     let ds = tmp.path().join("ds");
     std::fs::create_dir_all(&ds).unwrap();
     write_fvec(&ds.join("base__0000.fvec"), 4, 40, 0);
-    let yaml = "name: single\nprofiles:\n  default:\n    base_vectors:\n      \
+    let yaml = "format_version: 2\nname: single\nprofiles:\n  default:\n    base_vectors:\n      \
                 source: base__NNNN.fvec\n      shard_stride: 40\n      shard_count: 1\n      \
                 record_count: 40\n";
     std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
@@ -1549,7 +1558,7 @@ fn saving_a_sharded_dataset_preserves_its_series() {
     }
     write_fvec(&ds.join("part_a.fvec"), 4, 20, 0);
     write_fvec(&ds.join("part_b.fvec"), 4, 20, 20);
-    let yaml = "name: keep\nprofiles:\n  default:\n    base_vectors:\n      \
+    let yaml = "format_version: 2\nname: keep\nprofiles:\n  default:\n    base_vectors:\n      \
                 source: base__NNNN.fvec\n      shard_stride: 50\n      shard_count: 3\n      \
                 record_count: 150\n    query_vectors:\n      source:\n        \
                 - part_a.fvec=20\n        - part_b.fvec=20\n      record_count: 40\n";
@@ -1642,7 +1651,7 @@ fn a_local_series_reports_local_through_its_handle() {
     }
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: modes\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: modes\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 50\n      shard_count: 3\n      \
          record_count: 150\n",
     )
@@ -1674,7 +1683,7 @@ fn facet_selection_names_facets_not_shard_files() {
     }
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: sel\nprofiles:\n  default:\n    base_vectors:\n      \
+        "format_version: 2\nname: sel\nprofiles:\n  default:\n    base_vectors:\n      \
          source: base__NNNN.fvec\n      shard_stride: 50\n      shard_count: 2\n      \
          record_count: 100\n",
     )

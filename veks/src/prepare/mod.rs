@@ -1250,6 +1250,7 @@ fn clean_single_dataset(workspace: &std::path::Path) {
                 eprintln!("Cleaning without profile information.");
                 vectordata::dataset::DatasetConfig {
                     format_version: vectordata::model::FORMAT_VERSION_BASE,
+                    profile_tags: Default::default(),
                     name: String::new(),
                     description: None,
                     attributes: None,

@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn an_explicit_series_is_refused_rather_than_resolved_to_its_first_shard() {
         let tmp = workspace_with(
-            "name: d\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
+            "format_version: 2\nname: d\nprofiles:\n  default:\n    base_vectors:\n      source:\n\
              \x20       - part_a.fvec=100\n        - part_b.fvec=100\n      record_count: 200\n",
         );
         let err = resolve_path_option(&ctx_at(tmp.path()), &Options::new(), "base", "base_vectors")
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn a_uniform_series_is_refused_with_the_same_diagnosis() {
         let tmp = workspace_with(
-            "name: d\nprofiles:\n  default:\n    base_vectors:\n      source: base__NNNN.fvec\n\
+            "format_version: 2\nname: d\nprofiles:\n  default:\n    base_vectors:\n      source: base__NNNN.fvec\n\
              \x20     shard_stride: 100\n      shard_count: 5\n      record_count: 500\n",
         );
         let err = resolve_path_option(&ctx_at(tmp.path()), &Options::new(), "base", "base_vectors")
@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn an_explicit_option_overrides_a_sharded_declaration() {
         let tmp = workspace_with(
-            "name: d\nprofiles:\n  default:\n    base_vectors:\n      source: base__NNNN.fvec\n\
+            "format_version: 2\nname: d\nprofiles:\n  default:\n    base_vectors:\n      source: base__NNNN.fvec\n\
              \x20     shard_stride: 100\n      shard_count: 5\n      record_count: 500\n",
         );
         let mut opts = Options::new();

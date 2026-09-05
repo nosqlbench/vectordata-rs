@@ -4224,6 +4224,7 @@ mod tests {
             catalog_name: None,
             layout: crate::dataset::CatalogLayout {
                 format_version: crate::model::FORMAT_VERSION_BASE,
+                profile_tags: Default::default(),
                 attributes: None,
                 profiles: Default::default(),
             },
@@ -4305,6 +4306,7 @@ mod tests {
             catalog_name: None,
             layout: crate::dataset::CatalogLayout {
                 format_version: crate::model::FORMAT_VERSION_BASE,
+                profile_tags: Default::default(),
                 attributes: None,
                 profiles: Default::default(),
             },

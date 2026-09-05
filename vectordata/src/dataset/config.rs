@@ -123,9 +123,14 @@ pub struct DatasetConfig {
     /// by the other would make the transport decide whether it is
     /// readable.
     ///
-    /// See `docs/design/srd-dataset-format-version.md`.
-    #[serde(skip_serializing_if = "crate::model::is_base_format_version")]
+    /// See `docs/design/srd-dataset-format-version.md`. Always written,
+    /// version 1 included (V-25): a dataset says what it is.
     pub format_version: u32,
+
+    /// The profile tag schema (PS-19): naming tags in order, each with
+    /// a default or `~`.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub profile_tags: IndexMap<String, serde_yaml::Value>,
 
     /// Dataset name.
     pub name: String,
@@ -200,6 +205,8 @@ impl<'de> Deserialize<'de> for DatasetConfig {
         struct Raw {
             #[serde(default)]
             format_version: Option<u32>,
+            #[serde(default)]
+            profile_tags: IndexMap<String, serde_yaml::Value>,
             name: String,
             #[serde(default)]
             description: Option<String>,
@@ -220,12 +227,13 @@ impl<'de> Deserialize<'de> for DatasetConfig {
             .map_err(serde::de::Error::custom)?;
         crate::model::check_stated_against_content(
             raw.format_version,
-            required_format_version(&raw.profiles),
+            required_format_version(&raw.profiles, &raw.profile_tags),
         )
         .map_err(serde::de::Error::custom)?;
 
         Ok(DatasetConfig {
             format_version,
+            profile_tags: raw.profile_tags,
             name: raw.name,
             description: raw.description,
             attributes: raw.attributes,
@@ -237,19 +245,32 @@ impl<'de> Deserialize<'de> for DatasetConfig {
     }
 }
 
-/// The lowest format version that can express these profiles.
+/// The lowest format version that can express this dataset.
 ///
 /// Derived by folding the declarations rather than read from a field,
 /// which is what lets a writer emit the lowest version describing what
-/// it actually wrote (V-4). A multi-file facet is the only thing so far
-/// that needs more than version 1.
-pub(crate) fn required_format_version(profiles: &DSProfileGroup) -> u32 {
+/// it actually wrote (V-4). A multi-file facet needs version 2; a tag
+/// schema or a profile inheriting from a named parent other than
+/// `default` needs version 3 (PL-9, PS-16). This is the writer-side
+/// twin of `crate::model::DatasetConfig::min_format_version`, and the
+/// two must agree case for case, which the format-compat suite holds.
+pub(crate) fn required_format_version(
+    profiles: &DSProfileGroup,
+    profile_tags: &IndexMap<String, serde_yaml::Value>,
+) -> u32 {
     let sharded = profiles
         .profiles
         .values()
         .flat_map(|p| p.views.values())
         .any(|v| v.is_series());
-    if sharded {
+    let layered = !profile_tags.is_empty()
+        || profiles
+            .profiles
+            .iter()
+            .any(|(name, p)| name != "default" && p.inherits.as_deref().is_some_and(|i| i != "default"));
+    if layered {
+        crate::model::FORMAT_VERSION_TAGGED
+    } else if sharded {
         crate::model::FORMAT_VERSION_SHARDED
     } else {
         crate::model::FORMAT_VERSION_BASE
@@ -644,14 +665,13 @@ impl DatasetConfig {
         // to need version 2, and one that gained a series states it
         // (V-4).
         //
-        // Version 1 is written as nothing at all. An unsharded dataset
-        // that never carried the key does not acquire one by being
-        // saved, which is what keeps it readable by every build that
-        // ever existed (V-5).
-        let version = required_format_version(&self.profiles).max(self.format_version);
-        if version > crate::model::FORMAT_VERSION_BASE {
-            out.push_str(&format!("format_version: {version}\n"));
-        }
+        // Version 1 is written too (V-25). Every build that ever existed
+        // reads version 1, and an absent field is held to 1 on read
+        // (V-24), so stating it costs nothing and lets a reader refuse a
+        // dataset above its ceiling before fetching rather than after.
+        let version =
+            required_format_version(&self.profiles, &self.profile_tags).max(self.format_version);
+        out.push_str(&format!("format_version: {version}\n"));
 
         // name
         out.push_str(&format!("name: {}\n", self.name));
@@ -735,6 +755,19 @@ impl DatasetConfig {
             }
         }
 
+        // profile_tags — the tag schema (PS-19), in naming order. Its
+        // presence is what lifts the dataset to version 3, so it is
+        // written exactly as loaded: a dropped tag would silently
+        // change every generated profile name.
+        if !self.profile_tags.is_empty() {
+            out.push_str("\nprofile_tags:\n");
+            for (key, value) in &self.profile_tags {
+                let rendered = crate::dataset::yaml_edit::render_scalar(value)
+                    .map_err(|e| format!("profile_tags '{key}': {e}"))?;
+                out.push_str(&format!("  {key}: {rendered}\n"));
+            }
+        }
+
         // profiles
         if !self.profiles.is_empty() || self.profiles.has_deferred() {
             out.push_str("\nprofiles:\n");
@@ -785,11 +818,9 @@ impl DatasetConfig {
                 if !profile.attributes.is_empty() {
                     out.push_str("    attributes:\n");
                     for (key, value) in &profile.attributes {
-                        out.push_str(&format!(
-                            "      {}: {}\n",
-                            key,
-                            Self::scalar_yaml(value)
-                        ));
+                        let rendered = Self::scalar_yaml(value)
+                            .map_err(|e| format!("profile '{name}' attribute '{key}': {e}"))?;
+                        out.push_str(&format!("      {key}: {rendered}\n"));
                     }
                 }
                 // partition is derived structurally (non-default + has own
@@ -879,24 +910,12 @@ impl DatasetConfig {
 
     // -------------------------------------------------------------------------
 
-    /// Render an attribute value as a YAML scalar for `save()`.
-    ///
-    /// Strings are quoted so a value like `1e-3` or `yes` survives the
-    /// round trip as the string it was; everything else prints as
-    /// itself. A structured value is written as inline YAML, which
-    /// reparses to the same thing — attributes are an open map and a
-    /// writer must not drop what it does not recognise (P-5).
-    fn scalar_yaml(value: &serde_yaml::Value) -> String {
-        match value {
-            serde_yaml::Value::String(s) => format!("\"{}\"", s.replace('"', "\\\"")),
-            serde_yaml::Value::Number(n) => n.to_string(),
-            serde_yaml::Value::Bool(b) => b.to_string(),
-            serde_yaml::Value::Null => "null".to_string(),
-            other => serde_yaml::to_string(other)
-                .unwrap_or_default()
-                .trim()
-                .replace('\n', " "),
-        }
+    /// A profile attribute's value as the reader reads it back: a word
+    /// bare, a number-like string quoted, a list as a flow sequence —
+    /// the one rendering every writer shares (PS-19). A map is refused
+    /// (PS-15).
+    fn scalar_yaml(value: &serde_yaml::Value) -> Result<String, String> {
+        crate::dataset::yaml_edit::render_scalar(value)
     }
 
     /// Validate structural rules for all profiles.
@@ -1383,7 +1402,7 @@ profiles:
     /// only `view.path()` would let it through.
     #[test]
     fn validate_rejects_a_managed_path_in_a_later_shard() {
-        let yaml = "\
+        let yaml = "format_version: 2\n\
 name: test
 profiles:
   default:
@@ -1631,7 +1650,12 @@ attributes:
         config.save(tmp.path()).unwrap();
 
         let saved = std::fs::read_to_string(tmp.path()).unwrap();
-        assert!(saved.starts_with("name:"), "must start with content, not a header:\n{saved}");
+        // The first line is content: the version a writer always states
+        // (V-25), never a fabricated comment block.
+        assert!(
+            saved.starts_with("format_version: 1\nname:"),
+            "must start with content, not a header:\n{saved}"
+        );
         assert!(!saved.contains("Copyright"), "must not fabricate a copyright header:\n{saved}");
         assert!(!saved.contains("SPDX"), "must not fabricate a license header:\n{saved}");
 

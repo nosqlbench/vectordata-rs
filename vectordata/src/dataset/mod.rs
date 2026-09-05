@@ -30,6 +30,7 @@ pub mod shard_sizing;
 pub mod shards;
 pub mod source;
 pub mod strata;
+pub mod yaml_edit;
 
 pub use catalog::{CatalogEntry, CatalogLayout, find_catalog, load_catalog};
 pub use config::{DatasetAttributes, DatasetConfig};

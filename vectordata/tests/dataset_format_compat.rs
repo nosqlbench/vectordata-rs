@@ -169,16 +169,18 @@ fn an_old_build_reads_a_collapsed_single_shard_output() {
 
 // ── backwards: this build and pre-sharding datasets ────────────────
 
-/// **An unsharded output carries no v2-only key** (V-5).
+/// **An unsharded output states version 1 and carries no v2-only key**
+/// (V-25, V-5).
 ///
-/// Absence of `format_version` is the headline, but any shard key
-/// leaking into an unsharded declaration breaks an old reader just as
-/// thoroughly — `record_count` is ignored by an untagged `Detailed`,
-/// while a `source` promoted to a one-element sequence is fatal. The
-/// assertion is on the whole document rather than on one key, because
-/// the failure mode is a key nobody thought to check.
+/// The stated version is the one addition every build that ever
+/// existed reads past; any shard key leaking into an unsharded
+/// declaration breaks an old reader outright — `record_count` is
+/// ignored by an untagged `Detailed`, while a `source` promoted to a
+/// one-element sequence is fatal. The assertion is on the whole
+/// document rather than on one key, because the failure mode is a key
+/// nobody thought to check.
 #[test]
-fn an_unsharded_output_is_spelled_exactly_as_it_always_was() {
+fn an_unsharded_output_states_version_one_and_no_shard_key() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -206,12 +208,16 @@ fn an_unsharded_output_is_spelled_exactly_as_it_always_was() {
     );
 
     let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
-    for key in [
-        "format_version",
-        "shard_stride",
-        "shard_count",
-        "record_count",
-    ] {
+    assert_eq!(
+        yaml.matches("format_version").count(),
+        1,
+        "the version is stated exactly once:\n{yaml}"
+    );
+    assert!(
+        yaml.contains("format_version: 1\n"),
+        "an unsharded output states version 1 (V-25):\n{yaml}"
+    );
+    for key in ["shard_stride", "shard_count", "record_count"] {
         assert!(!yaml.contains(key), "v2-only key `{key}` leaked:\n{yaml}");
     }
 
@@ -320,10 +326,32 @@ fn both_loaders_agree_about_every_version_case() {
             false,
         ),
         (
-            "unannotated but sharded",
+            "unannotated but sharded: held to 1 and refused (V-24)",
             "name: a\nprofiles:\n  default:\n    base_vectors:\n      \
              source: b__NNNN.fvec\n      shard_stride: 100\n      shard_count: 3\n      \
              record_count: 250\n",
+            false,
+        ),
+        (
+            "unannotated with a named parent: held to 1 and refused (V-24)",
+            "name: n\nprofiles:\n  default:\n    base_vectors: base.fvec\n  \
+             1m:\n    base_count: 100\n  1m-sel:\n    inherits: 1m\n    query_vectors: q.fvec\n",
+            false,
+        ),
+        (
+            "unannotated with a tag schema: held to 1 and refused (V-24)",
+            "name: t\nprofile_tags:\n  size: {}\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
+            false,
+        ),
+        (
+            "a tag schema stating 3",
+            "format_version: 3\nname: t\nprofile_tags:\n  size: {}\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
+            true,
+        ),
+        (
+            "a named parent stating 3",
+            "format_version: 3\nname: n\nprofiles:\n  default:\n    base_vectors: base.fvec\n  \
+             1m:\n    base_count: 100\n  1m-sel:\n    inherits: 1m\n    query_vectors: q.fvec\n",
             true,
         ),
         (
@@ -362,6 +390,7 @@ fn a_generated_catalog_entry_carries_the_datasets_version() {
 
     let layout = vectordata::dataset::CatalogLayout {
         format_version: cfg.format_version,
+        profile_tags: Default::default(),
         attributes: cfg.attributes.clone(),
         profiles: cfg.profiles.clone(),
     };
@@ -371,17 +400,57 @@ fn a_generated_catalog_entry_carries_the_datasets_version() {
         "the version must reach the catalog: {json}"
     );
 
-    // And version 1 adds no key, so a catalog of pre-versioning
-    // datasets is unchanged by this.
+    // And version 1 is written too (V-25), so a consumer can refuse
+    // before fetching whatever the dataset's age (V-13).
     let plain: vectordata::dataset::DatasetConfig =
         serde_yaml::from_str("name: p\nprofiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
     let layout = vectordata::dataset::CatalogLayout {
         format_version: plain.format_version,
         attributes: None,
+        profile_tags: Default::default(),
         profiles: plain.profiles.clone(),
     };
     let json = serde_json::to_string(&layout).unwrap();
-    assert!(!json.contains("format_version"), "{json}");
+    assert!(json.contains("\"format_version\":1"), "{json}");
+}
+
+/// **A tag schema survives a save and lifts the dataset to version 3
+/// on both loaders** (PS-19, PS-16).
+///
+/// The schema is what names every generated profile, so a writer that
+/// dropped or reordered it would silently rename the next generation;
+/// the round trip is asserted on order, not just presence.
+#[test]
+fn a_tag_schema_round_trips_at_version_three() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("dataset.yaml");
+    // Naming tags carry no default (`~`); a tag with a default is
+    // carried by every profile but does not name (PS-19, settled).
+    let yaml = "format_version: 3\nname: t\nprofile_tags:\n  size: ~\n  predicates: ~\n  \
+                selectivity: ~\n  family: stratified\nprofiles:\n  default:\n    base_vectors: base.fvec\n";
+
+    let writer: vectordata::dataset::DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(
+        writer.profile_tags.keys().collect::<Vec<_>>(),
+        vec!["size", "predicates", "selectivity", "family"]
+    );
+    let saved = writer.to_expanded_yaml_string(&path).unwrap();
+    assert!(saved.contains("format_version: 3\n"), "{saved}");
+    assert!(
+        saved.contains("\nprofile_tags:\n  size: ~\n  predicates: ~\n  selectivity: ~\n  family: stratified\n"),
+        "{saved}"
+    );
+
+    let client: vectordata::model::DatasetConfig = serde_yaml::from_str(&saved).unwrap();
+    assert_eq!(
+        client.profile_tags.keys().collect::<Vec<_>>(),
+        vec!["size", "predicates", "selectivity", "family"],
+        "the schema reloads in naming order"
+    );
+    assert!(client.profile_tags["size"].is_null());
+    assert_eq!(client.profile_tags["family"], serde_yaml::Value::from("stratified"));
+    assert_eq!(client.format_version, 3);
+    assert_eq!(client.min_format_version(), 3, "a schema alone needs version 3");
 }
 
 /// **A save states the version the content needs, not the one it was
@@ -396,7 +465,7 @@ fn a_saved_dataset_states_the_version_its_content_needs() {
     let path = tmp.path().join("dataset.yaml");
 
     let sharded: vectordata::dataset::DatasetConfig = serde_yaml::from_str(
-        "name: s\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n      \
+        "format_version: 2\nname: s\nprofiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvec\n      \
          shard_stride: 100\n      shard_count: 3\n      record_count: 250\n",
     )
     .unwrap();
@@ -410,7 +479,7 @@ fn a_saved_dataset_states_the_version_its_content_needs() {
         serde_yaml::from_str("name: p\nprofiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
     let out = plain.to_expanded_yaml_string(&path).unwrap();
     assert!(
-        !out.contains("format_version"),
-        "an unsharded dataset must not acquire the key by being saved:\n{out}"
+        out.contains("format_version: 1"),
+        "a writer always states the version, 1 included (V-25):\n{out}"
     );
 }

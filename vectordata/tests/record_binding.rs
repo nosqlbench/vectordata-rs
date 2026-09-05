@@ -357,7 +357,7 @@ fn a_sharded_facet_binds_across_its_shards() {
     std::fs::write(ds.join("b.fvec"), [4u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
     std::fs::write(
         ds.join("dataset.yaml"),
-        "name: sh\nprofiles:\n  default:\n    base_vectors: b.fvec\n    \
+        "format_version: 2\nname: sh\nprofiles:\n  default:\n    base_vectors: b.fvec\n    \
          metadata_content:\n      source: meta__NNNN.slab\n      shard_stride: 5\n      \
          shard_count: 2\n      record_count: 10\n",
     )

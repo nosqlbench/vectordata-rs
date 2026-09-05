@@ -514,6 +514,7 @@ mod tests {
         // a clean file_relpath like "base.fvec".
         let layout = crate::dataset::CatalogLayout {
             format_version: crate::model::FORMAT_VERSION_BASE,
+            profile_tags: Default::default(),
             attributes: None,
             profiles: Default::default(),
         };
@@ -542,6 +543,7 @@ mod tests {
         // ("base.fvec", not the absolute URL).
         let layout = crate::dataset::CatalogLayout {
             format_version: crate::model::FORMAT_VERSION_BASE,
+            profile_tags: Default::default(),
             attributes: None,
             profiles: Default::default(),
         };

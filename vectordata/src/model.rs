@@ -42,6 +42,10 @@ pub struct DatasetConfig {
     pub format_version: u32,
     /// Arbitrary attributes describing the dataset (e.g., distance metric, dimension).
     pub attributes: HashMap<String, serde_yaml::Value>,
+    /// The profile tag schema (PS-19): the naming tags in order, each
+    /// with a default or `~`. Empty when the dataset declares none.
+    #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
+    pub profile_tags: indexmap::IndexMap<String, serde_yaml::Value>,
     /// Named profiles defining different views or subsets of the dataset.
     pub profiles: HashMap<String, ProfileConfig>,
 }
@@ -53,12 +57,22 @@ impl DatasetConfig {
     /// *requires* is a property of what it says, and deriving it is what
     /// stops a writer's stamp drifting from its content (V-19).
     pub fn min_format_version(&self) -> u32 {
-        self.profiles
+        let facets = self
+            .profiles
             .values()
             .flat_map(|p| p.facets())
             .map(|(_, f)| f.min_format_version())
             .max()
-            .unwrap_or(FORMAT_VERSION_BASE)
+            .unwrap_or(FORMAT_VERSION_BASE);
+        // A named parent or a tag schema is version 3 (V-7): a reader
+        // that predates `inherits:` would fall back to `default` and
+        // serve the wrong facets without a word.
+        let tagged = !self.profile_tags.is_empty()
+            || self.profiles.iter().any(|(name, p)| {
+                name != "default"
+                    && p.inherits.as_deref().is_some_and(|parent| parent != "default")
+            });
+        facets.max(if tagged { FORMAT_VERSION_TAGGED } else { FORMAT_VERSION_BASE })
     }
 
     /// Whether every facet is expressible in **v1**.
@@ -77,11 +91,15 @@ pub const FORMAT_VERSION_BASE: u32 = 1;
 /// The version a sharded facet declaration requires (V-7).
 pub const FORMAT_VERSION_SHARDED: u32 = 2;
 
+/// The version a named parent or a profile tag schema requires (V-7):
+/// profiles that state their parents and carry their tags.
+pub const FORMAT_VERSION_TAGGED: u32 = 3;
+
 /// The highest `dataset.yaml` format version this build can read.
 ///
 /// A dataset declaring more than this is refused at load, naming both
 /// numbers — the diagnosis the field exists to provide (V-9).
-pub const FORMAT_VERSION_SUPPORTED: u32 = FORMAT_VERSION_SHARDED;
+pub const FORMAT_VERSION_SUPPORTED: u32 = FORMAT_VERSION_TAGGED;
 
 /// The version an absent field stands for (V-2).
 pub fn base_format_version() -> u32 {
@@ -142,6 +160,13 @@ pub fn check_stated_against_content(stated: Option<u32>, required: u32) -> Resul
             "dataset declares format_version {stated} but its content \
              requires {required} — a declaration cannot understate what it holds"
         )),
+        // Absent means 1, and the dataset is held to it (V-24): a file
+        // that never said what it is is read as the least it could be,
+        // and refused when its content needs more.
+        None if required > FORMAT_VERSION_BASE => Err(format!(
+            "dataset declares no format_version and carries content that \
+             requires {required}; declare format_version: {required}"
+        )),
         _ => Ok(()),
     }
 }
@@ -174,6 +199,8 @@ impl<'de> Deserialize<'de> for DatasetConfig {
             format_version: Option<u32>,
             #[serde(default)]
             attributes: HashMap<String, serde_yaml::Value>,
+            #[serde(default)]
+            profile_tags: indexmap::IndexMap<String, serde_yaml::Value>,
             #[serde(default)]
             profiles: HashMap<String, serde_yaml::Value>,
         }
@@ -248,27 +275,22 @@ impl<'de> Deserialize<'de> for DatasetConfig {
         // same class of fault as a record count that disagrees with its
         // shards (SH-8).
         //
-        // An **absent** field is not a claim. It means 1 for the purpose
-        // of the gate above (V-2), but a dataset that never declared a
-        // version has not understated one, and a reader new enough to
-        // notice is new enough to read it. Under-annotation is a note
-        // from `veks check`, not a load failure — refusing it here would
-        // reject every hand-written sharded dataset for a field that
-        // helps no reader which can already read it.
-        let required = profiles
-            .values()
-            .flat_map(|p| p.facets())
-            .map(|(_, f)| f.min_format_version())
-            .max()
-            .unwrap_or(FORMAT_VERSION_BASE);
+        // An **absent** field means 1, and the dataset is held to it
+        // (V-24): content that needs more is refused naming the version
+        // to declare, so a file that never said what it is is read as
+        // the least it could be rather than the most a new reader can
+        // make of it.
+        let config = DatasetConfig {
+            format_version,
+            attributes: raw.attributes,
+            profile_tags: raw.profile_tags,
+            profiles,
+        };
+        let required = config.min_format_version();
         check_stated_against_content(raw.format_version, required)
             .map_err(serde::de::Error::custom)?;
 
-        Ok(DatasetConfig {
-            format_version,
-            attributes: raw.attributes,
-            profiles,
-        })
+        Ok(config)
     }
 }
 
@@ -960,6 +982,7 @@ mod tests {
     #[test]
     fn a_window_on_a_uniform_pattern_loads_as_the_facet_window() {
         let yaml = r#"
+format_version: 2
 profiles:
   default:
     base_vectors:
@@ -981,6 +1004,7 @@ profiles:
         assert_eq!(base.sources(), ["profiles/base/base_vectors__NNNN.fvecs"]);
         assert_eq!(base.window(), Some("[0..10]"));
         let twice = r#"
+format_version: 2
 profiles:
   default:
     base_vectors:
@@ -1155,6 +1179,7 @@ profiles:
     #[test]
     fn metadata_results_does_not_cross_the_size_axis() {
         let yaml = r#"
+format_version: 3
 attributes: {}
 profiles:
   default:

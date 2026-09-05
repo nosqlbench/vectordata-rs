@@ -180,7 +180,7 @@ fn sharded_facet_dataset(dir: &std::path::Path) {
     std::fs::write(dir.join("base.fvec"), [4u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
     std::fs::write(
         dir.join("dataset.yaml"),
-        "name: sharded-meta\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+        "format_version: 2\nname: sharded-meta\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
          metadata_content:\n      source: meta__NNNN.slab\n      shard_stride: 10\n      \
          shard_count: 3\n      record_count: 25\n",
     )
