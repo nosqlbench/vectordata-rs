@@ -244,7 +244,8 @@ impl<'de> Deserialize<'de> for DatasetConfig {
             .collect();
         crate::dataset::parents::check_parents(format_version, &facts)
             .map_err(serde::de::Error::custom)?;
-        let profiles = raw.profiles;
+        let mut profiles = raw.profiles;
+        profiles.layered = format_version >= crate::model::FORMAT_VERSION_TAGGED;
 
         Ok(DatasetConfig {
             format_version,
@@ -400,8 +401,20 @@ impl DatasetConfig {
                 added = self.profiles.expand_deferred_sized(vars, base_count);
             }
         }
+        // A layered dataset splits each generated rung into its size
+        // layer and the mixed set beside it (PL-9, PL-13).
+        if self.is_layered() {
+            added += self.profiles.layer_generated_profiles();
+        }
         self.strata.sync_series(&self.profiles.series_by_spec);
         added
+    }
+
+    /// Whether the dataset is layered (PL-1): from `format_version` 3 a
+    /// generated rung is a size layer with its predicate set beside it,
+    /// and templates run where the facet they produce is declared.
+    pub fn is_layered(&self) -> bool {
+        self.format_version >= crate::model::FORMAT_VERSION_TAGGED
     }
 
     /// Pick the effective base count from pipeline variables, falling

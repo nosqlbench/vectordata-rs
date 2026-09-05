@@ -79,6 +79,47 @@ fn command_facet(run: &str) -> Option<char> {
     }
 }
 
+/// The facet a command's code names in a profile's views.
+fn facet_key_for_code(code: char) -> Option<&'static str> {
+    match code {
+        'G' => Some("neighbor_indices"),
+        'R' => Some("metadata_results"),
+        'F' => Some("prefiltered_neighbor_indices"),
+        'E' => Some("postfiltered_neighbor_indices"),
+        'P' => Some("metadata_predicates"),
+        _ => None,
+    }
+}
+
+/// Refuse, at plan time, a step that writes a predicate-group facet
+/// into a layer (PL-10): a profile that declares no predicate facet
+/// holds no predicate group, and `evaluate-predicates` pointed at it
+/// would fill one it does not have. `compute-knn` on the layer is what
+/// the layer is for. Only a layered dataset has layers.
+pub fn refuse_layer_writes(steps: &[StepDef], profiles: &DSProfileGroup) -> Result<(), String> {
+    if !profiles.layered {
+        return Ok(());
+    }
+    for step in steps {
+        let Some(code) = command_facet(&step.run) else { continue };
+        if !matches!(code, 'R' | 'F' | 'E') {
+            continue;
+        }
+        let facet = facet_key_for_code(code).unwrap_or("predicate facet");
+        for profile in &step.profiles {
+            if profiles.is_layer(profile) {
+                return Err(format!(
+                    "step '{}' writes {facet} for profile '{profile}', which declares no predicate \
+                     facet; a layer holds no predicate group, so point the step at the set that \
+                     declares one (PL-10)",
+                    step.effective_id()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn expand_per_profile_steps(
     steps: Vec<StepDef>,
     profiles: &DSProfileGroup,
@@ -201,6 +242,21 @@ pub fn expand_per_profile_steps_scoped(
             // Templates with "partition" in the ID only expand for partition
             // profiles — never for default or sized profiles.
             if !is_partition && template_id.contains("partition") {
+                continue;
+            }
+
+            // In a layered dataset a template runs where the profile
+            // declares the facet its command produces (PL-9): the
+            // unfiltered ground truth on a size layer, the predicate
+            // group on the set beside it. Below version 3 every sized
+            // profile takes every template, as it always has.
+            if profiles.layered
+                && *profile_name != "default"
+                && !is_partition
+                && let Some(code) = command_facet(&template.run)
+                && let Some(facet) = facet_key_for_code(code)
+                && !profiles.declares(profile_name, facet)
+            {
                 continue;
             }
 
@@ -329,15 +385,19 @@ pub fn expand_per_profile_steps_scoped(
                 let suffix = if *profile_name == "default" { String::new() }
                     else { format!("-{}", profile_name) };
 
-                let first_id = phase_templates.first().map(|t| {
-                    let tid = t.effective_id();
-                    if suffix.is_empty() { tid } else { format!("{}{}", tid, suffix) }
-                });
-
-                let last_id = phase_templates.last().map(|t| {
-                    let tid = t.effective_id();
-                    if suffix.is_empty() { tid } else { format!("{}{}", tid, suffix) }
-                });
+                // Only instances that were emitted: in a layered
+                // dataset a template runs where its facet is declared,
+                // so a profile may have taken a subset of the phase.
+                let emitted: Vec<String> = phase_templates
+                    .iter()
+                    .map(|t| {
+                        let tid = t.effective_id();
+                        if suffix.is_empty() { tid } else { format!("{}{}", tid, suffix) }
+                    })
+                    .filter(|id| result.iter().any(|s| s.effective_id() == *id))
+                    .collect();
+                let first_id = emitted.first().cloned();
+                let last_id = emitted.last().cloned();
 
                 // Order after the previous profile's last step in this
                 // phase — a sequencing edge, not a provenance upstream.
@@ -356,6 +416,59 @@ pub fn expand_per_profile_steps_scoped(
             }
         }
 
+    }
+
+    // A template dependency whose instance was not emitted for this
+    // profile resolves up the parent chain (PL-2): the set's evaluation
+    // waits on its layer's unfiltered ground truth, which is the facet
+    // it inherits. A dependency nothing produced is dropped.
+    let emitted_now: std::collections::HashSet<String> = result.iter().map(|s| s.effective_id()).collect();
+    let instance_id = |template: &str, profile: &str| -> String {
+        if profile == "default" { template.to_string() } else { format!("{template}-{profile}") }
+    };
+    let mut fixups: Vec<(usize, Vec<String>)> = Vec::new();
+    for (i, step) in result.iter().enumerate() {
+        if step.profiles.len() != 1 {
+            continue;
+        }
+        let profile = step.profiles[0].as_str();
+        let mut changed = false;
+        let mut after: Vec<String> = Vec::new();
+        for dep in &step.after {
+            if emitted_now.contains(dep) {
+                after.push(dep.clone());
+                continue;
+            }
+            let Some(template) = template_ids
+                .iter()
+                .find(|t| instance_id(t, profile) == *dep)
+            else {
+                after.push(dep.clone());
+                continue;
+            };
+            changed = true;
+            let mut current = profiles.parent_name(profile);
+            let mut resolved: Option<String> = None;
+            while let Some(parent) = current {
+                let candidate = instance_id(template, &parent);
+                if emitted_now.contains(&candidate) {
+                    resolved = Some(candidate);
+                    break;
+                }
+                current = profiles.parent_name(&parent);
+            }
+            if let Some(r) = resolved
+                && !after.contains(&r)
+            {
+                after.push(r);
+            }
+        }
+        if changed {
+            fixups.push((i, after));
+        }
+    }
+    for (i, after) in fixups {
+        result[i].after = after;
     }
 
     // Post-hoc phase ordering: for each phase > 0, the first emitted step
@@ -405,6 +518,9 @@ pub fn expand_per_profile_steps_scoped(
                     format!("{}-{}", template, profile_name)
                 }
             })
+            // Only instances that were emitted (PL-9): a layer takes no
+            // predicate-group template and a set no unfiltered one.
+            .filter(|id| expanded_ids.contains(id))
             .collect()
     };
     for step in result.iter_mut() {
@@ -654,5 +770,86 @@ default:
             "profiles/10M/neighbor_indices.ivec");
         assert_eq!(step_10m.options.get("distances").and_then(|v| v.as_str()).unwrap(),
             "profiles/10M/neighbor_distances.fvec");
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+
+    fn layered_group() -> DSProfileGroup {
+        let mut g: DSProfileGroup = serde_yaml::from_str(
+            "default:\n  base_vectors: profiles/base/b.fvec\n  query_vectors: profiles/base/q.fvec\n  \
+             metadata_predicates: profiles/base/p.slab\n  neighbor_indices: profiles/default/g.ivec\n  \
+             metadata_results: profiles/default/r.slab\n\
+             10m:\n  inherits: default\n  base_count: 10000000\n  neighbor_indices: profiles/10m/g.ivec\n\
+             10m-mixed:\n  inherits: 10m\n  base_count: 10000000\n  metadata_results: profiles/10m-mixed/r.slab\n",
+        )
+        .unwrap();
+        g.layered = true;
+        g
+    }
+
+    fn template(id: &str, run: &str, after: &[&str], output: (&str, &str)) -> StepDef {
+        let mut options = indexmap::IndexMap::new();
+        options.insert(output.0.to_string(), serde_yaml::Value::String(output.1.to_string()));
+        StepDef {
+            id: Some(id.to_string()),
+            run: run.to_string(),
+            description: None,
+            after: after.iter().map(|s| s.to_string()).collect(),
+            sequence_after: vec![],
+            profiles: vec![],
+            per_profile: true,
+            phase: 0,
+            finalize: false,
+            on_partial: Default::default(),
+            options,
+        }
+    }
+
+    /// **A template runs where its facet is declared** (PL-9): the
+    /// unfiltered ground truth on the layer, the evaluation on the set,
+    /// and the set's evaluation waits on its layer's ground truth.
+    #[test]
+    fn templates_expand_where_their_facet_is_declared() {
+        let g = layered_group();
+        let steps = vec![
+            template("compute-knn", "compute knn", &[], ("indices", "neighbor_indices.ivec")),
+            template("evaluate-predicates", "compute evaluate-predicates", &["compute-knn"], ("output", "metadata_results.slab")),
+        ];
+        let out = expand_per_profile_steps(steps, &g, 100);
+        let ids: Vec<String> = out.iter().map(|s| s.effective_id()).collect();
+        assert!(ids.contains(&"compute-knn-10m".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"compute-knn-10m-mixed".to_string()), "a set takes no unfiltered template: {ids:?}");
+        assert!(ids.contains(&"evaluate-predicates-10m-mixed".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"evaluate-predicates-10m".to_string()), "a layer takes no predicate template: {ids:?}");
+        let eval = out.iter().find(|s| s.effective_id() == "evaluate-predicates-10m-mixed").unwrap();
+        assert_eq!(eval.after, vec!["compute-knn-10m".to_string()], "the set waits on its layer's ground truth (PL-2)");
+        // Below 3 every sized profile takes every template, as always.
+        let mut v2 = layered_group();
+        v2.layered = false;
+        let steps = vec![template("compute-knn", "compute knn", &[], ("indices", "neighbor_indices.ivec"))];
+        let out = expand_per_profile_steps(steps, &v2, 100);
+        assert!(out.iter().any(|s| s.effective_id() == "compute-knn-10m-mixed"));
+    }
+
+    /// **A step that would fill a layer's predicate group is refused at
+    /// plan time** (PL-10, case 12); the unfiltered KNN on it is not.
+    #[test]
+    fn a_predicate_write_into_a_layer_is_refused() {
+        let g = layered_group();
+        let mut on_layer = template("eval-10m", "compute evaluate-predicates", &[], ("output", "x"));
+        on_layer.per_profile = false;
+        on_layer.profiles = vec!["10m".to_string()];
+        let e = refuse_layer_writes(std::slice::from_ref(&on_layer), &g).unwrap_err();
+        assert!(e.contains("metadata_results") && e.contains("'10m'") && e.contains("PL-10"), "{e}");
+        let mut knn = template("knn-10m", "compute knn", &[], ("indices", "x"));
+        knn.per_profile = false;
+        knn.profiles = vec!["10m".to_string()];
+        assert!(refuse_layer_writes(std::slice::from_ref(&knn), &g).is_ok());
+        let mut on_set = on_layer.clone();
+        on_set.profiles = vec!["10m-mixed".to_string()];
+        assert!(refuse_layer_writes(std::slice::from_ref(&on_set), &g).is_ok());
     }
 }

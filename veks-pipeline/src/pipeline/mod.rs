@@ -431,6 +431,12 @@ pub fn run_script(args: ScriptArgs) {
 
     let mut config = config; // make mutable for resolve_all_steps
     let expanded_steps = resolve_all_steps(&mut config, &workspace);
+    // A step that would fill a layer's predicate group is refused
+    // before anything runs (PL-10).
+    if let Err(e) = vectordata::dataset::refuse_layer_writes(&expanded_steps, &config.profiles) {
+        println!("error: {e}");
+        std::process::exit(1);
+    }
 
     let steps = if profile_name == "all" {
         expanded_steps
@@ -551,6 +557,12 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
 
     // Resolve all steps including deferred profile expansion
     let expanded_steps = resolve_all_steps(&mut config, &workspace);
+    // A step that would fill a layer's predicate group is refused
+    // before anything runs (PL-10).
+    if let Err(e) = vectordata::dataset::refuse_layer_writes(&expanded_steps, &config.profiles) {
+        println!("error: {e}");
+        std::process::exit(1);
+    }
 
     // When sized profiles are still deferred (their base_count is not
     // yet known from variables.yaml), defer EVERY per-profile step out

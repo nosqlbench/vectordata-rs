@@ -420,12 +420,15 @@ fn e2e_topic_stratified_predicates() {
     let (ok, log) = run_pipeline(&dataset_yaml);
     assert!(ok, "second run failed:\n{}", log);
 
-    // The sized profile's E is its own G intersected with its own R,
-    // in G's rank order, padded with -1 (SRD TS-176).
+    // A layered dataset (PL-9, PL-13): `100` is the size layer holding
+    // the unfiltered ground truth, and `100-mixed` the predicate set
+    // beside it. The set's E is the layer's G intersected with the
+    // set's own R, in G's rank order, padded with -1 (SRD TS-176).
     {
         let g = ivec_rows(&dataset.join("profiles/100/neighbor_indices.ivecs"));
-        let e = ivec_rows(&dataset.join("profiles/100/postfiltered_neighbor_indices.ivec"));
-        let r = SlabReader::open(dataset.join("profiles/100/metadata_results.slab")).unwrap();
+        assert!(!dataset.join("profiles/100/metadata_results.slab").exists(), "a layer holds no predicate group (PL-1)");
+        let e = ivec_rows(&dataset.join("profiles/100-mixed/postfiltered_neighbor_indices.ivec"));
+        let r = SlabReader::open(dataset.join("profiles/100-mixed/metadata_results.slab")).unwrap();
         assert_eq!(g.len(), QUERIES);
         assert_eq!(e.len(), QUERIES);
         let mut survivors = 0usize;

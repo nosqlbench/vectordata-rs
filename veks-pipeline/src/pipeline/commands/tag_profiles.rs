@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
-use vectordata::dataset::profile::{DSProfileGroup, DSView, size_rung};
+use vectordata::dataset::profile::{DSView, size_rung};
 use vectordata::dataset::{DatasetConfig, catalog::strip_window_suffix};
 
 use crate::pipeline::command::{
@@ -168,27 +168,6 @@ pub struct TagPlan {
     pub notes: Vec<String>,
 }
 
-/// The facet a profile reads for `facet`: its own, else its parent's
-/// up the `inherits` chain to `default`; a partition profile reads
-/// only its own.
-fn effective_view<'a>(group: &'a DSProfileGroup, name: &str, facet: &str) -> Option<&'a DSView> {
-    let mut current = name.to_string();
-    for _ in 0..=group.profiles.len() {
-        let p = group.profiles.get(&current)?;
-        if let Some(v) = p.views.get(facet) {
-            return Some(v);
-        }
-        if p.partition || current == "default" {
-            return None;
-        }
-        current = match p.inherits.as_deref() {
-            Some(i) if i != current && group.profiles.contains_key(i) => i.to_string(),
-            _ => "default".to_string(),
-        };
-    }
-    None
-}
-
 fn facet_relpath(view: &DSView) -> String {
     let clean = strip_window_suffix(&view.source.path);
     crate::pipeline::dataset_lookup::strip_namespace(clean)
@@ -219,7 +198,7 @@ pub fn plan_tags(
         // default's is the rung of what its base holds; any other
         // profile with a count, the decimal rung of that count.
         let size = if name == "default" {
-            effective_view(group, name, "base_vectors")
+            group.effective_view(name, "base_vectors")
                 .and_then(|v| v.record_count.or(v.source.declared_count))
                 .or(profile.base_count)
                 .map(size_rung)
@@ -237,8 +216,12 @@ pub fn plan_tags(
         }
 
         // The class of the predicate facet this profile reads, from the
-        // step that produced it and a census of what it holds.
-        if let Some(view) = effective_view(group, name, "metadata_predicates") {
+        // step that produced it and a census of what it holds. A layer
+        // in a layered dataset holds no predicate group and carries no
+        // class of its own (PL-1, PL-11).
+        if !(group.layered && group.is_layer(name))
+            && let Some(view) = group.effective_view(name, "metadata_predicates")
+        {
             let rel = facet_relpath(view);
             if !facet_tags.contains_key(&rel) {
                 facet_tags.insert(rel.clone(), predicate_facet_tags(workspace, &rel, steps, &mut notes)?);

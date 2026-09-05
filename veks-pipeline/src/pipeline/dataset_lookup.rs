@@ -44,26 +44,29 @@ use super::command::{Options, StreamContext};
 /// facet name or recognized shorthand alias accepted by
 /// `vectordata::dataset::facet::resolve_standard_key`
 /// (`"base_vectors"`, `"base"`, `"neighbor_indices"`, `"gt"`, …).
-/// The profiles whose `facet` resolves to `path`: the ones a generator
-/// filling that file must tag (PS-12). A facet is compared by the file
-/// it names, windows stripped, against the workspace.
+/// The profiles that read `facet` from `path`, own or inherited: the
+/// ones a generator filling that file must tag (PS-12). A layer in a
+/// layered dataset holds no predicate group and takes no class
+/// (PL-1). A facet is compared by the file it names, windows stripped,
+/// against the workspace.
 pub fn profiles_declaring_facet(workspace: &Path, facet: &str, path: &Path) -> Vec<String> {
     let Ok(config) = vectordata::dataset::DatasetConfig::load(&workspace.join("dataset.yaml")) else {
         return Vec::new();
     };
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    config
+    let group = &config.profiles;
+    group
         .profiles
-        .profiles
-        .iter()
-        .filter(|(_, p)| {
-            p.views.get(facet).is_some_and(|v| {
+        .keys()
+        .filter(|name| !(group.layered && group.is_layer(name)))
+        .filter(|name| {
+            group.effective_view(name, facet).is_some_and(|v| {
                 let clean = vectordata::dataset::catalog::strip_window_suffix(&v.source.path);
                 let declared = workspace.join(strip_namespace(clean));
                 std::fs::canonicalize(&declared).unwrap_or(declared) == target
             })
         })
-        .map(|(name, _)| name.clone())
+        .cloned()
         .collect()
 }
 

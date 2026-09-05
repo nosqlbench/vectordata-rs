@@ -188,6 +188,16 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
         }
         config.profiles.profiles.insert(prof_name.clone(), profile);
     }
+    // A layered dataset keeps each rung as its size layer and puts the
+    // mixed predicate set beside it (PL-9, PL-13).
+    if config.is_layered() {
+        let sets = config.profiles.layer_generated_profiles();
+        config.strata.sync_series(&config.profiles.series_by_spec);
+        if sets > 0 {
+            println!("  Layered: {sets} mixed predicate set(s) beside their size layers");
+        }
+    }
+
     // The default carries its own rung as `size` (PS-20): the rung of
     // what its base facet holds, which is what a selector compares
     // against under the count rule.

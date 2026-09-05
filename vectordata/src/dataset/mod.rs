@@ -36,7 +36,7 @@ pub mod yaml_edit;
 
 pub use catalog::{CatalogEntry, CatalogLayout, find_catalog, load_catalog};
 pub use config::{DatasetAttributes, DatasetConfig};
-pub use expansion::{collect_all_steps, expand_per_profile_steps, expand_per_profile_steps_scoped, filter_steps_for_profile, resolve_steps};
+pub use expansion::{collect_all_steps, expand_per_profile_steps, expand_per_profile_steps_scoped, filter_steps_for_profile, refuse_layer_writes, resolve_steps};
 pub use facet::StandardFacet;
 pub use shard_sizing::{DEFAULT_MAX_SHARD_BYTES, RecordSize, ShardPlan, Sharding};
 pub use shards::{discover_shards, shard_name, shard_source_spec};

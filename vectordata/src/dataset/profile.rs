@@ -372,6 +372,12 @@ pub struct DSProfileGroup {
     /// round-trip serialization. Includes both immediately expanded
     /// entries and deferred entries.
     pub raw_sized: Vec<String>,
+    /// Whether the dataset is layered (PL-1): from `format_version` 3
+    /// a generated rung is a size layer and its predicate group lives
+    /// on a set beside it, and a per-profile template runs only where
+    /// the profile declares the facet it produces (PL-9, PL-10). Set by
+    /// the dataset that owns the group, never read from the file.
+    pub layered: bool,
     /// Per-spec expansion record: for each sized/strata generator spec
     /// (keyed by its original entry string), the profile names it
     /// produced, in generator order. A profile name may appear under
@@ -402,7 +408,160 @@ impl DSProfileGroup {
             deferred_facet_templates: None,
             raw_sized: Vec::new(),
             series_by_spec: IndexMap::new(),
+            layered: false,
         }
+    }
+
+    /// The parent a profile builds on: none for `default` and a
+    /// partition; a stated parent that exists and is not the profile
+    /// itself; else `default` when it exists.
+    pub fn parent_name(&self, name: &str) -> Option<String> {
+        let p = self.profiles.get(name)?;
+        if name == "default" || p.partition {
+            return None;
+        }
+        match p.inherits.as_deref() {
+            Some(i) if i != name && self.profiles.contains_key(i) => Some(i.to_string()),
+            _ => self.profiles.contains_key("default").then(|| "default".to_string()),
+        }
+    }
+
+    /// The facet a profile reads for `facet`: its own, else its parent's
+    /// up the chain (PL-5). A partition reads only its own.
+    pub fn effective_view(&self, name: &str, facet: &str) -> Option<&DSView> {
+        let mut current = name.to_string();
+        for _ in 0..=self.profiles.len() {
+            let p = self.profiles.get(&current)?;
+            if let Some(v) = p.views.get(facet) {
+                return Some(v);
+            }
+            current = self.parent_name(&current)?;
+        }
+        None
+    }
+
+    /// Whether a profile **declares** `facet` rather than inheriting it:
+    /// it carries a view for it that is not its parent's effective one.
+    /// A windowed cut of the parent's file is the parent's facet under
+    /// the child's count, not a declaration; a different file is.
+    pub fn declares(&self, name: &str, facet: &str) -> bool {
+        let Some(own) = self.profiles.get(name).and_then(|p| p.views.get(facet)) else {
+            return false;
+        };
+        let Some(parent) = self.parent_name(name) else {
+            return true;
+        };
+        match self.effective_view(&parent, facet) {
+            None => true,
+            Some(pv) => {
+                crate::dataset::catalog::strip_window_suffix(&own.source.path)
+                    != crate::dataset::catalog::strip_window_suffix(&pv.source.path)
+            }
+        }
+    }
+
+    /// A **layer** (PL-1): a profile other than `default` that declares
+    /// none of the predicate group. Opening it is the unfiltered
+    /// benchmark at its size; writing a predicate-group facet into it
+    /// is refused (PL-10).
+    pub fn is_layer(&self, name: &str) -> bool {
+        name != "default"
+            && self.profiles.contains_key(name)
+            && !PREDICATE_GROUP.iter().any(|f| self.declares(name, f))
+    }
+
+    /// Split every generated rung of a layered dataset into its size
+    /// layer and the mixed predicate set beside it (PL-9, PL-13): the
+    /// rung keeps the base window, the metadata window and the
+    /// unfiltered ground truth; `<rung>-mixed` names the rung as its
+    /// parent, restates its count, declares the results index and the
+    /// filtered ground truth under its own directory, and carries the
+    /// tags that describe the slab it inherits. Idempotent: a rung
+    /// already split, or one that carries no predicate group, is left
+    /// alone. Returns how many sets were made.
+    pub fn layer_generated_profiles(&mut self) -> usize {
+        let generated: Vec<String> = {
+            let mut names: Vec<String> = Vec::new();
+            for series in self.series_by_spec.values() {
+                for n in series {
+                    if !names.contains(n) {
+                        names.push(n.clone());
+                    }
+                }
+            }
+            names
+        };
+        let mut made = 0usize;
+        for rung in generated {
+            let set_name = format!("{rung}-mixed");
+            if self.profiles.contains_key(&set_name) {
+                continue;
+            }
+            let moved: Vec<String> = match self.profiles.get(&rung) {
+                // A set builds on a rung, not on default: it is the
+                // product of a split, never its subject.
+                Some(p) if p.inherits.as_deref().is_some_and(|i| i != "default") => continue,
+                Some(p) => PREDICATE_GROUP
+                    .iter()
+                    .filter(|f| **f != "metadata_predicates" && p.views.contains_key(**f))
+                    .map(|f| f.to_string())
+                    .collect(),
+                None => continue,
+            };
+            if moved.is_empty() {
+                continue;
+            }
+            let (layer_maxk, layer_count, size_tag) = {
+                let p = &self.profiles[&rung];
+                (p.maxk, p.base_count, p.attributes.get("size").cloned())
+            };
+            let mut set_views: IndexMap<String, DSView> = IndexMap::new();
+            let mut set_attrs: IndexMap<String, serde_yaml::Value> = IndexMap::new();
+            set_attrs.insert(
+                "size".to_string(),
+                size_tag.unwrap_or_else(|| serde_yaml::Value::from(rung.as_str())),
+            );
+            {
+                let layer = self.profiles.get_mut(&rung).expect("rung exists");
+                for f in &moved {
+                    if let Some(v) = layer.views.shift_remove(f) {
+                        // The set's copies live under its own directory.
+                        let mut v = v;
+                        let own = format!("profiles/{set_name}/");
+                        v.source.path = v.source.path.replace(&format!("profiles/{rung}/"), &own);
+                        set_views.insert(f.clone(), v);
+                    }
+                }
+                for key in PREDICATE_FACET_TAGS {
+                    if let Some(v) = layer.attributes.shift_remove(*key) {
+                        set_attrs.insert((*key).to_string(), v);
+                    }
+                }
+            }
+            set_attrs
+                .entry("predicates".to_string())
+                .or_insert_with(|| serde_yaml::Value::from("mixed"));
+            let set = DSProfile {
+                maxk: layer_maxk,
+                base_count: layer_count,
+                partition: false,
+                views: set_views,
+                attributes: set_attrs,
+                inherits: Some(rung.clone()),
+            };
+            // The set follows its rung in the map and in every series.
+            let at = self.profiles.get_index_of(&rung).map(|i| i + 1).unwrap_or(self.profiles.len());
+            self.profiles.shift_insert(at, set_name.clone(), set);
+            for series in self.series_by_spec.values_mut() {
+                if let Some(i) = series.iter().position(|n| *n == rung)
+                    && !series.contains(&set_name)
+                {
+                    series.insert(i + 1, set_name.clone());
+                }
+            }
+            made += 1;
+        }
+        made
     }
 
     /// The families this dataset declares: generator spec → members,
@@ -677,6 +836,17 @@ impl DSProfileGroup {
             return;
         }
 
+        // In a layered dataset a template fills the group a profile
+        // already declares (PL-9): the predicate group goes only where
+        // some of it is declared, and the unfiltered group never onto a
+        // predicate set. Decided before the mutable pass.
+        let layered = self.layered;
+        let declares_predicates: std::collections::HashMap<String, bool> = self
+            .profiles
+            .keys()
+            .map(|n| (n.clone(), PREDICATE_GROUP.iter().any(|f| self.declares(n, f))))
+            .collect();
+
         for (name, profile) in self.profiles.iter_mut() {
             // Skip non-default profiles without a `base_count` — they
             // aren't sized or partition profiles, so per-profile
@@ -684,6 +854,9 @@ impl DSProfileGroup {
             if name != "default" && profile.base_count.is_none() {
                 continue;
             }
+            let is_set = layered && name != "default" && !profile.partition
+                && declares_predicates.get(name).copied().unwrap_or(false);
+            let is_layer = layered && name != "default" && !profile.partition && !is_set;
 
             let profile_dir = format!("profiles/{}/", name);
 
@@ -719,6 +892,11 @@ impl DSProfileGroup {
 
                     // Don't override explicitly declared views
                     if profile.views.contains_key(&stem) {
+                        continue;
+                    }
+
+                    let predicate_facet = PREDICATE_GROUP.contains(&stem.as_str());
+                    if (is_layer && predicate_facet) || (is_set && !predicate_facet) {
                         continue;
                     }
 
@@ -1101,9 +1279,21 @@ pub fn derive_sized_profile(default: &DSProfile, name: &str, count: u64) -> DSPr
         partition: false,
         views,
         attributes,
-        ..Default::default()
+        // Stated, as version 3 requires (PL-6); harmless below it.
+        inherits: Some("default".to_string()),
     }
 }
+
+/// The predicate group (PL-2): the facets a predicate set declares
+/// whole, and a layer declares none of (PL-1).
+pub const PREDICATE_GROUP: &[&str] = &[
+    "metadata_predicates",
+    "metadata_results",
+    "prefiltered_neighbor_indices",
+    "prefiltered_neighbor_distances",
+    "postfiltered_neighbor_indices",
+    "postfiltered_neighbor_distances",
+];
 
 /// The tags that describe a predicate facet rather than a profile
 /// (PS-11, PS-23): they travel with the facet when a derivation copies
@@ -2143,6 +2333,7 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
             deferred_facet_templates,
             raw_sized,
             series_by_spec,
+            layered: false,
         })
     }
 }
@@ -2190,6 +2381,76 @@ mod tests {
             "source: base__NNNN.fvec[0..120]\nshard_stride: 100\nshard_count: 3\nrecord_count: 250\nwindow: \"[0..50]\"\n",
         );
         assert!(twice.is_err());
+    }
+
+    /// **A profile declares a facet when its view is not its parent's**
+    /// (PL-3): a windowed cut is inheritance, another file is a
+    /// declaration, and a layer declares none of the predicate group.
+    #[test]
+    fn declared_views_and_layers() {
+        let g: DSProfileGroup = serde_yaml::from_str(
+            "default:\n  base_vectors: b.fvec\n  metadata_predicates: p.slab\n  metadata_results: profiles/default/r.slab\n\
+             10m:\n  inherits: default\n  base_count: 10\n  base_vectors: b.fvec[0..10)\n  neighbor_indices: profiles/10m/g.ivec\n\
+             10m-mixed:\n  inherits: 10m\n  base_count: 10\n  metadata_results: profiles/10m-mixed/r.slab\n\
+             part:\n  partition: true\n  base_vectors: profiles/part/b.fvec\n",
+        )
+        .unwrap();
+        assert!(!g.declares("10m", "base_vectors"), "a windowed cut of the parent's file is not a declaration");
+        assert!(g.declares("10m", "neighbor_indices"));
+        assert!(!g.declares("10m", "metadata_predicates"), "inherited, not declared");
+        assert!(g.declares("10m-mixed", "metadata_results"));
+        assert!(g.declares("part", "base_vectors"));
+        assert_eq!(g.effective_view("10m-mixed", "metadata_predicates").map(|v| v.source.path.as_str()), Some("p.slab"));
+        assert_eq!(g.effective_view("10m-mixed", "neighbor_indices").map(|v| v.source.path.as_str()), Some("profiles/10m/g.ivec"));
+        assert!(g.is_layer("10m"));
+        assert!(!g.is_layer("10m-mixed"));
+        assert!(!g.is_layer("default"));
+        assert_eq!(g.parent_name("10m-mixed").as_deref(), Some("10m"));
+        assert_eq!(g.parent_name("part"), None);
+    }
+
+    /// **A generated rung of a layered dataset splits into its layer
+    /// and the mixed set beside it** (PL-9, PL-13), idempotently: the
+    /// set names the rung, restates its count, takes the predicate
+    /// group under its own directory and the tags that describe the
+    /// slab; the layer keeps `size` alone.
+    #[test]
+    fn a_generated_rung_splits_into_layer_and_mixed_set() {
+        let mut views: IndexMap<String, DSView> = IndexMap::new();
+        views.insert("base_vectors".into(), uniform_view("profiles/base/base__NNNN.fvec"));
+        views.insert("metadata_predicates".into(), serde_yaml::from_str("profiles/base/p.slab").unwrap());
+        views.insert("neighbor_indices".into(), serde_yaml::from_str("profiles/default/g.ivec").unwrap());
+        views.insert("metadata_results".into(), serde_yaml::from_str("profiles/default/r.slab").unwrap());
+        views.insert("prefiltered_neighbor_indices".into(), serde_yaml::from_str("profiles/default/f.ivec").unwrap());
+        let mut default = DSProfile { maxk: Some(10), views, ..Default::default() };
+        default.attributes.insert("predicates".into(), serde_yaml::Value::from("mixed"));
+        default.attributes.insert("family".into(), serde_yaml::Value::from("stratified"));
+        let mut g = DSProfileGroup::from_profiles(IndexMap::new());
+        g.layered = true;
+        g.profiles.insert("default".into(), default.clone());
+        g.profiles.insert("10m".into(), derive_sized_profile(&default, "10m", 10_000_000));
+        g.series_by_spec.insert("10m".into(), vec!["10m".into()]);
+
+        assert_eq!(g.layer_generated_profiles(), 1);
+        assert_eq!(g.layer_generated_profiles(), 0, "a rung already split is left alone");
+        let layer = &g.profiles["10m"];
+        assert!(layer.views.contains_key("neighbor_indices"));
+        assert!(!layer.views.contains_key("metadata_results") && !layer.views.contains_key("prefiltered_neighbor_indices"));
+        assert!(layer.views.contains_key("metadata_predicates"), "the invariant slab reaches the layer");
+        assert_eq!(layer.attributes.keys().collect::<Vec<_>>(), vec!["size"], "a layer carries size alone");
+        assert_eq!(layer.inherits.as_deref(), Some("default"));
+        let set = &g.profiles["10m-mixed"];
+        assert_eq!(set.inherits.as_deref(), Some("10m"));
+        assert_eq!(set.base_count, Some(10_000_000));
+        assert_eq!(set.views["metadata_results"].source.path, "profiles/10m-mixed/r.slab");
+        assert_eq!(set.views["prefiltered_neighbor_indices"].source.path, "profiles/10m-mixed/f.ivec");
+        assert!(!set.views.contains_key("neighbor_indices"));
+        assert_eq!(set.attributes["size"], serde_yaml::Value::from("10m"));
+        assert_eq!(set.attributes["predicates"], serde_yaml::Value::from("mixed"));
+        assert_eq!(set.attributes["family"], serde_yaml::Value::from("stratified"));
+        assert_eq!(g.series_by_spec["10m"], vec!["10m".to_string(), "10m-mixed".to_string()]);
+        assert!(g.is_layer("10m") && !g.is_layer("10m-mixed"));
+        assert_eq!(g.profiles.get_index_of("10m-mixed"), Some(2), "the set follows its rung");
     }
 
     /// **A sized profile carries its rung as `size`** (PS-12, PS-20),
