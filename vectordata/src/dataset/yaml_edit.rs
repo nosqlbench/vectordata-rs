@@ -284,7 +284,8 @@ pub fn set_profile_inherits(yaml: &str, profile: &str, parent: &str) -> Result<S
     let present = (profile_line + 1..profile_end)
         .any(|i| indent_of(&lines[i]) == 4 && key_of(&lines[i]) == Some("inherits"));
     if !present {
-        lines.insert(profile_line + 1, format!("    inherits: {parent}"));
+        let rendered = render_scalar(&Yaml::from(parent))?;
+        lines.insert(profile_line + 1, format!("    inherits: {rendered}"));
     }
     Ok(finish(lines, yaml))
 }
@@ -419,6 +420,9 @@ mod tests {
         let v3 = set_format_version(&grown, 3);
         assert_eq!(v3.matches("format_version").count(), 1);
         assert!(v3.starts_with("# an author's header\nformat_version: 3\nname: t\n"), "{v3}");
+        // Version 3 states every parent (PL-6).
+        let v3 = set_profile_inherits(&v3, "10m", "default").unwrap();
+        let v3 = set_profile_inherits(&v3, "20m", "default").unwrap();
         let fresh = set_format_version("name: x\nprofiles:\n  default:\n    base_vectors: b\n", 1);
         assert!(fresh.starts_with("format_version: 1\nname: x\n"), "{fresh}");
         let cfg: crate::dataset::DatasetConfig = serde_yaml::from_str(&v3).unwrap();

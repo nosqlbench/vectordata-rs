@@ -31,6 +31,7 @@ fn selectivity_family() -> &'static str {
     \x20   query_vectors: query_vectors.fvec\n\
     \x20   metadata_content: metadata_content.ivecs\n\
     \x20 1m:\n\
+    \x20   inherits: default\n\
     \x20   base_count: 1000000\n\
     \x20   neighbor_indices: profiles/1m/neighbor_indices.ivecs\n\
     \x20   neighbor_distances: profiles/1m/neighbor_distances.fvecs\n\
@@ -291,13 +292,12 @@ fn a_family_member_reading_a_different_corpus_is_reported() {
     );
 }
 
-/// An `inherits:` naming a profile the dataset does not declare is
-/// reported rather than silently ignored. The load still succeeds —
-/// the facets the profile does declare are readable, and taking a whole
-/// dataset out of reach over one profile would be worse.
+/// **An unknown parent is a refusal at version 3** (PL-6): a stated 3
+/// is a claim that every parent is real, so the load names the profile
+/// and the parent rather than falling back to `default`.
 #[test]
-fn an_unresolvable_parent_loads_but_is_reported() {
-    let cfg = load(
+fn an_unresolvable_parent_is_refused_at_version_three() {
+    let err = serde_yaml::from_str::<DatasetConfig>(
         "format_version: 3\nname: orphan\n\
          profiles:\n\
         \x20 default:\n\
@@ -305,25 +305,17 @@ fn an_unresolvable_parent_loads_but_is_reported() {
         \x20 child:\n\
         \x20   inherits: nonexistent\n\
         \x20   query_vectors: q.fvec\n",
-    );
-    let child = cfg.profiles.profile("child").expect("still loads");
-    assert!(child.view("query_vectors").is_some(), "what it declared is readable");
-
-    let violations = vectordata::dataset::conformance::validate_conformance(&cfg)
-        .expect_err("an unresolvable parent is reported");
-    assert!(
-        violations
-            .iter()
-            .any(|v| v.profile == "child" && v.key == "inherits"),
-        "{violations:?}"
-    );
+    )
+    .expect_err("an unknown parent is refused");
+    let text = err.to_string();
+    assert!(text.contains("`child`") && text.contains("unknown parent `nonexistent`"), "{text}");
 }
 
-/// A cycle leaves both profiles with what they declared, and is
-/// reported. It must not hang the loader.
+/// **A cycle is refused at version 3** naming its members (PL-6); it
+/// must not hang the loader.
 #[test]
-fn an_inheritance_cycle_terminates_and_is_reported() {
-    let cfg = load(
+fn an_inheritance_cycle_is_refused_at_version_three() {
+    let err = serde_yaml::from_str::<DatasetConfig>(
         "format_version: 3\nname: loop\n\
          profiles:\n\
         \x20 default:\n\
@@ -334,16 +326,10 @@ fn an_inheritance_cycle_terminates_and_is_reported() {
         \x20 b:\n\
         \x20   inherits: a\n\
         \x20   query_terms: qb.fvec\n",
-    );
-    assert!(cfg.profiles.profile("a").is_some());
-    let violations = vectordata::dataset::conformance::validate_conformance(&cfg)
-        .expect_err("a cycle is reported");
-    assert!(
-        violations
-            .iter()
-            .any(|v| v.key == "inherits" && v.detail.contains("cycle")),
-        "{violations:?}"
-    );
+    )
+    .expect_err("a cycle is refused");
+    let text = err.to_string();
+    assert!(text.contains("`a`, `b` close an inheritance cycle"), "{text}");
 }
 
 // ── case 12: the gate ──────────────────────────────────────────────

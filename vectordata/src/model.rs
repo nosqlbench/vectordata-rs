@@ -268,6 +268,20 @@ impl<'de> Deserialize<'de> for DatasetConfig {
             }
         }
 
+        // Stated parents (PL-6): at version 3 every parent is real and
+        // stated, or the load is refused naming the profiles; below 3
+        // the fallbacks below stand.
+        let facts: Vec<crate::dataset::parents::ParentFacts<'_>> = profiles
+            .iter()
+            .map(|(name, p)| crate::dataset::parents::ParentFacts {
+                name,
+                partition: p.partition,
+                inherits: p.inherits.as_deref(),
+            })
+            .collect();
+        crate::dataset::parents::check_parents(format_version, &facts)
+            .map_err(serde::de::Error::custom)?;
+
         apply_default_inheritance(&mut profiles);
 
         // A *stated* version lower than the content requires is a
@@ -317,6 +331,24 @@ fn apply_default_inheritance(profiles: &mut HashMap<String, ProfileConfig>) {
             continue;
         };
         inherit_from(profile, &parent, parent_name == "default");
+    }
+}
+
+/// A profile name that YAML may have read as a number — a rung such as
+/// `100` — comes back as the name it spells.
+fn name_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<serde_yaml::Value> = Option::deserialize(deserializer)?;
+    match v {
+        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(serde_yaml::Value::String(s)) => Ok(Some(s)),
+        Some(serde_yaml::Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "inherits: expected a profile name, found {}",
+            serde_yaml::to_string(&other).unwrap_or_default().trim()
+        ))),
     }
 }
 
@@ -570,7 +602,7 @@ pub struct ProfileConfig {
     /// `base_count` and the ground truth is invariant, so a member
     /// naming its sized parent inherits it instead of restating a path
     /// per member and drifting the moment one is edited.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "name_or_number")]
     pub inherits: Option<String>,
 
     // -- Vector facets --
@@ -1187,6 +1219,7 @@ profiles:
     metadata_predicates: profiles/base/predicates.slab
     metadata_results: profiles/default/metadata_results.slab
   10m:
+    inherits: default
     base_count: 10000000
     neighbor_indices: profiles/10m/neighbor_indices.ivecs
   10m-sel:

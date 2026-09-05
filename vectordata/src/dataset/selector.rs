@@ -1162,6 +1162,7 @@ profiles:
     base_vectors: base.fvec
     maxk: 100
   1m:
+    inherits: default
     base_count: 1000000
     attributes:
       family: sized

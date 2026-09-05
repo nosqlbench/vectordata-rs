@@ -231,6 +231,21 @@ impl<'de> Deserialize<'de> for DatasetConfig {
         )
         .map_err(serde::de::Error::custom)?;
 
+        // Stated parents (PL-6), by the one rule both loaders share.
+        let facts: Vec<crate::dataset::parents::ParentFacts<'_>> = raw
+            .profiles
+            .profiles
+            .iter()
+            .map(|(name, p)| crate::dataset::parents::ParentFacts {
+                name,
+                partition: p.partition,
+                inherits: p.inherits.as_deref(),
+            })
+            .collect();
+        crate::dataset::parents::check_parents(format_version, &facts)
+            .map_err(serde::de::Error::custom)?;
+        let profiles = raw.profiles;
+
         Ok(DatasetConfig {
             format_version,
             profile_tags: raw.profile_tags,
@@ -239,7 +254,7 @@ impl<'de> Deserialize<'de> for DatasetConfig {
             attributes: raw.attributes,
             upstream: raw.upstream,
             strata: raw.strata,
-            profiles: raw.profiles,
+            profiles,
             variables: raw.variables,
         })
     }
@@ -810,7 +825,11 @@ impl DatasetConfig {
                     out.push_str(&format!("    base_count: {}\n", base_count));
                 }
                 if let Some(parent) = profile.inherits.as_deref() {
-                    out.push_str(&format!("    inherits: {}\n", parent));
+                    // A name YAML would read as a number — a rung such
+                    // as `100` — is quoted, so it comes back as a name.
+                    let rendered = crate::dataset::yaml_edit::render_scalar(&serde_yaml::Value::from(parent))
+                        .map_err(|e| format!("profile '{name}' inherits: {e}"))?;
+                    out.push_str(&format!("    inherits: {rendered}\n"));
                 }
                 // What the profile *is*. Written only when non-empty:
                 // an emitted empty map would make "undescribed" and

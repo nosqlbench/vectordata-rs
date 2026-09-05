@@ -930,8 +930,10 @@ impl<'de> Deserialize<'de> for DSProfile {
                 continue;
             }
             if key == "inherits" {
+                // A rung such as `100` is a name YAML reads as a number.
                 inherits = match &value {
                     serde_yaml::Value::String(s) => Some(s.clone()),
+                    serde_yaml::Value::Number(n) => Some(n.to_string()),
                     _ => None,
                 };
                 continue;

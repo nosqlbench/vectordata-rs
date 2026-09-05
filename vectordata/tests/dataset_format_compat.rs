@@ -351,7 +351,25 @@ fn both_loaders_agree_about_every_version_case() {
         (
             "a named parent stating 3",
             "format_version: 3\nname: n\nprofiles:\n  default:\n    base_vectors: base.fvec\n  \
-             1m:\n    base_count: 100\n  1m-sel:\n    inherits: 1m\n    query_vectors: q.fvec\n",
+             1m:\n    inherits: default\n    base_count: 100\n  1m-sel:\n    inherits: 1m\n    query_vectors: q.fvec\n",
+            true,
+        ),
+        (
+            "stating 3 with an unstated parent: refused (PL-6)",
+            "format_version: 3\nname: n\nprofiles:\n  default:\n    base_vectors: base.fvec\n  \
+             1m:\n    base_count: 100\n",
+            false,
+        ),
+        (
+            "stating 3 with a partition that names a parent: refused (PL-6)",
+            "format_version: 3\nname: n\nprofiles:\n  default:\n    base_vectors: base.fvec\n  \
+             p:\n    partition: true\n    inherits: default\n    base_vectors: p.fvec\n",
+            false,
+        ),
+        (
+            "stating 3 with a partition alone: accepted (PL-6)",
+            "format_version: 3\nname: n\nprofiles:\n  default:\n    base_vectors: base.fvec\n  \
+             p:\n    partition: true\n    base_vectors: p.fvec\n",
             true,
         ),
         (
