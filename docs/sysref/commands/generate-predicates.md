@@ -96,3 +96,37 @@ re-derives it.
 | `--model` | input | no | — | Topic model report, required with `queries` |
 | `--labels` | input | no | — | Topic label slab, required with `queries` |
 | `--report` | output | no | beside `output`, `.json` | Generation report JSON: per-cell counts, floors, placement |
+
+## Uniform strategy
+
+`--strategy uniform` writes a set in which every predicate takes **one
+form at one level** (PS-23, PL-2): the form is `field.access` parts
+joined by `+` (a conjunction) or `|` (a disjunction), the level is the
+selectivity the set is planned for, and every predicate lands in the
+half-decade band around it. Literals come from the survey's census; a
+two-part conjunction the census tabulated as a pair takes its exact
+count, anything else is estimated from the parts' marginals under
+independence and the record says so. A part may be a no-op that holds
+the form constant. The set's profile is tagged `family: uniform`,
+`predicates: uniform-<n>`, `form`, `form_shape` and `selectivity`, and
+`veks check` holds the facet to a form census.
+
+```bash
+veks generate predicates --strategy uniform \
+  --form topic_l3.eq+citation_percentile.range --selectivity 1e-2 \
+  --count 10000 --survey .cache/metadata_survey.json \
+  --output profiles/10m-uniform-2-1e-2/predicates.slab
+```
+
+| Option | Required | Description |
+|---|---|---|
+| `--form` | yes | The one form: `field.eq`, `field.range` (a lower bound) and `field.le` parts under `+` or `\|` |
+| `--selectivity` | yes | The level, e.g. `1e-2`; kept as spelled in the `selectivity` tag and the set's name |
+| `--count` | yes | Records to write, one per query ordinal |
+| `--survey` | yes | The censused survey the literals come from |
+| `--band` | no | Band factor around the level (default √10) |
+| `--report` | no | Generation report (default: beside the output as `.json`) |
+
+Sets are declared with `veks prepare predicate-sets`, which writes one
+profile per size and level under its size layer and one generator step
+per set.

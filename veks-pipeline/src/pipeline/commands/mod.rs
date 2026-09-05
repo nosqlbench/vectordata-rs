@@ -89,6 +89,7 @@ pub mod gen_predicates;
 pub mod gen_predicates_common;
 pub mod gen_predicates_proto;
 pub mod gen_predicates_stratified;
+pub mod gen_predicates_uniform;
 pub mod gen_predicates_wizard;
 pub mod gen_simple_predicates;
 pub mod gen_shuffle;

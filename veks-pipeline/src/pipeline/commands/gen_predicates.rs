@@ -266,6 +266,16 @@ impl GenPredicatesOp {
                 seed,
             );
         }
+        if strategy == "uniform" {
+            return super::gen_predicates_uniform::run(
+                options,
+                ctx,
+                start,
+                &output_path,
+                survey_resolved.as_deref(),
+                seed,
+            );
+        }
 
         // Field-selection filters (CLI surface):
         //  --fields a,b,c       → whitelist (only these names are eligible)
@@ -675,7 +685,7 @@ impl CommandOp for GenPredicatesOp {
                 "string",
                 false,
                 Some("eq"),
-                "Predicate strategy: 'eq' (alias 'single'), 'compound', or 'stratified' (drawn per family and selectivity decade from the survey's census; see the stratified options)",
+                "Predicate strategy: 'eq' (alias 'single'), 'compound', 'stratified' (drawn per family and selectivity decade from the survey's census; see the stratified options), or 'uniform' (one form at one level; see the uniform options)",
                 OptionRole::Config,
             ),
             opt(
@@ -752,6 +762,7 @@ impl CommandOp for GenPredicatesOp {
             ),
         ];
         options.extend(super::gen_predicates_stratified::describe_options());
+        options.extend(super::gen_predicates_uniform::describe_options());
         options
     }
 
@@ -770,11 +781,20 @@ impl CommandOp for GenPredicatesOp {
                 _ => ArtifactState::Partial,
             };
         }
+        if options.get("strategy") == Some("uniform") {
+            if !output.exists() {
+                return ArtifactState::Absent;
+            }
+            return match super::gen_predicates_uniform::check_artifact(output, options) {
+                Some(true) => ArtifactState::Complete,
+                _ => ArtifactState::Partial,
+            };
+        }
         crate::pipeline::bound::check_artifact_default(output, options)
     }
 
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
-        if options.get("strategy") == Some("stratified") {
+        if matches!(options.get("strategy"), Some("stratified") | Some("uniform")) {
             // The stratified strategy reads the placement inputs and
             // writes its generation report beside the facet (TS-34).
             let mut manifest = crate::pipeline::command::manifest_from_keys(

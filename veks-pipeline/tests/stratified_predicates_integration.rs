@@ -687,3 +687,76 @@ fn stratified_needs_queries_or_a_count() {
     assert_eq!(r.status, Status::Error);
     assert!(r.message.contains("count"), "{}", r.message);
 }
+
+/// **A uniform set holds one form at one level** (PS-23, PL-2): every
+/// predicate takes `topic_l2 = ? AND citation_percentile >= ?`, drawn
+/// with exact pair counts from the census, in the band around the
+/// level; a form the census tabulates no pair for is estimated under
+/// independence, and the record says so.
+#[test]
+fn a_uniform_set_holds_one_form_at_one_level() {
+    use vectordata::metadata_schema::FAMILIES_NAMESPACE;
+    use veks_pipeline::pipeline::commands::analyze_predicate_forms::facet_form_classes;
+    let dir = tmp_dir();
+    let slab = dir.path().join("metadata_content.slab");
+    let rows = write_enriched_slab(&slab);
+    write_survey(dir.path(), &slab);
+    std::fs::create_dir_all(dir.path().join("profiles/base")).unwrap();
+    let mut o = Options::new();
+    o.set("strategy", "uniform");
+    o.set("survey", "survey.json");
+    o.set("output", "profiles/base/uniform.slab");
+    o.set("form", "topic_l2.eq+citation_percentile.range");
+    o.set("selectivity", "1e-1");
+    o.set("count", "40");
+    o.set("seed", "42");
+    let mut op = GenPredicatesOp;
+    let mut ctx = test_ctx(dir.path());
+    let r = op.execute(&o, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "{}", r.message);
+
+    let out = dir.path().join("profiles/base/uniform.slab");
+    let preds = predicates(&out);
+    assert_eq!(preds.len(), 40, "one record per slot");
+    let classes = facet_form_classes(&out).unwrap();
+    assert_eq!((classes.forms, classes.parts), (1, Some(2)), "one form of two parts");
+    let (lo, hi) = (0.1 / 10f64.sqrt(), 0.1 * 10f64.sqrt());
+    for p in &preds {
+        let hits = rows.iter().filter(|r| veks_core::formats::pnode::eval::evaluate(p, r)).count();
+        let s = hits as f64 / rows.len() as f64;
+        assert!(s >= lo && s < hi, "{p} realises {s}, outside [{lo}, {hi})");
+    }
+    let fam = namespace_records(&out, Some(FAMILIES_NAMESPACE));
+    assert_eq!(fam.len(), 40);
+    assert_eq!(text(&fam[0], "family"), "uniform");
+    assert_eq!(text(&fam[0], "form"), "citation_percentile.range_topic_l2.eq");
+    assert!(matches!(fam[0].fields.get("estimated"), Some(MValue::Bool(false))), "a pair the census tabulated is exact");
+    assert!(dir.path().join("profiles/base/uniform.json").exists(), "the report sits beside the facet");
+
+    // No pair for this form: estimated under independence, still one form.
+    o.set("form", "year.range+isopenaccess.eq");
+    o.set("output", "profiles/base/uniform2.slab");
+    let r = op.execute(&o, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "{}", r.message);
+    let out2 = dir.path().join("profiles/base/uniform2.slab");
+    let classes = facet_form_classes(&out2).unwrap();
+    assert_eq!((classes.forms, classes.parts), (1, Some(2)));
+    let fam = namespace_records(&out2, Some(FAMILIES_NAMESPACE));
+    assert!(matches!(fam[0].fields.get("estimated"), Some(MValue::Bool(true))));
+    assert_eq!(text(&fam[0], "form"), "isopenaccess.eq_year.range");
+
+    // A single-part disjunction-free form and a disjunction both hold.
+    o.set("form", "year.range");
+    o.set("output", "profiles/base/uniform3.slab");
+    let r = op.execute(&o, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "{}", r.message);
+    let classes = facet_form_classes(&dir.path().join("profiles/base/uniform3.slab")).unwrap();
+    assert_eq!((classes.forms, classes.parts), (1, Some(1)));
+    o.set("form", "section_class.eq|isopenaccess.eq");
+    o.set("selectivity", "5e-1");
+    o.set("output", "profiles/base/uniform4.slab");
+    let r = op.execute(&o, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "{}", r.message);
+    let classes = facet_form_classes(&dir.path().join("profiles/base/uniform4.slab")).unwrap();
+    assert_eq!((classes.forms, classes.parts), (1, Some(2)));
+}
