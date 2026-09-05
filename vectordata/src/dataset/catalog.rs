@@ -169,13 +169,32 @@ impl CatalogEntry {
     pub fn profile_names(&self) -> Vec<&str> {
         self.layout.profiles.profile_names()
     }
+
+    /// The profiles a selector names in this entry, size-ordered;
+    /// `None` is `default` (PS-10). A catalog entry is what a consumer
+    /// reads before fetching, so a selector resolves here the same way
+    /// it does against the loaded dataset.
+    pub fn select(
+        &self,
+        selector: Option<&str>,
+    ) -> Result<Vec<String>, crate::dataset::selector::SelectionError> {
+        self.layout.profiles.select(selector)
+    }
+
+    /// The one profile a selector names in this entry (PS-10).
+    pub fn select_one(
+        &self,
+        selector: Option<&str>,
+    ) -> Result<String, crate::dataset::selector::SelectionError> {
+        self.layout.profiles.select_one(selector)
+    }
 }
 
 /// Strip a window notation (`[lo..hi)` or `(lo..hi]`) from a source
 /// path, returning just the underlying file path. Source strings in
 /// `dataset.yaml` use these brackets to denote subranges of a shared
 /// base file (e.g. `base.fvec[0..1000000)`).
-pub(crate) fn strip_window_suffix(source_path: &str) -> &str {
+pub fn strip_window_suffix(source_path: &str) -> &str {
     match source_path.find(['[', '(']) {
         Some(bracket) => &source_path[..bracket],
         None => source_path,

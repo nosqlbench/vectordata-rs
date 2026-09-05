@@ -484,6 +484,34 @@ impl DSProfileGroup {
         names
     }
 
+    /// Everything a selector can read of every profile, in
+    /// `profile_names` order, with structure read through the
+    /// `inherits` chain the way the reader resolves it (PS-7).
+    pub fn profile_facts(&self) -> Vec<crate::dataset::selector::ProfileFacts> {
+        self.profile_names()
+            .into_iter()
+            .filter_map(|n| crate::dataset::selector::ProfileFacts::of_declared(n, self))
+            .collect()
+    }
+
+    /// The profiles a selector names, size-ordered; `None` is `default`
+    /// and `profile=*` is every profile (PS-10).
+    pub fn select(
+        &self,
+        selector: Option<&str>,
+    ) -> Result<Vec<String>, crate::dataset::selector::SelectionError> {
+        crate::dataset::selector::resolve(selector, &self.profile_facts())
+    }
+
+    /// The one profile a selector names; more than one match is an
+    /// error (PS-10).
+    pub fn select_one(
+        &self,
+        selector: Option<&str>,
+    ) -> Result<String, crate::dataset::selector::SelectionError> {
+        crate::dataset::selector::resolve_one(selector, &self.profile_facts())
+    }
+
     /// Returns view names from the default profile (for display).
     pub fn view_names(&self) -> Vec<&str> {
         self.default_profile()

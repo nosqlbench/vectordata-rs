@@ -26,6 +26,7 @@ pub mod facet;
 pub mod layout;
 pub mod pipeline;
 pub mod profile;
+pub mod selector;
 pub mod shard_sizing;
 pub mod shards;
 pub mod source;

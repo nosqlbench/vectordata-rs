@@ -141,8 +141,14 @@ impl Catalog {
         crate::TestDataGroup::load(&entry.path)
     }
 
-    /// Open a specific profile of a dataset by name, returning the view
-    /// directly.
+    /// Open the one profile of a dataset a selector names, returning
+    /// the view directly.
+    ///
+    /// `profile` is a selector (PS-3): a bare name as it always was, or
+    /// an expression such as `size=10m,predicates=uniform-2`. It must
+    /// name exactly one profile; a set is an error here, and
+    /// [`open_profiles`](Self::open_profiles) is the surface that takes
+    /// one (PS-10).
     ///
     /// ```rust,ignore
     /// let catalog = Catalog::of(&CatalogSources::new().configure_default());
@@ -151,8 +157,34 @@ impl Catalog {
     /// ```
     pub fn open_profile(&self, name: &str, profile: &str) -> crate::Result<std::sync::Arc<dyn crate::view::TestDataView>> {
         let group = self.open(name)?;
-        group.profile(profile)
-            .ok_or_else(|| crate::Error::Other(format!("profile '{}' not found in dataset '{}'", profile, name)))
+        let selected = group.select_one(Some(profile)).map_err(|e| {
+            crate::Error::Other(format!("dataset '{name}': {e}"))
+        })?;
+        group.profile(&selected)
+            .ok_or_else(|| crate::Error::Other(format!("profile '{}' not found in dataset '{}'", selected, name)))
+    }
+
+    /// Open every profile of a dataset a selector names, size-ordered,
+    /// each with its name (PS-9). `None` opens `default`; `profile=*`
+    /// opens them all (PS-10).
+    pub fn open_profiles(
+        &self,
+        name: &str,
+        selector: Option<&str>,
+    ) -> crate::Result<Vec<(String, std::sync::Arc<dyn crate::view::TestDataView>)>> {
+        let group = self.open(name)?;
+        let selected = group.select(selector).map_err(|e| {
+            crate::Error::Other(format!("dataset '{name}': {e}"))
+        })?;
+        selected
+            .into_iter()
+            .map(|p| {
+                group
+                    .profile(&p)
+                    .map(|v| (p.clone(), v))
+                    .ok_or_else(|| crate::Error::Other(format!("profile '{p}' not found in dataset '{name}'")))
+            })
+            .collect()
     }
 
     /// Print all datasets to stderr, highlighting any that contain the

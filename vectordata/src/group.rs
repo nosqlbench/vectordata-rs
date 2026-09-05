@@ -4,6 +4,7 @@
 //! and exposes named profiles as [`TestDataView`](crate::view::TestDataView)
 //! instances for reading vectors and metadata.
 
+use crate::dataset::selector::{self, ProfileFacts, SelectionError};
 use crate::model::DatasetConfig;
 use crate::view::{GenericTestDataView, TestDataView};
 use crate::{Error, Result};
@@ -290,6 +291,28 @@ impl TestDataGroup {
             crate::dataset::profile::profile_sort_by_size(a, a_bc, b, b_bc)
         });
         names
+    }
+
+    /// Everything a selector can read of every profile, in the order
+    /// `profile_names` lists them (PS-7, PS-9).
+    pub fn profile_facts(&self) -> Vec<ProfileFacts> {
+        self.profile_names()
+            .iter()
+            .filter_map(|n| self.config.profiles.get(n).map(|p| ProfileFacts::of_profile(n, p)))
+            .collect()
+    }
+
+    /// The profiles a selector names, size-ordered (PS-9). `None` is
+    /// `default`, `profile=*` is every profile, and a selector that
+    /// matches nothing is an error listing what was on offer (PS-10).
+    pub fn select(&self, selector: Option<&str>) -> std::result::Result<Vec<String>, SelectionError> {
+        selector::resolve(selector, &self.profile_facts())
+    }
+
+    /// The one profile a selector names, for a surface that takes a
+    /// single profile; more than one match is an error (PS-10).
+    pub fn select_one(&self, selector: Option<&str>) -> std::result::Result<String, SelectionError> {
+        selector::resolve_one(selector, &self.profile_facts())
     }
 
     /// Retrieves a top-level attribute from the dataset configuration.
