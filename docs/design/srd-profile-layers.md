@@ -1,6 +1,8 @@
 # SRD — Profile layers and explicit inheritance
 
-**Status:** draft
+**Status:** implemented in the Rust reference implementation
+(2026-09-05); the Java client (PL-8) is trued up separately. Decisions
+taken during implementation are in §10.
 **Scope:** `dataset.yaml` profile inheritance (`inherits:`), a new
 format version that makes every parent explicit, the intermediate
 *layer* profile, the content checks that hold a predicate set's members
@@ -299,3 +301,54 @@ the field declares its results per size, so nothing changes for them.
 - Whether `tessera:10m` should one day be re-pointed at the layer, with
   the mixed set as `10m-mixed`, in a fresh dataset version rather than
   in place. PS-22 keeps the name where it is for this dataset.
+
+## 10. Settled in implementation
+
+**Declared means "not the parent's".** A profile declares a facet when
+it carries a view whose file is not its parent's effective one; a
+windowed cut of the parent's file is inheritance under the child's
+count, not a declaration. This one predicate is what the template
+gating (PL-9), the plan-time refusal (PL-10), the decoy report (PL-4)
+and the `predicates` requirement (PS-23) read, so they cannot drift.
+
+**Layered is version 3.** A dataset at `format_version` 3 is layered:
+its generated rungs split into a size layer and a mixed set beside it
+(`10m`, `10m-mixed`, PL-13), and a per-profile template runs only where
+the profile declares the facet its command produces. Below 3 every
+sized profile takes every template and holds every per-profile facet,
+exactly as before, which is what keeps tessera and every dataset in
+the field unchanged. The split is one idempotent pass over generated
+rungs, run at load after expansion and by `stratify` before it saves,
+so a compact file and an expanded file yield the same profiles.
+
+**A set restates its count and takes the slab's tags.** The set
+carries `base_count` equal to its layer's — the writer-side group
+resolves no inheritance, and every consumer of a count reads the
+profile — so the step from layer to set is at one size (PL-5). The
+tags that describe the slab (`predicates`, `family`, `forms`,
+`selectivity_ladder`, `form`, `form_shape`) move from the rung to the
+set; the layer keeps `size` alone, as PL-11 draws it, and the migration
+and generator tagging skip layers.
+
+**Dependencies follow the parent chain.** A template dependency whose
+instance was not emitted for a profile resolves to the nearest
+ancestor's instance, so a set's evaluation waits on its layer's
+unfiltered ground truth; a shared step fans in only to instances that
+exist.
+
+**Names that YAML reads as numbers.** A rung such as `100` is written
+quoted where it names a parent and read back as a name by both
+loaders, so a layered dataset with all-digit rungs states its parents.
+
+**Schema tags at version 3.** `veks check` refuses a profile lacking a
+schema tag that has a default; a naming tag declared `~` may be absent,
+as the selectors SRD settled. The loader accepts either.
+
+**Downgrade** is `veks prepare downgrade --to N`, a textual edit with
+a backup: to 2 it drops `inherits: default` lines and the schema and
+refuses a named parent; to 1 it also refuses a multi-file facet.
+
+**Not implemented here.** The uniform-form predicate generator and a
+bootstrap spec for `(size, predicates, level)` sets beyond the mixed
+one; a set with its own slab is declared by hand or by a generator to
+come, and everything above holds for it.

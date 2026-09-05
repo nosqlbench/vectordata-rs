@@ -509,10 +509,21 @@ internally (serde alias).
 ### Inheritance
 
 A non-default profile inherits every facet it does not declare from
-its parent (`inherits:`, else `default`). What crosses depends on
-whether the step changes size:
+its parent. Below `format_version` 3 an absent `inherits:` means
+`default`; from 3 every profile other than `default` states its parent,
+and an absent, unknown, self or cyclic parent, or a `partition: true`
+profile that names one, is a load refusal naming the profiles
+(`docs/design/srd-profile-layers.md`). A profile naming any parent
+other than `default` is what requires version 3.
 
-- **Across a size step** (the child declares its own `base_count`):
+What crosses depends on whether the step changes size, and the axis of
+a step is **derived from `base_count`**: a size step is one where the
+child's count differs from the parent's effective one, whatever the
+parent is called, so a `20m` that builds on `10m` re-cuts the windows
+and takes no ground truth.
+
+- **Across a size step** (the child's `base_count` differs from its
+  parent's):
   `base_vectors` and `metadata_content` inherit cut to
   `[0..base_count)`; `query_vectors`, `metadata_predicates`, and
   `metadata_layout` inherit as they are. The neighbor facets, the
@@ -520,8 +531,40 @@ whether the step changes size:
   **not** cross: each is derived from `base_count`, so a parent's copy
   at another size is wrong for the child in the same way. A sized
   profile declares its own or has none.
-- **Across a step at the same size** (no `base_count` of its own):
-  every facet inherits as it is, `metadata_results` included.
+- **Across a step at the same size** (no `base_count` of its own, or
+  its parent's restated): every facet inherits as it is,
+  `metadata_results` included.
+
+### Layers
+
+A **layer** is a profile that exists to be inherited from: it declares
+the facets its children share and none they differ on. A **size layer**
+such as `10m` holds the base window, the metadata window and the
+unfiltered ground truth, and no predicate group; opening it is the
+unfiltered benchmark. A **predicate set** names a size layer as its
+parent and declares the predicate group — `metadata_predicates` when it
+has its own slab, `metadata_results`, and the filtered ground truth —
+with the tags PS-23 requires. `default` may hold a slab that is
+invariant across sizes, and every layer under it inherits that slab
+unchanged.
+
+From version 3 a dataset is **layered**: a generated rung is written as
+its size layer and the mixed set beside it, `10m` and `10m-mixed`, and a
+per-profile pipeline template runs where the profile declares the facet
+its command produces, so the unfiltered KNN runs on the layer and the
+evaluation on the set, whose steps wait on the layer's ground truth. A
+step that would write a predicate-group facet into a layer is refused at
+plan time naming the facet and the profile. `veks check` holds the group
+together by content: the results index has one row per predicate of the
+slab it resolves to, each filtered ground truth was computed from the
+profile's own results, and their rows agree with the query set; and it
+reports a parent whose declared facet a direct child overrides, since
+that declaration is a decoy.
+
+A version-3 dataset whose only parents are `default` downgrades with
+`veks prepare downgrade --to 2`, which drops those lines and the tag
+schema; one with a named parent does not, since no lower version can
+say what it says.
 
 The rule for `metadata_results` was settled on 2026-09-05; before that
 it crossed a size step, and a sized profile that omitted it would have
