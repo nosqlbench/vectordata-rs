@@ -506,6 +506,27 @@ before the F/E split.
 The `metadata_indices` key maps to the `predicate_results` field
 internally (serde alias).
 
+### Inheritance
+
+A non-default profile inherits every facet it does not declare from
+its parent (`inherits:`, else `default`). What crosses depends on
+whether the step changes size:
+
+- **Across a size step** (the child declares its own `base_count`):
+  `base_vectors` and `metadata_content` inherit cut to
+  `[0..base_count)`; `query_vectors`, `metadata_predicates`, and
+  `metadata_layout` inherit as they are. The neighbor facets, the
+  pre- and post-filtered ground truth, and `metadata_results` do
+  **not** cross: each is derived from `base_count`, so a parent's copy
+  at another size is wrong for the child in the same way. A sized
+  profile declares its own or has none.
+- **Across a step at the same size** (no `base_count` of its own):
+  every facet inherits as it is, `metadata_results` included.
+
+The rule for `metadata_results` was settled on 2026-09-05; before that
+it crossed a size step, and a sized profile that omitted it would have
+read its parent's index at the wrong size.
+
 ### Partition profiles
 
 Partition profiles are marked with `partition: true`. They have

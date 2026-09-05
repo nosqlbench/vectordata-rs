@@ -386,9 +386,15 @@ fn inherit_from(profile: &mut ProfileConfig, parent: &ProfileConfig, size_axis: 
     inherit(&mut profile.query_terms, &parent.query_terms);
     inherit(&mut profile.query_filters, &parent.query_filters);
     inherit(&mut profile.metadata_predicates, &parent.metadata_predicates);
-    inherit(&mut profile.predicate_results, &parent.predicate_results);
     inherit(&mut profile.metadata_layout, &parent.metadata_layout);
     if !size_axis {
+        // Everything derived from `base_count` stays on its own rung: a
+        // results index maps each predicate to base ordinals, so a
+        // parent's index at another size is wrong for this profile in
+        // the same way its ground truth is. The predicate slab itself
+        // crosses, because the predicates are the same at every size;
+        // what they match is not.
+        inherit(&mut profile.predicate_results, &parent.predicate_results);
         inherit(&mut profile.neighbor_indices, &parent.neighbor_indices);
         inherit(&mut profile.neighbor_distances, &parent.neighbor_distances);
         inherit(
@@ -1141,6 +1147,48 @@ profiles:
     /// they don't declare their own. Defended explicitly because
     /// silent inheritance would mis-route partition reads to the
     /// default's full-base file.
+    /// A results index is derived from `base_count` like the ground
+    /// truth: across a size step it is declared or absent, never the
+    /// parent's; across a selectivity step it inherits like any
+    /// invariant facet. The predicate slab crosses the size step, since
+    /// the predicates are the same at every size.
+    #[test]
+    fn metadata_results_does_not_cross_the_size_axis() {
+        let yaml = r#"
+attributes: {}
+profiles:
+  default:
+    base_vectors: profiles/base/base_vectors.fvecs
+    metadata_predicates: profiles/base/predicates.slab
+    metadata_results: profiles/default/metadata_results.slab
+  10m:
+    base_count: 10000000
+    neighbor_indices: profiles/10m/neighbor_indices.ivecs
+  10m-sel:
+    inherits: 10m
+    metadata_results: profiles/10m-sel/metadata_results.slab
+  10m-again:
+    inherits: 10m-sel
+"#;
+        let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        let sized = config.profiles.get("10m").unwrap();
+        assert!(
+            sized.predicate_results.is_none(),
+            "a sized child must not take default's results index at another size"
+        );
+        assert_eq!(
+            sized.metadata_predicates.as_ref().and_then(|f| f.source()),
+            Some("profiles/base/predicates.slab"),
+            "the predicate slab is the same at every size and crosses"
+        );
+        let same_size = config.profiles.get("10m-again").unwrap();
+        assert_eq!(
+            same_size.predicate_results.as_ref().and_then(|f| f.source()),
+            Some("profiles/10m-sel/metadata_results.slab"),
+            "across a step at one size the results index inherits like any invariant facet"
+        );
+    }
+
     #[test]
     fn partition_profile_does_not_inherit_from_default() {
         let yaml = r#"
