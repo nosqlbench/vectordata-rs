@@ -290,6 +290,76 @@ pub fn set_profile_inherits(yaml: &str, profile: &str, parent: &str) -> Result<S
     Ok(finish(lines, yaml))
 }
 
+/// Declare a new profile at the end of `profiles:` (PL-9): `  <name>:`
+/// followed by `body` lines, each written at the profile's own indent.
+/// A profile already declared is refused.
+pub fn append_profile(yaml: &str, name: &str, body: &[String]) -> Result<String, String> {
+    let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+    let profiles = lines
+        .iter()
+        .position(|l| indent_of(l) == 0 && key_of(l) == Some("profiles"))
+        .ok_or_else(|| "dataset.yaml declares no `profiles:`".to_string())?;
+    let end = block_end(&lines, profiles, 0);
+    if (profiles + 1..end).any(|i| indent_of(&lines[i]) == 2 && key_of(&lines[i]) == Some(name)) {
+        return Err(format!("profile '{name}' is already declared"));
+    }
+    let mut block = vec![format!("  {}:", render_scalar(&Yaml::from(name))?.trim_matches('\'').to_string())];
+    if name.chars().all(|c| c.is_ascii_digit()) {
+        block[0] = format!("  '{name}':");
+    }
+    block.extend(body.iter().map(|l| format!("    {l}")));
+    lines.splice(end..end, block);
+    Ok(finish(lines, yaml))
+}
+
+/// Append a step to `upstream.steps` (PL-12's rule for a definition
+/// edit): the item takes the indent the existing items use, and its
+/// `body` lines follow at the item's own indent.
+pub fn append_step(yaml: &str, body: &[String]) -> Result<String, String> {
+    let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+    let upstream = lines
+        .iter()
+        .position(|l| indent_of(l) == 0 && key_of(l) == Some("upstream"))
+        .ok_or_else(|| "dataset.yaml declares no `upstream:`".to_string())?;
+    let upstream_end = block_end(&lines, upstream, 0);
+    let steps = (upstream + 1..upstream_end)
+        .find(|&i| indent_of(&lines[i]) == 2 && key_of(&lines[i]) == Some("steps"))
+        .ok_or_else(|| "dataset.yaml declares no `upstream.steps:`".to_string())?;
+    // A sequence may sit at its key's own indent, so the block is
+    // followed item by item: an item at the items' indent, or a line
+    // deeper than it, belongs to the sequence.
+    let key_indent = indent_of(&lines[steps]);
+    let mut items_indent: Option<usize> = None;
+    let mut last_content = steps;
+    let mut i = steps + 1;
+    while i < lines.len() {
+        let l = &lines[i];
+        if is_blank_or_comment(l) {
+            i += 1;
+            continue;
+        }
+        let ind = indent_of(l);
+        let is_item = l.trim_start().starts_with("- ");
+        match items_indent {
+            None if is_item && ind >= key_indent => items_indent = Some(ind),
+            None => break,
+            Some(ii) if (is_item && ind == ii) || ind > ii => {}
+            Some(_) => break,
+        }
+        last_content = i;
+        i += 1;
+    }
+    let steps_end = last_content + 1;
+    let item_indent = " ".repeat(items_indent.unwrap_or(key_indent));
+    let Some((first, rest)) = body.split_first() else {
+        return Err("an empty step".to_string());
+    };
+    let mut block = vec![format!("{item_indent}- {first}")];
+    block.extend(rest.iter().map(|l| format!("{item_indent}  {l}")));
+    lines.splice(steps_end..steps_end, block);
+    Ok(finish(lines, yaml))
+}
+
 /// Downgrade a dataset to `target` (V-20, PL-7): a typed operation
 /// that succeeds exactly when nothing in the dataset needs the higher
 /// version. Below 3 the `inherits: default` lines and the tag schema
@@ -443,6 +513,23 @@ mod tests {
             let back: Yaml = serde_yaml::from_str(text).unwrap();
             assert_eq!(render_scalar(&back).unwrap(), text);
         }
+    }
+
+    /// **A profile and a step are appended where their blocks end**
+    /// (PL-9, PL-12), at the file's own indents, and never twice.
+    #[test]
+    fn profiles_and_steps_are_appended_in_place() {
+        let yaml = "format_version: 3\nname: t\nupstream:\n  defaults:\n    seed: '1'\n  steps:\n  - id: a\n    run: state set\n  - id: b\n    run: state set\n\nstrata:\n  x:\n    spec: '1'\n\nprofiles:\n  default:\n    base_vectors: b.fvec\n  10m:\n    inherits: default\n    base_count: 10\n";
+        let out = append_profile(yaml, "10m-uniform-2-1e-2", &["inherits: 10m".into(), "attributes:".into(), "  size: 10m".into()]).unwrap();
+        assert!(out.ends_with("  10m:\n    inherits: default\n    base_count: 10\n  10m-uniform-2-1e-2:\n    inherits: 10m\n    attributes:\n      size: 10m\n"), "{out}");
+        assert!(append_profile(&out, "10m", &[]).is_err());
+        let out = append_step(&out, &["id: generate-predicates-x".into(), "run: generate predicates".into(), "profiles:".into(), "- 10m-uniform-2-1e-2".into()]).unwrap();
+        assert!(out.contains("  - id: b\n    run: state set\n  - id: generate-predicates-x\n    run: generate predicates\n    profiles:\n    - 10m-uniform-2-1e-2\n\nstrata:\n"), "{out}");
+        let cfg: crate::dataset::DatasetConfig = serde_yaml::from_str(&out).unwrap();
+        assert!(cfg.profiles.profile("10m-uniform-2-1e-2").is_some());
+        assert_eq!(cfg.upstream.as_ref().and_then(|u| u.steps.as_ref()).map(|s| s.len()), Some(3));
+        let numeric = append_profile(yaml, "100", &["inherits: default".into()]).unwrap();
+        assert!(numeric.contains("  '100':\n    inherits: default\n"), "{numeric}");
     }
 
     /// **Downgrade succeeds exactly when nothing needs the higher

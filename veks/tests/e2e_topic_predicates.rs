@@ -445,6 +445,37 @@ fn e2e_topic_stratified_predicates() {
         assert!(survivors > 0, "the fixture's coarse cells give the sized profile survivors");
     }
 
+    // A uniform predicate set under the size layer (PL-2, PL-9, PS-23):
+    // declared by textual edit with its generator step, filled by the
+    // run, evaluated and filtered by the templates, tagged, and held
+    // to a form census by the check at the end.
+    let out = Command::new(veks_bin())
+        .args(["prepare", "predicate-sets"])
+        .arg(&dataset)
+        .args(["--form", "topic_l1.eq+year.range", "--levels", "1e-1", "--sizes", "100"])
+        .output()
+        .expect("failed to execute veks prepare predicate-sets");
+    assert!(out.status.success(), "predicate-sets failed:\n{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let (ok, log) = run_pipeline(&dataset_yaml);
+    assert!(ok, "third run failed:\n{}", log);
+    {
+        let set = dataset.join("profiles/100-uniform-2-1e-1");
+        for f in ["predicates.slab", "metadata_results.slab", "prefiltered_neighbor_indices.ivec", "postfiltered_neighbor_indices.ivec"] {
+            assert!(set.join(f).exists(), "{f} of the set not produced\n{log}");
+        }
+        let classes = veks_pipeline::pipeline::commands::analyze_predicate_forms::facet_form_classes(&set.join("predicates.slab")).unwrap();
+        assert_eq!((classes.forms, classes.parts), (1, Some(2)), "one form of two parts (PS-23)");
+        let yaml = std::fs::read_to_string(&dataset_yaml).unwrap();
+        let at = yaml.find("  100-uniform-2-1e-1:\n").expect("the set is declared");
+        let block: String = yaml[at..].lines().skip(1).take_while(|l| l.starts_with("    ")).collect::<Vec<_>>().join("\n");
+        assert!(block.contains("    inherits: '100'"), "the set names its layer:\n{block}");
+        for tag in ["predicates: uniform-2", "form: topic_l1.eq_year.range", "form_shape:", "family: uniform", "selectivity: '1e-1'"] {
+            assert!(block.contains(tag), "the set carries {tag}:\n{block}");
+        }
+        let r = SlabReader::open(set.join("metadata_results.slab")).unwrap();
+        assert_eq!(r.total_records() as usize, QUERIES, "one results record per query");
+    }
+
     // The strata verification passed with the labels re-derived.
     let report: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(dataset.join(".cache/verify_predicate_strata.json")).unwrap(),

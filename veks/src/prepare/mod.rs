@@ -15,6 +15,7 @@ pub(crate) mod cleanup;
 pub(crate) mod infer_manifest;
 pub mod import;
 pub mod stratify;
+pub mod predicate_sets;
 pub(crate) mod synthesize;
 pub(crate) mod wizard;
 
@@ -272,6 +273,34 @@ pub enum PrepareCommand {
         sources: Vec<PathBuf>,
     },
     /// Add sized profiles to an existing dataset for multi-scale benchmarking
+    /// Declare uniform predicate sets: one profile per size and level, under
+    /// the size layer, with its generator step, by textual edit. A rung that
+    /// carries a predicate group of its own gets a `<rung>-unfiltered` layer
+    /// beside it; the file is lifted to format version 3 when below it.
+    PredicateSets {
+        /// Dataset directory or path to dataset.yaml
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// The form every predicate takes: `field.access` parts joined by
+        /// `+` (conjunction) or `|` (disjunction), e.g.
+        /// `topic_l3.eq+citation_percentile.range`
+        #[arg(long)]
+        form: String,
+        /// The levels to plan sets for, comma-separated, e.g. `1e-2,1e-3`
+        #[arg(long)]
+        levels: String,
+        /// The sized profiles to declare sets under (default: every rung
+        /// that builds on default and is not itself a set)
+        #[arg(long)]
+        sizes: Option<String>,
+        /// Predicates per set (default: `${query_count}`, one per query)
+        #[arg(long)]
+        count: Option<String>,
+        /// Suffix of the layer declared beside a rung that carries its own
+        /// predicate group
+        #[arg(long, default_value = "unfiltered")]
+        layer_suffix: String,
+    },
     /// Downgrade a dataset.yaml to a lower format version (V-20): succeeds
     /// exactly when nothing in the dataset needs the higher one, by textual
     /// edit with a backup; refused naming what a lower version cannot say.
@@ -1041,6 +1070,9 @@ pub fn run(args: PrepareArgs) {
         }
         PrepareCommand::Publish(args) => {
             crate::publish::run(args);
+        }
+        PrepareCommand::PredicateSets { path, form, levels, sizes, count, layer_suffix } => {
+            predicate_sets::run(predicate_sets::PredicateSetsArgs { path, form, levels, sizes, count, layer_suffix });
         }
         PrepareCommand::Downgrade { path, to } => {
             let dataset_path = if path.is_file() { path.clone() } else { path.join("dataset.yaml") };
