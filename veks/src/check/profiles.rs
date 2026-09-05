@@ -48,6 +48,7 @@ pub fn check(dataset_files: &[PathBuf]) -> CheckResult {
             ));
         }
         check_profiles(&config, ds_dir, &ds_rel, tagged, &mut failures, &mut notes);
+        check_layers(&config, ds_dir, &ds_rel, tagged, &mut failures, &mut notes);
     }
     if failures.is_empty() {
         let mut r = CheckResult::ok("profile-selectors");
@@ -96,7 +97,12 @@ fn check_profiles(
                 ));
             }
         }
-        if let Some(view) = profile.views.get("metadata_predicates") {
+        // The class is required where the facet is declared, not where
+        // it is inherited: a layer reads its parent's slab and carries
+        // no class of its own (PL-1, PS-23).
+        if profiles.declares(name, "metadata_predicates")
+            && let Some(view) = profile.views.get("metadata_predicates")
+        {
             match profile.attributes.get("predicates") {
                 None if tagged => failures.push(format!(
                     "{ds_rel}: profile '{name}' declares metadata_predicates without the \
@@ -157,6 +163,157 @@ fn check_profiles(
             }
         }
     }
+}
+
+/// The layer rules (PL-3, PL-4, PL-6, PS-19): parents below 3 as
+/// advisories, a parent whose declaration a direct child overrides, a
+/// predicate group whose members do not belong together, and a
+/// version-3 profile lacking a defaulted schema tag.
+fn check_layers(
+    config: &vectordata::dataset::DatasetConfig,
+    ds_dir: &Path,
+    ds_rel: &str,
+    tagged: bool,
+    failures: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) {
+    let group = &config.profiles;
+
+    // PL-6 below 3: what version 3 will refuse, seen first.
+    let facts: Vec<vectordata::dataset::parents::ParentFacts<'_>> = group
+        .profiles
+        .iter()
+        .map(|(name, p)| vectordata::dataset::parents::ParentFacts {
+            name,
+            partition: p.partition,
+            inherits: p.inherits.as_deref(),
+        })
+        .collect();
+    for a in vectordata::dataset::parents::parent_advisories(config.format_version, &facts) {
+        notes.push(format!("{ds_rel}: {a}"));
+    }
+
+    // PL-4: a parent is a decoy when a direct child overrides a facet
+    // it declares that would have crossed the step.
+    for (child, cp) in &group.profiles {
+        let Some(parent) = group.parent_name(child) else { continue };
+        let pp = &group.profiles[&parent];
+        let size_step = cp.base_count.is_some() && cp.base_count != pp.base_count;
+        for facet in cp.views.keys() {
+            let crosses = !size_step
+                || vectordata::dataset::profile::facet_role(facet)
+                    != vectordata::dataset::profile::FacetRole::PerProfile;
+            if crosses && group.declares(child, facet) && group.declares(&parent, facet) {
+                failures.push(format!(
+                    "{ds_rel}: profile '{parent}' declares {facet} that its direct child '{child}' \
+                     overrides; a declaration no child inherits is a decoy (PL-4)"
+                ));
+            }
+        }
+    }
+
+    // PS-19 at version 3: every defaulted schema tag is on every profile.
+    if tagged {
+        for (name, p) in &group.profiles {
+            let missing: Vec<&str> = config
+                .profile_tags
+                .iter()
+                .filter(|(k, v)| !v.is_null() && !p.attributes.contains_key(k.as_str()))
+                .map(|(k, _)| k.as_str())
+                .collect();
+            if !missing.is_empty() {
+                failures.push(format!(
+                    "{ds_rel}: profile '{name}' lacks the schema tag(s) {}; `veks run` fills them (PS-19)",
+                    missing.join(", ")
+                ));
+            }
+        }
+    }
+
+    // PL-3: the predicate group holds together by content.
+    let progress = {
+        let log_path = crate::pipeline::progress::ProgressLog::path_for_dataset(&ds_dir.join("dataset.yaml"));
+        crate::pipeline::progress::ProgressLog::load(&log_path).ok().map(|(l, _)| l)
+    };
+    let relpath = |v: &vectordata::dataset::DSView| -> String {
+        vectordata::dataset::catalog::strip_window_suffix(&v.source.path)
+            .split_once(':')
+            .map(|(p, _)| p)
+            .unwrap_or(vectordata::dataset::catalog::strip_window_suffix(&v.source.path))
+            .trim_start_matches("./")
+            .to_string()
+    };
+    for name in group.profiles.keys() {
+        if group.layered && group.is_layer(name) {
+            continue;
+        }
+        let Some(results) = group.effective_view(name, "metadata_results") else { continue };
+        let results_rel = relpath(results);
+        let results_path = ds_dir.join(&results_rel);
+        let slab_rel = group.effective_view(name, "metadata_predicates").map(relpath);
+        if let Some(slab_rel) = &slab_rel {
+            let slab_path = ds_dir.join(slab_rel);
+            if results_path.exists() && slab_path.exists() {
+                match (slab_rows(&results_path), slab_rows(&slab_path)) {
+                    (Some(r), Some(p)) if r != p => failures.push(format!(
+                        "{ds_rel}: profile '{name}' results index {results_rel} holds {r} rows but its \
+                         predicate slab {slab_rel} holds {p} predicates; the group does not belong \
+                         together (PL-3)"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        let query_count = group
+            .effective_view(name, "query_vectors")
+            .map(relpath)
+            .map(|q| ds_dir.join(q))
+            .filter(|q| q.exists() && !q.to_string_lossy().contains("NNNN"))
+            .and_then(|q| vectordata::io::open_vec::<f32>(&q.to_string_lossy()).ok().map(|r| r.count()));
+        for facet in ["prefiltered_neighbor_indices", "postfiltered_neighbor_indices"] {
+            let Some(view) = group.effective_view(name, facet) else { continue };
+            let rel = relpath(view);
+            let path = ds_dir.join(&rel);
+            if !path.exists() || rel.contains("NNNN") {
+                continue;
+            }
+            if let (Some(q), Ok(reader)) =
+                (query_count, vectordata::io::open_vec::<i32>(&path.to_string_lossy()))
+                && reader.count() != q
+            {
+                failures.push(format!(
+                    "{ds_rel}: profile '{name}' {facet} {rel} holds {} rows for {q} queries (PL-3)",
+                    reader.count()
+                ));
+            }
+            if let Some(log) = &progress {
+                let producer = log.steps.values().find(|r| {
+                    r.status == crate::pipeline::command::Status::Ok
+                        && r.outputs.iter().any(|o| o.path.trim_start_matches("./") == rel)
+                });
+                match producer {
+                    Some(record) => {
+                        if let Some(from) = record.resolved_options.get("metadata-indices")
+                            && from.trim_start_matches("./") != results_rel
+                        {
+                            failures.push(format!(
+                                "{ds_rel}: profile '{name}' {facet} was computed from {from}, not from \
+                                 its results index {results_rel} (PL-3)"
+                            ));
+                        }
+                    }
+                    None => notes.push(format!(
+                        "{ds_rel}: profile '{name}' {facet} has no completed step record; its \
+                         derivation is unverified"
+                    )),
+                }
+            }
+        }
+    }
+}
+
+fn slab_rows(path: &Path) -> Option<u64> {
+    slabtastic::SlabReader::open(path).ok().map(|r| r.total_records())
 }
 
 /// Hold a `predicates` class to the facet's form census (PS-23).
@@ -248,8 +405,8 @@ mod tests {
             tmp.path(),
             "format_version: 3\nname: t\nprofile_tags:\n  size: ~\nprofiles:\n  default:\n    \
              base_vectors: b.fvec\n    metadata_predicates: p.slab\n    attributes:\n      size: 1k\n      \
-             maxk: 10\n      nested:\n        a: 1\n  a:\n    base_count: 100\n    attributes:\n      \
-             size: 100\n  b:\n    base_count: 100\n    attributes:\n      size: 100\n",
+             maxk: 10\n      nested:\n        a: 1\n  a:\n    inherits: default\n    base_count: 100\n    attributes:\n      \
+             size: 100\n  b:\n    inherits: default\n    base_count: 100\n    attributes:\n      size: 100\n",
         );
         let r = check(&[p]);
         assert!(!r.passed);
@@ -260,6 +417,114 @@ mod tests {
         assert!(all.contains("'a' and 'b' carry identical attributes"), "{all}");
     }
 
+    /// **A parent whose declaration a direct child overrides is a
+    /// decoy** (PL-4); an override two levels down is not, and a size
+    /// step's own ground truth never is.
+    #[test]
+    fn a_direct_override_of_a_parents_facet_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = dataset(
+            tmp.path(),
+            "format_version: 3\nname: t\nprofiles:\n  default:\n    base_vectors: b.fvec\n    \
+             neighbor_indices: profiles/default/g.ivec\n    metadata_predicates: profiles/base/p.slab\n  \
+             10m:\n    inherits: default\n    base_count: 10\n    neighbor_indices: profiles/10m/g.ivec\n    \
+             metadata_results: profiles/10m/r.slab\n  10m-set:\n    inherits: 10m\n    base_count: 10\n    \
+             metadata_results: profiles/10m-set/r.slab\n    metadata_predicates: profiles/10m-set/p.slab\n",
+        );
+        let r = check(&[p]);
+        let all = r.messages.join("\n");
+        assert!(all.contains("profile '10m' declares metadata_results that its direct child '10m-set' overrides"), "{all}");
+        assert!(!all.contains("'default' declares neighbor_indices that"), "ground truth does not cross a size step: {all}");
+        assert!(!all.contains("'default' declares metadata_predicates that"), "two levels down is not a decoy: {all}");
+        assert!(!all.contains("'10m' declares metadata_predicates without"), "a layer inheriting the slab needs no class: {all}");
+    }
+
+    /// **Below 3 an implicit parent is an advisory, not a failure**
+    /// (PL-6, case 15).
+    #[test]
+    fn implicit_parents_are_advisory_below_three() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = dataset(tmp.path(), "format_version: 2\nname: t\nprofiles:\n  default:\n    base_vectors: b.fvec\n  10m:\n    base_count: 10\n");
+        let r = check(&[p]);
+        assert!(r.passed, "{:?}", r.messages);
+        assert!(r.messages.iter().any(|m| m.contains("`10m` names no parent") && m.contains("refused from format_version 3")), "{:?}", r.messages);
+    }
+
+    /// **A version-3 profile lacking a defaulted schema tag is refused**
+    /// (PS-19, case 17); a naming tag may be absent.
+    #[test]
+    fn a_missing_defaulted_schema_tag_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = dataset(
+            tmp.path(),
+            "format_version: 3\nname: t\nprofile_tags:\n  size: ~\n  family: stratified\nprofiles:\n  default:\n    \
+             base_vectors: b.fvec\n    attributes:\n      family: stratified\n  10m:\n    inherits: default\n    \
+             base_count: 10\n    attributes:\n      size: 10m\n",
+        );
+        let r = check(&[p]);
+        assert!(!r.passed);
+        assert!(r.messages.iter().any(|m| m.contains("profile '10m' lacks the schema tag(s) family")), "{:?}", r.messages);
+    }
+
+    fn write_slab(path: &Path, records: usize) {
+        let config = slabtastic::WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
+        let mut w = slabtastic::SlabWriter::new(path, config).unwrap();
+        for i in 0..records {
+            w.add_record(&(i as u32).to_le_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    fn write_ivec(path: &Path, rows: usize, dim: usize) {
+        let mut bytes = Vec::new();
+        for r in 0..rows {
+            bytes.extend_from_slice(&(dim as i32).to_le_bytes());
+            for d in 0..dim {
+                bytes.extend_from_slice(&((r * dim + d) as i32).to_le_bytes());
+            }
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_fvec(path: &Path, rows: usize, dim: usize) {
+        let mut bytes = Vec::new();
+        for _ in 0..rows {
+            bytes.extend_from_slice(&(dim as i32).to_le_bytes());
+            for d in 0..dim {
+                bytes.extend_from_slice(&(d as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// **The predicate group holds together by content** (PL-3, case
+    /// 5): a results index with the wrong predicate count and a filtered
+    /// ground truth sized to other queries are reported naming the
+    /// profile and the facets.
+    #[test]
+    fn a_predicate_group_that_disagrees_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::create_dir_all(d.join("profiles/base")).unwrap();
+        std::fs::create_dir_all(d.join("profiles/default")).unwrap();
+        write_fvec(&d.join("profiles/base/q.fvec"), 3, 2);
+        write_slab(&d.join("profiles/base/p.slab"), 2);
+        write_slab(&d.join("profiles/default/r.slab"), 3);
+        write_ivec(&d.join("profiles/default/f.ivec"), 2, 2);
+        let p = dataset(
+            d,
+            "format_version: 2\nname: t\nprofiles:\n  default:\n    base_vectors: profiles/base/b.fvec\n    \
+             query_vectors: profiles/base/q.fvec\n    metadata_predicates: profiles/base/p.slab\n    \
+             metadata_results: profiles/default/r.slab\n    prefiltered_neighbor_indices: profiles/default/f.ivec\n    \
+             attributes:\n      predicates: mixed\n",
+        );
+        let r = check(&[p]);
+        assert!(!r.passed);
+        let all = r.messages.join("\n");
+        assert!(all.contains("results index profiles/default/r.slab holds 3 rows but its predicate slab profiles/base/p.slab holds 2 predicates"), "{all}");
+        assert!(all.contains("prefiltered_neighbor_indices profiles/default/f.ivec holds 2 rows for 3 queries"), "{all}");
+    }
+
     /// A tagged dataset whose profiles are all distinct passes.
     #[test]
     fn distinct_tagged_profiles_pass() {
@@ -267,7 +532,7 @@ mod tests {
         let p = dataset(
             tmp.path(),
             "format_version: 3\nname: t\nprofile_tags:\n  size: ~\nprofiles:\n  default:\n    \
-             base_vectors: b.fvec\n    attributes:\n      size: 1k\n  100:\n    base_count: 100\n    \
+             base_vectors: b.fvec\n    attributes:\n      size: 1k\n  100:\n    inherits: default\n    base_count: 100\n    \
              attributes:\n      size: 100\n",
         );
         let r = check(&[p]);
