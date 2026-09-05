@@ -123,6 +123,7 @@ palette.
 | `state set` / `state clear` | Pipeline variable management; `state set` with `attribute: true` writes a dataset attribute instead |
 | `download huggingface` | Download from Hugging Face Hub |
 | `download bulk` | Parallel bulk download (see config below) |
+| `veks prepare downgrade --to N` | Downgrade `dataset.yaml` to a lower format version: succeeds exactly when nothing needs the higher one, by textual edit with a backup |
 | `veks prepare cleanup-profiles` | Housekeeping: drop sized profiles no stratum names and profile directories no entry names, without touching the cache |
 | `veks prepare cache-gc` | Housekeeping: remove cache files nothing in the definition can use — not named by a step, not recorded by a defined step, not claimed by an engine's cache, not a twin of those |
 

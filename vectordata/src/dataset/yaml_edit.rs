@@ -290,6 +290,63 @@ pub fn set_profile_inherits(yaml: &str, profile: &str, parent: &str) -> Result<S
     Ok(finish(lines, yaml))
 }
 
+/// Downgrade a dataset to `target` (V-20, PL-7): a typed operation
+/// that succeeds exactly when nothing in the dataset needs the higher
+/// version. Below 3 the `inherits: default` lines and the tag schema
+/// are dropped, since neither can be said at 2; a profile naming any
+/// other parent, or a series below 2, is what cannot be said, and the
+/// downgrade is refused naming it.
+pub fn downgrade(yaml: &str, target: u32) -> Result<String, String> {
+    use crate::model::{FORMAT_VERSION_BASE, FORMAT_VERSION_SHARDED, FORMAT_VERSION_TAGGED};
+    let config: crate::dataset::DatasetConfig =
+        serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+    if target < FORMAT_VERSION_BASE {
+        return Err(format!("no format version below {FORMAT_VERSION_BASE}"));
+    }
+    if target >= config.format_version {
+        return Err(format!(
+            "the dataset is at format_version {}; {target} is not a downgrade",
+            config.format_version
+        ));
+    }
+    if target < FORMAT_VERSION_TAGGED {
+        let named: Vec<String> = config
+            .profiles
+            .profiles
+            .iter()
+            .filter(|(n, p)| n.as_str() != "default" && p.inherits.as_deref().is_some_and(|i| i != "default"))
+            .map(|(n, p)| format!("`{n}` builds on `{}`", p.inherits.as_deref().unwrap_or_default()))
+            .collect();
+        if !named.is_empty() {
+            return Err(format!(
+                "cannot downgrade to {target}: {} — a named parent is what version 3 says",
+                named.join(", ")
+            ));
+        }
+    }
+    if target < FORMAT_VERSION_SHARDED
+        && config.profiles.profiles.values().flat_map(|p| p.views.values()).any(|v| v.is_series())
+    {
+        return Err(format!("cannot downgrade to {target}: a multi-file facet needs version 2"));
+    }
+    let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+    if target < FORMAT_VERSION_TAGGED {
+        lines.retain(|l| {
+            !(indent_of(l) == 4
+                && key_of(l) == Some("inherits")
+                && value_and_comment(l).0 == "default")
+        });
+        if let Some(start) = lines
+            .iter()
+            .position(|l| indent_of(l) == 0 && key_of(l) == Some("profile_tags"))
+        {
+            let end = block_end(&lines, start, 0);
+            lines.drain(start..end);
+        }
+    }
+    Ok(set_format_version(&finish(lines, yaml), target))
+}
+
 /// The line after the last line of the block that starts at `start`,
 /// whose children are indented deeper than `indent`. Blank and comment
 /// lines inside the block belong to it; trailing ones do not.
@@ -386,6 +443,23 @@ mod tests {
             let back: Yaml = serde_yaml::from_str(text).unwrap();
             assert_eq!(render_scalar(&back).unwrap(), text);
         }
+    }
+
+    /// **Downgrade succeeds exactly when nothing needs the higher
+    /// version** (V-20, PL-7): parents of `default` and the schema are
+    /// dropped; a named parent refuses.
+    #[test]
+    fn a_downgrade_drops_what_a_lower_version_cannot_say() {
+        let v3 = "format_version: 3\nname: t\nprofile_tags:\n  size: ~\nprofiles:\n  default:\n    base_vectors: b.fvec\n  10m:\n    inherits: default  # stated\n    base_count: 10\n";
+        let v2 = downgrade(v3, 2).unwrap();
+        assert_eq!(v2, "format_version: 2\nname: t\nprofiles:\n  default:\n    base_vectors: b.fvec\n  10m:\n    base_count: 10\n");
+        let back: crate::dataset::DatasetConfig = serde_yaml::from_str(&v2).unwrap();
+        assert_eq!(back.format_version, 2);
+        assert!(downgrade(v3, 3).unwrap_err().contains("not a downgrade"));
+
+        let layered = "format_version: 3\nname: t\nprofiles:\n  default:\n    base_vectors: b.fvec\n  10m:\n    inherits: default\n    base_count: 10\n  set:\n    inherits: 10m\n    base_count: 10\n    query_vectors: q.fvec\n";
+        let e = downgrade(layered, 2).unwrap_err();
+        assert!(e.contains("`set` builds on `10m`"), "{e}");
     }
 
     /// **A parent is named once and never renamed** (PL-12): the line

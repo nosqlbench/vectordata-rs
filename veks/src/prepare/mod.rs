@@ -272,6 +272,17 @@ pub enum PrepareCommand {
         sources: Vec<PathBuf>,
     },
     /// Add sized profiles to an existing dataset for multi-scale benchmarking
+    /// Downgrade a dataset.yaml to a lower format version (V-20): succeeds
+    /// exactly when nothing in the dataset needs the higher one, by textual
+    /// edit with a backup; refused naming what a lower version cannot say.
+    Downgrade {
+        /// Dataset directory or path to dataset.yaml
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// The format version to write
+        #[arg(long)]
+        to: u32,
+    },
     Stratify {
         /// Dataset directory or path to dataset.yaml
         #[arg(default_value = ".")]
@@ -1030,6 +1041,27 @@ pub fn run(args: PrepareArgs) {
         }
         PrepareCommand::Publish(args) => {
             crate::publish::run(args);
+        }
+        PrepareCommand::Downgrade { path, to } => {
+            let dataset_path = if path.is_file() { path.clone() } else { path.join("dataset.yaml") };
+            let text = std::fs::read_to_string(&dataset_path).unwrap_or_else(|e| {
+                eprintln!("Error: {}: {e}", crate::check::rel_display(&dataset_path));
+                std::process::exit(1);
+            });
+            let out = vectordata::dataset::yaml_edit::downgrade(&text, to).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            });
+            match crate::check::fix::create_backup(&dataset_path) {
+                Ok(bp) => println!("  Backed up {} → {}", crate::check::rel_display(&dataset_path), crate::check::rel_display(&bp)),
+                Err(e) => eprintln!("  Warning: backup failed: {e}"),
+            }
+            let tmp = dataset_path.with_extension("yaml.tmp");
+            if let Err(e) = std::fs::write(&tmp, &out).and_then(|_| std::fs::rename(&tmp, &dataset_path)) {
+                eprintln!("Error: failed to write {}: {e}", crate::check::rel_display(&dataset_path));
+                std::process::exit(1);
+            }
+            println!("Wrote {} at format_version {to}", crate::check::rel_display(&dataset_path));
         }
         PrepareCommand::Stratify { path, spec, interactive, force, yes, auto } => {
             let interactive = interactive || auto;
