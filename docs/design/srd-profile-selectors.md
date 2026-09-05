@@ -254,7 +254,7 @@ that motivate it need, extending P-5:
 | `predicates` | identifier | **required** on any profile that declares a predicate facet: the structural class of that facet, `mixed` or `uniform-<n>` (PS-23) |
 | `selectivity` | number | the selectivity level a single-level predicate set was generated **for** (`1e-2`), not what it realised |
 | `selectivity_ladder` | list of numbers | the decades a stratified set was generated for, most to least selective |
-| `form` | identifier | the predicate form of a uniform set as a **derived id**: the fields and access kinds of the form in canonical order, `topic_l3.eq+citation_percentile.range`; `stratified` for a stratified set |
+| `form` | identifier | the predicate form of a uniform set as a **derived id**: the fields and access kinds of the form in canonical order joined by `_`, `topic_l3.eq_citation_percentile.range`, so it is an identifier PS-21 can name with; `stratified` for a stratified set |
 | `form_shape` | string | the rendered form, `(citation_percentile >= ? AND topic_l3 = ?)`, descriptive and never a naming tag |
 | `forms` | number | how many distinct forms the set holds |
 | `family` | string | the generator family the profile belongs to (P-8, surfaced) |
@@ -317,8 +317,12 @@ generator writes the tags of the set it was asked to produce. Tags are
 **denormalised**: reading one profile answers every key without
 consulting `default` or the schema, and a selector never meets an
 absent schema tag on a generated profile. Keys outside the schema are
-still free (P-5); they are simply not part of a name. Attributes
-**never inherit**: a profile carries exactly the tags written on it,
+still free (P-5); they are simply not part of a name. The schema, the
+naming rule, and the required tags are **version-3** semantics
+([srd-dataset-format-version.md](srd-dataset-format-version.md) V-7,
+V-24): a reader presumes no schema on a dataset below 3 or without a
+version, whose `attributes:` remain plain, selectable data (P-4) and
+nothing more. Attributes **never inherit**: a profile carries exactly the tags written on it,
 whatever its `inherits:` parent carries, and the loader pins that with
 a test. Writing tags into an existing `dataset.yaml` is a **textual
 edit** of the profile's own lines, preserving every comment and every
@@ -346,7 +350,9 @@ name is refused where a shard field would follow it. Two profiles whose
 naming values are identical would have one name, and the generator
 refuses to write the second rather than invent a suffix (it is also
 the PS-15 case a selector cannot tell apart). `default` keeps its name;
-it is the one name every spec without a selector relies on.
+it is the one name every spec without a selector relies on. The rule
+governs profiles a **generator** creates; a profile an author or a
+migration writes by hand carries the name it is given.
 
 **PS-22.** Names are **stable**. A profile already declared is never
 renamed by a later run, whatever its tags say: `veks run` on a dataset
@@ -365,7 +371,7 @@ subcommands, `explore`, every `veks` command that takes `--dataset` or a
 explorer's picker uses the same parser for its filter box, so what a
 user types there is what they can paste on a command line. On a
 command line a selector with a regex, a glob, or a quoted value is
-itself double-quoted, `"tessera:form='topic_l3.eq+citation_percentile.range'"`,
+itself double-quoted, `"tessera:form='topic_l3.eq_citation_percentile.range'"`,
 and every command's help shows that idiom once.
 
 **PS-15.** `veks check` reports, per dataset:
@@ -420,7 +426,7 @@ profiles:
 
   10m-uniform-2-1e-2:               # named by its tags (PS-21, PS-23)
     inherits: 10m
-    attributes: { size: 10m, predicates: uniform-2, selectivity: 1e-2, family: uniform, form: topic_l3.eq+citation_percentile.range, form_shape: "(citation_percentile >= ? AND topic_l3 = ?)" }
+    attributes: { size: 10m, predicates: uniform-2, selectivity: 1e-2, family: uniform, form: topic_l3.eq_citation_percentile.range, form_shape: "(citation_percentile >= ? AND topic_l3 = ?)" }
     metadata_predicates: profiles/10m-uniform-2-1e-2/predicates.slab
     metadata_results: profiles/10m-uniform-2-1e-2/metadata_results.slab
     postfiltered_neighbor_indices: profiles/10m-uniform-2-1e-2/postfiltered_neighbor_indices.ivecs
@@ -428,7 +434,7 @@ profiles:
 
   10m-uniform-2-1e-3:
     inherits: 10m
-    attributes: { size: 10m, predicates: uniform-2, selectivity: 1e-3, family: uniform, form: topic_l3.eq+citation_percentile.range, form_shape: "(citation_percentile >= ? AND topic_l3 = ?)" }
+    attributes: { size: 10m, predicates: uniform-2, selectivity: 1e-3, family: uniform, form: topic_l3.eq_citation_percentile.range, form_shape: "(citation_percentile >= ? AND topic_l3 = ?)" }
     ...
 ```
 
