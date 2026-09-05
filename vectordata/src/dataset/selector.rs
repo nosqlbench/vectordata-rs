@@ -213,13 +213,8 @@ fn declared_structure(group: &DSProfileGroup, name: &str) -> (Option<u64>, Optio
 fn yaml_summary(v: &Yaml) -> String {
     match v {
         Yaml::String(s) => s.clone(),
-        Yaml::Number(n) => n.to_string(),
-        Yaml::Bool(b) => b.to_string(),
-        Yaml::Null => "null".into(),
-        other => serde_yaml::to_string(other)
-            .unwrap_or_default()
-            .trim()
-            .replace('\n', " "),
+        other => crate::dataset::yaml_edit::render_scalar(other)
+            .unwrap_or_else(|_| serde_yaml::to_string(other).unwrap_or_default().trim().replace('\n', " ")),
     }
 }
 
