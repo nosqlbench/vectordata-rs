@@ -22,6 +22,8 @@
 use crate::catalog::resolver::Catalog;
 #[cfg(feature = "cli")]
 use crate::catalog::sources::CatalogSources;
+#[cfg(feature = "cli")]
+use crate::dataset::selector::DatasetSpec;
 
 /// Shared clap-derived argument struct for `<binary> datasets
 /// ping`. Both the `vectordata` and `veks` binaries import this.
@@ -34,11 +36,13 @@ pub struct PingArgs {
     /// ping searches them all.
     #[arg(long = "at")]
     pub at: Option<String>,
-    /// Dataset name in the catalog.
+    /// Dataset name in the catalog, optionally with a selector:
+    /// `name` or `name:<selector>` (PS-1). Ping probes every profile
+    /// the selector names (PS-9); none means `default`.
     pub dataset: String,
-    /// Profile to ping.
-    #[arg(long, default_value = "default")]
-    pub profile: String,
+    /// Profile selector. Outranks a selector carried by `dataset`.
+    #[arg(long)]
+    pub profile: Option<String>,
 }
 
 /// Drive `ping` from a parsed [`PingArgs`].
@@ -63,14 +67,28 @@ pub fn run_args(args: PingArgs, configdir: &str, catalog: &[String], at_extra: &
         eprintln!("or pass `--at <URL-or-path>` for one-off use.");
         return 1;
     }
+    let spec = match DatasetSpec::parse(&args.dataset) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    let selector = args
+        .profile
+        .or_else(|| spec.selector.as_ref().map(|s| s.text().to_string()));
     let cat = Catalog::of(&sources);
-    run_via_catalog(&cat, &args.dataset, &args.profile)
+    run_via_catalog(&cat, &spec.head, selector.as_deref())
 }
 
 /// Ping using a pre-built catalog. Used by the picker's Ping action
 /// and by `run_args` after it has built the catalog from its CLI
 /// inputs.
-pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, profile_name: &str) -> i32 {
+///
+/// Every profile `selector` names is probed in turn (PS-9); `None` is
+/// `default`. The exit code is non-zero if any facet of any selected
+/// profile fails.
+pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&str>) -> i32 {
     // Pre-flight: every facet probe below opens through the cache
     // layer, which needs a resolvable cache directory. Without this
     // check, a missing cache_dir surfaced as N cryptic per-facet
@@ -89,7 +107,10 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, profile_name: &str
         eprintln!("Try `vectordata datasets list` to see what's reachable.");
         return 1;
     }
-    println!("Pinging dataset '{dataset_name}' (profile '{profile_name}')");
+    println!(
+        "Pinging dataset '{dataset_name}' (selector '{}')",
+        selector.unwrap_or("default")
+    );
     println!();
 
     let group = match catalog.open(dataset_name) {
@@ -116,21 +137,22 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, profile_name: &str
     }
     println!();
 
-    let view = match group.profile(profile_name) {
-        Some(v) => v,
-        None => {
-            eprintln!("error: profile '{profile_name}' not found");
-            eprintln!("  available: {:?}", profile_names);
+    let selected = match group.select(selector) {
+        Ok(names) => names,
+        Err(e) => {
+            eprintln!("error: dataset '{dataset_name}': {e}");
             return 1;
         }
     };
 
+    let mut pass = 0;
+    let mut fail = 0;
+    for profile_name in &selected {
+    let view = group.profile(profile_name).expect("a selected profile exists");
     println!("  Probing facets for profile '{profile_name}':");
     let manifest = view.facet_manifest();
     let mut facets: Vec<&String> = manifest.keys().collect();
     facets.sort();
-    let mut pass = 0;
-    let mut fail = 0;
     for facet_name in &facets {
         let source = view.facet_source(facet_name).unwrap_or_else(|| "<unresolved>".to_string());
         print!("    {facet_name} ({source})... ");
@@ -182,6 +204,7 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, profile_name: &str
         }
     }
     println!();
+    }
     println!("  Summary: {pass} facets OK, {fail} failed");
     if fail > 0 { 1 } else { 0 }
 }

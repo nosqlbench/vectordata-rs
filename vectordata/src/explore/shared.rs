@@ -40,35 +40,35 @@ impl std::str::FromStr for SampleMode {
     }
 }
 
-/// Resolve a non-local source — either a `dataset[:profile]` catalog
-/// specifier or a remote URL pointing at a dataset directory — and
-/// return the canonical [`TestDataView`]. URL sources use the default
-/// profile (URLs don't carry a `:profile` suffix because the colon is
-/// reserved for the scheme separator).
+/// Resolve a non-local source — a `dataset[:selector]` catalog
+/// specifier or a remote URL pointing at a dataset directory, with a
+/// selector after its path — and return the canonical
+/// [`TestDataView`]. The explorer shows one profile, so the selector
+/// must name exactly one (PS-9); none means `default`.
 pub(super) fn open_dataset_view(source: &str) -> std::sync::Arc<dyn crate::TestDataView> {
-    if crate::transport::is_remote_url(source) {
-        let group = crate::TestDataGroup::load(source).unwrap_or_else(|e| {
-            eprintln!("error: failed to load {source}: {e}");
-            std::process::exit(1);
-        });
-        return group.profile("default").unwrap_or_else(|| {
-            eprintln!(
-                "error: profile 'default' not found at {source}. Available: {}",
-                group.profile_names().join(", "),
-            );
-            std::process::exit(1);
-        });
-    }
-    let (name, profile) = match source.find(':') {
-        Some(pos) => (&source[..pos], &source[pos + 1..]),
-        None => (source, "default"),
-    };
-    let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-    let catalog = crate::catalog::resolver::Catalog::of(&sources);
-    catalog.open_profile(name, profile).unwrap_or_else(|e| {
+    let spec = crate::dataset::selector::DatasetSpec::parse(source).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
-    })
+    });
+    let selector = spec.selector.as_ref().map(|s| s.text());
+    let group = if crate::transport::is_remote_url(&spec.head) {
+        crate::TestDataGroup::load(&spec.head).unwrap_or_else(|e| {
+            eprintln!("error: failed to load {}: {e}", spec.head);
+            std::process::exit(1);
+        })
+    } else {
+        let sources = crate::catalog::sources::CatalogSources::new().configure_default();
+        let catalog = crate::catalog::resolver::Catalog::of(&sources);
+        catalog.open(&spec.head).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        })
+    };
+    let name = group.select_one(selector).unwrap_or_else(|e| {
+        eprintln!("error: {}: {e}", spec.head);
+        std::process::exit(1);
+    });
+    group.profile(&name).expect("a selected profile exists")
 }
 
 /// Check if a source specifier refers to a local file. Remote URLs

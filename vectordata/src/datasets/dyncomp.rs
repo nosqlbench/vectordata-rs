@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::{self, CatalogSources};
 use veks_completion::{ValueProvider, fn_provider};
+use crate::dataset::selector::{DatasetSpec, ProfileFacts};
 
 /// The dataset-domain resolvers, keyed for
 /// [`veks_completion::cli::build_completion_tree`]: `--flag` keys
@@ -137,6 +138,16 @@ fn resolve_catalog(context: &[&str]) -> Catalog {
     Catalog::of(&catalog_sources)
 }
 
+/// Flatten a catalog into `(dataset, profile facts)` pairs: what a
+/// selector completion reads (PS-16).
+fn dataset_profile_facts(catalog: &Catalog) -> Vec<(String, Vec<ProfileFacts>)> {
+    catalog
+        .datasets()
+        .iter()
+        .map(|e| (e.name.clone(), e.layout.profiles.profile_facts()))
+        .collect()
+}
+
 /// Flatten a catalog into the `(dataset, profiles)` pairs the pure
 /// completion cores operate on.
 fn dataset_profile_pairs(catalog: &Catalog) -> Vec<(String, Vec<String>)> {
@@ -192,27 +203,104 @@ pub fn filter_profile_names(
     profiles.into_iter().collect()
 }
 
-/// `name[:profile]` spec candidates (the `describe`/`precache`
-/// positional). A partial without `:` completes dataset names; once
-/// the user types `name:` the candidates become that dataset's
-/// `name:profile` forms — splice-ready because the bash hook's
-/// `COMP_WORDBREAKS` keeps `name:prof` one shell word.
-pub fn filter_spec_candidates(pairs: &[(String, Vec<String>)], partial: &str) -> Vec<String> {
-    let Some((name_part, profile_part)) = partial.split_once(':') else {
-        return filter_dataset_names(pairs, partial);
+/// `name[:selector]` spec candidates (the `describe`/`precache`
+/// positional), PS-16. A partial without `:` completes dataset names;
+/// after `name:` the candidates are that dataset's profile names, the
+/// automatic `profile=`, and each attribute key followed by `=`; after
+/// `key=` the distinct values the key takes; after `,` or `(` the same
+/// again. Splice-ready because the bash hook's `COMP_WORDBREAKS` keeps
+/// `name:prof` one shell word.
+pub fn filter_spec_candidates(
+    facts: &[(String, Vec<ProfileFacts>)],
+    partial: &str,
+) -> Vec<String> {
+    let (head, tail) = DatasetSpec::split_head(partial);
+    let Some(tail) = tail else {
+        let names: Vec<(String, Vec<String>)> = facts
+            .iter()
+            .map(|(n, f)| (n.clone(), f.iter().map(|p| p.name.clone()).collect()))
+            .collect();
+        return filter_dataset_names(&names, partial);
     };
-    let profile_prefix = profile_part.to_lowercase();
-    pairs
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case(name_part))
-        .flat_map(|(name, profiles)| {
-            profiles
-                .iter()
-                .filter(|p| profile_prefix.is_empty() || p.to_lowercase().starts_with(&profile_prefix))
-                .map(|p| format!("{name}:{p}"))
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    let Some((name, profiles)) = facts.iter().find(|(n, _)| n.eq_ignore_ascii_case(head)) else {
+        return Vec::new();
+    };
+    // The atom being typed starts after the last `,` or `(`; what
+    // precedes it is kept as typed.
+    let atom_start = tail
+        .rfind([',', '('])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let (kept, atom) = tail.split_at(atom_start);
+    let atom = atom.trim_start();
+    let lower = atom.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    if let Some(op_at) = atom.find(['=', '<', '>', '!']) {
+        let key = atom[..op_at].trim().to_lowercase();
+        let op_end = op_at
+            + atom[op_at..]
+                .chars()
+                .take_while(|c| matches!(c, '=' | '<' | '>' | '!'))
+                .map(|c| c.len_utf8())
+                .sum::<usize>();
+        let op = &atom[op_at..op_end];
+        let value_prefix = atom[op_end..].to_lowercase();
+        let mut values: Vec<String> = Vec::new();
+        for p in profiles {
+            let candidates: Vec<String> = match key.as_str() {
+                "profile" => vec![p.name.clone()],
+                "base_count" => p.base_count.iter().map(|n| n.to_string()).collect(),
+                "maxk" => p.maxk.iter().map(|n| n.to_string()).collect(),
+                "partition" => vec![p.partition.to_string()],
+                "inherits" => p.inherits.iter().cloned().collect(),
+                _ => p
+                    .attributes
+                    .iter()
+                    .filter(|(k, _)| k.eq_ignore_ascii_case(&key))
+                    .flat_map(|(_, v)| value_texts(v))
+                    .collect(),
+            };
+            for c in candidates {
+                if !values.iter().any(|v| v.eq_ignore_ascii_case(&c)) {
+                    values.push(c);
+                }
+            }
+        }
+        for v in values {
+            if value_prefix.is_empty() || v.to_lowercase().starts_with(&value_prefix) {
+                out.push(format!("{name}:{kept}{key}{op}{v}"));
+            }
+        }
+        return out;
+    }
+    let mut words: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+    words.push("profile=".to_string());
+    for p in profiles {
+        for (k, _) in &p.attributes {
+            let w = format!("{k}=");
+            if !words.iter().any(|x| x.eq_ignore_ascii_case(&w)) {
+                words.push(w);
+            }
+        }
+    }
+    for w in words {
+        if lower.is_empty() || w.to_lowercase().starts_with(&lower) {
+            out.push(format!("{name}:{kept}{w}"));
+        }
+    }
+    out
+}
+
+/// The texts a tag value offers to completion: a scalar as written, a
+/// list one element at a time.
+fn value_texts(v: &serde_yaml::Value) -> Vec<String> {
+    match v {
+        serde_yaml::Value::Sequence(items) => items.iter().flat_map(value_texts).collect(),
+        serde_yaml::Value::String(s) => vec![s.clone()],
+        serde_yaml::Value::Number(n) => vec![n.to_string()],
+        serde_yaml::Value::Bool(b) => vec![b.to_string()],
+        _ => Vec::new(),
+    }
 }
 
 /// Infer the dataset a profile completion should scope to when no
@@ -270,8 +358,8 @@ pub fn complete_profile_names(partial: &str, context: &[&str]) -> Vec<String> {
 /// Suggest `name[:profile]` specs for the `describe`/`precache`
 /// positional (honors `--at` on the line).
 pub fn complete_dataset_specs(partial: &str, context: &[&str]) -> Vec<String> {
-    let pairs = dataset_profile_pairs(&resolve_catalog(context));
-    filter_spec_candidates(&pairs, partial)
+    let facts = dataset_profile_facts(&resolve_catalog(context));
+    filter_spec_candidates(&facts, partial)
 }
 
 /// Run `f` over the context catalog's entries, narrowed by the
@@ -626,18 +714,13 @@ pub fn complete_with_dim_threshold(partial: &str, context: &[&str]) -> Vec<Strin
 /// Suggest `--select` values: `dataset[:profile]` specs across the
 /// already-narrowed entries.
 pub fn complete_select_specs(partial: &str, context: &[&str]) -> Vec<String> {
-    let pairs = with_filtered_entries(context, false, |entries, _| {
+    let facts = with_filtered_entries(context, false, |entries, _| {
         entries
             .iter()
-            .map(|e| {
-                (
-                    e.name.clone(),
-                    e.profile_names().into_iter().map(|s| s.to_string()).collect(),
-                )
-            })
-            .collect::<Vec<(String, Vec<String>)>>()
+            .map(|e| (e.name.clone(), e.layout.profiles.profile_facts()))
+            .collect::<Vec<(String, Vec<ProfileFacts>)>>()
     });
-    filter_spec_candidates(&pairs, partial)
+    filter_spec_candidates(&facts, partial)
 }
 
 /// Suggest configured catalog shortcuts for `--at` by 1-based index.
@@ -741,18 +824,72 @@ mod tests {
         );
     }
 
+    fn facts() -> Vec<(String, Vec<ProfileFacts>)> {
+        let attrs = |pairs: &[(&str, serde_yaml::Value)]| -> Vec<(String, serde_yaml::Value)> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        };
+        pairs()
+            .into_iter()
+            .map(|(name, profiles)| {
+                let f = profiles
+                    .into_iter()
+                    .map(|p| ProfileFacts {
+                        name: p.clone(),
+                        attributes: if p == "d100" {
+                            attrs(&[
+                                ("size", serde_yaml::Value::from("100")),
+                                ("predicates", serde_yaml::Value::from("uniform-2")),
+                            ])
+                        } else if p == "default" {
+                            attrs(&[("size", serde_yaml::Value::from("1k"))])
+                        } else {
+                            Vec::new()
+                        },
+                        ..Default::default()
+                    })
+                    .collect();
+                (name, f)
+            })
+            .collect()
+    }
+
+    /// **After `dataset:` completion offers names, `profile=` and the
+    /// keys; after `key=` the values; after `,` the same again**
+    /// (PS-16).
     #[test]
     fn spec_candidates_complete_names_then_profiles() {
-        assert_eq!(filter_spec_candidates(&pairs(), "ga"), vec!["gamma".to_string()]);
+        assert_eq!(filter_spec_candidates(&facts(), "ga"), vec!["gamma".to_string()]);
         assert_eq!(
-            filter_spec_candidates(&pairs(), "alpha:"),
-            vec!["alpha:default".to_string(), "alpha:d100".to_string()]
+            filter_spec_candidates(&facts(), "alpha:"),
+            vec![
+                "alpha:default".to_string(),
+                "alpha:d100".to_string(),
+                "alpha:profile=".to_string(),
+                "alpha:size=".to_string(),
+                "alpha:predicates=".to_string(),
+            ]
         );
         assert_eq!(
-            filter_spec_candidates(&pairs(), "beta:w"),
+            filter_spec_candidates(&facts(), "beta:w"),
             vec!["Beta:wide".to_string()]
         );
-        assert!(filter_spec_candidates(&pairs(), "nope:x").is_empty());
+        assert_eq!(
+            filter_spec_candidates(&facts(), "alpha:size="),
+            vec!["alpha:size=1k".to_string(), "alpha:size=100".to_string()]
+        );
+        assert_eq!(
+            filter_spec_candidates(&facts(), "alpha:size=1k,pre"),
+            vec!["alpha:size=1k,predicates=".to_string()]
+        );
+        assert_eq!(
+            filter_spec_candidates(&facts(), "alpha:or(d1"),
+            vec!["alpha:or(d100".to_string()]
+        );
+        assert_eq!(
+            filter_spec_candidates(&facts(), "alpha:profile=d"),
+            vec!["alpha:profile=default".to_string(), "alpha:profile=d100".to_string()]
+        );
+        assert!(filter_spec_candidates(&facts(), "nope:x").is_empty());
     }
 
     #[test]

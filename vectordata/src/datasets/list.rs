@@ -15,6 +15,7 @@ use super::filter;
 use super::filter::{DatasetFilter, ProfileView};
 use crate::catalog::resolver::Catalog;
 use crate::dataset::CatalogEntry;
+use crate::dataset::selector::DatasetSpec;
 
 /// Shared clap-derived argument struct for `<binary> datasets
 /// list`. Defined once in vectordata so both the `vectordata`
@@ -53,7 +54,9 @@ pub struct ListArgs {
     #[arg(long = "matching-profile")]
     pub matching_profile: Option<String>,
 
-    /// Select a single dataset:profile; fails if the filters are ambiguous
+    /// Select a single dataset:profile; fails if the filters are ambiguous.
+    /// The profile part may be a selector expression (`ds:size=10m,predicates=uniform-2`),
+    /// which must resolve to exactly one profile.
     #[arg(long)]
     pub select: Option<String>,
 
@@ -319,6 +322,29 @@ fn output_select(entries: &[&CatalogEntry], pv: &ProfileView, select_value: &str
         } else {
             for p in profiles {
                 matches.push(format!("{}:{}", entry.name, p));
+            }
+        }
+    }
+
+    // A selector expression resolves against the named dataset's
+    // profiles (PS-9); a bare `dataset:profile` keeps the exact and
+    // prefix matching it always had.
+    if let Ok(spec) = DatasetSpec::parse(select_value)
+        && let Some(sel) = &spec.selector
+        && sel.bare_name().is_none()
+    {
+        let Some(entry) = entries.iter().find(|e| e.name.eq_ignore_ascii_case(&spec.head)) else {
+            eprintln!("--select '{select_value}': dataset '{}' does not match any dataset.", spec.head);
+            std::process::exit(1);
+        };
+        match entry.select_one(Some(sel.text())) {
+            Ok(profile) => {
+                println!("{}:{profile}", entry.name);
+                return;
+            }
+            Err(e) => {
+                eprintln!("--select '{select_value}': {e}");
+                std::process::exit(1);
             }
         }
     }

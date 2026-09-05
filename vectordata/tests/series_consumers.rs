@@ -85,7 +85,7 @@ fn deriving_from_an_explicit_series_copies_every_record() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(),
-            "default",
+            Some("default"),
             &out,
             "",
             &[],
@@ -119,7 +119,7 @@ fn deriving_from_a_uniform_series_copies_every_record() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(),
-            "default",
+            Some("default"),
             &out,
             "",
             &[],
@@ -156,7 +156,7 @@ fn a_series_re_strides_to_a_different_shard_layout() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(),
-            "default",
+            Some("default"),
             &out,
             "",
             &[],
@@ -214,7 +214,7 @@ fn deriving_a_windowed_series_slices_the_series() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(),
-            "default",
+            Some("default"),
             &out,
             "",
             &[],
@@ -382,7 +382,7 @@ fn deriving_a_series_without_a_stride_yields_the_single_file_a_kernel_needs() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(),
-            "default",
+            Some("default"),
             &out,
             "",
             &[],
@@ -458,7 +458,7 @@ fn a_vvec_series_derives_into_one_facet() {
     let out = tmp.path().join("out");
     assert_eq!(
         vectordata::datasets::derive::run(
-            src.to_str().unwrap(), "default", &out, "", &[], &[],
+            src.to_str().unwrap(), Some("default"), &out, "", &[], &[],
             Some("vv-derived"), true, Sharding::Whole,
         ),
         0,
@@ -505,7 +505,7 @@ fn a_windowed_vvec_series_slices_the_series() {
     let out = tmp.path().join("out");
     assert_eq!(
         vectordata::datasets::derive::run(
-            src.to_str().unwrap(), "default", &out, "", &[], &[],
+            src.to_str().unwrap(), Some("default"), &out, "", &[], &[],
             Some("vv-window"), true, Sharding::Whole,
         ),
         0
@@ -549,7 +549,7 @@ fn a_sliced_vvec_shard_contributes_only_its_own_records() {
     let out = tmp.path().join("out");
     assert_eq!(
         vectordata::datasets::derive::run(
-            src.to_str().unwrap(), "default", &out, "", &[], &[],
+            src.to_str().unwrap(), Some("default"), &out, "", &[], &[],
             Some("sliced"), true, Sharding::Whole,
         ),
         0,
@@ -600,7 +600,7 @@ fn a_slab_facet_survives_derive_by_either_plan_builder() {
     let out = tmp.path().join("out");
     assert_eq!(
         vectordata::datasets::derive::run(
-            src.to_str().unwrap(), "default", &out, "", &[], &[],
+            src.to_str().unwrap(), Some("default"), &out, "", &[], &[],
             Some("derived"), true, Sharding::Whole,
         ),
         0

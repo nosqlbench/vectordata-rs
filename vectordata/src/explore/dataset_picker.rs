@@ -297,6 +297,9 @@ struct PickerRow {
     cache_status: String,
     /// Predicted access mode for this profile's `base_vectors` source.
     access: AccessMode,
+    /// Everything a selector can read of this profile (PS-7), so the
+    /// filter box takes a selector expression (PS-9).
+    facts: crate::dataset::selector::ProfileFacts,
 }
 
 impl PickerRow {
@@ -368,6 +371,11 @@ fn build_rows(
                 size: String::new(),
                 cache_status,
                 access,
+                facts: crate::dataset::selector::ProfileFacts::of_declared(
+                    profile_name,
+                    &entry.layout.profiles,
+                )
+                .unwrap_or_default(),
             });
         }
     }
@@ -1224,6 +1232,156 @@ pub(super) fn purge_cache_for_entry(
     (removed, freed, skipped)
 }
 
+/// What a purge over a selection of profiles did (PS-9).
+pub(super) struct ProfilePurge {
+    pub removed: Vec<std::path::PathBuf>,
+    pub freed: u64,
+    pub skipped: Vec<String>,
+    /// Files left in place because a profile outside the selection
+    /// still references them, with that profile's name.
+    pub kept: Vec<(std::path::PathBuf, String)>,
+}
+
+/// Purge the cache of the profiles a selector named (PS-9): a file
+/// is removed only when **no unmatched profile references it**, so the
+/// base shards every profile shares survive a purge of one family, and
+/// what was kept is reported with the profile that kept it. A
+/// selection covering every profile is the whole-dataset purge.
+pub(super) fn purge_cache_for_profiles(
+    entry: &CatalogEntry,
+    selected: &[String],
+    cache_dir: &std::path::Path,
+) -> ProfilePurge {
+    let covers_all = entry
+        .profile_names()
+        .iter()
+        .all(|p| selected.iter().any(|s| s == p));
+    if covers_all {
+        let (removed, freed, skipped) = purge_cache_for_entry(entry, cache_dir);
+        return ProfilePurge { removed, freed, skipped, kept: Vec::new() };
+    }
+    let mut out = ProfilePurge { removed: Vec::new(), freed: 0, skipped: Vec::new(), kept: Vec::new() };
+    let name_dir = cache_dir.join(&entry.name);
+    if !name_dir.is_dir() {
+        return out;
+    }
+    let home = canonicalize_cache_url(&entry.dataset_home_url());
+    if let Some(origin) = crate::cache::layout::read_dataset_origin(&name_dir)
+        && canonicalize_cache_url(&origin.source) != home
+    {
+        out.skipped.push(format!(
+            "{} — origin.json records {} (a different catalog's dataset \
+             with the same name); not removed. Delete it manually if \
+             that's really what you want.",
+            name_dir.display(),
+            origin.source,
+        ));
+        return out;
+    }
+    let home_slash = {
+        let h = entry.dataset_home_url();
+        if h.ends_with('/') { h } else { format!("{h}/") }
+    };
+    // The cache leaves each profile's facets live in, by the same
+    // forward derivation the storage open uses.
+    let leaves_of = |profile: &crate::dataset::profile::DSProfile| -> Vec<String> {
+        profile
+            .views
+            .values()
+            .filter_map(|v| {
+                let clean = crate::dataset::catalog::strip_window_suffix(&v.source.path);
+                entry
+                    .resolve_facet_url(clean)
+                    .map(|url| crate::view::facet_cache_relpath(&url, &home_slash).to_string())
+            })
+            .collect()
+    };
+    let mut targets: Vec<String> = Vec::new();
+    let mut keepers: Vec<(String, Vec<String>)> = Vec::new();
+    for (pname, profile) in &entry.layout.profiles.profiles {
+        let leaves = leaves_of(profile);
+        if selected.iter().any(|s| s == pname) {
+            targets.extend(leaves);
+        } else {
+            keepers.push((pname.clone(), leaves));
+        }
+    }
+    let mut files = Vec::new();
+    collect_files(&name_dir, &mut files);
+    files.sort();
+    for file in files {
+        let rel = file
+            .strip_prefix(&name_dir)
+            .ok()
+            .and_then(|r| r.to_str())
+            .unwrap_or("")
+            .replace('\\', "/");
+        let Some(leaf) = cache_leaf_of(&rel) else { continue };
+        if !targets.iter().any(|t| leaf_matches(t, &leaf)) {
+            continue;
+        }
+        if let Some((keeper, _)) = keepers
+            .iter()
+            .find(|(_, leaves)| leaves.iter().any(|t| leaf_matches(t, &leaf)))
+        {
+            out.kept.push((file, keeper.clone()));
+            continue;
+        }
+        let bytes = std::fs::metadata(&file)
+            .map(|m| crate::cache::reader::allocated_size(&m))
+            .unwrap_or(0);
+        if std::fs::remove_file(&file).is_ok() {
+            out.freed += bytes;
+            out.removed.push(file);
+        }
+    }
+    out
+}
+
+/// The leaf a cached file belongs to: the data file itself, or the
+/// data file a sidecar rides beside. `origin.json` belongs to no leaf.
+fn cache_leaf_of(rel: &str) -> Option<String> {
+    if rel == "origin.json" {
+        return None;
+    }
+    for sidecar in [".mrkl", ".chunks"] {
+        if let Some(base) = rel.strip_suffix(sidecar) {
+            return Some(base.to_string());
+        }
+    }
+    Some(rel.to_string())
+}
+
+/// Whether a declared leaf names a cached one: literally, or as a
+/// series pattern whose `NNNN` a shard number fills.
+fn leaf_matches(declared: &str, leaf: &str) -> bool {
+    if declared == leaf {
+        return true;
+    }
+    let Some(i) = declared.find("NNNN") else {
+        return false;
+    };
+    let (pre, post) = (&declared[..i], &declared[i + 4..]);
+    leaf.len() > pre.len() + post.len()
+        && leaf.starts_with(pre)
+        && leaf.ends_with(post)
+        && leaf[pre.len()..leaf.len() - post.len()]
+            .chars()
+            .all(|c| c.is_ascii_digit())
+}
+
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        match e.file_type() {
+            Ok(ft) if ft.is_dir() => collect_files(&p, out),
+            Ok(_) => out.push(p),
+            Err(_) => {}
+        }
+    }
+}
+
 /// True iff a facet URL is a child of `base_url` (the recorded
 /// parent-URL origin of a dataset directory). The picker computes
 /// every facet URL declared by the dataset entry; if any of them
@@ -1821,6 +1979,16 @@ fn row_visible(
 
 fn matches_filter(row: &PickerRow, filter: &str) -> bool {
     if filter.is_empty() { return true; }
+
+    // An expression is a selector over the row's profile (PS-9). A
+    // bare word is not: it stays the substring match over dataset,
+    // profile and metric a picker filter has always been, because a
+    // half-typed name must keep narrowing the list as it is typed.
+    if let Ok(selector) = crate::dataset::selector::Selector::parse(filter)
+        && selector.bare_name().is_none()
+    {
+        return selector.matches(&row.facts);
+    }
 
     // If filter is all uppercase letters that are valid facet codes, match by facets.
     // Valid codes: B Q G D M P R F
@@ -4356,7 +4524,98 @@ mod tests {
             size: String::new(),
             cache_status: "—".to_string(),
             access: crate::AccessMode::FullTransfer,
+            facts: Default::default(),
         }
+    }
+
+    /// **A purge over a selection keeps what an unmatched profile still
+    /// references** (PS-9): the shared base survives a purge of one
+    /// profile and is reported with its keeper; the whole selection is
+    /// the whole-dataset purge.
+    #[test]
+    fn a_selective_purge_keeps_what_another_profile_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let ds = cache.join("ds-p");
+        std::fs::create_dir_all(ds.join("profiles/10m")).unwrap();
+        std::fs::write(ds.join("base.fvecs"), b"base").unwrap();
+        std::fs::write(ds.join("base.fvecs.mrkl"), b"m").unwrap();
+        std::fs::write(ds.join("profiles/10m/gt.ivecs"), b"gt").unwrap();
+        std::fs::write(ds.join("profiles/10m/gt.ivecs.mrkl"), b"m").unwrap();
+
+        let profiles: crate::dataset::DSProfileGroup = serde_yaml::from_str(
+            "default:\n  base_vectors: base.fvecs\n10m:\n  base_count: 10\n  \
+             base_vectors: base.fvecs[0..10)\n  neighbor_indices: profiles/10m/gt.ivecs\n",
+        )
+        .unwrap();
+        let entry = crate::dataset::CatalogEntry {
+            name: "ds-p".to_string(),
+            path: "https://h/data/ds-p/dataset.yaml".to_string(),
+            dataset_type: "dataset.yaml".to_string(),
+            catalog_file: None,
+            catalog_name: None,
+            layout: crate::dataset::CatalogLayout {
+                format_version: crate::model::FORMAT_VERSION_BASE,
+                profile_tags: Default::default(),
+                attributes: None,
+                profiles,
+            },
+        };
+
+        let one = super::purge_cache_for_profiles(&entry, &["10m".to_string()], &cache);
+        let removed: Vec<String> = one.removed.iter().map(|p| p.display().to_string()).collect();
+        assert!(removed.iter().any(|p| p.ends_with("profiles/10m/gt.ivecs")), "{removed:?}");
+        assert!(removed.iter().any(|p| p.ends_with("gt.ivecs.mrkl")), "the sidecar goes with its leaf");
+        assert!(ds.join("base.fvecs").exists(), "the shared base survives");
+        assert!(ds.join("base.fvecs.mrkl").exists());
+        assert!(
+            one.kept.iter().any(|(p, keeper)| p.ends_with("base.fvecs") && keeper == "default"),
+            "what was kept is reported with its keeper: {:?}",
+            one.kept
+        );
+
+        let all = super::purge_cache_for_profiles(
+            &entry,
+            &["default".to_string(), "10m".to_string()],
+            &cache,
+        );
+        assert!(all.kept.is_empty());
+        assert!(!ds.exists(), "every profile selected is the whole-dataset purge");
+    }
+
+    /// **The filter box takes a selector expression, and a bare word
+    /// stays a substring** (PS-9, settled in implementation).
+    #[test]
+    fn the_filter_reads_expressions_as_selectors_and_words_as_substrings() {
+        let mut uniform = test_row("tessera", "10m-uniform-2-1e-2");
+        uniform.facts = crate::dataset::selector::ProfileFacts {
+            name: uniform.profile.clone(),
+            base_count: Some(10_000_000),
+            attributes: vec![
+                ("size".into(), serde_yaml::Value::from("10m")),
+                ("predicates".into(), serde_yaml::Value::from("uniform-2")),
+                ("selectivity".into(), serde_yaml::Value::from(0.01)),
+            ],
+            ..Default::default()
+        };
+        let mut mixed = test_row("tessera", "10m");
+        mixed.facts = crate::dataset::selector::ProfileFacts {
+            name: mixed.profile.clone(),
+            base_count: Some(10_000_000),
+            attributes: vec![
+                ("size".into(), serde_yaml::Value::from("10m")),
+                ("predicates".into(), serde_yaml::Value::from("mixed")),
+            ],
+            ..Default::default()
+        };
+        assert!(super::matches_filter(&uniform, "predicates=uniform*"));
+        assert!(!super::matches_filter(&mixed, "predicates=uniform*"));
+        assert!(super::matches_filter(&mixed, "and(size=10m,not(predicates=uniform*))"));
+        assert!(super::matches_filter(&uniform, "selectivity<=1e-2"));
+        // A bare word narrows by substring, as it always has.
+        assert!(super::matches_filter(&uniform, "uniform"));
+        assert!(super::matches_filter(&mixed, "tess"));
+        assert!(!super::matches_filter(&mixed, "uniform"));
     }
 
     fn view_for(path: &str) -> crate::dataset::profile::DSView {

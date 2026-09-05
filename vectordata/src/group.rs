@@ -365,15 +365,24 @@ impl TestDataGroup {
         progress_cb: &mut dyn FnMut(&str, &str, &crate::PrebufferProgress),
         warn_cb: &mut dyn FnMut(u64),
     ) -> crate::Result<()> {
-        // Tally total announced size across every profile so we can
+        self.prebuffer_profiles_with_progress(&self.profile_names(), fallback, progress_cb, warn_cb)
+    }
+
+    /// Prebuffer the named profiles, in the order given (PS-9): what a
+    /// set selector resolved to. `prebuffer_all_profiles_with_progress`
+    /// is this over every profile.
+    pub fn prebuffer_profiles_with_progress(
+        &self,
+        profiles: &[String],
+        fallback: crate::view::WholeFacetFallback,
+        progress_cb: &mut dyn FnMut(&str, &str, &crate::PrebufferProgress),
+        warn_cb: &mut dyn FnMut(u64),
+    ) -> crate::Result<()> {
+        // Tally total announced size across the profiles so we can
         // surface a large-download warning before doing the work.
         let mut total_bytes: u64 = 0;
-        let mut profiles: Vec<String> = self.profile_names();
-        // Stable order: profile_names() already returns
-        // size-sorted; we fold dedupes implicitly because keys
-        // are unique.
-        profiles.sort();
-        profiles.dedup();
+        let mut seen = std::collections::HashSet::new();
+        let profiles: Vec<&String> = profiles.iter().filter(|p| seen.insert(p.as_str())).collect();
         for profile_name in &profiles {
             if let Some(view) = self.profile(profile_name) {
                 for (facet, desc) in view.facet_manifest() {

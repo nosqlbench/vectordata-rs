@@ -48,6 +48,7 @@ use crate::dataset::source::DSWindow;
 use crate::dataset::Sharding;
 use crate::merkle::MerkleRef;
 use crate::typed_access::ElementType;
+use crate::dataset::selector::DatasetSpec;
 
 /// Default chunk size for merkle-tree generation on the derived
 /// files. 1 MiB matches `merkle create`'s default.
@@ -148,7 +149,7 @@ fn plan_output_size(src: &SourceSpans, kind: FacetKind, window: &DSWindow) -> io
 /// single-file form in every case (SH-35, SH-83).
 pub fn run(
     dataset: &str,
-    profile: &str,
+    profile: Option<&str>,
     output: &Path,
     configdir: &str,
     extra_catalogs: &[String],
@@ -162,17 +163,34 @@ pub fn run(
         return 1;
     }
 
+    // The spec may carry the selector (PS-1); an explicit --profile
+    // outranks it (PS-14). A path that exists is taken whole, whatever
+    // punctuation it contains.
+    let (head, spec_selector) = if Path::new(dataset).exists() {
+        (dataset.to_string(), None)
+    } else {
+        match DatasetSpec::parse(dataset) {
+            Ok(spec) => (spec.head, spec.selector.map(|s| s.text().to_string())),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        }
+    };
+    let selector = profile.map(str::to_string).or(spec_selector);
+    let dataset = head.as_str();
+
     // Fast local path: a directory containing dataset.yaml, or a
     // direct path to a dataset.yaml file. No catalog lookup, no
     // runtime access layer, no precache — just read the YAML
     // and slice the files in place.
     if let Some(yaml_path) = local_dataset_yaml(dataset) {
-        return derive_local(&yaml_path, profile, output, name_override, sharding);
+        return derive_local(&yaml_path, selector.as_deref(), output, name_override, sharding);
     }
 
     // Otherwise: catalog / URL → runtime access layer.
     derive_via_access_layer(
-        dataset, profile, output, configdir, extra_catalogs, at, name_override, sharding)
+        dataset, selector.as_deref(), output, configdir, extra_catalogs, at, name_override, sharding)
 }
 
 /// If `dataset` points at a local directory containing a
@@ -218,7 +236,7 @@ fn preflight_output(output: &Path, force: bool) -> Result<(), String> {
 /// `settings.yaml` entirely.
 fn derive_local(
     yaml_path: &Path,
-    profile_name: &str,
+    selector: Option<&str>,
     output: &Path,
     name_override: Option<&str>,
     sharding: Sharding,
@@ -228,16 +246,16 @@ fn derive_local(
         Ok(c) => c,
         Err(e) => { eprintln!("error: failed to load {}: {e}", yaml_path.display()); return 1; }
     };
-    let ds_profile = match config.profiles.profile(profile_name) {
-        Some(p) => p,
-        None => {
-            eprintln!("Profile '{profile_name}' not found in {}.", yaml_path.display());
-            let names: Vec<&str> = config.profiles.profiles.keys()
-                .map(|s| s.as_str()).collect();
-            eprintln!("Available: {}", names.join(", "));
+    // The one profile the selector names (PS-9); derive writes one.
+    let profile_name = match config.profiles.select_one(selector) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {}: {e}", yaml_path.display());
             return 1;
         }
     };
+    let profile_name = profile_name.as_str();
+    let ds_profile = config.profiles.profile(profile_name).expect("a selected profile exists");
 
     let plan = match build_plan_local(base_dir, ds_profile, output) {
         Ok(p) => p,
@@ -258,7 +276,7 @@ fn derive_local(
 /// cache, then read from there.
 fn derive_via_access_layer(
     dataset: &str,
-    profile_name: &str,
+    selector: Option<&str>,
     output: &Path,
     configdir: &str,
     extra_catalogs: &[String],
@@ -299,14 +317,16 @@ fn derive_via_access_layer(
             (g, path)
         }
     };
-    let view = match group.profile(profile_name) {
-        Some(v) => v,
-        None => {
-            eprintln!("Profile '{profile_name}' not found at {yaml_url}.");
-            eprintln!("Available: {}", group.profile_names().join(", "));
+    // The one profile the selector names (PS-9); derive writes one.
+    let profile_name = match group.select_one(selector) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {yaml_url}: {e}");
             return 1;
         }
     };
+    let profile_name = profile_name.as_str();
+    let view = group.profile(profile_name).expect("a selected profile exists");
     let rich = match load_rich_config(&yaml_url) {
         Ok(c) => c,
         Err(e) => {
@@ -2167,7 +2187,7 @@ mod tests {
         let yaml_path = src.path().join("dataset.yaml");
         let rc = derive_local(
             &yaml_path,
-            "default",
+            Some("default"),
             dst.path(),
             Some("derived"),
             Sharding::Whole,

@@ -198,9 +198,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub recursive: bool,
 
-    /// Run steps for a specific profile, or `all` to run every profile
-    /// with barriers between them. Steps with a `profiles` field are gated:
-    /// they run only when the active profile is listed. Steps without a
+    /// Run steps for one profile, named by a selector (PS-3): a name, or
+    /// an expression such as `size=10m,predicates=uniform-2` that must
+    /// match exactly one profile; `all` runs every profile with barriers
+    /// between them. Steps with a `profiles` field are gated: they run
+    /// only when the active profile is listed. Steps without a
     /// `profiles` field are shared and always run.
     #[arg(long, default_value = "all")]
     pub profile: String,
@@ -364,7 +366,8 @@ pub struct ScriptArgs {
     /// Path to dataset.yaml (default: dataset.yaml in current directory)
     pub dataset: Option<PathBuf>,
 
-    /// Emit steps for a specific profile, or `all` for every profile.
+    /// Emit steps for one profile, named by a selector (PS-3) that must
+    /// match exactly one, or `all` for every profile.
     #[arg(long, default_value = "all")]
     pub profile: String,
 
@@ -423,7 +426,8 @@ pub fn run_script(args: ScriptArgs) {
         .map(|w| std::fs::canonicalize(&cwd).ok().map(|c| w == c).unwrap_or(false))
         .unwrap_or(false);
 
-    let profile_name = &args.profile;
+    let profile_name = resolve_profile_flag(&config, &args.profile);
+    let profile_name = profile_name.as_str();
 
     let mut config = config; // make mutable for resolve_all_steps
     let expanded_steps = resolve_all_steps(&mut config, &workspace);
@@ -627,20 +631,13 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
 
-    // Optionally filter to a single profile
-    let profile_name = &args.profile;
+    // Optionally filter to a single profile: the flag is a selector
+    // that must name one (PS-9); `all` is every profile.
+    let profile_name = resolve_profile_flag(&config, &args.profile);
+    let profile_name = profile_name.as_str();
     let steps = if profile_name == "all" {
         expanded_steps
     } else {
-        // Validate profile exists
-        if !config.profiles.is_empty() && config.profiles.profile(profile_name).is_none() {
-            println!(
-                "Profile '{}' not found. Available profiles: {}",
-                profile_name,
-                config.profile_names().join(", ")
-            );
-            std::process::exit(1);
-        }
         vectordata::dataset::filter_steps_for_profile(expanded_steps, profile_name)
     };
 
@@ -852,7 +849,7 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
     let cache_dir_for_guidance = cache_dir.clone();
     let mut ctx = StreamContext {
         dataset_name,
-        profile: profile_name.clone(),
+        profile: profile_name.to_string(),
         profile_names: all_profile_names,
         workspace,
         cache: cache_dir,
@@ -1747,6 +1744,22 @@ fn rewrite_var_refs(input: &str, var_names: &std::collections::HashSet<String>) 
 /// Emit the fully resolved pipeline as YAML to stdout.
 ///
 /// Delegates to [`resolve_pipeline_yaml`] and prints the result.
+/// The profile a `--profile` flag names (PS-9): `all` is every profile,
+/// as it always was; anything else is a selector that must name
+/// exactly one, refused with the matches when it names more.
+fn resolve_profile_flag(config: &vectordata::dataset::DatasetConfig, flag: &str) -> String {
+    if flag == "all" || config.profiles.is_empty() {
+        return flag.to_string();
+    }
+    match config.profiles.select_one(Some(flag)) {
+        Ok(name) => name,
+        Err(e) => {
+            println!("--profile {flag}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn emit_resolved_yaml(
     pipeline_dag: &dag::PipelineDag,
     defaults: &IndexMap<String, String>,

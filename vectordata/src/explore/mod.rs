@@ -159,13 +159,16 @@ pub(crate) fn resolve_palette_curve(
 /// in one TUI. Run without any source flag to pop the catalog picker.
 #[derive(veks_completion_derive::VeksCli)]
 pub struct ExploreArgs {
-    /// Dataset from catalog (e.g., img-search or img-search:default)
+    /// Dataset from catalog, with an optional selector (PS-1):
+    /// `img-search`, `img-search:default`, or `tessera:size=10m,predicates=uniform-2`.
+    /// The explorer shows one profile, so the selector must name exactly one;
+    /// none means `default`.
     #[arg(long, group = "input")]
     pub dataset: Option<String>,
     /// Any data source: local file path or dataset:profile:facet
     #[arg(long, group = "input")]
     pub source: Option<String>,
-    /// Profile name (used with --dataset; overrides profile in dataset:profile)
+    /// Profile selector (used with --dataset; outranks a selector carried by the spec)
     #[arg(long)]
     pub profile: Option<String>,
     /// Number of vectors to sample
@@ -194,8 +197,11 @@ pub struct ExploreArgs {
 
 /// Resolve the data source from mutually exclusive --dataset / --source options.
 ///
-/// When `--profile` is given with `--dataset`, it's appended as `dataset:profile`.
-/// If the dataset already contains a `:`, the explicit `--profile` overrides it.
+/// `--profile` is a selector that outranks whatever selector the spec
+/// carries (PS-14): the spec's head is found by its shape (PS-2), so a
+/// URL keeps its scheme and port, and the flag replaces what follows.
+/// A spec with no selector is left alone; the opener reads it as
+/// `default` (PS-10).
 fn resolve_input(
     dataset: Option<String>,
     source: Option<String>,
@@ -215,16 +221,10 @@ fn resolve_input(
 
     Some(match profile {
         Some(p) => {
-            let name = base.split(':').next().unwrap_or(&base);
-            format!("{}:{}", name, p)
+            let (head, _) = crate::dataset::selector::DatasetSpec::split_head(&base);
+            format!("{head}:{p}")
         }
-        None => {
-            if !base.contains(':') && !base.contains('/') && !base.contains('.') {
-                format!("{}:default", base)
-            } else {
-                base
-            }
-        }
+        None => base,
     })
 }
 
@@ -368,8 +368,8 @@ fn run_locate(specifier: &str, pause: bool) {
 
 /// Pure body of [`run_locate`].
 fn locate_lines(specifier: &str, cache_root: &std::path::Path) -> Vec<String> {
-    let (dataset, _profile) = split_specifier(specifier);
-    let dir = cache_root.join(dataset);
+    let dataset = specifier_head(specifier);
+    let dir = cache_root.join(&dataset);
     vec![
         format!("# location of {dataset} on local system:"),
         if dir.is_dir() {
@@ -380,12 +380,24 @@ fn locate_lines(specifier: &str, cache_root: &std::path::Path) -> Vec<String> {
     ]
 }
 
-/// Split a `dataset:profile` specifier. Profile defaults to `default`.
-fn split_specifier(specifier: &str) -> (&str, &str) {
-    match specifier.split_once(':') {
-        Some((d, p)) if !p.is_empty() => (d, p),
-        _ => (specifier, "default"),
-    }
+/// Split a `dataset[:selector]` specifier by the head's shape (PS-2).
+/// The picker builds `dataset:profile` itself; a typed `--dataset`
+/// can carry any selector, and a malformed one is reported rather
+/// than looked up.
+fn split_specifier(
+    specifier: &str,
+) -> Result<(String, Option<String>), crate::dataset::selector::SelectorError> {
+    let spec = crate::dataset::selector::DatasetSpec::parse(specifier)?;
+    Ok((spec.head, spec.selector.map(|s| s.text().to_string())))
+}
+
+/// The dataset a specifier names, whatever follows it. For a surface
+/// that acts on the dataset as a whole (locate, purge) the selector is
+/// not consulted, and a malformed one must not hide the dataset.
+fn specifier_head(specifier: &str) -> String {
+    split_specifier(specifier)
+        .map(|(head, _)| head)
+        .unwrap_or_else(|_| specifier.to_string())
 }
 
 /// Pause for a keystroke so the user can read the action's stderr
@@ -430,13 +442,22 @@ fn run_precache(specifier: &str, pause: bool) {
 }
 
 fn run_purge(specifier: &str, pause: bool) {
-    let (dataset, _profile) = split_specifier(specifier);
-    // Purge is per-dataset: every cache leaf whose origin URL belongs
-    // to ANY facet of ANY profile is removed. The profile component of
-    // the specifier is ignored on purpose — the runtime's cache is
-    // content-addressed by URL, not by profile, so per-profile purge
-    // can't actually exist without re-introducing the dataset-named
-    // layout we already moved away from.
+    // Purge acts on the profiles the selector names (PS-9): a file is
+    // removed only when no unmatched profile references it, so the
+    // base every profile shares survives a purge of one, and
+    // `profile=*` frees everything. The cache is content-addressed by
+    // URL, so this is a guard over shared files, not a per-profile
+    // layout.
+    let (dataset, selector) = match split_specifier(specifier) {
+        Ok(split) => split,
+        Err(e) => {
+            eprintln!("error: {e}");
+            if pause {
+                pause_for_keypress();
+            }
+            return;
+        }
+    };
     let sources = crate::catalog::sources::CatalogSources::new().configure_default();
     let catalog = crate::catalog::resolver::Catalog::of(&sources);
     let entry = match catalog.datasets().iter().find(|e| e.name == dataset) {
@@ -449,24 +470,38 @@ fn run_purge(specifier: &str, pause: bool) {
             return;
         }
     };
+    let selected = match entry.select(selector.as_deref()) {
+        Ok(names) => names,
+        Err(e) => {
+            eprintln!("error: dataset '{dataset}': {e}");
+            if pause {
+                pause_for_keypress();
+            }
+            return;
+        }
+    };
     let cache_dir = crate::settings::cache_dir().unwrap_or_else(|e| {
         eprintln!("error: cannot resolve cache_dir: {e}");
         std::process::exit(1);
     });
-    let (removed, freed, skipped) = dataset_picker::purge_cache_for_entry(&entry, &cache_dir);
-    for note in &skipped {
+    let what = format!("{dataset}:{}", selector.as_deref().unwrap_or("default"));
+    let outcome = dataset_picker::purge_cache_for_profiles(&entry, &selected, &cache_dir);
+    for note in &outcome.skipped {
         eprintln!("skipped: {note}");
     }
-    if removed.is_empty() {
-        println!("No cached entries found for '{dataset}'.");
+    for (path, keeper) in &outcome.kept {
+        println!("kept {} — still referenced by profile '{keeper}'", path.display());
+    }
+    if outcome.removed.is_empty() {
+        println!("No cached entries removed for '{what}'.");
     } else {
         println!(
-            "Purged {} cache entr{} for '{dataset}' ({}):",
-            removed.len(),
-            if removed.len() == 1 { "y" } else { "ies" },
-            format_bytes_short(freed)
+            "Purged {} cache entr{} for '{what}' ({}):",
+            outcome.removed.len(),
+            if outcome.removed.len() == 1 { "y" } else { "ies" },
+            format_bytes_short(outcome.freed)
         );
-        for path in &removed {
+        for path in &outcome.removed {
             println!("  - {}", path.display());
         }
     }
@@ -491,13 +526,22 @@ pub(crate) fn format_bytes_short(n: u64) -> String {
 }
 
 fn run_ping(specifier: &str, pause: bool) {
-    let (dataset, profile) = split_specifier(specifier);
+    let (dataset, selector) = match split_specifier(specifier) {
+        Ok(split) => split,
+        Err(e) => {
+            eprintln!("error: {e}");
+            if pause {
+                pause_for_keypress();
+            }
+            return;
+        }
+    };
     // Use the same union catalog the picker built its row list from
     // so a ping from inside the picker hits exactly the catalogs the
     // user can see.
     let sources = crate::catalog::sources::CatalogSources::new().configure_default();
     let catalog = crate::catalog::resolver::Catalog::of(&sources);
-    let code = crate::datasets::ping::run_via_catalog(&catalog, dataset, profile);
+    let code = crate::datasets::ping::run_via_catalog(&catalog, &dataset, selector.as_deref());
     if code != 0 {
         eprintln!("(ping exited with status {code})");
     }

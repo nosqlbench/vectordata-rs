@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use super::build_sources;
 use crate::catalog::resolver::Catalog;
 use crate::{PrebufferProgress, TestDataView};
+use crate::dataset::selector::{DatasetSpec, SelectorError};
 
 /// Everything a precache run needs.
 ///
@@ -93,12 +94,16 @@ impl PrecacheRequest {
 
 /// Entry point.
 ///
-/// `dataset_spec` is one of:
-/// - `name:profile` resolved via the catalog (e.g. `glove-100:default`)
-/// - `name` resolved via the catalog (uses *all* profiles)
+/// `dataset_spec` is `<head>[:<selector>]` (PS-1), where the head is:
+/// - a catalog name (e.g. `glove-100:default`, `tessera:size=10m`)
 /// - a local directory containing a `dataset.yaml`
 /// - a path to a `dataset.yaml` file
 /// - an HTTP URL to a dataset directory or `dataset.yaml`
+///
+/// The selector names the profiles to fetch; precache acts on every
+/// match (PS-9). A spec with no selector and no `--profile` is refused
+/// naming `head:profile=*`, which is how "every profile" is spelled
+/// now (PS-1).
 ///
 /// `configdir`, `extra_catalogs`, and `at` are the catalog-source
 /// inputs (same shape both binaries pass). `cache_dir` is purely
@@ -149,15 +154,23 @@ pub fn run(req: PrecacheRequest) -> i32 {
         );
     }
 
-    let (resolution, spec_profile) = match resolve_spec(dataset_spec, configdir, extra_catalogs, at)
-    {
+    let (head, spec_selector) = match classify_spec(dataset_spec) {
+        Ok(split) => split,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    // An explicit --profile outranks whatever the spec implied; it is
+    // a selector too (PS-14).
+    let selector = req.profile.clone().or(spec_selector);
+    let Some(selector) = selector else {
+        eprintln!("error: {}", bare_spec_refusal(&head));
+        return 2;
+    };
+    let resolution = match resolve_spec(&head, Some(&selector), configdir, extra_catalogs, at) {
         Some(r) => r,
         None => return 1,
-    };
-    // An explicit --profile outranks whatever the spec implied.
-    let profile_sel = match req.profile.as_deref() {
-        Some(p) => ProfileSelection::Named(p.to_string()),
-        None => spec_profile,
     };
 
     // Open through whichever path knows how to materialise this
@@ -193,64 +206,51 @@ pub fn run(req: PrecacheRequest) -> i32 {
         eprintln!("  Cache root: {}", c.display());
     }
 
-    match profile_sel {
-        ProfileSelection::Named(profile_name) => {
-            let view = match group.profile(&profile_name) {
-                Some(v) => v,
-                None => {
-                    eprintln!("Profile '{profile_name}' not found at {descriptor}.");
-                    eprintln!("Available profiles: {}", group.profile_names().join(", "));
-                    return 1;
-                }
-            };
-            if req.is_selective() {
-                return drive_selective(
-                    &*view,
-                    &format!("{descriptor}:{profile_name}"),
-                    &req.facets,
-                    window.as_ref(),
-                    req.plan_only,
-                    req.allow_whole_facet,
-                );
-            }
-            eprintln!("Prebuffering {descriptor}:{profile_name}");
-            drive_prebuffer(&*view, req.allow_whole_facet)
+    // The set the selector names, size-ordered (PS-9). Precache acts
+    // on every match; one match is the single-profile run it always
+    // was.
+    let names = match group.select(Some(&selector)) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {descriptor}: {e}");
+            return 1;
         }
-        ProfileSelection::AllProfiles if req.is_selective() => {
-            // A facet or window selection needs one profile to resolve
-            // against — the same facet name means different bytes in
-            // different profiles, and silently picking one would be a
-            // guess presented as a result.
-            let names = group.profile_names();
-            if names.len() == 1 {
-                let view = group.profile(&names[0]).expect("profile just listed");
-                return drive_selective(
-                    &*view,
-                    &format!("{descriptor}:{}", names[0]),
-                    &req.facets,
-                    window.as_ref(),
-                    req.plan_only,
-                    req.allow_whole_facet,
-                );
-            }
-            eprintln!(
-                "error: --facet/--window/--plan need a single profile, but \
-                 '{descriptor}' has {}: {}",
-                names.len(),
-                names.join(", ")
+    };
+    if let [profile_name] = names.as_slice() {
+        let view = group.profile(profile_name).expect("a selected profile exists");
+        if req.is_selective() {
+            return drive_selective(
+                &*view,
+                &format!("{descriptor}:{profile_name}"),
+                &req.facets,
+                window.as_ref(),
+                req.plan_only,
+                req.allow_whole_facet,
             );
-            eprintln!("Choose one with `--profile <name>`.");
-            2
         }
-        ProfileSelection::AllProfiles => {
-            let names = group.profile_names();
-            eprintln!(
-                "Prebuffering {descriptor} — all profiles ({})",
-                names.join(", ")
-            );
-            drive_prebuffer_all(&group, req.allow_whole_facet)
-        }
+        eprintln!("Prebuffering {descriptor}:{profile_name}");
+        return drive_prebuffer(&*view, req.allow_whole_facet);
     }
+    if req.is_selective() {
+        // A facet or window selection needs one profile to resolve
+        // against — the same facet name means different bytes in
+        // different profiles, and silently picking one would be a
+        // guess presented as a result.
+        eprintln!(
+            "error: --facet/--window/--plan need a single profile, but \
+             '{descriptor}:{selector}' matches {}: {}",
+            names.len(),
+            names.join(", ")
+        );
+        eprintln!("Narrow the selector, or choose one with `--profile <name>`.");
+        return 2;
+    }
+    eprintln!(
+        "Prebuffering {descriptor}:{selector} — {} profiles ({})",
+        names.len(),
+        names.join(", ")
+    );
+    drive_prebuffer_all(&group, &names, req.allow_whole_facet)
 }
 
 enum Resolved {
@@ -269,75 +269,61 @@ enum Resolved {
     Url(String),
 }
 
-/// Split a spec into the part that names a dataset and the profile
-/// selection it implies.
+/// Split a spec into the part that names a dataset and the selector
+/// after it (PS-2).
 ///
 /// Pure, so the punctuation rules can be tested on any platform —
 /// they are exactly the kind that look obvious and are wrong somewhere
-/// else.
+/// else. A **path that exists** is a path whatever punctuation it
+/// contains, and the head of anything else is found by its shape: a
+/// URL by scheme and authority, a path by its separators or a drive
+/// letter, and a catalog name otherwise. This is what makes Windows
+/// work: a spec there looks like `C:\\data\\ds`, and splitting on the
+/// first colon would take the drive letter for a dataset name and the
+/// rest for a profile. That is how `precache -d C:\\data\\ds` came to
+/// report that *'C' is not a local path*.
 ///
-/// The order matters:
-///
-/// 1. A **URL** is unambiguous.
-/// 2. A **path that exists** is a path, whatever punctuation it
-///    contains. This is what makes Windows work: a spec there looks
-///    like `C:\\data\\ds`, and splitting on the first colon would take
-///    the drive letter for a dataset name and the rest for a profile.
-///    That is how `precache -d C:\\data\\ds` came to report that
-///    *'C' is not a local path*.
-/// 3. A **separator** means it was meant as a path even if it does not
-///    exist, so the diagnostic names the path rather than hunting a
-///    catalog for a fragment of it. Backslash counts, not only slash.
-/// 4. Otherwise a **colon** separates a catalog name from a profile.
-///
-/// A local path still cannot carry a `:profile` suffix on any platform
-/// — use the `--profile` flag, which is why it exists.
-fn classify_spec(dataset_spec: &str) -> (&str, ProfileSelection) {
-    if dataset_spec.starts_with("http://") || dataset_spec.starts_with("https://") {
-        return (dataset_spec, ProfileSelection::AllProfiles);
-    }
+/// A malformed selector is a selector error, never a dataset lookup.
+fn classify_spec(dataset_spec: &str) -> Result<(String, Option<String>), SelectorError> {
     if Path::new(dataset_spec).exists() {
-        return (dataset_spec, ProfileSelection::AllProfiles);
+        return Ok((dataset_spec.to_string(), None));
     }
-    if dataset_spec.contains('/') || dataset_spec.contains('\\') {
-        return (dataset_spec, ProfileSelection::AllProfiles);
-    }
-    match dataset_spec.find(':') {
-        Some(pos) => (
-            &dataset_spec[..pos],
-            ProfileSelection::Named(dataset_spec[pos + 1..].to_string()),
-        ),
-        None => (dataset_spec, ProfileSelection::AllProfiles),
-    }
+    let spec = DatasetSpec::parse(dataset_spec)?;
+    Ok((spec.head, spec.selector.map(|s| s.text().to_string())))
 }
 
-/// Whether the user named a specific profile or asked for all of
-/// them. A bare `dataset` spec (no `:profile` suffix) selects all
-/// profiles; an explicit `dataset:profile` selects just that one.
-enum ProfileSelection {
-    Named(String),
-    AllProfiles,
+/// The message a spec with no selector gets (PS-1).
+///
+/// A bare dataset used to precache every profile. Every other surface
+/// reads no selector as `default`, and quietly meaning less than it
+/// used to would be worse than either, so the old form is refused
+/// naming both spellings.
+fn bare_spec_refusal(head: &str) -> String {
+    format!(
+        "'{head}' names no profile. A bare dataset used to precache every profile; \
+         say which:\n  {head}:profile=*   every profile\n  {head}:default     the default \
+         profile\n  {head}:<selector>  a selection, e.g. {head}:size=10m"
+    )
 }
 
-/// Resolve a user-supplied spec to a (path-or-url, profile)
-/// pair. Returns `None` when resolution fails after writing a
-/// diagnostic to stderr — the caller surfaces the exit code.
+/// Resolve a dataset head to where it lives. Returns `None` when
+/// resolution fails after writing a diagnostic to stderr — the caller
+/// surfaces the exit code. A catalog entry has the selector checked
+/// against it here, before anything is fetched (PS-9).
 fn resolve_spec(
-    dataset_spec: &str,
+    head: &str,
+    selector: Option<&str>,
     configdir: &str,
     extra_catalogs: &[String],
     at: &[String],
-) -> Option<(Resolved, ProfileSelection)> {
-    let (head, profile_sel) = classify_spec(dataset_spec);
-
+) -> Option<Resolved> {
     if head.starts_with("http://") || head.starts_with("https://") {
-        return Some((Resolved::Url(head.to_string()), profile_sel));
+        return Some(Resolved::Url(head.to_string()));
     }
     let as_path = Path::new(head);
     if as_path.exists() {
-        return Some((Resolved::Local(head.to_string()), profile_sel));
+        return Some(Resolved::Local(head.to_string()));
     }
-
     let sources = build_sources(configdir, extra_catalogs, at);
     if sources.is_empty() {
         eprintln!(
@@ -358,18 +344,12 @@ fn resolve_spec(
             return None;
         }
     };
-    if let ProfileSelection::Named(ref p) = profile_sel
-        && entry.layout.profiles.profile(p).is_none()
-    {
-        eprintln!(
-            "Profile '{p}' not found in dataset '{}'. Available: {}",
-            entry.name,
-            entry.profile_names().join(", ")
-        );
+    if let Err(e) = entry.select(selector) {
+        eprintln!("error: dataset '{}': {e}", entry.name);
         return None;
     }
     let name = entry.name.clone();
-    Some((Resolved::CatalogEntry { catalog, name }, profile_sel))
+    Some(Resolved::CatalogEntry { catalog, name })
 }
 
 // ─── Drivers ─────────────────────────────────────────────────────────
@@ -613,14 +593,14 @@ fn render_plan(plans: &[(String, crate::PrefetchPlan)]) -> String {
     s
 }
 
-fn drive_prebuffer_all(group: &crate::TestDataGroup, allow_whole_facet: bool) -> i32 {
+fn drive_prebuffer_all(group: &crate::TestDataGroup, names: &[String], allow_whole_facet: bool) -> i32 {
     let mut all_facets: Vec<FacetPlanRow> = Vec::new();
     let mut total_bytes = 0u64;
     let mut unresolvable: Vec<String> = Vec::new();
     let mut status = StatusTicker::start();
-    for profile_name in group.profile_names() {
-        if let Some(view) = group.profile(&profile_name) {
-            let plan = match plan_prebuffer(&*view, &mut |e| status.on_in(&profile_name, e)) {
+    for profile_name in names {
+        if let Some(view) = group.profile(profile_name) {
+            let plan = match plan_prebuffer(&*view, &mut |e| status.on_in(profile_name, e)) {
                 Ok(p) => p,
                 Err(e) => {
                     drop(status);
@@ -639,7 +619,7 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup, allow_whole_facet: bool) ->
     }
     drop(status);
     if all_facets.is_empty() {
-        println!("Precache: no facets across any profile.");
+        println!("Precache: no facets across the selected profiles.");
         return 0;
     }
     if !allow_whole_facet && !unresolvable.is_empty() {
@@ -648,24 +628,26 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup, allow_whole_facet: bool) ->
     }
     if total_bytes >= crate::PREBUFFER_LARGE_WARNING_BYTES {
         eprintln!(
-            "warning: precache announced {} across all profiles \
+            "warning: precache announced {} across the selected profiles \
                    (above the {} advisory threshold).",
             fmt_bytes(total_bytes),
             fmt_bytes(crate::PREBUFFER_LARGE_WARNING_BYTES)
         );
         eprintln!(
-            "Continuing — pass an explicit `dataset:profile` to limit \
-                   which profiles are downloaded."
+            "Continuing — narrow the selector to limit which profiles \
+                   are downloaded."
         );
     }
     eprintln!(
-        "Prebuffering {} facet(s) across all profiles, {} to download.",
+        "Prebuffering {} facet(s) across {} profiles, {} to download.",
         all_facets.len(),
+        names.len(),
         fmt_bytes(total_bytes)
     );
 
     let mut ctx = LiveCtx::new(all_facets.len(), total_bytes);
-    let result = group.prebuffer_all_profiles_with_progress(
+    let result = group.prebuffer_profiles_with_progress(
+        names,
         whole_facet_fallback(allow_whole_facet),
         &mut |profile, facet, p| {
             let qualified = format!("{profile}/{facet}");
@@ -1138,11 +1120,8 @@ pub(super) fn fmt_duration(secs: u64) -> String {
 mod spec_classification {
     use super::*;
 
-    fn named(sel: &ProfileSelection) -> Option<&str> {
-        match sel {
-            ProfileSelection::Named(p) => Some(p.as_str()),
-            ProfileSelection::AllProfiles => None,
-        }
+    fn split(spec: &str) -> (String, Option<String>) {
+        classify_spec(spec).unwrap_or_else(|e| panic!("{spec}: {e}"))
     }
 
     /// **A Windows drive letter is not a dataset name.**
@@ -1158,53 +1137,74 @@ mod spec_classification {
             r"D:\a\b\c",
             r"C:\Users\runner\AppData\Local\Temp\x\ds",
         ] {
-            let (head, sel) = classify_spec(spec);
+            let (head, sel) = split(spec);
             assert_eq!(head, spec, "the whole path is the spec: {spec}");
-            assert_eq!(named(&sel), None, "a drive letter is not a profile: {spec}");
+            assert_eq!(sel, None, "a drive letter is not a profile: {spec}");
         }
     }
 
     /// A UNC path has no drive letter but is still a path.
     #[test]
     fn a_unc_path_is_a_path() {
-        let (head, sel) = classify_spec(r"\\server\share\ds");
+        let (head, sel) = split(r"\\server\share\ds");
         assert_eq!(head, r"\\server\share\ds");
-        assert_eq!(named(&sel), None);
+        assert_eq!(sel, None);
     }
 
     /// The catalog form still splits — that is the whole reason the
-    /// colon rule exists, and it must survive the fix.
+    /// colon rule exists, and it must survive the fix — and what
+    /// follows the colon is a selector now (PS-3).
     #[test]
     fn a_catalog_name_still_carries_its_profile() {
-        let (head, sel) = classify_spec("glove-100:default");
+        let (head, sel) = split("glove-100:default");
         assert_eq!(head, "glove-100");
-        assert_eq!(named(&sel), Some("default"));
+        assert_eq!(sel.as_deref(), Some("default"));
 
-        let (head, sel) = classify_spec("glove-100");
+        let (head, sel) = split("glove-100");
         assert_eq!(head, "glove-100");
-        assert_eq!(named(&sel), None);
+        assert_eq!(sel, None);
+
+        let (head, sel) = split("tessera:size=10m,predicates=uniform*");
+        assert_eq!(head, "tessera");
+        assert_eq!(sel.as_deref(), Some("size=10m,predicates=uniform*"));
+
+        assert!(classify_spec("tessera:size==10m").is_err(), "a malformed selector is an error");
     }
 
-    /// URLs are taken whole, colons and all.
+    /// URLs are taken whole, colons and all, and a selector may follow
+    /// the path.
     #[test]
     fn a_url_is_never_split() {
         for spec in [
             "https://example.com/data/ds",
             "http://example.com:8080/data/ds",
         ] {
-            let (head, sel) = classify_spec(spec);
+            let (head, sel) = split(spec);
             assert_eq!(head, spec);
-            assert_eq!(named(&sel), None, "a port is not a profile: {spec}");
+            assert_eq!(sel, None, "a port is not a profile: {spec}");
         }
+        let (head, sel) = split("http://example.com:8080/data/ds:10m");
+        assert_eq!(head, "http://example.com:8080/data/ds");
+        assert_eq!(sel.as_deref(), Some("10m"));
+    }
+
+    /// **A bare spec is refused naming the new spelling** (PS-1), so
+    /// `precache ds` neither fetches everything as it used to nor
+    /// quietly fetches only `default`.
+    #[test]
+    fn a_bare_spec_is_refused_naming_both_spellings() {
+        let msg = bare_spec_refusal("tessera");
+        assert!(msg.contains("tessera:profile=*"), "{msg}");
+        assert!(msg.contains("tessera:default"), "{msg}");
     }
 
     /// A posix path is unchanged, whether or not it exists.
     #[test]
     fn a_posix_path_is_a_path() {
         for spec in ["/tmp/ds", "./ds", "some/dir/ds"] {
-            let (head, sel) = classify_spec(spec);
+            let (head, sel) = split(spec);
             assert_eq!(head, spec);
-            assert_eq!(named(&sel), None);
+            assert_eq!(sel.as_deref(), None);
         }
     }
 
@@ -1214,9 +1214,9 @@ mod spec_classification {
     fn an_existing_path_is_taken_whole() {
         let tmp = tempfile::tempdir().unwrap();
         let spec = tmp.path().to_str().unwrap();
-        let (head, sel) = classify_spec(spec);
+        let (head, sel) = split(spec);
         assert_eq!(head, spec);
-        assert_eq!(named(&sel), None);
+        assert_eq!(sel.as_deref(), None);
     }
 }
 

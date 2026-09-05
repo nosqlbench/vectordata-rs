@@ -611,7 +611,7 @@ pub fn verify_catalog_source(source: &str) -> Result<usize, String> {
         profiles.first().map(|p| p.to_string()).unwrap_or_else(|| "default".to_string())
     };
     println!("Verifying endpoint with a catalog ping — dataset '{name}', profile '{profile}':");
-    let code = crate::datasets::ping::run_via_catalog(&catalog, &name, &profile);
+    let code = crate::datasets::ping::run_via_catalog(&catalog, &name, Some(&profile));
     if code != 0 {
         return Err(format!(
             "catalog ping failed for dataset '{name}' (profile '{profile}') —              the catalog parses but its data endpoint is not serving"));

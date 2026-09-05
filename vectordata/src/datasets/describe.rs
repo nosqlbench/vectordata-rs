@@ -13,6 +13,8 @@
 
 use crate::catalog::resolver::Catalog;
 #[cfg(feature = "cli")]
+use crate::dataset::selector::DatasetSpec;
+#[cfg(feature = "cli")]
 use crate::catalog::sources::CatalogSources;
 use crate::dataset::CatalogEntry;
 
@@ -27,8 +29,10 @@ pub struct DescribeArgs {
     /// catalogs.yaml` plus any `--catalog` extras is in play.
     #[arg(long = "at")]
     pub at: Option<String>,
-    /// `<dataset>` or `<dataset>:<profile>`. Profile defaults to
-    /// `default` when omitted.
+    /// `<dataset>` or `<dataset>:<selector>` (PS-1). No selector means
+    /// `default`; a selector must name exactly one profile, so
+    /// `ds:size=10m,predicates=uniform-2` works where it is unique and
+    /// `ds:family=uniform` is refused listing what it matched (PS-9).
     pub spec: String,
 }
 
@@ -52,21 +56,38 @@ pub fn run_args(args: DescribeArgs, configdir: &str, catalog: &[String], at_extr
         eprintln!("or pass `--at <URL-or-path>` for one-off use.");
         return 1;
     }
-    let (dataset, profile) = split_spec(&args.spec);
+    let spec = match DatasetSpec::parse(&args.spec) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
     let cat = Catalog::of(&sources);
-    run_via_catalog(&cat, &dataset, &profile)
+    run_via_catalog(&cat, &spec.head, spec.selector.as_ref().map(|s| s.text()))
 }
 
 /// Render the descriptor using a pre-built catalog. Used by both the
 /// CLI path and any future programmatic caller.
-pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, profile_name: &str) -> i32 {
+///
+/// `selector` is resolved against the entry before anything is
+/// rendered (PS-9): `None` is `default`, and a selector matching more
+/// or fewer than one profile is an error naming what it matched.
+pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&str>) -> i32 {
     let Some(entry) = catalog.find_exact(dataset_name) else {
         eprintln!("error: dataset '{dataset_name}' not found in any configured catalog");
         eprintln!();
         eprintln!("Try `vectordata datasets list` to see what's reachable.");
         return 1;
     };
-    render(entry, profile_name);
+    let profile_name = match entry.select_one(selector) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: dataset '{}': {e}", entry.name);
+            return 1;
+        }
+    };
+    render(entry, &profile_name);
     0
 }
 
@@ -114,19 +135,6 @@ fn varying_attributes(
         seen.any(|v| v != first)
     });
     keys
-}
-
-/// Split `<dataset>[:<profile>]`. Profile defaults to `default`,
-/// including the bare-trailing-colon case (`myset:` → `myset` +
-/// `default`) so a stray keystroke doesn't produce a dataset name
-/// with a useless trailing `:` that no catalog lookup resolves.
-#[cfg(any(feature = "cli", test))]
-fn split_spec(spec: &str) -> (String, String) {
-    match spec.split_once(':') {
-        Some((d, p)) if !p.is_empty() => (d.to_string(), p.to_string()),
-        Some((d, _))                  => (d.to_string(), "default".to_string()),
-        None                          => (spec.to_string(), "default".to_string()),
-    }
 }
 
 fn render(entry: &CatalogEntry, profile_name: &str) {
@@ -262,27 +270,4 @@ fn render(entry: &CatalogEntry, profile_name: &str) {
 
 fn kv(key: &str, value: &str) {
     println!("  {key:<14} {value}");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn split_spec_defaults_to_default_profile() {
-        assert_eq!(split_spec("myset"), ("myset".to_string(), "default".to_string()));
-    }
-
-    #[test]
-    fn split_spec_honours_explicit_profile() {
-        assert_eq!(split_spec("myset:1m"), ("myset".to_string(), "1m".to_string()));
-    }
-
-    /// Bare trailing colon falls back to the default profile rather
-    /// than producing an empty profile name that no lookup would
-    /// resolve.
-    #[test]
-    fn split_spec_empty_profile_after_colon_is_default() {
-        assert_eq!(split_spec("myset:"), ("myset".to_string(), "default".to_string()));
-    }
 }

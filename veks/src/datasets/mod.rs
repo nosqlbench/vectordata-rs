@@ -192,13 +192,15 @@ pub enum DatasetsCommand {
         #[arg(long = "at")]
         at: Vec<String>,
 
-        /// Dataset name within the catalog
+        /// Dataset name within the catalog, optionally with a selector
+        /// (`name:<selector>`). Every profile the selector names is
+        /// probed; none means `default`.
         #[arg(long, short = 'd')]
         dataset: String,
 
-        /// Profile to ping (default: "default")
-        #[arg(long, default_value = "default")]
-        profile: String,
+        /// Profile selector; outranks a selector carried by `--dataset`.
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Remove cached datasets from the local cache directory
     #[command(alias = "purge")]
@@ -241,9 +243,11 @@ pub enum DatasetsCommand {
         #[arg(long, short = 'd')]
         dataset: String,
 
-        /// Profile to derive. Required.
+        /// Profile selector; outranks a selector carried by `--dataset`
+        /// (`ds:size=10m`). Must name exactly one profile; none means
+        /// `default`.
         #[arg(long)]
-        profile: String,
+        profile: Option<String>,
 
         /// Output directory for the new dataset.
         #[arg(long)]
@@ -294,11 +298,13 @@ pub enum DatasetsCommand {
     },
     /// Download and cache dataset facets locally
     Precache {
-        /// Dataset name or dataset:profile from catalog
+        /// `<head>[:<selector>]` (PS-1): a catalog name, path or URL, and the
+        /// profiles to fetch — a name, `profile=*` for every profile, or an
+        /// expression such as `size=10m,predicates=uniform*`
         #[arg(long, short = 'd')]
         dataset: String,
 
-        /// Profile name (overrides profile in dataset:profile)
+        /// Profile selector; outranks a selector carried by the spec
         #[arg(long)]
         profile: Option<String>,
 
@@ -566,7 +572,15 @@ pub fn run(args: DatasetsArgs) {
                 crate::catalog::sources::CatalogSources::new().add_catalogs(&resolved)
             };
             let catalog = crate::catalog::resolver::Catalog::of(&sources);
-            let code = ping::run_via_catalog(&catalog, &dataset, &profile);
+            let spec = match vectordata::dataset::selector::DatasetSpec::parse(&dataset) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let selector = profile.or_else(|| spec.selector.as_ref().map(|s| s.text().to_string()));
+            let code = ping::run_via_catalog(&catalog, &spec.head, selector.as_deref());
             if code != 0 {
                 std::process::exit(code);
             }
@@ -661,7 +675,7 @@ pub fn run(args: DatasetsArgs) {
             };
             let code = vectordata::datasets::derive::run(
                 &dataset,
-                &profile,
+                profile.as_deref(),
                 &output,
                 &configdir,
                 &catalog,

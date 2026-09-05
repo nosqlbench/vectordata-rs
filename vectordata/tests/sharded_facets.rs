@@ -777,7 +777,7 @@ fn a_derived_series_round_trips_through_the_reader() {
     let out = tmp.path().join("out");
     let rc = vectordata::datasets::derive::run(
         src.to_str().unwrap(),
-        "default",
+        Some("default"),
         &out,
         "",
         &[],
@@ -846,7 +846,7 @@ fn a_derive_that_fits_one_shard_emits_the_single_file_form() {
     let out = tmp.path().join("out");
     let rc = vectordata::datasets::derive::run(
         src.to_str().unwrap(),
-        "default",
+        Some("default"),
         &out,
         "",
         &[],
@@ -888,7 +888,7 @@ fn deriving_without_a_stride_is_unchanged() {
     let out = tmp.path().join("out");
     let rc = vectordata::datasets::derive::run(
         src.to_str().unwrap(),
-        "default",
+        Some("default"),
         &out,
         "",
         &[],
@@ -1174,7 +1174,7 @@ fn an_unsharded_derive_states_version_one() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(),
-            "default",
+            Some("default"),
             &out,
             "",
             &[],
@@ -1207,7 +1207,7 @@ fn a_sharded_derive_declares_version_two() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(),
-            "default",
+            Some("default"),
             &out,
             "",
             &[],
@@ -1430,7 +1430,7 @@ fn the_cli_stride_and_the_yaml_key_mean_the_same_number() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(),
-            "default",
+            Some("default"),
             &out,
             "",
             &[],
@@ -1742,7 +1742,7 @@ fn a_size_cap_derives_a_decade_stride() {
 
     let out = tmp.path().join("out");
     let rc = vectordata::datasets::derive::run(
-        src.to_str().unwrap(), "default", &out, "", &[], &[],
+        src.to_str().unwrap(), Some("default"), &out, "", &[], &[],
         Some("derived"), true, Sharding::MaxBytes(250),
     );
     assert_eq!(rc, 0, "derive under a cap must succeed");
@@ -1780,7 +1780,7 @@ fn a_facet_under_its_cap_stays_a_single_file() {
 
     let out = tmp.path().join("out");
     let rc = vectordata::datasets::derive::run(
-        src.to_str().unwrap(), "default", &out, "", &[], &[],
+        src.to_str().unwrap(), Some("default"), &out, "", &[], &[],
         Some("derived"), true, Sharding::MaxBytes(1_000_000_000),
     );
     assert_eq!(rc, 0);
@@ -1802,7 +1802,7 @@ fn a_cap_too_small_for_a_run_is_refused() {
 
     let out = tmp.path().join("out");
     let rc = vectordata::datasets::derive::run(
-        src.to_str().unwrap(), "default", &out, "", &[], &[],
+        src.to_str().unwrap(), Some("default"), &out, "", &[], &[],
         Some("derived"), true, Sharding::MaxBytes(100), // five records
     );
     assert_ne!(rc, 0, "a cap this small must be refused, not honoured");

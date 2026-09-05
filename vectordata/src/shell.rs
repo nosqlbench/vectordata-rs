@@ -324,9 +324,11 @@ enum DatasetsCmd {
         /// runtime cache + access layer entirely.
         #[arg(long, short = 'd')]
         dataset: String,
-        /// Profile to derive. Required.
+        /// Profile selector; outranks a selector carried by `--dataset`
+        /// (`ds:size=10m`). Must name exactly one profile; none means
+        /// `default`.
         #[arg(long)]
-        profile: String,
+        profile: Option<String>,
         /// Output directory for the new dataset.
         #[arg(long, short = 'o')]
         output: PathBuf,
@@ -385,8 +387,12 @@ enum DatasetsCmd {
     /// configured cache directory. Renders a live per-facet +
     /// aggregate progress meter on stderr.
     Precache {
-        /// `name[:profile]`, a path to a `dataset.yaml` or its
-        /// containing directory, or an `http(s)://…` URL.
+        /// `<head>[:<selector>]` (PS-1): the head is a catalog name, a path
+        /// to a `dataset.yaml` or its containing directory, or an
+        /// `http(s)://…` URL; the selector names the profiles to fetch —
+        /// a name, `profile=*` for every profile, or an expression such as
+        /// `size=10m,predicates=uniform*`. A spec with no selector and no
+        /// `--profile` is refused naming the spellings.
         spec: String,
         /// Configuration directory containing `catalogs.yaml`.
         #[arg(long, default_value_t = crate::catalog::sources::config_dir())]
@@ -705,7 +711,7 @@ pub fn bin_main(argv: Vec<String>) {
                     at,
                 } => crate::datasets::derive::run(
                     &dataset,
-                    &profile,
+                    profile.as_deref(),
                     &output,
                     &configdir,
                     &catalog,

@@ -695,14 +695,29 @@ fn request(spec: &str) -> PrecacheRequest {
     }
 }
 
+/// `<path>:default` — a spec names its profile after the head (PS-1),
+/// a path included; precache refuses a spec that names none.
+fn default_of(path: &std::path::Path) -> String {
+    format!("{}:default", path.display())
+}
+
 /// A windowless run is the original behaviour, not a special case of
 /// the windowed one — every caller that predates windows keeps working.
+///
+/// **A spec with no selector is refused** (PS-1): it used to mean
+/// every profile, so it can neither keep meaning that nor quietly mean
+/// `default`. Naming the profile after the path is the new spelling.
 #[test]
 fn a_windowless_run_still_precaches_everything() {
     let tmp = tempfile::tempdir().unwrap();
     let group_dir = tmp.path().join("ds");
     dataset(tmp.path());
-    assert_eq!(run(request(group_dir.to_str().unwrap())), 0);
+    assert_eq!(
+        run(request(group_dir.to_str().unwrap())),
+        2,
+        "a bare spec is refused naming the new spelling"
+    );
+    assert_eq!(run(request(&default_of(&group_dir))), 0);
 }
 
 /// **A profile's own window is honoured or refused, never widened.**
@@ -750,7 +765,7 @@ fn plan_only_reports_and_succeeds() {
     let ds = tmp.path().join("ds");
     let req = PrecacheRequest {
         plan_only: true,
-        ..request(ds.to_str().unwrap())
+        ..request(&default_of(&ds))
     };
     assert_eq!(run(req), 0);
 }
@@ -766,7 +781,7 @@ fn a_malformed_window_fails_early_with_a_usable_message() {
     let req = PrecacheRequest {
         window: Some("0,1000".to_string()),
         plan_only: true,
-        ..request(ds.to_str().unwrap())
+        ..request(&default_of(&ds))
     };
     assert_eq!(run(req), 2, "a bad window is a usage error, not a failure");
 }
@@ -781,7 +796,7 @@ fn an_unknown_facet_stops_the_run() {
     let req = PrecacheRequest {
         facets: vec!["not_a_facet".to_string()],
         plan_only: true,
-        ..request(ds.to_str().unwrap())
+        ..request(&default_of(&ds))
     };
     assert_eq!(run(req), 2);
 }
@@ -804,12 +819,12 @@ profiles:
     metadata_content: profiles/default/m.parquet
 "#;
     std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
-    let spec = ds.to_str().unwrap();
+    let spec = default_of(&ds);
 
     let refused = PrecacheRequest {
         facets: vec!["metadata_content".to_string()],
         window: Some("2..4".to_string()),
-        ..request(spec)
+        ..request(&spec)
     };
     assert_eq!(run(refused), 2, "no flag, no whole-facet fetch");
 
@@ -817,7 +832,7 @@ profiles:
         facets: vec!["metadata_content".to_string()],
         window: Some("2..4".to_string()),
         allow_whole_facet: true,
-        ..request(spec)
+        ..request(&spec)
     };
     assert_eq!(run(allowed), 0);
 
@@ -827,7 +842,7 @@ profiles:
         facets: vec!["metadata_content".to_string()],
         window: Some("2..4".to_string()),
         plan_only: true,
-        ..request(spec)
+        ..request(&spec)
     };
     assert_eq!(run(planned), 0);
 }
@@ -855,20 +870,25 @@ profiles:
     let ambiguous = PrecacheRequest {
         window: Some("0..10".to_string()),
         plan_only: true,
-        ..request(ds.to_str().unwrap())
+        ..request(&format!("{}:profile=*", ds.display()))
     };
     assert_eq!(run(ambiguous), 2, "two profiles, no way to choose");
 
-    // Naming the profile resolves it. A local path cannot carry a
-    // `:profile` suffix — resolve_spec reads anything with a `/` as
-    // naming every profile — so the field is the only way to say it.
+    // Naming the profile resolves it, by the flag or after the path:
+    // a path carries a selector like any head (PS-2).
     let named = PrecacheRequest {
         window: Some("0..10".to_string()),
         plan_only: true,
         profile: Some("default".to_string()),
-        ..request(ds.to_str().unwrap())
+        ..request(&format!("{}:profile=*", ds.display()))
     };
-    assert_eq!(run(named), 0);
+    assert_eq!(run(named), 0, "the flag outranks the spec's selector");
+    let suffixed = PrecacheRequest {
+        window: Some("0..10".to_string()),
+        plan_only: true,
+        ..request(&default_of(&ds))
+    };
+    assert_eq!(run(suffixed), 0);
 }
 
 // ─── Against a real remote facet ───────────────────────────────────
@@ -1429,7 +1449,7 @@ fn a_mixed_selection_is_refused_before_any_of_it_is_fetched() {
             "metadata_predicates".to_string(), // not
         ],
         window: Some("0..100".to_string()),
-        ..request(&spec)
+        ..request(&format!("{spec}:default"))
     };
     assert_eq!(run(refused), 2, "one unwindowable facet refuses the set");
 
@@ -1452,7 +1472,7 @@ fn a_mixed_selection_is_refused_before_any_of_it_is_fetched() {
         ],
         window: Some("0..100".to_string()),
         allow_whole_facet: true,
-        ..request(&spec)
+        ..request(&format!("{spec}:default"))
     };
     assert_eq!(run(allowed), 0);
 }
@@ -1556,16 +1576,16 @@ fn a_catalog_dataset_selects_its_profile_by_flag_or_suffix() {
 
     // Two profiles and no way to choose: refused rather than guessed.
     assert_eq!(
-        run(base("windowed")),
+        run(base("windowed:profile=*")),
         2,
         "a windowed selection across two profiles must ask which one"
     );
 
-    // The flag resolves it.
+    // The flag resolves it, outranking the spec's selector.
     assert_eq!(
         run(PrecacheRequest {
             profile: Some("small".to_string()),
-            ..base("windowed")
+            ..base("windowed:profile=*")
         }),
         0
     );

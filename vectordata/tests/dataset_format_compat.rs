@@ -137,7 +137,7 @@ fn an_old_build_reads_a_collapsed_single_shard_output() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(),
-            "default",
+            Some("default"),
             &out,
             "",
             &[],
@@ -195,7 +195,7 @@ fn an_unsharded_output_states_version_one_and_no_shard_key() {
     assert_eq!(
         vectordata::datasets::derive::run(
             src.to_str().unwrap(),
-            "default",
+            Some("default"),
             &out,
             "",
             &[],
