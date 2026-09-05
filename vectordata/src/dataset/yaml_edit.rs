@@ -262,6 +262,33 @@ pub fn set_profile_attributes(
     Ok(finish(lines, yaml))
 }
 
+/// Name a profile's parent (PL-12): `inherits: <parent>` written under
+/// the profile's name when no `inherits:` line is present; a line
+/// already there, whatever it names, is left alone.
+pub fn set_profile_inherits(yaml: &str, profile: &str, parent: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+    let profiles = lines
+        .iter()
+        .position(|l| indent_of(l) == 0 && key_of(l) == Some("profiles"))
+        .ok_or_else(|| "dataset.yaml declares no `profiles:`".to_string())?;
+    let profiles_end = block_end(&lines, profiles, 0);
+    let profile_line = (profiles + 1..profiles_end)
+        .find(|&i| indent_of(&lines[i]) == 2 && key_of(&lines[i]) == Some(profile))
+        .ok_or_else(|| format!("profile '{profile}' is not declared"))?;
+    if !value_and_comment(&lines[profile_line]).0.is_empty() {
+        return Err(format!(
+            "profile '{profile}' is declared in flow form; write it as a block to name its parent"
+        ));
+    }
+    let profile_end = block_end(&lines, profile_line, 2);
+    let present = (profile_line + 1..profile_end)
+        .any(|i| indent_of(&lines[i]) == 4 && key_of(&lines[i]) == Some("inherits"));
+    if !present {
+        lines.insert(profile_line + 1, format!("    inherits: {parent}"));
+    }
+    Ok(finish(lines, yaml))
+}
+
 /// The line after the last line of the block that starts at `start`,
 /// whose children are indented deeper than `indent`. Blank and comment
 /// lines inside the block belong to it; trailing ones do not.
@@ -358,6 +385,19 @@ mod tests {
             let back: Yaml = serde_yaml::from_str(text).unwrap();
             assert_eq!(render_scalar(&back).unwrap(), text);
         }
+    }
+
+    /// **A parent is named once and never renamed** (PL-12): the line
+    /// is inserted under the profile when absent and left alone when
+    /// present, whatever it names.
+    #[test]
+    fn a_parent_is_named_once() {
+        let out = set_profile_inherits(YAML, "10m", "default").unwrap();
+        assert!(out.contains("  10m:\n    inherits: default\n    base_count: 10000000\n"), "{out}");
+        assert_eq!(set_profile_inherits(&out, "10m", "default").unwrap(), out);
+        let named = out.replace("    inherits: default\n", "    inherits: 5m\n");
+        assert_eq!(set_profile_inherits(&named, "10m", "default").unwrap(), named, "a present line is kept");
+        assert!(set_profile_inherits(YAML, "nope", "default").is_err());
     }
 
     /// The schema goes before `profiles:` once, and the version line is

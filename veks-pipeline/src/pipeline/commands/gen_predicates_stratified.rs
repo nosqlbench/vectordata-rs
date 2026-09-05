@@ -115,6 +115,11 @@ impl Family {
 /// The decade a selectivity belongs to: `⌊log10 s + ½⌋`, so the band
 /// `[d/√10, d·√10)` tiles the axis without gaps or overlap and its
 /// upper edge belongs to the next decade up.
+/// The ladder a stratified set is generated for when `--decades` is
+/// not given; the tagging of an existing dataset reads the same
+/// default from the generator's record (PS-12).
+pub const DEFAULT_DECADES: &str = "1e-1..1e-7";
+
 pub fn decade_of(selectivity: f64) -> Option<i32> {
     if selectivity <= 0.0 || !selectivity.is_finite() {
         return None;
@@ -1299,7 +1304,7 @@ pub(super) fn run(
         Ok(f) => f,
         Err(e) => return error_result(e, start),
     };
-    let decades = match parse_decades(options.get("decades").unwrap_or("1e-1..1e-7")) {
+    let decades = match parse_decades(options.get("decades").unwrap_or(DEFAULT_DECADES)) {
         Ok(d) => d,
         Err(e) => return error_result(e, start),
     };

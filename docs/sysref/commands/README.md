@@ -14,6 +14,7 @@ Every command with a working example run against the
 | [analyze find-duplicates](./analyze-find-duplicates.md) | Scan for duplicate vectors |
 | [analyze explain-predicates](./analyze-explain-predicates.md) | Trace predicate → matching metadata |
 | [analyze predicate-forms](./analyze-predicate-forms.md) | Enumerate predicate forms and the indexes each needs |
+| [config tag-profiles](./config-tag-profiles.md) | Tag every profile of an existing dataset the way its generators would today |
 | [analyze explain-filtered-knn](./analyze-explain-filtered-knn.md) | Full query trace through all pipeline stages |
 | [analyze file](./analyze-file.md) | Low-level file metadata |
 | [analyze explain-partitions](./analyze-explain-partitions.md) | Trace query through partition oracle creation |

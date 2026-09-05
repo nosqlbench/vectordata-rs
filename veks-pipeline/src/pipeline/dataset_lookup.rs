@@ -623,7 +623,7 @@ fn facet_present(
 
 /// Strip a `#namespace` suffix from a view path, leaving the file path.
 /// `metadata_content.slab#layout` → `metadata_content.slab`.
-fn strip_namespace(path: &str) -> &str {
+pub(crate) fn strip_namespace(path: &str) -> &str {
     path.split('#').next().unwrap_or(path)
 }
 

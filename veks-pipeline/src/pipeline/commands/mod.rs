@@ -9,6 +9,7 @@
 
 // Removed: barrier, cleanup_cleanfvec
 pub mod catalog_generate;
+pub mod tag_profiles;
 pub mod catalog_stats;
 pub mod require;
 pub mod source_window;
@@ -306,6 +307,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
 
     // ── catalog ──────────────────────────────────────────────────────
     registry.register("catalog generate", catalog_generate::factory);
+    registry.register("config tag-profiles", tag_profiles::factory);
     registry.register("catalog stats", catalog_stats::factory);
 
     // ── pipeline orchestration ─────────────────────────────────────
