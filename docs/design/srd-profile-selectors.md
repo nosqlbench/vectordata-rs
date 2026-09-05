@@ -251,6 +251,7 @@ that motivate it need, extending P-5:
 | Key | Type | Meaning |
 |---|---|---|
 | `size` | count | the size ladder rung as spelled in the name (`10m`); numeric under the count rule |
+| `predicates` | identifier | **required** on any profile that declares a predicate facet: the structural class of that facet, `mixed` or `uniform-<n>` (PS-23) |
 | `selectivity` | number | the selectivity level a single-level predicate set was generated **for** (`1e-2`), not what it realised |
 | `selectivity_ladder` | list of numbers | the decades a stratified set was generated for, most to least selective |
 | `form` | identifier | the predicate form of a uniform set as a **derived id**: the fields and access kinds of the form in canonical order, `topic_l3.eq+citation_percentile.range`; `stratified` for a stratified set |
@@ -278,6 +279,32 @@ a written value, marks the step stale exactly as a changed output
 would, and the run reports the attribute by name. A hand edit to a
 generated tag is therefore reported, never silently overwritten and
 never silently kept.
+
+**PS-23.** Every profile that declares a predicate facet
+(`metadata_predicates`) carries the standard tag `predicates`, and
+`veks check` refuses a profile that declares the facet without it. The
+value names the **structural class** of the facet, which is what a
+result can be reasoned about against:
+
+| Value | Meaning |
+|---|---|
+| `mixed` | more than one predicate form is present; tessera's stratified sets today, 22 forms |
+| `uniform-<n>` | every predicate takes one and the same form, and that form has exactly `n` **parts** in its junction, conjunctive or disjunctive: `uniform-1` is single-part predicates, `uniform-2` two-part junctions, `uniform-3` three |
+
+A uniform set may include predicates that act as no-ops to hold the
+form constant; they still take the form, and the class still holds. The
+tag is a plan like every tag (PS-11): the generator writes the class it
+was asked for. Verification then holds the facet to it: `veks check`
+runs the form census of `analyze predicate-forms` over the facet and
+refuses `uniform-<n>` when the facet holds more than one form or its
+form has other than `n` parts, and refuses `mixed` when it holds
+exactly one — a set that is uniform in fact must say so, because a
+consumer selecting `predicates=mixed` is asking for the hard case.
+`predicates` is a naming tag, ordered in the schema after `size` and
+before the level, so a set is `10m-uniform-2-1e-2`; `form` (PS-11)
+still says *which* form a uniform set takes and is not a naming tag
+unless a dataset holds several uniform forms at one level, in which
+case the schema lists it too.
 
 ## 6. Tags at creation
 
@@ -307,9 +334,9 @@ count rule.
 
 **PS-21.** A generated profile is **named by its tags**: the values of
 the naming tags it carries, in schema order, joined by `-`. A
-`{size: 10m, family: uniform, selectivity: 1e-2}` profile is
-`10m-uniform-1e-2`; a sized profile whose only naming tag is `size` is
-`10m`, as before. Every naming tag is a **planned** value known at
+`{size: 10m, predicates: uniform-2, selectivity: 1e-2}` profile is
+`10m-uniform-2-1e-2`; a sized profile whose only naming tag is `size`
+is `10m`, as before. Every naming tag is a **planned** value known at
 bootstrap (the level, the family, the form id), which is what lets the
 name exist before a generator runs and stay put after it. The name is
 derived and never parsed — the tags are the truth (P-4), which is why
@@ -349,7 +376,9 @@ and every command's help shows that idiom once.
   distinguishes them, since the family is then addressable only by
   name, which is the fault this document exists to remove;
 - two profiles whose attributes are identical on every key, which a
-  selector can never tell apart.
+  selector can never tell apart;
+- a profile declaring a predicate facet without `predicates`, or
+  whose `predicates` value the facet's form census contradicts (PS-23).
 
 **PS-16.** Completion offers, after `dataset:`, the profile names, the
 automatic `profile=`, and the attribute keys of that dataset's profiles
@@ -371,12 +400,13 @@ The family this document is for, once the generators of §5 have run:
 ```yaml
 profile_tags:                       # the schema: naming order, then defaults
   size: ~                           # written per profile from base_count
-  family: stratified
+  predicates: ~                     # required wherever a predicate facet is declared (PS-23)
   selectivity: ~                    # no default: only single-level sets carry it
+  family: stratified                # not a naming tag: the generator family
 
 profiles:
   default:
-    attributes: { size: 495m, family: stratified }
+    attributes: { size: 495m, predicates: mixed, family: stratified }
     base_vectors: { source: profiles/base/base_vectors__NNNN.fvecs, shard_stride: 100000000, shard_count: 5, record_count: 495930736 }
     ...
 
@@ -386,19 +416,19 @@ profiles:
     neighbor_indices: profiles/10m/neighbor_indices.ivecs
     metadata_predicates: profiles/base/predicates.slab
     metadata_results: profiles/10m/metadata_results.slab
-    attributes: { size: 10m, family: stratified, selectivity_ladder: [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7], forms: 22 }
+    attributes: { size: 10m, predicates: mixed, family: stratified, selectivity_ladder: [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7], forms: 22 }
 
-  10m-uniform-1e-2:                 # named by its tags (PS-21)
+  10m-uniform-2-1e-2:               # named by its tags (PS-21, PS-23)
     inherits: 10m
-    attributes: { size: 10m, family: uniform, form: topic_l3.eq+citation_percentile.range, form_shape: "(citation_percentile >= ? AND topic_l3 = ?)", selectivity: 1e-2 }
-    metadata_predicates: profiles/10m-uniform-1e-2/predicates.slab
-    metadata_results: profiles/10m-uniform-1e-2/metadata_results.slab
-    postfiltered_neighbor_indices: profiles/10m-uniform-1e-2/postfiltered_neighbor_indices.ivecs
-    postfiltered_neighbor_distances: profiles/10m-uniform-1e-2/postfiltered_neighbor_distances.fvecs
+    attributes: { size: 10m, predicates: uniform-2, selectivity: 1e-2, family: uniform, form: topic_l3.eq+citation_percentile.range, form_shape: "(citation_percentile >= ? AND topic_l3 = ?)" }
+    metadata_predicates: profiles/10m-uniform-2-1e-2/predicates.slab
+    metadata_results: profiles/10m-uniform-2-1e-2/metadata_results.slab
+    postfiltered_neighbor_indices: profiles/10m-uniform-2-1e-2/postfiltered_neighbor_indices.ivecs
+    postfiltered_neighbor_distances: profiles/10m-uniform-2-1e-2/postfiltered_neighbor_distances.fvecs
 
-  10m-uniform-1e-3:
+  10m-uniform-2-1e-3:
     inherits: 10m
-    attributes: { size: 10m, family: uniform, form: topic_l3.eq+citation_percentile.range, form_shape: "(citation_percentile >= ? AND topic_l3 = ?)", selectivity: 1e-3 }
+    attributes: { size: 10m, predicates: uniform-2, selectivity: 1e-3, family: uniform, form: topic_l3.eq+citation_percentile.range, form_shape: "(citation_percentile >= ? AND topic_l3 = ?)" }
     ...
 ```
 
@@ -406,12 +436,13 @@ And the specs that address it:
 
 ```
 tessera:10m                                          the stratified set, as today
-tessera:size=10m,family=uniform                      both uniform sets
+tessera:size=10m,predicates=uniform*                 both uniform sets
+tessera:predicates=mixed                             every mixed-form set, the hard case
 tessera:size=10m,selectivity=1e-3..1e-2              the uniform set nearest 1%
 tessera:family=uniform,selectivity<1e-3              every uniform set below 0.1%, any size
-tessera:profile=^10m-uniform.*$                      the same two, by name
+tessera:profile=^10m-uniform-2.*$                    the same two, by name
 tessera:not(family=uniform)                          the stratified sets and anything undescribed
-tessera:or(size=10m,size=100m),family=uniform        both sizes' uniform sets
+tessera:or(size=10m,size=100m),predicates=uniform-2  both sizes' two-leaf uniform sets
 tessera:selectivity>=1e-4,selectivity<1e-2           two bounds on one key, an intersection
 ```
 
@@ -456,7 +487,8 @@ those surfaces stated once.
 | 15 | completion after `ds:`, `ds:key=`, `ds:a=1,` | names and keys; values; both again |
 | 16 | Java contract | same sets as Rust for every case above |
 | 17 | bootstrap + run | every profile carries every schema tag, defaults filled, the generators' planned values written; `default` carries `size` |
-| 18 | generated names | `{size: 10m, family: uniform, selectivity: 1e-2}` is `10m-uniform-1e-2`; a `size`-only profile is `10m`; identical naming values are refused |
+| 18 | generated names | `{size: 10m, predicates: uniform-2, selectivity: 1e-2}` is `10m-uniform-2-1e-2`; a `size`-only profile is `10m`; identical naming values are refused |
+| 18a | `predicates` tag | a predicate facet without it is refused; `uniform-2` on a 22-form facet is refused; `mixed` on a one-form facet is refused; tessera's sets check as `mixed` |
 | 19 | run on a pre-schema dataset | tags added by textual edit with comments intact, no profile renamed |
 | 20 | child of a tagged parent | carries only its own tags |
 | 21 | `generate-catalog` | profile attributes present in `catalog.json` and `catalog.yaml` |
