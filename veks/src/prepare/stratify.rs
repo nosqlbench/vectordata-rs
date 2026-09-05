@@ -188,12 +188,17 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
         }
         config.profiles.profiles.insert(prof_name.clone(), profile);
     }
-    // The default carries its own rung as `size` (PS-20), so `size>=`
-    // selects it under the count rule like any member.
+    // The default carries its own rung as `size` (PS-20): the rung of
+    // what its base facet holds, which is what a selector compares
+    // against under the count rule.
+    let held = default
+        .view("base_vectors")
+        .and_then(|v| v.record_count.or(v.source.declared_count))
+        .unwrap_or(effective_max);
     if let Some(d) = config.profiles.profiles.get_mut("default") {
         d.attributes.insert(
             "size".to_string(),
-            serde_yaml::Value::from(vectordata::dataset::profile::size_rung(effective_max)),
+            serde_yaml::Value::from(vectordata::dataset::profile::size_rung(held)),
         );
     }
     // Backup the existing file
@@ -203,19 +208,12 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
         Err(ref e) => eprintln!("  Warning: backup failed: {}", e),
     }
 
-    // Serialize and write
-    let yaml = serde_yaml::to_string(&config).unwrap_or_else(|e| {
-        eprintln!("Error: failed to serialize config: {}", e);
-        std::process::exit(1);
-    });
-
-    let tmp_path = dataset_path.with_extension("yaml.tmp");
-    if let Err(e) = std::fs::write(&tmp_path, &yaml) {
-        eprintln!("Error: failed to write {}: {}", crate::check::rel_display(&tmp_path), e);
-        std::process::exit(1);
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, &dataset_path) {
-        eprintln!("Error: failed to rename: {}", e);
+    // Written by the one writer every save uses, expanded so every
+    // sized profile is a concrete entry: the version stated, the schema
+    // and tags rendered as the reader reads them, the author's header
+    // kept (V-25, PS-19).
+    if let Err(e) = config.save_expanded(&dataset_path) {
+        eprintln!("Error: failed to write {}: {}", crate::check::rel_display(&dataset_path), e);
         std::process::exit(1);
     }
 
