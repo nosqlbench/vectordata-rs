@@ -229,7 +229,10 @@ fn family_members_and_values_are_enumerable() {
     assert_eq!(listed.len(), members.len());
     for (name, attrs) in &listed {
         assert!(members.contains(name));
-        assert!(attrs.is_empty(), "{name} recorded nothing");
+        // A generated member carries its rung as `size` (PS-12) and
+        // nothing else: attributes never inherit (PS-19).
+        assert_eq!(attrs.len(), 1, "{name}: {attrs:?}");
+        assert_eq!(attrs.get("size"), Some(&serde_yaml::Value::from(name.as_str())), "{name}");
     }
 
     // And membership is answerable from any member.

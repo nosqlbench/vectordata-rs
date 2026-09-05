@@ -289,6 +289,45 @@ pub(crate) fn form_of(p: &PNode) -> String {
     }
 }
 
+/// How many parts a predicate's top-level junction has: one for a
+/// leaf, the child count of a conjunction or disjunction (PS-23).
+pub(crate) fn parts_of(p: &PNode) -> usize {
+    match p {
+        PNode::Predicate(_) => 1,
+        PNode::Conjugate(c) => c.children.len().max(1),
+    }
+}
+
+/// The structural class of a predicate facet (PS-23): how many
+/// distinct forms it holds, and, when it holds one, how many parts
+/// that form has.
+pub struct FormClasses {
+    pub forms: usize,
+    pub parts: Option<usize>,
+}
+
+/// Census a predicate facet for its structural class (PS-23), the way
+/// `analyze predicate-forms` does, without the report.
+pub fn facet_form_classes(path: &std::path::Path) -> Result<FormClasses, String> {
+    let reader = SlabReader::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let n = reader.total_records() as usize;
+    let mut forms: BTreeSet<String> = BTreeSet::new();
+    let mut parts: Option<usize> = None;
+    for i in 0..n {
+        let bytes = reader
+            .get(i as i64)
+            .map_err(|e| format!("read predicate {i} of {}: {e}", path.display()))?;
+        let node = PNode::from_bytes_named(&bytes)
+            .map_err(|e| format!("decode predicate {i} of {}: {e}", path.display()))?;
+        forms.insert(form_of(&node));
+        parts = Some(parts_of(&node));
+    }
+    Ok(FormClasses {
+        forms: forms.len(),
+        parts: if forms.len() == 1 { parts } else { None },
+    })
+}
+
 /// Every (field, access) pair a predicate needs served.
 pub(crate) fn accesses_of(p: &PNode, out: &mut BTreeSet<(String, Access)>) {
     match p {

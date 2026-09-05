@@ -3812,6 +3812,7 @@ mod tests {
         let workspace = tmp.path();
 
         let mut ctx = StreamContext {
+            attributes: Vec::new(),
             dataset_name: String::new(),
             profile: String::new(),
             profile_names: vec![],
@@ -3883,6 +3884,7 @@ mod tests {
         let workspace = tmp.path();
 
         let mut ctx = StreamContext {
+            attributes: Vec::new(),
             dataset_name: String::new(),
             profile: String::new(),
             profile_names: vec![],
@@ -3967,6 +3969,7 @@ mod tests {
         let workspace = tmp.path();
 
         let mut ctx = StreamContext {
+            attributes: Vec::new(),
             dataset_name: String::new(),
             profile: String::new(),
             profile_names: vec![],
@@ -4052,6 +4055,7 @@ mod tests {
         let workspace = tmp.path();
 
         let mut ctx = StreamContext {
+            attributes: Vec::new(),
             dataset_name: String::new(),
             profile: String::new(),
             profile_names: vec![],
@@ -4132,6 +4136,7 @@ mod tests {
         let workspace = tmp.path();
 
         let mut ctx = StreamContext {
+            attributes: Vec::new(),
             dataset_name: String::new(),
             profile: String::new(),
             profile_names: vec![],
@@ -4235,6 +4240,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path();
         let mut ctx = StreamContext {
+            attributes: Vec::new(),
             dataset_name: String::new(),
             profile: String::new(),
             profile_names: vec![],

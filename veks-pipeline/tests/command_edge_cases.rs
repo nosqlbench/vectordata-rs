@@ -24,6 +24,7 @@ use veks_core::ui::{TestSink, UiHandle};
 /// Build a minimal `StreamContext` rooted at the given directory.
 fn test_ctx(dir: &Path) -> StreamContext {
     StreamContext {
+        attributes: Vec::new(),
         dataset_name: String::new(),
         profile: String::new(),
         profile_names: vec![],

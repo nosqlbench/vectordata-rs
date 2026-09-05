@@ -164,7 +164,37 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
     });
     for (prof_name, count) in &pairs {
         let profile = vectordata::dataset::profile::derive_sized_profile(&default, prof_name, *count);
+        // Under a tag schema a generated profile is named by the tags
+        // it plans (PS-21). The sized derivation plans one, its rung,
+        // so the name is the rung as before; the class tags that travel
+        // with a copied predicate facet are facts about that facet, not
+        // part of the rung's plan, and do not name it. The rule is what
+        // refuses a collision rather than inventing a suffix.
+        if !config.profile_tags.is_empty() {
+            let sharded = profile.views.values().any(|v| v.is_series());
+            let mut planned = indexmap::IndexMap::new();
+            planned.insert("size".to_string(), serde_yaml::Value::from(prof_name.as_str()));
+            match vectordata::dataset::profile::profile_name_from_tags(&config.profile_tags, &planned, sharded) {
+                Ok(named) if named == *prof_name => {}
+                Ok(named) => {
+                    eprintln!("Error: the tag schema names profile '{prof_name}' as '{named}'");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Error: profile '{prof_name}': {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         config.profiles.profiles.insert(prof_name.clone(), profile);
+    }
+    // The default carries its own rung as `size` (PS-20), so `size>=`
+    // selects it under the count rule like any member.
+    if let Some(d) = config.profiles.profiles.get_mut("default") {
+        d.attributes.insert(
+            "size".to_string(),
+            serde_yaml::Value::from(vectordata::dataset::profile::size_rung(effective_max)),
+        );
     }
     // Backup the existing file
     let backup = crate::check::fix::create_backup(&dataset_path);

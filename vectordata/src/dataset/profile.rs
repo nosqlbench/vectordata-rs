@@ -1078,13 +1078,111 @@ pub fn derive_sized_profile(default: &DSProfile, name: &str, count: u64) -> DSPr
         };
         views.insert(facet.clone(), derived);
     }
+    // The rung that was the whole of the name is the `size` tag,
+    // spelled exactly as the name is (PS-12, PS-20). Attributes are the
+    // member's own (PS-19): the one thing that crosses is the tags that
+    // describe a shared facet the derivation copied, because they are
+    // facts about that facet, not about the profile — a member that
+    // carries the default's predicate slab carries its class (PS-23).
+    let mut attributes = IndexMap::new();
+    attributes.insert("size".to_string(), serde_yaml::Value::from(name));
+    if views.contains_key("metadata_predicates") && default.views.contains_key("metadata_predicates") {
+        for key in PREDICATE_FACET_TAGS {
+            if let Some(v) = default.attributes.get(*key) {
+                attributes.insert((*key).to_string(), v.clone());
+            }
+        }
+    }
     DSProfile {
         maxk: default.maxk,
         base_count: Some(count),
         partition: false,
         views,
+        attributes,
         ..Default::default()
     }
+}
+
+/// The tags that describe a predicate facet rather than a profile
+/// (PS-11, PS-23): they travel with the facet when a derivation copies
+/// it, and a generator rewrites them when it fills the facet.
+pub const PREDICATE_FACET_TAGS: &[&str] =
+    &["predicates", "family", "forms", "selectivity_ladder", "form", "form_shape"];
+
+/// The rung spelling of a base count (PS-20): the count floored to its
+/// largest decimal unit, `495930736` → `495m`, `10000` → `10k`, so the
+/// default profile's `size` compares with the ladder under the count
+/// rule (PS-5).
+pub fn size_rung(count: u64) -> String {
+    if count >= 1_000_000_000 {
+        format!("{}b", count / 1_000_000_000)
+    } else if count >= 1_000_000 {
+        format!("{}m", count / 1_000_000)
+    } else if count >= 1_000 {
+        format!("{}k", count / 1_000)
+    } else {
+        count.to_string()
+    }
+}
+
+/// The naming tags of a schema (PS-19, PS-21): the tags declared
+/// without a default. A tag with a default is carried by every profile
+/// but does not name; a tag without one is a planned value a
+/// generator sets per profile, and the name is made of those.
+pub fn naming_tags(schema: &IndexMap<String, serde_yaml::Value>) -> Vec<&str> {
+    schema
+        .iter()
+        .filter(|(_, v)| v.is_null())
+        .map(|(k, _)| k.as_str())
+        .collect()
+}
+
+/// The name a generated profile takes from its tags (PS-21): the
+/// values of the naming tags it carries, in schema order, joined by
+/// `-`. Refused when no naming tag is set, when a value is not
+/// filename-safe (P-9), or — when the profile's files are `sharded`,
+/// so a shard field would follow the name — when the name is all
+/// digits, which that field would take for a number.
+pub fn profile_name_from_tags(
+    schema: &IndexMap<String, serde_yaml::Value>,
+    attributes: &IndexMap<String, serde_yaml::Value>,
+    sharded: bool,
+) -> Result<String, String> {
+    let mut parts: Vec<String> = Vec::new();
+    for key in naming_tags(schema) {
+        let Some(value) = attributes.get(key) else { continue };
+        let text = match value {
+            serde_yaml::Value::String(s) => s.clone(),
+            serde_yaml::Value::Number(n) => n.to_string(),
+            serde_yaml::Value::Bool(b) => b.to_string(),
+            other => {
+                return Err(format!(
+                    "tag '{key}' holds {}, which cannot name a profile",
+                    serde_yaml::to_string(other).unwrap_or_default().trim()
+                ))
+            }
+        };
+        if text.is_empty()
+            || !text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            return Err(format!(
+                "tag '{key}' value '{text}' is not filename-safe (P-9); a name takes letters, digits, '_', '-' and '.'"
+            ));
+        }
+        parts.push(text);
+    }
+    if parts.is_empty() {
+        return Err("no naming tag is set, so the profile has no name".to_string());
+    }
+    let name = parts.join("-");
+    if sharded && name.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "name '{name}' is all digits, which the shard field that follows it would take for a number (P-9)"
+        ));
+    }
+    Ok(name)
 }
 
 /// A sized profile from the default one, with a scaffold of
@@ -2090,6 +2188,65 @@ mod tests {
             "source: base__NNNN.fvec[0..120]\nshard_stride: 100\nshard_count: 3\nrecord_count: 250\nwindow: \"[0..50]\"\n",
         );
         assert!(twice.is_err());
+    }
+
+    /// **A sized profile carries its rung as `size`** (PS-12, PS-20),
+    /// and the default's rung is the floor spelling of its count.
+    #[test]
+    fn a_sized_profile_carries_its_rung_as_size() {
+        let mut views: IndexMap<String, DSView> = IndexMap::new();
+        views.insert("base_vectors".into(), uniform_view("profiles/base/base__NNNN.fvec"));
+        let mut default = DSProfile { views, ..Default::default() };
+        default.attributes.insert("family".into(), serde_yaml::Value::from("stratified"));
+        default.attributes.insert("notes".into(), serde_yaml::Value::from("hand-written"));
+        let sized = derive_sized_profile(&default, "10m", 10_000_000);
+        assert_eq!(sized.attributes["size"], serde_yaml::Value::from("10m"));
+        assert!(!sized.attributes.contains_key("family"), "no predicate facet, nothing travels (PS-19)");
+        assert!(!sized.attributes.contains_key("notes"));
+
+        // With the default's predicate slab comes the class that
+        // describes it (PS-23); the profile's own notes still do not.
+        default.views.insert(
+            "metadata_predicates".into(),
+            serde_yaml::from_str("profiles/base/predicates.slab").unwrap(),
+        );
+        default.attributes.insert("predicates".into(), serde_yaml::Value::from("mixed"));
+        let sized = derive_sized_profile(&default, "10m", 10_000_000);
+        assert_eq!(sized.attributes["predicates"], serde_yaml::Value::from("mixed"));
+        assert_eq!(sized.attributes["family"], serde_yaml::Value::from("stratified"));
+        assert!(!sized.attributes.contains_key("notes"), "only facet-describing tags travel");
+        assert_eq!(size_rung(495_930_736), "495m");
+        assert_eq!(size_rung(1_234_567), "1m");
+        assert_eq!(size_rung(10_000), "10k");
+        assert_eq!(size_rung(2_500_000_000), "2b");
+        assert_eq!(size_rung(999), "999");
+    }
+
+    /// **A generated profile is named by its naming tags in schema
+    /// order** (PS-21); a tag with a default does not name, and an
+    /// unsafe or all-digit name is refused.
+    #[test]
+    fn a_generated_name_is_its_naming_tags_in_schema_order() {
+        let schema: IndexMap<String, serde_yaml::Value> = serde_yaml::from_str(
+            "size: ~\npredicates: ~\nselectivity: ~\nfamily: stratified\n",
+        )
+        .unwrap();
+        assert_eq!(naming_tags(&schema), vec!["size", "predicates", "selectivity"]);
+        let attrs: IndexMap<String, serde_yaml::Value> = serde_yaml::from_str(
+            "selectivity: 1e-2\nsize: 10m\npredicates: uniform-2\nfamily: uniform\n",
+        )
+        .unwrap();
+        assert_eq!(profile_name_from_tags(&schema, &attrs, true).unwrap(), "10m-uniform-2-0.01");
+        let sized: IndexMap<String, serde_yaml::Value> = serde_yaml::from_str("size: 10m\n").unwrap();
+        assert_eq!(profile_name_from_tags(&schema, &sized, true).unwrap(), "10m");
+        let none: IndexMap<String, serde_yaml::Value> = serde_yaml::from_str("family: x\n").unwrap();
+        assert!(profile_name_from_tags(&schema, &none, false).is_err());
+        // All digits is refused only where a shard field would follow.
+        let digits: IndexMap<String, serde_yaml::Value> = serde_yaml::from_str("size: 100\n").unwrap();
+        assert!(profile_name_from_tags(&schema, &digits, true).unwrap_err().contains("all digits"));
+        assert_eq!(profile_name_from_tags(&schema, &digits, false).unwrap(), "100");
+        let unsafe_: IndexMap<String, serde_yaml::Value> = serde_yaml::from_str("size: 'a/b'\n").unwrap();
+        assert!(profile_name_from_tags(&schema, &unsafe_, false).unwrap_err().contains("filename-safe"));
     }
 
     /// A sized profile windows a series through the facet field, never

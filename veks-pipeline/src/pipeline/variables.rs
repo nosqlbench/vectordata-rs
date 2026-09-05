@@ -361,6 +361,7 @@ mod tests {
         opts.set("type", "f16");
 
         let mut ctx = StreamContext {
+            attributes: Vec::new(),
             dataset_name: String::new(),
             profile: String::new(),
             profile_names: vec![],

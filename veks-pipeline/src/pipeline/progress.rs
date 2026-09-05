@@ -227,6 +227,20 @@ pub struct StepRecord {
     /// selector at check time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Address>,
+    /// The tags this step wrote on profiles, beside its outputs
+    /// (PS-13). A difference between the record and the yaml on the
+    /// next run marks the step stale, reported by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributes: Vec<AttributeRecord>,
+}
+
+/// One tag a step wrote on a profile (PS-13): the value as its YAML
+/// text, so the record compares with the file as the reader reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributeRecord {
+    pub profile: String,
+    pub key: String,
+    pub value: String,
 }
 
 /// Record of a single output artifact at completion time.
@@ -669,6 +683,38 @@ impl ProgressLog {
             }
         }
 
+        // A tag the step wrote that the yaml no longer carries as
+        // written is a changed output (PS-13): hand-edited or missing,
+        // it is reported by name, never silently overwritten or kept.
+        if !record.attributes.is_empty()
+            && let Some(ws) = workspace
+        {
+            let yaml_path = ws.join("dataset.yaml");
+            let config = match vectordata::dataset::DatasetConfig::load(&yaml_path) {
+                Ok(c) => c,
+                Err(e) => return Some(format!("dataset.yaml unreadable for attribute check: {e}")),
+            };
+            for a in &record.attributes {
+                let current = config
+                    .profiles
+                    .profile(&a.profile)
+                    .and_then(|p| p.attributes.get(&a.key))
+                    .and_then(|v| vectordata::dataset::yaml_edit::render_scalar(v).ok());
+                match current {
+                    Some(v) if v == a.value => {}
+                    Some(v) => {
+                        return Some(format!(
+                            "attribute '{}.{}' changed ({} → {})",
+                            a.profile, a.key, a.value, v
+                        ))
+                    }
+                    None => {
+                        return Some(format!("attribute '{}.{}' missing", a.profile, a.key))
+                    }
+                }
+            }
+        }
+
         None
     }
 
@@ -757,6 +803,7 @@ fn migrate_nested(
         plain.insert(
             id,
             StepRecord {
+                attributes: Vec::new(),
                 status: record.status,
                 message: record.message,
                 completed_at: record.completed_at,
@@ -977,6 +1024,7 @@ mod tests {
 
     fn rec(provenance: Option<Address>) -> StepRecord {
         StepRecord {
+            attributes: Vec::new(),
             status: Status::Ok,
             message: "done".into(),
             completed_at: Utc::now(),

@@ -57,7 +57,7 @@ impl DatasetLog {
 use super::command::{ArtifactState, CommandResult, Options, Status, StreamContext};
 use super::dag::ResolvedStep;
 use super::interpolate;
-use super::progress::{OutputRecord, ResourceSummary, StepRecord};
+use super::progress::{OutputRecord, ResourceSummary, StepRecord, AttributeRecord};
 use super::provenance::Address;
 use super::registry::CommandRegistry;
 use super::schema::OnPartial;
@@ -649,8 +649,13 @@ pub fn run_steps(
         // Capture baseline snapshot for resource delta
         let baseline_snapshot = super::resource::SystemSnapshot::sample();
         let start = Instant::now();
+        ctx.attributes.clear();
         let result = cmd.execute(&options, ctx);
         let elapsed = start.elapsed();
+        // Tags the command asked for land on the profiles' own lines
+        // once it has succeeded (PS-13, PS-19), and are recorded beside
+        // its outputs.
+        let (result, written) = apply_attribute_writes(result, ctx, &prefix);
 
         // Stop resource monitoring thread
         resource_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -675,7 +680,7 @@ pub fn run_steps(
 
         // 8. Record result with the original (unmunged) options
         ctx.ui.clear();
-        let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(provenance.clone()), &ctx.workspace);
+        let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(provenance.clone()), &ctx.workspace, written);
         ctx.progress.record_step(&step.id, record);
 
         // If this step modified files that were outputs of previous steps
@@ -757,6 +762,7 @@ pub fn run_steps(
                 ctx.progress.record_step(
                     &step.id,
                     StepRecord {
+                        attributes: Vec::new(),
                         status: Status::Error,
                         message: msg.clone(),
                         completed_at: Utc::now(),
@@ -873,12 +879,91 @@ fn workspace_relative(path: &Path, workspace: &Path) -> String {
     }
 }
 
+/// Write the tags a command asked for onto `dataset.yaml`, textually
+/// and idempotently (PS-19), once the command has succeeded; a dry run
+/// writes nothing. Returns the result — an error if the write failed —
+/// and the records of what was written (PS-13).
+fn apply_attribute_writes(
+    result: CommandResult,
+    ctx: &mut StreamContext,
+    prefix: &str,
+) -> (CommandResult, Vec<AttributeRecord>) {
+    let writes = std::mem::take(&mut ctx.attributes);
+    if writes.is_empty() || result.status != Status::Ok || ctx.dry_run {
+        return (result, Vec::new());
+    }
+    let yaml_path = ctx.workspace.join("dataset.yaml");
+    let original = match std::fs::read_to_string(&yaml_path) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                CommandResult {
+                    status: Status::Error,
+                    message: format!("tags not written: cannot read {}: {e}", yaml_path.display()),
+                    ..result
+                },
+                Vec::new(),
+            )
+        }
+    };
+    let mut text = original.clone();
+    let mut records: Vec<AttributeRecord> = Vec::new();
+    let mut profiles: Vec<String> = Vec::new();
+    for w in &writes {
+        if !profiles.contains(&w.profile) {
+            profiles.push(w.profile.clone());
+        }
+    }
+    for profile in &profiles {
+        let attrs: Vec<(String, serde_yaml::Value)> = writes
+            .iter()
+            .filter(|w| &w.profile == profile)
+            .map(|w| (w.key.clone(), w.value.clone()))
+            .collect();
+        text = match vectordata::dataset::yaml_edit::set_profile_attributes(&text, profile, &attrs) {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    CommandResult {
+                        status: Status::Error,
+                        message: format!("tags not written on profile '{profile}': {e}"),
+                        ..result
+                    },
+                    Vec::new(),
+                )
+            }
+        };
+        let mut shown: Vec<String> = Vec::new();
+        for (k, v) in &attrs {
+            let value = vectordata::dataset::yaml_edit::render_scalar(v).unwrap_or_default();
+            shown.push(format!("{k}={value}"));
+            records.push(AttributeRecord { profile: profile.clone(), key: k.clone(), value });
+        }
+        ctx.ui.log(&format!("{prefix} tags on '{profile}': {}", shown.join(", ")));
+    }
+    if text != original {
+        let tmp = yaml_path.with_extension("yaml.tmp");
+        if let Err(e) = std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, &yaml_path)) {
+            return (
+                CommandResult {
+                    status: Status::Error,
+                    message: format!("tags not written: {}: {e}", yaml_path.display()),
+                    ..result
+                },
+                Vec::new(),
+            );
+        }
+    }
+    (result, records)
+}
+
 fn step_record_from_result(
     result: &CommandResult,
     resolved_opts: &indexmap::IndexMap<String, String>,
     resource_summary: Option<ResourceSummary>,
     provenance: Option<Address>,
     workspace: &Path,
+    attributes: Vec<AttributeRecord>,
 ) -> StepRecord {
     let outputs: Vec<OutputRecord> = result
         .produced
@@ -908,6 +993,7 @@ fn step_record_from_result(
     };
 
     StepRecord {
+        attributes,
         status: result.status.clone(),
         message: result.message.clone(),
         completed_at: Utc::now(),

@@ -1730,6 +1730,41 @@ pub(super) fn run(
     if let Err(e) = writer.finish() {
         return error_result(format!("finish error: {}", e), start);
     }
+    // The tags of the set this generator was asked to produce (PS-12,
+    // PS-23), on every profile whose predicate facet is this file: the
+    // family, the ladder it was generated for, how many forms it holds,
+    // and its structural class from the census of what was written.
+    match super::analyze_predicate_forms::facet_form_classes(output_path) {
+        Ok(classes) => {
+            let class = match (classes.forms, classes.parts) {
+                (1, Some(parts)) => format!("uniform-{parts}"),
+                _ => "mixed".to_string(),
+            };
+            let ladder: Vec<serde_yaml::Value> = decades
+                .iter()
+                .map(|&d| serde_yaml::Value::from(10f64.powi(d)))
+                .collect();
+            for profile in crate::pipeline::dataset_lookup::profiles_declaring_facet(
+                &ctx.workspace,
+                "metadata_predicates",
+                output_path,
+            ) {
+                for (key, value) in [
+                    ("family", serde_yaml::Value::from("stratified")),
+                    ("selectivity_ladder", serde_yaml::Value::Sequence(ladder.clone())),
+                    ("forms", serde_yaml::Value::from(classes.forms as u64)),
+                    ("predicates", serde_yaml::Value::from(class.clone())),
+                ] {
+                    ctx.attributes.push(crate::pipeline::command::AttributeWrite {
+                        profile: profile.clone(),
+                        key: key.to_string(),
+                        value,
+                    });
+                }
+            }
+        }
+        Err(e) => return error_result(format!("census of the written facet: {e}"), start),
+    }
     let var_name = format!(
         "verified_count:{}",
         output_path

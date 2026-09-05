@@ -401,7 +401,19 @@ impl Options {
 }
 
 /// Execution context shared across all pipeline steps.
+/// A tag a command asks the runner to write on a profile once the
+/// step succeeds (PS-12, PS-13).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeWrite {
+    pub profile: String,
+    pub key: String,
+    pub value: serde_yaml::Value,
+}
+
 pub struct StreamContext {
+    /// Tags to write on profiles when this step succeeds (PS-13); the
+    /// runner clears it before each step and applies it after.
+    pub attributes: Vec<AttributeWrite>,
     /// Dataset name (from `name` field in dataset.yaml).
     pub dataset_name: String,
     /// Active profile name (`"all"` when running all profiles).

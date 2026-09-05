@@ -631,6 +631,20 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
 
+    // Every declared profile carries every schema tag that has a
+    // default (PS-19, PS-22), written before any step runs.
+    let mut config = config;
+    match fill_schema_defaults(&workspace, &mut config, args.dry_run) {
+        Ok(0) => {}
+        Ok(n) => println!(
+            "Schema defaults {} on {n} profile(s).",
+            if args.dry_run { "to fill" } else { "filled" }
+        ),
+        Err(e) => {
+            println!("Schema defaults not written: {e}");
+            std::process::exit(1);
+        }
+    }
     // Optionally filter to a single profile: the flag is a selector
     // that must name one (PS-9); `all` is every profile.
     let profile_name = resolve_profile_flag(&config, &args.profile);
@@ -848,6 +862,7 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
 
     let cache_dir_for_guidance = cache_dir.clone();
     let mut ctx = StreamContext {
+        attributes: Vec::new(),
         dataset_name,
         profile: profile_name.to_string(),
         profile_names: all_profile_names,
@@ -1744,6 +1759,67 @@ fn rewrite_var_refs(input: &str, var_names: &std::collections::HashSet<String>) 
 /// Emit the fully resolved pipeline as YAML to stdout.
 ///
 /// Delegates to [`resolve_pipeline_yaml`] and prints the result.
+/// Fill every schema tag that has a default onto each declared profile
+/// that lacks it (PS-19, PS-22): a textual, idempotent edit of the
+/// profile's own lines, reported by name. Generated members are
+/// re-derived on load and carry the tags their derivation writes. A
+/// dry run reports what it would fill and writes nothing.
+fn fill_schema_defaults(
+    workspace: &Path,
+    config: &mut vectordata::dataset::DatasetConfig,
+    dry_run: bool,
+) -> Result<usize, String> {
+    let defaults: Vec<(String, serde_yaml::Value)> = config
+        .profile_tags
+        .iter()
+        .filter(|(_, v)| !v.is_null())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if defaults.is_empty() {
+        return Ok(0);
+    }
+    let yaml_path = workspace.join("dataset.yaml");
+    let original = std::fs::read_to_string(&yaml_path)
+        .map_err(|e| format!("{}: {e}", yaml_path.display()))?;
+    let mut text = original.clone();
+    let mut filled = 0usize;
+    let names: Vec<String> = config.profiles.profiles.keys().cloned().collect();
+    for name in names {
+        if config.profiles.is_generated_profile(&name) {
+            continue;
+        }
+        let missing: Vec<(String, serde_yaml::Value)> = defaults
+            .iter()
+            .filter(|(k, _)| !config.profiles.profiles[&name].attributes.contains_key(k))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        for (k, v) in &missing {
+            println!(
+                "  {} {name}.{k} = {}",
+                if dry_run { "would fill" } else { "filling" },
+                vectordata::dataset::yaml_edit::render_scalar(v)?
+            );
+        }
+        text = vectordata::dataset::yaml_edit::set_profile_attributes(&text, &name, &missing)?;
+        if let Some(p) = config.profiles.profiles.get_mut(&name) {
+            for (k, v) in missing {
+                p.attributes.insert(k, v);
+            }
+        }
+        filled += 1;
+    }
+    if !dry_run && text != original {
+        let tmp = yaml_path.with_extension("yaml.tmp");
+        std::fs::write(&tmp, &text)
+            .and_then(|_| std::fs::rename(&tmp, &yaml_path))
+            .map_err(|e| format!("{}: {e}", yaml_path.display()))?;
+    }
+    Ok(filled)
+}
+
 /// The profile a `--profile` flag names (PS-9): `all` is every profile,
 /// as it always was; anything else is a selector that must name
 /// exactly one, refused with the matches when it names more.
@@ -2925,6 +3001,7 @@ default:
             mtime: None,
         }).collect();
         log.record_step(id, StepRecord {
+            attributes: Vec::new(),
             status,
             message: format!("{} done", id),
             completed_at,

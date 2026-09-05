@@ -500,6 +500,7 @@ pub fn run_direct(args: Vec<String>) {
 
     let cache = workspace.join(".cache");
     let mut ctx = StreamContext {
+        attributes: Vec::new(),
         dataset_name: String::new(),
         profile: String::new(),
         profile_names: vec![],

@@ -32,6 +32,7 @@ use veks_pipeline::pipeline::resource::ResourceGovernor;
 
 fn test_ctx(dir: &Path) -> StreamContext {
     StreamContext {
+        attributes: Vec::new(),
         dataset_name: "sign-rtt".into(),
         profile: String::new(),
         profile_names: vec![],

@@ -355,6 +355,7 @@ mod tests {
 
     fn record(path: &str) -> StepRecord {
         StepRecord {
+            attributes: Vec::new(),
             status: Status::Ok,
             message: String::new(),
             completed_at: chrono::Utc::now(),

@@ -266,6 +266,7 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            attributes: Vec::new(),
             dataset_name: String::new(),
             profile: String::new(),
             profile_names: vec![],

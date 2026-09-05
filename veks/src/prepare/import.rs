@@ -2541,6 +2541,10 @@ fn generate_yaml(
     // A generated dataset.yaml is data metadata, not source code — no
     // copyright/license header. (The dataset's own license, if any, belongs
     // in `attributes.license`.)
+    // A new dataset states the version its content needs (V-25) and
+    // declares its tag schema (PS-19): the naming tags, in order, each
+    // without a default so a generator sets the planned value.
+    out.push_str(&format!("format_version: {}\n", vectordata::model::FORMAT_VERSION_TAGGED));
     out.push_str(&format!("name: {}\n", args.name));
     if let Some(ref desc) = args.description {
         out.push_str(&format!("description: >-\n  {}\n", desc));
@@ -2647,6 +2651,17 @@ fn generate_yaml(
         let formatted: Vec<String> = specs.iter().map(|s| format!("\"{}\"", s)).collect();
         out.push_str(&format!("strata: [{}]\n", formatted.join(", ")));
     }
+
+    // The tag schema (PS-19): naming order first, no default on a
+    // planned value. `size` is written per profile from its rung
+    // (PS-20); `predicates` wherever a predicate facet is declared
+    // (PS-23); `selectivity` only on single-level sets.
+    out.push_str("\n# profile tags: the naming tags in order (PS-19); a selector reads them,\n");
+    out.push_str("# and a generated profile is named by their values joined with '-'.\n");
+    out.push_str("profile_tags:\n");
+    out.push_str("  size: ~\n");
+    out.push_str("  predicates: ~\n");
+    out.push_str("  selectivity: ~\n");
 
     // Profiles
     out.push_str("\nprofiles:\n");

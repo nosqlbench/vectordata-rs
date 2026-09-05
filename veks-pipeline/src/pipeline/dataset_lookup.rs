@@ -44,6 +44,29 @@ use super::command::{Options, StreamContext};
 /// facet name or recognized shorthand alias accepted by
 /// `vectordata::dataset::facet::resolve_standard_key`
 /// (`"base_vectors"`, `"base"`, `"neighbor_indices"`, `"gt"`, …).
+/// The profiles whose `facet` resolves to `path`: the ones a generator
+/// filling that file must tag (PS-12). A facet is compared by the file
+/// it names, windows stripped, against the workspace.
+pub fn profiles_declaring_facet(workspace: &Path, facet: &str, path: &Path) -> Vec<String> {
+    let Ok(config) = vectordata::dataset::DatasetConfig::load(&workspace.join("dataset.yaml")) else {
+        return Vec::new();
+    };
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    config
+        .profiles
+        .profiles
+        .iter()
+        .filter(|(_, p)| {
+            p.views.get(facet).is_some_and(|v| {
+                let clean = vectordata::dataset::catalog::strip_window_suffix(&v.source.path);
+                let declared = workspace.join(strip_namespace(clean));
+                std::fs::canonicalize(&declared).unwrap_or(declared) == target
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 pub fn resolve_path_option(
     ctx: &StreamContext,
     options: &Options,
@@ -613,6 +636,7 @@ mod tests {
 
     fn ctx_at(workspace: &Path) -> StreamContext {
         StreamContext {
+            attributes: Vec::new(),
             dataset_name: String::new(),
             profile: String::new(),
             profile_names: vec![],

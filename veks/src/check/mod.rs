@@ -16,6 +16,7 @@ pub mod fix;
 pub mod integrity;
 pub mod merkle;
 pub mod pipelines;
+mod profiles;
 
 /// Arguments for `veks check`.
 #[derive(veks_completion_derive::VeksCli)]
@@ -176,6 +177,7 @@ pub fn run(args: CheckArgs) {
     if is_dataset_context && (run_all || args.check_pipelines) {
         results.push(check_dataset_attributes(&dataset_files));
         results.push(check_conformance(&dataset_files));
+        results.push(profiles::check(&dataset_files));
     }
     if run_publish {
         results.push(publish_url::check(&directory, &dataset_files));

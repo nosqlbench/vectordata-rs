@@ -1278,6 +1278,7 @@ mod tests {
         let cache = workspace.join(".cache");
         std::fs::create_dir_all(&cache).unwrap();
         StreamContext {
+            attributes: Vec::new(),
             dataset_name: String::new(), profile: String::new(), profile_names: vec![],
             workspace: workspace.to_path_buf(),
             cache,
