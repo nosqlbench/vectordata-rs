@@ -10,7 +10,7 @@
 //!
 //! The expansion is a pure data transformation: no I/O, no command execution.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::config::DatasetConfig;
 use super::pipeline::StepDef;
@@ -205,6 +205,19 @@ pub fn expand_per_profile_steps_scoped(
         .map(|p| !p.views.values().any(|v| v.source.path.contains("profiles/")))
         .unwrap_or(false);
 
+    // The files `default` declares, by facet, so a template's inputs can
+    // follow each profile's own facets (PL-2).
+    let default_facet_paths: HashMap<String, String> = profiles
+        .profiles
+        .get("default")
+        .map(|d| {
+            d.views
+                .iter()
+                .map(|(facet, v)| (super::catalog::strip_window_suffix(&v.source.path).to_string(), facet.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     for phase in 0..=max_phase {
     for (profile_name, base_count_opt) in &all_profiles {
         let profile_dir = if classic && *profile_name == "default" {
@@ -255,8 +268,15 @@ pub fn expand_per_profile_steps_scoped(
                 && !is_partition
                 && let Some(code) = command_facet(&template.run)
                 && let Some(facet) = facet_key_for_code(code)
-                && !profiles.declares(profile_name, facet)
+                && !(profiles.declares(profile_name, facet)
+                    && profiles.profiles[*profile_name]
+                        .views
+                        .get(facet)
+                        .is_some_and(|v| v.source.path.starts_with(&profile_dir)))
             {
+                // Declared elsewhere — a layer naming the files another
+                // profile computes (PL-11) — is not this profile's to
+                // produce.
                 continue;
             }
 
@@ -315,6 +335,28 @@ pub fn expand_per_profile_steps_scoped(
                         .replace("${query_count}", &query_count.to_string());
                     if let Some(bc) = base_count_opt {
                         *s = s.replace("${base_count}", &bc.to_string());
+                    }
+                }
+            }
+
+            // A template reads the profile's own facet (PL-2): an option
+            // naming a file `default` declares for a facet becomes the
+            // path this profile reads that facet from — its own slab
+            // for a predicate set, the shared file for everything else.
+            if *profile_name != "default" {
+                for (_, v) in expanded_options.iter_mut() {
+                    if let serde_yaml::Value::String(s) = v {
+                        let bare = super::catalog::strip_window_suffix(s);
+                        let window = s[bare.len()..].to_string();
+                        let bare = bare.to_string();
+                        if let Some(facet) = default_facet_paths.get(&bare)
+                            && let Some(view) = profiles.effective_view(profile_name, facet)
+                        {
+                            let own = super::catalog::strip_window_suffix(&view.source.path);
+                            if own != bare {
+                                *s = format!("{own}{window}");
+                            }
+                        }
                     }
                 }
             }
@@ -435,6 +477,17 @@ pub fn expand_per_profile_steps_scoped(
         let mut changed = false;
         let mut after: Vec<String> = Vec::new();
         for dep in &step.after {
+            // A step declared for this profile beside a shared one —
+            // `generate-predicates-<set>` beside `generate-predicates`
+            // — is the instance this profile waits on.
+            let own_instance = format!("{dep}-{profile}");
+            if profile != "default" && emitted_now.contains(&own_instance) && !template_ids.contains(dep.as_str()) {
+                if !after.contains(&own_instance) {
+                    after.push(own_instance);
+                }
+                changed = true;
+                continue;
+            }
             if emitted_now.contains(dep) {
                 after.push(dep.clone());
                 continue;
