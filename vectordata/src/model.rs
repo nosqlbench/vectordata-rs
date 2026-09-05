@@ -330,7 +330,12 @@ fn apply_default_inheritance(profiles: &mut HashMap<String, ProfileConfig>) {
         let Some(profile) = profiles.get_mut(&name) else {
             continue;
         };
-        inherit_from(profile, &parent, parent_name == "default");
+        // The axis of a step is derived from `base_count` (PL-5): a
+        // size step when the child's count differs from the parent's
+        // effective one, whatever the parent is called; otherwise the
+        // step is at one size and every facet crosses as it is.
+        let size_axis = profile.base_count.is_some() && profile.base_count != parent.base_count;
+        inherit_from(profile, &parent, size_axis);
     }
 }
 
@@ -425,12 +430,12 @@ fn inheritance_order(profiles: &HashMap<String, ProfileConfig>) -> Vec<String> {
 /// invariant, and restating them per member is the drift hazard the
 /// axis was supposed to remove.
 ///
-/// The parent decides which it is. Inheriting from `default` keeps the
-/// size-axis rule, which is what every dataset written before
-/// parameterized profiles relies on (P-13). Naming a parent explicitly
-/// is a statement that this profile is a parameterization *of that
-/// one*, so everything it does not override comes across — the general
-/// case of which the default rule is one instance (P-3).
+/// `base_count` decides which it is (PL-5): a child whose count differs
+/// from its parent's is a size step, whatever the parent is called, so
+/// a `20m` that names `10m` re-cuts the windows and takes no ground
+/// truth; a child at its parent's count is a parameterization of it,
+/// and everything it does not override comes across — the general case
+/// of which the default rule is one instance (P-3).
 fn inherit_from(profile: &mut ProfileConfig, parent: &ProfileConfig, size_axis: bool) {
     let bc = profile.base_count;
     inherit_with_window(&mut profile.base_vectors, &parent.base_vectors, bc);
@@ -483,11 +488,12 @@ fn inherit(target: &mut Option<FacetConfig>, source: &Option<FacetConfig>) {
     }
 }
 
-/// Inherit `source` into `target` and apply a `[0..base_count)`
-/// window suffix to its source path. The window is *only* applied to
-/// the inherited copy — an explicit per-profile facet is left alone.
-/// No-op when `base_count.is_none()` (no meaningful window to apply)
-/// or when the source path already has a `[...]` window suffix.
+/// Inherit `source` into `target` under a `[0..base_count)` window.
+/// The window is *only* applied to the inherited copy — an explicit
+/// per-profile facet is left alone — and a window the parent already
+/// carries is **re-cut** to the child's count (PL-5): a `20m` that
+/// builds on `10m` reads the first twenty million of the same file,
+/// not its parent's ten. No-op when `base_count.is_none()`.
 fn inherit_with_window(
     target: &mut Option<FacetConfig>,
     source: &Option<FacetConfig>,
@@ -501,20 +507,13 @@ fn inherit_with_window(
     };
     let windowed = match src {
         FacetConfig::Simple(path) => {
-            if path.contains('[') {
-                FacetConfig::Simple(path)
-            } else {
-                FacetConfig::Simple(format!("{path}[0..{bc})"))
-            }
+            let bare = crate::dataset::catalog::strip_window_suffix(&path).to_string();
+            FacetConfig::Simple(format!("{bare}[0..{bc})"))
         }
-        FacetConfig::Detailed { source, window } => {
-            let window = if window.is_some() || source.contains('[') {
-                window
-            } else {
-                Some(format!("0..{bc}"))
-            };
-            FacetConfig::Detailed { source, window }
-        }
+        FacetConfig::Detailed { source, .. } => FacetConfig::Detailed {
+            source: crate::dataset::catalog::strip_window_suffix(&source).to_string(),
+            window: Some(format!("0..{bc}")),
+        },
         // A profile window is in *facet* ordinals; an entry window
         // inside a series source is in *file* ordinals (SH-67). Only the
         // former is what inheritance sets, so a series is windowed
@@ -526,22 +525,22 @@ fn inherit_with_window(
                 shard_stride,
                 shard_count,
                 record_count,
-                window,
+                ..
             } => ShardedFacet::Uniform {
                 source,
                 shard_stride,
                 shard_count,
                 record_count,
-                window: window.or(Some(format!("0..{bc}"))),
+                window: Some(format!("0..{bc}")),
             },
             ShardedFacet::Explicit {
                 source,
                 record_count,
-                window,
+                ..
             } => ShardedFacet::Explicit {
                 source,
                 record_count,
-                window: window.or(Some(format!("0..{bc}"))),
+                window: Some(format!("0..{bc}")),
             },
         }),
         };
@@ -1152,6 +1151,78 @@ profiles:
             profile.postfiltered_neighbor_distances.as_ref().and_then(|f| f.source()),
             Some("postfiltered.fvec"),
         );
+    }
+
+    /// **The axis of a step is derived from `base_count`** (PL-5): a
+    /// `20m` that names `10m` re-cuts the windows to twenty million and
+    /// takes no ground truth, exactly as it would under `default`.
+    #[test]
+    fn the_axis_is_derived_from_base_count() {
+        let yaml = r#"
+format_version: 3
+profiles:
+  default:
+    base_vectors: base.fvec
+    metadata_content: meta.slab
+    query_vectors: q.fvec
+    neighbor_indices: profiles/default/gt.ivec
+  10m:
+    inherits: default
+    base_count: 10000000
+    neighbor_indices: profiles/10m/gt.ivec
+  20m:
+    inherits: 10m
+    base_count: 20000000
+"#;
+        let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        let p = &config.profiles["20m"];
+        assert_eq!(p.base_vectors.as_ref().and_then(|f| f.source()), Some("base.fvec[0..20000000)"), "the window is re-cut, not the parent's");
+        assert_eq!(p.metadata_content.as_ref().and_then(|f| f.source()), Some("meta.slab[0..20000000)"));
+        assert_eq!(p.query_vectors.as_ref().and_then(|f| f.source()), Some("q.fvec"));
+        assert!(p.neighbor_indices.is_none(), "ground truth does not cross a size step, whatever the parent is called");
+    }
+
+    /// **Layers stack** (PL-5, PL-2): `default` → `10m` → a set at the
+    /// same count inherits the layer's windows and unfiltered ground
+    /// truth unchanged and declares its predicate group; two sets may
+    /// read one slab (case 7).
+    #[test]
+    fn stacked_layers_derive_each_axis_from_base_count() {
+        let yaml = r#"
+format_version: 3
+profiles:
+  default:
+    base_vectors: base.fvec
+    metadata_content: meta.slab
+    query_vectors: q.fvec
+    metadata_predicates: profiles/base/predicates.slab
+    neighbor_indices: profiles/default/gt.ivec
+  10m:
+    inherits: default
+    base_count: 10000000
+    neighbor_indices: profiles/10m/gt.ivec
+  10m-mixed:
+    inherits: 10m
+    base_count: 10000000
+    metadata_results: profiles/10m-mixed/results.slab
+    prefiltered_neighbor_indices: profiles/10m-mixed/pre.ivec
+  10m-uniform-2-1e-2:
+    inherits: 10m
+    metadata_predicates: profiles/10m-uniform-2-1e-2/predicates.slab
+    metadata_results: profiles/10m-uniform-2-1e-2/results.slab
+"#;
+        let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        let set = &config.profiles["10m-mixed"];
+        assert_eq!(set.base_vectors.as_ref().and_then(|f| f.source()), Some("base.fvec[0..10000000)"));
+        assert_eq!(set.neighbor_indices.as_ref().and_then(|f| f.source()), Some("profiles/10m/gt.ivec"), "the unfiltered ground truth crosses a same-size step");
+        assert_eq!(set.metadata_predicates.as_ref().and_then(|f| f.source()), Some("profiles/base/predicates.slab"), "the invariant slab reaches the set through the layer");
+        assert_eq!(set.predicate_results.as_ref().and_then(|f| f.source()), Some("profiles/10m-mixed/results.slab"));
+        let uniform = &config.profiles["10m-uniform-2-1e-2"];
+        assert_eq!(uniform.base_count, Some(10000000), "a set without a count is at its layer's");
+        assert_eq!(uniform.metadata_predicates.as_ref().and_then(|f| f.source()), Some("profiles/10m-uniform-2-1e-2/predicates.slab"), "a set's own slab overrides");
+        assert_eq!(uniform.neighbor_indices.as_ref().and_then(|f| f.source()), Some("profiles/10m/gt.ivec"));
+        let layer = &config.profiles["10m"];
+        assert!(layer.predicate_results.is_none(), "a layer holds no predicate group of its own");
     }
 
     /// Sized profile inherits shared facets from default and applies
