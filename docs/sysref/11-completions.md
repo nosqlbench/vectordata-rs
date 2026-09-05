@@ -70,6 +70,12 @@ User presses Tab
 - Hidden subcommands (clap `hide(true)`) become `level=2` so they
   surface only on rapid double-tap.
 - Registers global value providers for `--dataset`, `--profile`, etc.
+  A `dataset[:selector]` value completes in scopes (PS-16): after
+  `name:` the profile names, `profile=`, and each attribute key
+  followed by `=`; after `key=` the distinct values the key takes;
+  after `,` or `(` the same again. The cores are pure
+  (`filter_spec_candidates` over profile facts) and tested without a
+  catalog.
 
 The completion crate has no dependency on clap, veks, or any
 pipeline code. The clap-to-tree conversion lives in the `veks`

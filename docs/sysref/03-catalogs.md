@@ -145,11 +145,16 @@ sequence the user can paste.
 
 ### Prebuffering
 
-Downloads all facets for offline access, verified against merkle hashes:
+Downloads the facets of the selected profiles for offline access,
+verified against merkle hashes. The spec names the profiles with a
+selector (see 02-api §2.9): a name, `profile=*` for every profile, or an
+expression; a spec with no selector is refused naming the spellings.
 
 ```bash
-veks datasets prebuffer --dataset my-dataset
-veks datasets prebuffer --dataset my-dataset:default --at https://example.com/datasets/
+vectordata datasets precache my-dataset:default
+vectordata datasets precache my-dataset:profile=*
+vectordata datasets precache "tessera:size=10m,predicates=uniform*" --plan
+veks datasets precache --dataset my-dataset:default --at https://example.com/datasets/
 ```
 
 ### Cache inspection

@@ -1059,3 +1059,26 @@ When implementing the P0 fixes from §F:
 
 A complete PR should include all four checks for any
 context-class change.
+
+---
+
+## J. Dataset Spec Selector Contexts
+
+A `dataset[:selector]` word (the `describe`/`precache` positional,
+`--dataset`, `--select`) is one shell word because `:` is not in
+`COMP_WORDBREAKS`, so candidates are spliced whole. The head is found
+by its shape (a URL keeps its `:`), and the atom being typed starts
+after the last `,` or `(`; everything before it is kept as typed.
+
+| Context | Candidates | Intent |
+|---|---|---|
+| no `:` yet | dataset names by prefix | OPEN |
+| after `name:` or `,` or `(` | profile names, `profile=`, each attribute key + `=` | OPEN; a key candidate ends in `=` so no space is appended |
+| after `key=` (or `<`, `<=`, `>`, `>=`, `!=`) | the distinct values the key takes across the dataset's profiles, list elements one by one | APPEND |
+| after a complete atom | nothing until `,` or `)` is typed | TERMINAL |
+
+The values of structural keys (`profile`, `base_count`, `maxk`,
+`partition`, `inherits`) come from the profiles as loaded; every other
+key's values come from `attributes:`. Candidates are emitted with the
+dataset name and the kept prefix, `tessera:size=10m,predicates=`, so
+the multi-candidate rule (§B.5) applies unchanged.

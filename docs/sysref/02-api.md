@@ -544,6 +544,92 @@ inherit views from the default profile:
     neighbor_distances: profiles/label-0/neighbor_distances.fvecs
 ```
 
+### Selectors
+
+Everywhere a `dataset:profile` spec is accepted, what follows the colon
+is a **selector** (`docs/design/srd-profile-selectors.md`). A bare name
+still names one profile; an expression names the set of profiles whose
+facts match:
+
+```text
+tessera:10m                                  one profile, as before
+tessera:size=10m,predicates=uniform-2        AND of two atoms
+tessera:or(10m,20m)                          junctions: and(), or(), not()
+tessera:selectivity=1e-3..1e-2               half-open interval
+tessera:family=uniform*,not(size<10m)        glob, comparison
+tessera:form='topic_l3.eq_citation_percentile.range'   quoted literal
+tessera:profile=*                            every profile
+```
+
+An atom is `key op value` with `=`, `!=`, `<`, `<=`, `>`, `>=`; a
+comma is AND. A value is read by its spelling: `^…` or `…$` is a
+regular expression (RE2 subset, case-insensitive), `*`, `?` and `[…]`
+make a glob, `lo..hi` an interval, a number may carry a count suffix
+(`10m`, `128mi`, `1e-3`), `true`/`false` are booleans, anything else a
+literal, and quotes force a literal. Everything is case-insensitive.
+The keys `profile`, `base_count`, `maxk`, `partition` and `inherits`
+are read from the profile as loaded, after inheritance; every other
+key is read from its `attributes:`, which never inherit. An absent
+attribute matches nothing; a list attribute matches when any element
+does; a map is addressed by dotted keys.
+
+The head of a spec is found by its shape — a URL by scheme and
+authority, a path by its separators or a drive letter, otherwise a
+catalog name — so `https://host:8080/ds:10m` and `C:\data\ds:10m` split
+where they should. A spec with no selector means `default`.
+
+Which surface receives a selector decides what a set means. `precache`,
+`ping`, the explorer's purge and picker filter, and
+`Catalog::open_profiles` act on every match. `describe`, `explore
+--dataset`, `derive`, a pipeline's `--profile`, and
+`Catalog::open_profile` need exactly one; more is an error listing the
+matches, and zero is an error listing the dataset's profiles and their
+attributes. `precache` with no selector is refused naming
+`dataset:profile=*`, which is how "every profile" is spelled.
+
+Programmatically:
+
+```rust
+let group = TestDataGroup::load("path/to/dataset")?;
+let names = group.select(Some("size>=10m,predicates=mixed"))?;   // the set
+let one = group.select_one(Some("10m"))?;                        // exactly one
+let facts = group.profile_facts();                               // what a selector reads
+let views = catalog.open_profiles("tessera", Some("profile=*"))?;
+```
+
+### Tags
+
+From `format_version: 3` a dataset may declare a **tag schema**, and a
+profile's `attributes:` are then its tags:
+
+```yaml
+profile_tags:            # naming order; `~` marks a naming tag
+  size: ~                # the rung a sized profile was generated for
+  predicates: ~          # `mixed` or `uniform-<n>`, wherever a predicate facet is declared
+  selectivity: ~         # only single-level sets carry it
+  family: stratified     # a tag with a default is carried by every profile but does not name
+
+profiles:
+  default:
+    attributes: { size: 495m, predicates: mixed, family: stratified }
+  10m:
+    base_count: 10000000
+    attributes: { size: 10m, predicates: mixed, family: stratified }
+```
+
+A tag is a plan, not a measurement: generators write what a profile was
+asked to be, and verification reports what came out. The sized-profile
+derivation writes `size` for every member and the default carries the
+rung spelling of its own count; a predicate generator writes `family`,
+`forms`, `selectivity_ladder` and the structural class `predicates`,
+which `veks check` holds to a form census of the facet. A generated
+profile is **named by its naming tags** in schema order joined with `-`
+(`10m-uniform-2-1e-2`); names never change once declared. Tags are
+written into an existing `dataset.yaml` as a textual edit of the
+profile's own lines, never a serializer round trip, and every step that
+writes a tag records it beside its outputs so a hand edit is reported
+as stale rather than silently kept or overwritten.
+
 ### `knn_entries.yaml` fallback
 
 When `dataset.yaml` is not found, `TestDataGroup::load` falls back

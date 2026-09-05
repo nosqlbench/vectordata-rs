@@ -1,6 +1,8 @@
 # SRD — Profile selectors
 
-**Status:** draft
+**Status:** implemented in the Rust reference implementation
+(2026-09-05); the Java client (PS-17) is trued up separately. Decisions
+taken during implementation are in §9.
 **Scope:** the `dataset:profile` spec everywhere it is accepted (the
 `vectordata` and `veks` command lines, `explore`, catalogs, completions,
 `series_by_spec`), profile `attributes:` as the selection axis, the
@@ -515,3 +517,68 @@ specs means would be a regression dressed as a feature.
 - What the uniform-form generator's `form` attribute should be when a
   set deliberately includes predicates that act as no-ops to keep the
   form constant, which is the question of the follow-on SRD.
+
+## 9. Settled in implementation
+
+**Schema shape.** A tag declared with no default (`~`) is a naming tag:
+a planned value a generator sets per profile, and part of the name. A
+tag declared with a default is carried by every profile — `veks run`
+fills it onto every declared profile before any step, textually and
+idempotently, and reports what it filled — but does not name. This is
+the shape §8 draws, with `family: stratified` outside the name. A
+generated member (a strata expansion) is re-derived on load and carries
+the tags its derivation writes.
+
+**Facet-describing tags travel with a copied facet.** `predicates`,
+`family`, `forms`, `selectivity_ladder`, `form` and `form_shape`
+describe a predicate facet, not a profile. When the sized derivation
+copies the default's predicate slab into a member, those tags come with
+it, so the member's `predicates` class is the facet's (PS-23) and
+`veks check` passes on a ladder cut from a tagged default. Nothing else
+crosses: load-time inheritance never copies an attribute, and the
+loader pins that with a test (PS-19).
+
+**The size ladder is named by the tag it plans.** The sized derivation
+plans one tag, its rung; the class tags that travel with a copied facet
+are not part of that plan and do not enter the name, so `10m` stays
+`10m` under a schema that names `predicates`. A generator that plans
+`predicates` and `selectivity` names with them (`10m-uniform-2-1e-2`).
+
+**All-digit names.** Refused only where a shard field would follow the
+name, that is when the profile's files are sharded; an unsharded
+profile named `100` is allowed, as every small dataset in the field
+has one.
+
+**Default's `size`.** The decimal floor rung of its base count
+(`495930736` → `495m`, `10000` → `10k`), written by `veks prepare
+stratify` beside the members it derives.
+
+**Bootstrap.** A new dataset states `format_version: 3` and declares
+`profile_tags: {size: ~, predicates: ~, selectivity: ~}`; `family` is
+written by the generator as a plain attribute rather than declared.
+
+**Attribute writes are recorded.** A step's written tags are kept in
+its step record (`attributes: [{profile, key, value}]`, the value as
+its YAML text); the freshness check compares them with the yaml and
+reports a changed or missing tag by name (PS-13). The generator asks
+for writes through the stream context, and the runner applies them
+once the step has succeeded; a dry run writes nothing.
+
+**Surfaces.** The picker's filter box reads a bare word as the
+substring match it always was and anything with an operator or a
+junction as a selector. `list --select` resolves an expression against
+the named dataset to exactly one profile; `--matching-profile` remains
+a name pattern. A pipeline's step-definition `profile:` keys are names;
+the `--profile` flag is a selector that must name one, `all`
+unchanged. `--profile` outranks a selector carried by the spec on
+`precache`, `ping`, `derive` and `explore`. The precache refusal of a
+bare spec names `ds:profile=*`, `ds:default` and `ds:<selector>`. The
+explorer's purge acts on the selected profiles with the shared-file
+guard; `drop-cache` still takes cache directory names. Selections
+follow the group's size-sorted profile order.
+
+**`veks check`.** One rule, `profile-selectors`: an unversioned
+`dataset.yaml` fails (V-25), one below 3 is reported as predating tag
+schemas, the PS-15 bullets are reported (identical attributes only
+under a schema), and a `predicates` class is held to the facet's
+census, where `uniform-<n>` counts the parts of the top-level junction.
