@@ -618,7 +618,7 @@ fails on any violation.
     }
 }
 
-fn text(m: &MNode, key: &str) -> Option<String> {
+pub(crate) fn text(m: &MNode, key: &str) -> Option<String> {
     match m.fields.get(key) {
         Some(MValue::Text(t)) => Some(t.clone()),
         _ => None,
@@ -635,7 +635,7 @@ fn int(m: &MNode, key: &str) -> Option<i64> {
 }
 
 /// Every record of a namespace, decoded as MNodes.
-fn read_mnodes(path: &Path, namespace: Option<&str>) -> Result<Vec<MNode>, String> {
+pub(crate) fn read_mnodes(path: &Path, namespace: Option<&str>) -> Result<Vec<MNode>, String> {
     let reader = match namespace {
         Some(ns) => SlabReader::open_namespace(path, Some(ns)),
         None => SlabReader::open(path),

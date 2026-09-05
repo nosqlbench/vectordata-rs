@@ -20,6 +20,7 @@ pub mod analyze_fvecs_check_knnutils;
 // `analyze_explore` (the REPL command engine) migrated to
 // `vectordata::explore::repl` so the TUI lives entirely within the
 // vectordata crate; the explore code was the only consumer.
+pub mod analyze_predicate_forms;
 pub mod analyze_predicate_summary;
 pub mod analyze_find_duplicates;
 pub mod analyze_find_zeros;
@@ -143,6 +144,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze display-histogram", analyze_histogram::factory);
     registry.register("analyze model-diff", analyze_modeldiff::factory);
     registry.register("analyze explain-predicates", inspect_predicate::factory);
+    registry.register("analyze predicate-forms", analyze_predicate_forms::factory);
     registry.register("analyze predicate-summary", analyze_predicate_summary::factory);
     registry.register("analyze explain-filtered-knn", inspect_filtered_knn::factory);
     registry.register("analyze explain-knn", inspect_knn::factory);

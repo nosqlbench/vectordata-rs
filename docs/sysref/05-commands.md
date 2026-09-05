@@ -20,6 +20,7 @@ each run against the synthetic-1k test fixture.
 | `analyze find-zeros` | Scan for near-zero vectors (L2 norm threshold) |
 | `analyze find-duplicates` | Scan for duplicate vectors (bitwise equality) |
 | `analyze explain-predicates` | Trace predicate → matching metadata with selectivity |
+| `analyze predicate-forms` | Enumerate the predicate forms a facet holds and the indexes each needs |
 | `analyze explain-filtered-knn` | Full query trace through all pipeline stages |
 | `analyze compare-files` | Byte-level comparison of two files |
 | `analyze check-endian` | Verify endianness of a vector file |
