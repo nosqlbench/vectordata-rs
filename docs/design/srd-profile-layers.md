@@ -348,7 +348,15 @@ as the selectors SRD settled. The loader accepts either.
 a backup: to 2 it drops `inherits: default` lines and the schema and
 refuses a named parent; to 1 it also refuses a multi-file facet.
 
-**Not implemented here.** The uniform-form predicate generator and a
-bootstrap spec for `(size, predicates, level)` sets beyond the mixed
-one; a set with its own slab is declared by hand or by a generator to
-come, and everything above holds for it.
+**Uniform sets are declared by a command, not by bootstrap.** `veks
+prepare predicate-sets --form F --levels L [--sizes S]` declares one
+set per size and level under its size layer — the rung itself in a
+layered dataset, a hand-named `<rung>-unfiltered` beside a rung that
+carries its own group (PL-11) — with the predicate group under
+`profiles/<set>/` and one `generate predicates --strategy uniform` step
+per set, by textual edit, lifting a file below 3 to 3 with the standard
+schema. A per-profile template then reads the profile's own facet: an
+option naming a file `default` declares becomes the path the profile
+reads that facet from, and a step declared for the profile beside a
+shared one is the instance it waits on. The strata verifier checks only
+the profiles whose predicate facet is the slab it was given.

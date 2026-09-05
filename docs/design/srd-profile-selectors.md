@@ -582,3 +582,15 @@ follow the group's size-sorted profile order.
 schemas, the PS-15 bullets are reported (identical attributes only
 under a schema), and a `predicates` class is held to the facet's
 census, where `uniform-<n>` counts the parts of the top-level junction.
+
+**The uniform-form generator.** `generate predicates --strategy uniform`
+takes the form as `field.access` parts under `+` or `|` — `eq`, `range`
+(a lower bound) or `le` — and the level as spelled; every predicate
+lands in the half-decade band around the level, a pair the census
+tabulated takes its exact count, anything else is estimated under
+independence and recorded as such, and a no-op part is taken only when
+nothing else lands. The set's profile is tagged `family: uniform`,
+`predicates: uniform-<n>`, `form` (parts in canonical order joined by
+`_`), `form_shape`, `selectivity` (the level as spelled, so
+`10m-uniform-2-1e-2` is the name) and `forms: 1`; `veks check` holds the
+facet to the census.
