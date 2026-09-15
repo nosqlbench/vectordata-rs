@@ -494,6 +494,26 @@ fn e2e_topic_stratified_predicates() {
     assert_eq!(report["label_checks"], QUERIES);
     assert_eq!(report["label_disagreements"], 0);
 
+    // A dataset is documented by its README (sysref §1): without one the
+    // check refuses it, the scaffold still refuses it, and once written
+    // the static payload is an input of the finalize pass, so the run
+    // merkles it and links it from the docs.
+    let check = Command::new(veks_bin()).args(["check"]).arg(&dataset).output().unwrap();
+    let text = String::from_utf8_lossy(&check.stdout).to_string() + &String::from_utf8_lossy(&check.stderr);
+    assert!(!check.status.success() && text.contains("no README.md"), "a dataset without a README is refused:\n{text}");
+    let out = Command::new(veks_bin()).args(["prepare", "readme"]).arg(&dataset).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let scaffold = std::fs::read_to_string(dataset.join("README.md")).unwrap();
+    assert!(scaffold.starts_with("# ") && scaffold.contains("<!-- veks: fill in -->"), "{scaffold}");
+    let check = Command::new(veks_bin()).args(["check"]).arg(&dataset).output().unwrap();
+    let text = String::from_utf8_lossy(&check.stdout).to_string() + &String::from_utf8_lossy(&check.stderr);
+    assert!(!check.status.success() && text.contains("to fill in"), "a scaffold is not documentation:\n{text}");
+    std::fs::write(dataset.join("README.md"), scaffold.replace("<!-- veks: fill in -->", "Written.")).unwrap();
+    let (ok, log) = run_pipeline(&dataset_yaml);
+    assert!(ok, "fourth run failed:\n{log}");
+    assert!(dataset.join("README.md.mref").exists(), "the README makes the finalize pass stale and is merkled like content:\n{log}");
+    let docs = std::fs::read_to_string(dataset.join("docs/dataset.md")).unwrap();
+    assert!(docs.contains("[`README.md`](../README.md)"), "the generated reference links the README:\n{docs}");
     // The dataset's own checks pass (merkle included, since the run finished).
     let check = Command::new(veks_bin()).args(["check"]).arg(&dataset).output().unwrap();
     let text = String::from_utf8_lossy(&check.stdout).to_string() + &String::from_utf8_lossy(&check.stderr);

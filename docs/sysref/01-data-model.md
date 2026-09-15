@@ -449,3 +449,21 @@ step to produce them; catalog staleness does not count them; and
 `analyze describe-dataset` links them from the generated docs under
 "License and Attribution", together with the `license`, `vendor` and
 `notes` attributes of `dataset.yaml`.
+
+### `README.md` is how a dataset is documented
+
+Of the static payload, `README.md` at the dataset root is **required**:
+it is the narrative a reader needs before the generated reference in
+`docs/dataset.md` makes sense. It carries six sections in this order —
+*What this dataset is*, *How it was made*, *License and attribution*,
+*Profiles*, *Tags and selectors*, *Predicates and example queries* —
+and it is written by a person: `veks prepare readme` writes the
+scaffold with every fact the definition already holds filled in and a
+`<!-- veks: fill in -->` marker wherever prose is owed, and `veks
+check` refuses a dataset with no README, one that does not open with a
+`# <title>` heading, or one whose markers are still there. The file is
+never regenerated, so a run never overwrites what was written; a
+generated fact that changes belongs in `docs/`, and the README says
+what the facts mean. Static payload is an input of the finalize pass
+(§4.3), so adding or editing a README republishes the docs and the
+merkle tree on the next run.

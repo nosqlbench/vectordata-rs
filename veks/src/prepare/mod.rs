@@ -16,6 +16,7 @@ pub(crate) mod infer_manifest;
 pub mod import;
 pub mod stratify;
 pub mod predicate_sets;
+pub mod readme;
 pub mod tags;
 pub(crate) mod synthesize;
 pub(crate) mod wizard;
@@ -274,6 +275,18 @@ pub enum PrepareCommand {
         sources: Vec<PathBuf>,
     },
     /// Add sized profiles to an existing dataset for multi-scale benchmarking
+    /// Write the dataset's README.md scaffold: the standard sections with every
+    /// fact the definition holds filled in and a marker wherever a person must
+    /// write. A README is how a dataset is documented; `veks check` refuses a
+    /// dataset without one, or with markers left.
+    Readme {
+        /// Dataset directory or path to dataset.yaml
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Replace an existing README.md with a fresh scaffold (a backup is taken)
+        #[arg(long)]
+        force: bool,
+    },
     /// Edit the tags of the profiles a selector names, as a change of plan:
     /// a textual edit of their own `attributes:` lines, recorded in every
     /// step record that holds the tag and in the records that name the file,
@@ -1100,6 +1113,9 @@ pub fn run(args: PrepareArgs) {
         }
         PrepareCommand::Publish(args) => {
             crate::publish::run(args);
+        }
+        PrepareCommand::Readme { path, force } => {
+            readme::run(readme::ReadmeArgs { path, force });
         }
         PrepareCommand::Tags { path, profile, set, unset, dry_run } => {
             tags::run(tags::TagsArgs { path, profile, set, unset, dry_run });

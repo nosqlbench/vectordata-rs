@@ -174,6 +174,12 @@ fn write_header(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
         doc.push_str(&format!("{}\n\n", desc));
     }
 
+    // The README is how a dataset is documented (sysref §1); this file
+    // is the generated reference, and says so.
+    if workspace_dir(workspace).join("README.md").is_file() {
+        doc.push_str("This is the generated reference. The dataset is documented in [`README.md`](../README.md).\n\n");
+    }
+
     doc.push_str("## Overview\n\n");
     doc.push_str("| Property | Value |\n");
     doc.push_str("|----------|-------|\n");
@@ -301,6 +307,13 @@ fn write_provenance(_config: &DatasetConfig, workspace: &Path, doc: &mut String)
     doc.push('\n');
 }
 
+/// A workspace as a directory to read: the runner names the current
+/// directory as the empty path, which joins like `.` but does not read
+/// like it.
+fn workspace_dir(workspace: &Path) -> &Path {
+    if workspace.as_os_str().is_empty() { Path::new(".") } else { workspace }
+}
+
 /// The dataset's license and attribution: the declared attributes and
 /// the static payload that carries the full terms.
 fn write_license_section(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
@@ -308,12 +321,13 @@ fn write_license_section(config: &DatasetConfig, workspace: &Path, doc: &mut Str
     let license = attrs.and_then(|a| a.license.as_deref());
     let vendor = attrs.and_then(|a| a.vendor.as_deref());
     let notes = attrs.and_then(|a| a.notes.as_deref());
-    let mut payload: Vec<String> = std::fs::read_dir(workspace)
+    // The README is linked from the header, not listed as terms.
+    let mut payload: Vec<String> = std::fs::read_dir(workspace_dir(workspace))
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| vectordata::filters::is_static_payload(n))
+                .filter(|n| vectordata::filters::is_static_payload(n) && !n.starts_with("README"))
                 .collect()
         })
         .unwrap_or_default();

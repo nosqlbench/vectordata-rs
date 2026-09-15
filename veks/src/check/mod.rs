@@ -178,6 +178,7 @@ pub fn run(args: CheckArgs) {
         results.push(check_dataset_attributes(&dataset_files));
         results.push(check_conformance(&dataset_files));
         results.push(profiles::check(&dataset_files));
+        results.push(check_readme(&dataset_files));
     }
     if run_publish {
         results.push(publish_url::check(&directory, &dataset_files));
@@ -444,6 +445,49 @@ fn check_dataset_attributes(dataset_files: &[PathBuf]) -> CheckResult {
         r
     } else {
         CheckResult::fail("dataset-attributes", missing_msgs)
+    }
+}
+
+/// What is wrong with a dataset's README, if anything: the file is how
+/// a dataset is documented (sysref §1, "Static payload"), so a dataset
+/// must carry one, it must open with a title, and the scaffold's
+/// fill-in markers must be gone. Empty when the README is in order.
+pub fn readme_report(ds_dir: &Path, text: &str) -> Vec<String> {
+    let ds_rel = rel_display(ds_dir);
+    let mut msgs = Vec::new();
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    if !first.starts_with("# ") {
+        msgs.push(format!("{ds_rel}: README.md does not open with a `# <title>` heading"));
+    }
+    let markers = text.matches(crate::prepare::readme::FILL_IN).count();
+    if markers > 0 {
+        msgs.push(format!(
+            "{ds_rel}: README.md still has {markers} place(s) to fill in (`{}`)",
+            crate::prepare::readme::FILL_IN
+        ));
+    }
+    msgs
+}
+
+fn check_readme(dataset_files: &[PathBuf]) -> CheckResult {
+    let mut msgs: Vec<String> = Vec::new();
+    for ds_path in dataset_files {
+        let ds_dir = ds_path.parent().unwrap_or(Path::new("."));
+        let readme = ds_dir.join("README.md");
+        match std::fs::read_to_string(&readme) {
+            Ok(text) => msgs.extend(readme_report(ds_dir, &text)),
+            Err(_) => msgs.push(format!(
+                "{}: no README.md — a dataset is documented by one; `veks prepare readme` writes the scaffold",
+                rel_display(ds_dir)
+            )),
+        }
+    }
+    if msgs.is_empty() {
+        let mut r = CheckResult::ok("readme");
+        r.messages.push("every dataset carries a README.md".to_string());
+        r
+    } else {
+        CheckResult::fail("readme", msgs)
     }
 }
 

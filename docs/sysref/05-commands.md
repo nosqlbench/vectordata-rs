@@ -126,6 +126,7 @@ palette.
 | `veks prepare downgrade --to N` | Downgrade `dataset.yaml` to a lower format version: succeeds exactly when nothing needs the higher one, by textual edit with a backup |
 | `veks prepare predicate-sets --form F --levels L` | Declare the grid of uniform predicate sets under each size layer, one shared slab and generator step per level, floored by the census, by textual edit |
 | `veks prepare tags --profile SEL --set k=v` | Edit the tags of the profiles a selector names as a change of plan: textual, recorded in the step records, no compute step turns stale |
+| `veks prepare readme [PATH]` | Write the README.md scaffold: the standard sections, the definition's facts filled in, a marker wherever a person must write |
 | `veks prepare cleanup-profiles` | Housekeeping: drop sized profiles no stratum names and profile directories no entry names, without touching the cache |
 | `veks prepare cache-gc` | Housekeeping: remove cache files nothing in the definition can use — not named by a step, not recorded by a defined step, not claimed by an engine's cache, not a twin of those |
 

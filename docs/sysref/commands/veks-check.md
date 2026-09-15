@@ -40,6 +40,14 @@ veks check --check-catalogs
 veks check --check-extraneous
 ```
 
+## The readme check
+
+A dataset is documented by `README.md` at its root (sysref §1, "Static
+payload"). The `readme` check fails a dataset with no README, one whose
+first line is not a `# <title>` heading, or one that still carries the
+`<!-- veks: fill in -->` markers `veks prepare readme` leaves where a
+person has to write.
+
 ## Cleanup
 
 ```bash
