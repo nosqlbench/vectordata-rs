@@ -116,7 +116,16 @@ A step is fresh when:
   sequencing edges do not count, AND
 - No input-role path is newer than the output (the Make rule), which
   carries a cascade across sessions: an upstream rebuilt yesterday
-  makes its dependents stale today.
+  makes its dependents stale today, AND
+- For a finalize step, the **definition** it publishes reads as it did:
+  `dataset.yaml` joins the node's upstreams under the key
+  `dataset.yaml`, keyed by content. A tag edited with `veks prepare
+  tags`, a reworded description or a declared profile reaches
+  dataset.json, the catalog and the docs on the next run; a save that
+  wrote the same bytes reaches nothing, and no compute step holds the
+  definition, so an edit never recomputes data. A record from before
+  the definition was an input is judged by the file's time until the
+  step runs again.
 
 A dry run applies the same rules to its plan: a planned step with
 outputs stands for outputs newer than its dependents' records, and a

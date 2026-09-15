@@ -1421,6 +1421,12 @@ fn explain_staleness(
             };
             upstream.insert((*up).to_string(), address);
         }
+        if step.def.finalize
+            && let Ok(node) = provenance::ProvenanceNode::definition(&ctx.workspace)
+            && let Ok(address) = graph.insert(node)
+        {
+            upstream.insert(provenance::DEFINITION_INPUT.to_string(), address);
+        }
         let binary = provenance::BinaryVersion::parse(&cmd_build_version);
         let current = graph
             .insert(provenance::ProvenanceNode::build(

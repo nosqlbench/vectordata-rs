@@ -62,6 +62,10 @@ pub type Address = String;
 /// `upstream` names each upstream by the **address** of the node the
 /// step was built on. The node itself is in the graph; two dependents
 /// of one upstream share it.
+/// The upstream key under which a finalize step holds the dataset
+/// definition as an input (see [`ProvenanceNode::definition`]).
+pub const DEFINITION_INPUT: &str = "dataset.yaml";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvenanceNode {
     /// Step identifier — the YAML `id` field.
@@ -173,6 +177,36 @@ impl ProvenanceNode {
         Ok(ProvenanceNode {
             step_id: format!("degenerate:{name}"),
             command_path: "degenerate".into(),
+            binary_version_major: 0,
+            binary_version_minor: 0,
+            binary_version_patch: 0,
+            binary_git_hash: String::new(),
+            binary_dirty: false,
+            options,
+            upstream: BTreeMap::new(),
+        })
+    }
+
+    /// The node of the dataset definition as an **input**: `dataset.yaml`
+    /// keyed by its content, so the steps that publish the definition
+    /// (dataset.json, the catalog, the docs, the merkle tree) are stale
+    /// when what it says changed and fresh when it was merely rewritten
+    /// — a tag edited by `veks prepare tags`, a description reworded,
+    /// a profile declared, each reaches the published copies on the next
+    /// run; a save that wrote the same bytes reaches nothing. Content,
+    /// not mtime: the run itself rewrites the file, and a rewrite that
+    /// changes nothing must not cascade.
+    pub fn definition(workspace: &Path) -> std::io::Result<Self> {
+        let path = workspace.join(DEFINITION_INPUT);
+        let bytes = std::fs::read(&path)?;
+        let mut h = FnvHasher::new();
+        h.write(&bytes);
+        let mut options: BTreeMap<String, String> = BTreeMap::new();
+        options.insert("path".into(), DEFINITION_INPUT.into());
+        options.insert("content".into(), format!("{:016x}", h.finish()));
+        Ok(ProvenanceNode {
+            step_id: format!("definition:{DEFINITION_INPUT}"),
+            command_path: "definition".into(),
             binary_version_major: 0,
             binary_version_minor: 0,
             binary_version_patch: 0,

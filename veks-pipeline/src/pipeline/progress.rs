@@ -25,7 +25,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::command::Status;
-use super::provenance::{Address, BinaryVersion, ProvenanceFlags, ProvenanceGraph, ProvenanceNode};
+use super::provenance::{DEFINITION_INPUT, Address, BinaryVersion, ProvenanceFlags, ProvenanceGraph, ProvenanceNode};
 
 /// Schema version for the progress log.
 ///
@@ -381,8 +381,28 @@ impl ProgressLog {
         upstream_ids: &[&str],
         build_version: &str,
     ) -> Address {
+        self.build_provenance_with_inputs(step_id, command_path, resolved_options, upstream_ids, &[], build_version)
+    }
+
+    /// [`build_provenance`](Self::build_provenance) with **inputs** that
+    /// are not steps: each `(key, address)` joins the node's upstreams
+    /// under its key, so the step is stale when the input's node changed.
+    /// A finalize step holds the dataset definition this way
+    /// ([`definition_input`](Self::definition_input)).
+    pub fn build_provenance_with_inputs(
+        &mut self,
+        step_id: &str,
+        command_path: &str,
+        resolved_options: &HashMap<String, String>,
+        upstream_ids: &[&str],
+        inputs: &[(&str, Address)],
+        build_version: &str,
+    ) -> Address {
         let binary = BinaryVersion::parse(build_version);
         let mut upstream: BTreeMap<String, Address> = BTreeMap::new();
+        for (key, address) in inputs {
+            upstream.insert((*key).to_string(), address.clone());
+        }
         for up_id in upstream_ids {
             let recorded = self
                 .steps
@@ -402,6 +422,44 @@ impl ProgressLog {
         self.provenance
             .insert(node)
             .expect("every upstream address was just taken from or put into this graph")
+    }
+
+    /// The address of the dataset definition as it reads now
+    /// ([`ProvenanceNode::definition`]), inserted into this log's graph;
+    /// `None` when the workspace has no readable `dataset.yaml`.
+    pub fn definition_input(&mut self, workspace: &Path) -> Option<Address> {
+        let node = ProvenanceNode::definition(workspace).ok()?;
+        self.provenance.insert(node).ok()
+    }
+
+    /// Whether `dataset.yaml` changed after a step's record that does
+    /// **not** hold the definition as an input — a record from before
+    /// the definition was one. A hash the record never had cannot judge
+    /// it (TS-169); the file's own time can: written after the record,
+    /// the step read something older than what stands. Once the step
+    /// runs again its record holds the definition by content and this
+    /// rule no longer applies to it.
+    pub fn definition_changed_after(&self, step_id: &str, workspace: &Path) -> Option<String> {
+        let record = self.steps.get(step_id)?;
+        if record.status != Status::Ok {
+            return None;
+        }
+        let holds_definition = record
+            .provenance
+            .as_deref()
+            .and_then(|a| self.provenance.get(a))
+            .is_some_and(|n| n.upstream.contains_key(DEFINITION_INPUT));
+        if holds_definition {
+            return None;
+        }
+        let modified: DateTime<Utc> = std::fs::metadata(workspace.join(DEFINITION_INPUT))
+            .ok()?
+            .modified()
+            .ok()?
+            .into();
+        (modified > record.completed_at).then(|| {
+            format!("'{DEFINITION_INPUT}' changed after this step's record")
+        })
     }
 
     /// Check whether a step's recorded provenance matches `current`
@@ -1685,5 +1743,45 @@ mod tests {
         assert!(msg.unwrap().contains("schema version changed"));
         assert!(log.steps.is_empty(), "steps should be cleared on version mismatch");
         assert_eq!(log.schema_version, PROGRESS_SCHEMA_VERSION);
+    }
+
+    /// **The definition is a finalize step's input, by content.** A
+    /// record holding it is stale when `dataset.yaml` says something
+    /// else and fresh when the file was rewritten with the same bytes;
+    /// a record from before the definition was an input is judged by
+    /// the file's time instead, and only until the step runs again.
+    #[test]
+    fn the_definition_is_an_input_by_content() {
+        let ws = tempfile::tempdir().unwrap();
+        let yaml = ws.path().join("dataset.yaml");
+        std::fs::write(&yaml, "name: t\nprofiles:\n  default:\n    attributes:\n      size: 1k\n").unwrap();
+        let mut log = ProgressLog::new();
+        let opts = HashMap::new();
+        let def = log.definition_input(ws.path()).unwrap();
+        let recorded = log.build_provenance_with_inputs("generate-dataset-json", "generate dataset-json", &opts, &[], &[(DEFINITION_INPUT, def)], "2.0.0+abc");
+        log.record_step("generate-dataset-json", rec(Some(recorded)));
+        let selector = ProvenanceFlags::CONFIG_ONLY;
+
+        // Rewritten, same bytes: fresh.
+        std::fs::write(&yaml, "name: t\nprofiles:\n  default:\n    attributes:\n      size: 1k\n").unwrap();
+        let def = log.definition_input(ws.path()).unwrap();
+        let current = log.build_provenance_with_inputs("generate-dataset-json", "generate dataset-json", &opts, &[], &[(DEFINITION_INPUT, def)], "2.0.0+abc");
+        assert!(log.check_provenance("generate-dataset-json", &current, selector).is_none());
+        assert!(log.definition_changed_after("generate-dataset-json", ws.path()).is_none(), "a record holding the definition is judged by content, not time");
+
+        // A tag edited: stale, naming the definition.
+        std::fs::write(&yaml, "name: t\nprofiles:\n  default:\n    attributes:\n      size: 1k\n      predicates: mixed\n").unwrap();
+        let def = log.definition_input(ws.path()).unwrap();
+        let current = log.build_provenance_with_inputs("generate-dataset-json", "generate dataset-json", &opts, &[], &[(DEFINITION_INPUT, def)], "2.0.0+abc");
+        let reason = log.check_provenance("generate-dataset-json", &current, selector).expect("stale");
+        assert!(reason.contains(DEFINITION_INPUT), "{reason}");
+
+        // A record from before the definition was an input: the file's time decides.
+        let old = log.build_provenance("generate-catalog", "catalog generate", &opts, &[], "2.0.0+abc");
+        log.record_step("generate-catalog", rec(Some(old)));
+        log.steps.get_mut("generate-catalog").unwrap().completed_at = Utc::now() - chrono::Duration::seconds(60);
+        assert!(log.definition_changed_after("generate-catalog", ws.path()).is_some(), "written after the record");
+        log.steps.get_mut("generate-catalog").unwrap().completed_at = Utc::now() + chrono::Duration::seconds(60);
+        assert!(log.definition_changed_after("generate-catalog", ws.path()).is_none());
     }
 }

@@ -200,11 +200,24 @@ pub fn run_steps(
         let upstream_ids: Vec<&str> = step.def.after.iter()
             .map(|s| s.as_str())
             .collect();
-        let provenance = ctx.progress.build_provenance(
+        // A finalize step publishes the definition, so the definition
+        // is its input, by content: an edit reaches dataset.json, the
+        // catalog and the docs on the next run; a rewrite that changed
+        // nothing reaches nothing.
+        let inputs: Vec<(&str, super::provenance::Address)> = if step.def.finalize {
+            ctx.progress
+                .definition_input(&ctx.workspace)
+                .map(|a| vec![(super::provenance::DEFINITION_INPUT, a)])
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let provenance = ctx.progress.build_provenance_with_inputs(
             &step.id,
             &step.def.run,
             &resolved_map,
             &upstream_ids,
+            &inputs,
             &cmd_build_version,
         );
         let selector = ctx.provenance_selector;
@@ -250,14 +263,23 @@ pub fn run_steps(
         } else {
             ctx.progress.upstream_wrote_after(&step.id, &step.def.after, Some(&ctx.workspace))
         };
+        // A finalize step recorded before the definition was its input
+        // is judged by the file's time, as any upstream declared since
+        // a record is.
+        let definition_changed: Option<String> = if step.def.finalize {
+            ctx.progress.definition_changed_after(&step.id, &ctx.workspace)
+        } else {
+            None
+        };
         let progress_fresh = match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
-            None if provenance_reason.is_none() && upstream_planned.is_none() && upstream_wrote.is_none() && planned_input.is_none() => true,
+            None if provenance_reason.is_none() && upstream_planned.is_none() && upstream_wrote.is_none() && planned_input.is_none() && definition_changed.is_none() => true,
             None if provenance_reason.is_none() => {
-                let reason = match (&upstream_planned, &upstream_wrote, &planned_input) {
-                    (Some(u), _, _) => format!("upstream '{}' runs in this plan", u),
-                    (None, Some((u, path)), _) => format!("upstream '{}' wrote '{}' after this step's record", u, path),
-                    (None, None, Some((input, producer))) => format!("input '{}' is produced by '{}' in this plan", input, producer),
-                    (None, None, None) => unreachable!("one of the three made the step stale"),
+                let reason = match (&upstream_planned, &upstream_wrote, &planned_input, &definition_changed) {
+                    (Some(u), _, _, _) => format!("upstream '{}' runs in this plan", u),
+                    (None, Some((u, path)), _, _) => format!("upstream '{}' wrote '{}' after this step's record", u, path),
+                    (None, None, Some((input, producer)), _) => format!("input '{}' is produced by '{}' in this plan", input, producer),
+                    (None, None, None, Some(reason)) => reason.clone(),
+                    (None, None, None, None) => unreachable!("one of the four made the step stale"),
                 };
                 ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id, reason));
                 false
