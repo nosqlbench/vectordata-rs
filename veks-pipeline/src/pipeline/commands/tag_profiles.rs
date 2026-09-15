@@ -115,11 +115,16 @@ steps that publish the dataset's definition.
         // the finalize steps that publish the definition see a newer
         // input and run again; a run that wrote nothing produces
         // nothing and leaves them fresh.
-        let produced = if parents_written || !plan.writes.is_empty() {
-            vec![yaml_path.clone()]
-        } else {
-            vec![]
-        };
+        let config_now = DatasetConfig::load(&yaml_path).ok();
+        let writes_anything = parents_written
+            || plan.writes.iter().any(|w| {
+                config_now
+                    .as_ref()
+                    .and_then(|c| c.profiles.profile(&w.profile))
+                    .and_then(|p| p.attributes.get(&w.key))
+                    != Some(&w.value)
+            });
+        let produced = if writes_anything { vec![yaml_path.clone()] } else { vec![] };
         ctx.attributes.extend(plan.writes);
 
         CommandResult {
@@ -229,10 +234,12 @@ pub fn plan_tags(
             tags.extend(facet_tags[&rel].iter().cloned());
         }
 
+        // Every tag the plan holds is asked for, present or not: the
+        // write is idempotent, and the record then carries the whole
+        // plan (PS-13), so a hand edit is reported after a run that
+        // wrote nothing as much as after one that did.
         for (key, value) in tags {
-            if profile.attributes.get(&key) != Some(&value) {
-                writes.push(AttributeWrite { profile: name.clone(), key, value });
-            }
+            writes.push(AttributeWrite { profile: name.clone(), key, value });
         }
         if name != "default" && !profile.partition && profile.inherits.is_none() {
             parents.push(name.clone());
@@ -409,13 +416,16 @@ mod tests {
 
         let again = DatasetConfig::load(&yaml_path).unwrap();
         let plan = plan_tags(&again, tmp.path(), &log.steps).unwrap();
-        assert!(plan.writes.is_empty(), "{:?}", plan.writes);
+        assert!(plan.writes.iter().all(|w| {
+            again.profiles.profile(&w.profile).and_then(|p| p.attributes.get(&w.key)) == Some(&w.value)
+        }), "a second plan asks for what is there, so the record holds the whole plan: {:?}", plan.writes);
         assert!(plan.parents.is_empty());
         let mut op = TagProfilesOp;
         let mut ctx = ctx_at(tmp.path());
         let r = op.execute(&Options::default(), &mut ctx);
         assert_eq!(r.status, Status::Ok, "{}", r.message);
         assert_eq!(std::fs::read_to_string(&yaml_path).unwrap(), text, "a re-run writes nothing");
-        assert!(ctx.attributes.is_empty());
+        assert!(!ctx.attributes.is_empty(), "and still records its plan");
+        assert!(r.produced.is_empty(), "nothing written, nothing produced");
     }
 }

@@ -671,7 +671,11 @@ profile is **named by its naming tags** in schema order joined with `-`
 written into an existing `dataset.yaml` as a textual edit of the
 profile's own lines, never a serializer round trip, and every step that
 writes a tag records it beside its outputs so a hand edit is reported
-as stale rather than silently kept or overwritten.
+as stale rather than silently kept or overwritten. A deliberate change
+of plan goes through `veks prepare tags --profile <selector> --set
+key=value`, which edits the profiles the selector names and records the
+new value in every step record that holds the tag, so nothing turns
+stale except the published definition, which refreshes.
 
 ### `knn_entries.yaml` fallback
 

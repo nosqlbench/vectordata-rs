@@ -290,6 +290,57 @@ pub fn set_profile_inherits(yaml: &str, profile: &str, parent: &str) -> Result<S
     Ok(finish(lines, yaml))
 }
 
+/// Remove one tag from a profile's `attributes:` (PS-13): the key's
+/// line in block form, the entry in flow form; a map left empty is
+/// removed with it, since an empty map would read as "described as
+/// nothing" (P-7). A key not present changes nothing.
+pub fn unset_profile_attribute(yaml: &str, profile: &str, key: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+    let profiles = lines
+        .iter()
+        .position(|l| indent_of(l) == 0 && key_of(l) == Some("profiles"))
+        .ok_or_else(|| "dataset.yaml declares no `profiles:`".to_string())?;
+    let profiles_end = block_end(&lines, profiles, 0);
+    let profile_line = (profiles + 1..profiles_end)
+        .find(|&i| indent_of(&lines[i]) == 2 && key_of(&lines[i]) == Some(profile))
+        .ok_or_else(|| format!("profile '{profile}' is not declared"))?;
+    let profile_end = block_end(&lines, profile_line, 2);
+    let Some(a) = (profile_line + 1..profile_end)
+        .find(|&i| indent_of(&lines[i]) == 4 && key_of(&lines[i]) == Some("attributes"))
+    else {
+        return Ok(finish(lines, yaml));
+    };
+    let (flow, comment) = value_and_comment(&lines[a]);
+    if flow.starts_with('{') {
+        let mut map: IndexMap<String, Yaml> = serde_yaml::from_str(&flow)
+            .map_err(|e| format!("profile '{profile}' attributes: {e}"))?;
+        if map.shift_remove(key).is_none() {
+            return Ok(finish(lines, yaml));
+        }
+        if map.is_empty() {
+            lines.remove(a);
+        } else {
+            let mut parts = Vec::new();
+            for (k, v) in &map {
+                parts.push(format!("{k}: {}", render_scalar(v)?));
+            }
+            lines[a] = updated_line(&lines[a], "    ", "attributes", &format!("{{ {} }}", parts.join(", ")));
+            let _ = comment;
+        }
+        return Ok(finish(lines, yaml));
+    }
+    let block_end_i = block_end(&lines, a, 4);
+    let Some(i) = (a + 1..block_end_i).find(|&i| indent_of(&lines[i]) == 6 && key_of(&lines[i]) == Some(key)) else {
+        return Ok(finish(lines, yaml));
+    };
+    lines.remove(i);
+    let remaining = (a + 1..block_end(&lines, a, 4)).any(|j| !is_blank_or_comment(&lines[j]) && indent_of(&lines[j]) == 6);
+    if !remaining {
+        lines.remove(a);
+    }
+    Ok(finish(lines, yaml))
+}
+
 /// Declare a new profile at the end of `profiles:` (PL-9): `  <name>:`
 /// followed by `body` lines, each written at the profile's own indent.
 /// A profile already declared is refused.
@@ -513,6 +564,20 @@ mod tests {
             let back: Yaml = serde_yaml::from_str(text).unwrap();
             assert_eq!(render_scalar(&back).unwrap(), text);
         }
+    }
+
+    /// **A tag is removed by its line, and an emptied map goes with it**
+    /// (PS-13, P-7); a flow map is re-rendered; an absent key is a no-op.
+    #[test]
+    fn a_tag_is_unset_by_its_line() {
+        let out = unset_profile_attribute(YAML, "10m", "family").unwrap();
+        assert!(!out.contains("family: stratified"), "{out}");
+        assert!(!out.contains("  10m:\n    base_count: 10000000\n    attributes:\n    neighbor"), "an emptied map is removed: {out}");
+        assert!(out.contains("  10m:\n    base_count: 10000000\n    neighbor_indices: profiles/10m/gt.ivec\n"), "{out}");
+        assert_eq!(unset_profile_attribute(YAML, "10m", "nope").unwrap(), YAML);
+        let flow = "profiles:\n  default:\n    attributes: { size: 495m, predicates: mixed }  # tags\n    base_vectors: b.fvec\n";
+        assert_eq!(unset_profile_attribute(flow, "default", "predicates").unwrap(), "profiles:\n  default:\n    attributes: { size: 495m }  # tags\n    base_vectors: b.fvec\n");
+        assert_eq!(unset_profile_attribute(&unset_profile_attribute(flow, "default", "predicates").unwrap(), "default", "size").unwrap(), "profiles:\n  default:\n    base_vectors: b.fvec\n");
     }
 
     /// **A profile and a step are appended where their blocks end**

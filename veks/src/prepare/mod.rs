@@ -16,6 +16,7 @@ pub(crate) mod infer_manifest;
 pub mod import;
 pub mod stratify;
 pub mod predicate_sets;
+pub mod tags;
 pub(crate) mod synthesize;
 pub(crate) mod wizard;
 
@@ -273,6 +274,30 @@ pub enum PrepareCommand {
         sources: Vec<PathBuf>,
     },
     /// Add sized profiles to an existing dataset for multi-scale benchmarking
+    /// Edit the tags of the profiles a selector names, as a change of plan:
+    /// a textual edit of their own `attributes:` lines, recorded in every
+    /// step record that holds the tag and in the records that name the file,
+    /// so no compute step turns stale; the published definition refreshes.
+    Tags {
+        /// Dataset directory or path to dataset.yaml
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// The profiles to edit, as a selector: a name, `profile=*`, or an
+        /// expression such as `predicates=mixed`
+        #[arg(long)]
+        profile: String,
+        /// A tag to set, `key=value`; the value is read as YAML, so
+        /// `selectivity=[0.1, 0.01]` is a list and `selectivity='1e-6'` keeps
+        /// its spelling
+        #[arg(long = "set")]
+        set: Vec<String>,
+        /// A tag to remove
+        #[arg(long = "unset")]
+        unset: Vec<String>,
+        /// Show the edits and write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Declare uniform predicate sets: one profile per size and level, under
     /// the size layer, with its generator step, by textual edit. A rung that
     /// carries a predicate group of its own gets a `<rung>-unfiltered` layer
@@ -1070,6 +1095,9 @@ pub fn run(args: PrepareArgs) {
         }
         PrepareCommand::Publish(args) => {
             crate::publish::run(args);
+        }
+        PrepareCommand::Tags { path, profile, set, unset, dry_run } => {
+            tags::run(tags::TagsArgs { path, profile, set, unset, dry_run });
         }
         PrepareCommand::PredicateSets { path, form, levels, sizes, count, layer_suffix } => {
             predicate_sets::run(predicate_sets::PredicateSetsArgs { path, form, levels, sizes, count, layer_suffix });
