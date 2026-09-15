@@ -478,15 +478,30 @@ pub fn expand_per_profile_steps_scoped(
         let mut after: Vec<String> = Vec::new();
         for dep in &step.after {
             // A step declared for this profile beside a shared one —
-            // `generate-predicates-<set>` beside `generate-predicates`
-            // — is the instance this profile waits on.
-            let own_instance = format!("{dep}-{profile}");
-            if profile != "default" && emitted_now.contains(&own_instance) && !template_ids.contains(dep.as_str()) {
-                if !after.contains(&own_instance) {
-                    after.push(own_instance);
+            // `generate-predicates-<set>` beside `generate-predicates`,
+            // or `generate-predicates-uniform-2-1e-3` listing every set
+            // that reads its slab — is the instance this profile waits
+            // on: named `<dep>-…`, listing the profile, and not a
+            // template's instance.
+            if profile != "default" && !template_ids.contains(dep.as_str()) {
+                let own_instance = format!("{dep}-{profile}");
+                let prefix = format!("{dep}-");
+                let declared_for = if emitted_now.contains(&own_instance) {
+                    Some(own_instance)
+                } else {
+                    result
+                        .iter()
+                        .filter(|s| s.profiles.iter().any(|p| p == profile))
+                        .map(|s| s.effective_id())
+                        .find(|id| id.starts_with(&prefix) && !template_ids.iter().any(|t| instance_id(t, profile) == *id))
+                };
+                if let Some(d) = declared_for {
+                    if !after.contains(&d) {
+                        after.push(d);
+                    }
+                    changed = true;
+                    continue;
                 }
-                changed = true;
-                continue;
             }
             if emitted_now.contains(dep) {
                 after.push(dep.clone());
@@ -885,6 +900,35 @@ mod layer_tests {
         let steps = vec![template("compute-knn", "compute knn", &[], ("indices", "neighbor_indices.ivec"))];
         let out = expand_per_profile_steps(steps, &v2, 100);
         assert!(out.iter().any(|s| s.effective_id() == "compute-knn-10m-mixed"));
+    }
+
+    /// **A set's evaluation waits on the generator declared for it**
+    /// (PL-2): a step named beside the shared one that lists the set —
+    /// one per set, or one per level shared by every set at the level —
+    /// replaces the shared generator in the instance's `after`.
+    #[test]
+    fn a_set_waits_on_the_generator_declared_for_it() {
+        let g = layered_group();
+        let mut shared = template("generate-predicates", "generate predicates", &[], ("output", "profiles/base/p.slab"));
+        shared.per_profile = false;
+        let mut level = template("generate-predicates-uniform-2-1e-3", "generate predicates", &[], ("output", "profiles/base/uniform-2-1e-3/p.slab"));
+        level.per_profile = false;
+        level.profiles = vec!["10m-mixed".to_string(), "20m-mixed".to_string()];
+        let steps = vec![
+            shared,
+            level,
+            template("evaluate-predicates", "compute evaluate-predicates", &["generate-predicates"], ("output", "metadata_results.slab")),
+        ];
+        let out = expand_per_profile_steps(steps, &g, 100);
+        let eval = out.iter().find(|s| s.effective_id() == "evaluate-predicates-10m-mixed").unwrap();
+        assert_eq!(eval.after, vec!["generate-predicates-uniform-2-1e-3".to_string()], "{:?}", eval.after);
+        // The shared step is the instance's dependency where nothing is declared for the profile.
+        let mut shared = template("generate-predicates", "generate predicates", &[], ("output", "profiles/base/p.slab"));
+        shared.per_profile = false;
+        let steps = vec![shared, template("evaluate-predicates", "compute evaluate-predicates", &["generate-predicates"], ("output", "metadata_results.slab"))];
+        let out = expand_per_profile_steps(steps, &g, 100);
+        let eval = out.iter().find(|s| s.effective_id() == "evaluate-predicates-10m-mixed").unwrap();
+        assert_eq!(eval.after, vec!["generate-predicates".to_string()]);
     }
 
     /// **A step that would fill a layer's predicate group is refused at
