@@ -392,6 +392,19 @@ fetched. `veks publish` says the same before it hands off, and its
 summary line calls the publish set what it is: what would move is the
 plan's `Plan:` line, not the set's size.
 
+**What you see while it runs.** A push is minutes of round trips and
+gigabytes of upload, and a terminal that goes quiet for either is a
+defect. Every phase reports on stderr through one sink — reaching the
+remote, reading the log, listing, how many directories the log vouched
+for and a counter over the fetches, then `upload: k/n files, X/Y — <the
+file that just landed>` redrawn in place, the checksum files, and
+`complete: version N is live`. The sink is a
+field of the engine's options (`ProgressSink`: stderr, silent, or a
+buffer), and a test drives a whole push through a capturing sink and
+holds every phase to its line, so the status cannot vanish again the
+way it did when publish was first delegated to push and the old
+`aws s3 sync` output went with the transport it replaced.
+
 ## Upload versioning via pushlog events
 
 A push touches many objects but object stores commit one object at a time, so

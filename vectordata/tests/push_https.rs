@@ -33,6 +33,7 @@ fn opts(src: &std::path::Path, base_url: String, token: Option<String>) -> Optio
         transport: TransportOptions { token, profile: None, endpoint_url: None },
         cmd: "vectordata push (https test)".into(),
         actor: "tester@host".into(),
+        progress: vectordata::push::ProgressSink::Silent,
     }
 }
 

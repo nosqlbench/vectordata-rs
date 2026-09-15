@@ -101,6 +101,7 @@ fn opts(src: &std::path::Path, to: String, token: Option<String>) -> Options {
         transport: TransportOptions { token, profile: None, endpoint_url: None },
         cmd: "vectordata push (vecd test)".into(),
         actor: "tester@host".into(),
+        progress: vectordata::push::ProgressSink::Silent,
     }
 }
 

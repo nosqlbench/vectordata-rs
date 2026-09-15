@@ -93,6 +93,7 @@ fn push_opts(src: &std::path::Path, to: String, token: &str, message: Option<&st
         transport: TransportOptions { token: Some(token.to_string()), profile: None, endpoint_url: None },
         cmd: "push".into(),
         actor: "tester".into(),
+        progress: vectordata::push::ProgressSink::Silent,
     }
 }
 

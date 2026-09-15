@@ -167,6 +167,7 @@ fn push_opts(src: &Path, to: String, token: Option<String>) -> Options {
         transport: TransportOptions { token, profile: None, endpoint_url: None },
         cmd: "vectordata push (cli e2e)".into(),
         actor: "tester@host".into(),
+        progress: vectordata::push::ProgressSink::Silent,
     }
 }
 

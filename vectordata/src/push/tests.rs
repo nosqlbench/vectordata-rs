@@ -59,7 +59,43 @@ fn opts(src: &Path, remote: &Path) -> Options {
         transport: TransportOptions::default(),
         cmd: "vectordata push (test)".to_string(),
         actor: "tester@host".to_string(),
+        progress: ProgressSink::Silent,
     }
+}
+
+/// **A push says what it is doing, phase by phase, all the way through**
+/// — reaching the remote, the log, the listing, the checksum fetches,
+/// the upload with files and bytes, the checksum files, the version
+/// going live — so a terminal is never silent for minutes. The old
+/// upload loop printed nothing; this holds every phase to a line.
+#[test]
+fn a_push_reports_every_phase() {
+    let src = unique("progress-src");
+    let remote = unique("progress-remote");
+    make_dataset(&src);
+    let (sink, lines) = ProgressSink::capture();
+    let mut o = opts(&src, &remote);
+    o.progress = sink;
+    let outcome = execute(&o).expect("push ok");
+    let lines = lines.lock().unwrap().clone();
+    let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
+    assert!(has("remote: reaching"), "{lines:?}");
+    assert!(has("remote: reading the push log"), "{lines:?}");
+    assert!(has("remote: listing the publish root"), "{lines:?}");
+    assert!(has("unchanged since the last committed push"), "{lines:?}");
+    assert!(has(&format!("upload: {} file(s)", outcome.added)), "{lines:?}");
+    assert!(has(&format!("upload: {}/{} files", outcome.added, outcome.added)), "the counter reaches the end: {lines:?}");
+    assert!(has("upload: checksum files of"), "{lines:?}");
+    assert!(has("complete: version 1 is live"), "{lines:?}");
+
+    // A dry run reports the plan's phases and no upload.
+    let (sink, lines) = ProgressSink::capture();
+    o.progress = sink;
+    o.dry_run = true;
+    execute(&o).expect("dry run ok");
+    let lines = lines.lock().unwrap().clone();
+    assert!(lines.iter().any(|l| l.contains("remote: listing the publish root")), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.starts_with("upload")), "{lines:?}");
 }
 
 fn remote_log(remote: &Path) -> Log {

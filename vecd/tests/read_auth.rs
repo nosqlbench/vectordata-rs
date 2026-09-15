@@ -125,6 +125,7 @@ fn private_dataset_needs_a_token_to_read() {
         transport: TransportOptions { token: Some(token.clone()), profile: None, endpoint_url: None },
         cmd: "push".into(),
         actor: "tester".into(),
+        progress: vectordata::push::ProgressSink::Silent,
     };
     execute(&opts).expect("push private dataset");
 

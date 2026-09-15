@@ -147,6 +147,7 @@ fn auth_view_credential_enables_private_upload_and_download() {
         transport: TransportOptions { token: Some(token.clone()), profile: None, endpoint_url: None },
         cmd: "push".into(),
         actor: "tester".into(),
+        progress: vectordata::push::ProgressSink::Silent,
     };
     execute(&opts).expect("authenticated push (upload) of the private dataset");
 

@@ -353,6 +353,7 @@ fn push_opts(src: &std::path::Path, to: String, token: &str, concurrency: u32) -
         },
         cmd: "push".into(),
         actor: "sat".into(),
+        progress: vectordata::push::ProgressSink::Silent,
     }
 }
 

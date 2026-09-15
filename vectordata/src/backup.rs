@@ -220,6 +220,7 @@ fn push_dir(dir: &Path, to: &str, token: Option<&str>) -> Result<(), String> {
         transport: TransportOptions { token: token.map(String::from), profile: None, endpoint_url: None },
         cmd: "vectordata restore".into(),
         actor: "vectordata restore".into(),
+        progress: crate::push::ProgressSink::Stderr,
     };
     execute(&opts).map(|_| ()).map_err(|e| format!("restoring {to}: {e:?}"))
 }

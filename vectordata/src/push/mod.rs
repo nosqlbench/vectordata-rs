@@ -85,6 +85,29 @@ pub struct Options {
     pub cmd: String,
     /// `user@host`, recorded on the `begin` event.
     pub actor: String,
+    /// Where the run says what it is doing while it does it. A push
+    /// is minutes of remote round trips and gigabytes of upload; every
+    /// phase reports, and a caller that wants to see it says so here.
+    pub progress: ProgressSink,
+}
+
+/// Where a run's status goes: the terminal's stderr, nowhere, or a
+/// buffer a test reads back — so that a phase going silent is a test
+/// failure, not a surprise at the terminal.
+#[derive(Debug, Clone, Default)]
+pub enum ProgressSink {
+    #[default]
+    Stderr,
+    Silent,
+    Capture(std::sync::Arc<std::sync::Mutex<Vec<String>>>),
+}
+
+impl ProgressSink {
+    /// A capturing sink and the buffer it fills.
+    pub fn capture() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (ProgressSink::Capture(buf.clone()), buf)
+    }
 }
 
 /// What a (non-dry-run) push accomplished, or what a dry-run would.
@@ -118,31 +141,47 @@ pub struct Outcome {
     pub dirs_fetched: usize,
 }
 
-/// Where the plan says what it is doing while it does it: stderr, so
-/// the plan itself stays on stdout. A counter is redrawn in place on a
-/// terminal and printed once at the end otherwise.
+/// Where the run says what it is doing while it does it: the sink the
+/// caller chose, stderr by default, so the plan itself stays on
+/// stdout. A counter is redrawn in place on a terminal, printed at its
+/// end otherwise, and every update is kept by a capturing sink.
 struct Reporter {
+    sink: ProgressSink,
     tty: bool,
 }
 
 impl Reporter {
-    fn new() -> Self {
+    fn new(sink: &ProgressSink) -> Self {
         use std::io::IsTerminal;
-        Reporter { tty: std::io::stderr().is_terminal() }
+        Reporter { sink: sink.clone(), tty: std::io::stderr().is_terminal() }
     }
 
     fn note(&self, msg: &str) {
-        eprintln!("  {msg}");
+        match &self.sink {
+            ProgressSink::Stderr => eprintln!("  {msg}"),
+            ProgressSink::Silent => {}
+            ProgressSink::Capture(buf) => buf.lock().expect("progress buffer").push(msg.to_string()),
+        }
     }
 
-    fn progress(&self, label: &str, done: usize, total: usize) {
-        if self.tty {
-            eprint!("\r  {label}: {done}/{total}");
-            if done >= total {
-                eprintln!();
+    /// A counter: `label: done/total` with an optional detail — the
+    /// bytes so far, the file in flight.
+    fn progress(&self, label: &str, done: usize, total: usize, detail: &str) {
+        let line = if detail.is_empty() { format!("{label}: {done}/{total}") } else { format!("{label}: {done}/{total} {detail}") };
+        match &self.sink {
+            ProgressSink::Stderr if self.tty => {
+                eprint!("\r  {line}\x1b[K");
+                if done >= total {
+                    eprintln!();
+                }
             }
-        } else if done >= total {
-            eprintln!("  {label}: {done}/{total}");
+            ProgressSink::Stderr => {
+                if done >= total {
+                    eprintln!("  {line}");
+                }
+            }
+            ProgressSink::Silent => {}
+            ProgressSink::Capture(buf) => buf.lock().expect("progress buffer").push(line),
         }
     }
 }
@@ -295,7 +334,7 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     }
 
     // 4. Open transport + auth/reachability preflight (fail fast).
-    let report = Reporter::new();
+    let report = Reporter::new(&opts.progress);
     let tx = transport::open(&endpoint, &opts.transport, opts.concurrency).map_err(Failure::Usage)?;
     report.note(&format!("remote: reaching {}", tx.describe()));
     tx.preflight().map_err(map_transport)?;
@@ -642,13 +681,19 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     }
 
     // Upload changed content files first… (a resumed push re-puts only
-    // what the classify step found missing or differing — idempotent).
-    for rel in &to_upload {
-        tx.put_file(rel, &root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)))
-            .map_err(map_transport)?;
-    }
+    // what the classify step found missing or differing — idempotent),
+    // saying how far along it is.
+    let upload_bytes: u64 = to_upload.iter().filter_map(|r| pre_stats.get(r).map(|s| s.0)).sum();
+    report.note(&format!(
+        "upload: {} file(s), {} on {} stream(s)",
+        to_upload.len(),
+        fmt_bytes(upload_bytes),
+        opts.concurrency.max(1)
+    ));
+    upload_files(tx.as_ref(), root, &to_upload, &pre_stats, opts.concurrency, &report)?;
     // …then every directory's SHA256SUMS (sums last = the per-dir commit
     // signal a strict reader keys on).
+    report.note(&format!("upload: checksum files of {} director{}", scan.content_dirs.len(), if scan.content_dirs.len() == 1 { "y" } else { "ies" }));
     for dir_rel in &scan.content_dirs {
         let key = plan::sums_key(dir_rel);
         let bytes = local_sums.get(dir_rel).expect("sums computed").render().into_bytes();
@@ -662,6 +707,7 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     // Complete = the atomic instant version `seq` goes live.
     log.events.push(Event::Complete { seq, ts, sums: sums_digests.clone() });
     write_log(tx.as_ref(), &log, current_etag.as_deref(), false)?;
+    report.note(&format!("complete: version {seq} is live"));
 
     // Delete orphans only after the new version is live, so a reader on
     // the prior version never sees its files vanish mid-update. The
@@ -774,7 +820,7 @@ fn fetch_dir_sums(
         loop {
             let d = done.load(Ordering::SeqCst);
             if d != shown {
-                report.progress("remote: checksum files fetched", d, n);
+                report.progress("remote: checksum files fetched", d, n, "");
                 shown = d;
             }
             if d >= n {
@@ -784,6 +830,27 @@ fn fetch_dir_sums(
         }
     });
     results.into_inner().expect("results")
+}
+
+/// Upload `files` one after another, reporting files and bytes done and
+/// the file that just landed.
+fn upload_files(
+    tx: &dyn PushTransport,
+    root: &Path,
+    files: &[String],
+    sizes: &BTreeMap<String, (u64, std::time::SystemTime)>,
+    _concurrency: u32,
+    report: &Reporter,
+) -> Result<(), Failure> {
+    let n = files.len();
+    let total_bytes: u64 = files.iter().filter_map(|r| sizes.get(r).map(|s| s.0)).sum();
+    let mut done_bytes = 0u64;
+    for (i, rel) in files.iter().enumerate() {
+        tx.put_file(rel, &root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))).map_err(map_transport)?;
+        done_bytes += sizes.get(rel).map(|s| s.0).unwrap_or(0);
+        report.progress("upload", i + 1, n, &format!("files, {}/{} — {rel}", fmt_bytes(done_bytes), fmt_bytes(total_bytes)));
+    }
+    Ok(())
 }
 
 /// Read the remote `pushlog.jsonl` and its etag (for conditional writes).
@@ -1336,6 +1403,7 @@ mod cli {
                     profile: self.profile,
                     endpoint_url: self.endpoint_url,
                 },
+                progress: ProgressSink::Stderr,
                 cmd,
                 actor,
             }

@@ -283,6 +283,7 @@ pub fn run(args: PublishArgs) {
         },
         cmd: std::env::args().collect::<Vec<_>>().join(" "),
         actor,
+        progress: vectordata::push::ProgressSink::Stderr,
     };
     match vectordata::push::execute(&push_opts) {
         Ok(o) if o.dry_run => {
