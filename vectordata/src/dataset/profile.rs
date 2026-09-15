@@ -2246,14 +2246,27 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                     .filter(|(k, _)| facet_role(k) != FacetRole::PerProfile)
                     .map(|(k, v)| {
                         if let Some(bc) = child_bc
-                            && facet_role(k) == FacetRole::Windowed && v.source.window.is_empty() {
-                                let mut windowed = v.clone();
-                                windowed.source.window = DSWindow(vec![DSInterval {
-                                    min_incl: 0,
-                                    max_excl: bc,
-                                }]);
-                                return (k.clone(), windowed);
+                            && facet_role(k) == FacetRole::Windowed
+                            && v.window.is_none()
+                            && v.source.window.is_empty()
+                        {
+                            let mut windowed = v.clone();
+                            let window = DSWindow(vec![DSInterval { min_incl: 0, max_excl: bc }]);
+                            // The same cut `derive_sized_profile` makes: a
+                            // series is windowed in facet ordinals through
+                            // its own field (SH-67), a file through its
+                            // source. Cutting a series through the source
+                            // wrote a window the writer then suppressed
+                            // and re-emitted on alternate saves, so the
+                            // file never settled.
+                            if windowed.is_series() {
+                                windowed.window = Some(window);
+                            } else {
+                                windowed.source.window = window;
+                                windowed.source.declared_count = None;
                             }
+                            return (k.clone(), windowed);
+                        }
                         (k.clone(), v.clone())
                     })
                     .collect();

@@ -881,15 +881,21 @@ impl DatasetConfig {
                     // deserializer will re-derive by inheritance from
                     // default. Without this, expanded-save bloats the
                     // file with N copies of every shared view.
+                    // The comparison is by what the view *reads*: the
+                    // path, the namespace and the effective window. A
+                    // window read from the file sits on the view and
+                    // one derived on load sits on the source; judged
+                    // field by field they differed, so a save emitted
+                    // what the next one suppressed and the file never
+                    // settled.
                     if name != "default"
                         && let Some(dv) = parent_views.and_then(|m| m.get(key))
-                            && dv.source.path == view.source.path
-                                && dv.source.window == view.source.window
-                                && dv.source.namespace == view.source.namespace
-                                && dv.window == view.window
-                            {
-                                continue;
-                            }
+                        && dv.source.path == view.source.path
+                        && dv.source.namespace == view.source.namespace
+                        && dv.effective_window() == view.effective_window()
+                    {
+                        continue;
+                    }
                     // A series must be written in the form it was
                     // declared in. Emitting `view.source.path` would
                     // write a uniform series' `NNNN` pattern with no
@@ -1884,6 +1890,31 @@ mod reconcile_shard_tests {
 
     fn config_of(yaml: &str) -> DatasetConfig {
         serde_yaml::from_str(yaml).expect("valid dataset")
+    }
+
+    /// **Saving is a fixpoint** (SH-67): a set under a layer inherits the
+    /// sharded base as a series windowed through its own field, so the
+    /// writer suppresses it as the parent's and a second save writes
+    /// the same bytes. Before this, the set's base was cut through its
+    /// source, emitted on one save and suppressed on the next, so the
+    /// file alternated between two forms on every run.
+    #[test]
+    fn saving_a_layered_set_is_a_fixpoint() {
+        let yaml = "format_version: 3\nname: t\nprofiles:\n  default:\n    base_vectors:\n      source: profiles/base/base__NNNN.fvecs\n      shard_stride: 100\n      shard_count: 5\n      record_count: 495\n    metadata_content: profiles/base/m.slab\n    query_vectors: q.fvec\n    neighbor_indices: g.ivec\n  10m:\n    base_count: 10\n    inherits: default\n    neighbor_indices: profiles/10m/g.ivec\n  10m-unfiltered:\n    base_count: 10\n    inherits: default\n    neighbor_indices: profiles/10m/g.ivec\n  10m-set:\n    base_count: 10\n    inherits: 10m-unfiltered\n    metadata_predicates: profiles/10m-set/p.slab\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dataset.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let config = DatasetConfig::load(&path).unwrap();
+        let set = &config.profiles.profiles["10m-set"];
+        let base = &set.views["base_vectors"];
+        assert!(base.is_series());
+        assert!(base.source.window.is_empty(), "a series is not cut through its source: {}", base.source);
+        assert_eq!(base.window.as_ref().map(|w| (w.0[0].min_incl, w.0[0].max_excl)), Some((0, 10)));
+        let once = config.to_expanded_yaml_string(&path).unwrap();
+        assert!(!once.contains("base__NNNN.fvecs[0..10"), "{once}");
+        std::fs::write(&path, &once).unwrap();
+        let again = DatasetConfig::load(&path).unwrap().to_expanded_yaml_string(&path).unwrap();
+        assert_eq!(again, once, "a second save writes the same bytes");
     }
 
     /// **A windowed view is reconciled too.** Sized profiles declare
