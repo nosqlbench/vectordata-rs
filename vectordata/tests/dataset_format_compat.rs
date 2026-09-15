@@ -501,3 +501,28 @@ fn a_saved_dataset_states_the_version_its_content_needs() {
         "a writer always states the version, 1 included (V-25):\n{out}"
     );
 }
+
+/// **A rung the file declares is never split at load** (PS-22, PL-11):
+/// lifting a materialised dataset to version 3 leaves its profiles and
+/// their groups exactly as declared; only a rung expansion makes from a
+/// spec gains a mixed set beside it.
+#[test]
+fn a_declared_rung_of_a_layered_dataset_is_not_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "format_version: 3\nname: t\nstrata:\n  decade:\n    spec: \"10m\"\n    series: [\"10m\"]\nprofiles:\n  default:\n    \
+         base_vectors: base.fvec\n    metadata_predicates: profiles/base/p.slab\n    metadata_results: profiles/default/r.slab\n  \
+         10m:\n    inherits: default\n    base_count: 10000000\n    metadata_results: profiles/10m/r.slab\n    \
+         neighbor_indices: profiles/10m/g.ivec\n",
+    )
+    .unwrap();
+    let cfg = vectordata::dataset::DatasetConfig::load_and_resolve(&ds.join("dataset.yaml")).unwrap();
+    assert!(cfg.profiles.profile("10m-mixed").is_none(), "a declared rung keeps its group: {:?}", cfg.profiles.profile_names());
+    assert_eq!(
+        cfg.profiles.profile("10m").unwrap().views.get("metadata_results").map(|v| v.source.path.as_str()),
+        Some("profiles/10m/r.slab")
+    );
+}

@@ -45,9 +45,9 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
     }
 
     // Check for existing sized profiles (any profile with base_count set)
-    let existing_sized: Vec<&str> = config.profiles.profiles.iter()
+    let existing_sized: Vec<String> = config.profiles.profiles.iter()
         .filter(|(name, p)| name.as_str() != "default" && p.base_count.is_some())
-        .map(|(name, _)| name.as_str())
+        .map(|(name, _)| name.to_string())
         .collect();
 
     if !existing_sized.is_empty() && !force {
@@ -191,7 +191,12 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
     // A layered dataset keeps each rung as its size layer and puts the
     // mixed predicate set beside it (PL-9, PL-13).
     if config.is_layered() {
-        let sets = config.profiles.layer_generated_profiles();
+        let fresh: Vec<String> = pairs
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| !existing_sized.iter().any(|e| e == n))
+            .collect();
+        let sets = config.profiles.layer_generated_profiles(&fresh);
         config.strata.sync_series(&config.profiles.series_by_spec);
         if sets > 0 {
             println!("  Layered: {sets} mixed predicate set(s) beside their size layers");

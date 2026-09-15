@@ -470,29 +470,21 @@ impl DSProfileGroup {
             && !PREDICATE_GROUP.iter().any(|f| self.declares(name, f))
     }
 
-    /// Split every generated rung of a layered dataset into its size
+    /// Split the named rungs of a layered dataset into their size
     /// layer and the mixed predicate set beside it (PL-9, PL-13): the
     /// rung keeps the base window, the metadata window and the
     /// unfiltered ground truth; `<rung>-mixed` names the rung as its
     /// parent, restates its count, declares the results index and the
     /// filtered ground truth under its own directory, and carries the
-    /// tags that describe the slab it inherits. Idempotent: a rung
-    /// already split, or one that carries no predicate group, is left
-    /// alone. Returns how many sets were made.
-    pub fn layer_generated_profiles(&mut self) -> usize {
-        let generated: Vec<String> = {
-            let mut names: Vec<String> = Vec::new();
-            for series in self.series_by_spec.values() {
-                for n in series {
-                    if !names.contains(n) {
-                        names.push(n.clone());
-                    }
-                }
-            }
-            names
-        };
+    /// tags that describe the slab it inherits. Only rungs a generator
+    /// has just made are named — those expansion added at load, or
+    /// stratify derived afresh — never a rung the file declares, whose
+    /// name and group stay what they are (PS-22, PL-11). Idempotent: a
+    /// rung already split, or one that carries no predicate group, is
+    /// left alone. Returns how many sets were made.
+    pub fn layer_generated_profiles(&mut self, rungs: &[String]) -> usize {
         let mut made = 0usize;
-        for rung in generated {
+        for rung in rungs.iter().cloned() {
             let set_name = format!("{rung}-mixed");
             if self.profiles.contains_key(&set_name) {
                 continue;
@@ -2431,8 +2423,8 @@ mod tests {
         g.profiles.insert("10m".into(), derive_sized_profile(&default, "10m", 10_000_000));
         g.series_by_spec.insert("10m".into(), vec!["10m".into()]);
 
-        assert_eq!(g.layer_generated_profiles(), 1);
-        assert_eq!(g.layer_generated_profiles(), 0, "a rung already split is left alone");
+        assert_eq!(g.layer_generated_profiles(&["10m".to_string()]), 1);
+        assert_eq!(g.layer_generated_profiles(&["10m".to_string()]), 0, "a rung already split is left alone");
         let layer = &g.profiles["10m"];
         assert!(layer.views.contains_key("neighbor_indices"));
         assert!(!layer.views.contains_key("metadata_results") && !layer.views.contains_key("prefiltered_neighbor_indices"));

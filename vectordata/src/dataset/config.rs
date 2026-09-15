@@ -395,16 +395,25 @@ impl DatasetConfig {
     /// strata series stale. Returns the number of profiles added.
     pub fn expand_sized_profiles(&mut self, vars: &IndexMap<String, String>) -> usize {
         let mut added = 0;
+        let before: Vec<String> = self.profiles.profiles.keys().cloned().collect();
         if self.profiles.has_deferred() {
             let base_count = Self::base_count_from_vars(vars);
             if base_count > 0 {
                 added = self.profiles.expand_deferred_sized(vars, base_count);
             }
         }
-        // A layered dataset splits each generated rung into its size
-        // layer and the mixed set beside it (PL-9, PL-13).
+        // A layered dataset splits each rung expansion just made into
+        // its size layer and the mixed set beside it (PL-9, PL-13); a
+        // rung the file declares is left as declared (PS-22).
         if self.is_layered() {
-            added += self.profiles.layer_generated_profiles();
+            let fresh: Vec<String> = self
+                .profiles
+                .profiles
+                .keys()
+                .filter(|n| !before.contains(n))
+                .cloned()
+                .collect();
+            added += self.profiles.layer_generated_profiles(&fresh);
         }
         self.strata.sync_series(&self.profiles.series_by_spec);
         added
