@@ -476,6 +476,57 @@ fn pair_draws(
 }
 
 // ---------------------------------------------------------------------------
+// The level census
+// ---------------------------------------------------------------------------
+
+/// What the census holds for one level of a form: how many exact draws
+/// land in the band and the median count among them, so a planner can
+/// tell where a set at this level meets a floor of matches per predicate
+/// before declaring it (PL-11). The census is over the whole base; a
+/// sized profile is its prefix, so a predicate's expected matches there
+/// scale with the rung.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LevelCensus {
+    /// Exact draws landing in the band.
+    pub pairs: usize,
+    /// The median count of those draws over the whole base.
+    pub median_count: u64,
+    /// Records the census covers.
+    pub population: u64,
+}
+
+impl LevelCensus {
+    /// The matches a median predicate of the level is expected to find
+    /// in the first `rows` records of the base.
+    pub fn expected_matches(&self, rows: u64) -> f64 {
+        if self.population == 0 {
+            return 0.0;
+        }
+        self.median_count as f64 * rows as f64 / self.population as f64
+    }
+}
+
+/// The level census of `form` at `level` from the survey at
+/// `survey_path`: `Ok(None)` when the form is not a censused pair, whose
+/// draws are estimated under independence and cannot be floored
+/// exactly.
+pub fn level_census(survey_path: &Path, form: &Form, level: f64) -> Result<Option<LevelCensus>, String> {
+    let survey: SurveyReport = survey_report_from_json(survey_path)?;
+    let population = survey.source.total_records;
+    if population == 0 {
+        return Err("the survey covers zero records".to_string());
+    }
+    let (lo, hi) = (level / BAND, level * BAND);
+    let Some((_, draws)) = pair_draws(&survey, form, population as f64, lo, hi) else {
+        return Ok(None);
+    };
+    let mut counts: Vec<u64> = draws.iter().map(|d| d.count).collect();
+    counts.sort_unstable();
+    let median_count = counts.get(counts.len() / 2).copied().unwrap_or(0);
+    Ok(Some(LevelCensus { pairs: counts.len(), median_count, population }))
+}
+
+// ---------------------------------------------------------------------------
 // The command
 // ---------------------------------------------------------------------------
 
