@@ -127,6 +127,16 @@ veks generate predicates --strategy uniform \
 | `--band` | no | Band factor around the level (default √10) |
 | `--report` | no | Generation report (default: beside the output as `.json`) |
 
-Sets are declared with `veks prepare predicate-sets`, which writes one
-profile per size and level under its size layer and one generator step
-per set.
+Sets are declared with `veks prepare predicate-sets --form F --levels
+L [--sizes S] [--min-matches N]`, which writes one profile per size and
+level under its size layer and **one generator step per level**: a
+level's predicates are drawn from the census of the whole base, so they
+are the same at every size, and one slab under
+`profiles/base/uniform-<n>-<level>/` is declared by every set at the
+level, the way every mixed rung declares the stratified slab. Each
+set's evaluation then shares its segment cache with the sets of the
+smaller rungs. A cell is declared only where a median predicate of the
+level expects at least `--min-matches` matches (default 100) in the
+rung's rows; `0` declares every cell. A set declared earlier with a
+slab of its own is trued up to the level's slab and its files are named
+for removal.

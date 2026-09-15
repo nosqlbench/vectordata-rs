@@ -446,13 +446,15 @@ fn e2e_topic_stratified_predicates() {
     }
 
     // A uniform predicate set under the size layer (PL-2, PL-9, PS-23):
-    // declared by textual edit with its generator step, filled by the
-    // run, evaluated and filtered by the templates, tagged, and held
-    // to a form census by the check at the end.
+    // declared by textual edit with the level's generator step, filled
+    // by the run into the level's one slab, evaluated and filtered by
+    // the templates, tagged, and held to a form census by the check at
+    // the end. The fixture is far below the reliability floor, so the
+    // floor is lifted.
     let out = Command::new(veks_bin())
         .args(["prepare", "predicate-sets"])
         .arg(&dataset)
-        .args(["--form", "topic_l1.eq+year.range", "--levels", "1e-1", "--sizes", "100"])
+        .args(["--form", "topic_l1.eq+year.range", "--levels", "1e-1", "--sizes", "100", "--min-matches", "0"])
         .output()
         .expect("failed to execute veks prepare predicate-sets");
     assert!(out.status.success(), "predicate-sets failed:\n{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -460,15 +462,21 @@ fn e2e_topic_stratified_predicates() {
     assert!(ok, "third run failed:\n{}", log);
     {
         let set = dataset.join("profiles/100-uniform-2-1e-1");
-        for f in ["predicates.slab", "metadata_results.slab", "prefiltered_neighbor_indices.ivec", "postfiltered_neighbor_indices.ivec"] {
+        let slab = dataset.join("profiles/base/uniform-2-1e-1/predicates.slab");
+        assert!(slab.exists(), "the level's slab not produced\n{log}");
+        assert!(!set.join("predicates.slab").exists(), "a set holds no slab of its own; it reads the level's");
+        for f in ["metadata_results.slab", "prefiltered_neighbor_indices.ivec", "postfiltered_neighbor_indices.ivec"] {
             assert!(set.join(f).exists(), "{f} of the set not produced\n{log}");
         }
-        let classes = veks_pipeline::pipeline::commands::analyze_predicate_forms::facet_form_classes(&set.join("predicates.slab")).unwrap();
+        let classes = veks_pipeline::pipeline::commands::analyze_predicate_forms::facet_form_classes(&slab).unwrap();
         assert_eq!((classes.forms, classes.parts), (1, Some(2)), "one form of two parts (PS-23)");
         let yaml = std::fs::read_to_string(&dataset_yaml).unwrap();
         let at = yaml.find("  100-uniform-2-1e-1:\n").expect("the set is declared");
         let block: String = yaml[at..].lines().skip(1).take_while(|l| l.starts_with("    ")).collect::<Vec<_>>().join("\n");
         assert!(block.contains("    inherits: '100'"), "the set names its layer:\n{block}");
+        assert!(block.contains("    metadata_predicates: profiles/base/uniform-2-1e-1/predicates.slab"), "the set declares the level's slab:\n{block}");
+        assert!(yaml.contains("  - id: generate-predicates-uniform-2-1e-1\n"), "one generator step per level");
+        assert!(!yaml.contains("generate-predicates-100-uniform-2-1e-1"), "no generator step per set");
         for tag in ["predicates: uniform-2", "form: topic_l1.eq_year.range", "form_shape:", "family: uniform", "selectivity: '1e-1'"] {
             assert!(block.contains(tag), "the set carries {tag}:\n{block}");
         }

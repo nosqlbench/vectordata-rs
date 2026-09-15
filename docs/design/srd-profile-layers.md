@@ -349,14 +349,25 @@ a backup: to 2 it drops `inherits: default` lines and the schema and
 refuses a named parent; to 1 it also refuses a multi-file facet.
 
 **Uniform sets are declared by a command, not by bootstrap.** `veks
-prepare predicate-sets --form F --levels L [--sizes S]` declares one
-set per size and level under its size layer — the rung itself in a
-layered dataset, a hand-named `<rung>-unfiltered` beside a rung that
-carries its own group (PL-11) — with the predicate group under
-`profiles/<set>/` and one `generate predicates --strategy uniform` step
-per set, by textual edit, lifting a file below 3 to 3 with the standard
-schema. A per-profile template then reads the profile's own facet: an
-option naming a file `default` declares becomes the path the profile
-reads that facet from, and a step declared for the profile beside a
-shared one is the instance it waits on. The strata verifier checks only
-the profiles whose predicate facet is the slab it was given.
+prepare predicate-sets --form F --levels L [--sizes S] [--min-matches
+N]` declares one set per size and level under its size layer — the rung
+itself in a layered dataset, a hand-named `<rung>-unfiltered` beside a
+rung that carries its own group (PL-11) — by textual edit, lifting a
+file below 3 to 3 with the standard schema. A level's predicates are
+drawn from the census of the whole base and are therefore the same at
+every size, so the command declares **one slab per level**, under
+`profiles/base/uniform-<n>-<level>/`, written by one `generate
+predicates --strategy uniform` step that lists every set at the level,
+and every set declares it — the mixed family's arrangement, whose
+shared slab lets each rung's evaluation reuse the segment cache of the
+smaller rungs. The rest of the group is under `profiles/<set>/`. A cell
+is declared only where the census says a median predicate of the level
+expects the floor of matches in the rung's rows (default 100, the
+stratified generator's reliability floor); a set declared earlier with
+a slab of its own is trued up to the level's slab. A per-profile
+template then reads the profile's own facet: an option naming a file
+`default` declares becomes the path the profile reads that facet from,
+and a step declared for the profile beside a shared one — named
+`<step>-…` and listing the profile — is the instance it waits on. The
+strata verifier checks only the profiles whose predicate facet is the
+slab it was given.

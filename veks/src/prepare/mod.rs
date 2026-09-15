@@ -325,6 +325,11 @@ pub enum PrepareCommand {
         /// predicate group
         #[arg(long, default_value = "unfiltered")]
         layer_suffix: String,
+        /// The floor of matches a median predicate of a level must expect in a
+        /// rung's rows for the cell to be declared, from the census; 0 declares
+        /// every cell
+        #[arg(long = "min-matches", default_value_t = 100)]
+        min_matches: u64,
     },
     /// Downgrade a dataset.yaml to a lower format version (V-20): succeeds
     /// exactly when nothing in the dataset needs the higher one, by textual
@@ -1099,8 +1104,8 @@ pub fn run(args: PrepareArgs) {
         PrepareCommand::Tags { path, profile, set, unset, dry_run } => {
             tags::run(tags::TagsArgs { path, profile, set, unset, dry_run });
         }
-        PrepareCommand::PredicateSets { path, form, levels, sizes, count, layer_suffix } => {
-            predicate_sets::run(predicate_sets::PredicateSetsArgs { path, form, levels, sizes, count, layer_suffix });
+        PrepareCommand::PredicateSets { path, form, levels, sizes, count, layer_suffix, min_matches } => {
+            predicate_sets::run(predicate_sets::PredicateSetsArgs { path, form, levels, sizes, count, layer_suffix, min_matches });
         }
         PrepareCommand::Downgrade { path, to } => {
             let dataset_path = if path.is_file() { path.clone() } else { path.join("dataset.yaml") };
