@@ -842,11 +842,19 @@ pub struct BinaryVersion {
     pub patch: u32,
     pub git_hash: String,
     pub dirty: bool,
+    /// The cargo profile the binary was built under (`debug`,
+    /// `release`), empty for a stamp from before profiles were stated.
+    /// Not a provenance axis: a debug build computes what a release
+    /// build computes, only slower, so it never makes a step stale.
+    pub profile: String,
 }
 
 impl BinaryVersion {
-    /// Parse `{CARGO_PKG_VERSION}+{git_short}[+dirty]`. Forgiving:
-    /// any component that doesn't parse is left at its default.
+    /// Parse `{CARGO_PKG_VERSION}+{git_short}[+dirty][+profile][.build_number]`.
+    /// Forgiving: any component that doesn't parse is left at its
+    /// default, and a build number glued to the last component with a
+    /// `.` is ignored, so the logged form of the stamp parses as the
+    /// provenance form does.
     pub fn parse(s: &str) -> Self {
         let mut out = Self::default();
         let mut parts = s.split('+');
@@ -857,10 +865,14 @@ impl BinaryVersion {
             out.patch = nums.next().and_then(|p| p.parse().ok()).unwrap_or(0);
         }
         if let Some(hash) = parts.next() {
-            out.git_hash = hash.to_string();
+            out.git_hash = hash.split('.').next().unwrap_or("").to_string();
         }
-        if parts.any(|p| p == "dirty") {
-            out.dirty = true;
+        for part in parts {
+            match part.split('.').next().unwrap_or("") {
+                "dirty" => out.dirty = true,
+                p @ ("debug" | "release") => out.profile = p.to_string(),
+                _ => {}
+            }
         }
         out
     }
@@ -907,6 +919,30 @@ mod tests {
         assert_eq!(v.patch, 3);
         assert_eq!(v.git_hash, "abcd1234");
         assert!(v.dirty);
+        assert_eq!(v.profile, "");
+    }
+
+    /// **The stamp states its profile**, after the dirty flag, and the
+    /// logged form with a build number parses the same: a debug binary
+    /// is visible in the run log's first line, and it hashes exactly as
+    /// the release build of the same tree does under every selector.
+    #[test]
+    fn binary_version_states_its_profile() {
+        let v = BinaryVersion::parse("2.1.0+552521c26a+dirty+debug.1789418550");
+        assert_eq!(v.git_hash, "552521c26a");
+        assert!(v.dirty);
+        assert_eq!(v.profile, "debug");
+        let r = BinaryVersion::parse("2.1.0+552521c26a+release");
+        assert_eq!(r.profile, "release");
+        assert!(!r.dirty);
+        let clean_numbered = BinaryVersion::parse("2.1.0+552521c26a.1789418550");
+        assert_eq!(clean_numbered.git_hash, "552521c26a");
+        let opts = opts();
+        assert_eq!(
+            hash_of("2.1.0+abc+dirty+debug", opts.clone(), ProvenanceFlags::STRICT),
+            hash_of("2.1.0+abc+dirty+release", opts, ProvenanceFlags::STRICT),
+            "the profile is not a provenance axis"
+        );
     }
 
     #[test]

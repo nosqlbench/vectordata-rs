@@ -19,7 +19,9 @@ fn main() {
     }
 
     // Inject build metadata as compile-time environment variables.
-    // VEKS_BUILD_HASH: short git SHA of the current commit (or "unknown").
+    // VEKS_BUILD_HASH: short git SHA (or "unknown"), `+dirty` when the
+    // working tree has uncommitted changes, then `+<profile>` — the cargo
+    // build profile, `debug` or `release`.
     // VEKS_BUILD_TIMESTAMP: UTC timestamp of the build.
     // These are used by CommandOp::build_version() for provenance tracking.
     let workspace = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -46,10 +48,15 @@ fn main() {
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
 
+    // The profile the binary was built under, stated always: a debug
+    // build's unoptimized hot loops run several times slower than a
+    // release build's, and the stamp in every run log is where that
+    // has to be visible.
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
     let build_hash = if dirty {
-        format!("{}+dirty", git_hash)
+        format!("{git_hash}+dirty+{profile}")
     } else {
-        git_hash
+        format!("{git_hash}+{profile}")
     };
 
     let build_number = std::time::SystemTime::now()

@@ -306,12 +306,12 @@ The governor prevents system lockups during large-scale operations
 
 ## 4.7 Build Versioning
 
-Each command exposes `build_version()` returning a string of the form `{CARGO_PKG_VERSION}+{git_hash}[+dirty]`. The runner parses this into the `BinaryVersion` axes (major/minor/patch/git_hash/dirty) recorded in each step's `ProvenanceMap`, so the staleness check can ignore or honor each axis independently per the active selector (see §4.3). At bootstrap time, `veks_version` and `veks_build` are stamped into `dataset.yaml` attributes so consumers can trace which build produced a dataset.
+Each command exposes `build_version()` returning a string of the form `{CARGO_PKG_VERSION}+{git_hash}[+dirty]+{profile}`, where `profile` is the cargo profile the binary was built under (`debug` or `release`). The runner parses this into the `BinaryVersion` axes (major/minor/patch/git_hash/dirty) recorded in each step's `ProvenanceMap`, so the staleness check can ignore or honor each axis independently per the active selector (see §4.3). The profile is parsed but never hashed: a debug build computes what a release build computes, only several times slower, and the stamp exists so that the `pipeline initialized … build=` line of every run log says which one ran. The logged form appends `.{build_number}` (epoch seconds) to the stamp; the parser ignores it. At bootstrap time, `veks_version` and `veks_build` are stamped into `dataset.yaml` attributes so consumers can trace which build produced a dataset.
 
 ```yaml
 attributes:
   veks_version: "0.9.0"
-  veks_build: "0.9.0+a3f7c2d"
+  veks_build: "a3f7c2d+release.1788644885"
 ```
 
 ---

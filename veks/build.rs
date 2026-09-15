@@ -12,7 +12,9 @@ fn main() {
     let _ = std::fs::create_dir_all(&test_tmp);
 
     // Inject build metadata as compile-time environment variables.
-    // VEKS_BUILD_HASH: short git SHA (with +dirty suffix if working tree is dirty).
+    // VEKS_BUILD_HASH: short git SHA (or "unknown"), `+dirty` when the
+    // working tree has uncommitted changes, then `+<profile>` — the cargo
+    // build profile, `debug` or `release`.
     // VEKS_BUILD_NUMBER: epoch seconds — changes every build regardless of git state.
     let git_hash = std::process::Command::new("git")
         .args(["rev-parse", "--short=10", "HEAD"])
@@ -34,10 +36,15 @@ fn main() {
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
 
+    // The profile the binary was built under, stated always: a debug
+    // build's unoptimized hot loops run several times slower than a
+    // release build's, and the stamp in every run log is where that
+    // has to be visible.
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
     let build_hash = if dirty {
-        format!("{}+dirty", git_hash)
+        format!("{git_hash}+dirty+{profile}")
     } else {
-        git_hash
+        format!("{git_hash}+{profile}")
     };
 
     let build_number = std::time::SystemTime::now()

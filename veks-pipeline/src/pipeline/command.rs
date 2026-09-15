@@ -138,7 +138,11 @@ pub trait CommandOp: Send {
     /// (or toggling between dirty/clean) changes the hash and
     /// invalidates once.
     ///
-    /// Format: `{CARGO_PKG_VERSION}+{git_short_hash}[+dirty]`
+    /// The cargo profile is stated too, `+debug` or `+release`, so a
+    /// run log's first line says which build ran; it is parsed but not
+    /// hashed — a debug build computes the same results, only slower.
+    ///
+    /// Format: `{CARGO_PKG_VERSION}+{git_short_hash}[+dirty]+{profile}`
     fn build_version(&self) -> &str {
         concat!(env!("CARGO_PKG_VERSION"), "+", env!("VEKS_BUILD_HASH"))
     }
