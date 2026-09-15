@@ -129,7 +129,9 @@ A step is fresh when:
 
 A dry run applies the same rules to its plan: a planned step with
 outputs stands for outputs newer than its dependents' records, and a
-step whose input a planned step produces is shown as following it.
+step whose input a planned step produces is shown as following it. It
+writes nothing, `dataset.yaml` included: the variable sync that ends a
+run is an effector.
 
 #### Selectors and presets
 

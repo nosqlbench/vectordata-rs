@@ -1149,7 +1149,9 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         // Sync variables and derived attributes to dataset.yaml BEFORE
         // finalization, so generate-dataset-json and generate-catalog see
         // the updated is_normalized, is_zero_vector_free, etc.
-        update_dataset_attributes(dataset_path, dataset_path.parent().unwrap_or(Path::new(".")));
+        if !args.dry_run {
+            update_dataset_attributes(dataset_path, dataset_path.parent().unwrap_or(Path::new(".")));
+        }
 
         // partition profiles added during Phase 3).
         let finalize_config = vectordata::dataset::DatasetConfig::load(dataset_path)
@@ -1208,7 +1210,9 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         Err(e) => {
             // Sync variables even on failure — earlier steps (dedup, zeros)
             // may have completed and their variables should be persisted.
-            update_dataset_attributes(dataset_path, dataset_path.parent().unwrap_or(Path::new(".")));
+            if !args.dry_run {
+                update_dataset_attributes(dataset_path, dataset_path.parent().unwrap_or(Path::new(".")));
+            }
             // Ensure we're on a clean line before printing the error.
             eprintln!();
             eprintln!("Pipeline failed: {}", e);
@@ -1219,7 +1223,11 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
             // Sync variables from variables.yaml into dataset.yaml.
             // Always attempt — even if all steps were fresh, the variables
             // may not have been synced yet (e.g., first run after upgrade).
-            update_dataset_attributes(dataset_path, dataset_path.parent().unwrap_or(Path::new(".")));
+            // A dry run writes nothing: the definition it judged is the
+            // one on disk, and a sync would move its mtime and content.
+            if !args.dry_run {
+                update_dataset_attributes(dataset_path, dataset_path.parent().unwrap_or(Path::new(".")));
+            }
             print_run_summary(&summary);
             // Post-completion guidance about the cache directory
             if summary.executed > 0 {
