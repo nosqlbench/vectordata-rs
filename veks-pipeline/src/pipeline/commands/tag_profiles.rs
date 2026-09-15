@@ -198,10 +198,14 @@ pub fn plan_tags(
     for (name, profile) in &group.profiles {
         let mut tags: Vec<(String, serde_yaml::Value)> = Vec::new();
 
-        // size: a member whose name spells its own count — `64mi`,
-        // `10m` — carries that spelling as its rung (PS-20); the
-        // default's is the rung of what its base holds; any other
-        // profile with a count, the decimal rung of that count.
+        // size: the rung a profile carries when it spells the count
+        // — the plan its declaring command wrote, `1mi` on a layer or
+        // set beside the `1mi` rung — else the leading segment of its
+        // name when that spells the count (`64mi`, `10m`,
+        // `64mi-unfiltered`) (PS-20); the default's is the rung of what
+        // its base holds; any other profile with a count, the decimal
+        // rung of that count. Rewriting a carried `1mi` to `1m` made a
+        // profile indistinguishable from its decimal neighbour (PS-15).
         let size = if name == "default" {
             group.effective_view(name, "base_vectors")
                 .and_then(|v| v.record_count.or(v.source.declared_count))
@@ -209,10 +213,19 @@ pub fn plan_tags(
                 .map(size_rung)
         } else {
             profile.base_count.map(|count| {
-                if vectordata::dataset::selector::parse_number(name) == Some(count as f64) {
-                    name.clone()
-                } else {
-                    size_rung(count)
+                let spells = |s: &str| vectordata::dataset::selector::parse_number(s) == Some(count as f64);
+                // A carried rung may have been read as a number (`1000000`).
+                let carried = profile.attributes.get("size").and_then(|v| match v {
+                    serde_yaml::Value::String(s) => Some(s.clone()),
+                    serde_yaml::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                });
+                let carried = carried.filter(|s| spells(s));
+                let leading = name.split('-').next().filter(|s| spells(s));
+                match (carried, leading) {
+                    (Some(c), _) => c,
+                    (None, Some(l)) => l.to_string(),
+                    (None, None) => size_rung(count),
                 }
             })
         };
@@ -306,7 +319,7 @@ mod tests {
     use chrono::Utc;
     use std::collections::HashMap;
 
-    const YAML: &str = "format_version: 2\nname: t\n\nprofiles:\n  default:\n    maxk: 10\n    base_vectors:\n      source: profiles/base/b__NNNN.fvecs\n      shard_stride: 100000000\n      shard_count: 5\n      record_count: 495930736\n    metadata_predicates: profiles/base/predicates.slab\n  10m:\n    base_count: 10000000  # ten million\n    neighbor_indices: profiles/10m/gt.ivecs\n  64mi:\n    base_count: 67108864\n  odd:\n    base_count: 1234567\n  part-0:\n    partition: true\n    base_count: 5\n    base_vectors: profiles/part-0/b.fvecs\n";
+    const YAML: &str = "format_version: 2\nname: t\n\nprofiles:\n  default:\n    maxk: 10\n    base_vectors:\n      source: profiles/base/b__NNNN.fvecs\n      shard_stride: 100000000\n      shard_count: 5\n      record_count: 495930736\n    metadata_predicates: profiles/base/predicates.slab\n  10m:\n    base_count: 10000000  # ten million\n    neighbor_indices: profiles/10m/gt.ivecs\n  64mi:\n    base_count: 67108864\n  odd:\n    base_count: 1234567\n  64mi-unfiltered:\n    inherits: default\n    base_count: 67108864\n  odd-set:\n    inherits: default\n    base_count: 1234567\n    attributes:\n      size: 1234567\n  part-0:\n    partition: true\n    base_count: 5\n    base_vectors: profiles/part-0/b.fvecs\n";
 
     fn ctx_at(workspace: &Path) -> StreamContext {
         StreamContext {
@@ -371,6 +384,8 @@ mod tests {
         assert_eq!(get("10m", "size"), Some(serde_yaml::Value::from("10m")));
         assert_eq!(get("64mi", "size"), Some(serde_yaml::Value::from("64mi")), "a name that spells its count is the rung");
         assert_eq!(get("odd", "size"), Some(serde_yaml::Value::from("1m")), "any other count takes the decimal rung");
+        assert_eq!(get("64mi-unfiltered", "size"), Some(serde_yaml::Value::from("64mi")), "the name's leading segment spells the count");
+        assert_eq!(get("odd-set", "size"), Some(serde_yaml::Value::from("1234567")), "a carried size that spells the count is the plan");
         assert_eq!(get("part-0", "size"), Some(serde_yaml::Value::from("5")));
         assert_eq!(get("default", "family"), Some(serde_yaml::Value::from("stratified")));
         assert_eq!(get("10m", "family"), Some(serde_yaml::Value::from("stratified")), "the member reads the default's facet");
