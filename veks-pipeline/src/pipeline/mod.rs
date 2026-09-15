@@ -1429,11 +1429,17 @@ fn explain_staleness(
             };
             upstream.insert((*up).to_string(), address);
         }
-        if step.def.finalize
-            && let Ok(node) = provenance::ProvenanceNode::definition(&ctx.workspace)
-            && let Ok(address) = graph.insert(node)
-        {
-            upstream.insert(provenance::DEFINITION_INPUT.to_string(), address);
+        if step.def.finalize {
+            if let Ok(node) = provenance::ProvenanceNode::definition(&ctx.workspace)
+                && let Ok(address) = graph.insert(node)
+            {
+                upstream.insert(provenance::DEFINITION_INPUT.to_string(), address);
+            }
+            if let Ok(Some(node)) = provenance::ProvenanceNode::static_payload(&ctx.workspace)
+                && let Ok(address) = graph.insert(node)
+            {
+                upstream.insert(provenance::STATIC_PAYLOAD_INPUT.to_string(), address);
+            }
         }
         let binary = provenance::BinaryVersion::parse(&cmd_build_version);
         let current = graph

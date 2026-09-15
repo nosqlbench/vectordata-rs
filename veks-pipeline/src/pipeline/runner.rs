@@ -200,15 +200,12 @@ pub fn run_steps(
         let upstream_ids: Vec<&str> = step.def.after.iter()
             .map(|s| s.as_str())
             .collect();
-        // A finalize step publishes the definition, so the definition
-        // is its input, by content: an edit reaches dataset.json, the
-        // catalog and the docs on the next run; a rewrite that changed
-        // nothing reaches nothing.
+        // A finalize step publishes the definition and the static
+        // payload, so both are its inputs, by content: an edit reaches
+        // dataset.json, the catalog, the docs and the merkle tree on the
+        // next run; a rewrite that changed nothing reaches nothing.
         let inputs: Vec<(&str, super::provenance::Address)> = if step.def.finalize {
-            ctx.progress
-                .definition_input(&ctx.workspace)
-                .map(|a| vec![(super::provenance::DEFINITION_INPUT, a)])
-                .unwrap_or_default()
+            ctx.progress.finalize_inputs(&ctx.workspace)
         } else {
             vec![]
         };

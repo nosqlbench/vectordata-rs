@@ -66,6 +66,10 @@ pub type Address = String;
 /// definition as an input (see [`ProvenanceNode::definition`]).
 pub const DEFINITION_INPUT: &str = "dataset.yaml";
 
+/// The upstream key under which a finalize step holds the static
+/// payload as an input (see [`ProvenanceNode::static_payload`]).
+pub const STATIC_PAYLOAD_INPUT: &str = "static-payload";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvenanceNode {
     /// Step identifier — the YAML `id` field.
@@ -215,6 +219,40 @@ impl ProvenanceNode {
             options,
             upstream: BTreeMap::new(),
         })
+    }
+
+    /// The node of the **static payload** as an input: every `README`,
+    /// `LICENSE`, `NOTICE` and `CITATION` file under the workspace
+    /// (sysref §1), keyed by path and content, so the steps that publish
+    /// them — the docs that link them, the merkle tree, the catalog —
+    /// are stale when one is added, edited or removed and fresh when
+    /// one was merely rewritten. `Ok(None)` when there is none.
+    pub fn static_payload(workspace: &Path) -> std::io::Result<Option<Self>> {
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_static_payload(workspace, &mut files)?;
+        if files.is_empty() {
+            return Ok(None);
+        }
+        files.sort();
+        let mut options: BTreeMap<String, String> = BTreeMap::new();
+        for f in &files {
+            let bytes = std::fs::read(f)?;
+            let mut h = FnvHasher::new();
+            h.write(&bytes);
+            let rel = f.strip_prefix(workspace_dir(workspace)).unwrap_or(f).to_string_lossy().replace('\\', "/");
+            options.insert(rel, format!("{:016x}", h.finish()));
+        }
+        Ok(Some(ProvenanceNode {
+            step_id: format!("input:{STATIC_PAYLOAD_INPUT}"),
+            command_path: "static-payload".into(),
+            binary_version_major: 0,
+            binary_version_minor: 0,
+            binary_version_patch: 0,
+            binary_git_hash: String::new(),
+            binary_dirty: false,
+            options,
+            upstream: BTreeMap::new(),
+        }))
     }
 
     /// The node's content address: its hash under
@@ -849,6 +887,45 @@ pub struct BinaryVersion {
     pub profile: String,
 }
 
+/// A workspace as a directory to read: the runner names the current
+/// directory as the empty path, which joins like `.` but does not read
+/// like it.
+fn workspace_dir(workspace: &Path) -> &Path {
+    if workspace.as_os_str().is_empty() { Path::new(".") } else { workspace }
+}
+
+/// Every static payload file under `dir`, hidden directories skipped.
+fn collect_static_payload(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(workspace_dir(dir))? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            collect_static_payload(&path, out)?;
+        } else if ty.is_file() && vectordata::filters::is_static_payload(&name) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Whether any static payload file under `workspace` was modified after
+/// `since` (see [`ProvenanceNode::static_payload`]).
+pub fn static_payload_modified_after(workspace: &Path, since: std::time::SystemTime) -> bool {
+    let mut files = Vec::new();
+    if collect_static_payload(workspace, &mut files).is_err() {
+        return false;
+    }
+    files
+        .iter()
+        .filter_map(|f| std::fs::metadata(f).ok().and_then(|m| m.modified().ok()))
+        .any(|m| m > since)
+}
+
 impl BinaryVersion {
     /// Parse `{CARGO_PKG_VERSION}+{git_short}[+dirty][+profile][.build_number]`.
     /// Forgiving: any component that doesn't parse is left at its
@@ -909,6 +986,21 @@ mod tests {
     fn hash_of(version: &str, opts_in: HashMap<String, String>, sel: ProvenanceFlags) -> String {
         let (g, a) = single(version, opts_in);
         g.hash(&a, sel).unwrap()
+    }
+
+    /// **The runner names the current directory as the empty path**;
+    /// the payload walker reads it as `.` and keys files relative to it.
+    #[test]
+    fn the_empty_workspace_reads_as_the_current_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("README.md"), "# t\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let node = ProvenanceNode::static_payload(Path::new("")).unwrap().expect("the README is found");
+        let modified = static_payload_modified_after(Path::new(""), std::time::UNIX_EPOCH);
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(node.options.keys().cloned().collect::<Vec<_>>(), vec!["README.md".to_string()]);
+        assert!(modified);
     }
 
     #[test]
@@ -1251,3 +1343,4 @@ mod tests {
         );
     }
 }
+

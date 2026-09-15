@@ -123,9 +123,12 @@ A step is fresh when:
   tags`, a reworded description or a declared profile reaches
   dataset.json, the catalog and the docs on the next run; a save that
   wrote the same bytes reaches nothing, and no compute step holds the
-  definition, so an edit never recomputes data. A record from before
-  the definition was an input is judged by the file's time until the
-  step runs again.
+  definition, so an edit never recomputes data. The **static payload**
+  — `README.md`, `LICENSE.md` and their kin — joins the same way under
+  the key `static-payload`, keyed by path and content, so a README
+  added or edited republishes the docs that link it and the merkle tree
+  that covers it. A record from before either was an input is judged by
+  the files' times until the step runs again.
 
 A dry run applies the same rules to its plan: a planned step with
 outputs stands for outputs newer than its dependents' records, and a
