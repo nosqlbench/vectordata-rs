@@ -1383,18 +1383,30 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
                 });
             };
 
+            // The slab this profile reads (PL-2): a set's own, else
+            // the shared one the step names.
+            let own_slab = config
+                .profiles
+                .effective_view(name, "metadata_predicates")
+                .map(|v| ctx.workspace.join(vectordata::dataset::catalog::strip_window_suffix(&v.source.path)));
+            let profile_pred_count = match &own_slab {
+                Some(p) if p != &predicates_path => slabtastic::SlabReader::open(p)
+                    .map(|r| r.total_records() as usize)
+                    .unwrap_or(pred_count),
+                _ => pred_count,
+            };
             let bc_str = if *bc == u64::MAX { "full".into() } else { bc.to_string() };
             ctx.ui.log(&format!(
-                "  profile '{}' (base_count={}): {} evaluation records",
-                name, bc_str, eval_count,
+                "  profile '{}' (base_count={}): {} evaluation records for {} predicates",
+                name, bc_str, eval_count, profile_pred_count,
             ));
 
             all_results.push(serde_json::json!({
                 "name": name,
-                "status": "verified",
+                "status": if eval_count == profile_pred_count { "verified" } else { "mismatch" },
                 "base_count": bc,
                 "eval_records": eval_count,
-                "pred_count": pred_count,
+                "pred_count": profile_pred_count,
             }));
             pb.inc(1);
         }
