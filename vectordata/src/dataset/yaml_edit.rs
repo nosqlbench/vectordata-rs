@@ -368,17 +368,31 @@ pub fn append_profile(yaml: &str, name: &str, body: &[String]) -> Result<String,
 /// `body` lines follow at the item's own indent.
 pub fn append_step(yaml: &str, body: &[String]) -> Result<String, String> {
     let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+    let (_, steps_end, items_indent) = steps_sequence(&lines)?;
+    let item_indent = " ".repeat(items_indent);
+    let Some((first, rest)) = body.split_first() else {
+        return Err("an empty step".to_string());
+    };
+    let mut block = vec![format!("{item_indent}- {first}")];
+    block.extend(rest.iter().map(|l| format!("{item_indent}  {l}")));
+    lines.splice(steps_end..steps_end, block);
+    Ok(finish(lines, yaml))
+}
+
+/// The `upstream.steps:` sequence: the index of the `steps:` line, the
+/// first index past its last item, and the items' indent. A sequence
+/// may sit at its key's own indent, so the block is followed item by
+/// item: an item at the items' indent, or a line deeper than it,
+/// belongs to the sequence.
+fn steps_sequence(lines: &[String]) -> Result<(usize, usize, usize), String> {
     let upstream = lines
         .iter()
         .position(|l| indent_of(l) == 0 && key_of(l) == Some("upstream"))
         .ok_or_else(|| "dataset.yaml declares no `upstream:`".to_string())?;
-    let upstream_end = block_end(&lines, upstream, 0);
+    let upstream_end = block_end(lines, upstream, 0);
     let steps = (upstream + 1..upstream_end)
         .find(|&i| indent_of(&lines[i]) == 2 && key_of(&lines[i]) == Some("steps"))
         .ok_or_else(|| "dataset.yaml declares no `upstream.steps:`".to_string())?;
-    // A sequence may sit at its key's own indent, so the block is
-    // followed item by item: an item at the items' indent, or a line
-    // deeper than it, belongs to the sequence.
     let key_indent = indent_of(&lines[steps]);
     let mut items_indent: Option<usize> = None;
     let mut last_content = steps;
@@ -400,14 +414,143 @@ pub fn append_step(yaml: &str, body: &[String]) -> Result<String, String> {
         last_content = i;
         i += 1;
     }
-    let steps_end = last_content + 1;
-    let item_indent = " ".repeat(items_indent.unwrap_or(key_indent));
-    let Some((first, rest)) = body.split_first() else {
-        return Err("an empty step".to_string());
+    Ok((steps, last_content + 1, items_indent.unwrap_or(key_indent)))
+}
+
+/// A scalar as written in a sequence item or after a key: a trailing
+/// comment dropped, quotes stripped.
+fn bare_scalar(s: &str) -> &str {
+    let s = match s.find(" #") {
+        Some(i) => &s[..i],
+        None => s,
     };
-    let mut block = vec![format!("{item_indent}- {first}")];
-    block.extend(rest.iter().map(|l| format!("{item_indent}  {l}")));
-    lines.splice(steps_end..steps_end, block);
+    s.trim().trim_matches(|c| c == '\'' || c == '"')
+}
+
+/// The line range `[start, end)` of the step item whose first line is
+/// `- id: <id>`, with the items' indent; `end` is the next item or the
+/// sequence's end.
+fn step_item(lines: &[String], id: &str) -> Result<Option<(usize, usize, usize)>, String> {
+    let (steps, end, ii) = steps_sequence(lines)?;
+    let starts: Vec<usize> = (steps + 1..end)
+        .filter(|&i| indent_of(&lines[i]) == ii && lines[i].trim_start().starts_with("- "))
+        .collect();
+    for (k, &s) in starts.iter().enumerate() {
+        let rest = lines[s].trim_start()[2..].trim();
+        let Some(v) = rest.strip_prefix("id:") else { continue };
+        if bare_scalar(v) == id {
+            return Ok(Some((s, starts.get(k + 1).copied().unwrap_or(end), ii)));
+        }
+    }
+    Ok(None)
+}
+
+/// Remove the step item `- id: <id>` from `upstream.steps:`, whole; a
+/// step not declared changes nothing.
+pub fn remove_step(yaml: &str, id: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+    let Some((s, e, _)) = step_item(&lines, id)? else {
+        return Ok(finish(lines, yaml));
+    };
+    lines.drain(s..e);
+    Ok(finish(lines, yaml))
+}
+
+/// List a profile on a step's `profiles:` — appended to the list in
+/// its own form, block or flow, or the key added at the item's end when
+/// the step has none. Idempotent: a profile already listed is left
+/// where it is.
+pub fn add_step_profile(yaml: &str, id: &str, profile: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+    let Some((s, e, ii)) = step_item(&lines, id)? else {
+        return Err(format!("step `{id}` is not declared"));
+    };
+    let key_indent = ii + 2;
+    let rendered = render_scalar(&Yaml::from(profile))?;
+    let key = (s + 1..e).find(|&i| indent_of(&lines[i]) == key_indent && key_of(&lines[i]) == Some("profiles"));
+    let Some(k) = key else {
+        let pad = " ".repeat(key_indent);
+        let mut at = e;
+        while at > s + 1 && is_blank_or_comment(&lines[at - 1]) {
+            at -= 1;
+        }
+        lines.splice(at..at, [format!("{pad}profiles:"), format!("{pad}- {rendered}")]);
+        return Ok(finish(lines, yaml));
+    };
+    let (flow, _) = value_and_comment(&lines[k]);
+    if flow.starts_with('[') {
+        let mut list: Vec<String> = serde_yaml::from_str(&flow).map_err(|e| format!("step `{id}` profiles: {e}"))?;
+        if list.iter().any(|p| p == profile) {
+            return Ok(finish(lines, yaml));
+        }
+        list.push(profile.to_string());
+        let parts = list
+            .iter()
+            .map(|p| render_scalar(&Yaml::from(p.as_str())))
+            .collect::<Result<Vec<_>, _>>()?;
+        lines[k] = updated_line(&lines[k], &" ".repeat(key_indent), "profiles", &format!("[{}]", parts.join(", ")));
+        return Ok(finish(lines, yaml));
+    }
+    let mut last = k;
+    let mut items_indent: Option<usize> = None;
+    for i in k + 1..e {
+        let l = &lines[i];
+        if is_blank_or_comment(l) {
+            continue;
+        }
+        let ind = indent_of(l);
+        let is_item = l.trim_start().starts_with("- ");
+        match items_indent {
+            None if is_item && ind >= key_indent => items_indent = Some(ind),
+            None => break,
+            Some(li) if (is_item && ind == li) || ind > li => {}
+            Some(_) => break,
+        }
+        if is_item && bare_scalar(&l.trim_start()[2..]) == profile {
+            return Ok(finish(lines, yaml));
+        }
+        last = i;
+    }
+    let li = items_indent.unwrap_or(key_indent);
+    lines.insert(last + 1, format!("{}- {rendered}", " ".repeat(li)));
+    Ok(finish(lines, yaml))
+}
+
+/// Point one view of a profile at a path (PL-2): the `<facet>: <path>`
+/// line is replaced in place, comment kept, or added at the profile's
+/// end when the facet is not declared there. A facet declared in block
+/// form — a series, a windowed source — is refused, since a path alone
+/// cannot restate it.
+pub fn set_profile_view(yaml: &str, profile: &str, facet: &str, path: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+    let profiles = lines
+        .iter()
+        .position(|l| indent_of(l) == 0 && key_of(l) == Some("profiles"))
+        .ok_or_else(|| "dataset.yaml declares no `profiles:`".to_string())?;
+    let profiles_end = block_end(&lines, profiles, 0);
+    let profile_line = (profiles + 1..profiles_end)
+        .find(|&i| indent_of(&lines[i]) == 2 && key_of(&lines[i]) == Some(profile))
+        .ok_or_else(|| format!("profile '{profile}' is not declared"))?;
+    let profile_end = block_end(&lines, profile_line, 2);
+    match (profile_line + 1..profile_end).find(|&i| indent_of(&lines[i]) == 4 && key_of(&lines[i]) == Some(facet)) {
+        Some(i) => {
+            let (value, _) = value_and_comment(&lines[i]);
+            if value.is_empty() {
+                return Err(format!("profile '{profile}': `{facet}` is declared in block form; a path cannot restate it"));
+            }
+            if value == path {
+                return Ok(finish(lines, yaml));
+            }
+            lines[i] = updated_line(&lines[i], "    ", facet, path);
+        }
+        None => {
+            let mut at = profile_end;
+            while at > profile_line + 1 && is_blank_or_comment(&lines[at - 1]) {
+                at -= 1;
+            }
+            lines.insert(at, format!("    {facet}: {path}"));
+        }
+    }
     Ok(finish(lines, yaml))
 }
 
@@ -578,6 +721,34 @@ mod tests {
         let flow = "profiles:\n  default:\n    attributes: { size: 495m, predicates: mixed }  # tags\n    base_vectors: b.fvec\n";
         assert_eq!(unset_profile_attribute(flow, "default", "predicates").unwrap(), "profiles:\n  default:\n    attributes: { size: 495m }  # tags\n    base_vectors: b.fvec\n");
         assert_eq!(unset_profile_attribute(&unset_profile_attribute(flow, "default", "predicates").unwrap(), "default", "size").unwrap(), "profiles:\n  default:\n    base_vectors: b.fvec\n");
+    }
+
+    /// **A step is removed whole, a profile is listed on it once, and a
+    /// view is re-pointed in place** — the editors a grid's true-up
+    /// needs (PL-2, PL-11); each is idempotent and keeps comments.
+    #[test]
+    fn steps_and_views_are_edited_textually() {
+        let yaml = "name: t\nupstream:\n  steps:\n  - id: survey\n    run: analyze survey\n  - id: gen-a  # a\n    run: generate predicates\n    after:\n    - survey\n    profiles:\n    - a-set\n    output: p.slab\n  - id: gen-flow\n    run: generate predicates\n    profiles: [x, y]  # flow\n  - id: gen-none\n    run: generate predicates\n\nprofiles:\n  default:\n    base_vectors: b.fvec\n  a-set:\n    inherits: default\n    metadata_predicates: profiles/a-set/p.slab  # own\n    metadata_results: profiles/a-set/r.slab\n";
+        let out = add_step_profile(yaml, "gen-a", "b-set").unwrap();
+        assert!(out.contains("    profiles:\n    - a-set\n    - b-set\n    output: p.slab\n"), "{out}");
+        assert_eq!(add_step_profile(&out, "gen-a", "b-set").unwrap(), out, "listed once");
+        let out = add_step_profile(&out, "gen-flow", "z").unwrap();
+        assert!(out.contains("    profiles: [x, y, z]  # flow\n"), "{out}");
+        assert_eq!(add_step_profile(&out, "gen-flow", "x").unwrap(), out);
+        let out = add_step_profile(&out, "gen-none", "q").unwrap();
+        assert!(out.contains("  - id: gen-none\n    run: generate predicates\n    profiles:\n    - q\n\nprofiles:\n"), "{out}");
+        assert!(add_step_profile(&out, "nope", "q").is_err());
+        let out = remove_step(&out, "gen-flow").unwrap();
+        assert!(!out.contains("gen-flow"), "{out}");
+        assert!(out.contains("    output: p.slab\n  - id: gen-none\n"), "the neighbours meet: {out}");
+        assert_eq!(remove_step(&out, "gen-flow").unwrap(), out, "absent is a no-op");
+        let out = set_profile_view(&out, "a-set", "metadata_predicates", "profiles/base/uniform-2-1e-3/p.slab").unwrap();
+        assert!(out.contains("    metadata_predicates: profiles/base/uniform-2-1e-3/p.slab  # own\n"), "{out}");
+        assert_eq!(set_profile_view(&out, "a-set", "metadata_predicates", "profiles/base/uniform-2-1e-3/p.slab").unwrap(), out);
+        let out = set_profile_view(&out, "a-set", "metadata_indices", "profiles/a-set/i.ivvecs").unwrap();
+        assert!(out.contains("    metadata_results: profiles/a-set/r.slab\n    metadata_indices: profiles/a-set/i.ivvecs\n"), "{out}");
+        let series = "profiles:\n  default:\n    base_vectors:\n      source: b__NNNN.fvecs\n      shard_stride: 10\n";
+        assert!(set_profile_view(series, "default", "base_vectors", "x.fvec").is_err());
     }
 
     /// **A profile and a step are appended where their blocks end**
