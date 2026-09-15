@@ -682,7 +682,7 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
 
     // Upload changed content files first… (a resumed push re-puts only
     // what the classify step found missing or differing — idempotent),
-    // saying how far along it is.
+    // on `--concurrency` streams, saying how far along it is.
     let upload_bytes: u64 = to_upload.iter().filter_map(|r| pre_stats.get(r).map(|s| s.0)).sum();
     report.note(&format!(
         "upload: {} file(s), {} on {} stream(s)",
@@ -832,25 +832,81 @@ fn fetch_dir_sums(
     results.into_inner().expect("results")
 }
 
-/// Upload `files` one after another, reporting files and bytes done and
-/// the file that just landed.
+/// Upload `files` on up to `concurrency` streams, reporting files and
+/// bytes done and the file that just landed. The first failure ends
+/// the upload; what was put stays, since a resumed push re-puts only
+/// what is missing.
 fn upload_files(
     tx: &dyn PushTransport,
     root: &Path,
     files: &[String],
     sizes: &BTreeMap<String, (u64, std::time::SystemTime)>,
-    _concurrency: u32,
+    concurrency: u32,
     report: &Reporter,
 ) -> Result<(), Failure> {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     let n = files.len();
-    let total_bytes: u64 = files.iter().filter_map(|r| sizes.get(r).map(|s| s.0)).sum();
-    let mut done_bytes = 0u64;
-    for (i, rel) in files.iter().enumerate() {
-        tx.put_file(rel, &root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))).map_err(map_transport)?;
-        done_bytes += sizes.get(rel).map(|s| s.0).unwrap_or(0);
-        report.progress("upload", i + 1, n, &format!("files, {}/{} — {rel}", fmt_bytes(done_bytes), fmt_bytes(total_bytes)));
+    if n == 0 {
+        return Ok(());
     }
-    Ok(())
+    let total_bytes: u64 = files.iter().filter_map(|r| sizes.get(r).map(|s| s.0)).sum();
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let done_bytes = AtomicU64::new(0);
+    let failed = std::sync::Mutex::new(None::<Failure>);
+    let last = std::sync::Mutex::new(String::new());
+    let workers = (concurrency.max(1) as usize).min(n);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if failed.lock().expect("failure slot").is_some() {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= n {
+                    break;
+                }
+                let rel = &files[i];
+                let r = tx.put_file(rel, &root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))).map_err(map_transport);
+                match r {
+                    Ok(()) => {
+                        done_bytes.fetch_add(sizes.get(rel).map(|s| s.0).unwrap_or(0), Ordering::SeqCst);
+                        *last.lock().expect("last file") = rel.clone();
+                        done.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        let mut slot = failed.lock().expect("failure slot");
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+        let mut shown = 0usize;
+        loop {
+            let d = done.load(Ordering::SeqCst);
+            if d != shown {
+                let detail = format!(
+                    "files, {}/{} — {}",
+                    fmt_bytes(done_bytes.load(Ordering::SeqCst)),
+                    fmt_bytes(total_bytes),
+                    last.lock().expect("last file")
+                );
+                report.progress("upload", d, n, &detail);
+                shown = d;
+            }
+            if d >= n || failed.lock().expect("failure slot").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    match failed.into_inner().expect("failure slot") {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Read the remote `pushlog.jsonl` and its etag (for conditional writes).
