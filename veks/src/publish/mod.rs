@@ -195,7 +195,7 @@ pub fn run(args: PublishArgs) {
         println!("    {} ({} files, {})", rel, ds_file_count, format_size(ds_size));
     }
     println!();
-    println!("  Files:       {} to sync, {} total",
+    println!("  Publish set: {} files, {} — what would move is decided against the remote below",
         publishable.len(),
         format_size(total_size),
     );
@@ -242,6 +242,8 @@ pub fn run(args: PublishArgs) {
         .count();
     println!("  Includes:    {} files ({} infrastructure: dataset.yaml, catalog.json, etc.)",
         include_files.len(), infra_count);
+    println!();
+    println!("Comparing against the remote — its push log, one listing, and the checksum files of directories the log cannot vouch for; no content is read:");
     if infra_count == 0 {
         eprintln!("  WARNING: no infrastructure files (dataset.yaml, catalog.json) in publish set!");
         eprintln!("           Check that .publish sentinel exists in the dataset directory.");
