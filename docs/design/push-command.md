@@ -370,6 +370,28 @@ transfer planner:
    fingerprint set, and overwriting it goes through the same `-m` gate as any
    other content.
 
+### What the plan reads from the remote
+
+Deciding what a push would do — which is all a dry run does — moves
+no content. The plan reads the remote's `pushlog.jsonl`, one listing
+of the publish root, and the `SHA256SUMS` of the directories the log
+cannot vouch for, with a metadata probe only for a file the listing
+could not settle. A directory is **vouched for** when the digest the
+last `complete` recorded for its `SHA256SUMS` equals the digest held
+locally: that digest is the remote file's content, so equal digests
+mean every file the directory lists is unchanged, and the plan takes
+the local sums as the remote's without a fetch. The other directories'
+sums are fetched concurrently (`--concurrency` workers, one transport),
+since over the S3 transport every fetch is an `aws` process and a
+publish root of a few hundred directories fetched one at a time was
+minutes of silence. The plan reports each phase on stderr as it goes —
+reaching the remote, reading the log, listing, how many directories the
+log vouched for and a counter over the fetches — and the printed plan
+states how many directories were judged from the log and how many
+fetched. `veks publish` says the same before it hands off, and its
+summary line calls the publish set what it is: what would move is the
+plan's `Plan:` line, not the set's size.
+
 ## Upload versioning via pushlog events
 
 A push touches many objects but object stores commit one object at a time, so

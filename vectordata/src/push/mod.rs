@@ -14,6 +14,17 @@
 //! exercised against the local `file://` transport in tests; the
 //! `https://` and `s3://` transports ride the same [`transport::PushTransport`]
 //! contract.
+//!
+//! **What the plan reads from the remote.** Deciding what a push would
+//! do — and all a dry run does — moves no content: it reads the
+//! remote's push log, one listing of the publish root, and the
+//! `SHA256SUMS` of the directories the log cannot vouch for, with a
+//! metadata probe only for a file the listing could not settle. A
+//! directory whose `SHA256SUMS` digest the last committed push recorded
+//! equals the one held locally is unchanged file for file and is not
+//! fetched at all; the rest are fetched concurrently, and the phases
+//! report on stderr as they go, since over the S3 transport every
+//! fetch is a process.
 
 pub mod binding;
 pub mod checksums;
@@ -99,6 +110,41 @@ pub struct Outcome {
     /// yet known, so whether they are unchanged or overwritten waits
     /// on the hashing.
     pub undetermined: usize,
+    /// Content directories the last committed push's log vouched for —
+    /// same `SHA256SUMS` digest as held locally — so their remote sums
+    /// were not fetched.
+    pub dirs_from_log: usize,
+    /// Content directories whose remote `SHA256SUMS` were fetched.
+    pub dirs_fetched: usize,
+}
+
+/// Where the plan says what it is doing while it does it: stderr, so
+/// the plan itself stays on stdout. A counter is redrawn in place on a
+/// terminal and printed once at the end otherwise.
+struct Reporter {
+    tty: bool,
+}
+
+impl Reporter {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        Reporter { tty: std::io::stderr().is_terminal() }
+    }
+
+    fn note(&self, msg: &str) {
+        eprintln!("  {msg}");
+    }
+
+    fn progress(&self, label: &str, done: usize, total: usize) {
+        if self.tty {
+            eprint!("\r  {label}: {done}/{total}");
+            if done >= total {
+                eprintln!();
+            }
+        } else if done >= total {
+            eprintln!("  {label}: {done}/{total}");
+        }
+    }
 }
 
 /// Failure classes, mapped to exit codes by [`run`].
@@ -249,7 +295,9 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     }
 
     // 4. Open transport + auth/reachability preflight (fail fast).
+    let report = Reporter::new();
     let tx = transport::open(&endpoint, &opts.transport, opts.concurrency).map_err(Failure::Usage)?;
+    report.note(&format!("remote: reaching {}", tx.describe()));
     tx.preflight().map_err(map_transport)?;
 
     // 4b. The single-provenance guarantee rests on the store honoring
@@ -280,6 +328,7 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     //    against the remote's *committed* history (excluding any trailing
     //    open `begin`, which is an in-flight or crashed push reconciled in
     //    step 7).
+    report.note("remote: reading the push log");
     let (remote_log, remote_log_etag) = read_remote_log(tx.as_ref())?;
     let mut local_log = read_local_log(root)?;
     let remote_committed = remote_log.committed();
@@ -321,6 +370,8 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
                     to_hash_files: 0,
                     to_hash_bytes: 0,
                     undetermined: 0,
+                    dirs_from_log: scan.content_dirs.len(),
+                    dirs_fetched: 0,
                 });
             }
             if remote_committed.stable_version() == local_log.stable_version() {
@@ -384,32 +435,59 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     let mut to_upload: Vec<String> = Vec::new();
     let mut skipped = 0usize;
     let mut undetermined: Vec<String> = Vec::new();
-    // The remote sums of a directory are one fetch per directory, not
-    // one per file in it: over the S3 transport every fetch is an
-    // `aws` process, and fetching a directory's sums once per file
-    // made a plan over a few hundred files take a quarter of an hour.
-    let mut remote_sums_by_dir: BTreeMap<String, Option<checksums::ChecksumFile>> = BTreeMap::new();
     // Whether a file the remote sums do not list is on the remote at
     // all comes from one listing of the publish root, not from a probe
     // per file: over the S3 transport every probe is an `aws` process,
     // and a first publish of a few hundred files probed each of them.
     // A transport that cannot enumerate (a bare https endpoint) leaves
     // the probe in place.
+    report.note("remote: listing the publish root");
     let inventory: Option<std::collections::HashSet<String>> = match tx.list("") {
         Ok(keys) => Some(keys.into_iter().collect()),
         Err(_) => None,
     };
+    if let Some(inv) = &inventory {
+        report.note(&format!("remote: {} object(s) listed", inv.len()));
+    }
+    // The remote sums of a directory are one fetch per directory, not
+    // one per file in it: over the S3 transport every fetch is an
+    // `aws` process, and fetching a directory's sums once per file
+    // made a plan over a few hundred files take a quarter of an hour.
+    // A directory the last committed push's log vouches for — the
+    // digest it recorded for the directory's SHA256SUMS is the digest
+    // held locally — is unchanged file for file and is not fetched at
+    // all, since that digest is the remote file's content; the rest
+    // are fetched concurrently.
+    let remote_stable = remote_committed.stable_sums();
+    let mut remote_sums_by_dir: BTreeMap<String, Option<checksums::ChecksumFile>> = BTreeMap::new();
+    let mut to_fetch: Vec<String> = Vec::new();
+    for dir_rel in &scan.content_dirs {
+        let vouched = remote_stable
+            .and_then(|s| s.get(dir_rel))
+            .is_some_and(|d| Some(d) == sums_digests.get(dir_rel));
+        if vouched {
+            remote_sums_by_dir.insert(dir_rel.clone(), local_sums.get(dir_rel).cloned());
+        } else {
+            to_fetch.push(dir_rel.clone());
+        }
+    }
+    let dirs_from_log = remote_sums_by_dir.len();
+    let dirs_fetched = to_fetch.len();
+    report.note(&format!(
+        "remote: {dirs_from_log} of {} director{} unchanged since the last committed push; fetching the checksums of {dirs_fetched}",
+        scan.content_dirs.len(),
+        if scan.content_dirs.len() == 1 { "y" } else { "ies" },
+    ));
+    for (dir_rel, fetched) in fetch_dir_sums(tx.as_ref(), &to_fetch, opts.concurrency, &report) {
+        remote_sums_by_dir.insert(dir_rel, fetched?);
+    }
     for rel in &scan.files {
         let (dir_rel, name) = split_rel(rel);
         let local_digest: Option<String> = local_sums.get(dir_rel).and_then(|cf| cf.digest_of(name)).map(str::to_string);
         if local_digest.is_none() && !opts.dry_run {
             return Err(Failure::op(format!("internal: no local digest for {rel}")));
         }
-        if !remote_sums_by_dir.contains_key(dir_rel) {
-            let fetched = remote_log_or_dir_sums(tx.as_ref(), dir_rel)?;
-            remote_sums_by_dir.insert(dir_rel.to_string(), fetched);
-        }
-        let remote_sums = remote_sums_by_dir.get(dir_rel).expect("just inserted");
+        let remote_sums = remote_sums_by_dir.get(dir_rel).expect("every content directory was settled above");
         let listed = inventory.as_ref().map(|inv| inv.contains(rel));
         match classify_file(tx.as_ref(), rel, dir_rel, local_digest.as_deref(), remote_sums, listed)? {
             Decision::Skip => skipped += 1,
@@ -487,6 +565,8 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
         to_hash_files: pending_sums.iter().map(|p| p.2).sum(),
         to_hash_bytes: pending_sums.iter().map(|p| p.4).sum(),
         undetermined: undetermined.len(),
+        dirs_from_log,
+        dirs_fetched,
     };
 
     // 11. The plan, printed the same way in both modes. A dry run is
@@ -657,6 +737,53 @@ fn classify_file(
         // overwrite (gated, safe) rather than risk a silent clobber.
         (true, Some(_)) => Ok(Decision::Overwrite { old_digest: "unknown".to_string() }),
     }
+}
+
+/// Fetch the remote `SHA256SUMS` of `dirs` with up to `concurrency`
+/// workers, reporting the count as it grows. Order of the result is
+/// not meaningful; the caller keys it.
+fn fetch_dir_sums(
+    tx: &dyn PushTransport,
+    dirs: &[String],
+    concurrency: u32,
+    report: &Reporter,
+) -> Vec<(String, Result<Option<checksums::ChecksumFile>, Failure>)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let n = dirs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<(String, Result<Option<checksums::ChecksumFile>, Failure>)>> =
+        std::sync::Mutex::new(Vec::with_capacity(n));
+    let workers = (concurrency.max(1) as usize).min(n);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= n {
+                    break;
+                }
+                let r = remote_log_or_dir_sums(tx, &dirs[i]);
+                results.lock().expect("results").push((dirs[i].clone(), r));
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        let mut shown = 0usize;
+        loop {
+            let d = done.load(Ordering::SeqCst);
+            if d != shown {
+                report.progress("remote: checksum files fetched", d, n);
+                shown = d;
+            }
+            if d >= n {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    results.into_inner().expect("results")
 }
 
 /// Read the remote `pushlog.jsonl` and its etag (for conditional writes).
@@ -1012,6 +1139,12 @@ fn print_plan(
         outcome.skipped,
         if undetermined.is_empty() { String::new() } else { format!(", {} awaiting their digest", undetermined.len()) },
         scan.content_dirs.len()
+    );
+    println!(
+        "Remote:      {} director{} unchanged since the last committed push (judged from its log, not fetched), {} fetched; no content was read",
+        outcome.dirs_from_log,
+        if outcome.dirs_from_log == 1 { "y" } else { "ies" },
+        outcome.dirs_fetched,
     );
     if pending_sums.is_empty() {
         println!("Checksums:   every SHA256SUMS is current; nothing to hash");

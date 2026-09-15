@@ -183,6 +183,43 @@ fn dry_run_hashes_nothing_and_reports_what_a_push_would_hash() {
     assert!(!src.join("profiles/1m/SHA256SUMS").exists());
 }
 
+/// **An unchanged directory is judged from the push log, not fetched.**
+/// The digest the last `complete` recorded for a directory's SHA256SUMS
+/// is the remote file's content; equal to the local one, every file in
+/// the directory is unchanged. With the remote sums files gone, the
+/// plan still knows every file is unchanged — it never asked for them —
+/// and a real push restores them.
+#[test]
+fn unchanged_directories_are_judged_from_the_push_log_not_fetched() {
+    let src = unique("vouch-src");
+    let remote = unique("vouch-remote");
+    make_dataset(&src);
+    let first = execute(&opts(&src, &remote)).expect("first push");
+    let total = first.added;
+    assert!(remote.join("SHA256SUMS").exists() && remote.join("profiles/1m/SHA256SUMS").exists());
+    std::fs::remove_file(remote.join("SHA256SUMS")).unwrap();
+    std::fs::remove_file(remote.join("profiles/1m/SHA256SUMS")).unwrap();
+
+    let mut o = opts(&src, &remote);
+    o.dry_run = true;
+    let outcome = execute(&o).expect("dry run ok");
+    assert_eq!((outcome.added, outcome.overwritten, outcome.undetermined), (0, 0, 0), "{outcome:?}");
+    assert_eq!(outcome.skipped, total, "every file is known unchanged without a fetch");
+    assert_eq!(outcome.dirs_fetched, 0, "nothing to fetch: the log vouched for every directory");
+    assert_eq!(outcome.dirs_from_log, 2);
+
+    // A changed file's directory is no longer vouched for and is fetched
+    // (the remote root sums are gone, so its files read as overwrites of
+    // unknown content, which the gate wants a message for).
+    let sums_mtime = std::fs::metadata(src.join("SHA256SUMS")).unwrap().modified().unwrap();
+    std::fs::write(src.join("base.fvec"), b"BASEDATA-v3").unwrap();
+    filetime::set_file_mtime(src.join("base.fvec"), filetime::FileTime::from_system_time(sums_mtime + std::time::Duration::from_secs(5))).unwrap();
+    o.message = Some("base rewritten".to_string());
+    let outcome = execute(&o).expect("dry run ok");
+    assert_eq!(outcome.dirs_fetched, 1, "the root directory changed: its sums are fetched");
+    assert_eq!(outcome.dirs_from_log, 1, "the other is still vouched for");
+}
+
 /// After a push, a dry run knows every unchanged file from the sums it
 /// kept; a file written since is reported as one a real push would
 /// hash, and — being on the remote — as awaiting its digest.

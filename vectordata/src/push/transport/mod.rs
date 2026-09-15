@@ -72,7 +72,9 @@ pub struct TransportOptions {
 /// The write-side transport contract. `rel` is a forward-slashed path
 /// relative to the publish root (`""` addresses the root itself); the
 /// implementation composes it onto the bound endpoint.
-pub trait PushTransport {
+/// `Send + Sync`: the plan fetches every directory's remote sums
+/// concurrently, and the same transport serves every worker.
+pub trait PushTransport: Send + Sync {
     /// Object metadata if it exists; `None` if absent.
     fn head(&self, rel: &str) -> Result<Option<RemoteObject>, PushError>;
 
