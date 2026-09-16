@@ -127,6 +127,10 @@ pub fn run_steps(
     // Dry run: the planned steps that have outputs to write.
     let mut planned_with_outputs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // What the steps in hand produce: a document among them is an
+    // output, not a hand-written input of the finalize pass.
+    let generated_docs = step_outputs(steps, registry, ctx);
+
     // Summary counters for the final report.
     let mut skipped_count: usize = 0;
     let mut executed_count: usize = 0;
@@ -205,7 +209,7 @@ pub fn run_steps(
         // dataset.json, the catalog, the docs and the merkle tree on the
         // next run; a rewrite that changed nothing reaches nothing.
         let inputs: Vec<(&str, super::provenance::Address)> = if step.def.finalize {
-            ctx.progress.finalize_inputs(&ctx.workspace)
+            ctx.progress.finalize_inputs(&ctx.workspace, &generated_docs)
         } else {
             vec![]
         };
@@ -264,7 +268,7 @@ pub fn run_steps(
         // is judged by the file's time, as any upstream declared since
         // a record is.
         let definition_changed: Option<String> = if step.def.finalize {
-            ctx.progress.definition_changed_after(&step.id, &ctx.workspace)
+            ctx.progress.definition_changed_after(&step.id, &ctx.workspace, &generated_docs)
         } else {
             None
         };
@@ -896,6 +900,31 @@ fn workspace_relative(path: &Path, workspace: &Path) -> String {
         Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
         _ => path.to_string_lossy().into_owned(),
     }
+}
+
+/// Every output the steps in hand project, as workspace-relative keys
+/// (see [`super::provenance::rel_key`]): what a step writes is never a
+/// hand-written input of the finalize pass. A step whose options do
+/// not interpolate contributes nothing; the run reports that itself.
+pub(crate) fn step_outputs(
+    steps: &[ResolvedStep],
+    registry: &CommandRegistry,
+    ctx: &StreamContext,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for step in steps {
+        let Ok(resolved) = interpolate::interpolate_options(&step.def.options, &ctx.defaults, &ctx.workspace) else { continue };
+        let Some(factory) = registry.get(&step.def.run) else { continue };
+        let mut options = Options::new();
+        for (k, v) in &resolved {
+            options.set(k, v);
+        }
+        for produced in factory().project_artifacts_in(&step.id, &options, &ctx.workspace).outputs {
+            let abs = resolve_in(&produced, &ctx.workspace);
+            out.insert(super::provenance::rel_key(&abs, &ctx.workspace));
+        }
+    }
+    out
 }
 
 /// Write the tags a command asked for onto `dataset.yaml`, textually

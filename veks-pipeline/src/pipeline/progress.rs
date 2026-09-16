@@ -436,12 +436,12 @@ impl ProgressLog {
     /// definition by content, and the static payload by content when
     /// there is any (see [`ProvenanceNode::definition`] and
     /// [`ProvenanceNode::static_payload`]).
-    pub fn finalize_inputs(&mut self, workspace: &Path) -> Vec<(&'static str, Address)> {
+    pub fn finalize_inputs(&mut self, workspace: &Path, generated: &std::collections::HashSet<String>) -> Vec<(&'static str, Address)> {
         let mut inputs = Vec::new();
         if let Some(a) = self.definition_input(workspace) {
             inputs.push((DEFINITION_INPUT, a));
         }
-        if let Ok(Some(node)) = ProvenanceNode::static_payload(workspace)
+        if let Ok(Some(node)) = ProvenanceNode::static_payload(workspace, generated)
             && let Ok(a) = self.provenance.insert(node)
         {
             inputs.push((STATIC_PAYLOAD_INPUT, a));
@@ -456,7 +456,7 @@ impl ProgressLog {
     /// can: written after the record, the step read something older
     /// than what stands. Once the step runs again its record holds the
     /// inputs by content and this rule no longer applies to it.
-    pub fn definition_changed_after(&self, step_id: &str, workspace: &Path) -> Option<String> {
+    pub fn definition_changed_after(&self, step_id: &str, workspace: &Path, generated: &std::collections::HashSet<String>) -> Option<String> {
         let record = self.steps.get(step_id)?;
         if record.status != Status::Ok {
             return None;
@@ -470,7 +470,7 @@ impl ProgressLog {
             }
         }
         if !node.is_some_and(|n| n.upstream.contains_key(STATIC_PAYLOAD_INPUT))
-            && super::provenance::static_payload_modified_after(workspace, since)
+            && super::provenance::static_payload_modified_after(workspace, since, generated)
         {
             return Some("a static payload file changed after this step's record".to_string());
         }
@@ -1767,6 +1767,7 @@ mod tests {
     /// the file's time instead, and only until the step runs again.
     #[test]
     fn the_definition_is_an_input_by_content() {
+        let none = std::collections::HashSet::new();
         let ws = tempfile::tempdir().unwrap();
         let yaml = ws.path().join("dataset.yaml");
         std::fs::write(&yaml, "name: t\nprofiles:\n  default:\n    attributes:\n      size: 1k\n").unwrap();
@@ -1782,7 +1783,7 @@ mod tests {
         let def = log.definition_input(ws.path()).unwrap();
         let current = log.build_provenance_with_inputs("generate-dataset-json", "generate dataset-json", &opts, &[], &[(DEFINITION_INPUT, def)], "2.0.0+abc");
         assert!(log.check_provenance("generate-dataset-json", &current, selector).is_none());
-        assert!(log.definition_changed_after("generate-dataset-json", ws.path()).is_none(), "a record holding the definition is judged by content, not time");
+        assert!(log.definition_changed_after("generate-dataset-json", ws.path(), &none).is_none(), "a record holding the definition is judged by content, not time");
 
         // A tag edited: stale, naming the definition.
         std::fs::write(&yaml, "name: t\nprofiles:\n  default:\n    attributes:\n      size: 1k\n      predicates: mixed\n").unwrap();
@@ -1795,9 +1796,34 @@ mod tests {
         let old = log.build_provenance("generate-catalog", "catalog generate", &opts, &[], "2.0.0+abc");
         log.record_step("generate-catalog", rec(Some(old)));
         log.steps.get_mut("generate-catalog").unwrap().completed_at = Utc::now() - chrono::Duration::seconds(60);
-        assert!(log.definition_changed_after("generate-catalog", ws.path()).is_some(), "written after the record");
+        assert!(log.definition_changed_after("generate-catalog", ws.path(), &none).is_some(), "written after the record");
         log.steps.get_mut("generate-catalog").unwrap().completed_at = Utc::now() + chrono::Duration::seconds(60);
-        assert!(log.definition_changed_after("generate-catalog", ws.path()).is_none());
+        assert!(log.definition_changed_after("generate-catalog", ws.path(), &none).is_none());
+    }
+
+    /// **A generated document is a step's output, not an input**: with
+    /// `docs/dataset.md` named as generated, writing it changes nothing
+    /// for the finalize pass; a hand-written `docs/notes.md` does.
+    #[test]
+    fn generated_documents_are_not_inputs() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("dataset.yaml"), "name: t\nprofiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
+        std::fs::create_dir_all(ws.path().join("docs")).unwrap();
+        std::fs::write(ws.path().join("docs/dataset.md"), "# generated\n").unwrap();
+        let generated: std::collections::HashSet<String> = ["docs/dataset.md".to_string()].into_iter().collect();
+        let mut log = ProgressLog::new();
+        let opts = HashMap::new();
+        let inputs = log.finalize_inputs(ws.path(), &generated);
+        assert_eq!(inputs.len(), 1, "the generated reference is no input: {inputs:?}");
+        let recorded = log.build_provenance_with_inputs("generate-catalog", "catalog generate", &opts, &[], &inputs, "2.0.0+abc");
+        log.record_step("generate-catalog", rec(Some(recorded)));
+        log.steps.get_mut("generate-catalog").unwrap().completed_at = Utc::now() - chrono::Duration::seconds(60);
+        std::fs::write(ws.path().join("docs/dataset.md"), "# regenerated\n").unwrap();
+        assert!(log.definition_changed_after("generate-catalog", ws.path(), &generated).is_none(), "regenerating the reference changes nothing");
+        std::fs::write(ws.path().join("docs/notes.md"), "# hand-written\n").unwrap();
+        assert!(log.definition_changed_after("generate-catalog", ws.path(), &generated).is_some(), "a hand-written document is an input");
+        let inputs = log.finalize_inputs(ws.path(), &generated);
+        assert_eq!(inputs.len(), 2);
     }
 
     /// **The static payload is a finalize step's input, by content**: a
@@ -1807,31 +1833,32 @@ mod tests {
     /// times.
     #[test]
     fn the_static_payload_is_an_input_by_content() {
+        let none = std::collections::HashSet::new();
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("dataset.yaml"), "name: t\nprofiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
         let mut log = ProgressLog::new();
         let opts = HashMap::new();
-        let inputs = log.finalize_inputs(ws.path());
+        let inputs = log.finalize_inputs(ws.path(), &none);
         assert_eq!(inputs.len(), 1, "no payload yet: only the definition");
         let recorded = log.build_provenance_with_inputs("generate-merkle", "merkle create", &opts, &[], &inputs, "2.0.0+abc");
         log.record_step("generate-merkle", rec(Some(recorded)));
         log.steps.get_mut("generate-merkle").unwrap().completed_at = Utc::now() - chrono::Duration::seconds(60);
-        assert!(log.definition_changed_after("generate-merkle", ws.path()).is_none());
+        assert!(log.definition_changed_after("generate-merkle", ws.path(), &none).is_none());
 
         std::fs::write(ws.path().join("README.md"), "# t\n").unwrap();
-        assert!(log.definition_changed_after("generate-merkle", ws.path()).is_some(), "a README appeared after the record");
-        let inputs = log.finalize_inputs(ws.path());
+        assert!(log.definition_changed_after("generate-merkle", ws.path(), &none).is_some(), "a README appeared after the record");
+        let inputs = log.finalize_inputs(ws.path(), &none);
         assert_eq!(inputs.len(), 2);
         let current = log.build_provenance_with_inputs("generate-merkle", "merkle create", &opts, &[], &inputs, "2.0.0+abc");
         log.record_step("generate-merkle", rec(Some(current)));
-        assert!(log.definition_changed_after("generate-merkle", ws.path()).is_none(), "the record now holds the payload");
+        assert!(log.definition_changed_after("generate-merkle", ws.path(), &none).is_none(), "the record now holds the payload");
 
         std::fs::write(ws.path().join("README.md"), "# t\n").unwrap();
-        let inputs = log.finalize_inputs(ws.path());
+        let inputs = log.finalize_inputs(ws.path(), &none);
         let same = log.build_provenance_with_inputs("generate-merkle", "merkle create", &opts, &[], &inputs, "2.0.0+abc");
         assert!(log.check_provenance("generate-merkle", &same, ProvenanceFlags::CONFIG_ONLY).is_none(), "same bytes, fresh");
         std::fs::write(ws.path().join("README.md"), "# t\n\nEdited.\n").unwrap();
-        let inputs = log.finalize_inputs(ws.path());
+        let inputs = log.finalize_inputs(ws.path(), &none);
         let edited = log.build_provenance_with_inputs("generate-merkle", "merkle create", &opts, &[], &inputs, "2.0.0+abc");
         let reason = log.check_provenance("generate-merkle", &edited, ProvenanceFlags::CONFIG_ONLY).expect("stale");
         assert!(reason.contains(STATIC_PAYLOAD_INPUT), "{reason}");

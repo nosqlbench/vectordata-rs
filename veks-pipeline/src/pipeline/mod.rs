@@ -1374,6 +1374,7 @@ fn explain_staleness(
     // upstream re-ran exactly as currently configured — without the
     // walk touching the log itself.
     let mut graph = ctx.progress.provenance.clone();
+    let generated_docs = runner::step_outputs(steps, registry, ctx);
     let mut current_addresses: std::collections::HashMap<String, provenance::Address> =
         std::collections::HashMap::new();
     let mut fresh_count = 0usize;
@@ -1435,7 +1436,7 @@ fn explain_staleness(
             {
                 upstream.insert(provenance::DEFINITION_INPUT.to_string(), address);
             }
-            if let Ok(Some(node)) = provenance::ProvenanceNode::static_payload(&ctx.workspace)
+            if let Ok(Some(node)) = provenance::ProvenanceNode::static_payload(&ctx.workspace, &generated_docs)
                 && let Ok(address) = graph.insert(node)
             {
                 upstream.insert(provenance::STATIC_PAYLOAD_INPUT.to_string(), address);
