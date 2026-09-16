@@ -1626,6 +1626,7 @@ fn e2e_finalize_steps_run_after_compute() {
         "generate-variables-json",
         "generate-dataset-log-jsonl",
         "generate-docs",
+        "generate-docs-html",
         "generate-merkle",
         "generate-catalog",
     ];

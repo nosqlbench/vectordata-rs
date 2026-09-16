@@ -68,6 +68,7 @@ mod convert;
 pub mod compute_knn_stdarch;
 mod describe;
 pub mod describe_dataset;
+pub mod render_docs;
 pub mod fetch_bulkdl;
 pub mod fetch_dlhf;
 pub mod fetch_s2ag;
@@ -139,6 +140,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze compute-info", info_compute::factory);
     registry.register("analyze describe", describe::factory);
     registry.register("analyze describe-dataset", describe_dataset::factory);
+    registry.register("generate docs-html", render_docs::factory);
     registry.register("analyze file", info_file::factory);
     registry.register("analyze find", analyze_find::factory);
     registry.register("analyze find-duplicates", analyze_find_duplicates::factory);

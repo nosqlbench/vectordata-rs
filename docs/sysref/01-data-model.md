@@ -275,6 +275,7 @@ dataset-name/
 ├── dataset.json              # machine-readable metadata
 ├── variables.yaml            # pipeline-computed variables
 ├── catalog.json              # dataset index for catalog discovery
+├── docs/html/                # the Markdown documents rendered to self-contained HTML, mirrored
 └── *.mref                    # merkle hash files (per data file; never for a document)
 ```
 
@@ -467,6 +468,13 @@ check` refuses a dataset with no README, one that does not open with a
 `# <title>` heading, or one whose markers are still there. The file is
 never regenerated, so a run never overwrites what was written; a
 generated fact that changes belongs in `docs/`, and the README says
-what the facts mean. Static payload is an input of the finalize pass
-(§4.3), so adding or editing a README republishes the docs and the
-merkle tree on the next run.
+what the facts mean. The Markdown is the source of truth and is
+**projected to HTML** by the `generate docs-html` finalize step: every
+Markdown document — the README, the licence, everything under `docs/`
+— renders to a self-contained page under `docs/html/`, mirroring the
+tree from the dataset root (`README.md` → `docs/html/README.html`,
+`docs/x.md` → `docs/html/docs/x.html`), with links rewritten relative
+to each page so that hosted as plain objects the documentation still
+reads as pages. Static payload and every Markdown document are inputs
+of the finalize pass (§4.3), so adding or editing one re-renders and
+republishes on the next run.

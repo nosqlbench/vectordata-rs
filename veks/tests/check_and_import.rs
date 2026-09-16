@@ -1795,6 +1795,7 @@ fn import_full_pipeline_all_features() {
         "generate-variables-json",
         "generate-dataset-log-jsonl",
         "generate-docs",
+        "generate-docs-html",
         "generate-merkle",
         "generate-catalog",
     ];
@@ -1862,11 +1863,11 @@ fn import_full_pipeline_everything_disabled() {
     // scan-duplicates, generate-shuffle, extract-queries,
     // extract-base, count-base, compute-knn, verify-knn,
     // generate-dataset-json, generate-variables-json,
-    // generate-dataset-log-jsonl, generate-docs, generate-catalog,
-    // generate-merkle = 20
+    // generate-dataset-log-jsonl, generate-docs, generate-docs-html,
+    // generate-catalog, generate-merkle = 21
     // (scan-zeros + scan-duplicates are now mandatory — see above.)
-    assert_eq!(ids.len(), 20,
-        "minimal self-search pipeline should have 20 steps (incl. mandatory scan-zeros + scan-duplicates), got {}: {:?}",
+    assert_eq!(ids.len(), 21,
+        "minimal self-search pipeline should have 21 steps (incl. mandatory scan-zeros + scan-duplicates), got {}: {:?}",
         ids.len(), ids);
 }
 

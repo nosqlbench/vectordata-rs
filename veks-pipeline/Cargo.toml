@@ -31,6 +31,7 @@ embed-cuda = [
 
 [dependencies]
 byteorder = "1"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }

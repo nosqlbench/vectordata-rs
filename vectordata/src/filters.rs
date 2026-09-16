@@ -137,14 +137,15 @@ pub fn is_derived_sidecar(name: &str) -> bool {
     name.ends_with(".provenance.json") || name.ends_with(".mref") || name.ends_with(".mrkl")
 }
 
-/// A document: a Markdown file or an image, wherever it sits — a
-/// README, a LICENSE, the generated reference and the diagrams under
-/// `docs/`. Read whole by people, never ranged or chunked by a client;
+/// A document: a Markdown file, a rendered HTML page or an image,
+/// wherever it sits — a README, a LICENSE, the generated reference, the
+/// diagrams and the HTML mirror under `docs/`. Read whole by people,
+/// never ranged or chunked by a client;
 /// its integrity is the per-directory `SHA256SUMS`, and a merkle tree
 /// over it would be a sidecar for nothing.
 pub fn is_document(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    [".md", ".markdown", ".svg", ".png", ".jpg", ".jpeg", ".gif"].iter().any(|ext| lower.ends_with(ext))
+    [".md", ".markdown", ".html", ".htm", ".svg", ".png", ".jpg", ".jpeg", ".gif"].iter().any(|ext| lower.ends_with(ext))
 }
 
 /// Files that should not receive their own merkle coverage.
@@ -251,6 +252,7 @@ mod tests {
         assert!(is_merkle_exempt("README.md") && is_merkle_exempt("LICENSE.md") && is_merkle_exempt("dataset.MD"), "documents get no .mref");
         assert!(is_document("docs/exemplars.md".rsplit('/').next().unwrap()));
         assert!(is_document("assembly.png") && is_document("assembly.svg") && is_merkle_exempt("profiles.PNG"));
+        assert!(is_document("README.html") && is_merkle_exempt("index.htm"));
         assert!(!is_document("notes.txt") && !is_document("base.fvec"));
         // Excluded files — exempt
         assert!(is_merkle_exempt(".hidden"));
