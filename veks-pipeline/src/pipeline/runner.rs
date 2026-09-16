@@ -437,7 +437,7 @@ pub fn run_steps(
                 planned_outputs.insert(resolve_in(output_path, &ctx.workspace), step.id.clone());
                 planned_with_outputs.insert(step.id.clone());
             }
-            for produced in cmd.project_artifacts(&step.id, &options).outputs {
+            for produced in cmd.project_artifacts_in(&step.id, &options, &ctx.workspace).outputs {
                 planned_outputs.insert(resolve_in(&produced, &ctx.workspace), step.id.clone());
                 planned_with_outputs.insert(step.id.clone());
             }

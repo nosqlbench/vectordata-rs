@@ -209,6 +209,16 @@ pub trait CommandOp: Send {
     fn project_cache_claims(&self, _options: &Options, _cache: &std::path::Path, _workspace: &std::path::Path) -> Vec<CacheClaim> {
         vec![]
     }
+
+    /// [`project_artifacts`](Self::project_artifacts) told where the
+    /// dataset is. A command whose outputs follow from what a directory
+    /// holds — the pages rendered from a dataset's documents — must
+    /// look there and not in the process's working directory, so it
+    /// overrides this one; every other command's projection is the
+    /// same from anywhere, and the default delegates.
+    fn project_artifacts_in(&self, step_id: &str, options: &Options, _workspace: &std::path::Path) -> ArtifactManifest {
+        self.project_artifacts(step_id, options)
+    }
 }
 
 /// A claim a command lays on files under the cache directory, relative

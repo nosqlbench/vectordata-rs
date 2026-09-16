@@ -153,7 +153,7 @@ pub fn project_workspace(
             }
         }
 
-        let manifest = cmd.project_artifacts(&step_id, &options);
+        let manifest = cmd.project_artifacts_in(&step_id, &options, workspace);
         for claim in cmd.project_cache_claims(&options, &cache_dir, workspace) {
             if !cache_claims.contains(&claim) {
                 cache_claims.push(claim);

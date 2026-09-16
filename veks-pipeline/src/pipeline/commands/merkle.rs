@@ -770,12 +770,23 @@ byte ranges rather than requiring a full file re-download.
     }
 
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        self.project_artifacts_in(step_id, options, Path::new("."))
+    }
+
+    /// The trees follow from what the source directory holds, so the
+    /// projection reads it under the dataset directory the caller names;
+    /// read from elsewhere it enumerated the wrong tree and called the
+    /// dataset's own sidecars extraneous.
+    fn project_artifacts_in(&self, step_id: &str, options: &Options, workspace: &Path) -> ArtifactManifest {
         let source_str = options.get("source").unwrap_or(".");
         let min_size: u64 = options.get("min-size")
             .and_then(veks_core::paths::parse_size)
             .unwrap_or(100_000_000);
 
-        let source_path = PathBuf::from(source_str);
+        let source_path = {
+            let p = PathBuf::from(source_str);
+            if p.is_absolute() { p } else { workspace.join(p) }
+        };
 
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
