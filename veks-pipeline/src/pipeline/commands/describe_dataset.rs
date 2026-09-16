@@ -16,7 +16,7 @@ use vectordata::dataset::DatasetConfig;
 use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     ResourceDesc, Status, StreamContext, render_options_table,
 };
 
@@ -135,10 +135,12 @@ outputs from the explain commands for representative queries.
         }
 
         // ── Exemplars ───────────────────────────────────────────────
+        let mut produced = vec![output_path];
         if gen_exemplars {
             let exemplar_path = docs_dir.join("exemplars.md");
             ctx.ui.log("  generating exemplars.md...");
             let exemplar_doc = generate_exemplars(&config, &workspace, ctx);
+            produced.push(exemplar_path.clone());
             match std::fs::write(&exemplar_path, &exemplar_doc) {
                 Ok(()) => ctx.ui.log(&format!("  wrote {}", exemplar_path.display())),
                 Err(e) => ctx.ui.log(&format!("  WARNING: write exemplars.md: {}", e)),
@@ -148,8 +150,30 @@ outputs from the explain commands for representative queries.
         CommandResult {
             status: Status::Ok,
             message: format!("generated dataset.md for '{}'", config.name),
-            produced: vec![output_path],
+            produced,
             elapsed: start.elapsed(),
+        }
+    }
+
+    /// The documents this step writes: they are its outputs, so the
+    /// finalize pass never mistakes the regenerated reference for a
+    /// hand-written document (see `ProgressLog::finalize_inputs`).
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        let dir = PathBuf::from(options.get("directory").unwrap_or("."));
+        let rel = |name: &str| {
+            let p = dir.join("docs").join(name);
+            p.to_string_lossy().replace('\\', "/").trim_start_matches("./").to_string()
+        };
+        let mut outputs = vec![rel("dataset.md")];
+        if options.get("exemplars").map(|v| v == "true").unwrap_or(false) {
+            outputs.push(rel("exemplars.md"));
+        }
+        ArtifactManifest {
+            step_id: step_id.to_string(),
+            command: self.command_path().to_string(),
+            inputs: vec![],
+            outputs,
+            intermediates: vec![],
         }
     }
 
