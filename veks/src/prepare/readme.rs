@@ -9,8 +9,8 @@
 //! it is shared, what its profiles, tags and predicate sets are for,
 //! and what a representative query looks like. The generated
 //! `docs/dataset.md` is the reference; the README is the explanation.
-//! It is static payload: shipped, checksummed and merkled with the
-//! data, never regenerated, never cleaned.
+//! It is static payload: shipped and checksummed with the data, never
+//! merkled (no Markdown file is), never regenerated, never cleaned.
 //!
 //! The scaffold writes the standard sections with every fact the
 //! definition already holds filled in, and a fill-in marker where a

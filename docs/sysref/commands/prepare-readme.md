@@ -5,7 +5,8 @@ Write the dataset's `README.md` scaffold.
 `README.md` at the dataset root is how a dataset is documented
 (sysref §1, "Static payload"): the narrative a reader needs before the
 generated reference in `docs/dataset.md` makes sense. It ships with the
-data, is checksummed and merkled like any content, and is never
+data, is checksummed in the directory's `SHA256SUMS`, is never merkled
+(no Markdown file or image is), and is never
 regenerated or cleaned.
 
 ## Usage

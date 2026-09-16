@@ -275,14 +275,16 @@ dataset-name/
 ├── dataset.json              # machine-readable metadata
 ├── variables.yaml            # pipeline-computed variables
 ├── catalog.json              # dataset index for catalog discovery
-└── *.mref                    # merkle hash files (per data file)
+└── *.mref                    # merkle hash files (per data file; never for a document)
 ```
 
 ### File naming conventions
 
 - `_` prefix: source files excluded from publishing (e.g., `_source_base.fvecs`)
 - `IDXFOR__` prefix: offset index companion files (auto-generated, published)
-- `.mref`: merkle hash tree (one per data file, published)
+- `.mref`: merkle hash tree (one per data file, published; a document —
+  Markdown or an image — never has one; its integrity is the
+  directory's `SHA256SUMS`)
 - `.mrkl`: local merkle cache state (not published)
 
 ---
@@ -442,9 +444,10 @@ ship with the data and that no pipeline step produces: `LICENSE`,
 recognised by exact name at any level of the dataset. The
 classification lives in `vectordata::filters::is_static_payload` and
 every tool consults it: the files are publishable content, checksummed
-in `SHA256SUMS`, merkled by the blanket merkle step and uploaded with
-the data; `veks run --clean` keeps them; the extraneous-files check
-accepts them and their `.mref`; the pipeline-coverage check asks no
+in `SHA256SUMS`, merkled by the blanket merkle step unless they are
+documents (Markdown and images are never merkled) and uploaded with the data;
+`veks run --clean` keeps them; the extraneous-files check accepts them
+and, for one that is merkled, its `.mref`; the pipeline-coverage check asks no
 step to produce them; catalog staleness does not count them; and
 `analyze describe-dataset` links them from the generated docs under
 "License and Attribution", together with the `license`, `vendor` and

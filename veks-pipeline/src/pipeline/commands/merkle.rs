@@ -611,6 +611,22 @@ byte ranges rather than requiring a full file re-download.
         let mut skipped_fresh = 0usize;
         let mut total_bytes: u64 = 0;
 
+        // A sidecar of a file the rule now exempts — a document's, from
+        // before documents were exempt — is removed: it describes
+        // nothing a reader ranges over, and the check would call it
+        // extraneous.
+        if source_path.is_dir() {
+            for orphan in collect_exempt_sidecars(&source_path) {
+                match std::fs::remove_file(&orphan) {
+                    Ok(()) => ctx.ui.log(&format!(
+                        "  removed {} — its file is not merkled",
+                        orphan.strip_prefix(&ctx.workspace).unwrap_or(&orphan).display()
+                    )),
+                    Err(e) => ctx.ui.log(&format!("  could not remove {}: {e}", orphan.display())),
+                }
+            }
+        }
+
         // Outer progress: files
         let files_pb = ctx.ui.bar_with_unit(files.len() as u64, "files", "files");
         let mut files_done = 0u64;
@@ -1854,12 +1870,24 @@ fn format_bytes(bytes: u64) -> String {
 /// deterministic ordering.
 fn collect_eligible_files(dir: &Path, min_size: u64) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    collect_eligible_recursive(dir, min_size, &mut files);
+    let mut orphans = Vec::new();
+    collect_eligible_recursive(dir, min_size, &mut files, &mut orphans);
     files.sort();
     files
 }
 
-fn collect_eligible_recursive(dir: &Path, min_size: u64, files: &mut Vec<PathBuf>) {
+/// The `.mref` files under `dir` whose base file is merkle-exempt — a
+/// document's, an infrastructure file's — left by an earlier rule.
+/// They say nothing a reader uses and the step removes them.
+fn collect_exempt_sidecars(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut orphans = Vec::new();
+    collect_eligible_recursive(dir, 0, &mut files, &mut orphans);
+    orphans.sort();
+    orphans
+}
+
+fn collect_eligible_recursive(dir: &Path, min_size: u64, files: &mut Vec<PathBuf>, orphans: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -1871,8 +1899,15 @@ fn collect_eligible_recursive(dir: &Path, min_size: u64, files: &mut Vec<PathBuf
 
         if path.is_dir() {
             if veks_core::filters::is_excluded_dir(&name_str) { continue; }
-            collect_eligible_recursive(&path, min_size, files);
+            collect_eligible_recursive(&path, min_size, files, orphans);
         } else {
+            if let Some(base) = name_str.strip_suffix(".mref")
+                && veks_core::filters::is_merkle_exempt(base)
+                && !veks_core::filters::is_derived_sidecar(base)
+            {
+                orphans.push(path);
+                continue;
+            }
             if veks_core::filters::is_merkle_exempt(&name_str) { continue; }
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             if size >= min_size {

@@ -137,15 +137,26 @@ pub fn is_derived_sidecar(name: &str) -> bool {
     name.ends_with(".provenance.json") || name.ends_with(".mref") || name.ends_with(".mrkl")
 }
 
+/// A document: a Markdown file or an image, wherever it sits — a
+/// README, a LICENSE, the generated reference and the diagrams under
+/// `docs/`. Read whole by people, never ranged or chunked by a client;
+/// its integrity is the per-directory `SHA256SUMS`, and a merkle tree
+/// over it would be a sidecar for nothing.
+pub fn is_document(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".md", ".markdown", ".svg", ".png", ".jpg", ".jpeg", ".gif"].iter().any(|ext| lower.ends_with(ext))
+}
+
 /// Files that should not receive their own merkle coverage.
 ///
 /// Infrastructure files at the dataset root level (dataset.yaml, catalog
 /// files, variables.yaml) are too small to benefit from chunked merkle
-/// verification. Everything within `profiles/` gets coverage categorically.
-/// Derived sidecars (provenance/merkle) and excluded files are always exempt —
-/// merkle must not cover a provenance sidecar or another merkle file.
+/// verification, and documents (Markdown) are never merkled. Everything
+/// else within `profiles/` gets coverage categorically. Derived sidecars
+/// (provenance/merkle) and excluded files are always exempt — merkle
+/// must not cover a provenance sidecar or another merkle file.
 pub fn is_merkle_exempt(name: &str) -> bool {
-    is_infrastructure_file(name) || is_derived_sidecar(name) || is_excluded_file(name)
+    is_infrastructure_file(name) || is_document(name) || is_derived_sidecar(name) || is_excluded_file(name)
 }
 
 
@@ -166,14 +177,15 @@ mod tests {
     }
 
     /// Static payload is content — not excluded, not infrastructure,
-    /// merkled like any content — and exempt from catalog staleness.
+    /// merkled like any content unless it is a document — and exempt
+    /// from catalog staleness.
     #[test]
     fn static_payload_is_retained_content() {
         for name in ["LICENSE.md", "LICENSE", "NOTICE.md", "README.md", "CITATION.cff"] {
             assert!(is_static_payload(name), "{name}");
             assert!(!is_excluded_file(name), "{name} ships");
             assert!(!is_infrastructure_file(name), "{name} is content, not infrastructure");
-            assert!(!is_merkle_exempt(name), "{name} is merkled like any content");
+            assert_eq!(is_merkle_exempt(name), is_document(name), "{name}: merkled unless it is Markdown");
             assert!(is_catalog_staleness_exempt(name), "{name} does not date the catalog");
         }
         assert!(!is_static_payload("license.md"), "exact names only");
@@ -236,6 +248,10 @@ mod tests {
         assert!(is_merkle_exempt("base.fvec.mref"));
         assert!(is_merkle_exempt("data.mrkl"));
         assert!(is_merkle_exempt("base.fvec.provenance.json"), "provenance sidecars get no .mref");
+        assert!(is_merkle_exempt("README.md") && is_merkle_exempt("LICENSE.md") && is_merkle_exempt("dataset.MD"), "documents get no .mref");
+        assert!(is_document("docs/exemplars.md".rsplit('/').next().unwrap()));
+        assert!(is_document("assembly.png") && is_document("assembly.svg") && is_merkle_exempt("profiles.PNG"));
+        assert!(!is_document("notes.txt") && !is_document("base.fvec"));
         // Excluded files — exempt
         assert!(is_merkle_exempt(".hidden"));
         assert!(is_merkle_exempt("data.tmp"));

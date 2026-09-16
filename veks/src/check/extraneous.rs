@@ -277,11 +277,12 @@ fn is_accounted(rel: &str, filename: &str, accounted: &HashSet<String>) -> bool 
         return true;
     }
     // Static payload — a license, a notice, a readme placed by hand —
-    // and its merkle reference.
+    // and its merkle reference when it may have one (a document never
+    // does: its `.mref` is a leftover and is reported).
     if vectordata::filters::is_static_payload(filename)
         || filename
             .strip_suffix(".mref")
-            .is_some_and(vectordata::filters::is_static_payload)
+            .is_some_and(|b| vectordata::filters::is_static_payload(b) && !vectordata::filters::is_merkle_exempt(b))
     {
         return true;
     }
@@ -290,9 +291,10 @@ fn is_accounted(rel: &str, filename: &str, accounted: &HashSet<String>) -> bool 
         Some(d) => format!("{}/{}", d, name),
         None => name.to_string(),
     };
-    // A .mref of an accounted file.
+    // A .mref of an accounted file that is merkled at all.
     if let Some(base) = rel.strip_suffix(".mref")
         && accounted.contains(base)
+        && !vectordata::filters::is_merkle_exempt(filename.strip_suffix(".mref").unwrap_or(filename))
     {
         return true;
     }
@@ -361,7 +363,8 @@ mod tests {
     fn static_payload_is_accounted_for() {
         let accounted: HashSet<String> = HashSet::new();
         assert!(is_accounted("LICENSE.md", "LICENSE.md", &accounted));
-        assert!(is_accounted("LICENSE.md.mref", "LICENSE.md.mref", &accounted));
+        assert!(!is_accounted("LICENSE.md.mref", "LICENSE.md.mref", &accounted), "a document is never merkled; its .mref is a leftover");
+        assert!(is_accounted("CITATION.cff.mref", "CITATION.cff.mref", &accounted));
         assert!(is_accounted("docs/NOTICE.md", "NOTICE.md", &accounted));
         assert!(!is_accounted("license-draft.md", "license-draft.md", &accounted));
     }

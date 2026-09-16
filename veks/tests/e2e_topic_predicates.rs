@@ -511,7 +511,8 @@ fn e2e_topic_stratified_predicates() {
     std::fs::write(dataset.join("README.md"), scaffold.replace("<!-- veks: fill in -->", "Written.")).unwrap();
     let (ok, log) = run_pipeline(&dataset_yaml);
     assert!(ok, "fourth run failed:\n{log}");
-    assert!(dataset.join("README.md.mref").exists(), "the README makes the finalize pass stale and is merkled like content:\n{log}");
+    assert!(!dataset.join("README.md.mref").exists(), "a document is never merkled");
+    // The README made the finalize pass stale: the reference now links it.
     let docs = std::fs::read_to_string(dataset.join("docs/dataset.md")).unwrap();
     assert!(docs.contains("[`README.md`](../README.md)"), "the generated reference links the README:\n{docs}");
     // The dataset's own checks pass (merkle included, since the run finished).
@@ -519,7 +520,7 @@ fn e2e_topic_stratified_predicates() {
     let text = String::from_utf8_lossy(&check.stdout).to_string() + &String::from_utf8_lossy(&check.stderr);
     assert!(check.status.success(), "veks check failed:\n{text}");
     assert!(dataset.join("LICENSE.md").exists(), "static payload was removed");
-    assert!(dataset.join("LICENSE.md.mref").exists(), "static payload is merkled like content");
+    assert!(!dataset.join("LICENSE.md.mref").exists(), "a document, static payload or not, is never merkled");
     let docs = std::fs::read_to_string(dataset.join("docs/dataset.md")).unwrap();
     assert!(docs.contains("## License and Attribution"), "{docs}");
     assert!(docs.contains("[`LICENSE.md`](../LICENSE.md)"), "{docs}");
