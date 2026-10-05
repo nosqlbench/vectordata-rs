@@ -9,7 +9,7 @@ description = "vectordata endpoint daemon — an AAA gateway in front of object 
 license = "Apache-2.0"
 homepage = "https://github.com/nosqlbench/vectordata-rs"
 repository = "https://github.com/nosqlbench/vectordata-rs"
-readme = "../README.md"
+readme = "../../README.md"
 keywords = ["vector", "dataset", "object-storage", "gateway", "rbac"]
 categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
 

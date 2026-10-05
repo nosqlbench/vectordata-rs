@@ -172,6 +172,34 @@ mod packaging_tests {
             .collect()
     }
 
+    /// **Every manifest's `readme` names a file that exists.**
+    ///
+    /// `cargo publish` refuses a package whose readme path is dangling,
+    /// and a relative path breaks silently when a crate moves: the
+    /// crates/ restructuring left two of them pointing at a nonexistent
+    /// `crates/README.md` until a release tripped over it.
+    #[test]
+    fn every_readme_path_resolves() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates = std::fs::read_dir(root.join("crates")).expect("crates/");
+        for dir in crates.flatten().map(|e| e.path()).filter(|p| p.join("Cargo.toml").is_file()) {
+            let toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+            let package = toml.split("\n[").next().unwrap_or(&toml);
+            let Some(line) = package.lines().find(|l| l.trim_start().starts_with("readme")) else {
+                continue;
+            };
+            let value = line.split('=').nth(1).unwrap().trim().trim_matches('"');
+            if value == "false" {
+                continue;
+            }
+            assert!(
+                dir.join(value).is_file(),
+                "{}: readme = \"{value}\" does not exist",
+                dir.join("Cargo.toml").display()
+            );
+        }
+    }
+
     /// **The default build compiles no native SIMD or BLAS code (SRD SK-1).**
     ///
     /// Every such dependency is optional in every manifest that names
