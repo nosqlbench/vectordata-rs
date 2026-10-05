@@ -456,19 +456,24 @@ mod tests {
         // The tree ahead of the bitset is intact.
         assert_eq!(on_disk.hashes, a.hashes);
 
+        // Every platform checkpoints bit 7; Linux also measures how many
+        // bytes that wrote (the rest of the test relies on the bit).
+        #[cfg(target_os = "linux")]
+        let wchar = || -> u64 {
+            std::fs::read_to_string("/proc/thread-self/io").unwrap()
+                .lines().find_map(|l| l.strip_prefix("wchar:"))
+                .and_then(|v| v.trim().parse().ok()).unwrap()
+        };
+        #[cfg(target_os = "linux")]
+        let before = wchar();
+        a.mark_valid(7);
+        a.checkpoint(&path).unwrap();
         #[cfg(target_os = "linux")]
         {
-            let wchar = || -> u64 {
-                std::fs::read_to_string("/proc/thread-self/io").unwrap()
-                    .lines().find_map(|l| l.strip_prefix("wchar:"))
-                    .and_then(|v| v.trim().parse().ok()).unwrap()
-            };
-            let before = wchar();
-            a.mark_valid(7);
-            a.checkpoint(&path).unwrap();
             let written = wchar() - before;
             assert!(written <= 4096, "checkpoint wrote {written} bytes; it must write the bitset, not the tree");
         }
+        assert!(MerkleState::load(&path).unwrap().is_valid(7));
 
         // Without a file, or with a foreign layout, it is a full save.
         std::fs::remove_file(&path).unwrap();

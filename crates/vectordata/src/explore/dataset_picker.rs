@@ -4563,9 +4563,11 @@ mod tests {
         };
 
         let one = super::purge_cache_for_profiles(&entry, &["10m".to_string()], &cache);
-        let removed: Vec<String> = one.removed.iter().map(|p| p.display().to_string()).collect();
+        // `Path::ends_with` compares components, so the expected suffix
+        // matches whatever separator the platform writes.
+        let removed = &one.removed;
         assert!(removed.iter().any(|p| p.ends_with("profiles/10m/gt.ivecs")), "{removed:?}");
-        assert!(removed.iter().any(|p| p.ends_with("gt.ivecs.mrkl")), "the sidecar goes with its leaf");
+        assert!(removed.iter().any(|p| p.ends_with("profiles/10m/gt.ivecs.mrkl")), "the sidecar goes with its leaf");
         assert!(ds.join("base.fvecs").exists(), "the shared base survives");
         assert!(ds.join("base.fvecs.mrkl").exists());
         assert!(
