@@ -1,7 +1,7 @@
 # 13. Incremental Metadata Survey
 
 **Status:** LANDED. All 11 build-plan steps from §13.13 are
-implemented under `veks-pipeline/src/pipeline/commands/survey/`. The
+implemented under `crates/veks-pipeline/src/pipeline/commands/survey/`. The
 single-pass legacy survey command was removed; `analyze survey`
 now refers exclusively to the two-pass type-driven orchestrator
 specified by this document. Downstream consumers
@@ -932,7 +932,7 @@ pub fn survey(
 ## 13.10 Implementation Sketch (proposed module layout)
 
 ```
-veks-pipeline/src/pipeline/commands/survey/
+crates/veks-pipeline/src/pipeline/commands/survey/
 ├── mod.rs                      // SurveyOp CommandOp + factory
 ├── orchestrator.rs             // two-pass driver, sampling, pair dispatch
 ├── exploration.rs              // ExplorationProbe + state machine
@@ -1010,7 +1010,7 @@ findings report**.
 
 The survey is a `CommandOp` like every other pipeline command — it
 receives a `ResourceGovernor` from `StreamContext.governor`
-(`veks-pipeline/src/pipeline/resource.rs:1406`) and obeys the same
+(`crates/veks-pipeline/src/pipeline/resource.rs:1406`) and obeys the same
 contract every other command does:
 
 - **Read effective values** at each batch boundary via
@@ -1073,7 +1073,7 @@ budget reserved against the larger Pass 2 budget (e.g. Pass 1 gets
 
 ### 13.11.3 Progress and Status Indicators
 
-The survey uses the standard `UiHandle` pipeline (`veks-core/src/ui`)
+The survey uses the standard `UiHandle` pipeline (`crates/veks-core/src/ui`)
 so its output integrates with every other command's progress shell —
 plain terminal, ratatui TUI, headless log, all work the same.
 

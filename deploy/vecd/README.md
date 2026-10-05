@@ -11,7 +11,7 @@ Install from the workspace, or grab a static binary from a tagged release
 (`*-unknown-linux-musl` runs anywhere):
 
 ```bash
-cargo install --path vecd          # from a checkout
+cargo install --path crates/vecd          # from a checkout
 # or: download vecd from the GitHub release for your target
 ```
 

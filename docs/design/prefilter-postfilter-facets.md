@@ -157,7 +157,7 @@ profiles:
 ## 4. Relationship to the current implementation
 
 Today's `compute filtered-knn`, by code inspection of
-`veks-pipeline/src/pipeline/commands/compute_prefiltered_knn.rs` (in
+`crates/veks-pipeline/src/pipeline/commands/compute_prefiltered_knn.rs` (in
 particular `find_top_k_filtered_*` and the per-partition compute
 loops), iterates the predicate-matching ordinals for each query,
 computes distances, and keeps a top-K heap — i.e., the algorithm
@@ -288,7 +288,7 @@ Update the facet→path resolution table to recognise both the canonical
 `prefiltered_*` / `postfiltered_*` keys and the legacy `filtered_*`
 fallback (legacy → F).
 
-### 6.5 `command_facet()` in `vectordata/src/dataset/expansion.rs`
+### 6.5 `command_facet()` in `crates/vectordata/src/dataset/expansion.rs`
 
 ```rust
 "compute prefiltered-knn"
@@ -313,29 +313,29 @@ update each requires.
 
 | File                                                              | Update                                          |
 |-------------------------------------------------------------------|-------------------------------------------------|
-| `veks-pipeline/src/pipeline/commands/inspect_filtered_knn.rs`     | Single bimodal command. Auto-detects which of F and E the active profile carries; reports per-facet histogram, exemplars, and rank-shift stats for each present facet. Optional `--mode F|E|both` flag forces selection. When both are present the output juxtaposes them so the user can read the post-filter sparsity against the pre-filter full-K result. The current intersection-with-G analysis is literally the E-definition computation (`G ∩ R`), so for any profile that does not yet carry an E facet on disk the analyze command can preview E from G+R directly — no need to run `compute postfiltered-knn` first. |
-| `veks-pipeline/src/pipeline/commands/verify_consolidated.rs`      | Split into prefilter and postfilter verifiers. |
-| `veks-pipeline/src/pipeline/commands/describe_dataset.rs`         | Enumerate both E and F when present.           |
-| `veks-pipeline/src/pipeline/commands/inspect_partition.rs`        | Oracle-partition profiles need to declare which of F/E they carry. Partition profiles are derived from default; if default has both, partitions can carry both, but post-filter inside a partition is degenerate (every base vector passes by construction). For partitions, **F only** by default; E at partition scope is the same data as F. |
-| `veks-pipeline/src/pipeline/dataset_lookup.rs`                    | `CommandType` enum gets `PrefilteredKnnConsolidated` and `PostfilteredKnnConsolidated`. |
-| `veks/src/prepare/wizard.rs`                                      | New role variants `PrefilteredNeighborIndices`/`Distances`. Wizard prompts add detection patterns for `prefiltered_*` files. |
-| `veks/src/prepare/import.rs`                                      | Pipeline scaffolding emits both producers (and both verifiers). |
-| `veks/src/prepare/infer_manifest.rs`                              | File-pattern inference recognises `prefiltered_neighbor_*` and updated `filtered_neighbor_*` semantics. |
-| `veks/src/prepare/stratify.rs`                                    | Partition-profile construction honours the new pairing (see partition note above). |
-| `vectordata/src/explore/dataset_picker.rs`                        | TUI lists both facets when present. |
-| `tools/src/bin/gen_swimlane.rs`                                   | Re-label F (pre-filter) to make the semantic explicit and add an E (post-filter, G ∩ R) column. Today's F tooltip already describes pre-filtering — keep it on F and add a new tooltip for E that describes G ∩ R. |
+| `crates/veks-pipeline/src/pipeline/commands/inspect_filtered_knn.rs`     | Single bimodal command. Auto-detects which of F and E the active profile carries; reports per-facet histogram, exemplars, and rank-shift stats for each present facet. Optional `--mode F|E|both` flag forces selection. When both are present the output juxtaposes them so the user can read the post-filter sparsity against the pre-filter full-K result. The current intersection-with-G analysis is literally the E-definition computation (`G ∩ R`), so for any profile that does not yet carry an E facet on disk the analyze command can preview E from G+R directly — no need to run `compute postfiltered-knn` first. |
+| `crates/veks-pipeline/src/pipeline/commands/verify_consolidated.rs`      | Split into prefilter and postfilter verifiers. |
+| `crates/veks-pipeline/src/pipeline/commands/describe_dataset.rs`         | Enumerate both E and F when present.           |
+| `crates/veks-pipeline/src/pipeline/commands/inspect_partition.rs`        | Oracle-partition profiles need to declare which of F/E they carry. Partition profiles are derived from default; if default has both, partitions can carry both, but post-filter inside a partition is degenerate (every base vector passes by construction). For partitions, **F only** by default; E at partition scope is the same data as F. |
+| `crates/veks-pipeline/src/pipeline/dataset_lookup.rs`                    | `CommandType` enum gets `PrefilteredKnnConsolidated` and `PostfilteredKnnConsolidated`. |
+| `crates/veks/src/prepare/wizard.rs`                                      | New role variants `PrefilteredNeighborIndices`/`Distances`. Wizard prompts add detection patterns for `prefiltered_*` files. |
+| `crates/veks/src/prepare/import.rs`                                      | Pipeline scaffolding emits both producers (and both verifiers). |
+| `crates/veks/src/prepare/infer_manifest.rs`                              | File-pattern inference recognises `prefiltered_neighbor_*` and updated `filtered_neighbor_*` semantics. |
+| `crates/veks/src/prepare/stratify.rs`                                    | Partition-profile construction honours the new pairing (see partition note above). |
+| `crates/vectordata/src/explore/dataset_picker.rs`                        | TUI lists both facets when present. |
+| `crates/tools/src/bin/gen_swimlane.rs`                                   | Re-label F (pre-filter) to make the semantic explicit and add an E (post-filter, G ∩ R) column. Today's F tooltip already describes pre-filtering — keep it on F and add a new tooltip for E that describes G ∩ R. |
 
 ### 7.2 Schema only (variants/keys)
 
 | File                                                              |
 |-------------------------------------------------------------------|
-| `vectordata/src/dataset/facet.rs`                                 |
-| `veks-core/src/formats/facet.rs`                                  |
-| `vectordata/src/model.rs`                                         |
-| `vectordata/src/dataset/profile.rs`                               |
-| `vectordata/src/view.rs`                                          |
-| `vectordata/src/knn_entries.rs`                                   |
-| `vectordata/src/dataset/expansion.rs` (`command_facet`)           |
+| `crates/vectordata/src/dataset/facet.rs`                                 |
+| `crates/veks-core/src/formats/facet.rs`                                  |
+| `crates/vectordata/src/model.rs`                                         |
+| `crates/vectordata/src/dataset/profile.rs`                               |
+| `crates/vectordata/src/view.rs`                                          |
+| `crates/vectordata/src/knn_entries.rs`                                   |
+| `crates/vectordata/src/dataset/expansion.rs` (`command_facet`)           |
 
 ### 7.3 Docs
 
@@ -360,9 +360,9 @@ update each requires.
 
 | File                                                              | Update                                      |
 |-------------------------------------------------------------------|---------------------------------------------|
-| `veks/tests/fixtures/synthetic-1k/dataset.yaml`                   | Add E facet entries.                        |
-| `veks/tests/e2e_pipeline.rs`                                      | Include both `compute prefiltered-knn` and `compute postfiltered-knn`; assert |F| ≤ K and |E| = K when matching ≥ K. |
-| `veks/tests/check_and_import.rs`                                  | Detection covers E.                         |
+| `crates/veks/tests/fixtures/synthetic-1k/dataset.yaml`                   | Add E facet entries.                        |
+| `crates/veks/tests/e2e_pipeline.rs`                                      | Include both `compute prefiltered-knn` and `compute postfiltered-knn`; assert |F| ≤ K and |E| = K when matching ≥ K. |
+| `crates/veks/tests/check_and_import.rs`                                  | Detection covers E.                         |
 | New: integration test asserting `F == G ∩ R` byte-for-byte.       |                                             |
 | New: integration test asserting `E == top_K(B|R) by distance` against a reference scan. |                  |
 

@@ -152,7 +152,7 @@ buffer's budget.
 
 "Step 1: Scan ivec for this partition's entries" in
 `sorted_index_extract_{fvec,mvec,slab}`
-(`veks-pipeline/src/pipeline/commands/gen_extract.rs`).
+(`crates/veks-pipeline/src/pipeline/commands/gen_extract.rs`).
 
 Next: [03-linearize.md](./03-linearize.md) — sorting the plan into
 source order.

@@ -65,6 +65,6 @@ most expensive slab rewrites resumable at segment granularity.
 `total_written` bookkeeping and final truncate in
 `sorted_index_extract_fvec`, and the cache replay/persist blocks in
 `sorted_index_extract_slab`
-(`veks-pipeline/src/pipeline/commands/gen_extract.rs`).
+(`crates/veks-pipeline/src/pipeline/commands/gen_extract.rs`).
 
 Back to the overview: [README.md](./README.md).

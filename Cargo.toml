@@ -5,7 +5,7 @@
 # install over it — plus the veks / vecd / slab personalities dispatched
 # by first argument or argv0 symlink. Each personality's shell lives in
 # its own crate's `shell` module and the member binaries remain the
-# canonical standalone installs (`cargo install --path veks`, …).
+# canonical standalone installs (`cargo install --path crates/veks`, …).
 #
 # NOTE: this package's bins intentionally share the names `vectordata`
 # and `veks` with the crates of the same name (superset relationship).
@@ -60,13 +60,13 @@ name = "veks"
 path = "src/main.rs"
 
 [dependencies]
-slabtastic = { path = "slabtastic", version = "1.0.0" }
-vecd = { path = "vecd", version = "2.0.0" }
-vectordata = { path = "vectordata", version = "2.0.0", features = ["cli"] }
-veks = { path = "veks", version = "2.0.0", default-features = false }
+slabtastic = { path = "crates/slabtastic", version = "1.0.0" }
+vecd = { path = "crates/vecd", version = "2.0.0" }
+vectordata = { path = "crates/vectordata", version = "2.0.0", features = ["cli"] }
+veks = { path = "crates/veks", version = "2.0.0", default-features = false }
 
 # Mirror veks's feature surface so `cargo install --path .` gets the same
-# default personality as `cargo install --path veks` (knnutils is veks's
+# default personality as `cargo install --path crates/veks` (knnutils is veks's
 # default because bootstrap emits `compute knn-blas`).
 [features]
 default = ["knnutils"]
@@ -80,18 +80,18 @@ workspace = true
 
 [workspace]
 members = [
-    "vectordata",
-    "veks-anode",
-    "veks-core",
-    "veks-pipeline",
-    "veks-completion",
-    "veks-completion-derive",
-    "veks",
-    "vecd",
-    "slabtastic",
-    "veks-io",
-    "tools",
-    "veks-studies",
+    "crates/vectordata",
+    "crates/veks-anode",
+    "crates/veks-core",
+    "crates/veks-pipeline",
+    "crates/veks-completion",
+    "crates/veks-completion-derive",
+    "crates/veks",
+    "crates/vecd",
+    "crates/slabtastic",
+    "crates/veks-io",
+    "crates/tools",
+    "crates/veks-studies",
 ]
 # Preserve the virtual-workspace default: bare `cargo build`/`cargo test`
 # at the root covers the shipping members — and NOT the root package,
@@ -113,17 +113,17 @@ members = [
 # off-by-default `heavy-tests` feature, which makes the exclusion hold
 # however the build is invoked.
 default-members = [
-    "vectordata",
-    "veks-anode",
-    "veks-core",
-    "veks-pipeline",
-    "veks-completion",
-    "veks-completion-derive",
-    "veks",
-    "vecd",
-    "slabtastic",
-    "veks-io",
-    "tools",
+    "crates/vectordata",
+    "crates/veks-anode",
+    "crates/veks-core",
+    "crates/veks-pipeline",
+    "crates/veks-completion",
+    "crates/veks-completion-derive",
+    "crates/veks",
+    "crates/vecd",
+    "crates/slabtastic",
+    "crates/veks-io",
+    "crates/tools",
 ]
 resolver = "3"
 

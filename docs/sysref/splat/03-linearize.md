@@ -70,7 +70,7 @@ to re-sort by *output* position later — see
 
 "Step 2: Sort by source position" in `sorted_index_extract_mvec`, the
 `is_sorted` check in `sorted_index_extract_fvec`
-(`veks-pipeline/src/pipeline/commands/gen_extract.rs`).
+(`crates/veks-pipeline/src/pipeline/commands/gen_extract.rs`).
 
 Next: [04-assemble.md](./04-assemble.md) — sequential gather, in-RAM
 scatter.

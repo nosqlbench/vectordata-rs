@@ -26,7 +26,7 @@ the variant for them.
 ## Storage
 
 ```rust
-// vectordata/src/storage.rs — pub(crate)
+// crates/vectordata/src/storage.rs — pub(crate)
 
 pub(crate) enum Storage {
     Mmap(memmap2::Mmap),
@@ -64,7 +64,7 @@ promotion.
 ## Shape adapters
 
 ```rust
-// vectordata/src/io.rs
+// crates/vectordata/src/io.rs
 
 pub struct XvecReader<T> {
     storage: Arc<Storage>,
@@ -81,7 +81,7 @@ pub struct IndexedVvecReader<T> {
     _phantom: PhantomData<T>,
 }
 
-// vectordata/src/typed_access.rs
+// crates/vectordata/src/typed_access.rs
 
 pub struct TypedReader<T: TypedElement> {
     storage: Arc<Storage>,

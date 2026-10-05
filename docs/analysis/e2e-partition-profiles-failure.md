@@ -75,7 +75,7 @@ profiles/default/metadata_indices.ivvecs
 | directory | `profiles/default/` | dataset root |
 | extension | `.ivecs` (plural) | `.ivec` (singular) |
 
-**Where the bug is** — `veks/src/prepare/import.rs`, the
+**Where the bug is** — `crates/veks/src/prepare/import.rs`, the
 `compute-postfiltered-knn` step (≈ lines 1982–2021):
 
 ```rust
@@ -139,7 +139,7 @@ step 'verify-postfiltered-knn' failed: verify postfiltered-knn-consolidated:
 
 **Where it comes from** — the verifier
 (`PostfilteredKnnConsolidated`) declares its anchor inputs in
-`veks-pipeline/src/pipeline/dataset_lookup.rs` (≈ lines 219–222):
+`crates/veks-pipeline/src/pipeline/dataset_lookup.rs` (≈ lines 219–222):
 
 ```rust
 Self::PostfilteredKnnConsolidated => &[
@@ -208,7 +208,7 @@ steps bypassed it. Both layers are fixed by routing through it:
   (and `ground-truth-distances` → `"neighbor_distances"` when a distances
   output is requested); mark the `ground-truth` schema option
   `required: false` so facet fallback is allowed (mirroring `verify_*`).
-- `veks/src/prepare/import.rs`: stop hardcoding `ground-truth` /
+- `crates/veks/src/prepare/import.rs`: stop hardcoding `ground-truth` /
   `ground-truth-distances` on the step — the command resolves them
   per-profile (correct path **and** extension tolerance for extant
   datasets).

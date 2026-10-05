@@ -48,7 +48,7 @@ Build them from the workspace root:
 cargo build -p vecd -p veks -p vectordata --bins
 ```
 
-…or `cargo install --path vecd` (and `veks`, `vectordata`) to put them on your
+…or `cargo install --path crates/vecd` (and `veks`, `vectordata`) to put them on your
 `PATH`. The shell setup below prepends the workspace `target/` dirs to `PATH`,
 so a plain `cargo build` is enough; installed copies win if present.
 

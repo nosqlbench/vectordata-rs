@@ -170,7 +170,7 @@ upstream:
     # ... (add KNN, metadata, predicates as needed)
 ```
 
-See `veks/tests/fixtures/synthetic-1k/dataset.yaml` for a complete
+See `crates/veks/tests/fixtures/synthetic-1k/dataset.yaml` for a complete
 example with all BQGDMPRF facets.
 
 ---

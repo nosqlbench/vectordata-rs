@@ -50,9 +50,9 @@ Get the binaries (or build from the workspace — `cargo build -p vecd -p veks -
 vectordata --bins`):
 
 ```bash
-cargo install --path vecd
-cargo install --path veks
-cargo install --path vectordata
+cargo install --path crates/vecd
+cargo install --path crates/veks
+cargo install --path crates/vectordata
 ```
 
 Stand up a local server and publish a dataset anyone on the box can read:

@@ -199,15 +199,15 @@ numpy reference).
 
 | Engine          | Kernel | Source |
 |-----------------|--------|--------|
-| `knn-metal`     | SimSIMD (AVX-512 / AVX2 / NEON, hardware-dispatched) | [`compute_knn.rs`](../../veks-pipeline/src/pipeline/commands/compute_knn.rs) |
-| `knn-stdarch`   | Pure `std::arch` SIMD, zero deps | [`compute_knn_stdarch.rs`](../../veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs) |
-| `knn-blas`      | `cblas_sgemm` (MKL or OpenBLAS) | [`compute_knn_blas.rs`](../../veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) |
-| `knn-faiss`     | FAISS `IndexFlat` brute force | [`compute_knn_faiss.rs`](../../veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) |
+| `knn-metal`     | SimSIMD (AVX-512 / AVX2 / NEON, hardware-dispatched) | [`compute_knn.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn.rs) |
+| `knn-stdarch`   | Pure `std::arch` SIMD, zero deps | [`compute_knn_stdarch.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs) |
+| `knn-blas`      | `cblas_sgemm` (MKL or OpenBLAS) | [`compute_knn_blas.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) |
+| `knn-faiss`     | FAISS `IndexFlat` brute force | [`compute_knn_faiss.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) |
 
 ### Comparison model
 
 Each query's KNN result is classified into one of four buckets by
-[`knn_compare::compare_query_ordinals`](../../veks-pipeline/src/pipeline/commands/knn_compare.rs):
+[`knn_compare::compare_query_ordinals`](../../crates/veks-pipeline/src/pipeline/commands/knn_compare.rs):
 
 | `QueryResult`           | Meaning |
 |-------------------------|---------|
@@ -443,15 +443,15 @@ on pathological fixtures.
 ### Tests and commands
 
 In-tree unit tests:
-- [`test_stdarch_matches_metal`](../../veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs)
+- [`test_stdarch_matches_metal`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs)
   — asserts `diff == 0` (stdarch ≡ metal bit-identical across every
   dim/distribution/seed).
-- [`test_knn_faiss_matches_compute_knn`](../../veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs)
+- [`test_knn_faiss_matches_compute_knn`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs)
   — asserts `diff == 0` at dim=8 (post-rerank, the FAISS and metal
   outputs share an identical canonical ranking).
-- [`test_metal_cache_reuse`](../../veks-pipeline/src/pipeline/commands/compute_knn.rs),
-  [`test_stdarch_cache_reuse`](../../veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs),
-  [`test_blas_cache_reuse`](../../veks-pipeline/src/pipeline/commands/compute_knn_blas.rs)
+- [`test_metal_cache_reuse`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn.rs),
+  [`test_stdarch_cache_reuse`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs),
+  [`test_blas_cache_reuse`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs)
   — assert each engine's segment cache filenames carry the
   engine-specific `ENGINE_NAME` prefix and that a second run hits
   the cache.
@@ -513,7 +513,7 @@ The slack exists for two known degenerate regimes:
   doesn't have a well-defined top-k".
 
 Tests for the classifier itself live in
-[`knn_compare.rs`](../../veks-pipeline/src/pipeline/commands/knn_compare.rs):
+[`knn_compare.rs`](../../crates/veks-pipeline/src/pipeline/commands/knn_compare.rs):
 `test_exact_match`, `test_set_match`, `test_boundary_mismatch`,
 `test_boundary_at_threshold`, `test_real_mismatch`.
 
@@ -525,15 +525,15 @@ reference (or another engine) within `BoundaryMismatch` tolerance.
 
 | Test | What it asserts |
 |------|------------------|
-| [`test_knn_faiss_matches_compute_knn`](../../veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) | FAISS results (L2, k=5, dim=8, 100 base × 10 queries) match the SimSIMD `compute knn` reference — sets differ by at most 2 boundary swaps. |
-| [`test_stdarch_matches_metal`](../../veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs) | Pure-`std::arch` kernel matches the SimSIMD `compute knn` reference under the same fixture and same boundary threshold. |
-| [`test_knn_blas_ip_known_neighbors`](../../veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) / [`test_knn_blas_l2`](../../veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) / [`test_knn_blas_multiple_queries`](../../veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) | The BLAS sgemm kernel returns the analytically-correct nearest neighbors for IP and L2 metrics on hand-built fixtures with known answers. |
-| [`test_knn_faiss_ip_known_neighbors`](../../veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) / [`test_knn_faiss_l2`](../../veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) | FAISS returns the same hand-built ground truth — establishes FAISS itself as a trustworthy reference under our test harness. |
+| [`test_knn_faiss_matches_compute_knn`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) | FAISS results (L2, k=5, dim=8, 100 base × 10 queries) match the SimSIMD `compute knn` reference — sets differ by at most 2 boundary swaps. |
+| [`test_stdarch_matches_metal`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs) | Pure-`std::arch` kernel matches the SimSIMD `compute knn` reference under the same fixture and same boundary threshold. |
+| [`test_knn_blas_ip_known_neighbors`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) / [`test_knn_blas_l2`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) / [`test_knn_blas_multiple_queries`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) | The BLAS sgemm kernel returns the analytically-correct nearest neighbors for IP and L2 metrics on hand-built fixtures with known answers. |
+| [`test_knn_faiss_ip_known_neighbors`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) / [`test_knn_faiss_l2`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) | FAISS returns the same hand-built ground truth — establishes FAISS itself as a trustworthy reference under our test harness. |
 
 ### Pipeline-level verification — `verify dataset-knnutils`
 
 The pipeline command
-[`verify dataset-knnutils`](../../veks-pipeline/src/pipeline/commands/verify_dataset_knnutils.rs)
+[`verify dataset-knnutils`](../../crates/veks-pipeline/src/pipeline/commands/verify_dataset_knnutils.rs)
 re-runs FAISS brute force on a sampled subset of queries against a
 published dataset and compares the recomputed neighbor sets against
 the dataset's stored ground truth, using the same
@@ -543,7 +543,7 @@ personality runs this check before publication.
 
 Tests for the verification scaffolding (positive and negative
 cases) live in
-[`verify_dataset_knnutils.rs`](../../veks-pipeline/src/pipeline/commands/verify_dataset_knnutils.rs):
+[`verify_dataset_knnutils.rs`](../../crates/veks-pipeline/src/pipeline/commands/verify_dataset_knnutils.rs):
 `test_verify_valid_dataset`, `test_verify_dimension_mismatch`,
 `test_verify_detects_duplicate_ordinals`.
 
@@ -641,7 +641,7 @@ scale, or curse-of-dimensionality fixtures).
 
 Engines you didn't compile in show up as `skipped: feature not
 enabled` rather than failing the whole demo. Source:
-[`verify_engine_parity.rs`](../../veks-pipeline/src/pipeline/commands/verify_engine_parity.rs).
+[`verify_engine_parity.rs`](../../crates/veks-pipeline/src/pipeline/commands/verify_engine_parity.rs).
 
 ### Run the conformance suite
 
@@ -702,7 +702,7 @@ query as `ExactMatch` / `SetMatch` / `BoundaryMismatch(d)` /
 **Full knn_utils-style report (FAISS recompute on a sample):**
 
 ```bash
-# Requires `cargo install --features knnutils --path veks` so the
+# Requires `cargo install --features knnutils --path crates/veks` so the
 # command is registered; the verifier itself uses BLAS directly.
 veks pipeline verify dataset-knnutils \
   --base      profiles/base/base_vectors.fvecs \

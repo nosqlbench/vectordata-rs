@@ -55,8 +55,8 @@ Scope guards:
 
 ## 4. What veks already has (session exploration findings)
 
-- Command registry: `veks-pipeline/src/pipeline/commands/mod.rs` (~120-291).
-- Vector import sources (`veks-core/src/formats/`): npy, parquet, hdf5,
+- Command registry: `crates/veks-pipeline/src/pipeline/commands/mod.rs` (~120-291).
+- Vector import sources (`crates/veks-core/src/formats/`): npy, parquet, hdf5,
   slab, xvec — **no JSONL/text sources**; parquet→xvec has a fast path
   (`require_fast`), parquet→MNode exists for later metadata work.
 - `download huggingface` (HF tree API) and `download bulk`
@@ -67,7 +67,7 @@ Scope guards:
   dataset.yaml; `veks run` executes). Key flags for the pilot:
   `--self-search --query-count N --metric ... --neighbors 100
   --required-facets BQGD --seed 42`. Canonical e2e pattern:
-  `veks/tests/e2e_http_sized_profiles.rs` (`default_args()` at ~:114) and
+  `crates/veks/tests/e2e_http_sized_profiles.rs` (`default_args()` at ~:114) and
   the tutorial script `docs/tutorials/vecd-end-to-end/02-generate-dataset.sh`.
 - Known quirks that may bite: `--sized-profiles` is wizard-only on the
   bootstrap CLI (not needed at pilot scale); `oracle_scope` round-trip bug

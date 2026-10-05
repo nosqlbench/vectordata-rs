@@ -1,0 +1,1649 @@
+// Copyright (c) Jonathan Shook
+// SPDX-License-Identifier: Apache-2.0
+
+//! Vector I/O — uniform and variable-length record readers.
+//!
+//! Two reader shapes, parameterised on element type, both backed by
+//! the crate-private [`crate::storage::Storage`] abstraction:
+//!
+//! - [`XvecReader<T>`] — uniform-stride records (`fvec`, `ivec`, `mvec`,
+//!   `dvec`, `bvec`, `svec`, …). All records have the same dimension.
+//! - [`IndexedVvecReader<T>`] — variable-length records (`ivvec`,
+//!   `fvvec`, `bvvec`, …). Each record may have a different dimension.
+//!
+//! Both readers are transport-agnostic: a single `open(source)` call
+//! handles local files (`mmap`), remote URLs with a published `.mref`
+//! (merkle-cached, auto-promoted to `mmap` once complete), and remote
+//! URLs without a `.mref` (direct HTTP RANGE, slow fallback).
+//!
+//! The traits [`VectorReader<T>`] and [`VvecReader<T>`] are the
+//! consumer-facing abstractions; the concrete struct types are
+//! provided for callers that want to reach for the storage-aware
+//! methods like `precache()`, `prefetch_range()`, `release_range()`.
+
+use std::fs::File;
+use std::io;
+use std::marker::PhantomData;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
+use byteorder::{ByteOrder, LittleEndian};
+use thiserror::Error;
+use url::Url;
+
+use crate::storage::Storage;
+
+/// Sentinel value for dimension when the file has zero records.
+///
+/// Dimensionality is undefined (moot) when cardinality is zero — there
+/// are no records to derive a dimension from. Callers must check
+/// `count() > 0` before relying on `dim()`.
+pub const DIM_UNDEFINED: usize = usize::MAX;
+
+/// Errors that can occur during vector I/O operations.
+#[derive(Error, Debug)]
+pub enum IoError {
+    /// Wrapper for standard IO errors.
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+    /// Wrapper for HTTP errors from reqwest.
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+    /// Error indicating invalid file format or data.
+    #[error("Invalid format: {0}")]
+    InvalidFormat(String),
+    /// Error indicating an access out of valid bounds.
+    #[error("Index out of bounds: {0}")]
+    OutOfBounds(usize),
+    /// File has variable-length records — cannot use uniform-stride
+    /// random access. Use [`IndexedVvecReader`] for variable-length
+    /// xvec files.
+    #[error("Variable-length records: {0}")]
+    VariableLengthRecords(String),
+    /// No record index could be obtained without downloading the whole
+    /// file, and the caller asked for [`OffsetSource::Published`].
+    ///
+    /// Raised for the planning path: a prefetch plan reports what a
+    /// transfer would cost, so it must not move the bytes in order to
+    /// decide. The caller degrades the window to a whole-facet fetch
+    /// and lets the fallback policy consent to it.
+    #[error(
+        "no published offset index for {0}; rebuilding one requires downloading the whole file"
+    )]
+    OffsetIndexUnavailable(String),
+}
+
+/// How hard [`load_offsets`] may work to produce a record index.
+///
+/// The two arms differ only for a *remote* vvec with no published
+/// `IDXFOR__` sidecar, where the only remaining way to learn the record
+/// boundaries is to walk the file — which drags every chunk across the
+/// network. A local walk reads an mmap and is free under either arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OffsetSource {
+    /// Any means necessary, including a remote walk-download. For
+    /// callers opening a reader: they are about to read the data
+    /// anyway, so the transfer is work brought forward, not wasted.
+    Rebuild,
+    /// Only indexes that are already cheap: a published sidecar, a
+    /// rebuild persisted beside the cache file, or a local mmap walk.
+    /// Never a remote walk-download. For callers that are *planning* a
+    /// transfer and must not perform one to do it.
+    Published,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Element trait
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Trait for types that can be decoded from little-endian bytes.
+pub trait VvecElement: Copy + Send + Sync + 'static {
+    /// Size of one element in bytes.
+    const ELEM_SIZE: usize;
+    /// Decode one element from a little-endian byte slice.
+    fn from_le_bytes(bytes: &[u8]) -> Self;
+}
+
+impl VvecElement for u8 {
+    const ELEM_SIZE: usize = 1;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        b[0]
+    }
+}
+impl VvecElement for i8 {
+    const ELEM_SIZE: usize = 1;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        b[0] as i8
+    }
+}
+impl VvecElement for u16 {
+    const ELEM_SIZE: usize = 2;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_u16(b)
+    }
+}
+impl VvecElement for i16 {
+    const ELEM_SIZE: usize = 2;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_i16(b)
+    }
+}
+impl VvecElement for u32 {
+    const ELEM_SIZE: usize = 4;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_u32(b)
+    }
+}
+impl VvecElement for i32 {
+    const ELEM_SIZE: usize = 4;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_i32(b)
+    }
+}
+impl VvecElement for f32 {
+    const ELEM_SIZE: usize = 4;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_f32(b)
+    }
+}
+impl VvecElement for u64 {
+    const ELEM_SIZE: usize = 8;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_u64(b)
+    }
+}
+impl VvecElement for i64 {
+    const ELEM_SIZE: usize = 8;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_i64(b)
+    }
+}
+impl VvecElement for f64 {
+    const ELEM_SIZE: usize = 8;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        LittleEndian::read_f64(b)
+    }
+}
+impl VvecElement for half::f16 {
+    const ELEM_SIZE: usize = 2;
+    fn from_le_bytes(b: &[u8]) -> Self {
+        half::f16::from_le_bytes([b[0], b[1]])
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Traits — VectorReader / VvecReader
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Random-access reader for uniform-stride vector files.
+///
+/// Implementations may be backed by local mmap, merkle-cached remote,
+/// or direct-HTTP storage; consumers don't need to know which.
+pub trait VectorReader<T>: Send + Sync {
+    /// Returns the dimension of the vectors.
+    fn dim(&self) -> usize;
+    /// Returns the total number of vectors available.
+    fn count(&self) -> usize;
+    /// Retrieves the vector at the specified index.
+    fn get(&self, index: usize) -> Result<Vec<T>, IoError>;
+
+    /// Try to access the vector at `index` as a borrowed slice
+    /// without copying. Returns `None` when the underlying storage
+    /// can't satisfy the request without materializing — e.g., HTTP-
+    /// backed readers, or merkle-cached storage that hasn't been
+    /// promoted to mmap yet.
+    fn get_slice(&self, _index: usize) -> Option<&[T]> {
+        None
+    }
+
+    /// Force-download the underlying storage into the local cache so
+    /// subsequent reads are zero-copy. No-op for local files and for
+    /// non-cacheable HTTP. Idempotent.
+    fn precache(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Whether all bytes are locally accessible. `true` for local
+    /// files, `true` for cached storage once every chunk is verified,
+    /// `false` for direct HTTP.
+    fn is_complete(&self) -> bool {
+        true
+    }
+}
+
+/// Random-access reader for variable-length vector record files.
+pub trait VvecReader<T: VvecElement>: Send + Sync {
+    /// Total number of records in the file.
+    fn count(&self) -> usize;
+    /// Dimension of the record at the given ordinal.
+    fn dim_at(&self, index: usize) -> Result<usize, IoError>;
+    /// Read the raw bytes of the record data (past the dim header).
+    fn get_bytes(&self, index: usize) -> Result<Vec<u8>, IoError>;
+    /// Read the record at the given ordinal as a Vec of typed elements.
+    fn get(&self, index: usize) -> Result<Vec<T>, IoError> {
+        let bytes = self.get_bytes(index)?;
+        Ok(bytes
+            .chunks_exact(T::ELEM_SIZE)
+            .map(T::from_le_bytes)
+            .collect())
+    }
+    /// See [`VectorReader::precache`].
+    fn precache(&self) -> io::Result<()> {
+        Ok(())
+    }
+    /// See [`VectorReader::is_complete`].
+    fn is_complete(&self) -> bool {
+        true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Extension / size inference helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Infer element size from an extension string (0 = unknown).
+pub(crate) fn infer_elem_size(ext: &str) -> usize {
+    match ext.to_lowercase().as_str() {
+        // 4-byte
+        "fvec" | "fvecs" | "f32vec" | "f32vecs" | "ivec" | "ivecs" | "i32vec" | "i32vecs"
+        | "u32vec" | "u32vecs" | "fvvec" | "fvvecs" | "ivvec" | "ivvecs" | "f32vvec"
+        | "f32vvecs" | "i32vvec" | "i32vvecs" | "u32vvec" | "u32vvecs" | "u32" | "i32" => 4,
+        // 8-byte
+        "dvec" | "dvecs" | "f64vec" | "f64vecs" | "dvvec" | "dvvecs" | "i64vec" | "i64vecs"
+        | "u64vec" | "u64vecs" | "f64vvec" | "f64vvecs" | "i64vvec" | "i64vvecs" | "u64vvec"
+        | "u64vvecs" | "u64" | "i64" => 8,
+        // 2-byte
+        "mvec" | "mvecs" | "f16vec" | "f16vecs" | "svec" | "svecs" | "i16vec" | "i16vecs"
+        | "u16vec" | "u16vecs" | "mvvec" | "mvvecs" | "svvec" | "svvecs" | "f16vvec"
+        | "f16vvecs" | "i16vvec" | "i16vvecs" | "u16vvec" | "u16vvecs" | "u16" | "i16" => 2,
+        // 1-byte
+        "bvec" | "bvecs" | "u8vec" | "u8vecs" | "i8vec" | "i8vecs" | "bvvec" | "bvvecs"
+        | "u8vvec" | "u8vvecs" | "i8vvec" | "i8vvecs" | "u8" | "i8" => 1,
+        _ => 0,
+    }
+}
+
+/// Whether the extension implies a variable-length record file.
+pub(crate) fn is_vvec_ext(ext: &str) -> bool {
+    let e = ext.to_lowercase();
+    e.contains("vvec") || e == "ivec" || e == "ivecs"
+}
+
+/// Whether `ext` names a *scalar* facet: raw packed values with no
+/// per-record header, addressed at `ordinal * elem_size`.
+///
+/// The single authority for the question — [`crate::typed_access`]
+/// classifies both paths and URLs through here. Keeping one table
+/// matters because the answer decides whether the first four bytes of
+/// a file are a dimension header or data: classify a scalar file as
+/// xvec and every offset past the first is wrong.
+///
+/// Deliberately only the eight integer widths. There is no bare
+/// `.f32`/`.f64` scalar extension — [`crate::typed_access::ElementType::from_extension`]
+/// does not recognise one, so such a file is rejected at open before
+/// any of this is reached.
+pub(crate) fn is_scalar_ext(ext: &str) -> bool {
+    matches!(
+        ext.to_lowercase().as_str(),
+        "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64"
+    )
+}
+
+/// Validate that a file's extension is compatible with `T`'s element width.
+fn validate_element_for_source(source: &str) -> Result<(), IoError> {
+    let name = source.rsplit('/').next().unwrap_or(source);
+    let ext = name.rsplit('.').next().unwrap_or("");
+    let size = infer_elem_size(ext);
+    if size == 0 {
+        return Err(IoError::InvalidFormat(format!(
+            "cannot infer element size from extension '.{ext}'"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn ext_of(source: &str) -> &str {
+    let name = source.rsplit('/').next().unwrap_or(source);
+    name.rsplit('.').next().unwrap_or("")
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// XvecReader<T> — uniform-stride canonical reader
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Canonical uniform-vector reader. Holds an `Arc<Storage>` so the same
+/// underlying transport can be shared by multiple shape adapters
+/// (e.g., the typed-access view of the same file).
+///
+/// All transport choice is hidden inside `Storage`. There is no public
+/// way to construct an `XvecReader` against a specific transport
+/// variant — `open` dispatches based on the source string.
+pub struct XvecReader<T> {
+    storage: Arc<Storage>,
+    dim: usize,
+    count: usize,
+    entry_size: usize,
+    /// Mapped base address of each shard, when this reads a series.
+    ///
+    /// Empty for a single file, which keeps the hot path a plain
+    /// pointer add. Held as `usize` rather than `*const u8` so the
+    /// reader stays `Send + Sync`: the addresses belong to mmaps that
+    /// `storage` owns for this reader's whole life, so sharing them
+    /// across threads is exactly as safe as sharing the one base
+    /// pointer a single-file reader already shares.
+    part_bases: Vec<usize>,
+    /// Records in each shard but the last, so an ordinal resolves to
+    /// its shard with one division rather than a search (SH-64).
+    shard_records: usize,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> std::fmt::Debug for XvecReader<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XvecReader")
+            .field("dim", &self.dim)
+            .field("count", &self.count)
+            .field("entry_size", &self.entry_size)
+            .field("storage", &self.storage)
+            .finish()
+    }
+}
+
+impl<T> XvecReader<T> {
+    // ---- shape accessors that don't need a VvecElement bound ----
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+    pub fn count(&self) -> usize {
+        self.count
+    }
+    /// Byte size of each record (4-byte dim header + `dim * ELEM_SIZE`).
+    pub fn entry_size(&self) -> usize {
+        self.entry_size
+    }
+
+    // ---- storage advice / reclaim API (no T bound) ----
+
+    /// Drive the underlying storage to fully resident state. No-op
+    /// for local files and for non-cacheable HTTP.
+    pub fn precache(&self) -> io::Result<()> {
+        self.storage.precache()
+    }
+
+    pub fn prebuffer_with_progress<F>(&self, cb: F) -> io::Result<()>
+    where
+        F: FnMut(&crate::transport::DownloadProgress),
+    {
+        self.storage.prebuffer_with_progress(cb)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.storage.is_complete()
+    }
+    pub fn advise_sequential(&self) {
+        self.storage.advise_sequential()
+    }
+    pub fn advise_random(&self) {
+        self.storage.advise_random()
+    }
+
+    pub fn prefetch_range(&self, start: usize, end: usize) {
+        let bs = (start * self.entry_size) as u64;
+        let be = (end.min(self.count) * self.entry_size) as u64;
+        self.storage.prefetch_range_bytes(bs, be);
+    }
+
+    pub fn release_range(&self, start: usize, end: usize) {
+        let bs = (start * self.entry_size) as u64;
+        let be = (end.min(self.count) * self.entry_size) as u64;
+        self.storage.release_range_bytes(bs, be);
+    }
+
+    pub fn prefetch_pages(&self, start: usize, end: usize, bytes_paged: Option<&AtomicU64>) {
+        let bs = (start * self.entry_size) as u64;
+        let be = (end.min(self.count) * self.entry_size) as u64;
+        self.storage.prefetch_pages_bytes(bs, be, bytes_paged);
+    }
+}
+
+impl<T: VvecElement> XvecReader<T> {
+    /// Open from a path or URL string. Local paths use mmap; URLs try
+    /// the merkle-cache path first and fall back to direct HTTP.
+    pub fn open(source: &str) -> Result<Self, IoError> {
+        validate_element_for_source(source)?;
+        let storage = Storage::open(source)?;
+        Self::from_storage(storage)
+    }
+
+    /// Open a local file by path. Functionally equivalent to
+    /// `open(path.to_str().unwrap())` but skips URL parsing.
+    pub fn open_path(path: &Path) -> Result<Self, IoError> {
+        let storage = Storage::open_path(path)?;
+        Self::from_storage(storage)
+    }
+
+    /// Open a remote URL with cache-first dispatch. Equivalent to
+    /// `open(url.as_str())` but takes a parsed `Url` directly.
+    pub fn open_url(url: Url) -> Result<Self, IoError> {
+        let storage = Storage::open_url(url)?;
+        Self::from_storage(storage)
+    }
+
+    /// Construct from a pre-opened storage. **Crate-internal**.
+    pub(crate) fn from_storage(storage: Arc<Storage>) -> Result<Self, IoError> {
+        let total_size = storage.total_size();
+        if total_size == 0 {
+            return Ok(Self {
+                storage,
+                dim: DIM_UNDEFINED,
+                count: 0,
+                entry_size: 0,
+                part_bases: Vec::new(),
+                shard_records: 0,
+                _phantom: PhantomData,
+            });
+        }
+        if total_size < 4 {
+            return Err(IoError::InvalidFormat(
+                "file too short for dim header".into(),
+            ));
+        }
+        let header = storage.read_bytes(0, 4)?;
+        let dim_i32 = LittleEndian::read_i32(&header);
+        if dim_i32 <= 0 {
+            return Err(IoError::InvalidFormat(format!(
+                "invalid dimension {dim_i32}"
+            )));
+        }
+        let dim = dim_i32 as usize;
+        let entry_size = 4 + dim * T::ELEM_SIZE;
+        if !total_size.is_multiple_of(entry_size as u64) {
+            return Err(IoError::VariableLengthRecords(format!(
+                "file size {total_size} is not a multiple of stride {entry_size} (dim={dim}). \
+                 Use IndexedVvecReader for variable-length files.",
+            )));
+        }
+        let count = (total_size / entry_size as u64) as usize;
+        // For a series, remember where each shard is mapped and how
+        // many records it holds, so the zero-copy path can resolve an
+        // ordinal to a shard-local address.
+        let parts = storage.parts();
+        let (part_bases, shard_records) = if parts.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            let bases: Vec<usize> = parts
+                .iter()
+                .map(|p| p.mmap_base().map_or(0, |b| b as usize))
+                .collect();
+            // Every shard but the last is full, so shard 0's record
+            // count is the stride (SH-35).
+            let first = (parts[0].total_size() / entry_size as u64) as usize;
+            (bases, first)
+        };
+        Ok(Self {
+            storage,
+            dim,
+            count,
+            entry_size,
+            part_bases,
+            shard_records,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// The mapped address of record `index` and its offset within the
+    /// shard that holds it.
+    ///
+    /// For a single file this is the file's base and `index` itself —
+    /// the same arithmetic that was here before a facet could be a
+    /// series. For a series it is one division and an index.
+    #[inline]
+    fn slice_base(&self, index: usize) -> (*const u8, usize) {
+        if self.part_bases.is_empty() {
+            let base = self
+                .storage
+                .mmap_base()
+                .expect("XvecReader::get_slice requires mmap-backed storage");
+            return (base, index);
+        }
+        let shard = index / self.shard_records;
+        let local = index % self.shard_records;
+        let base = self.part_bases[shard];
+        assert!(base != 0, "shard {shard} of this series is not mmap-backed");
+        (base as *const u8, local)
+    }
+}
+
+impl XvecReader<f32> {
+    /// Zero-copy slice of the vector at `index`. **Panics** if the
+    /// underlying storage is not mmap-backed.
+    ///
+    /// **No bounds check** on `index` — hot-path inner-loop form
+    /// used by KNN scans and normalisation. Reading past `count` is
+    /// undefined behaviour; the caller is responsible for
+    /// `index < self.count()`. Use [`VectorReader::get_slice`] for
+    /// the bounds-checked `Option<&[T]>` form.
+    #[inline]
+    pub fn get_slice(&self, index: usize) -> &[f32] {
+        let (base, local) = self.slice_base(index);
+        let data_start = local * self.entry_size + 4;
+        unsafe { core::slice::from_raw_parts(base.add(data_start) as *const f32, self.dim) }
+    }
+}
+
+macro_rules! impl_get_slice {
+    ($t:ty) => {
+        impl XvecReader<$t> {
+            /// See [`XvecReader::<f32>::get_slice`] — same semantics.
+            #[inline]
+            pub fn get_slice(&self, index: usize) -> &[$t] {
+                let (base, local) = self.slice_base(index);
+                let data_start = local * self.entry_size + 4;
+                unsafe { core::slice::from_raw_parts(base.add(data_start) as *const $t, self.dim) }
+            }
+        }
+    };
+}
+impl_get_slice!(half::f16);
+impl_get_slice!(f64);
+impl_get_slice!(i32);
+impl_get_slice!(u8);
+impl_get_slice!(i16);
+
+impl<T: VvecElement> VectorReader<T> for XvecReader<T> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn get(&self, index: usize) -> Result<Vec<T>, IoError> {
+        if index >= self.count {
+            return Err(IoError::OutOfBounds(index));
+        }
+        let data_start = (index * self.entry_size + 4) as u64;
+        let data_len = (self.dim * T::ELEM_SIZE) as u64;
+        if let Some(slice) = self.storage.mmap_slice(data_start, data_len) {
+            return Ok(slice
+                .chunks_exact(T::ELEM_SIZE)
+                .map(T::from_le_bytes)
+                .collect());
+        }
+        let bytes = self.storage.read_bytes(data_start, data_len)?;
+        Ok(bytes
+            .chunks_exact(T::ELEM_SIZE)
+            .map(T::from_le_bytes)
+            .collect())
+    }
+
+    fn get_slice(&self, index: usize) -> Option<&[T]> {
+        if index >= self.count {
+            return None;
+        }
+        let data_start = (index * self.entry_size + 4) as u64;
+        let data_len = (self.dim * T::ELEM_SIZE) as u64;
+        let bytes = self.storage.mmap_slice(data_start, data_len)?;
+        // Cast bytes → &[T]. Safe under the LE-host assumption that
+        // the rest of the crate already makes (storage values are
+        // little-endian on disk; native LE on x86/ARM means the byte
+        // order is identical). Alignment is satisfied by mmap (page-
+        // aligned base) and the per-record offset (4-byte dim header
+        // keeps T::ELEM_SIZE-aligned data starts aligned for sizes ≤
+        // 8). For 8-byte types, the leading dim header forces all
+        // records to start at offsets that are 4-aligned, not 8-
+        // aligned — so we conservatively bail out on 8-byte types.
+        if T::ELEM_SIZE > 4 {
+            return None;
+        }
+        let ptr = bytes.as_ptr() as *const T;
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        Some(unsafe { core::slice::from_raw_parts(ptr, self.dim) })
+    }
+
+    fn precache(&self) -> io::Result<()> {
+        self.storage.precache()
+    }
+    fn is_complete(&self) -> bool {
+        self.storage.is_complete()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// IndexedVvecReader<T> — variable-length canonical reader
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Canonical variable-length vvec reader. Holds an `Arc<Storage>`
+/// plus a precomputed offset index mapping ordinal → byte offset.
+///
+/// On open, reads the existing `IDXFOR__<name>.<i32|i64>` sidecar
+/// index when present; otherwise walks the file once to build it and
+/// persists for next time. For remote-cached storage the sidecar is
+/// fetched from the same URL prefix; for local files it lives next
+/// to the data file.
+pub struct IndexedVvecReader<T> {
+    storage: Arc<Storage>,
+    offsets: Vec<u64>,
+    elem_size: usize,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> std::fmt::Debug for IndexedVvecReader<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexedVvecReader")
+            .field("count", &self.offsets.len())
+            .field("elem_size", &self.elem_size)
+            .field("storage", &self.storage)
+            .finish()
+    }
+}
+
+impl<T: VvecElement> IndexedVvecReader<T> {
+    /// Open a local variable-length file by path. The element width
+    /// is taken from `T::ELEM_SIZE`. Errors if the file extension's
+    /// implied size disagrees with `T`.
+    pub fn open_path(path: &Path) -> Result<Self, IoError> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let inferred = infer_elem_size(ext);
+        if inferred != 0 && inferred != T::ELEM_SIZE {
+            return Err(IoError::InvalidFormat(format!(
+                "extension '.{ext}' implies {inferred}-byte elements but type {} requires {}",
+                std::any::type_name::<T>(),
+                T::ELEM_SIZE
+            )));
+        }
+        let storage = Storage::open_path(path)?;
+        let offsets = load_or_build_local_offsets(path, &storage, T::ELEM_SIZE)?;
+        Ok(Self {
+            storage,
+            offsets,
+            elem_size: T::ELEM_SIZE,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Open from a path or URL string. Auto-dispatches transport.
+    pub fn open(source: &str) -> Result<Self, IoError> {
+        let ext = ext_of(source);
+        let elem_size = infer_elem_size(ext);
+        if elem_size == 0 {
+            return Err(IoError::InvalidFormat(format!(
+                "cannot infer element size from extension '.{ext}'"
+            )));
+        }
+        if elem_size != T::ELEM_SIZE {
+            return Err(IoError::InvalidFormat(format!(
+                "extension '.{ext}' implies {elem_size}-byte elements but type {} requires {}",
+                std::any::type_name::<T>(),
+                T::ELEM_SIZE
+            )));
+        }
+        if !is_vvec_ext(ext) && ext != "ivec" {
+            return Err(IoError::InvalidFormat(format!(
+                "extension '.{ext}' is not a variable-length format; use XvecReader for uniform-stride files"
+            )));
+        }
+
+        // `s3://` URLs are remote and get dispatched through the
+        // same HTTPS-based offset-fetch path as `http(s)://`. The
+        // storage layer translates the scheme internally so the
+        // remote offset fetcher needs to see the translated URL
+        // when it composes sibling `IDXFOR__` requests.
+        let is_remote = crate::transport::is_remote_url(source);
+        let storage = Storage::open(source)?;
+        let offsets = if is_remote {
+            let translated = crate::transport::normalize_remote_url(source);
+            load_or_fetch_remote_offsets(
+                translated.as_ref(),
+                &storage,
+                elem_size,
+                OffsetSource::Rebuild,
+            )?
+        } else {
+            load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
+        };
+        Ok(Self {
+            storage,
+            offsets,
+            elem_size,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Build over an already-opened storage.
+    ///
+    /// `source` is still needed: it names the file whose sibling
+    /// `IDXFOR__` sidecar holds the offsets, and for a series that is
+    /// the *shard's own* file — each carries its own index, in its own
+    /// file ordinals (SH-17, SH-82).
+    pub(crate) fn from_storage(
+        storage: Arc<Storage>,
+        source: &str,
+        elem_size: usize,
+    ) -> Result<Self, IoError> {
+        let offsets = if crate::transport::is_remote_url(source) {
+            let translated = crate::transport::normalize_remote_url(source);
+            load_or_fetch_remote_offsets(
+                translated.as_ref(),
+                &storage,
+                elem_size,
+                OffsetSource::Rebuild,
+            )?
+        } else {
+            load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
+        };
+        Ok(Self {
+            storage,
+            offsets,
+            elem_size,
+            _phantom: PhantomData,
+        })
+    }
+
+    pub fn count(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub fn dim_at(&self, index: usize) -> Result<usize, IoError> {
+        if index >= self.offsets.len() {
+            return Err(IoError::OutOfBounds(index));
+        }
+        let offset = self.offsets[index];
+        let bytes = self.storage.read_bytes(offset, 4)?;
+        if bytes.len() < 4 {
+            return Err(IoError::InvalidFormat("short dim header".into()));
+        }
+        Ok(LittleEndian::read_i32(&bytes) as usize)
+    }
+
+    pub fn get_bytes(&self, index: usize) -> Result<Vec<u8>, IoError> {
+        if index >= self.offsets.len() {
+            return Err(IoError::OutOfBounds(index));
+        }
+        let offset = self.offsets[index];
+        // Read header + body in one shot when storage is local; when
+        // remote-direct, two requests is what it costs.
+        let dim = self.dim_at(index)?;
+        let body_start = offset + 4;
+        let body_len = (dim * self.elem_size) as u64;
+        self.storage
+            .read_bytes(body_start, body_len)
+            .map_err(IoError::Io)
+    }
+
+    /// Zero-copy access to record bytes when storage is mmap-backed.
+    pub fn get_raw(&self, index: usize) -> Option<&[u8]> {
+        if index >= self.offsets.len() {
+            return None;
+        }
+        let offset = self.offsets[index];
+        let dim_bytes = self.storage.mmap_slice(offset, 4)?;
+        let dim = LittleEndian::read_i32(dim_bytes) as usize;
+        let body_start = offset + 4;
+        let body_len = (dim * self.elem_size) as u64;
+        self.storage.mmap_slice(body_start, body_len)
+    }
+
+    pub fn precache(&self) -> io::Result<()> {
+        self.storage.precache()
+    }
+    pub fn is_complete(&self) -> bool {
+        self.storage.is_complete()
+    }
+}
+
+impl IndexedVvecReader<i32> {
+    /// Read a record as `Vec<i32>`. Convenience alias for the
+    /// trait-method `get(index)`.
+    pub fn get_i32(&self, index: usize) -> Result<Vec<i32>, IoError> {
+        self.get(index)
+    }
+}
+
+impl<T: VvecElement> VvecReader<T> for IndexedVvecReader<T> {
+    fn count(&self) -> usize {
+        self.offsets.len()
+    }
+    fn dim_at(&self, index: usize) -> Result<usize, IoError> {
+        self.dim_at(index)
+    }
+    fn get_bytes(&self, index: usize) -> Result<Vec<u8>, IoError> {
+        self.get_bytes(index)
+    }
+    fn precache(&self) -> io::Result<()> {
+        self.storage.precache()
+    }
+    fn is_complete(&self) -> bool {
+        self.storage.is_complete()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Streaming-reclaim helper for bounded-RSS scans
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Bounded-RSS streaming-scan helper for [`XvecReader`].
+///
+/// A sequential mmap scan over a TB-scale file accumulates pages in
+/// process RSS once they're touched. The kernel only reclaims under
+/// memory pressure, so on RAM-rich machines RSS climbs to the file
+/// size before any reclaim happens. `MADV_SEQUENTIAL` alone is
+/// insufficient; `MADV_DONTNEED` is the active form.
+///
+/// `StreamReclaim` advises sequential up front, releases a fixed-byte
+/// trailing window each time the cursor crosses a window boundary,
+/// and releases any remainder on drop. A no-op when storage is not
+/// mmap-backed (the underlying madvise calls just return).
+///
+/// ```ignore
+/// let mut rec = StreamReclaim::new(&reader, start, end);
+/// for i in start..end {
+///     let v = reader.get_slice(i).unwrap();
+///     // ... do work ...
+///     rec.advance(i);
+/// }
+/// // drop releases the trailing tail
+/// ```
+pub struct StreamReclaim<'a, T: VvecElement> {
+    reader: &'a XvecReader<T>,
+    last_released: usize,
+    end: usize,
+    reclaim_window_records: usize,
+}
+
+impl<'a, T: VvecElement> StreamReclaim<'a, T> {
+    /// Default 256 MiB reclaim windows. Large enough that the per-
+    /// window `madvise` overhead is negligible, small enough that
+    /// resident-set growth is bounded.
+    pub fn new(reader: &'a XvecReader<T>, start: usize, end: usize) -> Self {
+        Self::with_reclaim_bytes(reader, start, end, 256 * 1024 * 1024)
+    }
+
+    pub fn with_reclaim_bytes(
+        reader: &'a XvecReader<T>,
+        start: usize,
+        end: usize,
+        reclaim_bytes: usize,
+    ) -> Self {
+        reader.advise_sequential();
+        let entry_size = reader.entry_size().max(1);
+        let reclaim_window_records = (reclaim_bytes / entry_size).max(1024);
+        Self {
+            reader,
+            last_released: start,
+            end,
+            reclaim_window_records,
+        }
+    }
+
+    /// Call after touching index `i`. Releases the trailing window
+    /// when `i` crosses a window boundary.
+    #[inline]
+    pub fn advance(&mut self, i: usize) {
+        if i >= self.last_released + self.reclaim_window_records {
+            self.reader.release_range(
+                self.last_released,
+                self.last_released + self.reclaim_window_records,
+            );
+            self.last_released += self.reclaim_window_records;
+        }
+    }
+}
+
+impl<'a, T: VvecElement> Drop for StreamReclaim<'a, T> {
+    fn drop(&mut self) {
+        if self.last_released < self.end {
+            self.reader.release_range(self.last_released, self.end);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Top-level dispatchers
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Open a uniform vector file for typed random access. Local or
+/// remote — the source string is the dispatch.
+///
+/// ```no_run
+/// use vectordata::io::open_vec;
+/// let reader = open_vec::<f32>("base_vectors.fvec").unwrap();
+/// let v = reader.get(0).unwrap();
+/// ```
+pub fn open_vec<T: VvecElement>(source: &str) -> Result<Box<dyn VectorReader<T>>, IoError> {
+    Ok(Box::new(XvecReader::<T>::open(source)?))
+}
+
+/// Open a variable-length vector file for typed random access.
+pub fn open_vvec<T: VvecElement>(source: &str) -> Result<Box<dyn VvecReader<T>>, IoError> {
+    Ok(Box::new(IndexedVvecReader::<T>::open(source)?))
+}
+
+/// Open a variable-length vector file as raw `u8` records (no
+/// per-element typing). Useful when the caller decodes records itself.
+pub fn open_vvec_untyped(source: &str) -> Result<Box<dyn VvecReader<u8>>, IoError> {
+    let ext = ext_of(source);
+    let elem_size = infer_elem_size(ext);
+    if elem_size == 0 {
+        return Err(IoError::InvalidFormat(format!(
+            "cannot infer element size from extension '.{ext}'"
+        )));
+    }
+    let is_remote = crate::transport::is_remote_url(source);
+    let storage = Storage::open(source)?;
+    let offsets = if is_remote {
+        let translated = crate::transport::normalize_remote_url(source);
+        load_or_fetch_remote_offsets(
+            translated.as_ref(),
+            &storage,
+            elem_size,
+            OffsetSource::Rebuild,
+        )?
+    } else {
+        load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
+    };
+    Ok(Box::new(IndexedVvecReader::<u8> {
+        storage,
+        offsets,
+        elem_size,
+        _phantom: PhantomData,
+    }))
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Offset-index management (private)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Load the record-offset index for a variable-length file, without
+/// needing the element type.
+///
+/// The offsets are the only thing a caller needs to turn an ordinal
+/// range into a byte range, and nothing about them depends on `T` —
+/// only the walk fallback does, and only to compute a stride it should
+/// not be computing in the first place. Exposing them untyped is what
+/// lets the prefetch path window a vvec facet without opening a typed
+/// reader for a format whose element type it does not care about.
+///
+/// This is the same lookup [`IndexedVvecReader::open`] performs, in the
+/// same order, so a windowed prefetch and a subsequent read agree about
+/// where record `i` begins.
+pub(crate) fn load_offsets(
+    source: &str,
+    storage: &Storage,
+    elem_size: usize,
+    want: OffsetSource,
+) -> Result<Vec<u64>, IoError> {
+    if crate::transport::is_remote_url(source) {
+        let translated = crate::transport::normalize_remote_url(source);
+        load_or_fetch_remote_offsets(translated.as_ref(), storage, elem_size, want)
+    } else {
+        load_or_build_local_offsets(Path::new(source), storage, elem_size)
+    }
+}
+
+fn load_or_build_local_offsets(
+    data_path: &Path,
+    storage: &Storage,
+    elem_size: usize,
+) -> Result<Vec<u64>, IoError> {
+    let total_size = storage.total_size();
+    // The sidecar lives beside the file the storage actually opened,
+    // which is not necessarily what the caller named. A `dataset.yaml`
+    // facet is written relative to the dataset root ("meta.ivvec"), so
+    // resolving it here against the process CWD both misses a published
+    // sidecar and writes the rebuilt one into whatever directory the
+    // process happens to be sitting in.
+    let opened = storage.local_path();
+    let data_path = opened.as_deref().unwrap_or(data_path);
+    let index_path = index_path_for(data_path, total_size);
+    if let Some(cached) = load_local_index(&index_path, data_path)? {
+        return Ok(cached);
+    }
+    // Build by walking the mmap (local storage always has mmap).
+    let bytes = storage
+        .mmap_slice(0, total_size)
+        .ok_or_else(|| IoError::InvalidFormat("local storage missing mmap".into()))?;
+    let offsets = walk_offsets(bytes, elem_size)?;
+    let _ = write_index(&index_path, &offsets, total_size); // best-effort
+    Ok(offsets)
+}
+
+fn load_or_fetch_remote_offsets(
+    data_url: &str,
+    storage: &Storage,
+    elem_size: usize,
+    want: OffsetSource,
+) -> Result<Vec<u64>, IoError> {
+    // Try sibling IDXFOR__ index URLs.
+    let url =
+        Url::parse(data_url).map_err(|e| IoError::InvalidFormat(format!("invalid URL: {e}")))?;
+    let data_name = url
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .unwrap_or("")
+        .to_string();
+    let mut base = url.clone();
+    if base.path_segments_mut().is_ok() {
+        let _ = base.path_segments_mut().map(|mut s| {
+            s.pop();
+        });
+    }
+    let base_str = base.as_str().trim_end_matches('/').to_string();
+    let total_size = storage.total_size();
+    // Probe the width this file's size calls for first — the same rule
+    // `index_path_for` writes by — so the common case costs one request
+    // instead of a guaranteed 404 followed by the real one.
+    let (expected, other) = if index_ext_for(total_size) == "i32" {
+        ("i32", "i64")
+    } else {
+        ("i64", "i32")
+    };
+    let candidates = [
+        (
+            format!("{base_str}/IDXFOR__{data_name}.{expected}"),
+            expected,
+        ),
+        (format!("{base_str}/IDXFOR__{data_name}.{other}"), other),
+    ];
+    let client = crate::transport::shared_client_for(&base_str);
+    for (cand, ext) in &candidates {
+        if let Ok(resp) = client.get(cand).send()
+            && resp.status().is_success()
+            && let Ok(bytes) = resp.bytes()
+        {
+            return Ok(parse_index_bytes(&bytes, ext, total_size));
+        }
+    }
+    // Second chance before the expensive walk: a prior open of this
+    // URL already walked the file and persisted the rebuilt index
+    // next to the local cache file. Without this, every open of a
+    // remote vvec with no published sidecar re-paid the full walk.
+    let cache_path = storage.local_path();
+    if let Some(cp) = &cache_path {
+        let index_path = index_path_for(cp, storage.total_size());
+        if let Some(cached) = load_local_index(&index_path, cp)? {
+            return Ok(cached);
+        }
+    }
+    // Everything cheap is exhausted; only the walk remains, and for
+    // remote storage that means downloading the whole file. A caller
+    // that is merely *planning* a transfer must not perform one to
+    // decide — it would move the very bytes the plan exists to gate,
+    // and the consent check would then fire after the fact.
+    if want == OffsetSource::Published {
+        return Err(IoError::OffsetIndexUnavailable(data_url.to_string()));
+    }
+    // Fallback: walk the file via Storage::read_bytes. For remote
+    // storage this downloads EVERY chunk of the file before the
+    // reader exists — say so out loud instead of looking like a
+    // hang, and point at the durable fix (publish the sidecar).
+    log::warn!(
+        "no IDXFOR__ offset index published for {data_url}; rebuilding it \
+             requires downloading the entire file ({} bytes). Publish the \
+             IDXFOR__ sidecar next to the data file (or precache the dataset) \
+             to avoid this.",
+        storage.total_size(),
+    );
+    let offsets = walk_offsets_via_storage(storage, elem_size)?;
+    // Persist so the walk is paid once per cache lifetime. Best-
+    // effort: a read-only cache directory only costs us the rebuild.
+    if let Some(cp) = &cache_path {
+        let _ = write_index(
+            &index_path_for(cp, storage.total_size()),
+            &offsets,
+            storage.total_size(),
+        );
+    }
+    Ok(offsets)
+}
+
+fn walk_offsets(mmap: &[u8], elem_size: usize) -> Result<Vec<u64>, IoError> {
+    let file_size = mmap.len() as u64;
+    let mut offsets = Vec::new();
+    let mut offset: u64 = 0;
+    while offset + 4 <= file_size {
+        offsets.push(offset);
+        let o = offset as usize;
+        let dim = LittleEndian::read_i32(&mmap[o..o + 4]);
+        if dim < 0 {
+            return Err(IoError::InvalidFormat(format!(
+                "negative dimension {dim} at offset {offset}"
+            )));
+        }
+        offset += 4 + dim as u64 * elem_size as u64;
+    }
+    if offset != file_size {
+        return Err(IoError::InvalidFormat(format!(
+            "file does not end at a record boundary: {} bytes remaining at offset {offset}",
+            file_size - offset
+        )));
+    }
+    Ok(offsets)
+}
+
+fn walk_offsets_via_storage(storage: &Storage, elem_size: usize) -> Result<Vec<u64>, IoError> {
+    let total_size = storage.total_size();
+    let mut offsets = Vec::new();
+    let mut offset: u64 = 0;
+    while offset + 4 <= total_size {
+        offsets.push(offset);
+        let header = storage.read_bytes(offset, 4)?;
+        let dim = LittleEndian::read_i32(&header);
+        if dim < 0 {
+            return Err(IoError::InvalidFormat(format!(
+                "negative dimension {dim} at offset {offset}"
+            )));
+        }
+        offset += 4 + dim as u64 * elem_size as u64;
+    }
+    if offset != total_size {
+        return Err(IoError::InvalidFormat(format!(
+            "file does not end at a record boundary: {} bytes remaining at offset {offset}",
+            total_size - offset
+        )));
+    }
+    Ok(offsets)
+}
+
+/// Parse an `IDXFOR__` sidecar into **record start offsets**.
+///
+/// Two layouts are in circulation next to real data. This crate's own
+/// [`write_index`] persists `N` starts; nbdatatools publishes `N + 1`
+/// entries whose last is the payload size — an end sentinel that makes
+/// every record's extent readable as `offsets[i + 1] - offsets[i]`
+/// without a special case for the final one.
+///
+/// No record can *start* at the payload size, so a trailing entry equal
+/// to `payload_size` is unambiguously the sentinel and is dropped here.
+/// Without that, a sentinel sidecar reads as `N + 1` records, the last
+/// a phantom beginning at EOF: `count()` overstates by one and a window
+/// reaching the tail resolves to an empty range.
+///
+/// Both layouts therefore yield `N` starts, and the record count is the
+/// length of what this returns.
+fn parse_index_bytes(bytes: &[u8], ext: &str, payload_size: u64) -> Vec<u64> {
+    let mut offsets: Vec<u64> = match ext {
+        "i32" => bytes
+            .chunks_exact(4)
+            .map(|c| LittleEndian::read_i32(c) as u64)
+            .collect(),
+        "i64" => bytes
+            .chunks_exact(8)
+            .map(|c| LittleEndian::read_i64(c) as u64)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if offsets.last() == Some(&payload_size) {
+        offsets.pop();
+    }
+    offsets
+}
+
+/// The sidecar entry width a payload of `file_size` bytes calls for:
+/// `i32` while every offset still fits one, `i64` beyond that.
+///
+/// Shared by the local sidecar name and the remote sidecar probe so
+/// both agree on which file to expect.
+fn index_ext_for(file_size: u64) -> &'static str {
+    if file_size <= i32::MAX as u64 {
+        "i32"
+    } else {
+        "i64"
+    }
+}
+
+fn index_path_for(data_path: &Path, file_size: u64) -> std::path::PathBuf {
+    let parent = data_path.parent().unwrap_or(Path::new("."));
+    let name = data_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("data");
+    parent.join(format!("IDXFOR__{name}.{}", index_ext_for(file_size)))
+}
+
+fn load_local_index(index_path: &Path, data_path: &Path) -> Result<Option<Vec<u64>>, IoError> {
+    if !index_path.is_file() {
+        return Ok(None);
+    }
+    let data_meta = std::fs::metadata(data_path)?;
+    let data_mtime = data_meta
+        .modified()
+        .map_err(|e| IoError::InvalidFormat(format!("mtime: {e}")))?;
+    let index_mtime = std::fs::metadata(index_path)?
+        .modified()
+        .map_err(|e| IoError::InvalidFormat(format!("mtime: {e}")))?;
+    if index_mtime < data_mtime {
+        return Ok(None);
+    }
+    let data = std::fs::read(index_path)?;
+    let ext = index_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    // A whole number of offsets, or the file is not one. Belt and
+    // braces beside the atomic write above: a sidecar left short by an
+    // older build, a truncated copy, or a partial download should send
+    // us back to the walk rather than yield a reader that cannot see
+    // the records the tail describes.
+    let width = if ext == "i64" { 8 } else { 4 };
+    if data.is_empty() || !data.len().is_multiple_of(width) {
+        return Ok(None);
+    }
+    Ok(Some(parse_index_bytes(&data, ext, data_meta.len())))
+}
+
+/// Write the offset sidecar **atomically**.
+///
+/// `File::create` truncates in place and the offsets are written one at
+/// a time, so a reader that opens the sidecar mid-write sees a short
+/// file. `load_local_index` would then parse fewer offsets than the
+/// data has records and hand back a reader that silently cannot see the
+/// tail of the file — no error, just missing records.
+///
+/// That is reachable whenever two readers open the same vvec at once,
+/// in one process or across processes: both walk, both write. Writing
+/// to a sibling temporary and renaming makes the swap atomic, so a
+/// reader sees either the previous index or the whole new one.
+fn write_index(index_path: &Path, offsets: &[u64], file_size: u64) -> Result<(), IoError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Unique per writer: the pid separates processes, the counter
+    // separates threads within one.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = index_path.parent().unwrap_or(Path::new("."));
+    let stem = index_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("IDXFOR__");
+    let tmp = dir.join(format!(
+        ".{stem}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let write = || -> Result<(), IoError> {
+        let mut f = File::create(&tmp)?;
+        if file_size <= i32::MAX as u64 {
+            for &o in offsets {
+                f.write_all(&(o as i32).to_le_bytes())?;
+            }
+        } else {
+            for &o in offsets {
+                f.write_all(&(o as i64).to_le_bytes())?;
+            }
+        }
+        f.flush()?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, index_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Remove any existing IDXFOR__ index files for a data file.
+///
+/// Call this before rewriting a vvec file to ensure stale indices are
+/// cleaned up. The index will be rebuilt by [`IndexedVvecReader::open`].
+pub fn remove_vvec_index(data_path: &Path) {
+    let parent = data_path.parent().unwrap_or(Path::new("."));
+    let name = data_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.is_empty() {
+        return;
+    }
+    for ext in &["i32", "i64"] {
+        let idx = parent.join(format!("IDXFOR__{name}.{ext}"));
+        if idx.exists() {
+            let _ = std::fs::remove_file(&idx);
+        }
+    }
+}
+
+/// The `IDXFOR__` sidecar as it is actually published.
+///
+/// Two layouts are in circulation and both sit next to real data, so
+/// the parse has to read either one as the same N records. These pin
+/// that, and pin the extension tables the parse depends on.
+#[cfg(test)]
+mod sidecar_layouts {
+    use super::*;
+
+    /// Starts-only — what this crate's own `write_index` persists.
+    #[test]
+    fn a_starts_only_sidecar_keeps_every_entry() {
+        // Three records of 4 bytes each in a 12-byte payload.
+        let bytes: Vec<u8> = [0i32, 4, 8].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(parse_index_bytes(&bytes, "i32", 12), vec![0, 4, 8]);
+    }
+
+    /// Sentinel — what nbdatatools publishes. The trailing entry is the
+    /// payload size, which lets a consumer take every record's extent
+    /// as `offsets[i + 1] - offsets[i]`. It is not a record.
+    #[test]
+    fn an_end_sentinel_is_not_a_record() {
+        let bytes: Vec<u8> = [0i32, 4, 8, 12]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            parse_index_bytes(&bytes, "i32", 12),
+            vec![0, 4, 8],
+            "a final entry equal to the payload size is the sentinel; kept, \
+             it reads as a fourth record starting at EOF"
+        );
+    }
+
+    /// The same, at the wider entry width.
+    #[test]
+    fn the_sentinel_is_dropped_at_i64_width_too() {
+        let bytes: Vec<u8> = [0i64, 20, 40]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(parse_index_bytes(&bytes, "i64", 40), vec![0, 20]);
+    }
+
+    /// Only the *last* entry can be the sentinel. An interior offset
+    /// equal to the payload size would be a corrupt index, not a
+    /// layout, and silently dropping it would hide that.
+    #[test]
+    fn only_a_trailing_entry_is_treated_as_the_sentinel() {
+        let bytes: Vec<u8> = [0i32, 12, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(parse_index_bytes(&bytes, "i32", 12), vec![0, 12, 4]);
+    }
+
+    /// A record needs at least a 4-byte header, so no record can start
+    /// at the payload size — which is what makes the sentinel test
+    /// unambiguous rather than a heuristic.
+    #[test]
+    fn the_sentinel_value_is_never_a_legal_record_start() {
+        let dims: [i32; 3] = [2, 5, 1];
+        let mut at = 0u64;
+        let starts: Vec<u64> = dims
+            .iter()
+            .map(|&d| {
+                let s = at;
+                at += 4 + d as u64 * 4;
+                s
+            })
+            .collect();
+        assert!(
+            starts.iter().all(|&s| s < at),
+            "every record start is strictly inside the payload"
+        );
+    }
+
+    /// The width a payload calls for decides both the sidecar's name
+    /// and which remote sidecar is probed first. One rule, so the two
+    /// cannot drift apart and cost a guaranteed 404 on every open.
+    #[test]
+    fn the_entry_width_follows_the_payload_size() {
+        assert_eq!(index_ext_for(0), "i32");
+        assert_eq!(index_ext_for(i32::MAX as u64), "i32");
+        assert_eq!(index_ext_for(i32::MAX as u64 + 1), "i64");
+        let p = std::path::Path::new("/d/x.ivvec");
+        assert_eq!(
+            index_path_for(p, 1024).file_name().unwrap(),
+            "IDXFOR__x.ivvec.i32"
+        );
+        assert_eq!(
+            index_path_for(p, i32::MAX as u64 + 1).file_name().unwrap(),
+            "IDXFOR__x.ivvec.i64"
+        );
+    }
+}
+
+#[cfg(test)]
+mod index_atomicity {
+    use super::*;
+
+    /// **A half-written sidecar must never be read as a whole one.**
+    ///
+    /// `write_index` used to truncate the target in place and fill it
+    /// offset by offset, so a concurrent reader saw a short file and
+    /// parsed fewer offsets than the data had records — a reader that
+    /// silently could not see the tail of its own file. It surfaced as
+    /// a one-in-six flake in a test that opened one vvec from eight
+    /// threads.
+    #[test]
+    fn many_writers_never_leave_a_readable_partial_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = tmp.path().join("IDXFOR__x.ivvec.i32");
+        let offsets: Vec<u64> = (0..4096).map(|i| i * 12).collect();
+
+        // Writers racing on one path, readers observing it throughout.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let index = index.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut bad = 0usize;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Ok(bytes) = std::fs::read(&index)
+                            && !bytes.is_empty()
+                            && bytes.len() != offsets_len_bytes()
+                        {
+                            bad += 1;
+                        }
+                    }
+                    bad
+                })
+            })
+            .collect();
+
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let index = index.clone();
+                let offsets = offsets.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        write_index(&index, &offsets, 1 << 20).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let partial: usize = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert_eq!(
+            partial, 0,
+            "readers observed {partial} partial sidecars; the swap is not atomic"
+        );
+
+        // And no temporaries are left lying about.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporaries left behind: {leftovers:?}"
+        );
+    }
+
+    fn offsets_len_bytes() -> usize {
+        4096 * 4
+    }
+}
+
+/// How a facet's extension decides whether its first four bytes are a
+/// dimension header or data.
+#[cfg(test)]
+mod scalar_classification {
+    use super::*;
+
+    /// Scalar facets are the eight integer widths and nothing else.
+    ///
+    /// The set decides whether a file's first four bytes are a
+    /// dimension header or data, so it must be one table. `f32`/`f64`
+    /// are absent deliberately: `ElementType::from_extension` has no
+    /// bare-`f32` entry, so such a file never opens in the first place.
+    #[test]
+    fn the_scalar_extensions_are_exactly_the_integer_widths() {
+        for ext in ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64"] {
+            assert!(is_scalar_ext(ext), "{ext} is a scalar facet");
+            assert!(!is_vvec_ext(ext), "{ext} is not variable-length");
+            assert_ne!(infer_elem_size(ext), 0, "{ext} has a known width");
+        }
+        for ext in ["fvec", "ivvec", "parquet", "f32", "f64", ""] {
+            assert!(!is_scalar_ext(ext), "{ext} is not a scalar facet");
+        }
+        assert!(is_scalar_ext("I32"), "extension case must not matter");
+    }
+
+    /// The path and URL classifiers must answer from that one table.
+    /// A local open and a remote open of the same facet that disagree
+    /// read the same bytes two different ways, one of them wrong.
+    #[test]
+    fn path_and_url_classification_agree() {
+        for ext in [
+            "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "fvec", "ivvec", "f32", "f64",
+        ] {
+            let by_path = crate::typed_access::ElementType::is_scalar_format(format!("/d/x.{ext}"));
+            let by_ext = is_scalar_ext(ext);
+            assert_eq!(by_path, by_ext, "path classification of .{ext}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod series_reader_tests {
+    use super::*;
+
+    fn tmpdir() -> tempfile::TempDir {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(&base).unwrap()
+    }
+
+    /// Write records `from..from+n` of a dim-`d` fvec into shard `i`.
+    /// Record `r` is `[r, r+0.5, ...]`, so a value identifies its own
+    /// ordinal.
+    fn shard(dir: &std::path::Path, i: u32, d: usize, from: usize, n: usize) {
+        let p = dir.join(crate::dataset::shards::shard_name("base", "fvecs", i));
+        let mut bytes = Vec::new();
+        for r in from..from + n {
+            bytes.extend_from_slice(&(d as i32).to_le_bytes());
+            for k in 0..d {
+                bytes.extend_from_slice(&((r * 10 + k) as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    /// **A sharded facet reads as one vector space.** Count, dim, and
+    /// every record come back as if the shards were one file — which
+    /// is what lets a kernel scan a series without knowing it is one.
+    #[test]
+    fn a_sharded_facet_reads_as_one_vector_space() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 4, 0, 10);
+        shard(tmp.path(), 1, 4, 10, 10);
+        shard(tmp.path(), 2, 4, 20, 5);
+
+        let r = XvecReader::<f32>::open_path(&tmp.path().join("base.fvecs")).unwrap();
+        assert_eq!(VectorReader::count(&r), 25);
+        assert_eq!(VectorReader::dim(&r), 4);
+
+        for o in 0..25usize {
+            let want: Vec<f32> = (0..4).map(|k| (o * 10 + k) as f32).collect();
+            assert_eq!(r.get(o).unwrap(), want, "record {o} via get");
+        }
+    }
+
+    /// **The zero-copy path crosses shards.** `get_slice` is the KNN
+    /// inner loop; if it resolved every ordinal against the first
+    /// shard's base it would read adjacent memory and return plausible
+    /// garbage rather than failing.
+    #[test]
+    fn the_zero_copy_path_resolves_per_shard() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 3, 0, 8);
+        shard(tmp.path(), 1, 3, 8, 8);
+        shard(tmp.path(), 2, 3, 16, 4);
+
+        let r = XvecReader::<f32>::open_path(&tmp.path().join("base.fvecs")).unwrap();
+        assert_eq!(VectorReader::count(&r), 20);
+
+        for o in 0..20usize {
+            let want: Vec<f32> = (0..3).map(|k| (o * 10 + k) as f32).collect();
+            assert_eq!(r.get_slice(o), want.as_slice(), "record {o} via get_slice");
+        }
+        // The two paths agree, which is the invariant the hot loop
+        // relies on.
+        for o in [0usize, 7, 8, 15, 16, 19] {
+            assert_eq!(r.get_slice(o), r.get(o).unwrap().as_slice(), "record {o}");
+        }
+    }
+
+    /// A seam is where an off-by-one hides: the last record of each
+    /// shard and the first of the next are checked explicitly.
+    #[test]
+    fn records_either_side_of_a_seam_are_correct() {
+        let tmp = tmpdir();
+        shard(tmp.path(), 0, 2, 0, 6);
+        shard(tmp.path(), 1, 2, 6, 6);
+        let r = XvecReader::<f32>::open_path(&tmp.path().join("base.fvecs")).unwrap();
+
+        assert_eq!(r.get_slice(5), [50.0f32, 51.0].as_slice(), "last of shard 0");
+        assert_eq!(r.get_slice(6), [60.0f32, 61.0].as_slice(), "first of shard 1");
+    }
+
+    /// An unsharded file behaves exactly as it did — the series
+    /// machinery is inert when there is one file.
+    #[test]
+    fn a_single_file_is_unaffected() {
+        let tmp = tmpdir();
+        let path = tmp.path().join("solo.fvecs");
+        let mut bytes = Vec::new();
+        for r in 0..5usize {
+            bytes.extend_from_slice(&2i32.to_le_bytes());
+            for k in 0..2 {
+                bytes.extend_from_slice(&((r * 10 + k) as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).unwrap();
+
+        let r = XvecReader::<f32>::open_path(&path).unwrap();
+        assert_eq!(VectorReader::count(&r), 5);
+        assert_eq!(r.get_slice(4), [40.0f32, 41.0].as_slice());
+    }
+
+    /// A series of integer records reads the same way — the shard
+    /// resolution is about layout, not element type.
+    #[test]
+    fn an_integer_series_reads_across_shards() {
+        let tmp = tmpdir();
+        for (i, from) in [(0u32, 0usize), (1, 4)] {
+            let p = tmp.path().join(crate::dataset::shards::shard_name("n", "ivecs", i));
+            let mut bytes = Vec::new();
+            for r in from..from + 4 {
+                bytes.extend_from_slice(&3i32.to_le_bytes());
+                for k in 0..3 {
+                    bytes.extend_from_slice(&((r * 10 + k) as i32).to_le_bytes());
+                }
+            }
+            std::fs::write(p, bytes).unwrap();
+        }
+        let r = XvecReader::<i32>::open_path(&tmp.path().join("n.ivecs")).unwrap();
+        assert_eq!(VectorReader::count(&r), 8);
+        assert_eq!(r.get_slice(7), [70, 71, 72].as_slice());
+        assert_eq!(r.get(4).unwrap(), vec![40, 41, 42]);
+    }
+}

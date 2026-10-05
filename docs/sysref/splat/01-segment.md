@@ -67,7 +67,7 @@ real time in kernel page zeroing.
 ## Where in code
 
 `sorted_index_extract_{fvec,mvec,slab}` in
-`veks-pipeline/src/pipeline/commands/gen_extract.rs`, the block
+`crates/veks-pipeline/src/pipeline/commands/gen_extract.rs`, the block
 labeled "Determine partition count from memory budget" (and the
 fvec-specific "Partition sizing" block).
 

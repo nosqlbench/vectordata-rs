@@ -41,7 +41,7 @@ vectordata datasets describe my-dataset   # profiles, facets, metric
 vectordata datasets precache my-dataset   # download + verify into the local cache
 ```
 
-Full walk-through: [Find and fetch datasets with the CLI](./vectordata/docs/find-and-fetch-datasets.md).
+Full walk-through: [Find and fetch datasets with the CLI](./crates/vectordata/docs/find-and-fetch-datasets.md).
 
 ## 2. Read datasets — the Rust API
 
@@ -80,36 +80,36 @@ entry alone. Uniform and variable-length facets share the same
 `view.X()` shape; typed scalars come through `open_facet_typed`.
 
 This is the prescribed pattern — full walk-through in
-[Accessing datasets from Rust](./vectordata/docs/access-datasets-from-rust.md).
+[Accessing datasets from Rust](./crates/vectordata/docs/access-datasets-from-rust.md).
 
 ## What's in the box
 
-**[vectordata](./vectordata/)** — the access library. Add it as a
+**[vectordata](./crates/vectordata/)** — the access library. Add it as a
 dependency and read any dataset from anywhere.
-([Tutorial](./vectordata/docs/access-datasets-from-rust.md) ·
+([Tutorial](./crates/vectordata/docs/access-datasets-from-rust.md) ·
 [API Reference](./docs/sysref/02-api.md))
 
-**[veks](./veks/)** — the CLI. Bootstrap new datasets, run processing
+**[veks](./crates/veks/)** — the CLI. Bootstrap new datasets, run processing
 pipelines, analyze data, publish to catalogs.
 ([Commands](./docs/sysref/05-commands.md) |
 [Pipeline](./docs/sysref/04-pipeline.md) |
 [Import](./docs/sysref/07-import.md))
 
-**[vecd](./vecd/)** — the server. Self-host a private gateway that publishes
+**[vecd](./crates/vecd/)** — the server. Self-host a private gateway that publishes
 datasets over HTTP with authentication, per-namespace access control, and
 versioned atomic uploads.
 ([Intro & quickstart](./docs/guides/vecd-intro.md) ·
 [End-to-end tutorial](./docs/tutorials/vecd-end-to-end/) ·
 [Design](./docs/design/vecd-daemon.md))
 
-**[veks-pipeline](./veks-pipeline/)** — 50+ pipeline commands for KNN
+**[veks-pipeline](./crates/veks-pipeline/)** — 50+ pipeline commands for KNN
 computation, metadata synthesis, predicate evaluation, filtered search,
 and verification.
 
-**[slabtastic](./slabtastic/)** — page-aligned storage engine for
+**[slabtastic](./crates/slabtastic/)** — page-aligned storage engine for
 variable-length records.
 
-**[veks-anode](./veks-anode/)** — binary codecs for structured metadata
+**[veks-anode](./crates/veks-anode/)** — binary codecs for structured metadata
 and predicate trees.
 
 ---
@@ -147,7 +147,7 @@ tolerance is justified.
 See it live in 5 seconds — every available engine on one fixture, side by side:
 
 ```bash
-cargo install --features knnutils,faiss --path veks
+cargo install --features knnutils,faiss --path crates/veks
 veks pipeline verify engine-parity --use-synthetic \
   --dim 32 --base-count 500 --query-count 20 --neighbors 5
 ```
@@ -212,7 +212,7 @@ cargo build --release
 cargo test                           # 1000+ tests
 
 # Try it: generate a complete synthetic dataset from scratch
-cd veks/tests/fixtures/synthetic-1k
+cd crates/veks/tests/fixtures/synthetic-1k
 veks run dataset.yaml                # 18 steps, ~0.4 seconds
 veks check                           # all green
 ```

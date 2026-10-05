@@ -1,7 +1,7 @@
 # Command Reference
 
 Every command with a working example run against the
-[synthetic-1k](../../veks/tests/fixtures/synthetic-1k/) test fixture.
+[synthetic-1k](../../../crates/veks/tests/fixtures/synthetic-1k/) test fixture.
 
 ## Analyze
 

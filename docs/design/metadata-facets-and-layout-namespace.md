@@ -75,7 +75,7 @@ is established.
 
 ## How the design fork was found and resolved
 
-**The `vectordata` layout API** (`vectordata/src/dataset/layout.rs`):
+**The `vectordata` layout API** (`crates/vectordata/src/dataset/layout.rs`):
 - `LAYOUT_NAMESPACE` (`"layout"`), `read_layout_bytes(locator)` (reads the
   opaque schema bytes from a `path` / `path#namespace` slab locator; a
   missing namespace is `Ok(None)`, not an error), and
@@ -182,7 +182,7 @@ rulings mechanically checkable rather than convention:
 > always tell what facet a file or resource goes with, or how to look for,
 > given a facet, what files or resources it may contain."
 
-**The spec — `vectordata/src/dataset/facet.rs`:**
+**The spec — `crates/vectordata/src/dataset/facet.rs`:**
 - `FacetFormat` enumerates the coarse on-disk shapes (`FloatXvec`,
   `IntegerXvec`, `IntegerVarXvec`, `ScalarPacked`, `Slab`) and owns the
   extension↔format mapping (`extensions`, `from_extension`).
@@ -207,7 +207,7 @@ filesystem probe entirely from `StandardFacet::basenames()` ×
 `formats().extensions()`. There is one source of truth.
 
 **Enforcement is a check-time gate —
-`vectordata/src/dataset/conformance.rs` + `veks/src/check`:**
+`crates/vectordata/src/dataset/conformance.rs` + `crates/veks/src/check`:**
 - `validate_conformance(&DatasetConfig) -> Result<(), Vec<FacetViolation>>`
   verifies every profile view whose key resolves to a standard facet
   declares a resource whose format the facet permits (custom keys and

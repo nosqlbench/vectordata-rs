@@ -120,7 +120,7 @@ All congruent with the CLI↔yaml mirror rule (every knob reachable from both
 surfaces):
 
 1. **Surface `--sized-profiles` on `prepare bootstrap`** — exists in
-   `ImportArgs` (`veks/src/prepare/import.rs`) but is wizard-only today.
+   `ImportArgs` (`crates/veks/src/prepare/import.rs`) but is wizard-only today.
    Declaring strata at bootstrap time gets deferred sized expansion in one
    `veks run`, and the KNN segment cache shares work across profiles.
    *Fallback*: bootstrap → run → `veks prepare stratify --spec` → run again
@@ -134,7 +134,7 @@ surfaces):
 3. **Only if O with a custom scope: fix the `oracle_scope` round-trip bug** —
    bootstrap writes it as a bare `attributes:` key but the runner reads
    `attributes.tags["oracle_scope"]`, so custom scopes are silently dropped
-   (`import.rs` yaml emission vs `veks-pipeline/src/pipeline/mod.rs` reader).
+   (`import.rs` yaml emission vs `crates/veks-pipeline/src/pipeline/mod.rs` reader).
    *Workaround*: hand-write it under `attributes.tags`.
 4. **Confirm multi-shard parquet ingestion** for base vectors, or consolidate
    shards to one file in Phase 2's output step.
@@ -160,7 +160,7 @@ surfaces):
   - **`metadata_all.parquet`** with columns `category` (int id 0–32; name
     table in the layout), `price_cents` (i64), `average_rating`,
     `rating_number`, `store`. The parquet→MNode reader
-    (`veks-core/src/formats/reader/parquet_mnode.rs`) ingests this directly
+    (`crates/veks-core/src/formats/reader/parquet_mnode.rs`) ingests this directly
     into the M facet.
 
 ### Phase 2 — embedding (per the §3 decision)

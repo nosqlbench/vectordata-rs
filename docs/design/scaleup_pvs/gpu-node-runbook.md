@@ -44,7 +44,7 @@ export HF_HOME=/scratch/hf   # model cache is re-fetchable; fine to lose on stop
 
 ```bash
 git clone <repo> vectordata-rs && cd vectordata-rs   # see "source transfer" note below
-cargo install --path veks --features embed-cuda
+cargo install --path crates/veks --features embed-cuda
 veks help embed   # must resolve; confirms the command registry has generate embed
 ```
 

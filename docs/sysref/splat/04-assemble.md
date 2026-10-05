@@ -71,6 +71,6 @@ tens of seconds in kernel page-zeroing, which reads as a hang.
 the `transpose_fn`/chunked extract closures in
 `sorted_index_extract_fvec`, and the pair-collection loop in
 `sorted_index_extract_slab`
-(`veks-pipeline/src/pipeline/commands/gen_extract.rs`).
+(`crates/veks-pipeline/src/pipeline/commands/gen_extract.rs`).
 
 Next: [05-transfer.md](./05-transfer.md) — flushing the segment.

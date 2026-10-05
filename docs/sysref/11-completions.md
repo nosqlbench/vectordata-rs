@@ -64,7 +64,7 @@ User presses Tab
 - `next_tap_state`, `TAP_ADVANCE_MS` — pure tap-cadence rule + state
   type; lets embedders script timing scenarios.
 
-**`veks/src/cli/dyncomp.rs`** — veks-specific wiring:
+**`crates/veks/src/cli/dyncomp.rs`** — veks-specific wiring:
 
 - `build_tree()` walks the clap `Command` tree → `CommandTree`.
 - Hidden subcommands (clap `hide(true)`) become `level=2` so they
@@ -250,7 +250,7 @@ has children.
 
 ## 11.8 End-to-End Coding Scenario (Worked Example)
 
-`veks-completion/examples/metricsql.rs` is a complete, runnable
+`crates/veks-completion/examples/metricsql.rs` is a complete, runnable
 adoption walkthrough — the same pattern any downstream user will
 follow when wiring veks-completion into a tool that needs
 grammar-aware completion. Read it as the reference implementation.
@@ -634,7 +634,7 @@ completion to "just work" inside complex expressions.
 
 ### Verifying the Contract
 
-The provider tests in `veks-completion/src/providers.rs` exercise
+The provider tests in `crates/veks-completion/src/providers.rs` exercise
 both layers:
 
 - Candidate-shape assertions verify Layer 1 (intent): e.g.,
@@ -648,7 +648,7 @@ both layers:
   see — proving the engine's view of the splice point matches the
   hook's `COMP_WORDBREAKS`-driven view.
 - The trailing-space contract is pinned by the emission tests in
-  `veks-completion/src/lib.rs` (`trace_unique_subcommand_carries_trailing_space`
+  `crates/veks-completion/src/lib.rs` (`trace_unique_subcommand_carries_trailing_space`
   and friends), which drive `trace_completion_candidates` — the
   pure surface behind the `---trace-completion` diagnostic — and
   assert byte-exact `COMPREPLY` content: `TERMINAL` words carry

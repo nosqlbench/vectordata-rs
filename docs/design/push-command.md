@@ -118,7 +118,7 @@ overwrite-gating, and audit-log rules still apply in full; `--raw` relaxes
 ## Binding: `.publish_url` is the contract
 
 The `.publish_url` file (already used by `veks`; see
-`veks/src/check/publish_url.rs`) is the single source of truth for "where does
+`crates/veks/src/check/publish_url.rs`) is the single source of truth for "where does
 this data belong." `push` both **honors** and **persists** it.
 
 ```
@@ -272,7 +272,7 @@ We use **SHA-256**, emitted in `sha256sum`-compatible form. The efficiency
 trade-off lands here decisively:
 
 - The repo already commits to SHA-256 everywhere it hashes content — the merkle
-  scheme is `sha2 = "0.10"` (`vectordata/src/merkle/mod.rs`). SHA-1 is not even
+  scheme is `sha2 = "0.10"` (`crates/vectordata/src/merkle/mod.rs`). SHA-1 is not even
   a workspace dependency. Using SHA-256 means one hash family across the
   internal merkle and the external checksum file, and zero new dependencies;
   SHA-1 would *add* one.
@@ -503,7 +503,7 @@ struct RemoteObject { size: u64, digest: Digest } // ETag or merkle root
 | `file://`, bare local path | filesystem copy preserving the tree | `stat` size + digest |
 
 The `s3://` ↔ `https://bucket.s3.region.amazonaws.com/` normalization already
-in `vectordata/src/transport/mod.rs` is reused so the local binding can be
+in `crates/vectordata/src/transport/mod.rs` is reused so the local binding can be
 `s3://…` while the actual HTTP verbs go to the virtual-hosted host. A generic
 `https://` host that is *not* S3-shaped uses plain REST `PUT` semantics and
 expects an object-store gateway that honors them; this is documented as the

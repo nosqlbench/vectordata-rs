@@ -228,7 +228,7 @@ only sequential disk I/O, confining all random access to memory.
 
 Step-by-step guides: [SPLAT guide](./splat/README.md).
 Implementations: `sorted_index_extract_{fvec,mvec,slab}` in
-`veks-pipeline/src/pipeline/commands/gen_extract.rs`.
+`crates/veks-pipeline/src/pipeline/commands/gen_extract.rs`.
 
 ### Problem
 

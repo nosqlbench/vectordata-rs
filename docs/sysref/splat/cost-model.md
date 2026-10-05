@@ -175,7 +175,7 @@ form. A gather costs `N / IOPS(R)`; SPLAT costs `P` scans, or
 For `R = 4100 B`, `penalty` is 179 on the HDD and 3.6 on this NVMe — so
 the HDD tolerates 179 passes before ordering stops paying, and the NVMe
 tolerates 3. The full table is in the [gsplat cost
-model](../../../veks-studies/docs/gsplat/cost-model.md#where-ordering-starts-to-pay).
+model](../../../crates/veks-studies/docs/gsplat/cost-model.md#where-ordering-starts-to-pay).
 
 **`penalty` depends on I/O concurrency, and both figures above are at
 `iodepth=10`**, because that is what the source measurements used. Each
@@ -190,10 +190,10 @@ The practical reading for this project is that SPLAT's case rests on
 seek-bound media, small records, or modest issue concurrency — and that a
 deeply-pipelined reader on current flash is already buying what ordering
 would have sold it. See [How the line moves with
-concurrency](../../../veks-studies/docs/gsplat/cost-model.md#how-the-line-moves-with-concurrency).
+concurrency](../../../crates/veks-studies/docs/gsplat/cost-model.md#how-the-line-moves-with-concurrency).
 
 **What the device is actually doing.** An event-driven model of the
-storage path (`veks-studies/src/io/`) reproduces these sweeps to within
+storage path (`crates/veks-studies/src/io/`) reproduces these sweeps to within
 5% on the HDD without computing a throughput anywhere, and reports where
 the time goes. Under scattered 4 KiB reads the HDD spends **99% of its
 busy time positioning and 1% transferring**; reading the same bytes in
@@ -278,7 +278,7 @@ result:
 80× on the HDD and 1.7× on the NVMe, from one configuration change.
 Equivalently: ordering pays once `M > payload / penalty(R)`, which here
 is 143 GiB / 9.2 ≈ 15.6 GiB. See the [gsplat cost
-model](../../../veks-studies/docs/gsplat/cost-model.md#where-ordering-starts-to-pay) for the
+model](../../../crates/veks-studies/docs/gsplat/cost-model.md#where-ordering-starts-to-pay) for the
 derivation and the full table.
 
 ### C — S2OA passage spine: 450M × 1024-d f32
@@ -374,7 +374,7 @@ routine; not worth it while extracts fit in a handful of passes.
 
 Pass sizing: the "Determine partition count from memory budget" block in
 `sorted_index_extract_{fvec,mvec,slab}`
-(`veks-pipeline/src/pipeline/commands/gen_extract.rs`) —
+(`crates/veks-pipeline/src/pipeline/commands/gen_extract.rs`) —
 `records_per_partition`, `num_partitions`, `partition_size` are `S`, `P`,
 and the segment size above. `advise_sequential()` on the source reader
 is at the head of the fvec and mvec extractors.
@@ -384,7 +384,7 @@ Back to the overview: [README.md](./README.md).
 ## References
 
 Device figures and mechanisms in this document come from the sources
-catalogued in the [gsplat cost model](../../../veks-studies/docs/gsplat/cost-model.md#references).
+catalogued in the [gsplat cost model](../../../crates/veks-studies/docs/gsplat/cost-model.md#references).
 The ones this document depends on most directly:
 
 - [perfscripts](https://github.com/jshook/perfscripts) — the fio corpus

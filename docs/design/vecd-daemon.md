@@ -1205,7 +1205,7 @@ the root `Cargo.toml` members. Dependency direction stays acyclic:
 — `vecd` is downstream of both, so no cycle.
 
 ```
-vecd/Cargo.toml         # deps: axum 0.8, tokio (full), rusqlite 0.31 (bundled),
+crates/vecd/Cargo.toml         # deps: axum 0.8, tokio (full), rusqlite 0.31 (bundled),
                         #       clap 4 + clap_complete (dynamic), sha2, hex, aws-sdk-s3, rustls,
                         #       vectordata (path) — reuse PUBLISH_FILE/PUSHLOG_FILE/CHECKSUMS_FILE
                         #       constants + pushlog parsing for provenance-awareness;
@@ -1414,18 +1414,18 @@ or the anonymous defaults.
 
 **Frozen contract (must not regress):**
 
-- **REST object contract push relies on** — `vectordata/tests/push_https.rs`:
+- **REST object contract push relies on** — `crates/vectordata/tests/push_https.rs`:
   `https_transport_verbs_and_conditional_put`, `push_over_https_end_to_end`,
   `https_auth_failure_then_success_with_token`,
   `push_refuses_endpoint_that_ignores_conditional_writes`.
-- **push ↔ vecd** — `vecd/tests/push_against_vecd.rs`:
+- **push ↔ vecd** — `crates/vecd/tests/push_against_vecd.rs`:
   `push_succeeds_and_is_retrievable`, `push_without_token_is_rejected`,
   `read_only_token_cannot_push`, and (the read-path invariant)
   **`public_binding_enables_anonymous_pull`**; plus
-  `vecd/tests/cli_end_to_end.rs::cli_init_serve_push_pull`.
-- **Read/pull path (anonymous)** — `vectordata/tests/http_storage.rs` (the
+  `crates/vecd/tests/cli_end_to_end.rs::cli_init_serve_push_pull`.
+- **Read/pull path (anonymous)** — `crates/vectordata/tests/http_storage.rs` (the
   cached/chunked/merkle-verified read stack) and
-  `vectordata/tests/chunked_http_stress.rs` (chunk-resumable download). These
+  `crates/vectordata/tests/chunked_http_stress.rs` (chunk-resumable download). These
   are the guardrail that **read-side auth stays opt-in**: public reads keep
   working with no token, and the resume machinery the client backup reuses
   does not regress. (`catalog_knn_entries_fallback.rs` covers HTTP catalog

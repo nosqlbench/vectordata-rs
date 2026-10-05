@@ -109,7 +109,7 @@ mod packaging_tests {
     /// for everyone else first.
     #[test]
     fn the_published_veks_crate_still_provides_its_own_binary() {
-        let veks = manifest("veks/Cargo.toml");
+        let veks = manifest("crates/veks/Cargo.toml");
         assert!(
             declares_bin(&veks, "veks"),
             "the veks crate must keep its own bin for `cargo install veks`"

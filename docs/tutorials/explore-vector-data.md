@@ -12,7 +12,7 @@ specifier (`name:profile:facet`), or a profile from a remote catalog.
 
 ## Prerequisites
 
-- A built `veks` binary (`cargo install --path veks`)
+- A built `veks` binary (`cargo install --path crates/veks`)
 - Either a local vector file or a dataset configured via
   `veks datasets list` (or `veks datasets add-catalog`)
 

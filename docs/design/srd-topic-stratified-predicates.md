@@ -2022,7 +2022,7 @@ fixtures: the pipeline runs, the enriched M facet carries all eight
 columns, `predicates.slab` carries both namespaces with matching
 counts, and every generated predicate returns a non-empty match set at
 a profile above the threshold (TS-42). *Realised 2026-09-02* as
-`veks/tests/e2e_topic_predicates.rs`: a planted corpus of 200 passages
+`crates/veks/tests/e2e_topic_predicates.rs`: a planted corpus of 200 passages
 in 50 papers around six leaf directions with matching vocabulary and
 metadata is bootstrapped by `veks prepare bootstrap`, extended exactly
 as tessera's definition is, and run through the binary; every retained

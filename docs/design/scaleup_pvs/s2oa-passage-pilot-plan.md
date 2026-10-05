@@ -8,7 +8,7 @@ S2OA design), [`s2oa-passage-pipeline.drawio.png`](s2oa-passage-pipeline.drawio.
 This plan settles the hand-off's §7 decisions, specifies the three new
 pipeline commands, and defines the runnable end-to-end sequence and its
 tests. Codebase facts referenced here were verified this session
-(command contract: `veks-pipeline/src/pipeline/command.rs:62`; registry:
+(command contract: `crates/veks-pipeline/src/pipeline/command.rs:62`; registry:
 `commands/mod.rs:120`; CLI↔YAML mirror: `cli.rs:114-165` — option names
 are simultaneously the `--flags` and the `dataset.yaml` step keys, so the
 congruence rule is satisfied by construction).
@@ -30,7 +30,7 @@ congruence rule is satisfied by construction).
 
 ## 2. `download s2ag`
 
-New file `veks-pipeline/src/pipeline/commands/fetch_s2ag.rs`, registered in
+New file `crates/veks-pipeline/src/pipeline/commands/fetch_s2ag.rs`, registered in
 the `download` block of `register_all`. `CAT_DOWNLOAD` / `LVL_PRIMARY`.
 
 Options (names = YAML keys = `--flags`):
@@ -67,10 +67,10 @@ already taken by the hand-written dataset commands.)
 
 ## 3. `generate passages`
 
-New file `veks-pipeline/src/pipeline/commands/gen_passages.rs`, registered
+New file `crates/veks-pipeline/src/pipeline/commands/gen_passages.rs`, registered
 as `generate passages`. `CAT_GENERATE` / `LVL_PRIMARY`. Parquet writing goes
 through a new small table codec in **veks-core** (which already carries
-`arrow`/`parquet` 54 unconditionally): `veks-core/src/formats/passage_table.rs`
+`arrow`/`parquet` 54 unconditionally): `crates/veks-core/src/formats/passage_table.rs`
 (schema authority, staged atomic writers, read-back, footer row-count probe).
 veks-pipeline stays free of direct arrow/parquet deps, consistent with the
 existing pattern (parquet is reached only through veks-core). This is the
@@ -149,7 +149,7 @@ Reference implementation is a ~30-line Python script recorded in §7; it is
 not a repo artifact (external stage by decision D3).
 
 **`verify alignment`** — new file
-`veks-pipeline/src/pipeline/commands/verify_alignment.rs`, registered as
+`crates/veks-pipeline/src/pipeline/commands/verify_alignment.rs`, registered as
 `verify alignment`. `CAT_VERIFY` / `LVL_PRIMARY`. Asserts the ordinal-
 alignment invariant *before* bootstrap consumes the vectors:
 
@@ -202,7 +202,7 @@ pure resolver fn taking the env value as a parameter.
 1. **Chunker unit tests** (`gen_passages.rs`): section labeling, budget
    packing/splitting/merging edges, zero-passage records, doc-limit
    selection rule, `doc-order` shuffle determinism per seed.
-2. **`generate passages` integration** (`veks-pipeline/tests/`): registry-
+2. **`generate passages` integration** (`crates/veks-pipeline/tests/`): registry-
    driven execute over `.jsonl` and `.jsonl.gz` fixtures → read back parquet
    (arrow/parquet as dev-deps, matching veks's precedent) → numerical
    verification: passage/parent counts, parent-block contiguity, global-
@@ -214,7 +214,7 @@ pure resolver fn taking the env value as a parameter.
    signed-query-string shard URLs → assert selection rule, filename
    stripping, resume-skip on second run, failure without key.
 4. **`verify alignment`**: aligned/misaligned npy×parquet pairs; dim check.
-5. **e2e slice** (`veks/tests/`): fixture passages + synthetic aligned
+5. **e2e slice** (`crates/veks/tests/`): fixture passages + synthetic aligned
    vectors → `verify alignment` → bootstrap (BQGD, Cosine, self-search) →
    `veks run` → integrity checks green — the DoD-2 shape at toy scale.
 

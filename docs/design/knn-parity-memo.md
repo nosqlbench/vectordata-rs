@@ -47,7 +47,7 @@ arithmetic — this test would still pass.
 return as the k closest?*
 
 Measured by: `cross_engine_knn_parity` (integration test in
-`veks-pipeline/tests/command_edge_cases.rs`).
+`crates/veks-pipeline/tests/command_edge_cases.rs`).
 
 Mechanics: each engine runs in its default production configuration
 (no `rerank_margin_ratio` by default — though the test now sets it, via
