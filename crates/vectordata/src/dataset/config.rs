@@ -576,18 +576,24 @@ impl DatasetConfig {
                 };
                 // The `source:` keeps whatever directory prefix it
                 // had — and its window and namespace, which are
-                // untouched — and gains the shard field (SH-47).
-                let file = std::path::Path::new(&path);
-                let (basename, ext) = match file.file_name().and_then(|n| n.to_str()) {
-                    Some(name) => match name.rsplit_once('.') {
-                        Some((b, e)) => (b.to_string(), e.to_string()),
-                        None => (name.to_string(), String::new()),
-                    },
-                    None => continue,
+                // untouched — and gains the shard field (SH-47). The
+                // prefix is kept as the declared text: a declaration
+                // is `/`-separated on every platform, and rebuilding
+                // it through `Path::join` would write `\` on Windows.
+                let (dir, name) = match path.rsplit_once('/') {
+                    Some((d, n)) => (Some(d), n),
+                    None => (None, path.as_str()),
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                let (basename, ext) = match name.rsplit_once('.') {
+                    Some((b, e)) => (b.to_string(), e.to_string()),
+                    None => (name.to_string(), String::new()),
                 };
                 let pattern = super::shards::shard_source_spec(&basename, &ext);
-                let spec = match file.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    Some(dir) => dir.join(&pattern).to_string_lossy().into_owned(),
+                let spec = match dir {
+                    Some(d) => format!("{d}/{pattern}"),
                     None => pattern,
                 };
                 view.source.path = spec;
