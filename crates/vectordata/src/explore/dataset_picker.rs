@@ -1292,7 +1292,7 @@ pub(super) fn purge_cache_for_profiles(
                 let clean = crate::dataset::catalog::strip_window_suffix(&v.source.path);
                 entry
                     .resolve_facet_url(clean)
-                    .map(|url| crate::view::facet_cache_relpath(&url, &home_slash).to_string())
+                    .map(|url| crate::view::facet_cache_relpath(&url, &home_slash))
             })
             .collect()
     };
@@ -1624,7 +1624,7 @@ fn collect_local_knowledge(
                     continue; // already fully answered
                 }
                 let relpath = crate::view::facet_cache_relpath(&shape.url, &home);
-                let (bytes, header_file) = if let Some(cv) = survey.get(&ds_workspace.join(relpath)) {
+                let (bytes, header_file) = if let Some(cv) = survey.get(&ds_workspace.join(&relpath)) {
                     (Some(cv.total_size), Some(cv.cache_file_path.clone()))
                 } else {
                     let clean = strip_window_suffix(&view.source.path);

@@ -3324,12 +3324,30 @@ enum ResourceLocation {
 /// directory (`<cache_root>/<dataset>/<relpath>`): the home-relative
 /// path when the facet lives under the dataset's home URL, otherwise
 /// the URL basename — flat under the dataset directory, per the
-/// mandated dataset-keyed layout.
-pub(crate) fn facet_cache_relpath<'a>(resolved: &'a str, home_norm: &str) -> &'a str {
-    if let Some(rel) = resolved.strip_prefix(home_norm) {
-        return rel;
+/// mandated dataset-keyed layout. The result is `/`-separated.
+///
+/// A local facet resolves through `Path::join`, which on Windows
+/// yields mixed separators (`C:\ds\a/b.fvec`) while the home is
+/// written `C:\ds/`; both sides are compared with `/` separators, or
+/// the prefix never matches and every local facet falls back to its
+/// basename — colliding with any other facet that shares one.
+pub(crate) fn facet_cache_relpath(resolved: &str, home_norm: &str) -> String {
+    let resolved = forward_slashes(resolved);
+    let home_norm = forward_slashes(home_norm);
+    if let Some(rel) = resolved.strip_prefix(home_norm.as_ref()) {
+        return rel.to_string();
     }
-    resolved.rsplit('/').next().unwrap_or(resolved)
+    resolved.rsplit('/').next().unwrap_or(&resolved).to_string()
+}
+
+/// `s` with Windows path separators rewritten to `/`. A no-op on
+/// other platforms, where `\` is an ordinary filename character.
+fn forward_slashes(s: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) && s.contains('\\') {
+        std::borrow::Cow::Owned(s.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
 }
 
 impl GenericTestDataView {
@@ -3582,8 +3600,8 @@ impl TestDataView for GenericTestDataView {
                     format!("{home}/")
                 };
                 let file_relpath = facet_cache_relpath(&resolved, &home_norm);
-                self.reject_relpath_collisions(name, &resolved, file_relpath, &home_norm)?;
-                crate::storage::Storage::open_layered(&resolved, ds_name, file_relpath, home)
+                self.reject_relpath_collisions(name, &resolved, &file_relpath, &home_norm)?;
+                crate::storage::Storage::open_layered(&resolved, ds_name, &file_relpath, home)
             }
             _ => crate::storage::Storage::open(&resolved),
         }
@@ -3605,7 +3623,7 @@ impl GenericTestDataView {
                 } else {
                     format!("{home}/")
                 };
-                let relpath = facet_cache_relpath(&resolved, &home_norm).to_string();
+                let relpath = facet_cache_relpath(&resolved, &home_norm);
                 self.reject_relpath_collisions(facet, &resolved, &relpath, &home_norm)?;
                 ShardOpen::Layered {
                     resolved,
@@ -3675,6 +3693,22 @@ impl GenericTestDataView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn facet_cache_relpath_keeps_the_home_relative_path() {
+        assert_eq!(facet_cache_relpath("https://h/ds/a/b.fvec", "https://h/ds/"), "a/b.fvec");
+        assert_eq!(facet_cache_relpath("https://elsewhere/x/b.fvec", "https://h/ds/"), "b.fvec");
+    }
+
+    /// A local facet resolved through `Path::join` on Windows mixes
+    /// separators; it must still cache under its home-relative path,
+    /// not collapse to a basename another facet may share.
+    #[cfg(windows)]
+    #[test]
+    fn facet_cache_relpath_reads_windows_separators() {
+        assert_eq!(facet_cache_relpath(r"C:\tmp\ds\a/b__0001.fvec", r"C:\tmp\ds/"), "a/b__0001.fvec");
+        assert_eq!(facet_cache_relpath(r"C:\tmp\ds\a\b.fvec", r"C:\tmp\ds\"), "a/b.fvec");
+    }
 
     #[test]
     fn is_absolute_url_recognises_http_schemes() {
