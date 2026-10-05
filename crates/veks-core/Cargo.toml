@@ -1,6 +1,6 @@
 [package]
 name = "veks-core"
-version = "2.1.0"
+version = "2.3.0"
 edition = "2024"
 description = "Core utilities for veks — terminal, filters, UI, format I/O"
 license = "Apache-2.0"
@@ -24,8 +24,8 @@ parquet = "54"
 ratatui = { version = "0.29", features = ["all-widgets"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-slabtastic = { path = "../slabtastic", version = "1.0.0" }
-veks-io = { path = "../veks-io", version = "1.0.0" }
+slabtastic = { path = "../slabtastic", version = "2.3.0" }
+veks-io = { path = "../veks-io", version = "2.3.0" }
 veks-simd = { path = "../veks-simd", version = "2.2.0" }
 vectordata = { path = "../vectordata", version = "2.0.0" }
 

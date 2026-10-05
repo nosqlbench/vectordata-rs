@@ -1,6 +1,6 @@
 [package]
 name = "veks-simd"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2024"
 description = "Pure-Rust SIMD distance, query-batch and f16 conversion kernels for vectordata and veks, with runtime ISA dispatch"
 license = "Apache-2.0"
