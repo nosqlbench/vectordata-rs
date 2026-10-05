@@ -24,10 +24,10 @@ knn\_utils behavior with byte-identical results.
 
 | knn\_utils Dependency | veks Approach | Feature Flag |
 |-----------------------|---------------|-------------|
-| FAISS (KNN) | Direct BLAS `cblas_sgemm` + Rust top-k heap | `knnutils` |
+| FAISS (KNN) | sgemm + Rust top-k heap: pure-Rust `gemm`, or system `cblas_sgemm` (`--backend system`) | always; `blas-system` for the system BLAS |
 | FAISS (A/B testing) | `faiss` crate with vendored FAISS 1.9.0 | `faiss` |
 | numpy (normalization) | numpy subprocess call (byte-identical) | `knnutils` |
-| numpy (norms) | BLAS `cblas_snrm2` / `cblas_sdot` | `knnutils` |
+| numpy (norms) | `sqrt(v · v)` on the native SIMD kernel | `knnutils` |
 | numpy (shuffle) | Rust MT19937 (`rand_mt`) with `rk_interval` | `knnutils` |
 | h5py (HDF5 I/O) | **Removed** — pre-convert to fvec format | — |
 | Arrow/Parquet | `arrow-rs` + `parquet` (pure Rust) | always |
@@ -37,15 +37,16 @@ knn\_utils behavior with byte-identical results.
 ## 2. Feature Flags
 
 ```
-cargo build                        # vanilla — no knnutils, no BLAS needed
-cargo build --features knnutils    # knn_utils personality (needs system libopenblas-dev)
-cargo build --features faiss       # adds FAISS for A/B testing (needs cmake + g++)
+cargo build                           # veks: knnutils is a default feature, pure Rust
+cargo build --features blas-system    # adds `--backend system` (needs libopenblas-dev / libmkl-dev)
+cargo build --features faiss          # adds FAISS for A/B testing (needs cmake + g++)
 ```
 
 | Feature | Build Requirements | What It Enables |
 |---------|-------------------|-----------------|
-| (none) | vanilla cargo | Native SimSIMD pipeline only |
-| `knnutils` | `libopenblas-dev` (apt) | knn\_utils personality commands, BLAS sgemm KNN |
+| `knnutils` (default) | vanilla cargo | knn\_utils personality commands; `compute knn-blas` on the pure-Rust `gemm` crate |
+| `blas-system` | `libopenblas-dev` or `libmkl-dev` (apt), unix | `--backend system`: the sgemm scans on the system `cblas_sgemm` |
+| `simsimd` | a C compiler | `--backend simsimd`: pairwise scans on simsimd |
 | `faiss` | cmake + g++ + BLAS | `compute knn-faiss` for A/B verification |
 
 ---
@@ -134,15 +135,18 @@ fully sort within prefix groups.
 
 ## 5. BLAS Dependency and Licensing
 
-The knn\_utils personality commands call BLAS routines (`cblas_sgemm`,
-`cblas_snrm2`, `cblas_sdot`) through whatever system BLAS is linked.
+With `--backend system` (a `blas-system` build), the sgemm scans call
+`cblas_sgemm` through whatever system BLAS is linked. By default they
+run on the pure-Rust `gemm` crate, and the norm commands always use the
+native `sqrt(v · v)` kernel.
 
 knn\_utils uses Intel MKL (`mkl=2023.1.0`). The `libmkl-dev` Debian
 package is freely distributed by Intel via apt under the Intel
 Simplified Software License (ISSL).
 
-**With MKL**: `compute knn-blas` output matches Python knn\_utils on
-the same machine (verified byte-identical for a 128-dim HDF5 dataset).
+**With MKL** (`--backend system`): `compute knn-blas` output matches
+Python knn\_utils on the same machine (verified byte-identical for a
+128-dim HDF5 dataset).
 
 **With OpenBLAS**: 99.95% identical neighbor sets; ~5 queries per 10k
 swap a single neighbor at the k=100 boundary (ULP-level BLAS rounding).

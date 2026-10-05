@@ -23,7 +23,7 @@ and UI layer.
 | CLI | clap v4 |
 | I/O | memmap2, reqwest |
 | Concurrency | std::thread::scope, rayon |
-| SIMD distance | simsimd |
+| SIMD distance | veks-simd (on fearless_simd); gemm for sgemm |
 | Progress | indicatif |
 | TUI | ratatui |
 
@@ -345,7 +345,7 @@ When `partition_oracles = true`, the pipeline has three phases:
 3. **Phase 3** (partition KNN): pipeline re-loads dataset.yaml, sees
    new partition profiles, re-expands `per_profile` templates
    (compute-knn, verify-knn) for each partition. The same compute-knn
-   code path with SimSIMD + batching + caching runs for each partition.
+   code path with the native batch kernels + caching runs for each partition.
    Already-completed steps skip via freshness checks.
 
 ### Step activation conditions

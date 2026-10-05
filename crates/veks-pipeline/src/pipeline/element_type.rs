@@ -67,9 +67,10 @@ impl ElementType {
         matches!(self, Self::F64 | Self::F32 | Self::F16)
     }
 
-    /// Returns `true` if SIMD-accelerated distance functions are available.
+    /// Returns `true` if SIMD-accelerated distance functions are available
+    /// (the float types; `veks-simd` has no integer kernels).
     pub fn supports_simd_distance(&self) -> bool {
-        matches!(self, Self::F64 | Self::F32 | Self::F16 | Self::I8)
+        matches!(self, Self::F64 | Self::F32 | Self::F16)
     }
 
     /// Machine epsilon for floating-point types. `None` for integers.

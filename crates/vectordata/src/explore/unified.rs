@@ -31,7 +31,21 @@ use ratatui::{
     widgets::{Axis, Bar, BarChart, BarGroup, Block, Borders, Chart, Dataset, GraphType, Paragraph, canvas::{Canvas, Points}},
     Terminal,
 };
-use simsimd::SpatialSimilarity;
+use std::sync::LazyLock;
+
+/// The native f32 inner product, resolved once for the process.
+static DOT_F32: LazyLock<veks_simd::DistFnF32> =
+    LazyLock::new(|| veks_simd::Kernels::detected().dot_f32());
+
+/// The native squared-L2 kernel, resolved once for the process.
+static L2SQ_F32: LazyLock<veks_simd::DistFnF32> =
+    LazyLock::new(|| veks_simd::Kernels::detected().distance_f32(veks_simd::Metric::L2));
+
+/// `a · b` on the native SIMD kernel, widened to f64 for the analytics.
+#[inline]
+fn dot64(a: &[f32], b: &[f32]) -> f64 {
+    DOT_F32(a, b) as f64
+}
 
 use super::shared::{
     SortedMirror,
@@ -74,7 +88,7 @@ const VIEW_INFO_RAW: &[&str] = &[
         "  Outlier norms: Vectors far from the mean may be degenerate (zero vectors,\n",
         "  padding, or encoding errors). Check with 'veks analyze zeros'.\n\n",
         "Computation:\n",
-        "  norm(v) = sqrt(dot(v, v)) computed via SIMD (simsimd).\n",
+        "  norm(v) = sqrt(dot(v, v)) computed via SIMD (native kernels).\n",
         "  Stats use Welford's online algorithm for numerically stable\n",
         "  incremental mean and variance.\n",
         "  NORMALIZED verdict: std < 0.01 AND |mean - 1.0| < 0.01.\n\n",
@@ -139,7 +153,7 @@ const VIEW_INFO_RAW: &[&str] = &[
         "  For each component k: iterate v ← (X^T X / n) v with deflation\n",
         "  against previously found eigenvectors. 15 iterations for the first 3\n",
         "  components, 5 for the rest. Eigenvalue = E[dot(Xv, Xv)] = v^T Sigma v.\n",
-        "  Uses simsimd SIMD dot products and rayon parallelism.",
+        "  Uses native SIMD dot products and rayon parallelism.",
     ),
     // 5: PCA Loadings heatmap
     concat!(
@@ -482,7 +496,7 @@ pub(super) fn run_interactive_explore(
 
                 for opt in vecs {
                     if let Some(v) = opt {
-                        let norm_sq = <f32 as SpatialSimilarity>::dot(&v, &v).unwrap_or(0.0);
+                        let norm_sq = dot64(&v, &v);
                         batch_norms.push(norm_sq.sqrt());
                         batch_vecs.extend_from_slice(&v);
                         batch_count += 1;
@@ -587,19 +601,10 @@ pub(super) fn run_interactive_explore(
                             dist_rx = Some(drx);
                             let buf2 = buf.clone();
                             std::thread::spawn(move || {
-                                // L2 squared via simsimd — the existing
-                                // `.sqrt()` on the result converts to true
-                                // L2 distance. Replaces the migrated-away
-                                // `pipeline::simd_distance::Metric::L2` /
-                                // `select_distance_fn` indirection.
-                                use simsimd::SpatialSimilarity;
-                                // simsimd returns Option<f64>; cast at
-                                // the boundary so the closure stays
-                                // f32-on-the-wire to match the buffer
-                                // and the `.sqrt()` consumer.
-                                let dist_fn = |a: &[f32], b: &[f32]| -> f32 {
-                                    f32::l2sq(a, b).unwrap_or(f64::INFINITY) as f32
-                                };
+                                // L2 squared on the native kernel — the
+                                // existing `.sqrt()` on the result
+                                // converts to true L2 distance.
+                                let dist_fn: veks_simd::DistFnF32 = *L2SQ_F32;
                                 let mut rng = crate::explore::seeded_rng(42);
                                 use rand::Rng;
                                 let bs = 1000;
@@ -653,7 +658,7 @@ pub(super) fn run_interactive_explore(
                                         for vi in 0..actual_n {
                                             let off = vi * dim_c;
                                             let c = &centered_buf[off..off + dim_c];
-                                            let dot = <f32 as SpatialSimilarity>::dot(c, &v_f32).unwrap_or(0.0);
+                                            let dot = dot64(c, &v_f32);
                                             for d in 0..dim_c { new_v[d] += c[d] as f64 * dot; }
                                         }
                                         for d in 0..dim_c { new_v[d] /= actual_n as f64; }
@@ -670,7 +675,7 @@ pub(super) fn run_interactive_explore(
                                     for vi in 0..actual_n {
                                         let off = vi * dim_c;
                                         let c = &centered_buf[off..off + dim_c];
-                                        let dot = <f32 as SpatialSimilarity>::dot(c, &v_f32).unwrap_or(0.0);
+                                        let dot = dot64(c, &v_f32);
                                         ev_sum += dot * dot;
                                     }
                                     let eigenvalue = ev_sum / actual_n as f64;
@@ -760,7 +765,7 @@ pub(super) fn run_interactive_explore(
                                                 let mut pcs = [0.0f64; PROJECTED_PCS];
                                                 for k in 0..PROJECTED_PCS {
                                                     let ev = if k < ev_f32.len() { &ev_f32[k] } else { &zero };
-                                                    pcs[k] = <f32 as SpatialSimilarity>::dot(&centered, ev).unwrap_or(0.0) as f64;
+                                                    pcs[k] = dot64(&centered, ev);
                                                 }
                                                 pcs
                                             }).collect::<Vec<_>>()

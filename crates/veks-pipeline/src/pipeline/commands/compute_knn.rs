@@ -224,10 +224,11 @@ fn find_top_k_batch_transposed_f32(
         Vec::new()
     };
 
-    // TransposedBatch path: pad to an even number of sub-batches so that
-    // all queries go through the dual-pair kernel exclusively. An odd
-    // trailing sub-batch would fall through to the single-batch kernel,
-    // which can produce subtly different f32 results for the same inputs.
+    // TransposedBatch path: sub-batches go through the dual kernel in
+    // pairs and an odd one out through the single kernel. Both compute
+    // each query lane with the same operations (veks-simd's lane-order
+    // invariant), so a query's distances do not depend on which kernel
+    // its sub-batch landed in.
     let mut sub_batches: Vec<TransposedBatch> = Vec::new();
     let mut sub_offsets: Vec<usize> = Vec::new();
     if !use_packed {
@@ -238,13 +239,9 @@ fn find_top_k_batch_transposed_f32(
             sub_offsets.push(offset);
             offset = sub_end;
         }
-        if !sub_batches.len().is_multiple_of(2) {
-            let empty: &[&[f32]] = &[];
-            sub_batches.push(TransposedBatch::from_f32(empty, dim));
-            sub_offsets.push(batch_size); // past end — count=0, no results consumed
-        }
     }
-    let dual_fn = simd_distance::select_dual_batched_fn_f32(metric);
+    let dfn = simd_distance::select_dual_batched_fn_f32(metric);
+    let packed_fn = simd_distance::select_packed_neg_dot_f32();
     let mut dist_buf_16 = [0.0f32; SIMD_BATCH_WIDTH];
     let mut dist_buf_32 = [0.0f32; 32];
 
@@ -289,7 +286,7 @@ fn find_top_k_batch_transposed_f32(
             if let Some(ref pk) = packed {
                 // Packed tiled path: single sequential stream
                 for v in packed_out.iter_mut() { *v = 0.0; }
-                simd_distance::packed_neg_dot_f32(base_vec, pk, &mut packed_out);
+                packed_fn(base_vec, pk, &mut packed_out);
 
                 let n = pk.n_batches();
                 for si in 0..n {
@@ -308,31 +305,29 @@ fn find_top_k_batch_transposed_f32(
             } else {
                 // Legacy dual-pair path for L2/L1
                 let mut si = 0;
-                if let Some(dfn) = dual_fn {
-                    while si + 1 < sub_batches.len() {
-                        dfn(&sub_batches[si], &sub_batches[si + 1], base_vec, &mut dist_buf_32);
-                        let off_a = sub_offsets[si];
-                        for qi in 0..sub_batches[si].count() {
-                            let gqi = off_a + qi;
-                            let dist = dist_buf_32[qi];
-                            if dist < thresholds[gqi] {
-                                heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                                if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                                if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
-                            }
+                while si + 1 < sub_batches.len() {
+                    dfn(&sub_batches[si], &sub_batches[si + 1], base_vec, &mut dist_buf_32);
+                    let off_a = sub_offsets[si];
+                    for qi in 0..sub_batches[si].count() {
+                        let gqi = off_a + qi;
+                        let dist = dist_buf_32[qi];
+                        if dist < thresholds[gqi] {
+                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
                         }
-                        let off_b = sub_offsets[si + 1];
-                        for qi in 0..sub_batches[si + 1].count() {
-                            let gqi = off_b + qi;
-                            let dist = dist_buf_32[16 + qi];
-                            if dist < thresholds[gqi] {
-                                heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                                if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                                if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
-                            }
-                        }
-                        si += 2;
                     }
+                    let off_b = sub_offsets[si + 1];
+                    for qi in 0..sub_batches[si + 1].count() {
+                        let gqi = off_b + qi;
+                        let dist = dist_buf_32[16 + qi];
+                        if dist < thresholds[gqi] {
+                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                        }
+                    }
+                    si += 2;
                 }
                 while si < sub_batches.len() {
                     batched_fn(&sub_batches[si], base_vec, &mut dist_buf_16);
@@ -385,6 +380,16 @@ struct PartitionMeta {
 /// other's cache).
 const ENGINE_NAME: &str = "knn-metal";
 
+/// Engine identifier for a run on `backend`. The native backend keeps
+/// the historical `knn-metal` name; any other backend gets its own
+/// namespace, since its kernels sum in a different order.
+fn engine_name(backend: simd_distance::PairwiseBackend) -> &'static str {
+    match backend {
+        simd_distance::PairwiseBackend::Native => ENGINE_NAME,
+        simd_distance::PairwiseBackend::Simsimd => "knn-metal-simsimd",
+    }
+}
+
 /// Build a cache file path for a partition segment.
 ///
 /// The cache key includes the engine identifier, base/query file
@@ -393,6 +398,7 @@ const ENGINE_NAME: &str = "knn-metal";
 /// overlapping base-vector windows with the same query set, k, and
 /// metric, while preventing cross-engine pollution.
 fn build_cache_path(
+    engine: &str,
     cache_dir: &Path,
     cache_prefix: &str,
     start: usize,
@@ -410,7 +416,7 @@ fn build_cache_path(
     };
     cache_dir.join(format!(
         "{}.{}.range_{:06}_{:06}.k{}.{}.{}.{}",
-        ENGINE_NAME, cache_prefix, start, end, k, metric_str, suffix, ext
+        engine, cache_prefix, start, end, k, metric_str, suffix, ext
     ))
 }
 
@@ -446,16 +452,16 @@ fn compute_partition(
     end: usize,
     k: usize,
     dist_fn: fn(&[f32], &[f32]) -> f32,
+    batched: bool,
     metric: Metric,
     dim: usize,
     threads: usize,
     pb: &ProgressHandle,
 ) -> Vec<Vec<Neighbor>> {
-    // For normalized cosine/dot data, dist_fn already uses the optimal
-    // per-pair kernel. Select the matching batched kernel: if dist_fn was
-    // chosen for DotProduct (normalized cosine), the batched kernel should
-    // also be DotProduct (neg-dot, no norm division).
-    let batched_fn = simd_distance::select_batched_fn_f32(metric);
+    // The batched kernel is chosen for the same kernel metric as
+    // dist_fn: a COSINE run on normalized data arrives here as
+    // DotProduct, and its batches score neg-dot with no norm division.
+    let batched_fn = batched.then(|| simd_distance::select_batched_fn_f32(metric));
     let base_count = end - start;
     let stride = base_count.div_ceil(STRIDES_PER_THREAD);
     let base_progress = Arc::new(AtomicU64::new(0));
@@ -701,7 +707,9 @@ fn find_top_k_batch_transposed_f16(
             offset = sub_end;
         }
     }
-    let dual_fn = simd_distance::select_dual_batched_fn_f32(metric);
+    let dfn = simd_distance::select_dual_batched_fn_f32(metric);
+    let packed_fn = simd_distance::select_packed_neg_dot_f32();
+    let to_f32 = simd_distance::select_f16_to_f32();
     let mut dist_buf_16 = [0.0f32; SIMD_BATCH_WIDTH];
     let mut dist_buf_32 = [0.0f32; 32];
 
@@ -738,11 +746,11 @@ fn find_top_k_batch_transposed_f16(
             let idx = j as u32;
 
             // Convert base vector f16→f32 ONCE via SIMD bulk conversion
-            simd_distance::convert_f16_to_f32_bulk(base_f16, &mut base_f32);
+            to_f32(base_f16, &mut base_f32);
 
             if let Some(ref pk) = packed {
                 for v in packed_out.iter_mut() { *v = 0.0; }
-                simd_distance::packed_neg_dot_f32(&base_f32, pk, &mut packed_out);
+                packed_fn(&base_f32, pk, &mut packed_out);
 
                 let n = pk.n_batches();
                 for si in 0..n {
@@ -760,31 +768,29 @@ fn find_top_k_batch_transposed_f16(
                 }
             } else {
                 let mut si = 0;
-                if let Some(dfn) = dual_fn {
-                    while si + 1 < sub_batches.len() {
-                        dfn(&sub_batches[si], &sub_batches[si + 1], &base_f32, &mut dist_buf_32);
-                        let off_a = sub_offsets[si];
-                        for qi in 0..sub_batches[si].count() {
-                            let gqi = off_a + qi;
-                            let dist = dist_buf_32[qi];
-                            if dist < thresholds[gqi] {
-                                heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                                if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                                if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
-                            }
+                while si + 1 < sub_batches.len() {
+                    dfn(&sub_batches[si], &sub_batches[si + 1], &base_f32, &mut dist_buf_32);
+                    let off_a = sub_offsets[si];
+                    for qi in 0..sub_batches[si].count() {
+                        let gqi = off_a + qi;
+                        let dist = dist_buf_32[qi];
+                        if dist < thresholds[gqi] {
+                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
                         }
-                        let off_b = sub_offsets[si + 1];
-                        for qi in 0..sub_batches[si + 1].count() {
-                            let gqi = off_b + qi;
-                            let dist = dist_buf_32[16 + qi];
-                            if dist < thresholds[gqi] {
-                                heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                                if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                                if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
-                            }
-                        }
-                        si += 2;
                     }
+                    let off_b = sub_offsets[si + 1];
+                    for qi in 0..sub_batches[si + 1].count() {
+                        let gqi = off_b + qi;
+                        let dist = dist_buf_32[16 + qi];
+                        if dist < thresholds[gqi] {
+                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                        }
+                    }
+                    si += 2;
                 }
                 while si < sub_batches.len() {
                     batched_fn(&sub_batches[si], &base_f32, &mut dist_buf_16);
@@ -827,16 +833,16 @@ fn compute_partition_f16(
     end: usize,
     k: usize,
     dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
+    batched: bool,
     metric: Metric,
     dim: usize,
     threads: usize,
     pb: &ProgressHandle,
 ) -> Vec<Vec<Neighbor>> {
-    // For normalized cosine/dot data, dist_fn already uses the optimal
-    // per-pair kernel. Select the matching batched kernel: if dist_fn was
-    // chosen for DotProduct (normalized cosine), the batched kernel should
-    // also be DotProduct (neg-dot, no norm division).
-    let batched_fn = simd_distance::select_batched_fn_f32(metric);
+    // See `compute_partition`: the batched kernel shares dist_fn's
+    // kernel metric. Base vectors are widened to f32 once each and
+    // scored with the f32 batch kernels.
+    let batched_fn = batched.then(|| simd_distance::select_batched_fn_f32(metric));
     let base_count = end - start;
     let stride = base_count.div_ceil(STRIDES_PER_THREAD);
     let base_progress = Arc::new(AtomicU64::new(0));
@@ -923,7 +929,8 @@ fn compute_partition_f16(
 
 /// Compute KNN for a single partition `[start, end)` across all f64 queries.
 ///
-/// Uses pairwise distance computation (no transposed batch kernel for f64 yet).
+/// Pairwise only: f64 has no transposed batch kernels, so `batched` is
+/// ignored.
 #[allow(clippy::too_many_arguments)]
 fn compute_partition_f64(
     query_reader: &XvecReader<f64>,
@@ -933,6 +940,7 @@ fn compute_partition_f64(
     end: usize,
     k: usize,
     dist_fn: fn(&[f64], &[f64]) -> f32,
+    _batched: bool,
     _metric: Metric,
     _dim: usize,
     threads: usize,
@@ -1576,6 +1584,15 @@ compare an ANN index's approximate results against this exact ground truth.
             base_source.window, options.get("range"),
         );
 
+        // Kernel provider. The native backend scores with the transposed
+        // batch kernels; simsimd has none, so a simsimd run scans pairwise.
+        let backend = match simd_distance::PairwiseBackend::from_options(options) {
+            Ok(b) => b,
+            Err(e) => return error_result(e, start),
+        };
+        let batched = backend.has_batch_kernels();
+        let engine = engine_name(backend);
+
         // Detect element type from base file extension and dispatch
         let etype = match ElementType::from_path(&base_path) {
             Ok(t) => t,
@@ -1583,7 +1600,10 @@ compare an ANN index's approximate results against this exact ground truth.
         };
         match etype {
             ElementType::F16 => {
-                let dist_fn = simd_distance::select_distance_fn_f16(kernel_metric);
+                let dist_fn = match backend.distance_f16(kernel_metric) {
+                    Ok(f) => f,
+                    Err(e) => return error_result(e, start),
+                };
                 execute_f16(
                     &base_path,
                     &query_path,
@@ -1593,6 +1613,8 @@ compare an ANN index's approximate results against this exact ground truth.
                     kernel_metric,
                     display_metric,
                     dist_fn,
+                    batched,
+                    engine,
                     threads,
                     partition_size,
                     base_window,
@@ -1602,7 +1624,10 @@ compare an ANN index's approximate results against this exact ground truth.
                 )
             }
             ElementType::F64 => {
-                let dist_fn = simd_distance::select_distance_fn_f64(kernel_metric);
+                let dist_fn = match backend.distance_f64(kernel_metric) {
+                    Ok(f) => f,
+                    Err(e) => return error_result(e, start),
+                };
                 execute_f64(
                     &base_path,
                     &query_path,
@@ -1612,6 +1637,8 @@ compare an ANN index's approximate results against this exact ground truth.
                     kernel_metric,
                     display_metric,
                     dist_fn,
+                    batched,
+                    engine,
                     threads,
                     partition_size,
                     base_window,
@@ -1623,7 +1650,10 @@ compare an ANN index's approximate results against this exact ground truth.
             // F32 — and any element type without a specialized arm —
             // takes the generic f32 kernel.
             _ => {
-                let dist_fn = simd_distance::select_distance_fn(kernel_metric);
+                let dist_fn = match backend.distance_f32(kernel_metric) {
+                    Ok(f) => f,
+                    Err(e) => return error_result(e, start),
+                };
                 // Margin is opt-in: default 0 ⇒ original heap sizes
                 // and pruning aggressiveness, no slowdown.
                 // `verify engine-parity` sets `rerank_margin_ratio=3`
@@ -1640,6 +1670,8 @@ compare an ANN index's approximate results against this exact ground truth.
                     kernel_metric,
                     display_metric,
                     dist_fn,
+                    batched,
+                    engine,
                     threads,
                     partition_size,
                     base_window,
@@ -1761,6 +1793,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 extended_description: None,
                 role: OptionRole::Config,
         },
+            simd_distance::PairwiseBackend::option_desc(),
         ]
     }
 
@@ -1782,8 +1815,12 @@ compare an ANN index's approximate results against this exact ground truth.
             return vec![];
         };
         let query = super::gen_predicates_common::resolve_path(query, workspace);
+        // An unparseable backend fails the step at execute time; the
+        // claim then covers the default engine's namespace.
+        let backend = simd_distance::PairwiseBackend::from_options(options)
+            .unwrap_or(simd_distance::PairwiseBackend::Native);
         vec![crate::pipeline::command::CacheClaim::Prefix(
-            super::knn_segment::engine_cache_claim(ENGINE_NAME, &base.path, &query),
+            super::knn_segment::engine_cache_claim(engine_name(backend), &base.path, &query),
         )]
     }
 }
@@ -1800,6 +1837,8 @@ fn execute_f32(
     metric: Metric,
     display_metric: Metric,
     dist_fn: fn(&[f32], &[f32]) -> f32,
+    batched: bool,
+    engine: &'static str,
     threads: usize,
     partition_size: usize,
     base_window: Option<(usize, usize)>,
@@ -1852,23 +1891,19 @@ fn execute_f32(
 
     let base_bytes = base_count as u64 * base_dim as u64 * 4;
     let query_bytes = query_count as u64 * query_dim as u64 * 4;
-    let batched_mode = if simd_distance::select_batched_fn_f32(metric).is_some() {
-        "transposed AVX-512 (16-wide)"
-    } else {
-        "per-pair SimSIMD"
-    };
+    let batched_mode = if batched { "transposed 16-wide" } else { "pairwise" };
     if base_offset > 0 {
         ctx.ui.log(&format!(
-            "KNN: {} queries x {} base vectors (f32, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, simd={}, batch={}",
+            "KNN: {} queries x {} base vectors (f32, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, engine={}, simd={}, batch={}",
             format_count(query_count), format_count(base_count), base_dim,
             format_count(base_offset), format_count(base_offset + base_count),
-            k, display_metric, threads, simd_distance::simd_level(), batched_mode
+            k, display_metric, threads, engine, simd_distance::simd_level(), batched_mode
         ));
     } else {
         ctx.ui.log(&format!(
-            "KNN: {} queries x {} base vectors (f32, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
+            "KNN: {} queries x {} base vectors (f32, dim={}), k={}, metric={:?}, threads={}, engine={}, simd={}, batch={}",
             format_count(query_count), format_count(base_count), base_dim,
-            k, display_metric, threads, simd_distance::simd_level(), batched_mode
+            k, display_metric, threads, engine, simd_distance::simd_level(), batched_mode
         ));
     }
     ctx.ui.log(&format!(
@@ -1900,6 +1935,8 @@ fn execute_f32(
         metric,
         display_metric,
         dist_fn,
+        batched,
+        engine,
         threads,
         partition_size,
         base_path,
@@ -1953,6 +1990,8 @@ fn execute_f16(
     metric: Metric,
     display_metric: Metric,
     dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
+    batched: bool,
+    engine: &'static str,
     threads: usize,
     partition_size: usize,
     base_window: Option<(usize, usize)>,
@@ -2005,23 +2044,19 @@ fn execute_f16(
 
     let base_bytes = base_count as u64 * base_dim as u64 * 2;
     let query_bytes = query_count as u64 * query_dim as u64 * 2;
-    let batched_mode = if simd_distance::select_batched_fn_f16(metric).is_some() {
-        "transposed AVX-512 (16-wide)"
-    } else {
-        "per-pair SimSIMD"
-    };
+    let batched_mode = if batched { "transposed 16-wide" } else { "pairwise" };
     if base_offset > 0 {
         ctx.ui.log(&format!(
-            "KNN: {} queries x {} base vectors (f16, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, simd={}, batch={}",
+            "KNN: {} queries x {} base vectors (f16, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, engine={}, simd={}, batch={}",
             format_count(query_count), format_count(base_count), base_dim,
             format_count(base_offset), format_count(base_offset + base_count),
-            k, display_metric, threads, simd_distance::simd_level(), batched_mode
+            k, display_metric, threads, engine, simd_distance::simd_level(), batched_mode
         ));
     } else {
         ctx.ui.log(&format!(
-            "KNN: {} queries x {} base vectors (f16, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
+            "KNN: {} queries x {} base vectors (f16, dim={}), k={}, metric={:?}, threads={}, engine={}, simd={}, batch={}",
             format_count(query_count), format_count(base_count), base_dim,
-            k, display_metric, threads, simd_distance::simd_level(), batched_mode
+            k, display_metric, threads, engine, simd_distance::simd_level(), batched_mode
         ));
     }
     ctx.ui.log(&format!(
@@ -2045,6 +2080,8 @@ fn execute_f16(
         metric,
         display_metric,
         dist_fn,
+        batched,
+        engine,
         threads,
         partition_size,
         base_path,
@@ -2068,6 +2105,8 @@ fn execute_f64(
     metric: Metric,
     display_metric: Metric,
     dist_fn: fn(&[f64], &[f64]) -> f32,
+    batched: bool,
+    engine: &'static str,
     threads: usize,
     partition_size: usize,
     base_window: Option<(usize, usize)>,
@@ -2108,16 +2147,16 @@ fn execute_f64(
     let query_bytes = query_count as u64 * query_dim as u64 * 8;
     if base_offset > 0 {
         ctx.ui.log(&format!(
-            "KNN: {} queries x {} base vectors (f64, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, simd={}",
+            "KNN: {} queries x {} base vectors (f64, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, engine={}, simd={}",
             format_count(query_count), format_count(base_count), base_dim,
             format_count(base_offset), format_count(base_offset + base_count),
-            k, metric, threads, simd_distance::simd_level()
+            k, metric, threads, engine, simd_distance::simd_level()
         ));
     } else {
         ctx.ui.log(&format!(
-            "KNN: {} queries x {} base vectors (f64, dim={}), k={}, metric={:?}, threads={}, simd={}",
+            "KNN: {} queries x {} base vectors (f64, dim={}), k={}, metric={:?}, threads={}, engine={}, simd={}",
             format_count(query_count), format_count(base_count), base_dim,
-            k, metric, threads, simd_distance::simd_level()
+            k, metric, threads, engine, simd_distance::simd_level()
         ));
     }
     ctx.ui.log(&format!(
@@ -2141,6 +2180,8 @@ fn execute_f64(
         metric,
         display_metric,
         dist_fn,
+        batched,
+        engine,
         threads,
         partition_size,
         base_path,
@@ -2159,11 +2200,13 @@ fn execute_f64(
 /// loading. Each base-vector partition's results are cached independently,
 /// then merged into the final output.
 /// Per-element-type KNN kernel invoked once per base partition:
-/// `(query_reader, query_count, base_reader, base_offset, base_count,
-/// dim, dist_fn, metric, k, threads, progress) -> per-query neighbors`.
+/// `(query_reader, query_count, base_reader, start, end, k, dist_fn,
+/// batched, metric, dim, threads, progress) -> per-query neighbors`.
+/// `batched` selects the transposed query-batch kernels over the
+/// pairwise `dist_fn` scan, where the element type has them.
 type PartitionComputeFn<T> = fn(
     &XvecReader<T>, usize, &Arc<XvecReader<T>>, usize, usize, usize,
-    fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressHandle,
+    fn(&[T], &[T]) -> f32, bool, Metric, usize, usize, &ProgressHandle,
 ) -> Vec<Vec<Neighbor>>;
 
 #[allow(clippy::too_many_arguments)]
@@ -2180,6 +2223,8 @@ fn execute_with_partitions<T>(
     metric: Metric,
     display_metric: Metric,
     dist_fn: fn(&[T], &[T]) -> f32,
+    batched: bool,
+    engine: &'static str,
     threads: usize,
     partition_size: usize,
     base_path: &Path,
@@ -2343,16 +2388,16 @@ where
         // Scan key must include the engine prefix that `build_cache_path`
         // writes — otherwise the discovery loop misses the cache files
         // we just wrote and recomputes everything on the next call.
-        let prefix_pat = format!("{}.{}.range_", ENGINE_NAME, cache_prefix);
+        let prefix_pat = format!("{}.{}.range_", engine, cache_prefix);
         let suffix_pat = format!(".k{}.{}.neighbors.ivec", k, metric_str);
         let gz_suffix_pat = format!("{}.gz", suffix_pat);
 
         let check_cache_pair = |s: usize, e: usize| -> bool {
             let n_path = build_cache_path(
-                &ctx.cache, &cache_prefix, s, e, k, metric, "neighbors", "ivec",
+                engine, &ctx.cache, &cache_prefix, s, e, k, metric, "neighbors", "ivec",
             );
             let d_path = build_cache_path(
-                &ctx.cache, &cache_prefix, s, e, k, metric, "distances", "fvec",
+                engine, &ctx.cache, &cache_prefix, s, e, k, metric, "distances", "fvec",
             );
             if compress_cache {
                 crate::pipeline::gz_cache::gz_exists(&n_path)
@@ -2384,8 +2429,8 @@ where
                             segments.push(CachedSegment {
                                 start: s,
                                 end: e,
-                                neighbors_path: build_cache_path(&ctx.cache, &cache_prefix, s, e, k, metric, "neighbors", "ivec"),
-                                distances_path: build_cache_path(&ctx.cache, &cache_prefix, s, e, k, metric, "distances", "fvec"),
+                                neighbors_path: build_cache_path(engine, &ctx.cache, &cache_prefix, s, e, k, metric, "neighbors", "ivec"),
+                                distances_path: build_cache_path(engine, &ctx.cache, &cache_prefix, s, e, k, metric, "distances", "fvec"),
                             });
                         }
             }
@@ -2463,8 +2508,8 @@ where
                 (seg.end, seg.neighbors_path.clone(), seg.distances_path.clone(), true)
             } else {
                 let pe = std::cmp::min(part_start + partition_size, base_end);
-                let n = build_cache_path(&ctx.cache, &cache_prefix, part_start, pe, k, metric, "neighbors", "ivec");
-                let d = build_cache_path(&ctx.cache, &cache_prefix, part_start, pe, k, metric, "distances", "fvec");
+                let n = build_cache_path(engine, &ctx.cache, &cache_prefix, part_start, pe, k, metric, "neighbors", "ivec");
+                let d = build_cache_path(engine, &ctx.cache, &cache_prefix, part_start, pe, k, metric, "distances", "fvec");
                 (pe, n, d, false)
             };
 
@@ -2641,7 +2686,7 @@ where
             "vectors",
         );
         let results = compute_fn(
-            query_reader, query_count, base_reader, part.start, part.end, k, dist_fn, metric, dim, threads, &pb,
+            query_reader, query_count, base_reader, part.start, part.end, k, dist_fn, batched, metric, dim, threads, &pb,
         );
         pb.finish();
         let compute_elapsed = part_start_time.elapsed();
@@ -2859,10 +2904,10 @@ where
     // pre-computed "super-partition" rather than recomputing the same range.
     {
         let full_neighbors = build_cache_path(
-            &ctx.cache, &cache_prefix, base_offset, base_end, k, metric, "neighbors", "ivec",
+            engine, &ctx.cache, &cache_prefix, base_offset, base_end, k, metric, "neighbors", "ivec",
         );
         let full_distances = build_cache_path(
-            &ctx.cache, &cache_prefix, base_offset, base_end, k, metric, "distances", "fvec",
+            engine, &ctx.cache, &cache_prefix, base_offset, base_end, k, metric, "distances", "fvec",
         );
         if !full_neighbors.exists() || !full_distances.exists() {
             let cache_sp = ctx.ui.spinner("caching result for profile reuse");

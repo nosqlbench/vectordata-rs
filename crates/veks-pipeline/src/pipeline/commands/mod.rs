@@ -15,8 +15,7 @@ pub mod require;
 pub mod source_window;
 pub mod analyze_checkendian;
 pub mod analyze_compare;
-// Calls cblas_snrm2 — Unix-only (BLAS link).
-#[cfg(all(feature = "knnutils", unix))]
+#[cfg(feature = "knnutils")]
 pub mod analyze_fvecs_check_knnutils;
 // `analyze_explore` (the REPL command engine) migrated to
 // `vectordata::explore::repl` so the TUI lives entirely within the
@@ -34,7 +33,7 @@ pub mod analyze_stats;
 pub mod analyze_verifyknn;
 pub mod analyze_verifyprofiles;
 pub mod analyze_normals;
-#[cfg(all(feature = "knnutils", unix))]
+#[cfg(feature = "knnutils")]
 pub mod analyze_normals_knnutils;
 pub mod analyze_norms;
 pub mod analyze_overlap;
@@ -52,10 +51,8 @@ pub mod compute_knn;
 pub mod compute_knn_distances;
 pub mod compute_partition_profiles;
 pub mod knn_segment;
-// `compute_knn_blas` calls `cblas_sgemm` directly via FFI; the
-// system BLAS link directive in build.rs is Unix-only, so the
-// module itself must be Unix-only too.
-#[cfg(all(feature = "knnutils", unix))]
+// sgemm KNN: pure-Rust `gemm` by default, the system BLAS with the
+// `blas-system` feature (see `pipeline::sgemm`).
 pub mod compute_knn_blas;
 #[cfg(feature = "faiss")]
 pub mod compute_knn_faiss;
@@ -114,10 +111,9 @@ pub mod verify_alignment;
 pub mod verify_consolidated;
 #[cfg(feature = "knnutils")]
 pub mod transform_normalize_knnutils;
-#[cfg(all(feature = "knnutils", unix))]
+#[cfg(feature = "knnutils")]
 pub mod transform_remove_zeros_knnutils;
-// Uses super::compute_knn_blas, which is Unix-only (BLAS link).
-#[cfg(all(feature = "knnutils", unix))]
+#[cfg(feature = "knnutils")]
 pub mod verify_dataset_knnutils;
 pub mod verify_engine_parity;
 pub mod verify_knn;
@@ -135,7 +131,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── analyze ──────────────────────────────────────────────────────
     registry.register("analyze check-endian", analyze_checkendian::factory);
     registry.register("analyze compare-files", analyze_compare::factory);
-    #[cfg(all(feature = "knnutils", unix))]
+    #[cfg(feature = "knnutils")]
     registry.register("analyze fvecs-check-knnutils", analyze_fvecs_check_knnutils::factory);
     registry.register("analyze compute-info", info_compute::factory);
     registry.register("analyze describe", describe::factory);
@@ -160,7 +156,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze verify-knn", analyze_verifyknn::factory);
     registry.register("analyze verify-profiles", analyze_verifyprofiles::factory);
     registry.register("analyze measure-normals", analyze_normals::factory);
-    #[cfg(all(feature = "knnutils", unix))]
+    #[cfg(feature = "knnutils")]
     registry.register("analyze check-normalization-knnutils", analyze_normals_knnutils::factory);
     registry.register("analyze display-norms", analyze_norms::factory);
     registry.register("analyze overlap", analyze_overlap::factory);
@@ -181,7 +177,6 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("compute knn-metal", compute_knn::factory);
     registry.register("compute knn-stdarch", compute_knn_stdarch::factory);
     registry.register("compute partition-profiles", compute_partition_profiles::factory);
-    #[cfg(all(feature = "knnutils", unix))]
     registry.register("compute knn-blas", compute_knn_blas::factory);
     // "compute knn" → metal (SimSIMD). SimSIMD's hand-tuned kernels
     // unroll their FMA accumulator chains so they hit a much higher
@@ -275,21 +270,19 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("transform ordinals", clean_ordinals::factory);
     #[cfg(feature = "knnutils")]
     registry.register("transform normalize-knnutils", transform_normalize_knnutils::factory);
-    #[cfg(all(feature = "knnutils", unix))]
+    #[cfg(feature = "knnutils")]
     registry.register("transform remove-zeros-knnutils", transform_remove_zeros_knnutils::factory);
 
     // ── verify ───────────────────────────────────────────────────────
     registry.register("verify alignment", verify_alignment::factory);
-    #[cfg(all(feature = "knnutils", unix))]
+    #[cfg(feature = "knnutils")]
     registry.register("verify dataset-knnutils", verify_dataset_knnutils::factory);
-    // verify knn-groundtruth: per-profile, default is SimSIMD (metal)
+    // verify knn-groundtruth: per-profile, native batch kernels (as metal)
     registry.register("verify engine-parity", verify_engine_parity::factory);
     registry.register("verify knn-groundtruth", verify_knn::factory);
     registry.register("verify predicate-results", verify_predicates::factory);
-    // verify knn-consolidated: uses the sgemm kernel (same as compute
-    // knn-blas) so distances are bit-identical. Feature-gated on
-    // `knnutils` because the kernel requires system BLAS.
-    #[cfg(all(feature = "knnutils", unix))]
+    // verify knn-consolidated: uses the sgemm scan (same as compute
+    // knn-blas, on the same backend) so distances are bit-identical.
     registry.register("verify knn-consolidated", verify_consolidated::knn_consolidated_factory);
     // FAISS verify: explicit opt-in, safe-sampled to avoid BLAS ABI bug
     #[cfg(feature = "faiss")]

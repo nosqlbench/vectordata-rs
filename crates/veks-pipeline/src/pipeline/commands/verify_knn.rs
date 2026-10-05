@@ -80,74 +80,6 @@ const QUERY_BATCH_SIZE: usize = 256;
 
 // -- Batched pairwise KNN (f32) -----------------------------------------------
 
-/// Compute KNN for a batch of f32 queries against base vectors `[start, end)`.
-#[inline(never)]
-fn find_top_k_batch_f32(
-    queries: &[&[f32]],
-    base_reader: &XvecReader<f32>,
-    start: usize,
-    end: usize,
-    k: usize,
-    dist_fn: fn(&[f32], &[f32]) -> f32,
-    batched_fn: Option<simd_distance::BatchedDistFnF32>,
-    dim: usize,
-    results: &mut [Vec<Neighbor>],
-) {
-    if let Some(bfn) = batched_fn {
-        find_top_k_batch_transposed_f32(queries, base_reader, start, end, k, bfn, dim, results);
-    } else {
-        find_top_k_batch_pairwise_f32(queries, base_reader, start, end, k, dist_fn, results);
-    }
-}
-
-/// Per-pair fallback for f32 batch processing.
-#[inline(never)]
-fn find_top_k_batch_pairwise_f32(
-    queries: &[&[f32]],
-    base_reader: &XvecReader<f32>,
-    start: usize,
-    end: usize,
-    k: usize,
-    dist_fn: fn(&[f32], &[f32]) -> f32,
-    results: &mut [Vec<Neighbor>],
-) {
-    let batch_size = queries.len();
-    let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
-        .map(|_| BinaryHeap::with_capacity(k + 1))
-        .collect();
-    let mut thresholds = vec![f32::INFINITY; batch_size];
-
-    let mut reclaim = vectordata::io::StreamReclaim::new(base_reader, start, end);
-
-    for i in start..end {
-        let base_vec = base_reader.get_slice(i);
-        let idx = i as u32;
-
-        for qi in 0..batch_size {
-            let dist = dist_fn(queries[qi], base_vec);
-
-            if dist < thresholds[qi] {
-                heaps[qi].push(Neighbor { index: idx, distance: dist });
-                if heaps[qi].len() > k {
-                    heaps[qi].pop();
-                }
-                if heaps[qi].len() == k {
-                    thresholds[qi] = heaps[qi].peek().unwrap().distance;
-                }
-            }
-        }
-
-        reclaim.advance(i);
-    }
-    drop(reclaim);
-
-    for (qi, heap) in heaps.into_iter().enumerate() {
-        let mut v: Vec<Neighbor> = heap.into_vec();
-        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
-        results[qi] = v;
-    }
-}
-
 /// Transposed SIMD batch processing for f32.
 #[inline(never)]
 fn find_top_k_batch_transposed_f32(
@@ -225,74 +157,6 @@ fn find_top_k_batch_transposed_f32(
 
 // -- Batched pairwise KNN (f16) -----------------------------------------------
 
-/// Compute KNN for a batch of f16 queries against base vectors `[start, end)`.
-#[inline(never)]
-fn find_top_k_batch_f16(
-    queries: &[&[half::f16]],
-    base_reader: &XvecReader<half::f16>,
-    start: usize,
-    end: usize,
-    k: usize,
-    dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
-    batched_fn: Option<simd_distance::BatchedDistFnF32>,
-    dim: usize,
-    results: &mut [Vec<Neighbor>],
-) {
-    if let Some(bfn) = batched_fn {
-        find_top_k_batch_transposed_f16(queries, base_reader, start, end, k, bfn, dim, results);
-    } else {
-        find_top_k_batch_pairwise_f16(queries, base_reader, start, end, k, dist_fn, results);
-    }
-}
-
-/// Per-pair fallback for f16 batch processing.
-#[inline(never)]
-fn find_top_k_batch_pairwise_f16(
-    queries: &[&[half::f16]],
-    base_reader: &XvecReader<half::f16>,
-    start: usize,
-    end: usize,
-    k: usize,
-    dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
-    results: &mut [Vec<Neighbor>],
-) {
-    let batch_size = queries.len();
-    let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
-        .map(|_| BinaryHeap::with_capacity(k + 1))
-        .collect();
-    let mut thresholds = vec![f32::INFINITY; batch_size];
-
-    let mut reclaim = vectordata::io::StreamReclaim::new(base_reader, start, end);
-
-    for i in start..end {
-        let base_vec = base_reader.get_slice(i);
-        let idx = i as u32;
-
-        for qi in 0..batch_size {
-            let dist = dist_fn(queries[qi], base_vec);
-
-            if dist < thresholds[qi] {
-                heaps[qi].push(Neighbor { index: idx, distance: dist });
-                if heaps[qi].len() > k {
-                    heaps[qi].pop();
-                }
-                if heaps[qi].len() == k {
-                    thresholds[qi] = heaps[qi].peek().unwrap().distance;
-                }
-            }
-        }
-
-        reclaim.advance(i);
-    }
-    drop(reclaim);
-
-    for (qi, heap) in heaps.into_iter().enumerate() {
-        let mut v: Vec<Neighbor> = heap.into_vec();
-        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
-        results[qi] = v;
-    }
-}
-
 /// Transposed SIMD batch processing for f16 (converts base to f32 once).
 #[inline(never)]
 fn find_top_k_batch_transposed_f16(
@@ -325,6 +189,7 @@ fn find_top_k_batch_transposed_f16(
 
     let mut base_f32 = vec![0.0f32; dim];
     let mut dist_buf = [0.0f32; SIMD_BATCH_WIDTH];
+    let to_f32 = simd_distance::select_f16_to_f32();
 
     let mut reclaim = vectordata::io::StreamReclaim::new(base_reader, start, end);
 
@@ -332,7 +197,7 @@ fn find_top_k_batch_transposed_f16(
         let base_f16 = base_reader.get_slice(i);
         let idx = i as u32;
 
-        simd_distance::convert_f16_to_f32_bulk(base_f16, &mut base_f32);
+        to_f32(base_f16, &mut base_f32);
 
         for (si, sub_batch) in sub_batches.iter().enumerate() {
             batched_fn(sub_batch, &base_f32, &mut dist_buf);
@@ -428,7 +293,6 @@ fn verify_f32(
     base_end: usize,
     k: usize,
     metric: Metric,
-    dist_fn: fn(&[f32], &[f32]) -> f32,
     phi: f32,
     threads: usize,
     ui: &veks_core::ui::UiHandle,
@@ -478,13 +342,12 @@ fn verify_f32(
                             })
                             .collect();
 
-                        find_top_k_batch_f32(
+                        find_top_k_batch_transposed_f32(
                             &queries,
                             &base_ref,
                             base_offset,
                             base_end,
                             k,
-                            dist_fn,
                             batched_fn,
                             dim,
                             &mut chunk[offset..batch_end],
@@ -509,13 +372,12 @@ fn verify_f32(
                 })
                 .collect();
 
-            find_top_k_batch_f32(
+            find_top_k_batch_transposed_f32(
                 &queries,
                 base_reader,
                 base_offset,
                 base_end,
                 k,
-                dist_fn,
                 batched_fn,
                 dim,
                 &mut recomputed[offset..batch_end],
@@ -544,7 +406,6 @@ fn verify_f16(
     base_end: usize,
     k: usize,
     metric: Metric,
-    dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
     phi: f32,
     threads: usize,
     ui: &veks_core::ui::UiHandle,
@@ -592,13 +453,12 @@ fn verify_f16(
                             })
                             .collect();
 
-                        find_top_k_batch_f16(
+                        find_top_k_batch_transposed_f16(
                             &queries,
                             &base_ref,
                             base_offset,
                             base_end,
                             k,
-                            dist_fn,
                             batched_fn,
                             dim,
                             &mut chunk[offset..batch_end],
@@ -623,13 +483,12 @@ fn verify_f16(
                 })
                 .collect();
 
-            find_top_k_batch_f16(
+            find_top_k_batch_transposed_f16(
                 &queries,
                 base_reader,
                 base_offset,
                 base_end,
                 k,
-                dist_fn,
                 batched_fn,
                 dim,
                 &mut recomputed[offset..batch_end],
@@ -1095,8 +954,6 @@ impl CommandOp for VerifyKnnOp {
                 let (base_offset, base_end) =
                     base_source.effective_range(file_count);
 
-                let dist_fn = simd_distance::select_distance_fn(metric);
-
                 verify_f32(
                     &base_reader,
                     &query_reader,
@@ -1106,7 +963,6 @@ impl CommandOp for VerifyKnnOp {
                     base_end,
                     k,
                     metric,
-                    dist_fn,
                     phi,
                     threads,
                     &ctx.ui,
@@ -1149,8 +1005,6 @@ impl CommandOp for VerifyKnnOp {
                 let (base_offset, base_end) =
                     base_source.effective_range(file_count);
 
-                let dist_fn = simd_distance::select_distance_fn_f16(metric);
-
                 verify_f16(
                     &base_reader,
                     &query_reader,
@@ -1160,7 +1014,6 @@ impl CommandOp for VerifyKnnOp {
                     base_end,
                     k,
                     metric,
-                    dist_fn,
                     phi,
                     threads,
                     &ctx.ui,

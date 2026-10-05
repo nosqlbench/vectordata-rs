@@ -14,7 +14,7 @@ use veks_pipeline::pipeline::simd_distance::{
     Metric, TransposedBatch,
     select_distance_fn, select_distance_fn_f16,
     select_batched_fn_f32,
-    convert_f16_to_f32_bulk,
+    select_f16_to_f32,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -135,12 +135,11 @@ fn bench_batched(c: &mut Criterion) {
         let mut out = [0.0f32; 16];
 
         for &(name, metric) in &metrics {
-            if let Some(bfn) = select_batched_fn_f32(metric) {
-                group.throughput(Throughput::Elements((dim * 16) as u64));
-                group.bench_with_input(BenchmarkId::new(name, dim), &dim, |bench, _| {
-                    bench.iter(|| bfn(black_box(&batch), black_box(&base), black_box(&mut out)));
-                });
-            }
+            let bfn = select_batched_fn_f32(metric);
+            group.throughput(Throughput::Elements((dim * 16) as u64));
+            group.bench_with_input(BenchmarkId::new(name, dim), &dim, |bench, _| {
+                bench.iter(|| bfn(black_box(&batch), black_box(&base), black_box(&mut out)));
+            });
         }
     }
     group.finish();
@@ -156,9 +155,10 @@ fn bench_convert_f16_to_f32(c: &mut Criterion) {
     for &dim in &dims {
         let src = random_f16_vectors(1, dim, 42)[0].clone();
         let mut dst = vec![0.0f32; dim];
+        let to_f32 = select_f16_to_f32();
         group.throughput(Throughput::Elements(dim as u64));
         group.bench_with_input(BenchmarkId::from_parameter(dim), &dim, |bench, _| {
-            bench.iter(|| convert_f16_to_f32_bulk(black_box(&src), black_box(&mut dst)));
+            bench.iter(|| to_f32(black_box(&src), black_box(&mut dst)));
         });
     }
     group.finish();
@@ -216,7 +216,7 @@ fn bench_topk_structures(c: &mut Criterion) {
     let batch = TransposedBatch::from_f32(&query_refs, dim);
     let base_data: Vec<f32> = random_normalized_f32(base_count, dim, 99)
         .into_iter().flatten().collect();
-    let bfn = select_batched_fn_f32(Metric::DotProduct).unwrap();
+    let bfn = select_batched_fn_f32(Metric::DotProduct);
 
     let mut group = c.benchmark_group("topk_structure");
     group.sample_size(10);
@@ -289,7 +289,7 @@ fn bench_prefetch(c: &mut Criterion) {
     let batch = TransposedBatch::from_f32(&query_refs, dim);
     let base_data: Vec<f32> = random_normalized_f32(base_count, dim, 99)
         .into_iter().flatten().collect();
-    let bfn = select_batched_fn_f32(Metric::DotProduct).unwrap();
+    let bfn = select_batched_fn_f32(Metric::DotProduct);
 
     let mut group = c.benchmark_group("prefetch");
     group.sample_size(10);
@@ -364,7 +364,7 @@ fn bench_double_wide(c: &mut Criterion) {
     let dim = 512;
     let base_count = 100_000;
 
-    let bfn = select_batched_fn_f32(Metric::DotProduct).unwrap();
+    let bfn = select_batched_fn_f32(Metric::DotProduct);
 
     // 16-wide: one TransposedBatch
     let queries16 = random_normalized_f32(16, dim, 42);
@@ -475,7 +475,7 @@ unsafe fn dual_neg_dot_f32_avx512(
 fn bench_dual_accumulator(c: &mut Criterion) {
     let dim = 512;
     let base_count = 100_000;
-    let bfn = select_batched_fn_f32(Metric::DotProduct).unwrap();
+    let bfn = select_batched_fn_f32(Metric::DotProduct);
 
     let queries = random_normalized_f32(32, dim, 42);
     let refs: Vec<&[f32]> = queries.iter().map(|v| v.as_slice()).collect();
@@ -555,7 +555,7 @@ fn bench_combined(c: &mut Criterion) {
 
     let base_data: Vec<f32> = random_normalized_f32(base_count, dim, 99)
         .into_iter().flatten().collect();
-    let bfn = select_batched_fn_f32(Metric::DotProduct).unwrap();
+    let bfn = select_batched_fn_f32(Metric::DotProduct);
 
     let mut group = c.benchmark_group("combined_inner_loop");
     group.sample_size(10);

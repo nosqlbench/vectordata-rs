@@ -173,17 +173,15 @@ jobs:
             --target ${{ matrix.target }} \
             --features cli
 
-      # ─── Build the `veks` binary in release mode.
+      # ─── Build the `veks` binary in release mode, default features.
       #
-      # `--no-default-features` skips the `knnutils` feature, which
-      # would otherwise pull in `veks-pipeline/knnutils` and force a
-      # system-BLAS dependency (libopenblas on Linux, Accelerate on
-      # macOS, and no clean story on Windows MSVC). The shipped binary
-      # falls back to `compute knn` (stdarch) as its KNN engine — users
-      # who need `compute knn-blas` can `cargo install veks` with their
-      # own BLAS provider. This keeps the four release binaries
-      # symmetric across platforms with no FFI surprises.
-      - name: Build veks (release, no BLAS)
+      # The defaults are pure Rust: the vector kernels are `veks-simd`
+      # (runtime-dispatched AVX-512 / AVX2 / SSE / NEON) and `compute
+      # knn-blas` multiplies with the `gemm` crate, so `knnutils` needs
+      # no system BLAS and the four release binaries carry the same
+      # command set on every platform. The native backends (`simsimd`,
+      # `blas-system`, `faiss`) are opt-in features and not shipped.
+      - name: Build veks (release)
         shell: bash
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
@@ -191,8 +189,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release -p veks \
-            --target ${{ matrix.target }} \
-            --no-default-features
+            --target ${{ matrix.target }}
 
       # ─── Build the `vecd` daemon in release mode — Linux only.
       # vecd's lifecycle (`start`/`stop`/`status`) self-daemonizes via
@@ -236,6 +233,25 @@ jobs:
           cargo test --release -p vectordata \
             --target ${{ matrix.target }} \
             --features cli
+
+      # ─── Kernel conformance on the target's own CPU. Each runner
+      # checks every SIMD level it supports against the f64 reference,
+      # the f16 conversion against `half` bit for bit, and that dispatch
+      # picks the strongest level the CPU has — the aarch64 runners are
+      # the only place the NEON tables run. `verify engine-parity`'s
+      # synthetic sweep then runs the engines end to end and requires
+      # identical neighbour sets after the f64 rerank.
+      - name: Test SIMD kernels and engine parity
+        shell: bash
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          set -euo pipefail
+          mkdir -p target/test-tmp
+          cargo test --release -p veks-simd --target ${{ matrix.target }}
+          cargo test --release -p veks-pipeline --target ${{ matrix.target }} \
+            --features knnutils --lib engine_parity
 
       # ─── Smoke-test: each built binary actually starts and prints
       # its version. Catches LD_LIBRARY_PATH / shared-lib regressions
@@ -418,12 +434,12 @@ jobs:
 
           Verify with `SHA256SUMS`.
 
-          The published `veks` binary is built `--no-default-features`
-          so it doesn't require a system BLAS at runtime. The
-          `compute knn-blas` command is therefore unavailable in this
-          binary; `compute knn` (stdarch) is the default KNN engine.
-          Install via `cargo install veks` if you need the BLAS-backed
-          engine and have a BLAS provider on your system.
+          The published binaries are pure Rust: the vector kernels
+          dispatch at runtime to the CPU's best instruction set (AVX-512,
+          AVX2, SSE or NEON), and `compute knn-blas` multiplies with the
+          pure-Rust `gemm` crate, so no system BLAS is needed at runtime.
+          Build from source with `--features blas-system` (system BLAS),
+          `simsimd`, or `faiss` for those backends.
 
           ## Changes
 

@@ -38,6 +38,7 @@ pub mod interpolate;
 pub mod manifest;
 pub mod resource;
 pub mod rng;
+pub mod sgemm;
 pub mod simd_distance;
 pub mod progress;
 pub mod provenance;

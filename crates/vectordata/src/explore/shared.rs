@@ -208,7 +208,7 @@ impl AnyVectorReader {
         }
     }
 
-    /// Read a single vector as f32 values (for simsimd hot paths).
+    /// Read a single vector as f32 values (for the SIMD hot paths).
     pub(super) fn get_f32(&self, index: usize) -> Option<Vec<f32>> {
         use crate::VectorReader;
         match self {

@@ -135,7 +135,7 @@ pub mod client_cli;
 /// grid, REPL command engine. Migrated from `veks/src/explore` so the
 /// entire TUI lives under vectordata; veks now defers to this module
 /// rather than carrying its own copy. Gated on the `explore` feature
-/// (default on) so library-only consumers can drop the simsimd /
+/// (default on) so library-only consumers can drop the veks-simd /
 /// rand_xoshiro deps.
 #[cfg(feature = "explore")]
 pub mod explore;

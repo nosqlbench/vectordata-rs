@@ -34,18 +34,22 @@ knn_utils-compatible commands that replicate its exact behavior:
 
 | Native command | knn_utils equivalent | Difference |
 |---------------|---------------------|------------|
-| `compute knn` (SimSIMD) | `compute knn-blas` (BLAS sgemm) | Different distance kernel |
+| `compute knn` (native batch kernels) | `compute knn-blas` (sgemm) | Different distance kernel |
 | `compute sort` (prefix) | `compute sort-knnutils` (full lex) | Sort ordering within groups |
 | `generate shuffle` (PCG) | `generate shuffle-knnutils` (MT19937) | Different PRNG |
 | `verify knn-consolidated` | `verify dataset-knnutils` | Unified verification suite |
 
 ### Build requirements
 
+`knnutils` is a default feature of `veks` and needs nothing native: the
+sgemm and norm kernels behind it are pure Rust. For kernel-level parity
+with a knn_utils run, build with the system BLAS and select it:
+
 ```bash
-# knn_utils personality requires system BLAS
 sudo apt install libopenblas-dev   # or libmkl-dev for Intel MKL
 
-cargo build --features knnutils
+cargo build --features blas-system
+veks run compute knn-blas --backend system …
 ```
 
 ### Bootstrap
@@ -199,9 +203,9 @@ numpy reference).
 
 | Engine          | Kernel | Source |
 |-----------------|--------|--------|
-| `knn-metal`     | SimSIMD (AVX-512 / AVX2 / NEON, hardware-dispatched) | [`compute_knn.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn.rs) |
-| `knn-stdarch`   | Pure `std::arch` SIMD, zero deps | [`compute_knn_stdarch.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs) |
-| `knn-blas`      | `cblas_sgemm` (MKL or OpenBLAS) | [`compute_knn_blas.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) |
+| `knn-metal`     | `veks-simd` batch kernels (AVX-512 / AVX2 / SSE / NEON, runtime-dispatched); `--backend simsimd` for simsimd | [`compute_knn.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn.rs) |
+| `knn-stdarch`   | the same kernels over streaming pread | [`compute_knn_stdarch.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs) |
+| `knn-blas`      | sgemm: pure-Rust `gemm`, or `cblas_sgemm` (MKL / OpenBLAS) with `--backend system` | [`compute_knn_blas.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) |
 | `knn-faiss`     | FAISS `IndexFlat` brute force | [`compute_knn_faiss.rs`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) |
 
 ### Comparison model
@@ -226,7 +230,7 @@ below).
 
 Ran against 1000 base vectors × 100 queries × **k=100**, seed=42.
 All four engines compiled in (`--features knnutils,faiss`).
-Reference engine is metal (SimSIMD). The sweep covers three
+Reference engine is metal. The sweep covers three
 synthetic distributions (`--distribution uniform|gaussian|clustered`)
 and all four metric modes the engines support:
 
@@ -300,7 +304,7 @@ sgemm-expansion path (`‖a‖² + ‖b‖² − 2·a·b`) and the direct path
 top-(k + margin), and the shared **f64-direct canonical rerank**
 (`knn_segment::rerank_output_post_pass`) selects the same ten.
 
-EXACT count per engine against the metal (SimSIMD) reference,
+EXACT count per engine against the metal reference,
 format `stdarch / blas / faiss / blas-mirror`:
 
 | dim  | uniform                  | gaussian                  | clustered                 |
@@ -525,9 +529,10 @@ reference (or another engine) within `BoundaryMismatch` tolerance.
 
 | Test | What it asserts |
 |------|------------------|
-| [`test_knn_faiss_matches_compute_knn`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) | FAISS results (L2, k=5, dim=8, 100 base × 10 queries) match the SimSIMD `compute knn` reference — sets differ by at most 2 boundary swaps. |
-| [`test_stdarch_matches_metal`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs) | Pure-`std::arch` kernel matches the SimSIMD `compute knn` reference under the same fixture and same boundary threshold. |
-| [`test_knn_blas_ip_known_neighbors`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) / [`test_knn_blas_l2`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) / [`test_knn_blas_multiple_queries`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) | The BLAS sgemm kernel returns the analytically-correct nearest neighbors for IP and L2 metrics on hand-built fixtures with known answers. |
+| [`test_knn_faiss_matches_compute_knn`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) | FAISS results (L2, k=5, dim=8, 100 base × 10 queries) match the `compute knn` reference — sets differ by at most 2 boundary swaps. |
+| [`test_stdarch_matches_metal`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs) | The streaming-pread engine matches the `compute knn` reference under the same fixture and same boundary threshold. |
+| [`test_knn_blas_ip_known_neighbors`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) / [`test_knn_blas_l2`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) / [`test_knn_blas_multiple_queries`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_blas.rs) | The sgemm kernel returns the analytically-correct nearest neighbors for IP and L2 metrics on hand-built fixtures with known answers. |
+| [`veks-simd` tests](../../crates/veks-simd/tests) | Every pairwise, batch and conversion kernel at every SIMD level the CPU supports: against an f64 reference, bit-identical across single/dual/packed batch kernels, f16 conversion bit-exact with `half`, and dispatch selecting the strongest level the CPU has. |
 | [`test_knn_faiss_ip_known_neighbors`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) / [`test_knn_faiss_l2`](../../crates/veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs) | FAISS returns the same hand-built ground truth — establishes FAISS itself as a trustworthy reference under our test harness. |
 
 ### Pipeline-level verification — `verify dataset-knnutils`
@@ -576,13 +581,13 @@ suite spans more than the default cargo features:
 
 | Engine          | Cargo feature  | What it needs |
 |-----------------|----------------|---------------|
-| `knn-metal`     | (default)      | nothing extra (SimSIMD bundled) |
+| `knn-metal`     | (default)      | nothing extra — `--backend simsimd` needs the `simsimd` feature (C, via `cc`) |
 | `knn-stdarch`   | (default)      | nothing extra |
-| `knn-blas`      | `knnutils`     | system BLAS (libopenblas-dev or libmkl-dev) |
+| `knn-blas`      | (default)      | nothing extra — `--backend system` needs `blas-system` and libopenblas-dev or libmkl-dev |
 | `knn-faiss`     | `faiss`        | system FAISS + BLAS |
 
-`verify_dataset_knnutils` itself is also gated on `knnutils` (it
-links `cblas_snrm2`).
+`verify_dataset_knnutils` is gated on `knnutils` (default on in `veks`),
+which is pure Rust.
 
 ### One-shot live demo — `verify engine-parity`
 
@@ -646,14 +651,18 @@ enabled` rather than failing the whole demo. Source:
 ### Run the conformance suite
 
 ```bash
-# Default features — exercises knn-metal and knn-stdarch parity tests
+# The kernels themselves, at every SIMD level this CPU supports
+cargo test -p veks-simd
+
+# Default features — exercises knn-metal, knn-stdarch and knn-blas parity tests
 cargo test -p veks-pipeline --lib pipeline::commands::compute_knn
 
-# Add knnutils for the BLAS engine + dataset-knnutils verifier tests
-cargo test -p veks-pipeline --features knnutils \
+# Add knnutils for the dataset-knnutils verifier tests; add blas-system
+# and simsimd to cover the alternative backends
+cargo test -p veks-pipeline --features knnutils,blas-system,simsimd \
   --lib pipeline::commands::verify_dataset_knnutils
 
-# Add faiss for the cross-engine FAISS-vs-SimSIMD parity test
+# Add faiss for the cross-engine FAISS parity test
 cargo test -p veks-pipeline --features knnutils,faiss \
   --lib pipeline::commands::compute_knn
 ```

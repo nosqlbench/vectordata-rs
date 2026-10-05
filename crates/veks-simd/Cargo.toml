@@ -1,0 +1,35 @@
+[package]
+name = "veks-simd"
+version = "2.2.0"
+edition = "2024"
+description = "Pure-Rust SIMD distance, query-batch and f16 conversion kernels for vectordata and veks, with runtime ISA dispatch"
+license = "Apache-2.0"
+homepage = "https://github.com/nosqlbench/vectordata-rs"
+repository = "https://github.com/nosqlbench/vectordata-rs"
+keywords = ["simd", "vector", "distance", "knn"]
+categories = ["mathematics", "science"]
+
+[dependencies]
+# Portable SIMD with runtime dispatch over AVX-512 (Ice Lake class),
+# AVX2+FMA, SSE4.2, SSE2, NEON and wasm. Pure Rust: nothing here builds
+# native code, which is the point of this crate (SRD SK-1).
+fearless_simd = "1"
+fearless_simd_macros = "0.1"
+half = "2"
+# Opt-in alternative pairwise backend (C, compiled by `cc`). Off by
+# default; enabled only by builds that ask for `--backend simsimd`.
+simsimd = { version = "6", optional = true }
+
+[features]
+default = []
+simsimd = ["dep:simsimd"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[lints]
+workspace = true

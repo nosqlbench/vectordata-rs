@@ -6,7 +6,7 @@
 //! Replicates the logic of `fvecs_check.py` from the knn\_utils project,
 //! including the same underlying library calls:
 //!
-//! - Per-vector L2 norm via BLAS `cblas_snrm2` (same as `np.linalg.norm`)
+//! - Per-vector L2 norm as `sqrt(v · v)` (as `np.linalg.norm` computes it)
 //! - Normalization check: `abs(norm - 1) > tol_norm` (default 1e-5)
 //! - Zero vector check: `norm < tol_zero` (default 1e-6)
 //! - Dimension consistency validation across all vectors
@@ -30,14 +30,10 @@ use crate::pipeline::command::{
     Options, Status, StreamContext, render_options_table,
 };
 
-// BLAS snrm2: same routine knn_utils calls via np.linalg.norm(vector).
-unsafe extern "C" {
-    fn cblas_snrm2(n: i32, x: *const f32, incx: i32) -> f32;
-}
-
-/// Compute L2 norm of a float32 slice using BLAS `cblas_snrm2`.
-fn blas_snrm2(v: &[f32]) -> f32 {
-    unsafe { cblas_snrm2(v.len() as i32, v.as_ptr(), 1) }
+/// L2 norm of a float32 slice, `sqrt(v · v)` — the formula
+/// `np.linalg.norm(v)` evaluates — on the native SIMD kernel.
+fn l2_norm(v: &[f32]) -> f32 {
+    crate::pipeline::simd_distance::select_norm_fn()(v)
 }
 
 fn error_result(message: impl Into<String>, start: Instant) -> CommandResult {
@@ -85,7 +81,7 @@ from the knn\_utils project.
 ## Checks Performed
 
 - **Dimension consistency**: every vector must have the same dimension
-- **Normalization**: per-vector L2 norm via BLAS `cblas_snrm2`, flag
+- **Normalization**: per-vector L2 norm as `sqrt(v · v)`, flag
   vectors where `abs(norm - 1) > tol_norm`
 - **Zero vectors**: count vectors where `norm < tol_zero`
 - **Norm statistics**: min, max, mean, max absolute deviation from 1.0
@@ -196,9 +192,9 @@ from the knn\_utils project.
         for i in 0..count {
             let slice = reader.get_slice(i);
 
-            // Per-vector L2 norm via BLAS cblas_snrm2
+            // Per-vector L2 norm.
             // Matches: norm_val = np.linalg.norm(vector)
-            let norm_val = blas_snrm2(slice) as f64;
+            let norm_val = l2_norm(slice) as f64;
             norms.push(norm_val);
 
             // Matches: if (abs(norm_val - 1) > tol_norm): normalized = False

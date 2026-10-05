@@ -1630,6 +1630,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fearless_simd"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3772b63c40606beea8fe1f7b06a60de27ceb9bfc2d9dad3427368ca41dc7e62"
+
+[[package]]
+name = "fearless_simd_macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e91d94c6885390b81782d7ee60fd6583b33907333a8b340de25ccf468353315"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6286,7 +6303,6 @@ dependencies = [
  "sha2",
  "shadow-terminal",
  "signal-hook",
- "simsimd",
  "slabtastic",
  "tempfile",
  "thiserror 2.0.18",
@@ -6299,6 +6315,7 @@ dependencies = [
  "veks-anode",
  "veks-completion",
  "veks-completion-derive",
+ "veks-simd",
 ]
 
 [[package]]
@@ -6339,7 +6356,6 @@ dependencies = [
  "serde_yaml",
  "shadow-terminal",
  "signal-hook",
- "simsimd",
  "slabtastic",
  "tempfile",
  "tokio",
@@ -6404,6 +6420,7 @@ dependencies = [
  "tempfile",
  "vectordata",
  "veks-io",
+ "veks-simd",
 ]
 
 [[package]]
@@ -6438,6 +6455,7 @@ dependencies = [
  "faiss",
  "filetime",
  "flate2",
+ "gemm 0.19.0",
  "half",
  "hex",
  "hf-hub",
@@ -6466,7 +6484,6 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "signal-hook",
- "simsimd",
  "slabtastic",
  "tempfile",
  "tokenizers",
@@ -6475,6 +6492,18 @@ dependencies = [
  "veks-completion",
  "veks-completion-derive",
  "veks-core",
+ "veks-simd",
+]
+
+[[package]]
+name = "veks-simd"
+version = "2.2.0"
+dependencies = [
+ "criterion",
+ "fearless_simd",
+ "fearless_simd_macros",
+ "half",
+ "simsimd",
 ]
 
 [[package]]

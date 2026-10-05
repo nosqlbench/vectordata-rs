@@ -305,9 +305,11 @@ to all FAISS search paths in veks.
 
 ### Option 5: Use knn-metal or knn-stdarch instead
 
-For ground truth computation, knn-metal (SimSIMD) and knn-stdarch
-(pure `std::arch`) produce byte-identical results and are 50-180x
-faster than FAISS. FAISS is retained for cross-validation with
+For ground truth computation, knn-metal and knn-stdarch (the native
+`veks-simd` kernels) produce byte-identical results and are 50-180x
+faster than FAISS. knn-blas on its default `gemm` backend never touches
+the MKL symbols at all, so the single-threading workaround does not
+apply to it; only its `--backend system` path shares the hazard. FAISS is retained for cross-validation with
 the knn_utils Python ecosystem, but should not be the primary
 compute engine for high-dimensional datasets.
 

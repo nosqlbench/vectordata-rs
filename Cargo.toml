@@ -66,11 +66,14 @@ vectordata = { path = "crates/vectordata", version = "2.0.0", features = ["cli"]
 veks = { path = "crates/veks", version = "2.0.0", default-features = false }
 
 # Mirror veks's feature surface so `cargo install --path .` gets the same
-# default personality as `cargo install --path crates/veks` (knnutils is veks's
-# default because bootstrap emits `compute knn-blas`).
+# default personality as `cargo install --path crates/veks`. The defaults
+# are pure Rust; `blas-system`, `simsimd` and `faiss` opt into native
+# libraries.
 [features]
 default = ["knnutils"]
 knnutils = ["veks/knnutils"]
+blas-system = ["veks/blas-system"]
+simsimd = ["veks/simsimd"]
 faiss = ["veks/faiss"]
 embed = ["veks/embed"]
 embed-cuda = ["veks/embed-cuda"]
@@ -82,6 +85,7 @@ workspace = true
 members = [
     "crates/vectordata",
     "crates/veks-anode",
+    "crates/veks-simd",
     "crates/veks-core",
     "crates/veks-pipeline",
     "crates/veks-completion",
@@ -115,6 +119,7 @@ members = [
 default-members = [
     "crates/vectordata",
     "crates/veks-anode",
+    "crates/veks-simd",
     "crates/veks-core",
     "crates/veks-pipeline",
     "crates/veks-completion",

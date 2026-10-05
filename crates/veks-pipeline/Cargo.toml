@@ -9,7 +9,18 @@ repository = "https://github.com/nosqlbench/vectordata-rs"
 
 [features]
 default = []
+# The knn_utils / numpy parity personality: MT19937 shuffles and the
+# `*-knnutils` commands. Pure Rust; it no longer implies system BLAS.
 knnutils = ["dep:rand_mt"]
+# `--backend system` for the sgemm scans (`compute knn-blas`, `verify
+# knn-consolidated`, …): links the system BLAS (`-l blas`, unix only)
+# for kernel-level parity with numpy / FAISS. The default backend is the
+# pure-Rust `gemm` crate.
+blas-system = []
+# `--backend simsimd` for the pairwise scans: simsimd's C kernels as an
+# independent implementation for parity runs. Native kernels are the
+# default.
+simsimd = ["veks-simd/simsimd"]
 faiss = ["knnutils", "dep:faiss"]
 # In-process embedding backend (`generate embed`) on candle — heavy model
 # runtime, so strictly opt-in.
@@ -69,8 +80,11 @@ hmac = "0.12"
 hex = "0.4"
 quick-xml = "0.36"
 signal-hook = "0.3"
-simsimd = "6"
 slabtastic = { path = "../slabtastic", version = "1.0.0" }
+veks-simd = { path = "../veks-simd", version = "2.2.0" }
+# Pure-Rust sgemm (the engine under faer) for the matrix-multiply KNN
+# scans; `x86-v4` turns on its AVX-512 kernels.
+gemm = { version = "0.19", default-features = false, features = ["std", "rayon", "x86-v4"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 vectordata = { path = "../vectordata", version = "2.0.0" }

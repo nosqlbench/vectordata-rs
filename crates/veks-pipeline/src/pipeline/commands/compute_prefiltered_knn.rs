@@ -1080,9 +1080,9 @@ use the E facet produced by `compute postfiltered-knn`.
             Err(e) => return error_result(e, start),
         };
         match etype {
-            // F32 — and anything without SIMD support (or i8) —
-            // takes the generic f32 kernel.
-            _ if !etype.supports_simd_distance() || etype == ElementType::I8 => {
+            // F32 — and anything without SIMD support — takes the
+            // generic f32 kernel.
+            _ if !etype.supports_simd_distance() => {
                 let dist_fn = simd_distance::select_distance_fn(metric);
                 execute_f32(
                     &base_path, &query_path, &keys_reader, &indices_path,

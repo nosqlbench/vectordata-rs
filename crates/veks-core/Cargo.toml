@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 slabtastic = { path = "../slabtastic", version = "1.0.0" }
 veks-io = { path = "../veks-io", version = "1.0.0" }
+veks-simd = { path = "../veks-simd", version = "2.2.0" }
 vectordata = { path = "../vectordata", version = "2.0.0" }
 
 [dev-dependencies]

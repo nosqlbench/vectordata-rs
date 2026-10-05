@@ -104,12 +104,13 @@ Two implementations, selectable by personality:
 
 | Personality | Command | Distance kernel | PRNG |
 |-------------|---------|----------------|------|
-| native (default) | `compute knn` | SimSIMD | — |
-| knn_utils | `compute knn-blas` | BLAS `cblas_sgemm` | — |
+| native (default) | `compute knn` | `veks-simd` batch kernels | — |
+| knn_utils | `compute knn-blas` | sgemm (`gemm`, or system BLAS) | — |
 
 Both produce exact brute-force k-nearest-neighbor results. The
 knn_utils personality matches the Python knn_utils project
-byte-for-byte when using the same BLAS library. See
+byte-for-byte when `compute knn-blas` runs with `--backend system`
+against the same BLAS library (a `blas-system` build). See
 [§12 knn_utils Verification](./12-knn-utils-verification.md) for
 the definitive quality reference and cross-verification methodology.
 

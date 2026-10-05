@@ -11,7 +11,7 @@
 //!
 //! **fvecs checks** (base and query vectors):
 //! - Dimension consistency (all vectors same dim)
-//! - L2 normalization via BLAS `cblas_snrm2` (tol\_norm, default 1e-5)
+//! - L2 normalization, norm as `sqrt(v · v)` (tol\_norm, default 1e-5)
 //! - Zero/near-zero vectors (tol\_zero, default 1e-6)
 //! - Norm statistics: min, max, mean, max abs deviation from 1.0
 //!
@@ -49,13 +49,10 @@ use crate::pipeline::command::{
 };
 use crate::pipeline::element_type::ElementType;
 
-// BLAS snrm2: same routine knn_utils calls via np.linalg.norm(vector).
-unsafe extern "C" {
-    fn cblas_snrm2(n: i32, x: *const f32, incx: i32) -> f32;
-}
-
-fn blas_snrm2(v: &[f32]) -> f32 {
-    unsafe { cblas_snrm2(v.len() as i32, v.as_ptr(), 1) }
+/// L2 norm of a float32 slice, `sqrt(v · v)` — the formula
+/// `np.linalg.norm(v)` evaluates — on the native SIMD kernel.
+fn l2_norm(v: &[f32]) -> f32 {
+    crate::pipeline::simd_distance::select_norm_fn()(v)
 }
 
 fn error_result(message: impl Into<String>, start: Instant) -> CommandResult {
@@ -140,7 +137,7 @@ fn check_fvecs(
     const PB_CHUNK: usize = 1 << 14;
     for i in 0..count {
         let slice = reader.get_slice(i);
-        let norm = blas_snrm2(slice) as f64;
+        let norm = l2_norm(slice) as f64;
 
         norm_sum += norm;
         if norm < norm_min { norm_min = norm; }
@@ -179,7 +176,7 @@ fn check_fvecs(
 }
 
 /// Check an mvecs (f16) file — same logic as `check_fvecs` but reads
-/// half-precision and upcasts each vector to f32 for the BLAS norm.
+/// half-precision and upcasts each vector to f32 for the norm.
 fn check_mvecs(
     path: &Path,
     tol_norm: f64,
@@ -217,7 +214,7 @@ fn check_mvecs(
         for (j, v) in slice.iter().enumerate() {
             f32_buf[j] = v.to_f32();
         }
-        let norm = blas_snrm2(&f32_buf) as f64;
+        let norm = l2_norm(&f32_buf) as f64;
 
         norm_sum += norm;
         if norm < norm_min { norm_min = norm; }
@@ -500,15 +497,21 @@ checks, in a single pipeline step.
                 extended_description: None,
                 role: OptionRole::Output,
             },
+            crate::pipeline::sgemm::MatmulBackend::option_desc(),
         ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        // knn_utils verifier uses sgemm — same MKL ABI hazard as
-        // every other BLAS-touching command (see pipeline::blas_abi).
+        // knn_utils verifier uses sgemm — on the system backend, the
+        // same MKL ABI hazard as every other BLAS-touching command (see
+        // pipeline::blas_abi).
         crate::pipeline::blas_abi::set_single_threaded_if_faiss();
+        let backend = match crate::pipeline::sgemm::MatmulBackend::from_options(options) {
+            Ok(b) => b,
+            Err(e) => return error_result(e, start),
+        };
 
         // Up-front: confirm the local dataset has the minimum facets
         // this verify kind requires (see pipeline::dataset_lookup).
@@ -590,9 +593,9 @@ checks, in a single pipeline step.
             None => "?".to_string(),
         };
         ctx.ui.log(&format!(
-            "verify dataset-knnutils: norm/zero + neighbor sanity + KNN sample-recompute via BLAS sgemm \
-             (single-threaded, MKL-safe); sample={} of {} queries, k={}, metric={}",
-            actual_sample, total_str, k, metric_str,
+            "verify dataset-knnutils: norm/zero + neighbor sanity + KNN sample-recompute via sgemm \
+             (backend={}); sample={} of {} queries, k={}, metric={}",
+            backend.name(), actual_sample, total_str, k, metric_str,
         ));
 
         let mut report = Vec::<String>::new();
@@ -767,7 +770,7 @@ checks, in a single pipeline step.
         emit(ctx, &format!("  Sampling {} of {} queries, metric={}, k={}",
             actual_sample, query_result.count, metric_str, k));
 
-        // Recompute KNN for sampled queries using BLAS sgemm. sgemm
+        // Recompute KNN for sampled queries using sgemm. sgemm
         // wants f32, but the base / query files may be f16. Decide the
         // element type once per file, then dispatch the actual reads
         // below — same pattern as `verify knn-consolidated`, no
@@ -895,6 +898,7 @@ checks, in a single pipeline step.
             let pb_ref = &scan_pb;
             let mut tick_cb = move |done: u64| { pb_ref.set_position(done); };
             if let Err(e) = super::compute_knn_blas::scan_range_sgemm(
+                backend,
                 &base_file,
                 0..n_base,
                 dim,
@@ -939,9 +943,9 @@ checks, in a single pipeline step.
 
         // Compare each sampled query's result against ground truth.
         //
-        // Multi-threaded BLAS (MKL/OpenBLAS) is non-deterministic across
-        // calls with different batch sizes — the thread block decomposition
-        // in sgemm produces different floating-point rounding. Queries
+        // sgemm is not deterministic across calls with different batch
+        // sizes — the block decomposition (and, for multi-threaded
+        // MKL/OpenBLAS, the thread split) changes the rounding. Queries
         // where the only difference is a small number of boundary neighbors
         // (swapped at ULP-level distance ties) are expected and acceptable.
         // A query is a "boundary mismatch" when <= 5 neighbors differ;
@@ -1126,7 +1130,7 @@ mod tests {
         write_fvec(&tmp.path().join("base.fvec"), &base);
         write_fvec(&tmp.path().join("query.fvec"), &query);
 
-        // Compute GT via BLAS sgemm
+        // Compute GT via sgemm
         let mut knn_opts = Options::new();
         knn_opts.set("base", tmp.path().join("base.fvec").to_string_lossy().to_string());
         knn_opts.set("query", tmp.path().join("query.fvec").to_string_lossy().to_string());

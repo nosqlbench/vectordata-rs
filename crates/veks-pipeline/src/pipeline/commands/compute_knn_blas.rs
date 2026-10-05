@@ -1,13 +1,15 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pipeline command: compute exact KNN using direct BLAS sgemm.
+//! Pipeline command: compute exact KNN as a matrix multiply (sgemm).
 //!
-//! Numpy/knn_utils parity at the kernel level: `cblas_sgemm` is the same
-//! routine `numpy.matmul` dispatches to under MKL/OpenBLAS and the same
-//! routine FAISS `IndexFlatIP`/`IndexFlatL2` wraps. Results are bit-
-//! identical on CPU when compiled against the same BLAS backend as the
-//! Python reference.
+//! Each chunk of base vectors is scored against a block of queries with
+//! one `Q · Bᵀ` sgemm, then top-k is selected from the score rows. The
+//! multiply runs on [`MatmulBackend`]: the pure-Rust `gemm` crate by
+//! default, or — with `--backend system` in a `blas-system` build — the
+//! system `cblas_sgemm`, the same routine `numpy.matmul` dispatches to
+//! under MKL/OpenBLAS and FAISS `IndexFlatIP`/`IndexFlatL2` wraps, for
+//! kernel-level parity with the Python reference.
 //!
 //! Architecturally this command is a peer of `compute knn-stdarch`: it
 //! reuses the shared segment-cache infrastructure ([`super::knn_segment`])
@@ -16,8 +18,9 @@
 //! space during compute. The only difference is the per-chunk distance
 //! kernel — sgemm (BLAS matmul) instead of a per-vector SIMD loop.
 //!
-//! Links dynamically against the system BLAS (`libopenblas-dev` /
-//! `libmkl-dev`) — no static compilation, no FAISS dependency.
+//! The system backend links dynamically against the system BLAS
+//! (`libopenblas-dev` / `libmkl-dev`) — no static compilation, no FAISS
+//! dependency. The default backend links nothing.
 
 use std::collections::BinaryHeap;
 use std::io::Write;
@@ -40,11 +43,20 @@ use super::knn_segment::{
     scan_cached_segments, write_segment_cache,
 };
 use super::source_window::resolve_source;
+use crate::pipeline::sgemm::{MatmulBackend, sgemm_nt};
 
-/// Engine identifier in the segment cache. Distinct from other engines
-/// because different backends compute ULP-different f32 values for the
-/// same inputs, so their caches are not interchangeable.
-const ENGINE_NAME: &str = "knn-blas";
+/// Engine identifier in the segment cache, per backend. Distinct from
+/// other engines — and from each other — because different kernels
+/// compute ULP-different f32 values for the same inputs, so their caches
+/// are not interchangeable. The system backend keeps the historical
+/// `knn-blas` name, which every cache written before the `gemm` backend
+/// existed carries.
+fn engine_name(backend: MatmulBackend) -> &'static str {
+    match backend {
+        MatmulBackend::System => "knn-blas",
+        MatmulBackend::Gemm => "knn-blas-gemm",
+    }
+}
 
 /// I/O chunk size target. Same default as knn-stdarch — 64 MiB of raw
 /// fvec bytes per chunk. Actual `vecs_per_chunk` is derived from
@@ -66,33 +78,6 @@ const SCORE_MATRIX_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// grow). Larger values amortize sgemm startup overhead. 2048 is a
 /// sweet spot on modern x86 with AVX-512 / OpenBLAS.
 const QUERY_SUBBATCH_SIZE: usize = 2048;
-
-// ─── BLAS FFI ────────────────────────────────────────────────────────────
-// Links dynamically against whatever `libblas.so` / `libopenblas.so` /
-// `libmkl_rt.so` the system provides. The `-l blas` linker flag is
-// handled by `build.rs` / `Cargo.toml` under the `knnutils` feature.
-unsafe extern "C" {
-    fn cblas_sgemm(
-        order: i32,     // CblasRowMajor = 101
-        transa: i32,    // CblasNoTrans = 111
-        transb: i32,    // CblasTrans = 112
-        m: i32,         // rows of A (n_query)
-        n: i32,         // cols of B^T (n_base)
-        k: i32,         // shared dim
-        alpha: f32,
-        a: *const f32,  // query batch (m × k)
-        lda: i32,
-        b: *const f32,  // base data (n × k, transposed by flag)
-        ldb: i32,
-        beta: f32,
-        c: *mut f32,    // output scores (m × n)
-        ldc: i32,
-    );
-}
-
-const CBLAS_ROW_MAJOR: i32 = 101;
-const CBLAS_NO_TRANS: i32 = 111;
-const CBLAS_TRANS: i32 = 112;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Streaming + compute helpers
@@ -154,6 +139,7 @@ fn pread_and_unpack(
             // f16 path — decode each pair of bytes into half::f16,
             // then upcast to f32. We use the SIMD bulk converter so
             // wide vectors don't bottleneck on per-element decode.
+            let to_f32 = crate::pipeline::simd_distance::select_f16_to_f32();
             for i in 0..n_vecs {
                 let src_off = i * entry_size + 4;
                 let dst_off = i * dim;
@@ -164,10 +150,7 @@ fn pread_and_unpack(
                 let f16_slice: &[half::f16] = unsafe {
                     std::slice::from_raw_parts(src.as_ptr() as *const half::f16, dim)
                 };
-                crate::pipeline::simd_distance::convert_f16_to_f32_bulk(
-                    f16_slice,
-                    &mut packed[dst_off..dst_off + dim],
-                );
+                to_f32(f16_slice, &mut packed[dst_off..dst_off + dim]);
             }
         }
         other => return Err(std::io::Error::new(
@@ -178,12 +161,13 @@ fn pread_and_unpack(
     Ok(())
 }
 
-/// Run `cblas_sgemm` for one chunk. Writes `n_query × chunk_n` scores
-/// into `scores` (row-major). `use_ip` picks IP (pure matmul) vs L2
+/// Run sgemm for one chunk. Writes `n_query × chunk_n` scores into
+/// `scores` (row-major). `use_ip` picks IP (pure matmul) vs L2
 /// (|q|² + |b|² − 2·q·b). Caller is responsible for `query_norms_sq`
 /// and `base_norms_sq` for the L2 path.
 #[allow(clippy::too_many_arguments)]
 fn sgemm_chunk(
+    backend: MatmulBackend,
     queries_packed: &[f32], n_query: usize,
     chunk_packed: &[f32], chunk_n: usize,
     dim: usize,
@@ -192,31 +176,19 @@ fn sgemm_chunk(
     base_norms_sq: Option<&[f32]>,
     scores: &mut [f32],
 ) {
+    // 0 threads: the gemm backend uses rayon's whole pool; the system
+    // backend uses the BLAS library's own threading.
     if use_ip {
-        unsafe {
-            cblas_sgemm(
-                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
-                n_query as i32, chunk_n as i32, dim as i32,
-                1.0,
-                queries_packed.as_ptr(), dim as i32,
-                chunk_packed.as_ptr(), dim as i32,
-                0.0,
-                scores.as_mut_ptr(), chunk_n as i32,
-            );
-        }
+        sgemm_nt(
+            backend, n_query, chunk_n, dim, 1.0,
+            queries_packed, dim, chunk_packed, dim, scores, chunk_n, 0,
+        );
     } else {
         // L2: start with -2·q·b via sgemm, then add |q|² + |b|².
-        unsafe {
-            cblas_sgemm(
-                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
-                n_query as i32, chunk_n as i32, dim as i32,
-                -2.0,
-                queries_packed.as_ptr(), dim as i32,
-                chunk_packed.as_ptr(), dim as i32,
-                0.0,
-                scores.as_mut_ptr(), chunk_n as i32,
-            );
-        }
+        sgemm_nt(
+            backend, n_query, chunk_n, dim, -2.0,
+            queries_packed, dim, chunk_packed, dim, scores, chunk_n, 0,
+        );
         let q_norms = query_norms_sq.expect("L2 path requires query_norms_sq");
         let b_norms = base_norms_sq.expect("L2 path requires base_norms_sq");
         for qi in 0..n_query {
@@ -277,70 +249,6 @@ fn topk_from_scores_into(
         }
     }
     threshold
-}
-
-// ─── Compatibility shims used by verify_dataset_knnutils ──────────────
-// These preserve the pre-refactor API for the verifier so it doesn't
-// need its own sgemm + top-k path. Both delegate to the new
-// `sgemm_chunk` / `topk_from_scores_into` helpers.
-
-/// Compute the score matrix `n_query × n_base` via sgemm, with the
-/// "higher score = better" convention (the L2 path negates after the
-/// norm adjustment so the caller can run a uniform top-k).
-///
-/// # Safety
-/// Calls `cblas_sgemm` via FFI. Slices must be valid contiguous f32.
-#[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn blas_sgemm_scores(
-    query_data: &[f32], n_query: usize,
-    base_data: &[f32], n_base: usize,
-    dim: usize, use_ip: bool,
-    scores: &mut [f32],
-) {
-    let q_norms_sq: Vec<f32>;
-    let b_norms_sq: Vec<f32>;
-    let (q_n_opt, b_n_opt): (Option<&[f32]>, Option<&[f32]>) = if use_ip {
-        (None, None)
-    } else {
-        q_norms_sq = (0..n_query).map(|qi| {
-            let s = &query_data[qi * dim..(qi + 1) * dim];
-            s.iter().map(|v| v * v).sum::<f32>()
-        }).collect();
-        b_norms_sq = (0..n_base).map(|bi| {
-            let s = &base_data[bi * dim..(bi + 1) * dim];
-            s.iter().map(|v| v * v).sum::<f32>()
-        }).collect();
-        (Some(q_norms_sq.as_slice()), Some(b_norms_sq.as_slice()))
-    };
-    sgemm_chunk(
-        query_data, n_query,
-        base_data, n_base,
-        dim, use_ip,
-        q_n_opt, b_n_opt,
-        scores,
-    );
-    if !use_ip {
-        // Negate L2sq so the caller's top-k can treat all paths
-        // uniformly as "higher = better".
-        for s in scores.iter_mut() {
-            *s = -*s;
-        }
-    }
-}
-
-/// Top-k indices for one row of "higher = better" scores. Sorted
-/// ascending by distance (best first). Returns
-/// `compute_knn::Neighbor` whose `.distance == -score`.
-pub(super) fn topk_indices(scores: &[f32], k: usize) -> Vec<Neighbor> {
-    let mut heap: BinaryHeap<Neighbor> = BinaryHeap::with_capacity(k + 1);
-    let _ = topk_from_scores_into(scores, k, /*use_ip=*/true, 0, f32::INFINITY, &mut heap);
-    let mut v: Vec<Neighbor> = heap.into_vec();
-    v.sort_by(|a, b| {
-        a.distance.partial_cmp(&b.distance)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.index.cmp(&b.index))
-    });
-    v
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -420,6 +328,7 @@ impl SgemmScanBuffers {
 /// sgemm when computing cosine on non-normalized inputs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_range_sgemm(
+    backend: MatmulBackend,
     base_file: &SpanFile,
     base_range: std::ops::Range<usize>,
     dim: usize,
@@ -527,6 +436,7 @@ pub(super) fn scan_range_sgemm(
                     let scores_slice = &mut score_matrix_ref[..qb_n * cur_n];
 
                     sgemm_chunk(
+                        backend,
                         queries_slice, qb_n,
                         packed_cur, cur_n,
                         dim,
@@ -630,20 +540,26 @@ impl CommandOp for ComputeKnnBlasOp {
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Brute-force exact KNN via BLAS sgemm (knn_utils compatible)".into(),
+            summary: "Brute-force exact KNN via sgemm (pure-Rust gemm, or the system BLAS for knn_utils parity)".into(),
             body: format!(r#"# compute knn-blas
 
-Brute-force exact K-nearest-neighbor ground truth computation using
-direct BLAS `cblas_sgemm` for the distance matrix, with Rust top-K
+Brute-force exact K-nearest-neighbor ground truth that computes each
+block of distances as one matrix multiply (`Q · Bᵀ`), with Rust top-K
 heap selection.
 
-## Numerical parity
+## Backends
 
-Produces bit-identical CPU results to:
-  - `numpy.matmul` / `np.linalg.norm`-based KNN (both dispatch to the
-    same `cblas_sgemm` routine under MKL/OpenBLAS).
-  - FAISS `IndexFlatIP` / `IndexFlatL2` when both link the same BLAS
-    backend.
+  - `gemm` (default): the pure-Rust `gemm` crate, dispatched at runtime
+    to the CPU's instruction set and threaded with rayon. Available on
+    every target.
+  - `system`: the system BLAS `cblas_sgemm`, in builds with the
+    `blas-system` feature (unix). This is the routine `numpy.matmul`
+    dispatches to under MKL/OpenBLAS and FAISS `IndexFlatIP` /
+    `IndexFlatL2` wraps, so with the same BLAS library the scores are
+    bit-identical to theirs.
+
+The two backends sum in different orders and are cached separately;
+the closing f64 rerank makes their final outputs agree.
 
 ## Architecture
 
@@ -651,7 +567,8 @@ Reuses the shared segment-cache infrastructure:
   - Cross-profile cache reuse — smaller sibling profiles' published
     outputs drop in as `[0..N)` segments.
   - Mid-run resumability — each segment's per-query top-K is cached
-    in `<workspace>/.cache/knn-blas.v3.*` files.
+    in `<workspace>/.cache/` under the backend's engine name
+    (`knn-blas-gemm`, or `knn-blas` for the system backend).
   - Streaming pread — base vectors never enter the mmap address
     space during compute; I/O is double-buffered against sgemm
     compute.
@@ -703,6 +620,11 @@ Reuses the shared segment-cache infrastructure:
             Some(m) => m,
             None => return error_result(format!("unsupported metric: '{}'", metric_str), start),
         };
+        let backend = match MatmulBackend::from_options(options) {
+            Ok(b) => b,
+            Err(e) => return error_result(e, start),
+        };
+        let engine = engine_name(backend);
         let cosine_mode = match resolve_cosine_mode(metric, options) {
             Ok(m) => m,
             Err(e) => return error_result(e, start),
@@ -802,8 +724,8 @@ Reuses the shared segment-cache infrastructure:
         let internal_k = super::knn_segment::internal_k(k, margin).min(base_n);
 
         ctx.ui.log(&format!(
-            "KNN-blas: {} queries × {} base, dim={}, k={} (internal {}), metric={} (engine=BLAS sgemm)",
-            query_count, base_n, dim, k, internal_k, metric_str,
+            "KNN-blas: {} queries × {} base, dim={}, k={} (internal {}), metric={} (engine={}, sgemm backend={})",
+            query_count, base_n, dim, k, internal_k, metric_str, engine, backend.name(),
         ));
 
         // ── Segment planning (shared with knn-stdarch) ──────────────
@@ -842,7 +764,7 @@ Reuses the shared segment-cache infrastructure:
         }
         let cache_prefix = cache_prefix_for(&base_path, &query_path);
         let cached_segments = scan_cached_segments(
-            &ctx.cache, ENGINE_NAME, &cache_prefix, internal_k, kernel_metric, query_count,
+            &ctx.cache, engine, &cache_prefix, internal_k, kernel_metric, query_count,
             &ctx.workspace, base_end, &ctx.ui,
         );
 
@@ -872,8 +794,8 @@ Reuses the shared segment-cache infrastructure:
                 let pe = (pos + segment_size).min(base_end);
                 plan.push(PlannedSegment {
                     start: pos, end: pe,
-                    ivec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, internal_k, kernel_metric, "neighbors", "ivec"),
-                    fvec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, internal_k, kernel_metric, "distances", "fvec"),
+                    ivec_path: build_cache_path(&ctx.cache, engine, &cache_prefix, pos, pe, internal_k, kernel_metric, "neighbors", "ivec"),
+                    fvec_path: build_cache_path(&ctx.cache, engine, &cache_prefix, pos, pe, internal_k, kernel_metric, "distances", "fvec"),
                     cached: false,
                 });
                 pos = pe;
@@ -1035,6 +957,7 @@ Reuses the shared segment-cache infrastructure:
             };
 
             if let Err(e) = scan_range_sgemm(
+                backend,
                 &base_file,
                 seg_start..seg_end,
                 dim,
@@ -1238,6 +1161,7 @@ Reuses the shared segment-cache infrastructure:
                 description: "Override auto-sized segment length (for testing or finer cache granularity)".into(),
                 extended_description: None,
                 role: OptionRole::Config },
+            MatmulBackend::option_desc(),
         ]
     }
 
@@ -1259,8 +1183,11 @@ Reuses the shared segment-cache infrastructure:
             return vec![];
         };
         let query = super::gen_predicates_common::resolve_path(query, workspace);
+        // An unparseable backend fails the step at execute time; the
+        // claim then covers the default engine's namespace.
+        let backend = MatmulBackend::from_options(options).unwrap_or(MatmulBackend::Gemm);
         vec![crate::pipeline::command::CacheClaim::Prefix(
-            super::knn_segment::engine_cache_claim(ENGINE_NAME, &base.path, &query),
+            super::knn_segment::engine_cache_claim(engine_name(backend), &base.path, &query),
         )]
     }
 }
@@ -1474,7 +1401,7 @@ mod tests {
         let files_after_a: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-blas.v3.")).unwrap_or(false))
+                .map(|n| n.starts_with(&format!("{}.v3.", engine_name(MatmulBackend::Gemm)))).unwrap_or(false))
             .collect();
         assert_eq!(files_after_a.len(), 6,
             "profile A should have written 6 cache files (3 segments × ivec+fvec), got {}",
@@ -1519,7 +1446,7 @@ mod tests {
         let files_after_b: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-blas.v3.")).unwrap_or(false))
+                .map(|n| n.starts_with(&format!("{}.v3.", engine_name(MatmulBackend::Gemm)))).unwrap_or(false))
             .collect();
         assert_eq!(files_after_b.len(), 12,
             "expected 12 cache files (6 from A + 6 fresh from B), got {}",
@@ -1592,8 +1519,8 @@ mod tests {
         assert!(!mtimes_before.is_empty(), "first run must populate the cache");
         for (name, _) in &mtimes_before {
             let s = name.to_string_lossy();
-            assert!(s.starts_with(super::ENGINE_NAME),
-                "cache file {} not in {} namespace", s, super::ENGINE_NAME);
+            let engine = super::engine_name(MatmulBackend::Gemm);
+            assert!(s.starts_with(engine), "cache file {} not in {} namespace", s, engine);
         }
 
         std::thread::sleep(std::time::Duration::from_millis(50));

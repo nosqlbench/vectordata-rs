@@ -29,10 +29,8 @@ use std::time::Instant;
 use crate::pipeline::command::*;
 use crate::pipeline::element_type::ElementType;
 use crate::pipeline::simd_distance;
-// `Metric` is only referenced by the bare name inside the
-// knnutils-gated `VerifyKnnConsolidatedOp::execute` impl below.
-#[cfg(all(feature = "knnutils", unix))]
 use crate::pipeline::simd_distance::Metric;
+use crate::pipeline::sgemm::MatmulBackend;
 use vectordata::io::XvecReader;
 use vectordata::VectorReader;
 use vectordata::dataset::DatasetConfig;
@@ -123,7 +121,8 @@ impl AnyFloatReader {
         match self {
             AnyFloatReader::F16(r) => {
                 let slice = r.get_slice(index);
-                simd_distance::convert_f16_to_f32_bulk(slice, buf);
+                // Query-side packing, once per query — not a scan loop.
+                simd_distance::select_f16_to_f32()(slice, buf);
             }
             AnyFloatReader::F32(r) => {
                 let slice = r.get_slice(index);
@@ -167,21 +166,16 @@ fn predicate_results_candidates(workspace: &Path, profile: &str) -> Vec<PathBuf>
 // verify knn-consolidated (multi-threaded)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// verify knn-consolidated uses the same sgemm kernel as compute knn-blas
-// so distances are bit-identical and verify can't false-positive on ULP
-// boundary tie-swaps. That kernel is feature-gated on `knnutils`
-// (system BLAS link); the command is therefore only registered when
-// knnutils is compiled in. Non-knnutils builds can still use the other
-// verify commands (filtered / predicates).
-#[cfg(all(feature = "knnutils", unix))]
+// verify knn-consolidated uses the same sgemm scan as compute knn-blas,
+// on the same backend, so distances are bit-identical and verify can't
+// false-positive on ULP boundary tie-swaps. Its `backend` option must
+// therefore name the backend the ground truth was computed with.
 pub struct VerifyKnnConsolidatedOp;
 
-#[cfg(all(feature = "knnutils", unix))]
 pub fn knn_consolidated_factory() -> Box<dyn CommandOp> {
     Box::new(VerifyKnnConsolidatedOp)
 }
 
-#[cfg(all(feature = "knnutils", unix))]
 impl CommandOp for VerifyKnnConsolidatedOp {
     fn command_path(&self) -> &str {
         "verify knn-consolidated"
@@ -203,7 +197,11 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                    normalized mode is enabled, uses DotProduct kernel. At each profile's \
                    base_count boundary, per-thread heaps are merged and compared against \
                    that profile's GT indices. The threads option controls parallelism \
-                   (0 = auto). Writes a JSON report to output.".into(),
+                   (0 = auto). Distances come from the same sgemm scan as compute \
+                   knn-blas; the backend option (gemm by default, or system for the \
+                   system BLAS) must name the backend the ground truth was computed \
+                   with, so the two produce bit-identical distances. Writes a JSON \
+                   report to output.".into(),
         }
     }
 
@@ -217,6 +215,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             OptionDesc { name: "seed".into(), type_name: "int".into(), required: false, default: Some("42".into()), description: "Random seed for sampling".into(), extended_description: None, role: OptionRole::Config },
             OptionDesc { name: "threads".into(), type_name: "int".into(), required: false, default: Some("0".into()), description: "Thread count (0 = auto)".into(), extended_description: None, role: OptionRole::Config },
             OptionDesc { name: "output".into(), type_name: "Path".into(), required: true, default: None, description: "Output JSON report".into(), extended_description: None, role: OptionRole::Output },
+            MatmulBackend::option_desc(),
         ]
     }
 
@@ -230,10 +229,14 @@ impl CommandOp for VerifyKnnConsolidatedOp {
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        // Verifier drives `scan_range_sgemm` which calls cblas_sgemm
-        // directly — poisoned by faiss-sys static MKL under multi-
+        // Verifier drives `scan_range_sgemm`. On the system backend that
+        // is `cblas_sgemm`, poisoned by faiss-sys static MKL under multi-
         // threading (see pipeline::blas_abi). Force single-threaded.
         crate::pipeline::blas_abi::set_single_threaded_if_faiss();
+        let backend = match MatmulBackend::from_options(options) {
+            Ok(b) => b,
+            Err(e) => return error_result(e, start),
+        };
 
         // Up-front: confirm the local dataset has the minimum facets
         // this verify kind requires (see pipeline::dataset_lookup).
@@ -396,10 +399,10 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // Open base vectors with element-type dispatch. Matches the
         // pattern in `compute_knn.rs::execute_{f32,f16,f64}`: detect
         // the on-disk type once, monomorphize per type, run the
-        // specialized arm. The verify scan is sgemm-based (BLAS only
-        // knows f32) so the f16 arm just upcasts at unpack time —
+        // specialized arm. The verify scan is sgemm-based (f32 only)
+        // so the f16 arm just upcasts at unpack time —
         // see `pread_and_unpack`'s `elem_size` parameter. For a
-        // dedicated f16 SIMD path (cblas_hgemm or stdarch f16),
+        // dedicated f16 path (an hgemm),
         // it'd add a third arm here, not collapse into a runtime
         // enum like AnyFloatReader.
         let base_etype = match ElementType::from_path(&base_path) {
@@ -538,10 +541,11 @@ impl CommandOp for VerifyKnnConsolidatedOp {
 
         let pct = if query_count > 0 { 100.0 * num_samples as f64 / query_count as f64 } else { 0.0 };
         ctx.ui.log(&format!(
-            "verify knn-consolidated: KNN ground truth across {} profile{} via cblas_sgemm \
-             (single-threaded, MKL-safe); sample={} of {} queries ({:.1}%), metric={:?}, threads={}",
+            "verify knn-consolidated: KNN ground truth across {} profile{} via sgemm \
+             (backend={}); sample={} of {} queries ({:.1}%), metric={:?}, threads={}",
             profiles.len(),
             if profiles.len() == 1 { "" } else { "s" },
+            backend.name(),
             num_samples, query_count, pct, kernel_metric, threads,
         ));
 
@@ -611,8 +615,8 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             vecs_per_chunk, qb_size,
         ));
         ctx.ui.log(&format!(
-            "  scanning {} base vectors ({} sample queries, metric={:?}, engine=BLAS sgemm)",
-            base_count, num_samples, kernel_metric,
+            "  scanning {} base vectors ({} sample queries, metric={:?}, sgemm backend={})",
+            base_count, num_samples, kernel_metric, backend.name(),
         ));
 
         // ── Boundary grouping ─────────────────────────────────────
@@ -676,6 +680,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                 // pread reads the right bytes when the source has a
                 // non-zero window start.
                 if let Err(e) = super::compute_knn_blas::scan_range_sgemm(
+                    backend,
                     &base_file,
                     (base_offset + seg_start)..(base_offset + seg_end),
                     dim,
@@ -1017,8 +1022,8 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
 
         let actual_sample = sample_count.min(query_count);
         ctx.ui.log(&format!(
-            "verify filtered-knn-consolidated: filtered KNN ground truth across {} profile{} via cblas_sgemm \
-             (single-threaded, MKL-safe); sample={} of {} queries, base={}",
+            "verify filtered-knn-consolidated: filtered KNN ground truth across {} profile{} via pairwise \
+             native kernels; sample={} of {} queries, base={}",
             profiles.len(),
             if profiles.len() == 1 { "" } else { "s" },
             actual_sample, query_count, base_count,

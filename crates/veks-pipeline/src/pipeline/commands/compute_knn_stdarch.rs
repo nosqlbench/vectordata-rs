@@ -1,15 +1,13 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pipeline command: compute exact KNN using pure `std::arch` SIMD.
+//! Pipeline command: compute exact KNN with streaming pread I/O.
 //!
-//! Zero external SIMD dependencies — uses only Rust's `std::arch` intrinsics
-//! (AVX-512, AVX2, scalar fallback). Same threading and batching strategy as
-//! knn-metal, but with no SimSIMD or FAISS dependency.
-//!
-//! This is a reference implementation demonstrating that the full KNN pipeline
-//! can be built on `std::arch` alone. Runtime feature detection selects the
-//! best available ISA.
+//! The distance kernels are the shared native ones (`veks-simd`: AVX-512,
+//! AVX2, SSE, NEON, dispatched at runtime), the same as `compute knn`'s.
+//! This engine differs in how it reads the base: it streams it through a
+//! pair of pread buffers instead of mapping it, and all threads scan the
+//! same chunk together so it stays hot in L3.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -37,8 +35,14 @@ pub fn factory() -> Box<dyn CommandOp> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Pure std::arch distance functions with runtime ISA detection
+// Kernels
 // ═══════════════════════════════════════════════════════════════════════
+//
+// The distance kernels are the shared native ones from `veks-simd`
+// (through `pipeline::simd_distance`), dispatched once per process to
+// the best instruction set the CPU supports. What distinguishes this
+// engine is its I/O: streaming pread into double buffers, with every
+// thread scanning the same chunk while it is hot in L3.
 
 /// Distance function type.
 pub(crate) type DistFn = fn(&[f32], &[f32]) -> f32;
@@ -50,426 +54,29 @@ use super::knn_segment::{
     load_segment_cache, merge_segment_into_heaps, resolve_cosine_mode,
     scan_cached_segments, write_segment_cache,
 };
+use crate::pipeline::simd_distance::{self, SIMD_BATCH_WIDTH as BATCH_WIDTH, TransposedBatch};
 
 const ENGINE_NAME: &str = "knn-stdarch";
 
-fn select_dist_fn(metric: Metric) -> (DistFn, &'static str) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            let f = match metric {
-                Metric::L2 => l2sq_avx512 as DistFn,
-                Metric::DotProduct => neg_dot_avx512 as DistFn,
-                Metric::Cosine => cosine_avx512 as DistFn,
-            };
-            return (f, "AVX-512");
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            let f = match metric {
-                Metric::L2 => l2sq_avx2 as DistFn,
-                Metric::DotProduct => neg_dot_avx2 as DistFn,
-                Metric::Cosine => cosine_avx2 as DistFn,
-            };
-            return (f, "AVX2+FMA");
-        }
+/// The kernel crate's metric for one of the segment cache's.
+fn kernel_metric_of(metric: Metric) -> simd_distance::Metric {
+    match metric {
+        Metric::L2 => simd_distance::Metric::L2,
+        Metric::DotProduct => simd_distance::Metric::DotProduct,
+        Metric::Cosine => simd_distance::Metric::Cosine,
     }
-    let f = match metric {
-        Metric::L2 => l2sq_scalar as DistFn,
-        Metric::DotProduct => neg_dot_scalar as DistFn,
-        Metric::Cosine => cosine_scalar as DistFn,
-    };
-    (f, "scalar")
 }
 
-/// Inner product `a · b` with the same runtime kernel selection as
-/// [`select_dist_fn`]. Shared with `compute topics`, whose spherical
-/// k-means and hierarchical descent are argmaxes of this.
+/// The f32 inner product, with the name of the level it dispatched to.
+/// Shared with `compute topics`, whose spherical k-means and
+/// hierarchical descent are argmaxes of it.
 pub(crate) fn select_dot_fn() -> (DistFn, &'static str) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            return (dot_avx512 as DistFn, "AVX-512");
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return (dot_avx2 as DistFn, "AVX2+FMA");
-        }
-    }
-    (dot_scalar as DistFn, "scalar")
+    (simd_distance::select_dot_fn(), simd_distance::simd_level())
 }
 
-fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
-    -neg_dot_scalar(a, b)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
-    -neg_dot_avx512(a, b)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
-    -neg_dot_avx2(a, b)
-}
-
-// -- Scalar fallback ----------------------------------------------------------
-
-fn l2sq_scalar(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| { let d = x - y; d * d }).sum()
-}
-
-fn neg_dot_scalar(a: &[f32], b: &[f32]) -> f32 {
-    -(a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>())
-}
-
-fn cosine_scalar(a: &[f32], b: &[f32]) -> f32 {
-    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-    for (x, y) in a.iter().zip(b) {
-        dot += x * y; na += x * x; nb += y * y;
-    }
-    let denom = (na * nb).sqrt();
-    if denom == 0.0 { 1.0 } else { 1.0 - dot / denom }
-}
-
-// -- AVX-512 ------------------------------------------------------------------
-
-#[cfg(target_arch = "x86_64")]
-fn l2sq_avx512(a: &[f32], b: &[f32]) -> f32 {
-    unsafe { l2sq_avx512_inner(a, b) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn l2sq_avx512_inner(a: &[f32], b: &[f32]) -> f32 {
-    unsafe {
-        use std::arch::x86_64::*;
-        let n = a.len();
-        let mut acc = _mm512_setzero_ps();
-        let (ap, bp) = (a.as_ptr(), b.as_ptr());
-        let chunks = n / 16;
-        for i in 0..chunks {
-            let va = _mm512_loadu_ps(ap.add(i * 16));
-            let vb = _mm512_loadu_ps(bp.add(i * 16));
-            let d = _mm512_sub_ps(va, vb);
-            acc = _mm512_fmadd_ps(d, d, acc);
-        }
-        let mut sum = _mm512_reduce_add_ps(acc);
-        for i in (chunks * 16)..n {
-            let d = a[i] - b[i]; sum += d * d;
-        }
-        sum
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn neg_dot_avx512(a: &[f32], b: &[f32]) -> f32 {
-    unsafe { neg_dot_avx512_inner(a, b) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn neg_dot_avx512_inner(a: &[f32], b: &[f32]) -> f32 {    unsafe {
-        use std::arch::x86_64::*;
-        let n = a.len();
-        let mut acc = _mm512_setzero_ps();
-        let (ap, bp) = (a.as_ptr(), b.as_ptr());
-        let chunks = n / 16;
-        for i in 0..chunks {
-            let va = _mm512_loadu_ps(ap.add(i * 16));
-            let vb = _mm512_loadu_ps(bp.add(i * 16));
-            acc = _mm512_fmadd_ps(va, vb, acc);
-        }
-        let mut sum = _mm512_reduce_add_ps(acc);
-        for i in (chunks * 16)..n {
-            sum += a[i] * b[i];
-        }
-        -sum
-
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn cosine_avx512(a: &[f32], b: &[f32]) -> f32 {
-    unsafe { cosine_avx512_inner(a, b) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn cosine_avx512_inner(a: &[f32], b: &[f32]) -> f32 {    unsafe {
-        use std::arch::x86_64::*;
-        let n = a.len();
-        let (mut dot_acc, mut na_acc, mut nb_acc) = (
-            _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps());
-        let (ap, bp) = (a.as_ptr(), b.as_ptr());
-        let chunks = n / 16;
-        for i in 0..chunks {
-            let va = _mm512_loadu_ps(ap.add(i * 16));
-            let vb = _mm512_loadu_ps(bp.add(i * 16));
-            dot_acc = _mm512_fmadd_ps(va, vb, dot_acc);
-            na_acc = _mm512_fmadd_ps(va, va, na_acc);
-            nb_acc = _mm512_fmadd_ps(vb, vb, nb_acc);
-        }
-        let (mut dot, mut na, mut nb) = (
-            _mm512_reduce_add_ps(dot_acc),
-            _mm512_reduce_add_ps(na_acc),
-            _mm512_reduce_add_ps(nb_acc));
-        for i in (chunks * 16)..n {
-            dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i];
-        }
-        let denom = (na * nb).sqrt();
-        if denom == 0.0 { 1.0 } else { 1.0 - dot / denom }
-
-    }
-}
-
-// -- AVX2+FMA -----------------------------------------------------------------
-
-#[cfg(target_arch = "x86_64")]
-fn l2sq_avx2(a: &[f32], b: &[f32]) -> f32 {
-    unsafe { l2sq_avx2_inner(a, b) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn l2sq_avx2_inner(a: &[f32], b: &[f32]) -> f32 {    unsafe {
-        use std::arch::x86_64::*;
-        let n = a.len();
-        let mut acc = _mm256_setzero_ps();
-        let (ap, bp) = (a.as_ptr(), b.as_ptr());
-        let chunks = n / 8;
-        for i in 0..chunks {
-            let va = _mm256_loadu_ps(ap.add(i * 8));
-            let vb = _mm256_loadu_ps(bp.add(i * 8));
-            let d = _mm256_sub_ps(va, vb);
-            acc = _mm256_fmadd_ps(d, d, acc);
-        }
-        let mut sum = hsum256(acc);
-        for i in (chunks * 8)..n {
-            let d = a[i] - b[i]; sum += d * d;
-        }
-        sum
-
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn neg_dot_avx2(a: &[f32], b: &[f32]) -> f32 {
-    unsafe { neg_dot_avx2_inner(a, b) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn neg_dot_avx2_inner(a: &[f32], b: &[f32]) -> f32 {    unsafe {
-        use std::arch::x86_64::*;
-        let n = a.len();
-        let mut acc = _mm256_setzero_ps();
-        let (ap, bp) = (a.as_ptr(), b.as_ptr());
-        let chunks = n / 8;
-        for i in 0..chunks {
-            let va = _mm256_loadu_ps(ap.add(i * 8));
-            let vb = _mm256_loadu_ps(bp.add(i * 8));
-            acc = _mm256_fmadd_ps(va, vb, acc);
-        }
-        let mut sum = hsum256(acc);
-        for i in (chunks * 8)..n {
-            sum += a[i] * b[i];
-        }
-        -sum
-
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn cosine_avx2(a: &[f32], b: &[f32]) -> f32 {
-    unsafe { cosine_avx2_inner(a, b) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn cosine_avx2_inner(a: &[f32], b: &[f32]) -> f32 {    unsafe {
-        use std::arch::x86_64::*;
-        let n = a.len();
-        let (mut dot_acc, mut na_acc, mut nb_acc) = (
-            _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps());
-        let (ap, bp) = (a.as_ptr(), b.as_ptr());
-        let chunks = n / 8;
-        for i in 0..chunks {
-            let va = _mm256_loadu_ps(ap.add(i * 8));
-            let vb = _mm256_loadu_ps(bp.add(i * 8));
-            dot_acc = _mm256_fmadd_ps(va, vb, dot_acc);
-            na_acc = _mm256_fmadd_ps(va, va, na_acc);
-            nb_acc = _mm256_fmadd_ps(vb, vb, nb_acc);
-        }
-        let (mut dot, mut na, mut nb) = (hsum256(dot_acc), hsum256(na_acc), hsum256(nb_acc));
-        for i in (chunks * 8)..n {
-            dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i];
-        }
-        let denom = (na * nb).sqrt();
-        if denom == 0.0 { 1.0 } else { 1.0 - dot / denom }
-
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
-    use std::arch::x86_64::*;
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let s128 = _mm_add_ps(lo, hi);
-    let shuf = _mm_movehdup_ps(s128);
-    let sums = _mm_add_ps(s128, shuf);
-    let shuf2 = _mm_movehl_ps(sums, sums);
-    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// KNN computation — same strategy as knn-metal
-// ═══════════════════════════════════════════════════════════════════════
-
-const BATCH_WIDTH: usize = 16;
-
-/// Transpose queries into dimension-major layout for SIMD batch processing.
-/// Layout: `data[d * BATCH_WIDTH + qi]` — one contiguous f32x16 per dimension.
-struct TransposedQueries {
-    data: Vec<f32>,
-    /// Precomputed L2 norm of each query (for cosine distance).
-    /// Unused slots = 1.0 to avoid division by zero.
-    query_norms: [f32; BATCH_WIDTH],
-    dim: usize,
-    count: usize,
-}
-
-impl TransposedQueries {
-    fn new(queries: &[&[f32]], dim: usize) -> Self {
-        let count = queries.len();
-        assert!(count <= BATCH_WIDTH);
-        let mut data = vec![0.0f32; dim * BATCH_WIDTH];
-        let mut query_norms = [1.0f32; BATCH_WIDTH];
-        for (qi, q) in queries.iter().enumerate() {
-            let mut norm_sq = 0.0f32;
-            for d in 0..dim {
-                data[d * BATCH_WIDTH + qi] = q[d];
-                norm_sq += q[d] * q[d];
-            }
-            query_norms[qi] = norm_sq.sqrt().max(f32::EPSILON);
-        }
-        Self { data, query_norms, dim, count }
-    }
-}
-
-/// Compute L2sq distances from one base vector to 16 transposed queries.
-/// Pure std::arch AVX-512: broadcast each base dim, subtract, FMA accumulate.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn l2sq_batch16_avx512(
-    base_vec: &[f32],
-    transposed: &TransposedQueries,
-    out: &mut [f32; BATCH_WIDTH],
-) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let dim = transposed.dim;
-        let tp = transposed.data.as_ptr();
-        let bp = base_vec.as_ptr();
-        let mut acc = _mm512_setzero_ps();
-
-        for d in 0..dim {
-            let bval = _mm512_set1_ps(*bp.add(d));
-            let qvals = _mm512_loadu_ps(tp.add(d * BATCH_WIDTH));
-            let diff = _mm512_sub_ps(bval, qvals);
-            acc = _mm512_fmadd_ps(diff, diff, acc);
-        }
-
-        _mm512_storeu_ps(out.as_mut_ptr(), acc);
-    }
-}
-
-/// Compute negative dot product from one base vector to 16 transposed queries.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn neg_dot_batch16_avx512(
-    base_vec: &[f32],
-    transposed: &TransposedQueries,
-    out: &mut [f32; BATCH_WIDTH],
-) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let dim = transposed.dim;
-        let tp = transposed.data.as_ptr();
-        let bp = base_vec.as_ptr();
-        let mut acc = _mm512_setzero_ps();
-
-        for d in 0..dim {
-            let bval = _mm512_set1_ps(*bp.add(d));
-            let qvals = _mm512_loadu_ps(tp.add(d * BATCH_WIDTH));
-            acc = _mm512_fmadd_ps(bval, qvals, acc);
-        }
-
-        // Negate: lower dot product = higher distance
-        let neg = _mm512_sub_ps(_mm512_setzero_ps(), acc);
-        _mm512_storeu_ps(out.as_mut_ptr(), neg);
-    }
-}
-
-/// Compute cosine distance from one base vector to 16 transposed queries.
-/// cosine_dist = 1.0 - dot(base, query) / (norm(base) * norm(query))
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn cosine_batch16_avx512(
-    base_vec: &[f32],
-    transposed: &TransposedQueries,
-    out: &mut [f32; BATCH_WIDTH],
-) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let dim = transposed.dim;
-        let tp = transposed.data.as_ptr();
-        let bp = base_vec.as_ptr();
-        let mut dot_acc = _mm512_setzero_ps();
-        let mut base_norm_acc = _mm512_setzero_ps();
-
-        for d in 0..dim {
-            let bval = _mm512_set1_ps(*bp.add(d));
-            let qvals = _mm512_loadu_ps(tp.add(d * BATCH_WIDTH));
-            dot_acc = _mm512_fmadd_ps(bval, qvals, dot_acc);
-            base_norm_acc = _mm512_fmadd_ps(bval, bval, base_norm_acc);
-        }
-
-        // base_norm is the same for all 16 queries — reduce and broadcast
-        let base_norm = _mm512_reduce_add_ps(base_norm_acc).sqrt().max(f32::EPSILON);
-        let base_norm_v = _mm512_set1_ps(base_norm);
-
-        // query norms are precomputed
-        let q_norms = _mm512_loadu_ps(transposed.query_norms.as_ptr());
-
-        // denom = base_norm * query_norms
-        let denom = _mm512_mul_ps(base_norm_v, q_norms);
-
-        // cosine_dist = 1.0 - dot / denom
-        let one = _mm512_set1_ps(1.0);
-        let cos_sim = _mm512_div_ps(dot_acc, denom);
-        let cos_dist = _mm512_sub_ps(one, cos_sim);
-
-        _mm512_storeu_ps(out.as_mut_ptr(), cos_dist);
-    }
-}
-
-/// Batch distance function type for transposed queries.
-type BatchDistFn = unsafe fn(&[f32], &TransposedQueries, &mut [f32; BATCH_WIDTH]);
-
-fn select_batch_dist_fn(metric: Metric) -> Option<BatchDistFn> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            return Some(match metric {
-                Metric::L2 => l2sq_batch16_avx512,
-                Metric::DotProduct => neg_dot_batch16_avx512,
-                Metric::Cosine => cosine_batch16_avx512,
-            });
-        }
-    }
-    None
-}
+/// Batch distance function: one base vector against one transposed
+/// batch of up to 16 queries.
+type BatchDistFn = simd_distance::BatchedDistFnF32;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Streaming pread scanner
@@ -530,22 +137,20 @@ fn buf_bytes_mut(buf: &mut [f32]) -> &mut [u8] {
 /// `chunk_first_idx` is the absolute base-vector index of the
 /// chunk's first vector, used to tag `Neighbor` records with the
 /// file-level index.
+#[allow(clippy::too_many_arguments)]
 fn scan_chunk_f32(
     chunk_buf: &[f32],
     n_vecs: usize,
     chunk_first_idx: usize,
     dim: usize,
-    queries: &[&[f32]],
-    sub_batches: &[TransposedQueries],
+    sub_batches: &[TransposedBatch],
     sub_offsets: &[usize],
     k: usize,
-    dist_fn: DistFn,
-    batch_fn: Option<BatchDistFn>,
+    batch_fn: BatchDistFn,
     heaps: &mut [BinaryHeap<Neighbor>],
     thresholds: &mut [f32],
 ) {
     let stride_f32 = 1 + dim; // header (1 f32) + payload (dim f32s)
-    let n_queries = queries.len();
     let mut dist_buf = [0.0f32; BATCH_WIDTH];
 
     for j in 0..n_vecs {
@@ -553,31 +158,17 @@ fn scan_chunk_f32(
         let base_vec: &[f32] = &chunk_buf[payload_off..payload_off + dim];
         let idx = (chunk_first_idx + j) as u32;
 
-        if let Some(bfn) = batch_fn {
-            for (si, batch) in sub_batches.iter().enumerate() {
-                unsafe { bfn(base_vec, batch, &mut dist_buf) };
-                let sub_offset = sub_offsets[si];
-                let count = batch.count;
-                for qi in 0..count {
-                    let gqi = sub_offset + qi;
-                    let dist = dist_buf[qi];
-                    if dist < thresholds[gqi] {
-                        heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                        if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                        if heaps[gqi].len() == k {
-                            thresholds[gqi] = heaps[gqi].peek().unwrap().distance;
-                        }
-                    }
-                }
-            }
-        } else {
-            for qi in 0..n_queries {
-                let dist = dist_fn(queries[qi], base_vec);
-                if dist < thresholds[qi] {
-                    heaps[qi].push(Neighbor { index: idx, distance: dist });
-                    if heaps[qi].len() > k { heaps[qi].pop(); }
-                    if heaps[qi].len() == k {
-                        thresholds[qi] = heaps[qi].peek().unwrap().distance;
+        for (si, batch) in sub_batches.iter().enumerate() {
+            batch_fn(batch, base_vec, &mut dist_buf);
+            let sub_offset = sub_offsets[si];
+            for qi in 0..batch.count() {
+                let gqi = sub_offset + qi;
+                let dist = dist_buf[qi];
+                if dist < thresholds[gqi] {
+                    heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                    if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                    if heaps[gqi].len() == k {
+                        thresholds[gqi] = heaps[gqi].peek().unwrap().distance;
                     }
                 }
             }
@@ -613,19 +204,24 @@ impl CommandOp for ComputeKnnStdarchOp {
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Brute-force exact KNN using pure std::arch SIMD (no external deps)".into(),
+            summary: "Brute-force exact KNN with streaming pread I/O and native SIMD kernels".into(),
             body: format!(r#"# compute knn-stdarch
 
-Brute-force exact KNN ground truth using only Rust `std::arch` intrinsics.
+Brute-force exact KNN ground truth that streams the base vectors through
+pread buffers instead of mapping them.
 
 ## Description
 
-Zero external SIMD dependencies. Runtime feature detection selects the best
-available ISA: AVX-512 → AVX2+FMA → scalar fallback. Uses the same
-multi-threaded query-batching strategy as knn-metal.
+The distance kernels are the shared native ones (pure Rust, `veks-simd`),
+dispatched at runtime to the best instruction set the CPU supports —
+AVX-512, AVX2+FMA, SSE4.2, SSE2 or NEON — and score 16 queries per base
+vector load, as `compute knn` does.
 
-This is a reference implementation proving the full KNN pipeline can run
-on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
+What differs is the I/O. The base is read with pread into two buffers
+that alternate: while every thread scans the current chunk for its share
+of the queries, one task reads the next chunk into the other buffer. All
+threads work on the same chunk, so it stays hot in L3, and no base bytes
+are ever mapped into the process.
 
 ## Options
 
@@ -735,13 +331,9 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             None => (0, base_count),
         };
 
-        let (dist_fn, isa_label) = select_dist_fn(kernel_metric);
-
-        let batch_label = if select_batch_dist_fn(kernel_metric).is_some() {
-            "transposed 16-wide"
-        } else {
-            "pairwise"
-        };
+        let batch_fn = simd_distance::select_batched_fn_f32(kernel_metric_of(kernel_metric));
+        let isa_label = simd_distance::simd_level();
+        let batch_label = "transposed 16-wide";
 
         // Margin is opt-in: default 0 ⇒ `internal_k == k` ⇒ original
         // heap sizes and pruning aggressiveness, no slowdown.
@@ -968,7 +560,6 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
         let chunk_byte_cap = vecs_per_chunk * entry_size;
         let mut buf_a = alloc_chunk_buf(chunk_byte_cap);
         let mut buf_b = alloc_chunk_buf(chunk_byte_cap);
-        let batch_fn = select_batch_dist_fn(kernel_metric);
 
         let mut computed_count = 0usize;
         for seg_idx in 0..n_segments {
@@ -998,7 +589,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             struct ThreadCtx<'a> {
                 q_start: usize,
                 queries: Vec<&'a [f32]>,
-                sub_batches: Vec<TransposedQueries>,
+                sub_batches: Vec<TransposedBatch>,
                 sub_offsets: Vec<usize>,
                 heaps: Vec<BinaryHeap<Neighbor>>,
                 thresholds: Vec<f32>,
@@ -1011,16 +602,14 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                 let queries: Vec<&[f32]> = (0..q_len)
                     .map(|i| query_reader.get_slice(q_start + i))
                     .collect();
-                let mut sub_batches: Vec<TransposedQueries> = Vec::new();
+                let mut sub_batches: Vec<TransposedBatch> = Vec::new();
                 let mut sub_offsets: Vec<usize> = Vec::new();
-                if batch_fn.is_some() {
-                    let mut off = 0;
-                    while off < q_len {
-                        let se = (off + BATCH_WIDTH).min(q_len);
-                        sub_batches.push(TransposedQueries::new(&queries[off..se], dim));
-                        sub_offsets.push(off);
-                        off = se;
-                    }
+                let mut off = 0;
+                while off < q_len {
+                    let se = (off + BATCH_WIDTH).min(q_len);
+                    sub_batches.push(TransposedBatch::from_f32(&queries[off..se], dim));
+                    sub_offsets.push(off);
+                    off = se;
                 }
                 let heaps: Vec<BinaryHeap<Neighbor>> = (0..q_len)
                     .map(|_| BinaryHeap::with_capacity(internal_k + 1))
@@ -1091,16 +680,15 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                     // query subset, updating its persistent heaps.
                     let sb: &[f32] = &buf_a;
                     for tc in thread_ctxs.iter_mut() {
-                        let queries_ref: &[&[f32]] = &tc.queries;
-                        let subs_ref: &[TransposedQueries] = &tc.sub_batches;
+                        let subs_ref: &[TransposedBatch] = &tc.sub_batches;
                         let offs_ref: &[usize] = &tc.sub_offsets;
                         let heaps_ref: &mut [BinaryHeap<Neighbor>] = &mut tc.heaps;
                         let thr_ref: &mut [f32] = &mut tc.thresholds;
                         scope.spawn(move || {
                             scan_chunk_f32(
                                 sb, cur_n, cur_first, dim,
-                                queries_ref, subs_ref, offs_ref,
-                                internal_k, dist_fn, batch_fn,
+                                subs_ref, offs_ref,
+                                internal_k, batch_fn,
                                 heaps_ref, thr_ref,
                             );
                         });
@@ -1917,16 +1505,20 @@ mod tests {
 
     #[test]
     fn test_distance_kernels() {
-        let a = vec![1.0f32, 2.0, 3.0, 4.0];
-        let b = vec![5.0f32, 6.0, 7.0, 8.0];
+        // The engine's batch kernels, as `kernel_metric_of` maps them,
+        // compute the documented distance conventions.
+        let q = [1.0f32, 2.0, 3.0, 4.0];
+        let b = [5.0f32, 6.0, 7.0, 8.0];
+        let batch = TransposedBatch::from_f32(&[&q], 4);
+        let mut out = [0.0f32; BATCH_WIDTH];
 
-        let l2 = l2sq_scalar(&a, &b);
-        assert!((l2 - 64.0).abs() < 1e-6, "L2sq should be 64, got {}", l2);
+        simd_distance::select_batched_fn_f32(kernel_metric_of(Metric::L2))(&batch, &b, &mut out);
+        assert!((out[0] - 64.0).abs() < 1e-6, "L2sq should be 64, got {}", out[0]);
 
-        let dot = neg_dot_scalar(&a, &b);
-        assert!((dot - (-70.0)).abs() < 1e-6, "neg_dot should be -70, got {}", dot);
+        simd_distance::select_batched_fn_f32(kernel_metric_of(Metric::DotProduct))(&batch, &b, &mut out);
+        assert!((out[0] - (-70.0)).abs() < 1e-6, "neg_dot should be -70, got {}", out[0]);
 
-        let cos = cosine_scalar(&a, &b);
-        assert!((0.0..0.05).contains(&cos), "cosine dist should be near 0, got {}", cos);
+        simd_distance::select_batched_fn_f32(kernel_metric_of(Metric::Cosine))(&batch, &b, &mut out);
+        assert!((0.0..0.05).contains(&out[0]), "cosine dist should be near 0, got {}", out[0]);
     }
 }

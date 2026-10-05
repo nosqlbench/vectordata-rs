@@ -1,19 +1,27 @@
-# KNN Engine Comparison: knn-metal vs knn-faiss vs knn-stdarch
+# KNN Engine Comparison: knn-metal, knn-stdarch, knn-blas, knn-faiss
 
 ## Overview
 
-veks provides three brute-force exact KNN engines for ground truth computation:
+veks provides four brute-force exact KNN engines for ground truth computation:
 
-- **knn-metal** (`compute knn-metal`) — Custom Rust implementation using SimSIMD
-  for hardware-dispatched SIMD (AVX-512, AVX2, NEON).
-- **knn-stdarch** (`compute knn-stdarch`) — Pure `std::arch` implementation with
-  zero external SIMD dependencies. Uses hand-rolled AVX-512/AVX2 kernels.
-- **knn-faiss** (`compute knn-faiss`, also the default `compute knn`) — Facebook's
-  FAISS library via the `faiss` Rust crate, using FlatIndex for exhaustive search.
+- **knn-metal** (`compute knn`, alias `compute knn-metal`) — the default. Scores
+  16 queries per base-vector load with the native `veks-simd` batch kernels,
+  dispatched at runtime to AVX-512, AVX2, SSE or NEON, over mmap'd partitions.
+  `--backend simsimd` (with the `simsimd` feature) scans pairwise on simsimd's
+  C kernels instead, as an independent implementation.
+- **knn-stdarch** (`compute knn-stdarch`) — the same native kernels, reading
+  the base through double-buffered streaming pread instead of mmap.
+- **knn-blas** (`compute knn-blas`) — one `Q · Bᵀ` sgemm per block, on the
+  pure-Rust `gemm` crate by default, or the system `cblas_sgemm` with
+  `--backend system` (the `blas-system` feature, unix) for numpy/FAISS parity.
+- **knn-faiss** (`compute knn-faiss`, the `faiss` feature) — Facebook's FAISS
+  library via the `faiss` Rust crate, using FlatIndex for exhaustive search.
 
-knn-metal and knn-stdarch produce byte-identical results. FAISS produces
-equivalent results (within floating-point tolerance) with the same
-tie-breaking strategy: lower ordinal wins at equal distance.
+All engines break ties the same way — lower ordinal wins at equal distance —
+and end with the same f64 rerank of their candidates, so their published
+outputs agree; their f32 distances before the rerank differ at the ULP level.
+See [srd-native-simd-kernels.md](srd-native-simd-kernels.md) for the kernel
+layer.
 
 ## FAISS Batch Size Limitation
 
@@ -167,7 +175,7 @@ Both engines use the same deterministic tie-breaking strategy:
 This means both engines produce the same output given the same distance values.
 
 However, **the distance values themselves differ at the ULP level** due to
-different SIMD implementations (SimSIMD vs FAISS/BLAS). The same vector pair
+different SIMD implementations (native kernels vs FAISS/BLAS). The same vector pair
 can produce distances that differ by 1 ULP (unit in the last place) due to
 different FMA instruction ordering. At the k-th boundary where many base
 vectors have nearly identical distances to a query, a 1-ULP difference can
@@ -201,11 +209,10 @@ The verification commands mirror the engine split:
 
 | Command | Engine | Usage |
 |---------|--------|-------|
-| `verify knn-groundtruth` | FAISS (default) | Per-profile pipeline step |
-| `verify knn-groundtruth-metal` | SimSIMD | Explicit SimSIMD verification |
-| `verify knn-consolidated` | FAISS (default) | Multi-profile single-pass |
-| `verify knn-consolidated-metal` | SimSIMD | Explicit SimSIMD consolidated |
+| `verify knn-groundtruth` | native batch kernels (as knn-metal) | Per-profile pipeline step |
+| `verify knn-consolidated` | sgemm (as knn-blas, same `backend`) | Multi-profile single-pass |
 | `verify knn-faiss` | FAISS | Post-hoc standalone verification |
+| `verify knn-faiss-consolidated` | FAISS | Multi-profile FAISS verification |
 
 The consolidated FAISS verifier loads base vectors once and shares them across
 all sized profiles. Partition profiles are verified in parallel using

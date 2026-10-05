@@ -11,8 +11,8 @@
 //! return arr[keep_mask]
 //! ```
 //!
-//! Reads an fvec file, computes the L2 norm of each vector via BLAS
-//! `cblas_snrm2`, and writes only vectors with `norm > tolerance` to
+//! Reads an fvec file, computes the L2 norm of each vector as
+//! `sqrt(v · v)`, and writes only vectors with `norm > tolerance` to
 //! the output. Default tolerance is 0.0 (exact zeros only), matching
 //! `fvecs_remove_zeros.py`.
 
@@ -29,12 +29,10 @@ use crate::pipeline::command::{
     Options, Status, StreamContext, render_options_table,
 };
 
-unsafe extern "C" {
-    fn cblas_snrm2(n: i32, x: *const f32, incx: i32) -> f32;
-}
-
-fn blas_snrm2(v: &[f32]) -> f32 {
-    unsafe { cblas_snrm2(v.len() as i32, v.as_ptr(), 1) }
+/// L2 norm of a float32 slice, `sqrt(v · v)` — the formula
+/// `np.linalg.norm(v)` evaluates — on the native SIMD kernel.
+fn l2_norm(v: &[f32]) -> f32 {
+    crate::pipeline::simd_distance::select_norm_fn()(v)
 }
 
 fn error_result(message: impl Into<String>, start: Instant) -> CommandResult {
@@ -78,7 +76,7 @@ impl CommandOp for TransformRemoveZerosKnnUtilsOp {
 Remove vectors whose L2 norm is at or below a tolerance, replicating
 `fvecs_remove_zeros.py` from knn\_utils.
 
-Norm is computed via BLAS `cblas_snrm2` (matching knn\_utils which uses
+Norm is computed as `sqrt(v · v)` (matching knn\_utils, which uses
 `np.linalg.norm`). Default tolerance is 0.0 (exact zeros only).
 
 ## Options
@@ -137,7 +135,7 @@ Norm is computed via BLAS `cblas_snrm2` (matching knn\_utils which uses
 
         for i in 0..count {
             let slice = reader.get_slice(i);
-            let norm = blas_snrm2(slice);
+            let norm = l2_norm(slice);
 
             if norm > tolerance {
                 writer.write_all(&dim_bytes).map_err(|e| e.to_string()).unwrap();

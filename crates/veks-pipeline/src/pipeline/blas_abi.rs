@@ -14,9 +14,10 @@
 //!
 //! The corruption is **process-wide**, not FAISS-internal. Once this
 //! binary links the static MKL, every `cblas_sgemm` symbol resolves
-//! to the poisoned copy — FAISS's own search path, our
-//! `compute knn-blas`, `verify knn-consolidated`'s sgemm scan, and
-//! anywhere else anyone calls sgemm. Multi-threaded MKL amplifies
+//! to the poisoned copy — FAISS's own search path, and the
+//! `--backend system` path of `compute knn-blas` and `verify
+//! knn-consolidated`. Their default `gemm` backend is pure Rust and
+//! never calls `cblas_sgemm`, so it is immune and keeps its threading. Multi-threaded MKL amplifies
 //! the bug: empirically, sgemm goes wrong starting at `dim ≥ 384`
 //! for small batch sizes when MKL threads > 1.
 //!

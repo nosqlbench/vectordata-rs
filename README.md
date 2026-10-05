@@ -135,9 +135,10 @@ veks analyze explain-filtered-knn --ordinal 42
 
 This is what makes a published benchmark *reproducible*. The ground truth `veks`
 produces is held to a numerical parity guarantee against the Python `knn_utils`
-reference (FAISS + numpy). Four independent KNN engines — SimSIMD (`knn-metal`),
-pure `std::arch` (`knn-stdarch`), BLAS sgemm (`knn-blas`), and FAISS
-(`knn-faiss`) — are cross-verified at the unit-test level (asserting *zero*
+reference (FAISS + numpy). Independent KNN engines — native batch kernels
+(`knn-metal`), streaming pread over the same kernels (`knn-stdarch`), sgemm
+(`knn-blas`, pure-Rust `gemm` or the system BLAS), and FAISS (`knn-faiss`) —
+are cross-verified at the unit-test level (asserting *zero*
 differing neighbors on deterministic fixtures) and re-checked end-to-end before
 every dataset is published. See the
 [KNN engine conformance section](./docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing)

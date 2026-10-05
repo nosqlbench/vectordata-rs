@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 fn main() {
-    // Link system BLAS for knnutils personality commands.
+    // Link the system BLAS for `--backend system` on the sgemm scans.
     // On Ubuntu: `apt install libopenblas-dev` (or `libmkl-dev` for MKL).
     // The system's libblas.so resolves to whichever BLAS is configured
     // via update-alternatives.
     //
-    // Unix-only: every `cblas_sgemm` call site in the source is gated
-    // on `cfg(all(feature = "knnutils", unix))`, so on non-Unix targets
-    // the FFI symbols are never referenced and the link directive
+    // Unix-only: the `cblas_sgemm` declaration in `pipeline::sgemm` is
+    // gated on `cfg(all(feature = "blas-system", unix))`, so on non-Unix
+    // targets the FFI symbol is never referenced and the link directive
     // would just produce a "library not found" error from the linker.
     // `CARGO_CFG_UNIX` is set in build.rs when the *target* is Unix
     // (cargo populates these per the target triple, not the host).
-    #[cfg(feature = "knnutils")]
+    #[cfg(feature = "blas-system")]
     if std::env::var_os("CARGO_CFG_UNIX").is_some() {
         println!("cargo:rustc-link-lib=blas");
     }

@@ -143,7 +143,7 @@ veks run dataset.yaml
 #   verify-filtered-knn (filtered brute-force recomputation)
 ```
 
-The native pipeline uses different algorithms (SimSIMD distances,
+The native pipeline uses different algorithms (native SIMD distances,
 PCG PRNG, prefix sort) but produces self-consistent results verified
 by independent brute-force recomputation at each stage.
 

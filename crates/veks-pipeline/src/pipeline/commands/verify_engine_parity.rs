@@ -11,10 +11,14 @@
 //!
 //! Engines exercised:
 //!
-//! - `compute knn`         — SimSIMD (always available)
-//! - `compute knn-stdarch` — pure `std::arch` (always available)
-//! - `compute knn-blas`    — `cblas_sgemm` (requires `knnutils` feature)
-//! - `compute knn-faiss`   — FAISS `IndexFlat` (requires `faiss` feature)
+//! - `metal`              — `compute knn`, native kernels (always available)
+//! - `metal-simsimd`      — `compute knn --backend simsimd` (`simsimd` feature)
+//! - `stdarch`            — `compute knn-stdarch` (always available)
+//! - `blas`               — `compute knn-blas`, pure-Rust `gemm` (always available)
+//! - `blas-system`        — `compute knn-blas --backend system` (`blas-system` feature, unix)
+//! - `blas-mirror`        — FAISS's blocked sgemm call pattern on `gemm`
+//! - `blas-mirror-system` — the same on the system BLAS (`blas-system`)
+//! - `faiss`              — `compute knn-faiss`, FAISS `IndexFlat` (`faiss` feature)
 //!
 //! Engines not enabled at build time are reported as `skipped: feature
 //! not enabled` rather than failing — the demo still produces a useful
@@ -35,32 +39,15 @@ use crate::pipeline::command::{
 };
 use super::knn_compare::{compare_query_ordinals, QueryResult, VerifySummary};
 
-#[cfg(all(feature = "knnutils", unix))]
-unsafe extern "C" {
-    fn cblas_sgemm(
-        order: i32,     // CblasRowMajor = 101
-        transa: i32,    // CblasNoTrans = 111
-        transb: i32,    // CblasTrans = 112
-        m: i32,
-        n: i32,
-        k: i32,
-        alpha: f32,
-        a: *const f32,
-        lda: i32,
-        b: *const f32,
-        ldb: i32,
-        beta: f32,
-        c: *mut f32,
-        ldc: i32,
-    );
+use crate::pipeline::sgemm::{MatmulBackend, sgemm_nt};
+use crate::pipeline::simd_distance::PairwiseBackend;
 
-}
-#[cfg(all(feature = "knnutils", unix))]
-const CBLAS_ROW_MAJOR: i32 = 101;
-#[cfg(all(feature = "knnutils", unix))]
-const CBLAS_NO_TRANS: i32 = 111;
-#[cfg(all(feature = "knnutils", unix))]
-const CBLAS_TRANS: i32 = 112;
+/// Every engine this command knows, in report order. Engines whose
+/// backend is not compiled in are reported as skipped.
+const ENGINES: [&str; 8] = [
+    "metal", "metal-simsimd", "stdarch", "blas", "blas-system",
+    "blas-mirror", "blas-mirror-system", "faiss",
+];
 
 // Set env vars that BLAS libraries read at init time. This only
 // has an effect if called before the BLAS is first invoked — for
@@ -111,7 +98,7 @@ impl CommandOp for VerifyEngineParityOp {
                 Default boundary tolerance is **0** — any neighbor-set \
                 difference fails the run. Real measurements at \
                 dim ≤ 128 with k ≤ 100 produce 0 boundary mismatches across \
-                all four engines (SimSIMD / stdarch / BLAS / FAISS); the \
+                every engine (native / simsimd / stdarch / gemm / system BLAS / FAISS); the \
                 small `SetMatch` count seen at larger k is just \
                 tie-breaking order, not a substantive disagreement.\n\n\
                 Pass `--boundary-tolerance N` to allow up to N differing \
@@ -154,7 +141,7 @@ impl CommandOp for VerifyEngineParityOp {
                 extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "engines".into(),      type_name: "string".into(), required: false, default: None,
-                description: "Comma-separated subset (default = all enabled): metal,stdarch,blas,faiss".into(),
+                description: "Comma-separated subset (default = all; engines not compiled in are reported as skipped): metal,metal-simsimd,stdarch,blas,blas-system,blas-mirror,blas-mirror-system,faiss".into(),
                 extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "show-queries".into(), type_name: "int".into(),  required: false, default: Some("5".into()),
@@ -238,7 +225,7 @@ impl CommandOp for VerifyEngineParityOp {
         use crate::pipeline::command::ValueCompletions;
         let mut m = std::collections::HashMap::new();
         m.insert("engines".to_string(), ValueCompletions::comma_separated_enum(
-            &["metal", "stdarch", "blas", "blas-mirror", "faiss"]));
+            &ENGINES));
         m.insert("metric".to_string(), ValueCompletions::enum_values(
             &["L2", "DOT_PRODUCT", "COSINE", "IP"]));
         m.insert("distribution".to_string(), ValueCompletions::enum_values(
@@ -409,10 +396,7 @@ impl CommandOp for VerifyEngineParityOp {
         // --engines; otherwise we run everything that was compiled in.
         let requested: Vec<String> = options.get("engines")
             .map(|s| s.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect())
-            .unwrap_or_else(|| vec![
-                "metal".into(), "stdarch".into(), "blas".into(),
-                "blas-mirror".into(), "faiss".into(),
-            ]);
+            .unwrap_or_else(|| ENGINES.iter().map(|e| e.to_string()).collect());
         let want = |name: &str| requested.iter().any(|r| r == name);
 
         // Cosine mode propagation. When `metric=COSINE`, every engine
@@ -444,30 +428,42 @@ impl CommandOp for VerifyEngineParityOp {
                 "metal",
                 || super::compute_knn::factory(),
                 &base_path, &query_path, &workdir.path().join("metal.ivec"),
-                neighbors, &metric, assume_normalized, use_proper_cosine, ctx,
+                neighbors, &metric, assume_normalized, use_proper_cosine, &[], ctx,
             ));
+        }
+        if want("metal-simsimd") {
+            runs.push(match PairwiseBackend::parse("simsimd") {
+                Ok(b) => run_engine(
+                    "metal-simsimd",
+                    || super::compute_knn::factory(),
+                    &base_path, &query_path, &workdir.path().join("metal-simsimd.ivec"),
+                    neighbors, &metric, assume_normalized, use_proper_cosine,
+                    &[(PairwiseBackend::OPTION, b.name())], ctx,
+                ),
+                Err(e) => skipped("metal-simsimd", &e),
+            });
         }
         if want("stdarch") {
             runs.push(run_engine(
                 "stdarch",
                 || super::compute_knn_stdarch::factory(),
                 &base_path, &query_path, &workdir.path().join("stdarch.ivec"),
-                neighbors, &metric, assume_normalized, use_proper_cosine, ctx,
+                neighbors, &metric, assume_normalized, use_proper_cosine, &[], ctx,
             ));
         }
 
-        #[cfg(all(feature = "knnutils", unix))]
-        if want("blas") {
-            runs.push(run_engine(
-                "blas",
-                || super::compute_knn_blas::factory(),
-                &base_path, &query_path, &workdir.path().join("blas.ivec"),
-                neighbors, &metric, assume_normalized, use_proper_cosine, ctx,
-            ));
-        }
-        #[cfg(not(all(feature = "knnutils", unix)))]
-        if want("blas") {
-            runs.push(skipped("blas", "knnutils feature not enabled (cargo build --features knnutils)"));
+        for (name, backend_name) in [("blas", "gemm"), ("blas-system", "system")] {
+            if !want(name) { continue; }
+            runs.push(match MatmulBackend::parse(backend_name) {
+                Ok(b) => run_engine(
+                    name,
+                    || super::compute_knn_blas::factory(),
+                    &base_path, &query_path, &workdir.path().join(format!("{name}.ivec")),
+                    neighbors, &metric, assume_normalized, use_proper_cosine,
+                    &[(MatmulBackend::OPTION, b.name())], ctx,
+                ),
+                Err(e) => skipped(name, &e),
+            });
         }
 
         #[cfg(feature = "faiss")]
@@ -492,7 +488,7 @@ impl CommandOp for VerifyEngineParityOp {
                     "faiss",
                     || Box::new(super::compute_knn_faiss::ComputeKnnFaissOp) as Box<dyn CommandOp>,
                     &base_path, &query_path, &workdir.path().join("faiss.ivec"),
-                    neighbors, &metric, assume_normalized, use_proper_cosine, ctx,
+                    neighbors, &metric, assume_normalized, use_proper_cosine, &[], ctx,
                 ));
             }
         }
@@ -505,24 +501,24 @@ impl CommandOp for VerifyEngineParityOp {
         // exactly — same outer/inner block sizes, same sgemm orientation,
         // same per-cell post-processing. Extended for IP/Cosine using the
         // same sgemm + per-cell post-pass.
-        #[cfg(all(feature = "knnutils", unix))]
-        if want("blas-mirror") {
-            ctx.ui.log("  running engine: blas-mirror");
+        for (name, backend_name) in [("blas-mirror", "gemm"), ("blas-mirror-system", "system")] {
+            if !want(name) { continue; }
+            let backend = match MatmulBackend::parse(backend_name) {
+                Ok(b) => b,
+                Err(e) => { runs.push(skipped(name, &e)); continue; }
+            };
+            ctx.ui.log(&format!("  running engine: {name}"));
             let started = Instant::now();
-            let path = workdir.path().join("blas-mirror.ivec");
+            let path = workdir.path().join(format!("{name}.ivec"));
             let res = run_blas_mirror(
-                &base_path, &query_path, &path, neighbors, &metric,
+                backend, &base_path, &query_path, &path, neighbors, &metric,
                 assume_normalized, use_proper_cosine, &mut ctx.ui,
             );
             let elapsed = started.elapsed();
             runs.push(match res {
-                Ok(()) => EngineRun { name: "blas-mirror", indices_path: Some(path), elapsed, note: None },
-                Err(e) => EngineRun { name: "blas-mirror", indices_path: None, elapsed, note: Some(e) },
+                Ok(()) => EngineRun { name, indices_path: Some(path), elapsed, note: None },
+                Err(e) => EngineRun { name, indices_path: None, elapsed, note: Some(e) },
             });
-        }
-        #[cfg(not(all(feature = "knnutils", unix)))]
-        if want("blas-mirror") {
-            runs.push(skipped("blas-mirror", "knnutils feature not enabled"));
         }
 
         // Print run summaries.
@@ -972,6 +968,7 @@ fn run_engine<F>(
     metric: &str,
     assume_normalized: bool,
     use_proper_cosine: bool,
+    extra: &[(&str, &str)],
     ctx: &mut StreamContext,
 ) -> EngineRun
 where
@@ -998,6 +995,10 @@ where
     // leave `rerank_margin_ratio` unset → margin=0 → original
     // heap sizes and full pruning aggressiveness.
     opts.set("rerank_margin_ratio", "3");
+    // Engine-variant options (the backend a variant runs on).
+    for (key, value) in extra {
+        opts.set(*key, value.to_string());
+    }
     let started = Instant::now();
     let res = op.execute(&opts, ctx);
     let elapsed = started.elapsed();
@@ -1165,8 +1166,9 @@ fn normalize(row: &mut [f32]) {
 /// the parity demo cares about. Streaming + sgemm for billion-vector
 /// datasets is the job of `compute knn-blas`; this is strictly for
 /// proving the parity hypothesis.
-#[cfg(all(feature = "knnutils", unix))]
+#[allow(clippy::too_many_arguments)]
 fn run_blas_mirror(
+    backend: MatmulBackend,
     base_path: &Path,
     query_path: &Path,
     out_path: &Path,
@@ -1318,17 +1320,12 @@ fn run_blas_mirror(
 
             // Row-major equivalent of FAISS's column-major sgemm.
             // Result `ip_block[i * nyi + j]` = query[i0+i] · base[j0+j].
-            unsafe {
-                cblas_sgemm(
-                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
-                    nxi as i32, nyi as i32, dim as i32,
-                    1.0,
-                    query_block_buf.as_ptr(), dim as i32,
-                    base_block_buf.as_ptr(),  dim as i32,
-                    0.0,
-                    ip_block.as_mut_ptr(), nyi as i32,
-                );
-            }
+            sgemm_nt(
+                backend, nxi, nyi, dim, 1.0,
+                &query_block_buf, dim,
+                &base_block_buf, dim,
+                &mut ip_block, nyi, 0,
+            );
 
             // Per-cell post-pass — produces a kernel-convention
             // distance (smaller = better) for every metric so the
@@ -1424,7 +1421,6 @@ fn run_blas_mirror(
     Ok(())
 }
 
-#[cfg(all(feature = "knnutils", unix))]
 use super::compute_knn::Neighbor;
 
 #[cfg(test)]

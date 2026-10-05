@@ -147,4 +147,92 @@ mod packaging_tests {
             "both root bins must be the same multiplexer: {paths:?}"
         );
     }
+
+    /// Dependencies that compile or link native code for SIMD or linear
+    /// algebra: C/C++ kernel crates and BLAS bindings.
+    const NATIVE_KERNEL_DEPS: &[&str] = &["simsimd", "faiss", "faiss-sys", "openblas-src", "blas-src", "cblas-sys", "intel-mkl-src"];
+
+    /// The `[dependencies]` line for `name` in a manifest, if any.
+    fn dependency_line<'a>(toml: &'a str, name: &str) -> Option<&'a str> {
+        let deps = toml.split("\n[dependencies]").nth(1)?;
+        let deps = deps.split("\n[").next().unwrap_or(deps);
+        deps.lines().find(|l| l.trim_start().starts_with(&format!("{name} ")) || l.trim_start().starts_with(&format!("{name}=")))
+    }
+
+    /// The value list of feature `name` in a manifest's `[features]`.
+    fn feature_list(toml: &str, name: &str) -> Vec<String> {
+        let Some(features) = toml.split("\n[features]").nth(1) else { return vec![] };
+        let features = features.split("\n[").next().unwrap_or(features);
+        let Some(start) = features.find(&format!("\n{name} = [")) else { return vec![] };
+        let rest = &features[start..];
+        let list = &rest[rest.find('[').unwrap() + 1..rest.find(']').unwrap()];
+        list.split(',')
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// **The default build compiles no native SIMD or BLAS code (SRD SK-1).**
+    ///
+    /// Every such dependency is optional in every manifest that names
+    /// it, and no default feature — directly or through `knnutils`,
+    /// which `veks` enables by default — turns one on. Native backends
+    /// are opt-in features (`simsimd`, `blas-system`, `faiss`).
+    #[test]
+    fn default_features_pull_no_native_kernels() {
+        for rel in [
+            "Cargo.toml",
+            "crates/vectordata/Cargo.toml",
+            "crates/veks-simd/Cargo.toml",
+            "crates/veks-core/Cargo.toml",
+            "crates/veks-pipeline/Cargo.toml",
+            "crates/veks/Cargo.toml",
+        ] {
+            let toml = manifest(rel);
+            for dep in NATIVE_KERNEL_DEPS {
+                if let Some(line) = dependency_line(&toml, dep) {
+                    assert!(line.contains("optional = true"), "{rel}: `{dep}` must be optional: {line}");
+                }
+            }
+            let mut enabled = feature_list(&toml, "default");
+            enabled.extend(feature_list(&toml, "knnutils"));
+            for f in &enabled {
+                for native in ["simsimd", "faiss", "blas-system"] {
+                    assert!(
+                        !f.contains(native),
+                        "{rel}: a default-path feature enables `{f}`; `{native}` must stay opt-in"
+                    );
+                }
+            }
+        }
+        // The system BLAS link is tied to `blas-system`, not `knnutils`.
+        let build_rs = manifest("crates/veks-pipeline/build.rs");
+        let link = build_rs.find("rustc-link-lib=blas").expect("the blas link directive");
+        let gate = build_rs[..link].rfind("#[cfg(feature = ").expect("a feature gate on the link");
+        assert!(build_rs[gate..link].starts_with("#[cfg(feature = \"blas-system\")]"));
+    }
+
+    /// **`vectordata` with `cli` resolves no native kernel crate (SRD
+    /// acceptance case 9).** Checked against the resolved graph, so a
+    /// transitive path the manifest test cannot see is still caught.
+    #[test]
+    fn vectordata_cli_graph_has_no_native_kernels() {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = std::process::Command::new(cargo)
+            .current_dir(root)
+            .args([
+                "tree", "--offline", "--locked", "-p", "vectordata", "--features", "cli",
+                "-e", "normal,build", "--prefix", "none", "--format", "{p}",
+            ])
+            .output()
+            .expect("run cargo tree");
+        assert!(out.status.success(), "cargo tree failed: {}", String::from_utf8_lossy(&out.stderr));
+        let tree = String::from_utf8_lossy(&out.stdout);
+        let names: Vec<&str> = tree.lines().filter_map(|l| l.split_whitespace().next()).collect();
+        assert!(names.contains(&"veks-simd"), "explore must use the native kernels");
+        for dep in NATIVE_KERNEL_DEPS {
+            assert!(!names.contains(dep), "vectordata --features cli resolves `{dep}`");
+        }
+    }
 }

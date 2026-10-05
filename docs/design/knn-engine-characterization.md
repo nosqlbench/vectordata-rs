@@ -35,6 +35,33 @@ The "hot-path rate" column reports the segment-compute throughput from
 the engine's own log line, which excludes setup and the canonical
 rerank post-pass (~50 ms with current code).
 
+## Native kernels vs the previous build (same host, same day)
+
+Measured when the kernels moved to `veks-simd` (SRD
+[srd-native-simd-kernels.md](srd-native-simd-kernels.md)), with the
+previous commit built side by side. 1M base × 10K queries × dim 384,
+k=100, 128 threads, Xeon Platinum 8375C (Ice Lake, AVX-512), no `faiss`
+feature, so the baseline's `knn-blas` ran on multi-threaded system
+OpenBLAS. Each cell is the median `Elapsed` of 3–5 runs, alternating
+binaries, every run on a fresh cache; it includes setup and the f64
+rerank, so it is the whole step.
+
+| Engine | Metric | Previous | Native | Change |
+|---|---|---|---|---|
+| `compute knn` (metal) | DOT_PRODUCT | 4.29 s | 4.29 s | parity |
+| `compute knn` (metal) | L2 | 5.69 s | 4.88 s | 14% faster |
+| `knn-stdarch` | DOT_PRODUCT | 4.33 s | 4.28 s | parity (within run-to-run spread) |
+| `knn-stdarch` | L2 | 5.71 s | 5.61 s | parity |
+| `knn-blas` | DOT_PRODUCT | 3.22 s (OpenBLAS) | 2.69 s (`gemm`) | 16% faster |
+| `knn-blas` | L2 | 8.25 s (OpenBLAS) | 8.05 s (`gemm`) | parity |
+
+At 100K base the f16 path of `compute knn` is at parity too (463 ms
+both). The native kernels keep the hand-written AVX-512 kernels'
+instruction sequence where it was already optimal and add multiple
+accumulator chains where it was latency-bound; on CPUs below AVX-512
+the batch kernels now run vectorized instead of scalar, which this
+host cannot measure.
+
 ## Why FAISS is so much slower than blas, even though they share MKL
 
 Two compounding penalties from the bug workaround stack:

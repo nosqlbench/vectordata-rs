@@ -12,9 +12,11 @@ This crate provides:
 
 ## Verified against FAISS and numpy
 
-This crate hosts all four KNN engines — `compute_knn` (SimSIMD),
-`compute_knn_stdarch` (pure `std::arch`), `compute_knn_blas`
-(`cblas_sgemm`), and `compute_knn_faiss` (FAISS) — plus the shared
+This crate hosts all four KNN engines — `compute_knn` (native
+`veks-simd` batch kernels), `compute_knn_stdarch` (the same kernels over
+streaming pread), `compute_knn_blas` (sgemm: pure-Rust `gemm`, or the
+system `cblas_sgemm` with `blas-system`), and `compute_knn_faiss` (FAISS) —
+plus the shared
 [`knn_compare`](src/pipeline/commands/knn_compare.rs) classifier
 and the end-to-end [`verify_dataset_knnutils`](src/pipeline/commands/verify_dataset_knnutils.rs)
 command. In-tree conformance tests assert *zero* differing neighbors across

@@ -92,20 +92,17 @@ beginning of a pipeline to log the execution environment.
         let arch = std::env::consts::ARCH;
         let os = std::env::consts::OS;
 
-        // Detect SIMD capabilities via cfg attributes
-        let simd_features = detect_simd_features();
+        // The level the vector kernels dispatch to on this CPU, and every
+        // level it can run — detected at runtime, not read from the
+        // compile-time target baseline (which is SSE2 for any portable
+        // x86-64 build, whatever the CPU).
+        let dispatched = veks_simd::SimdLevel::detected().name();
+        let supported: Vec<&str> = veks_simd::SimdLevel::supported().iter().map(|l| l.name()).collect();
 
         if short {
             ctx.ui.log(&format!(
                 "{} {} | {} CPUs | SIMD: {}",
-                os,
-                arch,
-                cpus,
-                if simd_features.is_empty() {
-                    "none detected".to_string()
-                } else {
-                    simd_features.join(", ")
-                }
+                os, arch, cpus, dispatched,
             ));
         } else {
             ctx.ui.log("Compute Environment");
@@ -117,14 +114,8 @@ beginning of a pipeline to log the execution environment.
                 std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string())
             ));
 
-            if simd_features.is_empty() {
-                ctx.ui.log("  SIMD:         none detected at compile time");
-            } else {
-                ctx.ui.log("  SIMD features:");
-                for feat in &simd_features {
-                    ctx.ui.log(&format!("    - {}", feat));
-                }
-            }
+            ctx.ui.log(&format!("  SIMD:         {} (kernels dispatch here)", dispatched));
+            ctx.ui.log(&format!("  SIMD levels:  {} (all this CPU can run)", supported.join(", ")));
 
             // Memory info (best effort)
             #[cfg(target_os = "linux")]
@@ -137,23 +128,15 @@ beginning of a pipeline to log the execution environment.
             }
 
             ctx.ui.log("");
-            ctx.ui.log("  Vectorized distance computation: Rust auto-vectorization");
-            ctx.ui.log("  For best performance, compile with:");
-            ctx.ui.log("    RUSTFLAGS=\"-C target-cpu=native\" cargo build --release");
+            ctx.ui.log("  Distance kernels: veks-simd, selected at runtime — no target-cpu");
+            ctx.ui.log("  build flags are needed to reach the dispatched level.");
         }
 
         CommandResult {
             status: Status::Ok,
             message: format!(
                 "compute env: {} {} ({} CPUs, SIMD: {})",
-                os,
-                arch,
-                cpus,
-                if simd_features.is_empty() {
-                    "none"
-                } else {
-                    "available"
-                }
+                os, arch, cpus, dispatched,
             ),
             produced: vec![],
             elapsed: start.elapsed(),
@@ -171,23 +154,6 @@ beginning of a pipeline to log the execution environment.
                 role: OptionRole::Config,
     }]
     }
-}
-
-/// Detect available SIMD features at compile time.
-fn detect_simd_features() -> Vec<&'static str> {
-    let candidates = [
-        (cfg!(target_feature = "avx512f"), "AVX-512F"),
-        (cfg!(target_feature = "avx2"), "AVX2"),
-        (cfg!(target_feature = "avx"), "AVX"),
-        (cfg!(target_feature = "sse4.2"), "SSE4.2"),
-        (cfg!(target_feature = "sse4.1"), "SSE4.1"),
-        (cfg!(target_feature = "sse2"), "SSE2"),
-        (cfg!(target_feature = "neon"), "NEON"),
-    ];
-    candidates.iter()
-        .filter(|(enabled, _)| *enabled)
-        .map(|&(_, name)| name)
-        .collect()
 }
 
 #[cfg(test)]
@@ -243,11 +209,17 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_simd() {
-        // Just verify it doesn't panic
-        let features = detect_simd_features();
-        // On x86_64, SSE2 should always be present
-        #[cfg(target_arch = "x86_64")]
-        assert!(features.contains(&"SSE2"));
+    fn reports_the_dispatched_level() {
+        // SK-16: the reported level is the one the kernels run at,
+        // which on any x86-64 CPU from the last decade is above the
+        // SSE2 compile-time baseline a portable build carries.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let mut opts = Options::new();
+        opts.set("short", "true");
+        let result = InfoComputeOp.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Ok);
+        let level = veks_simd::SimdLevel::detected().name();
+        assert!(result.message.ends_with(&format!("SIMD: {level})")), "{}", result.message);
     }
 }

@@ -10,9 +10,10 @@
 //! return np.all(np.abs(norms - 1) < tol)
 //! ```
 //!
-//! - L2 norm computed via BLAS `cblas_snrm2` (the same MKL routine that
-//!   numpy calls internally for `np.linalg.norm`), producing **identical**
-//!   floating-point results to knn\_utils
+//! - L2 norm computed as `sqrt(v · v)` in f32 — the formula
+//!   `np.linalg.norm` evaluates — on the native SIMD kernel. It agrees
+//!   with knn\_utils to f32 rounding; only a norm within an ulp of the
+//!   tolerance can classify differently
 //! - Checks **all** vectors (no sampling)
 //! - Default tolerance **1e-3** (matching `check_normalization()` in knn\_utils)
 //! - Produces a simple boolean `is_normalized` result
@@ -27,19 +28,10 @@ use std::time::Instant;
 use vectordata::VectorReader;
 use vectordata::io::XvecReader;
 
-// BLAS snrm2: computes the L2 norm of a float32 vector.
-// This is the same routine numpy calls via MKL for np.linalg.norm().
-// Linked transitively through FAISS's BLAS dependency (MKL).
-unsafe extern "C" {
-    fn cblas_snrm2(n: i32, x: *const f32, incx: i32) -> f32;
-}
-
-/// Compute L2 norm of a float32 slice using BLAS `cblas_snrm2`.
-///
-/// Produces identical results to `np.linalg.norm(vec)` when numpy
-/// is backed by the same BLAS (MKL).
-fn blas_snrm2(v: &[f32]) -> f32 {
-    unsafe { cblas_snrm2(v.len() as i32, v.as_ptr(), 1) }
+/// L2 norm of a float32 slice, `sqrt(v · v)` — the formula
+/// `np.linalg.norm(v)` evaluates — on the native SIMD kernel.
+fn l2_norm(v: &[f32]) -> f32 {
+    crate::pipeline::simd_distance::select_norm_fn()(v)
 }
 
 use crate::pipeline::command::{
@@ -156,7 +148,7 @@ Also counts exact-zero vectors (norm == 0.0), matching knn\_utils
         ));
 
         // Replicate knn_utils exactly:
-        //   norms = np.linalg.norm(vecs, axis=1)  # via MKL cblas_snrm2
+        //   norms = np.linalg.norm(vecs, axis=1)  # sqrt(v · v)
         //   zero_count = int(np.sum(norms <= 0.0))
         //   is_normalized = np.all(np.abs(norms - 1) < tol)
         let pb = ctx.ui.bar_with_unit(count as u64, "checking norms", "vectors");
@@ -169,9 +161,8 @@ Also counts exact-zero vectors (norm == 0.0), matching knn\_utils
         for i in 0..count {
             let slice = reader.get_slice(i);
 
-            // L2 norm via BLAS cblas_snrm2 — identical to numpy's
-            // np.linalg.norm() when both use MKL.
-            let norm = blas_snrm2(slice);
+            // L2 norm, sqrt(v · v), as numpy's np.linalg.norm().
+            let norm = l2_norm(slice);
 
             // count_zero_vectors: norm <= 0.0 (exact zeros)
             if norm <= 0.0 {

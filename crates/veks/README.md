@@ -6,8 +6,8 @@ A CLI for bulk processing of vector datasets used in approximate nearest neighbo
 
 Ground truth produced by `veks` is held to a numerical parity
 guarantee against the Python `knn_utils` reference (FAISS + numpy).
-Four KNN engines (`knn-metal` / SimSIMD, `knn-stdarch`, `knn-blas`,
-`knn-faiss`) are cross-verified at the unit-test level and the
+Four KNN engines (`knn-metal` and `knn-stdarch` on the native SIMD
+kernels, `knn-blas` on sgemm, `knn-faiss`) are cross-verified at the unit-test level and the
 `verify dataset-knnutils` pipeline command re-runs FAISS on a
 sampled subset of every published dataset to catch regressions.
 See the [conformance section](../../docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing)
