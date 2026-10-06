@@ -1,0 +1,12 @@
+# The Rust toolchain for this workspace, pinned so a new stable release
+# cannot change what builds, lints or documents cleanly underneath us.
+# rustdoc 1.99 tightened intra-doc link checks that 1.98 accepted, and
+# CI, which followed `stable`, failed on code that passed locally.
+#
+# Bump deliberately: change the channel, then run the workspace tests,
+# clippy and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` before
+# committing. CI installs whatever this file names (see build.yml).
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

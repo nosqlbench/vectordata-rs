@@ -138,10 +138,17 @@ jobs:
       # (Xcode CLT on macOS, bundled MSVC on windows-2022) covers
       # everything.
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # ─── The toolchain is pinned in rust-toolchain.toml; install
+      # exactly that, plus this job's target for it. (A toolchain
+      # action that installs `stable` would add the target to the wrong
+      # toolchain: cargo honors the file and builds with the pin.)
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+          rustc --version
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
