@@ -253,6 +253,25 @@ jobs:
           cargo test --release -p veks-pipeline --target ${{ matrix.target }} \
             --features knnutils --lib engine_parity
 
+      # ─── Documentation as docs.rs builds it: default features, no
+      # dependencies, every rustdoc warning (a broken or private intra-
+      # doc link) an error, plus the doc examples. Once is enough — the
+      # docs do not vary by target.
+      - name: Docs (docs.rs build, warnings denied)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          set -euo pipefail
+          mkdir -p target/test-tmp
+          # Every published crate: the workspace minus the umbrella
+          # package and the two `publish = false` members.
+          args="--workspace --exclude vectordata-rs --exclude tools --exclude veks-studies"
+          cargo doc --no-deps --target ${{ matrix.target }} $args
+          cargo test --doc --release --target ${{ matrix.target }} $args
+
       # ─── Smoke-test: each built binary actually starts and prints
       # its version. Catches LD_LIBRARY_PATH / shared-lib regressions
       # that a successful build wouldn't surface. Loops over both
