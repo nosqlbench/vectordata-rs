@@ -1,10 +1,34 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Veks — CLI toolkit for vector dataset preparation.
+//! `veks` — the CLI toolkit that builds, checks and publishes vector
+//! datasets.
 //!
-//! Provides pipeline execution, format conversion, bulk downloads, and
-//! analysis tools for large-scale vector datasets.
+//! Most users want the binary (`cargo install veks`): `veks prepare
+//! bootstrap` turns source vectors and metadata into a dataset directory
+//! with a `dataset.yaml`, `veks run` executes its pipeline (ground-truth
+//! KNN, predicates, filtered KNN, merkle trees, docs), `veks check`
+//! verifies it, and `veks publish` puts it at an endpoint. Datasets are
+//! read back with [`vectordata`](https://docs.rs/vectordata).
+//!
+//! The library exists so other binaries can embed the same CLI:
+//!
+//! - [`shell::bin_main`] — the whole `veks` command line, as the binary
+//!   runs it.
+//! - [`prepare`] — bootstrap, the dataset wizard, tagging, cleanup and
+//!   cache maintenance.
+//! - [`check`] — dataset conformance and publish-readiness checks.
+//! - [`publish`] and [`catalog`] — publishing and catalog generation.
+//! - [`pipeline`] — re-exported from
+//!   [`veks-pipeline`](https://docs.rs/veks-pipeline), the step runner
+//!   and every pipeline command.
+//!
+//! ## Features
+//!
+//! - `knnutils` (default) — the knn_utils parity personality; pure Rust.
+//! - `blas-system`, `simsimd`, `faiss` — native backends for the KNN
+//!   engines, all opt-in (see `veks-pipeline`).
+//! - `embed`, `embed-cuda` — in-process embedding.
 
 #![allow(dead_code)]
 

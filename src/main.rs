@@ -200,6 +200,37 @@ mod packaging_tests {
         }
     }
 
+    /// **A published crate's README links absolutely.**
+    ///
+    /// crates.io and docs.rs render the README outside the repository,
+    /// where a relative link (`../../docs/…`) is dead. Unpublished crates
+    /// (`publish = false`) are exempt.
+    #[test]
+    fn published_readmes_have_no_relative_links() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates = std::fs::read_dir(root.join("crates")).expect("crates/");
+        for dir in crates.flatten().map(|e| e.path()).filter(|p| p.join("Cargo.toml").is_file()) {
+            let toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+            if toml.lines().any(|l| l.trim() == "publish = false") {
+                continue;
+            }
+            let Ok(readme) = std::fs::read_to_string(dir.join("README.md")) else { continue };
+            for (n, line) in readme.lines().enumerate() {
+                for target in line.split("](").skip(1).filter_map(|rest| rest.split(')').next()) {
+                    let absolute = target.starts_with('#')
+                        || target.contains("://")
+                        || target.starts_with("mailto:");
+                    assert!(
+                        absolute,
+                        "{}:{}: relative link `{target}` is dead on crates.io",
+                        dir.join("README.md").display(),
+                        n + 1
+                    );
+                }
+            }
+        }
+    }
+
     /// **The default build compiles no native SIMD or BLAS code (SRD SK-1).**
     ///
     /// Every such dependency is optional in every manifest that names

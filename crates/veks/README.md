@@ -10,7 +10,7 @@ Four KNN engines (`knn-metal` and `knn-stdarch` on the native SIMD
 kernels, `knn-blas` on sgemm, `knn-faiss`) are cross-verified at the unit-test level and the
 `verify dataset-knnutils` pipeline command re-runs FAISS on a
 sampled subset of every published dataset to catch regressions.
-See the [conformance section](../../docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing)
+See the [conformance section](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing)
 for the comparison model and a per-test breakdown.
 
 **Live demo** — runs every available engine on the same input and
@@ -100,7 +100,7 @@ saves always render the named form). Available generator strategies:
 | `linear:<lo>/<step>` | Open-ended arithmetic, capped at `base_count` |
 | `decade`            | 100k, 200k, … 900k, 1m, 2m, … one detent per decimal click |
 
-See [docs/sysref/01-data-model.md](../../docs/sysref/01-data-model.md)
+See [docs/sysref/01-data-model.md](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/sysref/01-data-model.md)
 for the full strata spec.
 
 ### interact
@@ -120,7 +120,7 @@ veks interact values  --source ./data/base.fvecs --start 0 --digits 4
 veks interact shell   --source ./data/base.fvecs "info; range 0 5"
 ```
 
-See the [Explore tutorial](../../docs/tutorials/explore-vector-data.md)
+See the [Explore tutorial](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/tutorials/explore-vector-data.md)
 for the full keybinding sheet (vim hjkl/HJKL navigation, palette/curve
 cycling, color-blind-safe palettes, Turbo / Spectrum scatter palettes).
 

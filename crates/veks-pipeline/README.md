@@ -17,8 +17,8 @@ This crate hosts all four KNN engines — `compute_knn` (native
 streaming pread), `compute_knn_blas` (sgemm: pure-Rust `gemm`, or the
 system `cblas_sgemm` with `blas-system`), and `compute_knn_faiss` (FAISS) —
 plus the shared
-[`knn_compare`](src/pipeline/commands/knn_compare.rs) classifier
-and the end-to-end [`verify_dataset_knnutils`](src/pipeline/commands/verify_dataset_knnutils.rs)
+[`knn_compare`](https://github.com/nosqlbench/vectordata-rs/blob/main/crates/veks-pipeline/src/pipeline/commands/knn_compare.rs) classifier
+and the end-to-end [`verify_dataset_knnutils`](https://github.com/nosqlbench/vectordata-rs/blob/main/crates/veks-pipeline/src/pipeline/commands/verify_dataset_knnutils.rs)
 command. In-tree conformance tests assert *zero* differing neighbors across
 engines on deterministic fixtures; the `verify engine-parity`
 demo command defaults to `--boundary-tolerance 0` so any disagreement
@@ -26,7 +26,7 @@ fails the verdict. The `BOUNDARY_THRESHOLD = 5` constant in
 `knn_compare.rs` is a defensive ceiling for the multi-threaded BLAS
 regime at billion-vector scale, not a slack used at unit-test or
 default-demo sizes. See the
-[conformance section](../../docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing)
+[conformance section](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing)
 for observed numbers, the test catalog, and the two degenerate
 regimes where users might opt into `--boundary-tolerance > 0`.
 
@@ -51,7 +51,7 @@ cargo test -p veks-pipeline --features knnutils \
 ## Usage
 
 This crate is not intended for direct consumption. It is used by the
-[veks](../veks/) CLI binary. Pipeline commands are invoked via:
+[veks](https://github.com/nosqlbench/vectordata-rs/tree/main/crates/veks) CLI binary. Pipeline commands are invoked via:
 
 ```bash
 veks run dataset.yaml              # execute pipeline
@@ -71,6 +71,6 @@ veks pipeline <group> <command>    # direct command invocation
 
 ## Documentation
 
-- [Command Reference](../../docs/sysref/commands/README.md) — per-command examples with real output
-- [Pipeline Engine](../../docs/sysref/04-pipeline.md) — DAG execution, variables, profiles
-- [Architecture](../../docs/sysref/08-architecture.md) — CommandOp trait, resource governance, UI layer
+- [Command Reference](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/sysref/commands/README.md) — per-command examples with real output
+- [Pipeline Engine](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/sysref/04-pipeline.md) — DAG execution, variables, profiles
+- [Architecture](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/sysref/08-architecture.md) — CommandOp trait, resource governance, UI layer

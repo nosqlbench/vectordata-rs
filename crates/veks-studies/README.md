@@ -35,7 +35,7 @@ known to be wrong.
 
 Three layers, and the distinctions matter.
 
-![Layer overview](docs/gsplat/veks-sim-layers.svg)
+![Layer overview](https://github.com/nosqlbench/vectordata-rs/blob/main/crates/veks-studies/docs/gsplat/veks-sim-layers.svg)
 
 **A model of the algorithm.** `algo`, `model`, `check` and `study`
 simulate the rewrite itself — every read, scatter, spill and write
@@ -67,7 +67,7 @@ Every stage one access passes through, and what can stop it at each.
 Reads and writes take different routes, and that difference is most of
 the story:
 
-![Storage request path](docs/gsplat/veks-sim-request-path.svg)
+![Storage request path](https://github.com/nosqlbench/vectordata-rs/blob/main/crates/veks-studies/docs/gsplat/veks-sim-request-path.svg)
 
 ## Running it
 
@@ -104,7 +104,7 @@ the deltas are measured against.
 
 ### Studies — where a staged rewrite becomes necessary
 
-**[docs/findings.md](docs/findings.md) is the explainer**: every table
+**[docs/findings.md](https://github.com/nosqlbench/vectordata-rs/blob/main/crates/veks-studies/docs/findings.md) is the explainer**: every table
 these produce, what each one is evidence for, and the test that keeps it
 honest. Read that if you want the results; run the commands below if you
 want to reproduce them.
@@ -178,7 +178,7 @@ concurrency-dependent, and the corpus fixes concurrency at one value.
 
 ## Accuracy
 
-![Validation flow](docs/gsplat/veks-sim-validation.svg)
+![Validation flow](https://github.com/nosqlbench/vectordata-rs/blob/main/crates/veks-studies/docs/gsplat/veks-sim-validation.svg)
 
 Scored across three devices and every block size from 512 B to 1 MiB, as
 mean absolute percentage error against measurement. Latency is compared

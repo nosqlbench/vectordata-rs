@@ -8,7 +8,7 @@ vectors.
 Datasets carry ground truth (exact and filtered KNN) that has been
 numerically cross-verified against FAISS and the Python `knn_utils`
 reference (numpy + FAISS) — see the
-[KNN engine conformance section](../../docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing).
+[KNN engine conformance section](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing).
 
 There are **two ways in**, both built on the same
 catalog → profile → facet model:
@@ -42,7 +42,7 @@ Datasets are addressed by name (`my-dataset`) or `name:profile`
 its SHA-256 chunk hashes, and persists it to disk — subsequent reads
 (and `explore`) are then zero-copy mmap.
 
-Full walk-through: [Find and fetch datasets with the CLI](./docs/find-and-fetch-datasets.md).
+Full walk-through: [Find and fetch datasets with the CLI](https://github.com/nosqlbench/vectordata-rs/blob/main/crates/vectordata/docs/find-and-fetch-datasets.md).
 
 ## 2. Read datasets from Rust
 
@@ -83,11 +83,11 @@ HTTP with auto-promotion to mmap, or direct HTTP RANGE) for you
 based on the catalog entry. There is no public type or function in
 the crate that lets a caller bypass the cache or pick the slow
 direct-HTTP path on a URL that has a published `.mref` — see the
-[Storage / transport factoring](../../docs/design/storage_transport_factoring.md)
+[Storage / transport factoring](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/design/storage_transport_factoring.md)
 design note.
 
 For the full walk-through, see the
-[Accessing datasets from Rust](./docs/access-datasets-from-rust.md)
+[Accessing datasets from Rust](https://github.com/nosqlbench/vectordata-rs/blob/main/crates/vectordata/docs/access-datasets-from-rust.md)
 tutorial.
 
 ## Discover profiles and facets
@@ -190,12 +190,12 @@ let r = open_vvec::<i32>("metadata_indices.ivvecs")?;
 
 ## Documentation
 
-- [API reference](../../docs/sysref/02-api.md) — full consumer reference.
-- [Tutorial: Accessing datasets from Rust](./docs/access-datasets-from-rust.md)
+- [API reference](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/sysref/02-api.md) — full consumer reference.
+- [Tutorial: Accessing datasets from Rust](https://github.com/nosqlbench/vectordata-rs/blob/main/crates/vectordata/docs/access-datasets-from-rust.md)
   — end-to-end walk-through of the prescribed pattern.
-- [Data Model](../../docs/sysref/01-data-model.md) — file formats,
+- [Data Model](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/sysref/01-data-model.md) — file formats,
   facets, profiles.
-- [Catalogs](../../docs/sysref/03-catalogs.md) — discovery, publishing,
+- [Catalogs](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/sysref/03-catalogs.md) — discovery, publishing,
   caching.
-- [Storage / transport factoring](../../docs/design/storage_transport_factoring.md)
+- [Storage / transport factoring](https://github.com/nosqlbench/vectordata-rs/blob/main/docs/design/storage_transport_factoring.md)
   — the design behind the unified-dispatch reader API.
