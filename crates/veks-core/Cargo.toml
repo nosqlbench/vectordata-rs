@@ -1,6 +1,6 @@
 [package]
 name = "veks-core"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2024"
 description = "Core utilities for veks — terminal, filters, UI, format I/O"
 license = "Apache-2.0"
