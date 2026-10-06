@@ -1,7 +1,7 @@
 //! High-level entry point for loading vector datasets.
 //!
 //! [`TestDataGroup`] parses a `dataset.yaml` (from a local path or HTTP URL)
-//! and exposes named profiles as [`TestDataView`](crate::view::TestDataView)
+//! and exposes named profiles as [`TestDataView`]
 //! instances for reading vectors and metadata.
 
 use crate::dataset::selector::{self, ProfileFacts, SelectionError};
