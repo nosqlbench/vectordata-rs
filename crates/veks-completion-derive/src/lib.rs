@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `#[derive(VeksCli)]` — generates the [`veks_completion::VeksCli`] impl for a
+//! `#[derive(VeksCli)]` — generates the `veks_completion::VeksCli` impl for a
 //! command/args struct or a subcommand enum. From one annotated declaration it
 //! produces the `CommandSpec` (which drives parsing, help, and completion) and
 //! the typed extraction from a `ParsedArgs`. This is the in-tree replacement

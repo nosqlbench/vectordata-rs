@@ -79,7 +79,7 @@ pub trait CommandOp: Send {
     /// no default: the command's author decides whether the command
     /// surfaces on the first tab tap or sits behind a deeper one.
     ///
-    /// Symmetric with [`category`]: returns `&'static dyn LevelTag`
+    /// Symmetric with [`category`](Self::category): returns `&'static dyn LevelTag`
     /// so consumers of `veks-completion` can define their own tier
     /// enum. Inside `veks-pipeline`, return one of the static
     /// instances ([`LVL_PRIMARY`], [`LVL_SECONDARY`], [`LVL_ADVANCED`]).

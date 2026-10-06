@@ -4,7 +4,7 @@
 //! Compiled MNode writer for Arrow `RecordBatch` rows.
 //!
 //! Analyzes an Arrow [`Schema`] once to produce a [`CompiledMnodeWriter`] — a
-//! flat vector of [`FieldOp`]s that knows pre-encoded field name bytes, the
+//! flat vector of `FieldOp`s that knows pre-encoded field name bytes, the
 //! MNode type tag, and which Arrow column/array type to read from. At write
 //! time it iterates the ops and writes MNode wire format directly to a
 //! `Vec<u8>` buffer, avoiding per-row HashMap and allocation overhead.

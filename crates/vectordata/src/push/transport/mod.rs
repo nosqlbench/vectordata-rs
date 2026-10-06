@@ -8,9 +8,9 @@
 //! endpoint; callers never choose a transport by hand. Three schemes are
 //! supported:
 //!
-//! - `file://` / local — filesystem copy ([`local::LocalTransport`]);
-//! - `https://` / `http://` — REST `PUT`/`HEAD`/`GET` ([`https::HttpsTransport`]);
-//! - `s3://` — the AWS CLI ([`s3::S3Transport`]), matching `veks publish`.
+//! - `file://` / local — filesystem copy (`LocalTransport`);
+//! - `https://` / `http://` — REST `PUT`/`HEAD`/`GET` (`HttpsTransport`);
+//! - `s3://` — the AWS CLI (`S3Transport`), matching `veks publish`.
 //!
 //! See `docs/design/push-command.md` — *Transports: dispatch on the URL
 //! scheme*.

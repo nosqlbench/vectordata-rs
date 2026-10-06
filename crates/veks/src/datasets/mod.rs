@@ -187,7 +187,7 @@ pub enum DatasetsCommand {
     /// Ping a remote dataset: verify catalog access, list facets, read a sample
     #[command(alias = "probe")]
     Ping {
-        /// Catalog base URL(s) or number(s) (e.g., 1, https://bucket.s3.amazonaws.com/path/)
+        /// Catalog base URL(s) or number(s) (e.g., 1, `https://bucket.s3.amazonaws.com/path/`)
         /// to pin the search to. If omitted, searches configured catalogs for the dataset.
         #[arg(long = "at")]
         at: Vec<String>,

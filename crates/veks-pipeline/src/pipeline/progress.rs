@@ -269,9 +269,9 @@ impl ProgressLog {
     /// does not exist.
     ///
     /// A log at the current schema is read as is. A log at
-    /// [`NESTED_PROVENANCE_SCHEMA_VERSION`] is migrated: every record is
+    /// `NESTED_PROVENANCE_SCHEMA_VERSION` is migrated: every record is
     /// kept and its provenance rebuilt from the records of its upstreams
-    /// (see [`migrate_nested`]); the message in the second tuple element
+    /// (see `migrate_nested`); the message in the second tuple element
     /// says so, and the first `save` keeps the original file beside the
     /// rewritten one. Any other stored version clears all step records,
     /// as before.

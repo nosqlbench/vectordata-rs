@@ -674,7 +674,7 @@ pub trait TestDataView: Send + Sync {
         self.prebuffer_all_with_progress(WholeFacetFallback::Refuse, &mut |_, _| {})
     }
 
-    /// Same as [`prebuffer_all`] with a callback fired per facet
+    /// Same as [`prebuffer_all`](Self::prebuffer_all) with a callback fired per facet
     /// after its download completes. The callback receives the
     /// facet name and a progress snapshot.
     ///
@@ -1165,7 +1165,7 @@ pub trait TestDataView: Send + Sync {
 ///
 /// The native element type is inferred from the facet's source
 /// extension via [`TestDataView::facet_element_type`]; the transport
-/// is inferred from the source string via [`TypedReader::open_auto`].
+/// is inferred from the source string via [`TypedReader::open_auto`](crate::typed_access::TypedReader::open_auto).
 pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
     view: &dyn TestDataView,
     facet_name: &str,

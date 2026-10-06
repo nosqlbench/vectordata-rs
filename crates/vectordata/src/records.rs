@@ -40,7 +40,7 @@
 //! ```
 //!
 //! There is one read path. The untyped level is not a separate
-//! implementation but [`Records<Anode>`] — the codec that stops after
+//! implementation but [`Records<Anode>`](crate::records::Records) — the codec that stops after
 //! stage 1. A by-name codec resolves to the same impls, so the dynamic
 //! entry point is a lookup in front of one implementation rather than a
 //! parallel one.
@@ -53,7 +53,7 @@
 //!
 //! ## Incremental by the same means as everything else
 //!
-//! Reads go through [`crate::storage::Storage`], not a memory map of
+//! Reads go through the crate's internal storage layer, not a memory map of
 //! this module's own. A slab ends with a pages-page indexing every data
 //! page by start ordinal, so opening a facet costs its tail and reading
 //! a record costs that record's page — each fetched and merkle-verified

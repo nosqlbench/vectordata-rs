@@ -194,7 +194,7 @@ pub mod group;
 ///
 /// Exposes a *minimal* surface for tasks that inspect or scrub the
 /// on-disk cache root — the live cache state itself is owned by
-/// internal types ([`storage::Storage`], [`cache::CachedChannel`])
+/// internal types (`storage::Storage`, `cache::CachedChannel`)
 /// that are deliberately not reachable from outside this crate. If you
 /// find yourself reaching for more than this module exposes, the right
 /// move is to add another targeted re-export, not to widen visibility

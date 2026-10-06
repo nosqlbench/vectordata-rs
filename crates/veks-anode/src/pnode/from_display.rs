@@ -5,7 +5,7 @@
 //! in `pnode::mod`): parse a Display-format string back into a
 //! concrete [`PNode`].
 //!
-//! The grammar is the one [`PNode::Display`] emits:
+//! The grammar is the one [`PNode`]'s `Display` impl emits:
 //!
 //! ```text
 //! pnode      := conjugate | predicate

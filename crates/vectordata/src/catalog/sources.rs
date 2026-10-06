@@ -363,7 +363,7 @@ pub fn expand_tilde(path: &str) -> String {
 /// under a single root, so tests and tutorials never touch the real config.
 ///
 /// This is the thin env-reading wrapper; the resolution logic lives in the
-/// pure [`config_dir_from`] so it can be tested without mutating the
+/// pure `config_dir_from` so it can be tested without mutating the
 /// process-wide environment.
 pub fn config_dir() -> String {
     config_dir_from(std::env::var_os("VECTORDATA_HOME"))

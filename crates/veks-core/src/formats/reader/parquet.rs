@@ -86,7 +86,7 @@ impl WorkQueue {
 /// The first list-of-float column found is used as the vector data.
 ///
 /// A pool of workers loads files in parallel. Each worker pulls the next
-/// unloaded file from a shared [`WorkQueue`], loads it, and sends the result
+/// unloaded file from a shared `WorkQueue`, loads it, and sends the result
 /// (tagged with its file index) through a channel. The consumer reassembles
 /// results in sorted order using a small reorder buffer.
 pub struct ParquetDirReader {

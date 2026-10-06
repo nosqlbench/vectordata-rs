@@ -41,7 +41,7 @@
 //!
 //! ## Alternative backend
 //!
-//! With the `simsimd` feature, [`simsimd_backend`] exposes simsimd's
+//! With the `simsimd` feature, the `simsimd_backend` module exposes simsimd's
 //! pairwise kernels behind the same function-pointer types, for parity
 //! runs that want to compare against it. Native kernels are always the
 //! default.

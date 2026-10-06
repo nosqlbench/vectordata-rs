@@ -59,7 +59,7 @@ pub use options::{CommandOption, OptionConflict, OptionDef, OptionRegistry, Pars
 /// Heap-allocated, thread-safe closure type so providers can capture
 /// data (e.g., a static enum-value list discovered from a
 /// `CommandOp::value_completions` map). Function pointers can be
-/// promoted to this type via [`ValueProvider::from_fn`] so existing
+/// promoted to this type via [`fn_provider`] so existing
 /// `fn(&str, &[&str]) -> Vec<String>` providers keep working.
 pub type ValueProvider = std::sync::Arc<dyn Fn(&str, &[&str]) -> Vec<String> + Send + Sync>;
 
@@ -183,7 +183,7 @@ impl From<ClosedValues> for ValueProvider {
 /// they're named — each consuming crate decides. Implement
 /// `LevelTag` on your own enum to declare a closed set of
 /// stratified-completion tiers; commands then return `&'static dyn
-/// LevelTag` and the completion engine orders by [`rank`].
+/// LevelTag` and the completion engine orders by [`rank`](LevelTag::rank).
 ///
 /// `rank()` is the scalar used by stratified completion (the Nth
 /// tab tap reveals everything with `rank <= N`). Lower = more
@@ -1618,7 +1618,7 @@ pub fn complete(tree: &CommandTree, words: &[&str]) -> Vec<String> {
 ///   tap 4 → wraps back to level 1
 ///   ...
 ///
-/// Cycle length is the tree's [`max_level`].
+/// Cycle length is the tree's [`max_level`](CommandTree::max_level).
 pub fn complete_at_level_only(tree: &CommandTree, words: &[&str], only_level: u32) -> Vec<String> {
     // Words shape: [binary, completed..., partial]. At absolute root
     // with no input at all, words may have just [binary], so treat

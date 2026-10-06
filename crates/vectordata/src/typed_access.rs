@@ -6,7 +6,7 @@
 //! [`TypedReader<T>`] opens vector and scalar files with compile-time
 //! type safety and runtime width/signedness validation. The transport
 //! choice (local mmap, merkle-cached remote, direct HTTP) is hidden
-//! inside the crate-private [`crate::storage::Storage`] abstraction.
+//! inside the crate-private `Storage` abstraction.
 //!
 //! # Access modes
 //!
@@ -98,7 +98,7 @@ impl ElementType {
     }
 
     /// Whether `path` names a scalar facet — raw packed values with no
-    /// per-record header. See [`crate::io::is_scalar_ext`], the single
+    /// per-record header. See `crate::io::is_scalar_ext`, the single
     /// table both this and the URL form answer from.
     pub fn is_scalar_format(path: impl AsRef<Path>) -> bool {
         let ext = path.as_ref().extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -219,9 +219,9 @@ fn read_native_value(data: &[u8], native: ElementType) -> i128 {
 
 /// Typed reader for vector or scalar data files.
 ///
-/// Single concrete struct over [`crate::storage::Storage`]. The
+/// Single concrete struct over the crate's internal `Storage`. The
 /// transport choice (local mmap, merkle-cached remote, direct HTTP)
-/// is hidden inside the storage and selected by [`Storage::open`].
+/// is hidden inside the storage and selected by `Storage::open`.
 pub struct TypedReader<T: TypedElement> {
     storage: Arc<Storage>,
     /// The remaining shards, when this facet is a series.

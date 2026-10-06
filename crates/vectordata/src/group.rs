@@ -349,7 +349,7 @@ impl TestDataGroup {
         )
     }
 
-    /// Same as [`prebuffer_all_profiles`] with progress and
+    /// Same as [`prebuffer_all_profiles`](Self::prebuffer_all_profiles) with progress and
     /// large-download warning callbacks.
     ///
     /// `progress_cb(profile, facet, prog)` fires per facet within
@@ -425,7 +425,7 @@ impl TestDataGroup {
 pub const PREBUFFER_LARGE_WARNING_BYTES: u64 = 250 * 1024 * 1024;
 
 impl TestDataGroup {
-    /// Construct a `TestDataGroup` directly from a [`CatalogEntry`]
+    /// Construct a `TestDataGroup` directly from a [`CatalogEntry`](crate::dataset::CatalogEntry)
     /// whose layout already carries the full profile/facet
     /// description.
     ///

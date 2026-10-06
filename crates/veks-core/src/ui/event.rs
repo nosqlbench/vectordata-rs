@@ -54,7 +54,7 @@ pub struct ResourceMetrics {
 
 /// Opaque handle that identifies a progress indicator within a session.
 ///
-/// Created by [`UiSink::next_progress_id`] and referenced in subsequent
+/// Created by [`UiSink::next_progress_id`](crate::ui::UiSink::next_progress_id) and referenced in subsequent
 /// progress events.  The value is meaningful only to the sink that issued it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProgressId(pub u32);

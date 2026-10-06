@@ -233,7 +233,7 @@ impl UiHandle {
 
     /// Update the resource status line (text only, no structured metrics).
     ///
-    /// Prefer [`resource_status_with_metrics`] when structured data is available.
+    /// Prefer [`resource_status_with_metrics`](Self::resource_status_with_metrics) when structured data is available.
     pub fn resource_status(&self, line: impl Into<String>) {
         self.sink.send(UiEvent::ResourceStatus {
             line: line.into(),
@@ -249,7 +249,7 @@ impl UiHandle {
         self.sink.send(UiEvent::ResourceStatus { line, metrics });
     }
 
-    /// Begin a batch — suppress intermediate redraws until [`suspend_end`].
+    /// Begin a batch — suppress intermediate redraws until [`suspend_end`](Self::suspend_end).
     pub fn suspend_begin(&self) {
         self.sink.send(UiEvent::SuspendBegin);
     }

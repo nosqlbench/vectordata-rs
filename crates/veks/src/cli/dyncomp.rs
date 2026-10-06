@@ -87,8 +87,8 @@ fn observed_options_spec(
     }
 }
 
-/// Parse-consistency audit against a [`CommandSpec`] (the clap-free path).
-/// Same invariant as [`audit_parse_consistency`], walking the spec instead of a
+/// Parse-consistency audit against a [`CommandSpec`](veks_completion::CommandSpec) (the clap-free path).
+/// Same invariant as the clap-based parse audit it replaced, walking the spec instead of a
 /// `clap::Command`.
 pub fn audit_parse_consistency_spec(spec: &veks_completion::CommandSpec) -> Vec<ParseMismatch> {
     let mut registry = OptionRegistry::new();

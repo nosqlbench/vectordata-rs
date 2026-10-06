@@ -9,7 +9,7 @@
 //! every quirk of the access layer: canonical `catalog.json` /
 //! `catalog.yaml` lookup, `knn_entries.yaml`-shape synthesis, s3 →
 //! https scheme translation, mref-backed cache routing, and chunked
-//! HTTP fallback. Then for every facet it opens a [`FacetStorage`]
+//! HTTP fallback. Then for every facet it opens a [`FacetStorage`](crate::view::FacetStorage)
 //! (which probes `.mref` / does the HEAD that confirms reachability)
 //! and reports per-facet OK / FAIL plus byte count.
 //!

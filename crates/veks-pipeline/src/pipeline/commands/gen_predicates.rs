@@ -4,7 +4,7 @@
 //! Pipeline command: generate selectivity-targeted PNode predicates
 //! from a metadata survey.
 //!
-//! Consumes the rich [`SurveyReport`] from `analyze survey` (sysref
+//! Consumes the rich [`SurveyReport`](super::survey::orchestrator::SurveyReport) from `analyze survey` (sysref
 //! §13) directly — no projection down to a flat per-field summary.
 //! That lets the generator do calibrated predicate synthesis:
 //!

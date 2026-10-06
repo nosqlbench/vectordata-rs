@@ -128,9 +128,9 @@ impl Catalog {
 
     /// Open a [`CatalogEntry`] directly, dispatching on its shape:
     /// `knn_entries.yaml`-shape entries synthesise the
-    /// [`TestDataGroup`] from their embedded layout (no
+    /// [`TestDataGroup`](crate::TestDataGroup) from their embedded layout (no
     /// per-dataset `dataset.yaml` to re-fetch), while canonical
-    /// entries load through [`TestDataGroup::load`] with the
+    /// entries load through [`TestDataGroup::load`](crate::TestDataGroup::load) with the
     /// entry's absolute `dataset.yaml` URL. Callers that already
     /// hold a `CatalogEntry` (e.g. the picker iterating `datasets()`)
     /// use this to avoid the `find_exact` round-trip.

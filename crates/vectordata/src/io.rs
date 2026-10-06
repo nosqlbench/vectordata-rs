@@ -4,7 +4,7 @@
 //! Vector I/O — uniform and variable-length record readers.
 //!
 //! Two reader shapes, parameterised on element type, both backed by
-//! the crate-private [`crate::storage::Storage`] abstraction:
+//! the crate-private `Storage` abstraction:
 //!
 //! - [`XvecReader<T>`] — uniform-stride records (`fvec`, `ivec`, `mvec`,
 //!   `dvec`, `bvec`, `svec`, …). All records have the same dimension.
@@ -62,7 +62,7 @@ pub enum IoError {
     #[error("Variable-length records: {0}")]
     VariableLengthRecords(String),
     /// No record index could be obtained without downloading the whole
-    /// file, and the caller asked for [`OffsetSource::Published`].
+    /// file, and the caller asked for `OffsetSource::Published`.
     ///
     /// Raised for the planning path: a prefetch plan reports what a
     /// transfer would cost, so it must not move the bytes in order to

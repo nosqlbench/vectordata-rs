@@ -11,8 +11,8 @@
 //! honored uniformly across vectordata and any consuming crate.
 //!
 //! There is no silent fallback. If the settings file is missing or
-//! does not declare `cache_dir:`, [`cache_dir`] returns
-//! [`SettingsError::NotConfigured`], whose `Display` impl prints a
+//! does not declare `cache_dir:`, [`cache_dir`](crate::settings::cache_dir) returns
+//! [`SettingsError::NotConfigured`](crate::settings::SettingsError::NotConfigured), whose `Display` impl prints a
 //! ready-to-paste set of commands the user can run to configure it.
 
 use std::io;

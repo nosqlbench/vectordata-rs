@@ -10,9 +10,9 @@
 //! and a single-provenance event log. The full design lives in
 //! `docs/design/push-command.md`; this module is its implementation.
 //!
-//! The orchestration ([`execute`]) is transport-agnostic and fully
+//! The orchestration ([`execute`](crate::push::execute)) is transport-agnostic and fully
 //! exercised against the local `file://` transport in tests; the
-//! `https://` and `s3://` transports ride the same [`transport::PushTransport`]
+//! `https://` and `s3://` transports ride the same [`PushTransport`](crate::push::transport::PushTransport)
 //! contract.
 //!
 //! **What the plan reads from the remote.** Deciding what a push would

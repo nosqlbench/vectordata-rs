@@ -16,12 +16,12 @@
 //!
 //! ## E vs F (see `docs/design/prefilter-postfilter-facets.md`)
 //!
-//! - **F** — [`PrefilteredNeighborIndices`] / [`PrefilteredNeighborDistances`]:
+//! - **F** — [`PrefilteredNeighborIndices`](StandardFacet::PrefilteredNeighborIndices) / [`PrefilteredNeighborDistances`](StandardFacet::PrefilteredNeighborDistances):
 //!   pre-filter ground truth, ACORN's `G_K`. The top-K of `X_p` by distance —
 //!   perfect recall, full K when `|X_p| ≥ K`. This is the **legacy filtered-
 //!   knn shape**, retained under the F code so existing datasets keep their
 //!   meaning.
-//! - **E** — [`PostfilteredNeighborIndices`] / [`PostfilteredNeighborDistances`]:
+//! - **E** — [`PostfilteredNeighborIndices`](StandardFacet::PostfilteredNeighborIndices) / [`PostfilteredNeighborDistances`](StandardFacet::PostfilteredNeighborDistances):
 //!   post-filter ground truth, `G ∩ R`. The unfiltered top-K intersected
 //!   with the predicate-matching set. Sparse possible. New facet introduced
 //!   alongside the E/F split.

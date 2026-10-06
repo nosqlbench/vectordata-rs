@@ -9,7 +9,7 @@
 //! manifest — this is what closes push's "in-flux window". At `complete`
 //! the session **commits in one transaction**: the staged manifest
 //! atomically *replaces* the live manifest **and** is snapshotted as a new
-//! immutable [`versions`] row (the pointer flip). An `abort` discards the
+//! immutable `versions` row (the pointer flip). An `abort` discards the
 //! staging with no effect on readers.
 //!
 //! The staging manifest is **copy-on-write initialised** from the current

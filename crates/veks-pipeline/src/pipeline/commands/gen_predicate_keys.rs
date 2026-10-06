@@ -22,7 +22,7 @@
 //! During scanning, [`scan_record`] walks raw MNode bytes with zero heap
 //! allocation: non-targeted fields are skipped in-place and targeted fields
 //! are compared directly against comparand values using
-//! [`check_condition_raw`].
+//! [`check_condition_raw`](veks_core::formats::mnode::scan::check_condition_raw).
 //!
 //! Large datasets are split into segments (default 1 M records). Each segment
 //! is processed independently and its results cached to disk so that

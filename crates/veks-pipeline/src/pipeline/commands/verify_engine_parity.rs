@@ -7,7 +7,7 @@
 //! readable comparison so a user can see — directly, without reading
 //! source — that the engines agree under the documented
 //! `BoundaryMismatch ≤ 5` tolerance described in the conformance
-//! section of [`12-knn-utils-verification.md`].
+//! section of `docs/sysref/12-knn-utils-verification.md`.
 //!
 //! Engines exercised:
 //!

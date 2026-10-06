@@ -16,7 +16,7 @@ use super::{FOOTER_SIZE, FOOTER_SIZE_V2, HASH_SIZE, MerkleRef, MerkleShape, read
 /// uses Java `BitSet`-compatible encoding: a little-endian `u64` array where
 /// bit N maps to `words[N / 64] & (1 << (N % 64))`.
 ///
-/// `valid_words` is stored as `Vec<AtomicU64>` so [`mark_valid`] is
+/// `valid_words` is stored as `Vec<AtomicU64>` so [`mark_valid`](MerkleState::mark_valid) is
 /// lock-free — workers in `CachedChannel::parallel_fetch_verify_write`
 /// can update the bitmap concurrently without taking a shared mutex.
 /// All reads use `Relaxed`/`Acquire` ordering as appropriate.

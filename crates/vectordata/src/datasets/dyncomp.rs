@@ -731,7 +731,7 @@ pub fn complete_select_specs(partial: &str, context: &[&str]) -> Vec<String> {
 /// completer twice per tab press (generate + display), so the legend
 /// is debounced through a short-lived marker file in the
 /// VECTORDATA_HOME-isolated completion scratch dir (see
-/// [`completion_scratch_dir`]).
+/// `completion_scratch_dir`).
 pub fn complete_catalog_urls(partial: &str, _context: &[&str]) -> Vec<String> {
     let configured = sources::raw_catalog_entries(&sources::config_dir());
     let results = filter_catalog_indices(&configured, partial);

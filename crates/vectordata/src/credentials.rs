@@ -479,7 +479,7 @@ fn epoch_str(v: &serde_json::Value) -> Option<String> {
 const EXPIRY_WARN_SECS: i64 = 7 * 24 * 3600;
 
 /// Print a stderr warning if the stored credential for `url`'s origin is past
-/// expiry, or within [`EXPIRY_WARN_SECS`] of it — so a lapsing token surfaces
+/// expiry, or within `EXPIRY_WARN_SECS` of it — so a lapsing token surfaces
 /// as a clear "go re-login" rather than an opaque 401 later. No-op when there
 /// is no stored credential or it carries no expiry. Call it from commands that
 /// rely on a stored credential.

@@ -10,12 +10,12 @@
 //! - **Never blocks and never fails a command.** The startup hook
 //!   prints from *cached* state only (zero network); the remote
 //!   probe runs in a detached re-invocation of this binary (marked
-//!   by [`PROBE_CHILD_ENV`]) that outlives the user's command —
+//!   by `PROBE_CHILD_ENV`) that outlives the user's command —
 //!   threads die with the process, and most vectordata invocations
 //!   finish faster than one HTTPS round trip. The child writes the
 //!   state file for the NEXT run to print.
 //! - **Throttled.** Probes happen at most once per
-//!   [`CHECK_INTERVAL_SECS`] (24 h), tracked in `update_check.yaml`
+//!   `CHECK_INTERVAL_SECS` (24 h), tracked in `update_check.yaml`
 //!   under the config dir ([`crate::catalog::sources::config_dir`],
 //!   so `VECTORDATA_HOME` isolation applies). The timestamp is only
 //!   advanced on a successful probe.

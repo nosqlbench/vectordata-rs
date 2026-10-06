@@ -13,7 +13,7 @@
 //! in the field's reservoir, tracks per-probe match rates, and
 //! commits to the highest-rate probe above the field's confidence
 //! threshold. Unmatched fields fall through to the encoding-only
-//! verdict assigned in [`super::template::classify_semantic`].
+//! verdict assigned in `template::classify_semantic`.
 //!
 //! See sysref §13.3.3 for the full probe-table specification.
 

@@ -506,7 +506,7 @@ pub trait MetricsqlCatalog: Send + Sync + 'static {
     fn label_keys(&self, metric: &str, prefix: &str) -> Vec<String>;
 
     /// Label values for the given (metric, label) matching the
-    /// prefix. Same `metric=""` convention as [`label_keys`].
+    /// prefix. Same `metric=""` convention as [`label_keys`](Self::label_keys).
     fn label_values(&self, metric: &str, label: &str, prefix: &str) -> Vec<String>;
 }
 

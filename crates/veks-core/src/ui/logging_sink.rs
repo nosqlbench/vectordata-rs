@@ -4,7 +4,7 @@
 //! Unified logging: TUI display + persistent file log.
 //!
 //! [`install_logger`] opens the log file, writes a session header, and
-//! returns a shared writer that [`UiHandle`] stores. Every call to
+//! returns a shared writer that [`UiHandle`](crate::ui::UiHandle) stores. Every call to
 //! `UiHandle::log()` writes to both the TUI sink and the file in lock-step.
 //!
 //! The `log` crate is also configured so that `log::info!()` etc. from
@@ -27,7 +27,7 @@ use super::sink::UiSink;
 
 /// Shared handle to the persistent log file.
 ///
-/// Stored inside [`UiHandle`] so that `log()` writes in lock-step with
+/// Stored inside [`UiHandle`](crate::ui::UiHandle) so that `log()` writes in lock-step with
 /// TUI display, without depending on `log::set_logger`.
 pub type LogFileWriter = Arc<Mutex<std::io::BufWriter<std::fs::File>>>;
 

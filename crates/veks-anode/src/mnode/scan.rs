@@ -4,7 +4,7 @@
 //! Zero-allocation binary scanner for MNode records.
 //!
 //! Scans raw MNode bytes and evaluates predicate conditions directly against
-//! binary data without materializing [`MNode`] or [`MValue`] objects. Combined
+//! binary data without materializing [`MNode`](crate::mnode::MNode) or [`MValue`](crate::mnode::MValue) objects. Combined
 //! with schema-compiled predicates, this eliminates all heap allocation in the
 //! per-record hot path.
 //!
@@ -716,7 +716,7 @@ pub fn flatten_and(pnode: &PNode) -> Option<Vec<(String, OpType, Vec<Comparand>)
 
 /// Evaluate whether a missing field satisfies a condition.
 ///
-/// Mirrors the semantics in [`pnode::eval::evaluate`]: missing fields match
+/// Mirrors the semantics in [`pnode::eval::evaluate`](crate::pnode::eval::evaluate): missing fields match
 /// `Eq Null`, `In Null`, and `Ne <non-Null>`.
 pub fn missing_field_passes(op: &OpType, comparands: &[Comparand]) -> bool {
     match op {

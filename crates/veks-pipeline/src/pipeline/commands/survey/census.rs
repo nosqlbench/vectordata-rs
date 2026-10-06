@@ -35,7 +35,7 @@
 //! first-seen parents and report order never depend on scheduling.
 //! Worker threads therefore walk each page's records with the
 //! zero-allocation MNode scanner and extract **only the declared
-//! fields** into a per-page array of [`Slot`]s plus one text arena —
+//! fields** into a per-page array of `Slot`s plus one text arena —
 //! two allocations per page, none per record. One consumer applies
 //! pages strictly in page order, interning values on first sight, so
 //! the per-record cost is one hash probe per declared use.

@@ -71,7 +71,7 @@ pub fn pipeline_command_metadata() -> BTreeMap<String, CommandMetadata> {
 }
 
 /// The full pipeline command tree as a [`veks_completion::CommandSpec`] — the
-/// clap-free replacement for [`build_pipeline_command`]. Commands are grouped by
+/// clap-free replacement for the former clap `build_pipeline_command`. Commands are grouped by
 /// first word; a single-word command (empty subname) becomes the group node
 /// itself (matching the clap builder's `is_direct` behavior).
 pub fn pipeline_command_spec() -> veks_completion::CommandSpec {

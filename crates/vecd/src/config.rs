@@ -288,7 +288,7 @@ impl Config {
     }
 
     /// Serialize to canonical `key = value` text — the native `vecd.conf`
-    /// format, round-trippable through [`parse`](Self::parse).
+    /// format, round-trippable through `parse`.
     pub fn to_text(&self) -> String {
         let mut out =
             String::from("# vecd configuration — see docs/guides/vecd-config.md (or `vecd config get`)\n");

@@ -12,14 +12,14 @@
 //!
 //! Operations:
 //!
-//! - [`show`] — print the active configuration (settings file path,
+//! - [`show`](crate::config::show) — print the active configuration (settings file path,
 //!   `cache_dir`, status, used space, protect flag).
-//! - [`set_cache`] — write a new `cache_dir` into `settings.yaml`,
+//! - [`set_cache`](crate::config::set_cache) — write a new `cache_dir` into `settings.yaml`,
 //!   honoring `protect_settings: true` unless `force=true`.
-//! - [`list_mounts`] — enumerate writable mount points with available
+//! - [`list_mounts`](crate::config::list_mounts) — enumerate writable mount points with available
 //!   and total space; the standard "where should I put my cache"
 //!   helper.
-//! - [`add_catalog`], [`remove_catalog`], [`list_catalogs`] —
+//! - [`add_catalog`](crate::config::add_catalog), [`remove_catalog`](crate::config::remove_catalog), [`list_catalogs`](crate::config::list_catalogs) —
 //!   manage `catalogs.yaml`, the list of catalog sources used by
 //!   [`crate::catalog::resolver::Catalog::of`].
 

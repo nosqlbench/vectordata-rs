@@ -10,13 +10,13 @@
 //! engines:
 //!
 //! - [`Metric`] — metric-selection enum with canonical cache tags
-//! - [`build_cache_path`], [`validate_cache_file`] — file-naming and
+//! - `build_cache_path`, `validate_cache_file` — file-naming and
 //!   size-based validation for cached segment artifacts
-//! - [`write_segment_cache`], [`load_segment_cache`] — write/replay of
+//! - `write_segment_cache`, `load_segment_cache` — write/replay of
 //!   a single segment's per-query top-K
-//! - [`scan_cached_segments`] — cross-profile cache discovery plus
+//! - `scan_cached_segments` — cross-profile cache discovery plus
 //!   salvage of sibling profiles' published outputs
-//! - [`merge_segment_into_heaps`] — append-with-pruning merge
+//! - `merge_segment_into_heaps` — append-with-pruning merge
 //!
 //! Each engine supplies:
 //!   - an `engine` string (`"knn-stdarch"`, `"knn-blas"`, ...) that
@@ -47,8 +47,8 @@ use super::compute_knn::Neighbor;
 ///
 /// The kernel still operates on monotonic-distance values internally
 /// (smaller = better), but conversion to/from publication convention
-/// happens at every disk boundary via [`kernel_to_published`] and
-/// [`published_to_kernel`]. v2 cache files were a mix (segment caches
+/// happens at every disk boundary via `kernel_to_published` and
+/// `published_to_kernel`. v2 cache files were a mix (segment caches
 /// in kernel convention, published files in publication convention)
 /// and would be misinterpreted under the new uniform convention.
 pub const CACHE_VERSION: &str = "v3";
@@ -255,7 +255,7 @@ pub(super) fn resolve_cosine_mode_for(
 ///
 /// Returns `{base_stem}.{query_stem}.{base_size}_{query_size}` — the
 /// per-dataset-pair component of the cache path. The full cache
-/// filename is built by [`build_cache_path`], which prepends the
+/// filename is built by `build_cache_path`, which prepends the
 /// **engine name** (`knn-metal`, `knn-stdarch`, `knn-blas`, …) so
 /// engines never replay each other's output. That engine prefix is
 /// the load-bearing differentiator: every `compute knn*`
