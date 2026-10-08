@@ -1,9 +1,9 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stream a profile's base vectors in order, a window at a time, with
-//! the next window fetching in the background while the current one is
-//! read.
+//! Stream a profile's base vectors in order, a window at a time, into
+//! one reused buffer, with the next window fetching in the background
+//! while the current one is read.
 //!
 //! ```text
 //! cargo run -p vectordata --example stream_base_vectors -- my-dataset:default 100000
@@ -32,6 +32,8 @@ fn main() -> vectordata::Result<()> {
     let view = catalog.open_spec(&spec)?.view()?;
     let base = view.base_vectors()?;
     let count = base.count() as u64;
+    let dim = base.dim();
+    let mut buf = vec![0f32; step as usize * dim];
 
     // The first window, fetched before reading starts.
     view.fetch(
@@ -51,10 +53,9 @@ fn main() -> vectordata::Result<()> {
                 WholeFacetFallback::Refuse,
             )
         });
-        for i in start..end {
-            let v = base.get(i as usize)?;
-            sum += v.iter().map(|x| *x as f64).sum::<f64>();
-        }
+        // One bulk copy per window into a buffer reused across windows.
+        let n = base.read_into(start as usize, &mut buf)?;
+        sum += buf[..n * dim].iter().map(|x| *x as f64).sum::<f64>();
         if let Some(handle) = next {
             handle?.join()?;
         }

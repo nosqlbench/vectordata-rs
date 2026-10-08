@@ -362,3 +362,81 @@ fn a_windowed_fetch_reports_an_incomplete_file() {
     let row = &report.facets[0];
     assert!(!row.complete, "only the window was fetched");
 }
+
+// ─── Bulk reads ────────────────────────────────────────────────────
+
+/// The value `write_fvec` puts at element `d` of record `i`.
+fn expected(seed: f32, dim: usize, i: usize, d: usize) -> f32 {
+    seed + (i * dim + d) as f32
+}
+
+/// **`read_into` copies records contiguously, across a shard seam, and
+/// clamps at the end** — the bulk read that replaces opening the files.
+#[test]
+fn read_into_fills_a_buffer_across_shards() {
+    let tmp = make_tmp();
+    // Two shards of 100 records, each numbered on from the last.
+    let mut buf = Vec::new();
+    for s in 0..2usize {
+        buf.clear();
+        for i in s * 100..(s + 1) * 100 {
+            buf.extend_from_slice(&4i32.to_le_bytes());
+            for d in 0..4 {
+                buf.extend_from_slice(&expected(9.0e6, 4, i, d).to_le_bytes());
+            }
+        }
+        std::fs::write(tmp.path().join(format!("base__{s:04}.fvec")), &buf).unwrap();
+    }
+    std::fs::write(
+        tmp.path().join("dataset.yaml"),
+        "format_version: 2\nname: series\nprofiles:\n  default:\n    base_vectors:\n      \
+         source: base__NNNN.fvec\n      shard_stride: 100\n      shard_count: 2\n      \
+         record_count: 200\n  window:\n    base_vectors: base__0000.fvec[10..60)\n",
+    )
+    .unwrap();
+    let group = TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let base = group.profile("default").unwrap().base_vectors().unwrap();
+
+    // 30 records straddling the seam at 100.
+    let mut out = vec![0f32; 30 * 4];
+    assert_eq!(base.read_into(90, &mut out).unwrap(), 30);
+    for k in 0..30 {
+        for d in 0..4 {
+            assert_eq!(out[k * 4 + d], expected(9.0e6, 4, 90 + k, d), "record {}", 90 + k);
+        }
+    }
+    // Clamped at the end of the facet; nothing at the end; past it is an error.
+    let mut out = vec![0f32; 50 * 4];
+    assert_eq!(base.read_into(180, &mut out).unwrap(), 20);
+    assert_eq!(base.read_into(200, &mut out).unwrap(), 0);
+    assert!(base.read_into(201, &mut out).is_err());
+    // A buffer that is not whole records is refused.
+    assert!(base.read_into(0, &mut [0f32; 6]).is_err());
+
+    // A windowed profile reads in its own ordinals.
+    let windowed = group.profile("window").unwrap().base_vectors().unwrap();
+    assert_eq!(windowed.count(), 50);
+    let mut out = vec![0f32; 2 * 4];
+    assert_eq!(windowed.read_into(0, &mut out).unwrap(), 2);
+    assert_eq!(out[0], expected(9.0e6, 4, 10, 0), "window record 0 is file record 10");
+    assert!(windowed.get_slice(0).is_some(), "a windowed reader passes zero-copy slices through");
+}
+
+/// Over HTTP, unfetched, `read_into` reads the span in one go and
+/// agrees with per-record reads; after a fetch it copies from the map.
+#[test]
+fn read_into_matches_per_record_reads_over_http() {
+    let (_tmp, server) = served(1.1e7);
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let base = view.base_vectors().unwrap();
+    let mut out = vec![0f32; 300 * 8];
+    assert_eq!(base.read_into(500, &mut out).unwrap(), 300);
+    for k in [0usize, 1, 150, 299] {
+        assert_eq!(&out[k * 8..(k + 1) * 8], base.get(500 + k).unwrap().as_slice(), "record {}", 500 + k);
+    }
+    view.fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent).unwrap();
+    let mut again = vec![0f32; 300 * 8];
+    assert_eq!(base.read_into(500, &mut again).unwrap(), 300);
+    assert_eq!(out, again);
+}

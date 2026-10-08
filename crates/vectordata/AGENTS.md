@@ -56,7 +56,11 @@ documentation's **Common tasks** table is the same index with examples.
 - Read vectors:
   [`TestDataView::base_vectors`](crate::TestDataView::base_vectors) /
   [`query_vectors`](crate::TestDataView::query_vectors) →
-  [`VectorReader::get`](crate::VectorReader::get).
+  [`VectorReader::get`](crate::VectorReader::get) or the zero-copy
+  [`get_slice`](crate::VectorReader::get_slice) per record, and
+  [`VectorReader::read_into`](crate::VectorReader::read_into) to copy a
+  run of records into a contiguous buffer you own — a whole base set,
+  or one window at a time — split across shards and windows for you.
 - Read ground truth:
   [`TestDataView::neighbor_indices`](crate::TestDataView::neighbor_indices),
   [`neighbor_distances`](crate::TestDataView::neighbor_distances).

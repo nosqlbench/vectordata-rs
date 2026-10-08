@@ -29,7 +29,7 @@
 //! | Draw the CLI's progress meter | [`TextMeter`](fetch::TextMeter) | `examples/fetch_with_progress.rs` |
 //! | Warm a window in the background while reading | [`TestDataView::prefetch_in_background`] | `examples/stream_base_vectors.rs` |
 //! | Read vectors by ordinal | [`TestDataView::base_vectors`] → [`VectorReader::get`] | below |
-//! | Stream base vectors in order | [`VectorReader::get`] over a fetched window | `examples/stream_base_vectors.rs` |
+//! | Load or stream records in bulk, into your own buffer | [`VectorReader::read_into`] | `examples/stream_base_vectors.rs` |
 //! | Read ground truth | [`TestDataView::neighbor_indices`], [`TestDataView::neighbor_distances`] | — |
 //! | Read a metadata or scalar facet | [`open_facet_typed`] → [`TypedReader`] | below |
 //! | Read a record (slab) facet | [`TestDataView::open_facet_records`] | — |

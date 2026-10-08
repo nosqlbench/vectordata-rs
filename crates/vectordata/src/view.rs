@@ -505,6 +505,22 @@ impl<T: Send + Sync> VectorReader<T> for WindowedVectorReader<T> {
         }
         self.inner.get(self.start + index)
     }
+    fn get_slice(&self, index: usize) -> Option<&[T]> {
+        (index < self.len).then(|| self.inner.get_slice(self.start + index)).flatten()
+    }
+    fn read_into(&self, start: usize, out: &mut [T]) -> std::result::Result<usize, IoError>
+    where
+        T: Copy,
+    {
+        let n = crate::io::records_to_read(start, out.len(), self.dim(), self.len)?;
+        self.inner.read_into(self.start + start, &mut out[..n * self.dim()])
+    }
+    fn precache(&self) -> std::io::Result<()> {
+        self.inner.precache()
+    }
+    fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
 }
 
 /// Describes a single facet declared in a dataset profile.
@@ -2764,6 +2780,41 @@ impl<T: VvecElement> VectorReader<T> for ShardedXvecReader<T> {
     fn get_slice(&self, index: usize) -> Option<&[T]> {
         let (reader, at) = self.locate(index).ok()?;
         reader.get_slice(at)
+    }
+
+    /// One bulk read per shard the span touches.
+    fn read_into(&self, start: usize, out: &mut [T]) -> std::result::Result<usize, crate::io::IoError>
+    where
+        T: Copy,
+    {
+        let n = crate::io::records_to_read(start, out.len(), self.dim, self.count)?;
+        let mut done = 0;
+        while done < n {
+            let at = self
+                .series
+                .shards()
+                .locate((start + done) as u64)
+                .ok_or(crate::io::IoError::OutOfBounds(start + done))?;
+            let in_shard = (self.series.shards().entries()[at.shard].len - at.local) as usize;
+            let run = in_shard.min(n - done);
+            let file = self
+                .series
+                .file_index_of_shard(at.shard)
+                .map_err(|e| crate::io::IoError::InvalidFormat(e.to_string()))?;
+            let reader = self
+                .reader(file)
+                .map_err(|e| crate::io::IoError::InvalidFormat(e.to_string()))?;
+            let span = &mut out[done * self.dim..(done + run) * self.dim];
+            let got = crate::io::VectorReader::read_into(reader, at.file_ordinal as usize, span)?;
+            if got != run {
+                return Err(crate::io::IoError::InvalidFormat(format!(
+                    "shard {} holds {got} of the {run} records its declaration promises",
+                    at.shard
+                )));
+            }
+            done += run;
+        }
+        Ok(n)
     }
 
     fn precache(&self) -> std::io::Result<()> {

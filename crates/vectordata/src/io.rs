@@ -188,6 +188,36 @@ pub trait VectorReader<T>: Send + Sync {
         None
     }
 
+    /// Copy consecutive records `start, start + 1, …` into `out`,
+    /// contiguously — record `start + k` lands at
+    /// `out[k * dim .. (k + 1) * dim]` — and return how many were copied:
+    /// as many as fit, up to the end of the facet.
+    ///
+    /// **The bulk read.** One call per batch instead of one per record:
+    /// a single-file facet reads the whole span in one range request (or
+    /// one copy from its mapping, once fetched), and a series or a
+    /// windowed facet is split across files here rather than by the
+    /// caller. Use it to load a base set, or to stream one a window at a
+    /// time into a buffer you reuse.
+    ///
+    /// `out.len()` must be a multiple of [`dim`](Self::dim). `start ==
+    /// count()` copies nothing; past that is
+    /// [`IoError::OutOfBounds`].
+    fn read_into(&self, start: usize, out: &mut [T]) -> Result<usize, IoError>
+    where
+        T: Copy,
+    {
+        let dim = self.dim();
+        let n = records_to_read(start, out.len(), dim, self.count())?;
+        for (k, record) in out[..n * dim].chunks_exact_mut(dim).enumerate() {
+            match self.get_slice(start + k) {
+                Some(s) => record.copy_from_slice(s),
+                None => record.copy_from_slice(&self.get(start + k)?),
+            }
+        }
+        Ok(n)
+    }
+
     /// Low-level: download this reader's file whole into the local
     /// cache, so later reads are zero-copy. Most callers want
     /// [`TestDataView::fetch`](crate::TestDataView::fetch), which plans,
@@ -202,6 +232,53 @@ pub trait VectorReader<T>: Send + Sync {
     /// `false` for direct HTTP.
     fn is_complete(&self) -> bool {
         true
+    }
+}
+
+/// How many records a [`VectorReader::read_into`] call copies: as many
+/// whole records as `out_len` holds, up to the end of the facet.
+pub(crate) fn records_to_read(
+    start: usize,
+    out_len: usize,
+    dim: usize,
+    count: usize,
+) -> Result<usize, IoError> {
+    if dim == 0 {
+        return Ok(0);
+    }
+    if !out_len.is_multiple_of(dim) {
+        return Err(IoError::InvalidFormat(format!(
+            "read_into: buffer of {out_len} elements is not a whole number of {dim}-element records"
+        )));
+    }
+    if start > count {
+        return Err(IoError::OutOfBounds(start));
+    }
+    Ok((out_len / dim).min(count - start))
+}
+
+/// Copy `n` xvec records out of `bytes` — each a 4-byte dimension header
+/// followed by `dim` little-endian elements, `entry_size` bytes apart —
+/// into `out`, dropping the headers.
+fn copy_records<T: VvecElement>(bytes: &[u8], entry_size: usize, dim: usize, out: &mut [T]) {
+    let body = dim * T::ELEM_SIZE;
+    for (k, record) in out.chunks_exact_mut(dim).enumerate() {
+        let src = &bytes[k * entry_size + 4..k * entry_size + 4 + body];
+        #[cfg(target_endian = "little")]
+        {
+            debug_assert_eq!(core::mem::size_of::<T>(), T::ELEM_SIZE);
+            // SAFETY: `VvecElement` types are plain little-endian numbers
+            // whose in-memory form, on a little-endian host, is exactly
+            // their on-disk bytes; `record` holds `dim` of them, which is
+            // `body` bytes, and the regions cannot overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr(), record.as_mut_ptr() as *mut u8, body);
+            }
+        }
+        #[cfg(not(target_endian = "little"))]
+        for (dst, b) in record.iter_mut().zip(src.chunks_exact(T::ELEM_SIZE)) {
+            *dst = T::from_le_bytes(b);
+        }
     }
 }
 
@@ -627,6 +704,26 @@ impl<T: VvecElement> VectorReader<T> for XvecReader<T> {
             return None;
         }
         Some(unsafe { core::slice::from_raw_parts(ptr, self.dim) })
+    }
+
+    /// One range of the file for the whole span: a copy out of the
+    /// mapping once resident, else a single read.
+    fn read_into(&self, start: usize, out: &mut [T]) -> Result<usize, IoError>
+    where
+        T: Copy,
+    {
+        let n = records_to_read(start, out.len(), self.dim, self.count)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        let from = (start * self.entry_size) as u64;
+        let len = (n * self.entry_size) as u64;
+        let out = &mut out[..n * self.dim];
+        match self.storage.mmap_slice(from, len) {
+            Some(bytes) => copy_records(bytes, self.entry_size, self.dim, out),
+            None => copy_records(&self.storage.read_bytes(from, len)?, self.entry_size, self.dim, out),
+        }
+        Ok(n)
     }
 
     fn precache(&self) -> io::Result<()> {
