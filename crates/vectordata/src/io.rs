@@ -361,7 +361,7 @@ pub(crate) fn is_scalar_ext(ext: &str) -> bool {
 }
 
 /// Validate that a file's extension is compatible with `T`'s element width.
-fn validate_element_for_source(source: &str) -> Result<(), IoError> {
+pub(crate) fn validate_element_for_source(source: &str) -> Result<(), IoError> {
     let name = source.rsplit('/').next().unwrap_or(source);
     let ext = name.rsplit('.').next().unwrap_or("");
     let size = infer_elem_size(ext);
@@ -787,15 +787,9 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         })
     }
 
-    /// Open from a path or URL string. Auto-dispatches transport.
-    ///
-    /// Records vary in length, so random access needs an offset index:
-    /// a published `IDXFOR__` sidecar, one persisted from an earlier
-    /// open, or a walk of a complete local copy. A remote file with none
-    /// of those is refused with [`IoError::OffsetIndexUnavailable`]
-    /// rather than downloaded whole behind the call; fetch it first
-    /// ([`TestDataView::fetch`](crate::TestDataView::fetch)).
-    pub fn open(source: &str) -> Result<Self, IoError> {
+    /// Check that `source` names a variable-length file whose element
+    /// width is `T`'s, before any storage is opened.
+    pub(crate) fn validate_source(source: &str) -> Result<(), IoError> {
         let ext = ext_of(source);
         let elem_size = infer_elem_size(ext);
         if elem_size == 0 {
@@ -815,6 +809,20 @@ impl<T: VvecElement> IndexedVvecReader<T> {
                 "extension '.{ext}' is not a variable-length format; use XvecReader for uniform-stride files"
             )));
         }
+        Ok(())
+    }
+
+    /// Open from a path or URL string. Auto-dispatches transport.
+    ///
+    /// Records vary in length, so random access needs an offset index:
+    /// a published `IDXFOR__` sidecar, one persisted from an earlier
+    /// open, or a walk of a complete local copy. A remote file with none
+    /// of those is refused with [`IoError::OffsetIndexUnavailable`]
+    /// rather than downloaded whole behind the call; fetch it first
+    /// ([`TestDataView::fetch`](crate::TestDataView::fetch)).
+    pub fn open(source: &str) -> Result<Self, IoError> {
+        Self::validate_source(source)?;
+        let elem_size = T::ELEM_SIZE;
 
         // `s3://` URLs are remote and get dispatched through the
         // same HTTPS-based offset-fetch path as `http(s)://`. The

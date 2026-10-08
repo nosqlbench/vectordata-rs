@@ -440,3 +440,114 @@ fn read_into_matches_per_record_reads_over_http() {
     assert_eq!(base.read_into(500, &mut again).unwrap(), 300);
     assert_eq!(out, again);
 }
+
+// ─── One cache entry per facet ─────────────────────────────────────
+
+/// Write the catalog-served dataset the cross-process test uses.
+fn anchored_dataset(root: &Path) {
+    let ds = root.join("anchored");
+    std::fs::create_dir_all(&ds).unwrap();
+    write_fvec(&ds.join("base.fvec"), 2000, 8, 1.2e7);
+    write_mref(&ds.join("base.fvec"));
+    let mut results = Vec::new();
+    for i in 0..300i32 {
+        results.extend_from_slice(&1i32.to_le_bytes());
+        results.extend_from_slice(&(12_000_000 + i).to_le_bytes());
+    }
+    std::fs::write(ds.join("results.ivvec"), &results).unwrap();
+    write_mref(&ds.join("results.ivvec"));
+    let labels: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(ds.join("labels.u8"), &labels).unwrap();
+    write_mref(&ds.join("labels.u8"));
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: anchored\nprofiles:\n  default:\n    base_vectors: base.fvec\n    \
+         metadata_results: results.ivvec\n    metadata_content: labels.u8\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("catalog.json"),
+        r#"[{"name":"anchored","path":"anchored/dataset.yaml","dataset_type":"dataset.yaml","layout":{"profiles":{"default":{}}}}]"#,
+    )
+    .unwrap();
+}
+
+const CHILD_CATALOG: &str = "VECTORDATA_TEST_CHILD_CATALOG";
+const CHILD_CACHE: &str = "VECTORDATA_TEST_CHILD_CACHE";
+
+/// **A fetched facet is the facet its readers read — in the next
+/// process too.** `fetch` fills the dataset-anchored cache entry
+/// (`<cache>/<dataset>/<file>`). The readers used to open the resolved
+/// URL instead. Within one process that went unnoticed, because both
+/// opens share a registry keyed by URL; in the run after a `precache`,
+/// the URL open keyed a *second* entry by URL authority, downloaded
+/// every byte again, and served every read as a range request against
+/// it — while `is_complete()` and the chunk bitmap described the first.
+///
+/// So the fetch runs here and the reads run in a fresh process (this
+/// test binary, re-run as the child below), against the same cache.
+/// Each accessor shape is checked: uniform vectors, variable-length
+/// records, and typed scalars.
+#[test]
+fn readers_in_a_later_process_read_the_entry_fetch_filled() {
+    let tmp = make_tmp();
+    anchored_dataset(tmp.path());
+    let server = TestServer::start(tmp.path()).unwrap();
+    // The override is process-wide, so this test uses the cache every
+    // test in this file shares, and tells the child where it is.
+    init_test_cache();
+    let cache = TEST_CACHE_DIR.path();
+    let catalog = Catalog::of(&vectordata::catalog::CatalogSources::new().add_catalogs(&[server.base_url()]));
+    assert!(catalog.diagnostics().is_empty(), "{:?}", catalog.diagnostics());
+    catalog
+        .open_profile("anchored", "default")
+        .unwrap()
+        .fetch(&FetchRequest::all(), &mut Silent)
+        .unwrap();
+
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["read_the_fetched_facets_in_a_child", "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD_CATALOG, server.base_url())
+        .env(CHILD_CACHE, cache)
+        .output()
+        .expect("run the reading process");
+    assert!(
+        child.status.success(),
+        "the reading process failed:\n{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+
+    // No URL-keyed copy of this server's files beside the anchored one.
+    let listing = vectordata::cache_admin::list_entries(cache).unwrap();
+    let port = server.port().to_string();
+    let doubled: Vec<_> = listing
+        .url_derived
+        .iter()
+        .filter(|e| e.path.to_string_lossy().contains(&port))
+        .collect();
+    assert!(doubled.is_empty(), "a URL-keyed duplicate cache entry: {doubled:?}");
+}
+
+/// The reading half of the test above. Does nothing unless that test
+/// launched it.
+#[test]
+fn read_the_fetched_facets_in_a_child() {
+    let (Ok(catalog_url), Ok(cache)) = (std::env::var(CHILD_CATALOG), std::env::var(CHILD_CACHE)) else {
+        return;
+    };
+    vectordata::settings::override_cache_dir_for_process(cache.into());
+    let catalog = Catalog::of(&vectordata::catalog::CatalogSources::new().add_catalogs(&[catalog_url]));
+    let view = catalog.open_profile("anchored", "default").unwrap();
+
+    let base = view.base_vectors().unwrap();
+    assert!(base.is_complete(), "the vector reader sees the fetched bytes");
+    assert!(base.get_slice(1999).is_some(), "and borrows them from the mapping");
+    let results = view.metadata_results().unwrap();
+    assert!(results.is_complete(), "the variable-length reader sees them too");
+    assert_eq!(results.get(299).unwrap(), vec![12_000_299]);
+    let typed: vectordata::TypedReader<u8> =
+        vectordata::open_facet_typed(&*view, "metadata_content").unwrap();
+    assert!(typed.is_complete(), "and so does the typed reader");
+    assert_eq!(typed.get_native(300).unwrap(), (300 % 251) as u8);
+}

@@ -18,9 +18,7 @@ use crate::io::{self, VectorReader, VvecElement, VvecReader};
 use crate::model::{FacetConfig, ProfileConfig};
 use crate::{Error, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use url::Url;
 
 /// True for `http://` and `https://` schemes — the only schemes the
 /// crate handles as remote.
@@ -1199,20 +1197,41 @@ pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
         .facet_element_type(facet_name)
         .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
 
-    // A series has no single source to open; it reads through the shard
-    // model instead. Every shard shares the element type and scalar-ness
-    // (SRD invariant 4), so both come from the facet as a whole.
-    if let Some(source) = view.facet_source(facet_name) {
-        return crate::typed_access::TypedReader::<T>::open_auto(&source, native);
+    if T::width() < native.byte_width() {
+        return Err(crate::typed_access::TypedAccessError::Narrowing {
+            native,
+            target: T::type_name(),
+        });
     }
     if !view.facet_manifest().contains_key(facet_name) {
         return Err(crate::typed_access::TypedAccessError::Io(format!(
             "facet '{facet_name}' not declared by this view"
         )));
     }
+    // Built on the facet's own storage — the dataset-anchored open a
+    // fetch fills — never on its resolved URL, which would key a second
+    // cache entry and read past everything the fetch brought in.
     let storage = view
         .open_facet_storage(facet_name)
         .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
+    if let Some(source) = view.facet_source(facet_name) {
+        let is_scalar = crate::io::is_scalar_ext(
+            crate::dataset::source::parse_source_string(&source)
+                .map(|p| p.path)
+                .unwrap_or(source)
+                .rsplit('.')
+                .next()
+                .unwrap_or(""),
+        );
+        return crate::typed_access::TypedReader::<T>::from_storage(
+            storage.storage_handle(),
+            native,
+            is_scalar,
+        );
+    }
+    // A series has no single source; it reads through the shard model.
+    // Every shard shares the element type and scalar-ness (SRD
+    // invariant 4), so both come from the facet as a whole.
     let series = storage
         .series_ref()
         .ok_or_else(|| {
@@ -3014,45 +3033,6 @@ impl GenericTestDataView {
         self
     }
 
-    fn resolve_resource(&self, facet: &FacetConfig) -> Result<ResourceLocation> {
-        let source_str = single_source(facet, "resolve")?;
-        // Absolute URLs in the YAML override the dataset's base
-        // location — supports the case where a local dataset.yaml
-        // references remote facets, or a remote catalog references
-        // facets in a different bucket.
-        if is_absolute_url(source_str) {
-            return Ok(ResourceLocation::Http(Url::parse(source_str)?));
-        }
-        // Local-file short-circuit: `file://` URI or absolute path.
-        // Bypass the catalog's base-URL join — the catalog entry
-        // is naming a file that already exists locally, and the
-        // most efficient open is a direct mmap. Same semantic as a
-        // fully-precached remote facet.
-        if is_local_facet_source(source_str) {
-            return Ok(ResourceLocation::FileSystem(PathBuf::from(
-                file_uri_to_path(source_str),
-            )));
-        }
-        // Any other absolute URI scheme (e.g. `s3://`) — pass
-        // through verbatim. We can't open it (no transport here),
-        // but the storage layer will surface a precise error
-        // rather than the bogus double-prefixed path we'd get from
-        // joining it against the catalog's base URL.
-        if has_absolute_uri_scheme(source_str) {
-            return Ok(ResourceLocation::FileSystem(PathBuf::from(source_str)));
-        }
-        match &self.source {
-            DataSource::FileSystem(base_path) => {
-                let path = base_path.join(source_str);
-                Ok(ResourceLocation::FileSystem(path))
-            }
-            DataSource::Http(base_url) => {
-                let url = base_url.join(source_str)?;
-                Ok(ResourceLocation::Http(url))
-            }
-        }
-    }
-
     /// Open a uniform vector facet with the unified `open_vec` API.
     /// Handles local (mmap) and remote (HTTP) transparently.
     ///
@@ -3126,8 +3106,15 @@ impl GenericTestDataView {
                     )));
                 }
             };
-        let resolved = self.resolve_path_str(&path_str)?;
-        let reader = io::open_vec::<T>(&resolved)?;
+        // The reader is built on the facet's own storage — the one open
+        // that anchors the cache by dataset — so it reads the bytes a
+        // fetch brought in. Opening the resolved URL directly would key a
+        // second cache entry by URL: everything downloaded twice, and
+        // every read a range request against the empty one.
+        io::validate_element_for_source(&path_str)?;
+        let storage = self.open_facet_storage(name)?;
+        let reader: Box<dyn VectorReader<T>> =
+            Box::new(io::XvecReader::<T>::from_storage(storage.storage_handle())?);
 
         let window = window_from_suffix.or_else(|| facet.window().and_then(parse_window_first));
         if let Some((start, end)) = window {
@@ -3185,9 +3172,17 @@ impl GenericTestDataView {
                 T::ELEM_SIZE,
             )?));
         }
+        // On the facet's own storage, as `open_uniform` is, so the cache
+        // is the one a fetch filled. The source still names where the
+        // offset index's sidecar lives.
         let path_or_url = self.resolve_as_string(facet)?;
-        let reader = io::open_vvec::<T>(&path_or_url)?;
-        Ok(Arc::from(reader))
+        io::IndexedVvecReader::<T>::validate_source(&path_or_url)?;
+        let storage = self.open_facet_storage(name)?;
+        Ok(Arc::new(io::IndexedVvecReader::<T>::from_storage(
+            storage.storage_handle(),
+            &path_or_url,
+            T::ELEM_SIZE,
+        )?))
     }
 
     /// Resolve a facet to a path string (local) or URL string (remote).
@@ -3392,39 +3387,13 @@ impl GenericTestDataView {
     > {
         self.require_facet_shape(name, crate::dataset::facet::FacetShape::Elements)
             .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
-        let facet = self.facet_config_by_name(name).ok_or_else(|| {
-            crate::typed_access::TypedAccessError::Io(format!("facet '{}' not found", name))
-        })?;
-        // A series has no single resource to resolve. The free
-        // `open_facet_typed` reads one through the shard model, and
-        // routing there is what keeps the two entry points answering
-        // the same question the same way — a method that errored where
-        // the function succeeded would be a bypass in the direction
-        // nobody wants (SH-79).
-        if facet.is_series() {
-            return open_facet_typed::<T>(self, name);
-        }
-        let resource = self
-            .resolve_resource(facet)
-            .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
-        match resource {
-            ResourceLocation::FileSystem(path) => {
-                crate::typed_access::TypedReader::<T>::open(&path)
-            }
-            ResourceLocation::Http(url) => {
-                let native_type = crate::typed_access::ElementType::from_url(&url)
-                    .map_err(crate::typed_access::TypedAccessError::Io)?;
-                crate::typed_access::TypedReader::<T>::open_url(url, native_type)
-            }
-        }
+        // One implementation for both entry points, so they cannot
+        // disagree about whether a facet is readable (SH-79) or about
+        // which cache entry it reads.
+        open_facet_typed::<T>(self, name)
     }
 }
 
-#[allow(dead_code)]
-enum ResourceLocation {
-    FileSystem(PathBuf),
-    Http(Url),
-}
 
 /// Cache-relative path for a facet inside its dataset's cache
 /// directory (`<cache_root>/<dataset>/<relpath>`): the home-relative
@@ -3799,6 +3768,8 @@ impl GenericTestDataView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use url::Url;
 
     #[test]
     fn facet_cache_relpath_keeps_the_home_relative_path() {
@@ -3851,7 +3822,7 @@ mod tests {
 
     /// When a remote-loaded `TestDataGroup` has a facet whose source
     /// is a `file://` URI (a fully-precached local file), the resolver
-    /// must yield a `ResourceLocation::FileSystem` — not try to join
+    /// must yield the filesystem path — not try to join
     /// the URI onto the catalog's HTTP base. Symmetric for an
     /// absolute filesystem path. Same semantic as "remote facet that
     /// already lives on disk".
@@ -3895,20 +3866,10 @@ mod tests {
 
         let bv = view.config.base_vectors.as_ref().unwrap();
         let q = view.config.query_vectors.as_ref().unwrap();
-        match view.resolve_resource(bv).unwrap() {
-            ResourceLocation::FileSystem(p) => {
-                assert_eq!(p, PathBuf::from("/tank/share/base.fvec"))
-            }
-            ResourceLocation::Http(u) => panic!("expected FileSystem, got Http({u})"),
-        }
-        match view.resolve_resource(q).unwrap() {
-            ResourceLocation::FileSystem(p) => {
-                assert_eq!(p, PathBuf::from("/tank/share/query.fvec"))
-            }
-            ResourceLocation::Http(u) => panic!("expected FileSystem, got Http({u})"),
-        }
-
-        // resolve_as_string short-circuits the same way (no `https://.../tank/...` join).
+        // The storage open resolves the same way (no `https://.../tank/...` join).
+        assert_eq!(view.resolve_path_str("file:///tank/share/base.fvec").unwrap(), "/tank/share/base.fvec");
+        assert_eq!(view.resolve_path_str("/tank/share/query.fvec").unwrap(), "/tank/share/query.fvec");
+        // And so does the variable-length readers' resolution.
         assert_eq!(view.resolve_as_string(bv).unwrap(), "/tank/share/base.fvec");
         assert_eq!(view.resolve_as_string(q).unwrap(), "/tank/share/query.fvec");
     }
