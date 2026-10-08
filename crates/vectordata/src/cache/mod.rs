@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cache-backed file channel with merkle verification.
+//! Internal. Cache-backed file channel with merkle verification.
 //!
 //! `CachedChannel` transparently downloads, verifies, and caches data from a
 //! remote source using merkle tree integrity checking. Reads check local state

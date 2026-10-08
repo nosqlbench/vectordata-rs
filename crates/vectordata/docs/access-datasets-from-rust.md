@@ -124,56 +124,71 @@ for profile in group.profile_names() {
 }
 ```
 
-## 6. Prebuffer for offline / zero-copy access
+## 6. Fetch for offline / zero-copy access
 
-Remote facets are downloaded on demand by the merkle-cache layer.
-Call `prebuffer_all` to drive every facet to fully-resident state
-up front; subsequent reads come from a memory-mapped local cache
-file with no per-read overhead.
+Remote facets are downloaded on demand, a chunk at a time, as reads
+touch them. For a scan, fetch first: `fetch` plans every facet, skips
+what is already resident, checks the cache has room, downloads in
+parallel, and reports progress. Afterwards reads come from a
+memory-mapped local cache file with no per-read overhead.
 
 ```rust
-view.prebuffer_all()?;
-// every facet is now mmap-backed and zero-copy
+use vectordata::fetch::{FetchRequest, Silent, TextMeter};
+
+// Everything the profile declares, quietly:
+view.fetch(&FetchRequest::all(), &mut Silent)?;
+
+// Or chosen facets, with the progress meter the CLI draws:
+view.fetch(
+    &FetchRequest::facets(["base_vectors", "query_vectors"]),
+    &mut TextMeter::stderr("Fetch"),
+)?;
 ```
 
-With per-facet progress:
+To see the cost before anything moves, plan first:
 
 ```rust
-view.prebuffer_all_with_progress(&mut |facet, p| {
-    let pct = if p.total_chunks > 0 {
-        100.0 * p.verified_chunks as f64 / p.total_chunks as f64
-    } else { 0.0 };
-    eprintln!("  {facet}: {:.0}% ({}/{} chunks, {:.1} MiB)",
-        pct, p.verified_chunks, p.total_chunks,
-        p.total_bytes as f64 / 1_048_576.0);
+let plan = view.plan_fetch(&FetchRequest::all(), &mut Silent)?;
+println!("{} bytes to fetch", plan.bytes_to_fetch());
+let report = plan.execute(&mut TextMeter::stderr("Fetch"))?;
+```
+
+For your own progress display, pass a closure:
+
+```rust
+use vectordata::fetch::FetchEvent;
+
+view.fetch(&FetchRequest::all(), &mut |e: &FetchEvent<'_>| {
+    if let FetchEvent::Progress { facet, bytes, total, .. } = e {
+        eprintln!("  {facet}: {bytes}/{total} bytes");
+    }
 })?;
 ```
 
-For a single facet:
+Per-facet cache state, without fetching:
 
 ```rust
 use vectordata::CacheStats;
 
 let storage = view.open_facet_storage("base_vectors")?;
-storage.prebuffer()?;
-assert!(storage.is_complete());
-
-if let Some(cs): Option<CacheStats> = storage.cache_stats() {
+if let Some(cs) = storage.cache_stats() {
     println!("{}/{} chunks ({} bytes)",
         cs.valid_chunks, cs.total_chunks, cs.content_size);
 }
 
-// After prebuffer, cache_path() returns the local cache file —
-// useful for tools that need a Path to mmap, hash, or copy.
-if let Some(path) = storage.cache_path() {
-    println!("cached at: {}", path.display());
-}
 ```
 
-`cache_stats()` and `cache_path()` both return `None` for purely
-local datasets and for direct-HTTP (no `.mref` published) — there
-is no cache file to report. `is_local()` is true for local datasets
-from the start and for cached-remote once promoted.
+`cache_stats()` returns `None` for purely local datasets — there is no
+cache to report on. `is_local()` is true for local datasets from the
+start and for cached-remote once promoted.
+
+Read the data through the facet readers (`base_vectors()`, `facet()`,
+`open_facet_typed`), never by opening cache files yourself: a cache
+file is pre-sized and sparse until complete, which chunks are valid is
+recorded separately, and a sharded facet spans several files. The
+readers handle all of that and are zero-copy once the facet is fetched
+(`VectorReader::get_slice`). `FacetStorage::cache_path()` exists for
+diagnostics — showing where a facet is cached — not for access.
 
 ## 6a. Mixing local and remote in one dataset
 
@@ -202,9 +217,9 @@ let base = view.base_vectors()?;
 // read, promotes to mmap once complete)
 let query = view.query_vectors()?;
 
-// prebuffer_all is per-facet aware: local facets no-op, remote
-// facets download.
-view.prebuffer_all()?;
+// fetch is per-facet aware: local facets cost nothing, remote facets
+// download.
+view.fetch(&vectordata::fetch::FetchRequest::all(), &mut vectordata::fetch::Silent)?;
 ```
 
 The same logic applies in reverse — a remote `dataset.yaml` can
@@ -215,7 +230,7 @@ no special-casing.
 ## 7. Read in parallel
 
 All readers are `Send + Sync` and the inner `Arc<Storage>` is
-shared across clones, so a single `prebuffer_all` makes every
+shared across clones, so a single `fetch` makes every
 reader on every thread zero-copy:
 
 ```rust

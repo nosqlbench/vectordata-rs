@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `<binary> datasets list` — list datasets from configured or specified catalogs.
+//! CLI support. `<binary> datasets list` — list datasets from configured or specified catalogs.
 //!
 //! Uses the full catalog resolution chain:
 //! 1. If `--at` is specified, use those locations directly (overrides everything).
@@ -13,6 +13,7 @@
 use super::build_sources;
 use super::filter;
 use super::filter::{DatasetFilter, ProfileView};
+#[cfg(test)]
 use crate::catalog::resolver::Catalog;
 use crate::dataset::CatalogEntry;
 use crate::dataset::selector::DatasetSpec;
@@ -225,6 +226,17 @@ struct DatasetProfileSummary {
     family: Option<serde_json::Value>,
 }
 
+/// Run `datasets list`: load the catalogs, apply `filter`, and print
+/// the matching entries limited to the profiles `profile_view` admits.
+///
+/// Catalogs come from `at` alone when given, else from the
+/// configuration in `configdir` plus `extra_catalogs`. `format` is
+/// `json`, `yaml` or `csv`; anything else prints the text table,
+/// grouped by `group_by` when set. With `select`, prints the single
+/// matching `dataset:profile` instead, exiting the process with 1 when
+/// the match is not unique. Returns the exit code: 1 when no source is
+/// configured, or when nothing is found and the user named a source,
+/// gave filters, or asked to select; otherwise 0.
 pub fn run(
     configdir: &str,
     extra_catalogs: &[String],
@@ -248,7 +260,7 @@ pub fn run(
         return 1;
     }
 
-    let catalog = Catalog::of(&sources);
+    let catalog = super::open_catalog(&sources);
 
     if catalog.is_empty() {
         eprintln!("error: no datasets found in any configured catalog");

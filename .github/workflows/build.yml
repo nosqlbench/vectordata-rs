@@ -261,9 +261,11 @@ jobs:
             --features knnutils --lib engine_parity
 
       # ─── Documentation as docs.rs builds it: default features, no
-      # dependencies, every rustdoc warning (a broken or private intra-
-      # doc link) an error, plus the doc examples. Once is enough — the
-      # docs do not vary by target.
+      # dependencies, every rustdoc warning an error — a broken or
+      # private intra-doc link, and, since every published crate carries
+      # `#![warn(missing_docs)]`, an undocumented public item — plus the
+      # doc examples and the `examples/` programs the crate docs point
+      # at. Once is enough — the docs do not vary by target.
       - name: Docs (docs.rs build, warnings denied)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         shell: bash
@@ -278,6 +280,7 @@ jobs:
           args="--workspace --exclude vectordata-rs --exclude tools --exclude veks-studies"
           cargo doc --no-deps --target ${{ matrix.target }} $args
           cargo test --doc --release --target ${{ matrix.target }} $args
+          cargo build --examples --release --target ${{ matrix.target }} $args
 
       # ─── Smoke-test: each built binary actually starts and prints
       # its version. Catches LD_LIBRARY_PATH / shared-lib regressions

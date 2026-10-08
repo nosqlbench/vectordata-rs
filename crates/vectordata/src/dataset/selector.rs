@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Profile selectors: the language after the colon in a dataset spec.
+//! Library API. Profile selectors: the language after the colon in a dataset spec.
 //!
 //! `dataset:10m` names one profile, as it always has. `dataset:size=10m,
 //! predicates=uniform*` names the *set* of profiles whose attributes
@@ -47,11 +47,17 @@ struct Atom {
 /// A comparison operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
+    /// `=`, also implied by a bare value with no key.
     Eq,
+    /// `!=`.
     Ne,
+    /// `<`; numeric only.
     Lt,
+    /// `<=`; numeric only.
     Le,
+    /// `>`; numeric only.
     Gt,
+    /// `>=`; numeric only.
     Ge,
 }
 
@@ -78,6 +84,7 @@ enum Value {
 pub struct SelectorError {
     /// Byte offset into the selector text.
     pub position: usize,
+    /// What was wrong at that position.
     pub message: String,
 }
 
@@ -96,11 +103,18 @@ impl std::error::Error for SelectorError {}
 /// never inherited (PS-19), so the map is the profile's own.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProfileFacts {
+    /// Profile name, matched by the `profile` key and by bare atoms.
     pub name: String,
+    /// Number of base vectors, after inheritance; `None` when undeclared.
     pub base_count: Option<u64>,
+    /// Maximum `k` for KNN queries, after inheritance; `None` when
+    /// undeclared.
     pub maxk: Option<u32>,
+    /// Whether this is a partition profile.
     pub partition: bool,
+    /// Name of the profile it inherits from, if declared.
     pub inherits: Option<String>,
+    /// The profile's own declared `attributes:`, never inherited.
     pub attributes: Vec<(String, Yaml)>,
 }
 
@@ -226,17 +240,24 @@ pub enum SelectionError {
     /// No profile matches. Carries what was on offer, with everything a
     /// selector can read of each, so the message says why.
     NoMatch {
+        /// The selector text as given.
         selector: String,
+        /// Every profile that was considered.
         profiles: Vec<ProfileFacts>,
     },
     /// A single-profile surface was given a selector matching more than
     /// one profile.
     Ambiguous {
+        /// The selector text as given.
         selector: String,
+        /// Names of the matching profiles.
         matches: Vec<String>,
     },
     /// No selector was given and the dataset has no `default` profile.
-    NoDefault { profiles: Vec<String> },
+    NoDefault {
+        /// Names of the profiles the dataset does have.
+        profiles: Vec<String>,
+    },
 }
 
 impl fmt::Display for SelectionError {

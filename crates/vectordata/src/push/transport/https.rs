@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Generic `https://` / `http://` push transport — REST object
+//! Library API. Generic `https://` / `http://` push transport — REST object
 //! semantics: `PUT <base>/<rel>` to create/overwrite, `HEAD` for
 //! existence/size/etag, `GET` for small artifacts, conditional `PUT`
 //! via `If-Match` / `If-None-Match`.
@@ -21,7 +21,7 @@
 //! artifacts (`SHA256SUMS`, `.publish_url`, the conditional `pushlog`) stay
 //! plain `PUT` via [`HttpsTransport::put_bytes`].
 
-use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -51,6 +51,9 @@ pub struct HttpsTransport {
     /// saturate aggregate bandwidth across many connections even when each
     /// connection is individually rate-limited. 1 = sequential.
     concurrency: usize,
+    /// Draw the live per-file upload display on stderr. Off unless the
+    /// caller asked for terminal progress.
+    live: bool,
 }
 
 impl HttpsTransport {
@@ -62,7 +65,15 @@ impl HttpsTransport {
             token,
             vecd: OnceLock::new(),
             concurrency: (concurrency as usize).max(1),
+            live: false,
         }
+    }
+
+    /// Draw the live upload display on stderr while files upload — for a
+    /// caller reporting on a terminal.
+    pub fn drawing_progress(mut self, live: bool) -> Self {
+        self.live = live;
+        self
     }
 
     fn url(&self, rel: &str) -> String {
@@ -303,7 +314,7 @@ impl HttpsTransport {
         // readout of which file fractions the server has acknowledged — lit
         // pips track the (possibly disjoint) acked chunk offsets. Off when
         // stderr isn't a TTY, so logs and tests stay clean.
-        let live = std::io::stderr().is_terminal();
+        let live = self.live;
         let stop = AtomicBool::new(false);
         let result = std::thread::scope(|scope| {
             if live {

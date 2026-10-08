@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stated parents (PL-6).
+//! Library API. Stated parents (PL-6).
 //!
 //! From `format_version` 3 every profile other than `default` states
 //! `inherits:`, and a stated 3 is a claim that every parent is real
@@ -19,8 +19,11 @@ use crate::model::FORMAT_VERSION_TAGGED;
 /// What the rule reads of a profile.
 #[derive(Debug, Clone)]
 pub struct ParentFacts<'a> {
+    /// Profile name.
     pub name: &'a str,
+    /// Whether the profile declares `partition: true`.
     pub partition: bool,
+    /// The declared `inherits:` parent, or `None` when not stated.
     pub inherits: Option<&'a str>,
 }
 

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Byte-level storage abstraction. **Crate-private.**
+//! Internal. Byte-level storage abstraction. **Crate-private.**
 //!
 //! `Storage` hides the transport choice (local mmap, direct HTTP RANGE,
 //! merkle-cached HTTP-with-mmap-promotion) behind a single byte-oriented

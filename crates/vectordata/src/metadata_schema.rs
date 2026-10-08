@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Schema descriptors for slab files (the `:schema` namespace).
+//! Library API. Schema descriptors for slab files (the `:schema` namespace).
 //!
 //! Every typed slab produced by the toolchain carries a single-
 //! record sidecar in a dedicated `schema` namespace describing
@@ -11,10 +11,10 @@
 //!
 //! Two descriptor flavors share the namespace:
 //!
-//! - **[`MetadataSchema`](crate::metadata_schema::MetadataSchema)** (`kind: "metadata"`) — emitted by
+//! - **[`MetadataSchema`]** (`kind: "metadata"`) — emitted by
 //!   `convert` for metadata slabs (MNode content). Lists field
 //!   names, types, and nullability.
-//! - **[`PredicateSchema`](crate::metadata_schema::PredicateSchema)** (`kind: "predicate"`) — emitted by
+//! - **[`PredicateSchema`]** (`kind: "predicate"`) — emitted by
 //!   `generate predicates` for predicate slabs (PNode content).
 //!   Records the template in PNode `Display` vernacular plus the
 //!   generation parameters that produced the records.

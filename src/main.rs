@@ -231,6 +231,42 @@ mod packaging_tests {
         }
     }
 
+    /// **`vectordata` ships its agent guide** (SRD DX-22, DX-29).
+    ///
+    /// `AGENTS.md` is read from the registry copy of the crate, so it has
+    /// to be in the published package, not only in the repository; the
+    /// examples it and the crate docs point at have to be there too.
+    /// That its links resolve is checked by rustdoc, which renders it as
+    /// `vectordata::_agents`. Any other crate that grows an `AGENTS.md`
+    /// must ship it the same way.
+    #[test]
+    fn agent_guides_are_in_the_published_packages() {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates = std::fs::read_dir(root.join("crates")).expect("crates/");
+        let mut checked = Vec::new();
+        for dir in crates.flatten().map(|e| e.path()).filter(|p| p.join("AGENTS.md").is_file()) {
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            let out = std::process::Command::new(&cargo)
+                .current_dir(root)
+                .args(["package", "--list", "--allow-dirty", "--offline", "-p", &name])
+                .output()
+                .expect("run cargo package --list");
+            assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+            let files = String::from_utf8_lossy(&out.stdout);
+            let listed: Vec<&str> = files.lines().collect();
+            assert!(listed.contains(&"AGENTS.md"), "{name} does not package its AGENTS.md");
+            if dir.join("examples").is_dir() {
+                assert!(
+                    listed.iter().any(|f| f.starts_with("examples/")),
+                    "{name} does not package its examples"
+                );
+            }
+            checked.push(name);
+        }
+        assert!(checked.contains(&"vectordata".to_string()), "vectordata must have an AGENTS.md");
+    }
+
     /// **The default build compiles no native SIMD or BLAS code (SRD SK-1).**
     ///
     /// Every such dependency is optional in every manifest that names

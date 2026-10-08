@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unified file and directory filtering rules for the whole toolchain.
+//! Library API. Unified file and directory filtering rules for the whole toolchain.
 //!
 //! All decisions about which files/directories to include or exclude —
 //! for publishing/pushing, merkle coverage, catalog generation, workspace

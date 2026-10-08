@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `.publish_url` binding — the contract that ties a local dataset
+//! Library API. `.publish_url` binding — the contract that ties a local dataset
 //! directory to the remote endpoint it belongs to.
 //!
 //! This is the canonical implementation for the workspace. `veks`

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Chunked byte-range transport for downloading data with retry and progress.
+//! Internal. Chunked byte-range transport for downloading data with retry and progress.
 //!
 //! This module abstracts the mechanics of fetching byte ranges from local or
 //! remote sources, with retry logic, connection pooling, and parallel download

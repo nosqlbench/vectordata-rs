@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Non-blocking update-availability notice, backed by the GitHub
+//! CLI support. Non-blocking update-availability notice, backed by the GitHub
 //! Releases page.
 //!
 //! Design constraints (the etiquette every CLI update check owes its

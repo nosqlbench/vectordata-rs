@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dynamic tab-completion resolvers for the `datasets` command family.
+//! CLI support. Dynamic tab-completion resolvers for the `datasets` command family.
 //!
 //! This is the canonical home of the dataset-domain completers —
 //! catalog dataset names, profile names, `name[:profile]` specs, and

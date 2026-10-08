@@ -2,6 +2,12 @@
 
 **Status:** proposal, not implemented. Nothing in this document is built.
 
+> **Note (2026-10-06).** The `prebuffer_all*`, `prefetch` and
+> `prefetch_with_progress` entry points named below are now deprecated
+> wrappers over `TestDataView::fetch` (`vectordata::fetch`); see
+> `srd-api-discoverability.md`. The factoring described here is
+> unchanged.
+
 ## What is true today
 
 The byte-range plumbing already exists and is already exercised:

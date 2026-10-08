@@ -1,7 +1,7 @@
-//! Legacy data model types for `dataset.yaml` parsing.
+//! Library API. Legacy data model types for `dataset.yaml` parsing.
 //!
 //! This module contains the original `DatasetConfig`, `ProfileConfig`, and
-//! `FacetConfig` types used by [`TestDataGroup`].
+//! `FacetConfig` types used by [`TestDataGroup`](crate::TestDataGroup).
 //! The newer, richer configuration model lives in [`crate::dataset::config`] and
 //! [`crate::dataset::profile`].
 //!

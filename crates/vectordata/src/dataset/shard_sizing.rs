@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Choosing how many records go in a shard.
+//! Library API. Choosing how many records go in a shard.
 //!
 //! A facet that would be written as one enormous file is split into a
 //! series instead, capped at a maximum file size. The cap exists

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `<binary> datasets curlify` — generate curl download scripts for a dataset.
+//! CLI support. `<binary> datasets curlify` — generate curl download scripts for a dataset.
 
 use std::path::Path;
 // `PathBuf` only appears in the `cli`-gated `CurlifyArgs` fields.
@@ -27,6 +27,15 @@ pub fn run_args(args: CurlifyArgs) -> i32 {
     run(&args.path, args.output.as_deref())
 }
 
+/// Write `download-<name>.sh` beside the `dataset.yaml` at `path` (a
+/// file, or a directory holding one): one resumable `curl -L -C -`
+/// per view of the `default` profile (else the first profile) whose
+/// source is a URL or resolves against `upstream.base_url`, saving
+/// into `output` (default: the dataset directory).
+///
+/// Returns the exit code: 1 when the file is missing or unreadable or
+/// the script cannot be written; 0 otherwise, including when there is
+/// nothing downloadable and no script is written.
 pub fn run(path: &Path, output: Option<&Path>) -> i32 {
     let yaml_path = if path.is_file() {
         path.to_path_buf()

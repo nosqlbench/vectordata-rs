@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Ordinal-addressed record facets, and the codecs that type them.
+//! Library API. Ordinal-addressed record facets, and the codecs that type them.
 //!
 //! A metadata or predicate facet is a **slab**: a container of
 //! variable-length records addressed by ordinal, with named sibling
@@ -522,16 +522,6 @@ impl RecordFacet {
         Err(RecordError::OutOfBounds(o))
     }
 
-    /// One record's bytes.
-    ///
-    /// Borrowed when the source is mapped — a local file, or a remote
-    /// one already resident — and owned when the page had to be
-    /// fetched. The same borrow-where-mapped rule the vector readers
-    /// follow, and the reason reading one record from a remote facet
-    /// costs one page rather than one file.
-    ///
-    /// The escape hatch beneath every codec: a caller that wants to
-    /// decode a record some other way is not obliged to go through one.
     /// Measure this facet's record lengths, for sizing a shard.
     ///
     /// A slab's records carry their own extents, so there is no record
@@ -553,6 +543,19 @@ impl RecordFacet {
         })
     }
 
+    /// One record's bytes.
+    ///
+    /// Borrowed when the source is mapped — a local file, or a remote
+    /// one already resident — and owned when the page had to be
+    /// fetched. The same borrow-where-mapped rule the vector readers
+    /// follow, and the reason reading one record from a remote facet
+    /// costs one page rather than one file.
+    ///
+    /// The escape hatch beneath every codec: a caller that wants to
+    /// decode a record some other way is not obliged to go through one.
+    ///
+    /// Reads from whichever shard holds `ordinal`; past the last record
+    /// it errors with [`RecordError::OutOfBounds`].
     pub fn record_bytes(&self, ordinal: u64) -> Result<std::borrow::Cow<'_, [u8]>> {
         let (container, local) = self.locate(ordinal)?;
         container.record(local)

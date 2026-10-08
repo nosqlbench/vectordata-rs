@@ -581,7 +581,7 @@ fn build_to_url_resolves_namespace_shorthands() {
         "general".to_string(),
         "experiments/glove".to_string(),
     ];
-    let b = |to: &str| super::build_to_url("http://h:8443", "toy", to, &nss);
+    let b = |to: &str| super::cli::build_to_url("http://h:8443", "toy", to, &nss);
 
     // `root` / `/` → the root namespace (no namespace segment).
     assert_eq!(b("root").unwrap(), "http://h:8443/toy/");
@@ -605,7 +605,7 @@ fn build_to_url_unique_last_segment_resolves() {
     let nss = vec!["datasets/glove".to_string(), "general".to_string()];
     // `glove` matches only datasets/glove → resolves to its full path.
     assert_eq!(
-        super::build_to_url("http://h:8443/", "toy", "glove", &nss).unwrap(),
+        super::cli::build_to_url("http://h:8443/", "toy", "glove", &nss).unwrap(),
         "http://h:8443/datasets/glove/toy/"
     );
 }
@@ -777,7 +777,7 @@ fn transport_conditional_put_enforces_if_match() {
     use super::transport::{open, PushError, TransportOptions};
     let dir = unique("cas");
     let binding = binding::parse_publish_url(&file_url(&dir)).unwrap();
-    let tx = open(&binding, &TransportOptions::default(), 1).unwrap();
+    let tx = open(&binding, &TransportOptions::default(), 1, false).unwrap();
 
     // must-not-exist precondition: succeeds while absent…
     tx.put_bytes("log", b"v1", Some("")).unwrap();

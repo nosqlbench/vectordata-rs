@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-endpoint client credentials and bearer-token resolution.
+//! Library API. Per-endpoint client credentials and bearer-token resolution.
 //!
 //! `vectordata login <url>` stores a bearer token bound to the request's
 //! **origin** (`scheme://host[:port]`) in
@@ -68,9 +68,15 @@ pub enum Expiry {
     /// No expiry was recorded (or it didn't parse).
     Unknown,
     /// Still valid, with this many seconds left.
-    Active { secs_left: i64 },
+    Active {
+        /// Seconds until expiry; always positive.
+        secs_left: i64,
+    },
     /// Already lapsed, this many seconds ago.
-    Expired { secs_ago: i64 },
+    Expired {
+        /// Seconds since expiry; zero or more.
+        secs_ago: i64,
+    },
 }
 
 impl Entry {
@@ -114,6 +120,8 @@ impl Store {
         Ok(())
     }
 
+    /// The entry stored under exactly this key (a [`credential_key`]),
+    /// without prefix matching; see [`Store::token_for_url`] for that.
     pub fn get(&self, origin: &str) -> Option<&Entry> {
         self.entries.get(origin)
     }
@@ -133,6 +141,9 @@ impl Store {
             .map(|(_, e)| e)
     }
 
+    /// Store `entry` under the key `origin` (a [`credential_key`]),
+    /// replacing any existing entry. In memory only; call
+    /// [`Store::save`] to persist.
     pub fn set(&mut self, origin: String, entry: Entry) {
         self.entries.insert(origin, entry);
     }
@@ -385,6 +396,7 @@ fn resolve_endpoint_spec_in(
 /// source carried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedToken {
+    /// The literal bearer token.
     pub token: String,
     /// The user the token is for, if the source named it (a JSON token record).
     pub user: Option<String>,
@@ -478,33 +490,33 @@ fn epoch_str(v: &serde_json::Value) -> Option<String> {
 /// Credentials within this window of expiry get a heads-up warning.
 const EXPIRY_WARN_SECS: i64 = 7 * 24 * 3600;
 
-/// Print a stderr warning if the stored credential for `url`'s origin is past
-/// expiry, or within `EXPIRY_WARN_SECS` of it — so a lapsing token surfaces
-/// as a clear "go re-login" rather than an opaque 401 later. No-op when there
-/// is no stored credential or it carries no expiry. Call it from commands that
-/// rely on a stored credential.
-pub fn warn_if_expiring(url: &str) {
-    warn_if_expiring_in(url, now_secs(), &Store::load());
+/// A warning to show when the stored credential for `url`'s origin is past
+/// expiry, or within a week of it — so a lapsing token surfaces as a clear
+/// "go re-login" rather than an opaque 401 later. `None` when there is no
+/// stored credential, it carries no expiry, or it is not close to expiring.
+/// The commands that rely on a stored credential print it.
+pub fn expiry_warning(url: &str) -> Option<String> {
+    expiry_warning_in(url, now_secs(), &Store::load())
 }
 
-/// Testable core of [`warn_if_expiring`] (time + store injected).
-fn warn_if_expiring_in(url: &str, now: i64, store: &Store) {
-    let Some(origin) = origin_of_str(url) else { return };
-    let Some(entry) = store.get(&origin) else { return };
+/// Testable core of [`expiry_warning`] (time + store injected).
+fn expiry_warning_in(url: &str, now: i64, store: &Store) -> Option<String> {
+    let origin = origin_of_str(url)?;
+    let entry = store.get(&origin)?;
     match entry.expiry_status(now) {
-        Expiry::Expired { .. } => eprintln!(
+        Expiry::Expired { .. } => Some(format!(
             "warning: your stored credential for {origin} has expired — \
              run `vectordata login {url}` to refresh it."
-        ),
+        )),
         Expiry::Active { secs_left } if secs_left <= EXPIRY_WARN_SECS => {
             // Round up to whole days (secs_left > 0 in the Active arm).
             let days = (secs_left + 24 * 3600 - 1) / (24 * 3600);
-            eprintln!(
+            Some(format!(
                 "warning: your stored credential for {origin} expires in ~{days} day(s) — \
                  run `vectordata login {url}` to refresh it."
-            );
+            ))
         }
-        _ => {}
+        _ => None,
     }
 }
 

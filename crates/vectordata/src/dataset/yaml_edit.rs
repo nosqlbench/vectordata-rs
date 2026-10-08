@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Textual edits of an author's `dataset.yaml`.
+//! Library API. Textual edits of an author's `dataset.yaml`.
 //!
 //! Tags, a tag schema, and a format version are written into the file
 //! line by line, preserving every comment and every other line: a

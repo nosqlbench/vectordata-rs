@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! CLI shell for the `vectordata` command — cache admin, datasets
+//! CLI support. CLI shell for the `vectordata` command — cache admin, datasets
 //! browsing, config, and the `explore` TUI.
 //!
 //! Lives in the library (gated on the `cli` feature) so both binaries
@@ -1008,6 +1008,9 @@ fn cmd_cache_prune(cache_dir: Option<PathBuf>, dataset: Option<String>, dry_run:
         }
     };
 
+    for (entry, why) in &report.failed {
+        eprintln!("warning: failed to remove {}: {why}", entry.path.display());
+    }
     if report.matched.is_empty() {
         println!("No cache entries match the filter.");
         return;
@@ -1221,6 +1224,48 @@ fn fmt_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every command path the binary accepts, to depth two (`datasets
+    /// precache`, `cache prune`, `token issue`) — the granularity the
+    /// CLI ↔ library map in `AGENTS.md` is kept at.
+    fn command_paths() -> Vec<String> {
+        let root = <Cli as VeksCli>::veks_command_spec("vectordata");
+        let mut out = Vec::new();
+        for top in &root.subcommands {
+            if top.subcommands.is_empty() {
+                out.push(top.name.clone());
+            }
+            for sub in &top.subcommands {
+                out.push(format!("{} {}", top.name, sub.name));
+            }
+        }
+        out
+    }
+
+
+    /// **Every command names the library call it runs** (SRD DX-28).
+    ///
+    /// The CLI ↔ library table in `AGENTS.md` is how a program finds
+    /// the call behind a command it has watched work, which is the
+    /// miss the SRD opens with. A command added without a row fails
+    /// here, and a row naming a command that no longer exists does too.
+    /// (The links in each row are checked by rustdoc: the file renders
+    /// as `crate::_agents`.)
+    #[test]
+    fn every_command_has_a_row_in_the_agents_cli_map() {
+        let agents = include_str!("../AGENTS.md");
+        let map = &agents[agents.find("## CLI ↔ library").expect("AGENTS.md has the CLI map")..];
+        let rows: Vec<&str> = map
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `vectordata "))
+            .filter_map(|l| l.split('`').next())
+            .collect();
+        let commands = command_paths();
+        let missing: Vec<&String> = commands.iter().filter(|c| !rows.contains(&c.as_str())).collect();
+        assert!(missing.is_empty(), "commands with no CLI ↔ library row in AGENTS.md: {missing:?}");
+        let stale: Vec<&&str> = rows.iter().filter(|r| !commands.iter().any(|c| c == **r)).collect();
+        assert!(stale.is_empty(), "AGENTS.md rows for commands that do not exist: {stale:?}");
+    }
 
     /// The registration contract for this binary's dynamic
     /// completion: the shared dataset-domain resolvers plus the

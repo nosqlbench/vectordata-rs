@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Local / `file://` push transport — a filesystem copy preserving the
+//! Library API. Local / `file://` push transport — a filesystem copy preserving the
 //! relative tree. Used for local catalogs, mounts, and as the
 //! fully-exercisable transport in tests.
 

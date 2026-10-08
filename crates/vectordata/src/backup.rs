@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Client-driven, resumable, content-addressed off-system backup of a
+//! Library API. Client-driven, resumable, content-addressed off-system backup of a
 //! `vecd` store, and its inverse.
 //!
 //! `backup` walks the introspection API for everything the caller can
@@ -31,18 +31,29 @@ use crate::endpoint;
 /// What a backup run moved.
 #[derive(Debug, Default, Clone)]
 pub struct BackupStats {
+    /// Readable namespaces with at least one committed version.
     pub namespaces: usize,
+    /// Committed versions mirrored in this run.
     pub versions: usize,
+    /// Versions skipped under `--incremental` because their
+    /// `manifest.json` was already written.
     pub versions_skipped: usize,
+    /// Content blobs downloaded.
     pub blobs_fetched: usize,
+    /// Content blobs already present in `blobs/`, so not fetched.
     pub blobs_skipped: usize,
+    /// Total bytes of the fetched blobs.
     pub bytes: u64,
 }
 
 /// What a restore run pushed.
 #[derive(Debug, Default, Clone)]
 pub struct RestoreStats {
+    /// Namespaces whose latest committed version was pushed.
     pub namespaces: usize,
+    /// Files materialized and pushed, excluding the provenance
+    /// artifacts (`pushlog.jsonl`, `.publish_url`, `SHA256SUMS`) that
+    /// push regenerates.
     pub objects: usize,
 }
 

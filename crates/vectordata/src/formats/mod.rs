@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Wire format codecs for metadata and predicate records.
+//! Library API. Wire format codecs for metadata and predicate records.
 //!
 //! - **mnode**: Self-describing binary metadata records (MNode/MValue).
 //! - **pnode**: Binary predicate expression trees (PNode).

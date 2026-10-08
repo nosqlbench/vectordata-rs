@@ -1,13 +1,13 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks datasets precache` — thin delegate over
+//! CLI support. `veks datasets precache` — thin delegate over
 //! [`vectordata::datasets::precache::run`].
 //!
-//! The implementation (spec resolution, live progress meter,
-//! per-facet + aggregate rendering) lives in the vectordata crate so
-//! `vectordata datasets precache …` and `veks datasets precache …`
-//! produce identical behaviour.
+//! The command lives in the vectordata crate so `vectordata datasets
+//! precache …` and `veks datasets precache …` behave identically, and
+//! it is itself an adapter over the library fetch
+//! ([`vectordata::fetch`]), which is what code should call.
 
 pub use vectordata::datasets::precache::PrecacheRequest;
 
@@ -54,7 +54,8 @@ profiles:
         let group =
             vectordata::TestDataGroup::load(ws.join("dataset.yaml").to_str().unwrap()).unwrap();
         let view = group.profile("default").unwrap();
-        view.prebuffer_all().unwrap();
+        view.fetch(&vectordata::fetch::FetchRequest::all(), &mut vectordata::fetch::Silent)
+            .unwrap();
 
         // The base.fvec original must still be exactly where we put
         // it — no shadow copy in any cache directory.

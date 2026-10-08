@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Ordinal mapping for multi-file facets.
+//! Library API. Ordinal mapping for multi-file facets.
 //!
 //! A facet may be one file or a series of them. Either way its records
 //! form one dense, gapless ordinal space, and this module is what turns

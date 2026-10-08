@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Conformance enforcement for `dataset.yaml`.
+//! Library API. Conformance enforcement for `dataset.yaml`.
 //!
 //! The facet spec in [`crate::dataset::facet`] is the single authority for
 //! *which resources a facet may own* (basenames, formats/extensions, and

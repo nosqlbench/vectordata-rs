@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-user `vectordata` settings.
+//! Library API. Per-user `vectordata` settings.
 //!
 //! Loaded from `~/.config/vectordata/settings.yaml` (or
 //! `$VECTORDATA_HOME/settings.yaml` when that env var is set —
@@ -11,8 +11,8 @@
 //! honored uniformly across vectordata and any consuming crate.
 //!
 //! There is no silent fallback. If the settings file is missing or
-//! does not declare `cache_dir:`, [`cache_dir`](crate::settings::cache_dir) returns
-//! [`SettingsError::NotConfigured`](crate::settings::SettingsError::NotConfigured), whose `Display` impl prints a
+//! does not declare `cache_dir:`, [`cache_dir`] returns
+//! [`SettingsError::NotConfigured`], whose `Display` impl prints a
 //! ready-to-paste set of commands the user can run to configure it.
 
 use std::io;
@@ -256,7 +256,9 @@ pub enum CacheDirResolutionReason {
 /// A cache-directory candidate auto-picked from the live mount table.
 #[derive(Debug, Clone)]
 pub struct AutoResolved {
+    /// The proposed cache directory.
     pub path: PathBuf,
+    /// Why this path was chosen.
     pub reason: CacheDirResolutionReason,
     /// The mount-point string that was picked (for diagnostic
     /// messages).

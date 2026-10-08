@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Mutable merkle verification state loaded from / persisted to `.mrkl` files.
+//! Library API. Mutable merkle verification state loaded from / persisted to `.mrkl` files.
 
 use std::fs;
 use std::io::{self, Cursor};

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vector I/O — uniform and variable-length record readers.
+//! Library API. Vector I/O — uniform and variable-length record readers.
 //!
 //! Two reader shapes, parameterised on element type, both backed by
 //! the crate-private `Storage` abstraction:
@@ -61,36 +61,27 @@ pub enum IoError {
     /// xvec files.
     #[error("Variable-length records: {0}")]
     VariableLengthRecords(String),
-    /// No record index could be obtained without downloading the whole
-    /// file, and the caller asked for `OffsetSource::Published`.
+    /// A remote variable-length file has no published offset index,
+    /// and the only other way to find its record boundaries is to read
+    /// every byte of it.
     ///
-    /// Raised for the planning path: a prefetch plan reports what a
-    /// transfer would cost, so it must not move the bytes in order to
-    /// decide. The caller degrades the window to a whole-facet fetch
-    /// and lets the fallback policy consent to it.
+    /// Opening a reader never does that implicitly: a whole-file
+    /// download behind a constructor is the trap this refusal replaces.
+    /// Fetch the facet first — which downloads it with progress and
+    /// consent — and the reader then rebuilds the index from the local
+    /// copy; or publish the `IDXFOR__` sidecar beside the file.
     #[error(
-        "no published offset index for {0}; rebuilding one requires downloading the whole file"
+        "no published offset index for {url}; finding its record boundaries means \
+         downloading the whole file ({bytes} bytes). Fetch the facet first \
+         (TestDataView::fetch, or `vectordata datasets precache`) or publish its \
+         IDXFOR__ sidecar"
     )]
-    OffsetIndexUnavailable(String),
-}
-
-/// How hard [`load_offsets`] may work to produce a record index.
-///
-/// The two arms differ only for a *remote* vvec with no published
-/// `IDXFOR__` sidecar, where the only remaining way to learn the record
-/// boundaries is to walk the file — which drags every chunk across the
-/// network. A local walk reads an mmap and is free under either arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OffsetSource {
-    /// Any means necessary, including a remote walk-download. For
-    /// callers opening a reader: they are about to read the data
-    /// anyway, so the transfer is work brought forward, not wasted.
-    Rebuild,
-    /// Only indexes that are already cheap: a published sidecar, a
-    /// rebuild persisted beside the cache file, or a local mmap walk.
-    /// Never a remote walk-download. For callers that are *planning* a
-    /// transfer and must not perform one to do it.
-    Published,
+    OffsetIndexUnavailable {
+        /// The file.
+        url: String,
+        /// Its size: what fetching it costs.
+        bytes: u64,
+    },
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -197,9 +188,11 @@ pub trait VectorReader<T>: Send + Sync {
         None
     }
 
-    /// Force-download the underlying storage into the local cache so
-    /// subsequent reads are zero-copy. No-op for local files and for
-    /// non-cacheable HTTP. Idempotent.
+    /// Low-level: download this reader's file whole into the local
+    /// cache, so later reads are zero-copy. Most callers want
+    /// [`TestDataView::fetch`](crate::TestDataView::fetch), which plans,
+    /// checks cache space and reports progress. No-op for local files.
+    /// Idempotent.
     fn precache(&self) -> io::Result<()> {
         Ok(())
     }
@@ -353,9 +346,11 @@ impl<T> std::fmt::Debug for XvecReader<T> {
 impl<T> XvecReader<T> {
     // ---- shape accessors that don't need a VvecElement bound ----
 
+    /// Elements per record (every record has the same dimension).
     pub fn dim(&self) -> usize {
         self.dim
     }
+    /// Records in the file.
     pub fn count(&self) -> usize {
         self.count
     }
@@ -366,12 +361,17 @@ impl<T> XvecReader<T> {
 
     // ---- storage advice / reclaim API (no T bound) ----
 
-    /// Drive the underlying storage to fully resident state. No-op
-    /// for local files and for non-cacheable HTTP.
+    /// Low-level: download this one file whole. Most callers want
+    /// [`TestDataView::fetch`](crate::TestDataView::fetch), which plans,
+    /// checks cache space and reports progress across a profile's facets.
+    /// No-op for local files.
     pub fn precache(&self) -> io::Result<()> {
         self.storage.precache()
     }
 
+    /// Low-level: [`precache`](Self::precache) with the transport's
+    /// progress per chunk. Most callers want
+    /// [`TestDataView::fetch`](crate::TestDataView::fetch).
     pub fn prebuffer_with_progress<F>(&self, cb: F) -> io::Result<()>
     where
         F: FnMut(&crate::transport::DownloadProgress),
@@ -379,28 +379,45 @@ impl<T> XvecReader<T> {
         self.storage.prebuffer_with_progress(cb)
     }
 
+    /// Whether every byte of the file is resident locally, so reads
+    /// make no network requests.
     pub fn is_complete(&self) -> bool {
         self.storage.is_complete()
     }
+    /// Hint that the file will be read front to back
+    /// (`madvise(SEQUENTIAL)`). No-op unless the file is memory-mapped,
+    /// and on non-Unix targets.
     pub fn advise_sequential(&self) {
         self.storage.advise_sequential()
     }
+    /// Hint that the file will be read in no particular order
+    /// (`madvise(RANDOM)`). No-op unless memory-mapped, and on non-Unix
+    /// targets.
     pub fn advise_random(&self) {
         self.storage.advise_random()
     }
 
+    /// Hint that records `start..end` will be read soon
+    /// (`madvise(WILLNEED)`); returns without waiting. `end` is clamped
+    /// to [`count`](Self::count).
     pub fn prefetch_range(&self, start: usize, end: usize) {
         let bs = (start * self.entry_size) as u64;
         let be = (end.min(self.count) * self.entry_size) as u64;
         self.storage.prefetch_range_bytes(bs, be);
     }
 
+    /// Let the kernel drop the pages of records `start..end`
+    /// (`madvise(DONTNEED)`), bounding resident memory during a scan.
+    /// The data stays readable; a later read pages it back in.
     pub fn release_range(&self, start: usize, end: usize) {
         let bs = (start * self.entry_size) as u64;
         let be = (end.min(self.count) * self.entry_size) as u64;
         self.storage.release_range_bytes(bs, be);
     }
 
+    /// Page records `start..end` into memory and wait until they are
+    /// resident, adding the bytes touched to `bytes_paged` when given.
+    /// The blocking counterpart of [`prefetch_range`](Self::prefetch_range).
     pub fn prefetch_pages(&self, start: usize, end: usize, bytes_paged: Option<&AtomicU64>) {
         let bs = (start * self.entry_size) as u64;
         let be = (end.min(self.count) * self.entry_size) as u64;
@@ -411,6 +428,13 @@ impl<T> XvecReader<T> {
 impl<T: VvecElement> XvecReader<T> {
     /// Open from a path or URL string. Local paths use mmap; URLs try
     /// the merkle-cache path first and fall back to direct HTTP.
+    ///
+    /// Opening a URL reads only the header. Reads then fetch the chunks
+    /// they touch — except against a server without HTTP range support,
+    /// where the first read downloads the whole file, because no other
+    /// way to read it exists. Fetch first
+    /// ([`TestDataView::fetch`](crate::TestDataView::fetch)) to see that
+    /// download with progress.
     pub fn open(source: &str) -> Result<Self, IoError> {
         validate_element_for_source(source)?;
         let storage = Storage::open(source)?;
@@ -667,6 +691,13 @@ impl<T: VvecElement> IndexedVvecReader<T> {
     }
 
     /// Open from a path or URL string. Auto-dispatches transport.
+    ///
+    /// Records vary in length, so random access needs an offset index:
+    /// a published `IDXFOR__` sidecar, one persisted from an earlier
+    /// open, or a walk of a complete local copy. A remote file with none
+    /// of those is refused with [`IoError::OffsetIndexUnavailable`]
+    /// rather than downloaded whole behind the call; fetch it first
+    /// ([`TestDataView::fetch`](crate::TestDataView::fetch)).
     pub fn open(source: &str) -> Result<Self, IoError> {
         let ext = ext_of(source);
         let elem_size = infer_elem_size(ext);
@@ -701,7 +732,6 @@ impl<T: VvecElement> IndexedVvecReader<T> {
                 translated.as_ref(),
                 &storage,
                 elem_size,
-                OffsetSource::Rebuild,
             )?
         } else {
             load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
@@ -731,7 +761,6 @@ impl<T: VvecElement> IndexedVvecReader<T> {
                 translated.as_ref(),
                 &storage,
                 elem_size,
-                OffsetSource::Rebuild,
             )?
         } else {
             load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
@@ -744,10 +773,12 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         })
     }
 
+    /// Records in the file.
     pub fn count(&self) -> usize {
         self.offsets.len()
     }
 
+    /// Elements in record `index` — records vary in length.
     pub fn dim_at(&self, index: usize) -> Result<usize, IoError> {
         if index >= self.offsets.len() {
             return Err(IoError::OutOfBounds(index));
@@ -760,6 +791,8 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         Ok(LittleEndian::read_i32(&bytes) as usize)
     }
 
+    /// Record `index`'s elements as raw little-endian bytes, without the
+    /// dimension header.
     pub fn get_bytes(&self, index: usize) -> Result<Vec<u8>, IoError> {
         if index >= self.offsets.len() {
             return Err(IoError::OutOfBounds(index));
@@ -788,9 +821,13 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         self.storage.mmap_slice(body_start, body_len)
     }
 
+    /// Low-level: download this one file whole. Most callers want
+    /// [`TestDataView::fetch`](crate::TestDataView::fetch), which plans,
+    /// checks cache space and reports progress.
     pub fn precache(&self) -> io::Result<()> {
         self.storage.precache()
     }
+    /// Whether every byte of the file is resident locally.
     pub fn is_complete(&self) -> bool {
         self.storage.is_complete()
     }
@@ -863,6 +900,9 @@ impl<'a, T: VvecElement> StreamReclaim<'a, T> {
         Self::with_reclaim_bytes(reader, start, end, 256 * 1024 * 1024)
     }
 
+    /// [`new`](Self::new) with an explicit window: the trailing
+    /// `reclaim_bytes` of records (at least 1024 records) are released
+    /// each time the scan crosses a window boundary.
     pub fn with_reclaim_bytes(
         reader: &'a XvecReader<T>,
         start: usize,
@@ -919,12 +959,18 @@ pub fn open_vec<T: VvecElement>(source: &str) -> Result<Box<dyn VectorReader<T>>
 }
 
 /// Open a variable-length vector file for typed random access.
+///
+/// A remote file with no published offset index is refused rather than
+/// downloaded whole; see [`IndexedVvecReader::open`].
 pub fn open_vvec<T: VvecElement>(source: &str) -> Result<Box<dyn VvecReader<T>>, IoError> {
     Ok(Box::new(IndexedVvecReader::<T>::open(source)?))
 }
 
 /// Open a variable-length vector file as raw `u8` records (no
 /// per-element typing). Useful when the caller decodes records itself.
+///
+/// A remote file with no published offset index is refused rather than
+/// downloaded whole; see [`IndexedVvecReader::open`].
 pub fn open_vvec_untyped(source: &str) -> Result<Box<dyn VvecReader<u8>>, IoError> {
     let ext = ext_of(source);
     let elem_size = infer_elem_size(ext);
@@ -941,7 +987,6 @@ pub fn open_vvec_untyped(source: &str) -> Result<Box<dyn VvecReader<u8>>, IoErro
             translated.as_ref(),
             &storage,
             elem_size,
-            OffsetSource::Rebuild,
         )?
     } else {
         load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
@@ -975,11 +1020,10 @@ pub(crate) fn load_offsets(
     source: &str,
     storage: &Storage,
     elem_size: usize,
-    want: OffsetSource,
 ) -> Result<Vec<u64>, IoError> {
     if crate::transport::is_remote_url(source) {
         let translated = crate::transport::normalize_remote_url(source);
-        load_or_fetch_remote_offsets(translated.as_ref(), storage, elem_size, want)
+        load_or_fetch_remote_offsets(translated.as_ref(), storage, elem_size)
     } else {
         load_or_build_local_offsets(Path::new(source), storage, elem_size)
     }
@@ -1016,7 +1060,6 @@ fn load_or_fetch_remote_offsets(
     data_url: &str,
     storage: &Storage,
     elem_size: usize,
-    want: OffsetSource,
 ) -> Result<Vec<u64>, IoError> {
     // Try sibling IDXFOR__ index URLs.
     let url =
@@ -1069,25 +1112,18 @@ fn load_or_fetch_remote_offsets(
             return Ok(cached);
         }
     }
-    // Everything cheap is exhausted; only the walk remains, and for
-    // remote storage that means downloading the whole file. A caller
-    // that is merely *planning* a transfer must not perform one to
-    // decide — it would move the very bytes the plan exists to gate,
-    // and the consent check would then fire after the fact.
-    if want == OffsetSource::Published {
-        return Err(IoError::OffsetIndexUnavailable(data_url.to_string()));
+    // Everything cheap is exhausted; only the walk remains. Over a
+    // complete local copy that is a read of the cache file. Over a
+    // remote file it is a download of every byte, which no open may do
+    // behind the caller's back — and which a planner, asking what a
+    // transfer would cost, must not do in order to answer. Refuse, and
+    // say what to do instead.
+    if !storage.is_complete() {
+        return Err(IoError::OffsetIndexUnavailable {
+            url: data_url.to_string(),
+            bytes: storage.total_size(),
+        });
     }
-    // Fallback: walk the file via Storage::read_bytes. For remote
-    // storage this downloads EVERY chunk of the file before the
-    // reader exists — say so out loud instead of looking like a
-    // hang, and point at the durable fix (publish the sidecar).
-    log::warn!(
-        "no IDXFOR__ offset index published for {data_url}; rebuilding it \
-             requires downloading the entire file ({} bytes). Publish the \
-             IDXFOR__ sidecar next to the data file (or precache the dataset) \
-             to avoid this.",
-        storage.total_size(),
-    );
     let offsets = walk_offsets_via_storage(storage, elem_size)?;
     // Persist so the walk is paid once per cache lifetime. Best-
     // effort: a read-only cache directory only costs us the rebuild.

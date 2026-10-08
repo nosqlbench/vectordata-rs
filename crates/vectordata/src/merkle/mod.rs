@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Merkle tree integrity verification for chunked data.
+//! Library API. Merkle tree integrity verification for chunked data.
 //!
 //! This module implements wire-compatible merkle tree structures matching the
 //! Java companion project (`nbdatatools`). The binary formats for `.mref`

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP byte-range transport using reqwest with connection pooling.
+//! Internal. HTTP byte-range transport using reqwest with connection pooling.
 
 use std::io;
 use std::sync::OnceLock;

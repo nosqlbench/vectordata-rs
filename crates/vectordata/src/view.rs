@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Profile views for accessing dataset components.
+//! Library API. Profile views for accessing dataset components.
 //!
 //! Defines the [`TestDataView`] trait and `GenericTestDataView` implementation
 //! for uniform access to base vectors, query vectors, ground-truth neighbors,
@@ -174,9 +174,7 @@ pub(crate) fn records_in(path: &str, storage: &crate::storage::Storage) -> Optio
     if crate::io::is_vvec_ext(ext) {
         // Variable-length: only the index knows. A bare entry is
         // local-only, so the walk this may cost is a local walk.
-        let offsets =
-            crate::io::load_offsets(path, storage, elem_size, crate::io::OffsetSource::Rebuild)
-                .ok()?;
+        let offsets = crate::io::load_offsets(path, storage, elem_size).ok()?;
         return Some(offsets.len() as u64);
     }
     if crate::io::is_scalar_ext(ext) {
@@ -588,20 +586,20 @@ pub trait TestDataView: Send + Sync {
     /// Returns a reader for the neighbor distances (ground truth).
     fn neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
-    // -- Filtered neighbor facets (E / F) --
+    // -- Filtered neighbor facets (F / E) --
 
-    /// Returns a reader for the **pre-filter** KNN ground-truth indices (E).
-    /// Top-K of `X_p` by distance; full K when `|X_p| ≥ K`.
+    /// Returns a reader for the **pre-filter** KNN ground-truth indices (F).
+    /// Top-K of `X_p` by distance; full K when `|X_p| ≥ K`. The legacy
+    /// `filtered_neighbor_indices` YAML key resolves to this facet.
     fn prefiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
-    /// Returns a reader for the **pre-filter** KNN ground-truth distances (E).
+    /// Returns a reader for the **pre-filter** KNN ground-truth distances (F).
     fn prefiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
-    /// Returns a reader for the **post-filter** KNN ground-truth indices (F).
+    /// Returns a reader for the **post-filter** KNN ground-truth indices (E).
     /// `G ∩ R` — the unfiltered top-K intersected with the predicate-passing
-    /// set; sparse possible. The legacy `filtered_neighbor_indices` YAML key
-    /// resolves to this facet for backwards compatibility.
+    /// set; sparse possible.
     fn postfiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
-    /// Returns a reader for the **post-filter** KNN ground-truth distances (F).
+    /// Returns a reader for the **post-filter** KNN ground-truth distances (E).
     fn postfiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
     // -- Metadata facets --
@@ -661,136 +659,105 @@ pub trait TestDataView: Send + Sync {
     /// knowing the dataset's transport details.
     fn facet_source(&self, name: &str) -> Option<String>;
 
-    // -- Precache / cache --
+    // -- Fetch --------------------------------------------------------
 
-    /// Drive every facet of this profile to fully-resident,
-    /// zero-copy state. **Strict contract**: returning `Ok(())`
-    /// means every facet is local and mmap-promoted. Local-mmap
-    /// facets are already complete (no work). Cached-remote and
-    /// direct-HTTP-without-`.mref` facets are downloaded fully and
-    /// promoted. Per-facet failure surfaces as `Err` — callers
-    /// cannot continue with partial state.
-    fn prebuffer_all(&self) -> Result<()> {
-        self.prebuffer_all_with_progress(WholeFacetFallback::Refuse, &mut |_, _| {})
+    /// Bring facets of this profile into the local cache, with progress.
+    /// **The fetch call** — also what to use for "precache", "prebuffer"
+    /// or "download" ([`crate::fetch`]).
+    ///
+    /// `request` picks the facets ([`FetchRequest::all`](crate::fetch::FetchRequest::all)
+    /// or [`FetchRequest::facets`](crate::fetch::FetchRequest::facets))
+    /// and optionally a record window; `progress` hears every step
+    /// ([`Silent`](crate::fetch::Silent), [`TextMeter`](crate::fetch::TextMeter),
+    /// or a closure). This is [`plan_fetch`](Self::plan_fetch) followed
+    /// by [`FetchPlan::execute`](crate::fetch::FetchPlan::execute).
+    ///
+    /// Before any byte moves, the whole run is checked: an unknown facet
+    /// ([`Error::UnknownFacets`]), a window that would silently become a
+    /// whole-facet download ([`Error::WindowUnresolvable`]), and a cache
+    /// directory without room ([`Error::InsufficientCacheSpace`]) are all
+    /// refused up front. Returning `Ok` means every planned byte is
+    /// resident; readers opened afterwards take the zero-copy path.
+    ///
+    /// ```no_run
+    /// # use vectordata::fetch::{FetchRequest, TextMeter};
+    /// # fn demo(view: &dyn vectordata::TestDataView) -> vectordata::Result<()> {
+    /// let report = view.fetch(
+    ///     &FetchRequest::facets(["base_vectors", "query_vectors"]),
+    ///     &mut TextMeter::stderr("Fetch"),
+    /// )?;
+    /// assert!(report.facet("base_vectors").is_some());
+    /// # Ok(()) }
+    /// ```
+    fn fetch(
+        &self,
+        request: &crate::fetch::FetchRequest,
+        progress: &mut dyn crate::fetch::FetchProgress,
+    ) -> Result<crate::fetch::FetchReport> {
+        self.plan_fetch(request, progress)?.execute(progress)
     }
 
-    /// Same as [`prebuffer_all`](Self::prebuffer_all) with a callback fired per facet
-    /// after its download completes. The callback receives the
-    /// facet name and a progress snapshot.
+    /// Plan a [`fetch`](Self::fetch) without fetching: open each facet
+    /// and resolve its window to the ranges and chunks it needs, net of
+    /// what is already resident. Read the cost from the returned
+    /// [`FetchPlan`](crate::fetch::FetchPlan), then
+    /// [`execute`](crate::fetch::FetchPlan::execute) it or drop it.
     ///
-    /// **Strict contract**: returning `Ok(())` means every declared
-    /// facet is fully resident and zero-copy ready. Per-facet
-    /// failure is propagated as `Err`, never swallowed — callers
-    /// cannot accidentally continue with partial state.
+    /// `progress` hears a `PlanBegin`/`PlanEnd` pair per facet, because
+    /// opening a large remote facet takes long enough to need saying.
+    fn plan_fetch(
+        &self,
+        request: &crate::fetch::FetchRequest,
+        progress: &mut dyn crate::fetch::FetchProgress,
+    ) -> Result<crate::fetch::FetchPlan> {
+        let mut facets = Vec::new();
+        crate::fetch::plan_view(self, None, request, progress, &mut facets)?;
+        Ok(crate::fetch::plan_from(facets, request))
+    }
+
+    /// Deprecated: use [`fetch`](Self::fetch) with
+    /// [`FetchRequest::all`](crate::fetch::FetchRequest::all), which this
+    /// now is, and which reports progress and returns what it did.
+    #[deprecated(
+        since = "2.5.0",
+        note = "use `view.fetch(&FetchRequest::all(), &mut Silent)` (vectordata::fetch)"
+    )]
+    fn prebuffer_all(&self) -> Result<()> {
+        self.fetch(&crate::fetch::FetchRequest::all(), &mut crate::fetch::Silent)
+            .map(|_| ())
+    }
+
+    /// Deprecated: use [`fetch`](Self::fetch) with
+    /// [`FetchRequest::all`](crate::fetch::FetchRequest::all) and a
+    /// [`FetchProgress`](crate::fetch::FetchProgress) sink, which this
+    /// now is.
     ///
-    /// Every facet is fetched against the window it declares, a series
-    /// included; a declared window the format cannot map is refused
-    /// under [`WholeFacetFallback::Refuse`] and fetched whole under
-    /// [`WholeFacetFallback::Allow`]. `cb` is taken by `&mut dyn`
-    /// rather than as a generic parameter so this trait remains
-    /// dyn-compatible (consumers receive `Arc<dyn TestDataView>` from
-    /// the catalog API).
+    /// `cb` hears each facet once before it is fetched with
+    /// `total_bytes` set and nothing verified, then chunk-level progress,
+    /// then once more when it completes. Every facet is fetched against
+    /// the window it declares; one the format cannot map is refused under
+    /// [`WholeFacetFallback::Refuse`] and fetched whole under
+    /// [`WholeFacetFallback::Allow`].
+    #[deprecated(
+        since = "2.5.0",
+        note = "use `view.fetch(&FetchRequest::all(), &mut sink)` (vectordata::fetch)"
+    )]
     fn prebuffer_all_with_progress(
         &self,
         fallback: WholeFacetFallback,
         cb: &mut dyn FnMut(&str, &PrebufferProgress),
     ) -> Result<()> {
-        use std::cell::{Cell, RefCell};
-
-        // One plan per facet, from the planner the selective precache
-        // uses, against the window the facet declares for itself. The
-        // per-file mapping this replaced answered "no window" for a
-        // series, which has no single source path, so a sized profile
-        // over a sharded base downloaded the whole base: a "small part"
-        // of tessera came to two terabytes. The planner decomposes a
-        // facet window across shards (SH-14), so a profile pulls what
-        // it can address and nothing more.
-        let mut planned: Vec<(String, FacetStorage, PrefetchPlan)> = Vec::new();
-        for (name, desc) in self.facet_manifest() {
-            if !self.facet_holds_data(&name) {
-                continue;
-            }
-            let storage = self
-                .open_facet_storage(&name)
-                .map_err(|e| Error::Other(format!("open '{name}' for precache: {e}")))?;
-            let window = facet_declared_window(&desc)?;
-            let plan = self.prefetch_plan_on(&storage, &name, &window)?;
-            // A declared window the format cannot map is refused unless
-            // the caller accepted the whole facet, exactly as a
-            // requested window is. Widening a profile's own window to
-            // its whole base in silence is not a fallback; it is the
-            // download the window existed to prevent.
-            check_fallback(&name, &plan, fallback)?;
-            planned.push((name, storage, plan));
-        }
-        let bytes_to_fetch: u64 = planned
-            .iter()
-            .map(|(_, storage, plan)| {
-                if plan.degrades_to_full_download {
-                    storage
-                        .total_size()
-                        .saturating_sub(storage.allocated_cache_bytes())
-                } else {
-                    plan.bytes_to_fetch()
-                }
-            })
-            .sum();
-        crate::cache::ensure_cache_capacity(bytes_to_fetch)
-            .map_err(|e| Error::Other(e.to_string()))?;
-
-        for (name, storage, plan) in &planned {
-            // The "total" a meter tops out at is what this facet will
-            // hold when done: the window's bytes for a windowed facet,
-            // the file for a whole one.
-            let total_for_display: u64 = if plan.degrades_to_full_download {
-                storage.total_size()
-            } else {
-                plan.byte_ranges.iter().map(|r| r.len()).sum()
-            };
-            {
-                let p = PrebufferProgress {
-                    verified_chunks: 0,
-                    total_chunks: 0,
-                    verified_bytes: 0,
-                    total_bytes: total_for_display,
-                };
-                cb(name, &p);
-            }
-
-            let cb_cell: RefCell<&mut dyn FnMut(&str, &PrebufferProgress)> = RefCell::new(&mut *cb);
-            let fired = Cell::new(false);
-            let forward = |p: &crate::transport::DownloadProgress| {
-                let progress = PrebufferProgress {
-                    verified_chunks: p.completed_chunks(),
-                    total_chunks: p.total_chunks(),
-                    verified_bytes: p.downloaded_bytes(),
-                    total_bytes: p.total_bytes(),
-                };
-                (cb_cell.borrow_mut())(name, &progress);
-                fired.set(true);
-            };
-            let result = if plan.degrades_to_full_download {
-                storage.prebuffer_with_progress(&forward)
-            } else {
-                plan.byte_ranges
-                    .iter()
-                    .try_for_each(|r| storage.prebuffer_shard_range(r.shard, r.start, r.end, &forward))
-            };
-            result.map_err(|e| Error::Other(format!("precache '{name}': {e}")))?;
-
-            if !fired.get() {
-                let progress = PrebufferProgress {
-                    verified_chunks: 0,
-                    total_chunks: 0,
-                    verified_bytes: total_for_display,
-                    total_bytes: total_for_display,
-                };
-                (cb_cell.borrow_mut())(name, &progress);
-            }
-        }
-        Ok(())
+        let request = crate::fetch::FetchRequest::all().fallback(fallback);
+        self.fetch(&request, &mut prebuffer_progress_adapter(&mut |_, facet, p| cb(facet, p)))
+            .map(|_| ())
     }
 
+    /// Open a record-shaped facet — a slab of opaque records, such as
+    /// `metadata_content` — for ordinal access to its records. A facet
+    /// of element runs is refused naming the reader that opens it; ask
+    /// [`facet_shape`](Self::facet_shape) to know which to use. A
+    /// namespace in the declaration (`metadata_content.slab:layout`)
+    /// selects that document inside the container.
     fn open_facet_records(
         &self,
         name: &str,
@@ -897,12 +864,11 @@ pub trait TestDataView: Send + Sync {
             .is_some()
     }
 
-    /// **Crate-internal hook** used by the default `prebuffer_all`
-    /// implementation. Returns a handle whose `precache*` methods
-    /// drive the underlying [`crate::storage::Storage`]. Implementors
-    /// rarely override this — the `GenericTestDataView` default is
-    /// usually correct.
-    #[doc(hidden)]
+    /// Low-level: an open [`FacetStorage`] handle on the facet's bytes,
+    /// for cache inspection and planning. Most callers want
+    /// [`fetch`](Self::fetch) to bring bytes in and a reader to read
+    /// them. Every implementor provides it; the default fetch, planning
+    /// and typed-access methods are built on it.
     fn open_facet_storage(&self, name: &str) -> Result<FacetStorage>;
 
     // -- Prefetch --------------------------------------------------
@@ -953,6 +919,7 @@ pub trait TestDataView: Send + Sync {
             (None, Some(_)) => String::new(),
             (None, None) => {
                 plan.degrades_to_full_download = true;
+                plan.resident_bytes = storage.allocated_cache_bytes().min(facet_bytes);
                 return Ok(plan);
             }
         };
@@ -998,6 +965,7 @@ pub trait TestDataView: Send + Sync {
                     // full download; reporting a partial plan beside it
                     // would understate what is about to happen.
                     plan.degrades_to_full_download = true;
+                    plan.resident_bytes = storage.allocated_cache_bytes().min(facet_bytes);
                     plan.requested_ranges.clear();
                     plan.byte_ranges.clear();
                     plan.fills.clear();
@@ -1019,11 +987,15 @@ pub trait TestDataView: Send + Sync {
         Ok(plan)
     }
 
-    /// Start fetching `window` of `facet` on another thread.
+    /// Start fetching `window` of `facet` on another thread, returning
+    /// a handle to watch, cancel or join it. The background form of
+    /// [`fetch`](Self::fetch): use that instead when the caller waits
+    /// for the bytes anyway.
     ///
-    /// The plan is computed before this returns — planning needs the
-    /// view, and a caller deserves the cost before committing — so the
-    /// `Err` here is a planning failure. Fetch failures arrive through
+    /// The plan is computed, and the cache directory's free space
+    /// checked, before this returns — planning needs the view, and a
+    /// caller deserves the cost before committing — so the `Err` here
+    /// is a planning or capacity failure. Fetch failures arrive through
     /// [`PrefetchHandle::join`], and are logged regardless so an
     /// unwatched prefetch cannot fail silently.
     ///
@@ -1041,50 +1013,27 @@ pub trait TestDataView: Send + Sync {
         let storage = self.open_facet_storage(facet)?;
         let plan = self.prefetch_plan_on(&storage, facet, window)?;
         check_fallback(facet, &plan, fallback)?;
+        crate::cache::ensure_cache_capacity(plan.bytes_to_fetch())?;
 
         let state = std::sync::Arc::new(PrefetchState::default());
         let worker_state = state.clone();
-        let ranges = plan.byte_ranges.clone();
-        let degrades = plan.degrades_to_full_download;
+        let worker_plan = plan.clone();
         let name = facet.to_string();
 
         let thread = std::thread::Builder::new()
             .name(format!("prefetch:{name}"))
             .spawn(move || {
                 use std::sync::atomic::Ordering;
-                let record = |e: std::io::Error| {
+                let outcome = crate::fetch::fetch_planned(
+                    &storage,
+                    &worker_plan,
+                    &|| worker_state.cancelled.load(Ordering::Acquire),
+                    &mut |bytes, _| worker_state.bytes_fetched.store(bytes, Ordering::Relaxed),
+                    &mut |ranges| worker_state.ranges_fetched.store(ranges, Ordering::Relaxed),
+                );
+                if let Err(e) = outcome {
                     log::warn!("prefetch of '{name}' failed: {e}");
                     *worker_state.error.lock().unwrap() = Some(e.to_string());
-                };
-
-                let outcome = if degrades {
-                    storage.prebuffer_with_progress(|p| {
-                        worker_state
-                            .bytes_fetched
-                            .store(p.downloaded_bytes(), Ordering::Relaxed);
-                    })
-                } else {
-                    let mut acc = 0u64;
-                    let mut result = Ok(());
-                    for r in ranges {
-                        if worker_state.cancelled.load(Ordering::Acquire) {
-                            break;
-                        }
-                        result = storage.prebuffer_shard_range(r.shard, r.start, r.end, |p| {
-                            worker_state
-                                .bytes_fetched
-                                .store(acc + p.downloaded_bytes(), Ordering::Relaxed);
-                        });
-                        if result.is_err() {
-                            break;
-                        }
-                        acc = worker_state.bytes_fetched.load(Ordering::Relaxed);
-                        worker_state.ranges_fetched.fetch_add(1, Ordering::Relaxed);
-                    }
-                    result
-                };
-                if let Err(e) = outcome {
-                    record(e);
                 }
                 // Set last, and with Release, so a caller that sees
                 // `is_done()` also sees the error and the counters.
@@ -1099,17 +1048,33 @@ pub trait TestDataView: Send + Sync {
         })
     }
 
-    /// Fetch `window` of `facet` and return when it is resident.
+    /// Deprecated: use [`fetch`](Self::fetch) with
+    /// `FetchRequest::facets([facet]).window(window)`, which also checks
+    /// cache space and reports progress.
+    #[deprecated(
+        since = "2.5.0",
+        note = "use `view.fetch(&FetchRequest::facets([facet]).window(w), &mut Silent)` (vectordata::fetch)"
+    )]
     fn prefetch(
         &self,
         facet: &str,
         window: &DSWindow,
         fallback: WholeFacetFallback,
     ) -> Result<PrefetchReport> {
+        #[allow(deprecated)]
         self.prefetch_with_progress(facet, window, fallback, &mut |_| {})
     }
 
-    /// Same, with chunk-level progress per range.
+    /// Deprecated: use [`fetch`](Self::fetch) with
+    /// `FetchRequest::facets([facet]).window(window)` and a
+    /// [`FetchProgress`](crate::fetch::FetchProgress) sink.
+    ///
+    /// Fetches `window` of `facet` and returns when it is resident;
+    /// `cb` hears the transport's progress per range.
+    #[deprecated(
+        since = "2.5.0",
+        note = "use `view.fetch(&FetchRequest::facets([facet]).window(w), &mut sink)` (vectordata::fetch)"
+    )]
     fn prefetch_with_progress(
         &self,
         facet: &str,
@@ -1122,28 +1087,71 @@ pub trait TestDataView: Send + Sync {
         let storage = self.open_facet_storage(facet)?;
         let planned = self.prefetch_plan_on(&storage, facet, window)?;
         check_fallback(facet, &planned, fallback)?;
-
-        if planned.degrades_to_full_download {
+        crate::cache::ensure_cache_capacity(planned.bytes_to_fetch())?;
+        let fetched = if planned.degrades_to_full_download {
             storage
                 .prebuffer_with_progress(|p| cb(p))
-                .map_err(|e| Error::Other(e.to_string()))?;
-            return Ok(PrefetchReport {
-                planned,
-                ranges_fetched: 1,
-            });
+                .map(|_| 1)
+        } else {
+            planned
+                .byte_ranges
+                .iter()
+                .try_fold(0usize, |n, r| {
+                    storage
+                        .prebuffer_shard_range(r.shard, r.start, r.end, |p| cb(p))
+                        .map(|_| n + 1)
+                })
         }
-
-        let mut fetched = 0;
-        for r in &planned.byte_ranges {
-            storage
-                .prebuffer_shard_range(r.shard, r.start, r.end, |p| cb(p))
-                .map_err(|e| Error::Other(e.to_string()))?;
-            fetched += 1;
-        }
+        .map_err(|e| Error::Other(e.to_string()))?;
         Ok(PrefetchReport {
             planned,
             ranges_fetched: fetched,
         })
+    }
+}
+
+/// Adapt a [`FetchProgress`](crate::fetch::FetchProgress) stream to the
+/// per-facet callback the deprecated `prebuffer_*_with_progress` forms
+/// take: `(profile, facet, progress)`, with `profile` empty for a
+/// single view.
+pub(crate) fn prebuffer_progress_adapter<'c>(
+    cb: &'c mut dyn FnMut(&str, &str, &PrebufferProgress),
+) -> impl FnMut(&crate::fetch::FetchEvent<'_>) + 'c {
+    use crate::fetch::FetchEvent;
+    let mut fired = false;
+    let (mut total, mut total_chunks) = (0u64, 0u32);
+    move |event: &FetchEvent<'_>| match event {
+        FetchEvent::FacetBegin { facet, bytes, chunks, .. } => {
+            fired = false;
+            (total, total_chunks) = (*bytes, *chunks);
+            let p = PrebufferProgress {
+                verified_chunks: 0,
+                total_chunks,
+                verified_bytes: 0,
+                total_bytes: total,
+            };
+            cb(facet.profile.as_deref().unwrap_or(""), &facet.facet, &p);
+        }
+        FetchEvent::Progress { facet, bytes, total, chunks } => {
+            fired = true;
+            let p = PrebufferProgress {
+                verified_chunks: *chunks,
+                total_chunks: total_chunks.max(*chunks),
+                verified_bytes: *bytes,
+                total_bytes: *total,
+            };
+            cb(facet.profile.as_deref().unwrap_or(""), &facet.facet, &p);
+        }
+        FetchEvent::FacetEnd { facet, .. } if !fired => {
+            let p = PrebufferProgress {
+                verified_chunks: total_chunks,
+                total_chunks,
+                verified_bytes: total,
+                total_bytes: total,
+            };
+            cb(facet.profile.as_deref().unwrap_or(""), &facet.facet, &p);
+        }
+        _ => {}
     }
 }
 
@@ -1204,13 +1212,18 @@ pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
     crate::typed_access::TypedReader::<T>::from_series(series, native, is_scalar)
 }
 
-/// Snapshot of in-progress precache state for a single facet. Passed
-/// to the callback registered with [`TestDataView::prebuffer_all_with_progress`].
+/// Snapshot of one facet's progress, as the deprecated
+/// `prebuffer_*_with_progress` callbacks receive it. New code reads
+/// [`FetchEvent`](crate::fetch::FetchEvent)s instead.
 #[derive(Debug, Clone)]
 pub struct PrebufferProgress {
+    /// Chunks fetched and verified so far.
     pub verified_chunks: u32,
+    /// Chunks the facet's fetch covers.
     pub total_chunks: u32,
+    /// Bytes fetched so far.
     pub verified_bytes: u64,
+    /// Bytes the facet's fetch covers.
     pub total_bytes: u64,
 }
 
@@ -1256,6 +1269,7 @@ pub struct RangeFill {
     /// Byte range the fetch actually spans once widened to chunk
     /// boundaries — always a superset of what was asked for.
     pub aligned_start: u64,
+    /// End of that chunk-aligned span (exclusive).
     pub aligned_end: u64,
 }
 
@@ -1385,6 +1399,10 @@ pub struct PrefetchPlan {
     pub degrades_to_full_download: bool,
     /// Size of the facet, for reading the degrade case against.
     pub facet_bytes: u64,
+    /// For a plan that degrades to the whole facet, bytes of it already
+    /// in the local cache — what an interrupted whole-facet fetch left
+    /// behind, which a retry need not fetch again. Zero otherwise.
+    pub resident_bytes: u64,
 }
 
 /// A byte range within a named shard.
@@ -1442,7 +1460,7 @@ impl PrefetchPlan {
     /// Bytes that will cross the network.
     pub fn bytes_to_fetch(&self) -> u64 {
         if self.degrades_to_full_download {
-            return self.facet_bytes;
+            return self.facet_bytes.saturating_sub(self.resident_bytes);
         }
         self.fills.iter().map(|f| f.bytes_to_fetch()).sum()
     }
@@ -1592,6 +1610,7 @@ impl PrefetchHandle {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Whether [`cancel`](Self::cancel) has been called.
     pub fn is_cancelled(&self) -> bool {
         self.state
             .cancelled
@@ -1626,12 +1645,6 @@ pub struct PrefetchReport {
     pub ranges_fetched: usize,
 }
 
-/// Opaque handle to a facet's underlying storage. Returned by
-/// [`TestDataView::open_facet_storage`] and consumed by the default
-/// `prebuffer_all` implementation. There is no public API for
-/// reading bytes through this handle — reads go through the
-/// shape-aware reader returned by `base_vectors()`, `facet()`, or
-/// `open_facet_typed`.
 /// How to open one of a series' files, recorded at handle creation so
 /// the open itself can be deferred (SH-26).
 ///
@@ -1878,13 +1891,7 @@ impl Series {
             return Some(o.clone());
         }
         let storage = self.file(i).ok()?;
-        let loaded = crate::io::load_offsets(
-            source,
-            &storage,
-            elem_size,
-            crate::io::OffsetSource::Published,
-        )
-        .ok()?;
+        let loaded = crate::io::load_offsets(source, &storage, elem_size).ok()?;
         let _ = self.offsets[i].set(std::sync::Arc::new(loaded));
         self.offsets.get(i)?.get().cloned()
     }
@@ -2061,6 +2068,14 @@ impl Series {
     }
 }
 
+/// Low-level: an open handle on a facet's bytes — one file, or every
+/// shard of a series — for cache inspection and range fetches. Most
+/// callers want [`TestDataView::fetch`] to bring bytes in and a reader
+/// (`base_vectors()`, `facet()`, `open_facet_typed`) to read them.
+///
+/// There is no public API for reading bytes through this handle; it
+/// answers what is resident ([`cache_stats`](Self::cache_stats),
+/// [`range_fill`](Self::range_fill)) and moves bytes on request.
 pub struct FacetStorage {
     storage: std::sync::Arc<crate::storage::Storage>,
     /// The remaining shards, when this facet is a series.
@@ -2123,14 +2138,13 @@ impl FacetStorage {
     /// The record-offset index for a variable-length facet, loaded on
     /// first use and reused for the life of this handle.
     ///
-    /// Restricted to [`crate::io::OffsetSource::Published`] — a
-    /// published sidecar, a persisted rebuild, or a local mmap walk.
-    /// This handle exists to answer *planning* questions ("what would
-    /// this window cost?"), and the remaining way to build an index for
-    /// a remote vvec is to walk the file, which downloads all of it. A
-    /// plan that transfers the facet in order to report the cost of
-    /// transferring part of it is not a plan. Readers, which will read
-    /// the data regardless, load their own offsets and may rebuild.
+    /// Only cheap sources: a published sidecar, a persisted rebuild, or
+    /// a walk of a complete local copy. This handle exists to answer
+    /// *planning* questions ("what would this window cost?"), and the
+    /// remaining way to build an index for a remote vvec is to walk the
+    /// file, which downloads all of it — and a plan that transfers the
+    /// facet in order to report the cost of transferring part of it is
+    /// not a plan. Readers follow the same rule.
     ///
     /// `None` when no such index is available, or when this handle
     /// already holds offsets for a different element width — see
@@ -2143,13 +2157,7 @@ impl FacetStorage {
         if let Some(cached) = self.offsets.get() {
             return (cached.elem_size == elem_size).then(|| cached.offsets.clone());
         }
-        let loaded = crate::io::load_offsets(
-            source,
-            &self.storage,
-            elem_size,
-            crate::io::OffsetSource::Published,
-        )
-        .ok()?;
+        let loaded = crate::io::load_offsets(source, &self.storage, elem_size).ok()?;
         // A race here means two loads and one winner, which is wasteful
         // but never wrong — both produce the same offsets. Return what
         // is *cached* rather than what this call built, so every caller
@@ -2171,7 +2179,10 @@ impl FacetStorage {
         let len = len.min(self.total_size());
         self.storage.read_bytes(0, len)
     }
-    /// Drive this facet to fully-resident, zero-copy state.
+    /// Low-level: download everything this facet can address. Most
+    /// callers want [`TestDataView::fetch`], which plans, checks cache
+    /// space and reports progress.
+    ///
     /// **Strict**: returns `Err` on any failure — never silently
     /// leaves the facet in a partially-resident state. After
     /// `Ok(())`, every read on every reader against this source
@@ -2204,7 +2215,8 @@ impl FacetStorage {
             }
         }
     }
-    /// Fetch everything this facet can address, reporting progress.
+    /// Low-level: [`precache`](Self::precache) with the transport's
+    /// per-file progress. Most callers want [`TestDataView::fetch`].
     ///
     /// **Walks the series**, exactly as [`Self::precache`] does.
     /// `self.storage` is the first shard's, so delegating to it would
@@ -2222,29 +2234,47 @@ impl FacetStorage {
     where
         F: FnMut(&crate::transport::DownloadProgress),
     {
+        self.prebuffer_parts(&mut |_, p| cb(p))
+    }
+
+    /// [`Self::prebuffer_with_progress`], telling the callback which
+    /// part each progress snapshot belongs to: the shard index for a
+    /// series, `0` for a single file.
+    ///
+    /// Each part's fetch reports its own totals, so a caller summing
+    /// bytes across a series needs to know where one part ends and the
+    /// next begins. Guessing that from the numbers alone (a total that
+    /// changes, a count that drops) misreads two equal-sized shards as
+    /// one.
+    pub(crate) fn prebuffer_parts(
+        &self,
+        cb: &mut dyn FnMut(usize, &crate::transport::DownloadProgress),
+    ) -> std::io::Result<()> {
         let Some(s) = &self.series else {
-            return self.storage.prebuffer_with_progress(cb);
+            return self.storage.prebuffer_with_progress(|p| cb(0, p));
         };
         for shard in 0..s.shards().entries().len() {
             // Addressable bytes, not whole files (SH-92): a sliced
             // shard pulls its window, not bytes it can never read.
             match s.shard_byte_extent(shard) {
-                Some((lo, hi)) => self.prebuffer_shard_range(shard, lo, hi, &mut cb)?,
+                Some((lo, hi)) => self.prebuffer_shard_range(shard, lo, hi, |p| cb(shard, p))?,
                 None => {
                     let i = s
                         .file_index_of_shard(shard)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     s.file(i)
                         .map_err(|e| std::io::Error::other(e.to_string()))?
-                        .prebuffer_with_progress(&mut cb)?;
+                        .prebuffer_with_progress(|p| cb(shard, p))?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Same as [`Self::prebuffer_with_progress`] but only fetches
-    /// chunks covering `[byte_start, byte_end)`. Used by windowed
+    /// Low-level: fetch the chunks covering bytes
+    /// `[byte_start, byte_end)` of the facet's joined byte space. Most
+    /// callers want [`TestDataView::fetch`] with a record window, which
+    /// maps records to bytes for them. Used by windowed
     /// profile precache so a `:1m` window against a 1.3 TiB base
     /// only pulls the chunks for the window's byte range. The
     /// view layer computes the byte range from the window record
@@ -2385,6 +2415,8 @@ impl FacetStorage {
         .unwrap_or(crate::access::AccessMode::Local)
     }
 
+    /// Whether reads make no network requests: a local source file, or
+    /// a remote one whose cache copy is complete and memory-mapped.
     pub fn is_local(&self) -> bool {
         match &self.series {
             None => self.storage.is_local(),
@@ -2426,19 +2458,39 @@ impl FacetStorage {
         self.series.as_ref().map(|s| s.shards().count())
     }
 
-    /// Path to the local file that backs this facet, when one
-    /// exists. `Some` for `Storage::Cached` (the cache file under
-    /// the configured cache root) and for purely-local datasets
-    /// where no cache is involved. `None` for direct-HTTP storage
-    /// (no `.mref` published — there is no local file).
+    /// Low-level: the path of the local file behind this facet, for
+    /// diagnostics and cache administration — showing where a facet is
+    /// cached, measuring it. **Not an access path for the data.** A
+    /// cache file is pre-sized and sparse until complete, its validity
+    /// lives in a separate chunk bitmap, and a series spans several
+    /// files; only vectordata's readers account for all of that. Read
+    /// through [`TestDataView::base_vectors`], [`TestDataView::facet`]
+    /// and the other facet readers, which are zero-copy once the facet
+    /// is fetched.
     ///
-    /// Hot-path consumers that need a `&Path` to mmap should call
-    /// `precache()` first to ensure the file is fully resident,
-    /// then use this path. Consumers that just want to read should
-    /// prefer `view.facet(name)` / `view.base_vectors()` and let
-    /// the reader handle resident-state for them.
+    /// `Some` for cached remote storage and for local source files;
+    /// `None` for direct HTTP before its first fetch. **For a series
+    /// this is the first shard's file only**; see
+    /// [`local_files`](Self::local_files).
     pub fn cache_path(&self) -> Option<std::path::PathBuf> {
         self.storage.local_path()
+    }
+
+    /// Low-level: the local file behind every file this facet spans, in
+    /// order — one per shard for a series — for tools that manage files
+    /// (hash, copy, inspect the cache). **Not an access path for the
+    /// data:** read vectors through the facet's readers
+    /// ([`TestDataView::base_vectors`], [`TestDataView::facet`], …), which
+    /// are zero-copy once the facet is fetched and know the record
+    /// layout, shard boundaries and windows that a raw file does not.
+    /// `None` when any file has no local copy yet.
+    pub fn local_files(&self) -> Option<Vec<std::path::PathBuf>> {
+        match &self.series {
+            None => self.storage.local_path().map(|p| vec![p]),
+            Some(s) => (0..s.file_count())
+                .map(|i| s.file(i).ok().and_then(|f| f.local_path()))
+                .collect(),
+        }
     }
 
     /// Bytes this facet's backing cache file *actually* occupies on
@@ -2520,6 +2572,9 @@ impl FacetStorage {
         })
     }
 
+    /// What fetching bytes `[byte_start, byte_end)` would cost, at chunk
+    /// granularity, and how much of it is already resident. `None` for
+    /// storage without chunks (local files).
     pub fn range_fill(&self, byte_start: u64, byte_end: u64) -> Option<RangeFill> {
         let (first, last, chunk_size, resident) = self.storage.range_fill(byte_start, byte_end)?;
         let aligned_start = first as u64 * chunk_size;
@@ -3148,7 +3203,7 @@ impl GenericTestDataView {
                 Some(StandardFacet::MetadataPredicates),
             ),
             (
-                "predicate_results",
+                "metadata_results",
                 self.config.predicate_results.as_ref(),
                 Some(StandardFacet::MetadataResults),
             ),

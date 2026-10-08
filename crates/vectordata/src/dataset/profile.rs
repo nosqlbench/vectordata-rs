@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dataset profiles — named configurations of data views with inheritance.
+//! Library API. Dataset profiles — named configurations of data views with inheritance.
 //!
 //! A profile groups data views (keyed by canonical facet names) together with
 //! optional metadata like `maxk`. Profiles support inheritance: when a

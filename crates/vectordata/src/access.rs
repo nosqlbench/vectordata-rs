@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Access-mode taxonomy for vector data sources.
+//! Library API. Access-mode taxonomy for vector data sources.
 //!
 //! Datasets reach the runtime through one of four [`AccessMode`]
 //! variants. Two are sparse — chunks are fetched on demand and
@@ -67,25 +67,6 @@ pub enum AccessMode {
 }
 
 impl AccessMode {
-    /// Predict the access mode for a source without performing
-    /// network I/O.
-    ///
-    /// `resolved_source` is the full source string the underlying
-    /// storage layer would see (absolute path, `file://` URI, or
-    /// remote URL — relative paths must already be resolved against
-    /// their catalog's location).
-    ///
-    /// `cache_dir` is the configured cache root. When the file's
-    /// `.mrkl` sidecar is already present under this root, the
-    /// classification can upgrade `MerkleChunked` → `MerkleHashed`
-    /// (proof from the prior open). Pass an empty path to skip the
-    /// sidecar lookup.
-    ///
-    /// Conservative bias: when offline information can't distinguish
-    /// merkle-hashed from merkle-chunked, returns `MerkleChunked`
-    /// (the safe sparse path that works without `.mref`). When
-    /// sparse access can't apply at all (vvec format, unknown
-    /// extension), returns `FullTransfer`.
     /// How constraining this mode is on a caller, lowest first.
     ///
     /// Not a quality ranking: the axis is what a caller must plan
@@ -120,6 +101,25 @@ impl AccessMode {
         modes.into_iter().min_by_key(|m| m.strength())
     }
 
+    /// Predict the access mode for a source without performing
+    /// network I/O.
+    ///
+    /// `resolved_source` is the full source string the underlying
+    /// storage layer would see (absolute path, `file://` URI, or
+    /// remote URL — relative paths must already be resolved against
+    /// their catalog's location).
+    ///
+    /// `cache_dir` is the configured cache root. When the file's
+    /// `.mrkl` sidecar is already present under this root, the
+    /// classification can upgrade `MerkleChunked` → `MerkleHashed`
+    /// (proof from the prior open). Pass an empty path to skip the
+    /// sidecar lookup.
+    ///
+    /// Conservative bias: when offline information can't distinguish
+    /// merkle-hashed from merkle-chunked, returns `MerkleChunked`
+    /// (the safe sparse path that works without `.mref`). When
+    /// sparse access can't apply at all (vvec format, unknown
+    /// extension), returns `FullTransfer`.
     pub fn classify(resolved_source: &str, cache_dir: &Path) -> AccessMode {
         if !crate::transport::is_remote_url(resolved_source) {
             return AccessMode::Local;

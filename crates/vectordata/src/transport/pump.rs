@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parallel work-pump: a fixed pool of scoped worker threads draining a
+//! Internal. Parallel work-pump: a fixed pool of scoped worker threads draining a
 //! shared queue, with first-error abort and a calling-thread progress/
 //! checkpoint tick.
 //!

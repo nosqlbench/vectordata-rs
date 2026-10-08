@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Canonical implementation of the user-facing `config` admin
+//! CLI support. Canonical implementation of the user-facing `config` admin
 //! commands.
 //!
 //! Every operation lives here once. Both the in-tree `vectordata`
@@ -12,20 +12,19 @@
 //!
 //! Operations:
 //!
-//! - [`show`](crate::config::show) — print the active configuration (settings file path,
+//! - [`show`] — print the active configuration (settings file path,
 //!   `cache_dir`, status, used space, protect flag).
-//! - [`set_cache`](crate::config::set_cache) — write a new `cache_dir` into `settings.yaml`,
+//! - [`set_cache`] — write a new `cache_dir` into `settings.yaml`,
 //!   honoring `protect_settings: true` unless `force=true`.
-//! - [`list_mounts`](crate::config::list_mounts) — enumerate writable mount points with available
+//! - [`list_mounts`] — enumerate writable mount points with available
 //!   and total space; the standard "where should I put my cache"
 //!   helper.
-//! - [`add_catalog`](crate::config::add_catalog), [`remove_catalog`](crate::config::remove_catalog), [`list_catalogs`](crate::config::list_catalogs) —
+//! - [`add_catalog`], [`remove_catalog`], [`list_catalogs`] —
 //!   manage `catalogs.yaml`, the list of catalog sources used by
 //!   [`crate::catalog::resolver::Catalog::of`].
 
 use std::path::{Path, PathBuf};
 
-use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::{CatalogSources, raw_catalog_entries};
 use crate::mounts;
 use crate::settings::{self, SettingsWriteError, WriteCacheOutcome};
@@ -113,6 +112,7 @@ pub fn get_cache() -> i32 {
 /// Both spellings are accepted; `largest-writable-mount` is what the
 /// help text advertises and `auto` is the shorter alias.
 pub const AUTO_CACHE_SENTINEL_LONG: &str = "largest-writable-mount";
+/// Short alias of [`AUTO_CACHE_SENTINEL_LONG`].
 pub const AUTO_CACHE_SENTINEL_SHORT: &str = "auto";
 
 /// Write `cache_dir` into `settings.yaml`. Honors
@@ -597,7 +597,7 @@ pub fn set_update_check(value: &str) -> i32 {
 /// against a fixture server.
 pub fn verify_catalog_source(source: &str) -> Result<usize, String> {
     let sources = CatalogSources::new().add_catalogs(&[source.to_string()]);
-    let catalog = Catalog::of(&sources);
+    let catalog = crate::datasets::open_catalog(&sources);
     let count = catalog.datasets().len();
     if count == 0 {
         return Err("no datasets found at this location".to_string());

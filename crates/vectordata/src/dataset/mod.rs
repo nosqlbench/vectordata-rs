@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dataset configuration model for vector datasets.
+//! Library API. Dataset configuration model for vector datasets.
 //!
 //! Defines the canonical `dataset.yaml` schema used to describe vector test
 //! datasets, including profiles, pipeline definitions, facet mappings, and

@@ -1,13 +1,13 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Standard facet kinds for vector datasets.
+//! Library API. Standard facet kinds for vector datasets.
 //!
 //! [`StandardFacet`] enumerates the well-known facet types that define a
 //! dataset's layout: `base_vectors`, `query_vectors`, `neighbor_indices`,
 //! `neighbor_distances`, metadata content/predicates/results/layout, and
-//! the two predicated KNN ground-truth variants — pre-filter (`E`) and
-//! post-filter (`F`).
+//! the two predicated KNN ground-truth variants — pre-filter (`F`) and
+//! post-filter (`E`).
 //!
 //! Each facet has a canonical key name (used in `dataset.yaml` profile
 //! definitions) and a set of shorthand aliases for convenience. This module
@@ -149,6 +149,8 @@ impl FacetFormat {
     }
 }
 
+/// A well-known facet kind, with a canonical `dataset.yaml` key and a
+/// single-letter facet code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StandardFacet {
     /// Base vectors (the corpus to search) — facet code `B`

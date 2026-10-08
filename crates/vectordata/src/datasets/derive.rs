@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `<binary> datasets derive` — materialize a profile of an
+//! CLI support. `<binary> datasets derive` — materialize a profile of an
 //! existing dataset as a self-standing dataset.
 //!
 //! Where `precache` brings a profile's bytes into the local cache
@@ -343,7 +343,10 @@ fn derive_via_access_layer(
     };
 
     eprintln!("Prebuffering source profile so windows can be sliced locally…");
-    if let Err(e) = view.prebuffer_all() {
+    if let Err(e) = view.fetch(
+        &crate::fetch::FetchRequest::all(),
+        &mut crate::fetch::TextMeter::stderr("Prebuffer"),
+    ) {
         eprintln!("error: failed to precache source: {e}");
         return 1;
     }
@@ -590,7 +593,7 @@ fn run_plan(
 ) -> i32 {
     let total_bytes: u64 = plan.iter().map(|r| r.expected_bytes).sum();
     eprintln!("Materializing {} facet(s), {} to write.",
-        plan.len(), super::precache::fmt_bytes(total_bytes));
+        plan.len(), crate::fetch::meter::fmt_bytes(total_bytes));
 
     let mut meter = DeriveMeter::new(plan.len(), total_bytes);
     let mut derived_facets: Vec<DerivedFacet> = Vec::new();
@@ -788,7 +791,7 @@ impl DeriveMeter {
         // Clear the live line and print a permanent ✓ row.
         eprintln!("\r  [{}/{}] {} \u{2713} {}\u{1b}[K",
             self.facet_index, self.facet_count, facet,
-            super::precache::fmt_bytes(expected_bytes));
+            crate::fetch::meter::fmt_bytes(expected_bytes));
         self.bytes_done_in_prior_facets =
             self.bytes_done_in_prior_facets.saturating_add(expected_bytes);
         self.current_facet.clear();
@@ -806,7 +809,7 @@ impl DeriveMeter {
         use std::io::Write;
         let aggregate_done = self.bytes_done_in_prior_facets
             .saturating_add(self.current_facet_bytes);
-        let pct_total = super::precache::pct(aggregate_done, self.total_bytes);
+        let pct_total = crate::fetch::meter::pct(aggregate_done, self.total_bytes);
         let facet_state = match self.phase {
             Phase::Copy => {
                 if self.current_facet_total == 0 {
@@ -814,9 +817,9 @@ impl DeriveMeter {
                 } else {
                     format!(
                         "copy {}% ({}/{})",
-                        super::precache::pct(self.current_facet_bytes, self.current_facet_total),
-                        super::precache::fmt_bytes(self.current_facet_bytes),
-                        super::precache::fmt_bytes(self.current_facet_total),
+                        crate::fetch::meter::pct(self.current_facet_bytes, self.current_facet_total),
+                        crate::fetch::meter::fmt_bytes(self.current_facet_bytes),
+                        crate::fetch::meter::fmt_bytes(self.current_facet_total),
                     )
                 }
             }
@@ -826,9 +829,9 @@ impl DeriveMeter {
                 } else {
                     format!(
                         "merkle {}% ({}/{})",
-                        super::precache::pct(self.current_merkle_bytes, self.current_merkle_total),
-                        super::precache::fmt_bytes(self.current_merkle_bytes),
-                        super::precache::fmt_bytes(self.current_merkle_total),
+                        crate::fetch::meter::pct(self.current_merkle_bytes, self.current_merkle_total),
+                        crate::fetch::meter::fmt_bytes(self.current_merkle_bytes),
+                        crate::fetch::meter::fmt_bytes(self.current_merkle_total),
                     )
                 }
             }
@@ -838,8 +841,8 @@ impl DeriveMeter {
             self.facet_index, self.facet_count, self.current_facet,
             facet_state,
             pct_total,
-            super::precache::fmt_bytes(aggregate_done),
-            super::precache::fmt_bytes(self.total_bytes));
+            crate::fetch::meter::fmt_bytes(aggregate_done),
+            crate::fetch::meter::fmt_bytes(self.total_bytes));
         let _ = std::io::stderr().flush();
     }
 
@@ -848,9 +851,9 @@ impl DeriveMeter {
         let done = self.bytes_done_in_prior_facets;
         eprintln!("Derive done: {} facet(s), {} in {:.1}s ({}/s).",
             self.facet_count,
-            super::precache::fmt_bytes(done),
+            crate::fetch::meter::fmt_bytes(done),
             elapsed,
-            super::precache::fmt_bytes((done as f64 / elapsed.max(0.001)) as u64));
+            crate::fetch::meter::fmt_bytes((done as f64 / elapsed.max(0.001)) as u64));
     }
 }
 
@@ -1887,12 +1890,11 @@ fn resolve_spec(
         eprintln!("Add a catalog with: vectordata config catalog add <URL-or-path>");
         return None;
     }
-    let catalog = Catalog::of(&sources);
-    let entry = match catalog.find_exact(head) {
-        Some(e) => e,
-        None => {
-            eprintln!("Dataset '{head}' not found.");
-            catalog.list_datasets(head);
+    let catalog = super::open_catalog(&sources);
+    let entry = match catalog.lookup(head) {
+        Ok(e) => e,
+        Err(e) => {
+            super::report_lookup_failure(&catalog, &e);
             return None;
         }
     };

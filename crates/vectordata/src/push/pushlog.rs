@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `pushlog.jsonl` — the single primary provenance artifact for a
+//! Library API. `pushlog.jsonl` — the single primary provenance artifact for a
 //! pushed dataset, modeled as an append-only event log.
 //!
 //! Every push is *bracketed* by two events sharing one monotonically
@@ -28,8 +28,14 @@ pub const PUSHLOG_FILE: &str = "pushlog.jsonl";
 /// A single overwritten object recorded on a `begin` event.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Overwrite {
+    /// Object key: the file's forward-slashed path relative to the
+    /// publish root.
     pub key: String,
+    /// The remote's digest before the push, as `sha256:<hex>`, or
+    /// `unknown` when the file exists remotely but its directory's
+    /// `SHA256SUMS` does not list it.
     pub old_digest: String,
+    /// The local digest being uploaded over it, as `sha256:<hex>`.
     pub new_digest: String,
 }
 
@@ -42,27 +48,42 @@ pub struct Overwrite {
 pub enum Event {
     /// Opens a push: declares intent and the fingerprints it will set.
     Begin {
+        /// Version number of this push, shared with its `complete`.
         seq: u64,
+        /// When the push was written, as an HTTP date (RFC 7231).
         ts: String,
+        /// Who pushed, as `user@host`.
         actor: String,
+        /// The invoking command line, verbatim.
         cmd: String,
+        /// The `-m` justification; required when the push overwrites
+        /// or deletes remote data.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// Remote objects this push replaces.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         overwrites: Vec<Overwrite>,
+        /// Keys of objects new to the remote.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         added: Vec<String>,
+        /// Keys of remote orphans removed under `--delete`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         deletes: Vec<String>,
+        /// Intended end state: content directory (relative to the
+        /// publish root) to `sha256:<hex>` of its `SHA256SUMS`.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         sums: BTreeMap<String, String>,
+        /// Version of the `vectordata` crate that wrote the event.
         tool_version: String,
     },
     /// Closes a push: the version is stable for download. Echoes the
     /// per-directory `sums` so a tail-only reader is self-contained.
     Complete {
+        /// Version number being completed; matches its `begin`.
         seq: u64,
+        /// When the version went live, as an HTTP date (RFC 7231).
         ts: String,
+        /// Per-directory `SHA256SUMS` digests, as on the `begin`.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         sums: BTreeMap<String, String>,
     },
@@ -71,9 +92,13 @@ pub enum Event {
     /// was re-driven fresh under a later seq). Like `complete`, it makes
     /// the seq no longer "open".
     Abort {
+        /// Version number of the abandoned `begin`.
         seq: u64,
+        /// When it was abandoned, as an HTTP date (RFC 7231).
         ts: String,
+        /// Who abandoned it, as `user@host`.
         actor: String,
+        /// Why it was abandoned, when recorded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
@@ -98,6 +123,7 @@ impl Event {
 /// An in-memory view of a `pushlog.jsonl`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Log {
+    /// Events in file order, oldest first.
     pub events: Vec<Event>,
 }
 
@@ -108,12 +134,21 @@ pub enum Convergence {
     Equal,
     /// Local is the remote plus `extra` trailing events the remote
     /// lacks — recoverable; carry the extras up after acknowledgement.
-    LocalAhead { extra: usize },
+    LocalAhead {
+        /// Number of local events past the shared prefix.
+        extra: usize,
+    },
     /// Remote is the local plus `extra` trailing events — divergent;
     /// the local must re-sync before pushing.
-    RemoteAhead { extra: usize },
+    RemoteAhead {
+        /// Number of remote events past the shared prefix.
+        extra: usize,
+    },
     /// Neither is a prefix of the other — forked histories.
-    Diverged { common: usize },
+    Diverged {
+        /// Length of the longest shared prefix, in events.
+        common: usize,
+    },
 }
 
 impl Log {

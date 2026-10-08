@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Data source specifications: [`DSSource`], [`DSInterval`], [`DSWindow`].
+//! Library API. Data source specifications: [`DSSource`], [`DSInterval`], [`DSWindow`].
 //!
 //! A [`DSSource`] identifies a file path plus optional namespace and window
 //! (record range). Sources can be specified as bare strings with inline

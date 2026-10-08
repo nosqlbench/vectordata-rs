@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Named strata — sized-profile generator specs keyed by name.
+//! Library API. Named strata — sized-profile generator specs keyed by name.
 //!
 //! A *stratum* is one sized-profile generator spec (the
 //! `mul:/fib:/linear:/decade` grammar parsed by

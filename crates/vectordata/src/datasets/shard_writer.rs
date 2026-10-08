@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Writing a facet across a series of shard files.
+//! CLI support. Writing a facet across a series of shard files.
 //!
 //! Takes a stream of whole records and rolls over to the next file every
 //! `stride` records, producing the **uniform** layout — the only form

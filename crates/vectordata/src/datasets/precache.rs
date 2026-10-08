@@ -1,40 +1,40 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `<binary> datasets precache` — drive a dataset profile to
-//! fully-resident state through the canonical reader API.
+//! CLI support. `<binary> datasets precache`: the command-line adapter
+//! over the library fetch.
 //!
 //! Reachable as `vectordata datasets precache` or `veks datasets
-//! precache` — both binaries dispatch into this module.
+//! precache` — both binaries dispatch into this module. **Everything it
+//! does is library API:** it resolves the spec with
+//! [`Catalog::open_selection`](crate::catalog::Catalog::open_selection),
+//! plans with [`TestDataView::plan_fetch`]
+//! or [`TestDataGroup::plan_fetch`](crate::TestDataGroup::plan_fetch),
+//! and executes the plan with a [`TextMeter`] attached. What this module
+//! adds is only what a command line needs: string-shaped input,
+//! headings, the `--plan` table, and an exit code. A program should call
+//! [`crate::fetch`] directly.
 //!
-//! Source resolution: catalog name, `name:profile` pair, local path
-//! / `dataset.yaml`, or HTTP URL. The reader layer dispatches
-//! per-facet:
+//! Per facet, the reader layer decides how bytes arrive:
 //!
-//! - **local file** → `Storage::Mmap`, no copy, no merkle, no work.
-//! - **remote URL with `.mref`** → `Storage::Cached`; download +
-//!   merkle-verify chunks into the configured cache directory,
-//!   promote to mmap on completion.
-//! - **remote URL without `.mref`** → `Storage::Http`; download the
-//!   full file via parallel fixed-size HTTP RANGE chunks (same
-//!   `download_concurrency` worker pool + retry policy as the
-//!   `.mref` path, but trusting TLS rather than a per-chunk hash
-//!   chain) into the cache directory, promote to mmap on completion.
-//!
-//! The driver prints a live single-line status meter with per-facet
-//! and aggregate progress (carriage-return-overwritten on stderr).
-//! Pre-walks the facet manifest once to know the total download
-//! size upfront, then streams chunk-level updates from
-//! [`crate::view::TestDataView::prebuffer_all_with_progress`].
+//! - **local file** → mmap, nothing to fetch.
+//! - **remote URL with `.mref`** → download and merkle-verify chunks
+//!   into the cache directory, promote to mmap on completion.
+//! - **remote URL without `.mref`** → download over parallel HTTP range
+//!   requests, trusting TLS rather than a per-chunk hash chain, into the
+//!   cache directory, promote to mmap on completion.
 
 use std::path::{Path, PathBuf};
 
 use super::build_sources;
 use crate::catalog::resolver::Catalog;
-use crate::{PrebufferProgress, TestDataView};
 use crate::dataset::selector::{DatasetSpec, SelectorError};
+use crate::fetch::meter::fmt_bytes;
+use crate::fetch::{FetchPlan, FetchRequest, TextMeter};
+use crate::{Error, TestDataView};
 
-/// Everything a precache run needs.
+/// Everything a precache run needs, in command-line shape. A program
+/// builds a [`FetchRequest`] instead.
 ///
 /// A struct rather than a widening positional list: the call already
 /// carried five arguments before windows and facet selection, and four
@@ -43,8 +43,11 @@ use crate::dataset::selector::{DatasetSpec, SelectorError};
 pub struct PrecacheRequest {
     /// `name`, `name:profile`, a local path, a `dataset.yaml`, or a URL.
     pub dataset_spec: String,
+    /// Directory holding `catalogs.yaml` (`--configdir`).
     pub configdir: String,
+    /// Catalog locations added to the configured ones (`--catalog`).
     pub extra_catalogs: Vec<String>,
+    /// Catalog locations used instead of the configured ones (`--at`).
     pub at: Vec<String>,
     /// Recorded and reported; the active cache root comes from settings.
     pub cache_dir: Option<PathBuf>,
@@ -110,14 +113,11 @@ impl PrecacheRequest {
 /// informational; the actual cache root is resolved via
 /// [`crate::settings::cache_dir`].
 ///
-/// Returns a process exit code (0 = success).
+/// Returns a process exit code: 0 on success, 1 when the fetch or a
+/// lookup fails, 2 when the request itself is refused (a malformed
+/// window or selector, an unknown facet, a window that would become a
+/// whole-facet download).
 pub fn run(req: PrecacheRequest) -> i32 {
-    let dataset_spec = req.dataset_spec.as_str();
-    let configdir = req.configdir.as_str();
-    let extra_catalogs = req.extra_catalogs.as_slice();
-    let at = req.at.as_slice();
-    let cache_dir = req.cache_dir.as_deref();
-
     // A window has to parse before anything is opened or downloaded.
     // Discovering it is malformed after the catalog round-trip wastes
     // the user's time for no reason.
@@ -136,14 +136,13 @@ pub fn run(req: PrecacheRequest) -> i32 {
         Ok(p) => Some(p),
         Err(e) => {
             // Only fatal if we'll actually need the cache. Local-only
-            // datasets precache fine without one. Defer the fatal
-            // until we know the dispatch outcome.
+            // datasets precache fine without one.
             eprintln!("note: {e}");
             eprintln!();
             None
         }
     };
-    if let Some(override_) = cache_dir {
+    if let Some(override_) = req.cache_dir.as_deref() {
         eprintln!(
             "note: --cache-dir {} is recorded but the active cache root is {}",
             override_.display(),
@@ -154,7 +153,7 @@ pub fn run(req: PrecacheRequest) -> i32 {
         );
     }
 
-    let (head, spec_selector) = match classify_spec(dataset_spec) {
+    let (head, spec_selector) = match classify_spec(&req.dataset_spec) {
         Ok(split) => split,
         Err(e) => {
             eprintln!("error: {e}");
@@ -163,73 +162,63 @@ pub fn run(req: PrecacheRequest) -> i32 {
     };
     // An explicit --profile outranks whatever the spec implied; it is
     // a selector too (PS-14).
-    let selector = req.profile.clone().or(spec_selector);
-    let Some(selector) = selector else {
+    let Some(selector) = req.profile.clone().or(spec_selector) else {
         eprintln!("error: {}", bare_spec_refusal(&head));
         return 2;
     };
-    let resolution = match resolve_spec(&head, Some(&selector), configdir, extra_catalogs, at) {
-        Some(r) => r,
-        None => return 1,
-    };
 
-    // Open through whichever path knows how to materialise this
-    // shape. Catalog-resolved entries MUST go through
-    // `Catalog::open` so the knn_entries-shape synthesis path is
-    // taken when applicable — `TestDataGroup::load(entry.path)`
-    // would point at the catalog base URL for those entries (there
-    // is no per-dataset `dataset.yaml` to load) and fail.
-    let (group, descriptor) = match resolution {
-        Resolved::CatalogEntry { catalog, name } => {
-            let group = match catalog.open(&name) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("error: failed to open dataset '{name}': {e}");
-                    return 1;
-                }
-            };
-            (group, name)
+    // Catalogs are loaded only for a head that names a dataset: a path
+    // or URL opens directly, and fetching remote catalogs to then not
+    // use them would be wasted round trips.
+    let catalog = if crate::transport::is_remote_url(&head) || Path::new(&head).exists() {
+        Catalog::default()
+    } else {
+        let sources = build_sources(&req.configdir, &req.extra_catalogs, &req.at);
+        if sources.is_empty() {
+            eprintln!("'{head}' is not a local path, not a URL, and no catalog is configured.");
+            eprintln!("Add a catalog with:");
+            eprintln!("  vectordata config catalog add <URL-or-path>");
+            eprintln!("Or use --catalog/--at for one-off access.");
+            return 1;
         }
-        Resolved::Local(path) | Resolved::Url(path) => {
-            let group = match crate::TestDataGroup::load(&path) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("error: failed to open dataset at {path}: {e}");
-                    return 1;
-                }
-            };
-            (group, path)
+        super::open_catalog(&sources)
+    };
+    let selection = match catalog.open_selection(&head, Some(&selector)) {
+        Ok(s) => s,
+        Err(e) => {
+            super::report_lookup_failure(&catalog, &e);
+            return 1;
         }
     };
+    let descriptor = selection.dataset().to_string();
 
     if let Some(c) = &configured {
         eprintln!("  Cache root: {}", c.display());
     }
 
-    // The set the selector names, size-ordered (PS-9). Precache acts
-    // on every match; one match is the single-profile run it always
-    // was.
-    let names = match group.select(Some(&selector)) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("error: {descriptor}: {e}");
-            return 1;
-        }
+    let fetch = FetchRequest::facets(req.facets.iter().cloned())
+        .fallback(whole_facet_fallback(req.allow_whole_facet));
+    let fetch = match window {
+        Some(w) => fetch.window(w),
+        None => fetch,
     };
-    if let [profile_name] = names.as_slice() {
-        let view = group.profile(profile_name).expect("a selected profile exists");
+    let mut meter = TextMeter::stderr("Precache");
+
+    let names = selection.profiles();
+    if let [profile_name] = names {
+        let view = match selection.view() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        };
+        let label = format!("{descriptor}:{profile_name}");
         if req.is_selective() {
-            return drive_selective(
-                &*view,
-                &format!("{descriptor}:{profile_name}"),
-                &req.facets,
-                window.as_ref(),
-                req.plan_only,
-                req.allow_whole_facet,
-            );
+            return drive_selective(&*view, &label, &fetch, req.plan_only, &mut meter);
         }
-        eprintln!("Prebuffering {descriptor}:{profile_name}");
-        return drive_prebuffer(&*view, req.allow_whole_facet);
+        eprintln!("Prebuffering {label}");
+        return drive_prebuffer(&*view, &fetch, &mut meter);
     }
     if req.is_selective() {
         // A facet or window selection needs one profile to resolve
@@ -250,23 +239,7 @@ pub fn run(req: PrecacheRequest) -> i32 {
         names.len(),
         names.join(", ")
     );
-    drive_prebuffer_all(&group, &names, req.allow_whole_facet)
-}
-
-enum Resolved {
-    /// Catalog-resolved entry. Carries the catalog itself so the
-    /// caller goes through `Catalog::open(name)` — that's the only
-    /// path that handles `knn_entries.yaml`-shape catalogs
-    /// correctly (those entries have no per-dataset `dataset.yaml`;
-    /// the catalog's own embedded layout *is* the dataset
-    /// description, and `Catalog::open` synthesises the group from
-    /// it).
-    CatalogEntry {
-        catalog: Catalog,
-        name: String,
-    },
-    Local(String),
-    Url(String),
+    drive_prebuffer_all(&selection, &fetch, &mut meter)
 }
 
 /// Split a spec into the part that names a dataset and the selector
@@ -306,88 +279,32 @@ fn bare_spec_refusal(head: &str) -> String {
     )
 }
 
-/// Resolve a dataset head to where it lives. Returns `None` when
-/// resolution fails after writing a diagnostic to stderr — the caller
-/// surfaces the exit code. A catalog entry has the selector checked
-/// against it here, before anything is fetched (PS-9).
-fn resolve_spec(
-    head: &str,
-    selector: Option<&str>,
-    configdir: &str,
-    extra_catalogs: &[String],
-    at: &[String],
-) -> Option<Resolved> {
-    if head.starts_with("http://") || head.starts_with("https://") {
-        return Some(Resolved::Url(head.to_string()));
-    }
-    let as_path = Path::new(head);
-    if as_path.exists() {
-        return Some(Resolved::Local(head.to_string()));
-    }
-    let sources = build_sources(configdir, extra_catalogs, at);
-    if sources.is_empty() {
-        eprintln!(
-            "'{}' is not a local path, not a URL, and no catalog is configured.",
-            head
-        );
-        eprintln!("Add a catalog with:");
-        eprintln!("  vectordata config catalog add <URL-or-path>");
-        eprintln!("Or use --catalog/--at for one-off access.");
-        return None;
-    }
-    let catalog = Catalog::of(&sources);
-    let entry = match catalog.find_exact(head) {
-        Some(e) => e,
-        None => {
-            eprintln!("Dataset '{head}' not found.");
-            catalog.list_datasets(head);
-            return None;
-        }
-    };
-    if let Err(e) = entry.select(selector) {
-        eprintln!("error: dataset '{}': {e}", entry.name);
-        return None;
-    }
-    let name = entry.name.clone();
-    Some(Resolved::CatalogEntry { catalog, name })
-}
-
 // ─── Drivers ─────────────────────────────────────────────────────────
 
-fn drive_prebuffer(view: &dyn TestDataView, allow_whole_facet: bool) -> i32 {
-    let plan = {
-        let mut status = StatusTicker::start();
-        match plan_prebuffer(view, &mut |e| status.on(e)) {
-            Ok(p) => p,
-            Err(e) => {
-                drop(status);
-                eprintln!("Precache: {e}");
-                return 1;
-            }
+/// Fetch one whole profile.
+fn drive_prebuffer(view: &dyn TestDataView, fetch: &FetchRequest, meter: &mut TextMeter) -> i32 {
+    let plan = match view.plan_fetch(fetch, meter) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Precache: {e}");
+            return 1;
         }
     };
-    if plan.facets.is_empty() {
+    if plan.is_empty() {
         println!("Precache: profile declared no facets.");
         return 0;
     }
-    if !allow_whole_facet && !plan.unresolvable.is_empty() {
-        report_unresolvable(&plan.unresolvable);
-        return 2;
+    if let Some(code) = refuse(&plan) {
+        return code;
     }
     eprintln!(
         "Prebuffering {} facet(s), {} to download. ({} streams × {} HTTP runtimes)",
-        plan.facets.len(),
-        fmt_bytes(plan.total_bytes),
+        plan.facets().len(),
+        fmt_bytes(plan.bytes_to_fetch()),
         crate::cache::download_concurrency(),
         crate::transport::http_runtimes()
     );
-    let mut ctx = LiveCtx::new(plan.facets.len(), plan.total_bytes);
-    let result = view.prebuffer_all_with_progress(
-        whole_facet_fallback(allow_whole_facet),
-        &mut |facet, p| ctx.on_progress(facet, p),
-    );
-    ctx.finalize(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
-    if result.is_err() { 1 } else { 0 }
+    execute(plan, meter)
 }
 
 /// Fetch a chosen window of chosen facets, or just say what that would
@@ -401,150 +318,49 @@ fn drive_prebuffer(view: &dyn TestDataView, allow_whole_facet: bool) -> i32 {
 fn drive_selective(
     view: &dyn TestDataView,
     label: &str,
-    facets: &[String],
-    window: Option<&crate::dataset::source::DSWindow>,
+    fetch: &FetchRequest,
     plan_only: bool,
-    allow_whole_facet: bool,
+    meter: &mut TextMeter,
 ) -> i32 {
-    let manifest = view.facet_manifest();
-    let selected: Vec<String> = if facets.is_empty() {
-        let mut names: Vec<String> = manifest.keys().cloned().collect();
-        names.sort();
-        names
-    } else {
-        // Name a facet that does not exist and the run stops, rather
-        // than quietly fetching the ones that do and reporting success.
-        let mut missing: Vec<&String> = facets
-            .iter()
-            .filter(|f| !manifest.contains_key(f.as_str()))
-            .collect();
-        if !missing.is_empty() {
-            missing.sort();
-            let mut known: Vec<&String> = manifest.keys().collect();
-            known.sort();
-            eprintln!(
-                "error: no such facet(s): {}",
-                missing
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            eprintln!(
-                "This profile declares: {}",
-                known
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            return 2;
-        }
-        facets.to_vec()
-    };
-
     // A requested window overrides every selected facet's own. Absent
     // one, each facet is planned against the window it declares — the
     // same plan the whole-profile precache runs — so `--plan` and
     // `--facet` describe and fetch what the profile addresses, never
     // a sized profile's whole base.
-    let window_label = match window {
+    let window_label = match fetch.record_window() {
         Some(w) => format!("records {w}"),
         None => "each facet's declared window".to_string(),
     };
     eprintln!("Precache {label} — {window_label}");
 
-    let mut plans = Vec::new();
-    // The window each plan was made against, so the fetch that follows
-    // asks for exactly what was planned and printed.
-    let mut windows: Vec<crate::dataset::source::DSWindow> = Vec::new();
-    let mut status = StatusTicker::start();
-    for (i, name) in selected.iter().enumerate() {
-        status.on(PlanEvent::Begin {
-            index: i + 1,
-            count: selected.len(),
-            name,
-            files: manifest.get(name).and_then(|d| d.shard_count).map(|n| n as usize),
-        });
-        let facet_window = match window {
-            Some(w) => w.clone(),
-            None => match manifest.get(name).map(crate::view::facet_declared_window) {
-                Some(Ok(w)) => w,
-                Some(Err(e)) => {
-                    eprintln!("error: facet '{name}': {e}");
-                    return 1;
-                }
-                None => crate::dataset::source::DSWindow(Vec::new()),
-            },
-        };
-        match view.prefetch_plan(name, &facet_window) {
-            Ok(plan) => {
-                status.on(PlanEvent::end_of(name, &plan));
-                plans.push((name.clone(), plan));
-                windows.push(facet_window);
-            }
-            Err(e) => {
-                drop(status);
-                eprintln!("error: facet '{name}': {e}");
-                return 1;
-            }
+    let plan = match view.plan_fetch(fetch, meter) {
+        Ok(p) => p,
+        Err(Error::UnknownFacets { missing, declared, .. }) => {
+            // Name a facet that does not exist and the run stops, rather
+            // than quietly fetching the ones that do and reporting success.
+            eprintln!("error: no such facet(s): {}", missing.join(", "));
+            eprintln!("This profile declares: {}", declared.join(", "));
+            return 2;
         }
-    }
-    drop(status);
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
 
-    print!("{}", render_plan(&plans));
+    print!("{}", render_plan(&plan));
     if plan_only {
         return 0;
     }
-
-    // Refuse the whole set before fetching any of it. Fetching the
-    // facets that can be windowed and then failing on one that cannot
-    // would leave the run half done for a reason the user could have
-    // been told up front.
-    let fallback = whole_facet_fallback(allow_whole_facet);
-    if !allow_whole_facet {
-        let refused: Vec<String> = plans
-            .iter()
-            .filter(|(_, p)| p.degrades_to_full_download)
-            .map(|(n, _)| n.clone())
-            .collect();
-        if !refused.is_empty() {
-            report_unresolvable(&refused);
-            return 2;
-        }
+    if let Some(code) = refuse(&plan) {
+        return code;
     }
-
-    for ((name, plan), facet_window) in plans.iter().zip(&windows) {
-        if plan.is_resident() {
-            eprintln!("  {name}: already resident");
-            continue;
-        }
-        let mut ctx = LiveCtx::new(1, plan.bytes_to_fetch());
-        let result = view.prefetch_with_progress(name, facet_window, fallback, &mut |p| {
-            // The prefetch callback carries transport progress; the
-            // renderer speaks the per-facet shape, so adapt.
-            ctx.on_progress(
-                name,
-                &PrebufferProgress {
-                    verified_chunks: p.completed_chunks(),
-                    total_chunks: p.total_chunks(),
-                    verified_bytes: p.downloaded_bytes(),
-                    total_bytes: p.total_bytes(),
-                },
-            );
-        });
-        ctx.finalize(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
-        if let Err(e) = result {
-            eprintln!("error: facet '{name}': {e}");
-            return 1;
-        }
-    }
-    0
+    execute(plan, meter)
 }
 
 /// Render one row per facet: what was asked for, what it costs, and
 /// what is already there.
-fn render_plan(plans: &[(String, crate::PrefetchPlan)]) -> String {
+fn render_plan(plan: &FetchPlan) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     let _ = writeln!(
@@ -552,9 +368,9 @@ fn render_plan(plans: &[(String, crate::PrefetchPlan)]) -> String {
         "\n  {:<28} {:>10} {:>10} {:>8} {:>10} {:>8}  note",
         "facet", "to fetch", "overfetch", "requests", "resident", "index"
     );
-    let mut total = 0u64;
-    for (name, plan) in plans {
-        total += plan.bytes_to_fetch();
+    for facet in plan.facets() {
+        let name = facet.id().to_string();
+        let plan = facet.plan();
         let resident = plan.fills.iter().map(|f| f.chunks_resident).sum::<u32>();
         let chunks = plan.fills.iter().map(|f| f.chunks).sum::<u32>();
         let note = if plan.degrades_to_full_download {
@@ -589,48 +405,36 @@ fn render_plan(plans: &[(String, crate::PrefetchPlan)]) -> String {
             note
         );
     }
-    let _ = writeln!(s, "\n  {} to fetch\n", fmt_bytes(total));
+    let _ = writeln!(s, "\n  {} to fetch\n", fmt_bytes(plan.bytes_to_fetch()));
     s
 }
 
-fn drive_prebuffer_all(group: &crate::TestDataGroup, names: &[String], allow_whole_facet: bool) -> i32 {
-    let mut all_facets: Vec<FacetPlanRow> = Vec::new();
-    let mut total_bytes = 0u64;
-    let mut unresolvable: Vec<String> = Vec::new();
-    let mut status = StatusTicker::start();
-    for profile_name in names {
-        if let Some(view) = group.profile(profile_name) {
-            let plan = match plan_prebuffer(&*view, &mut |e| status.on_in(profile_name, e)) {
-                Ok(p) => p,
-                Err(e) => {
-                    drop(status);
-                    eprintln!("Precache: profile '{profile_name}': {e}");
-                    return 1;
-                }
-            };
-            total_bytes += plan.total_bytes;
-            unresolvable.extend(plan.unresolvable.iter().map(|f| format!("{profile_name}/{f}")));
-            for row in plan.facets {
-                all_facets.push(FacetPlanRow {
-                    qualified_name: format!("{profile_name}/{}", row.qualified_name),
-                });
-            }
+/// Fetch every profile a selector matched.
+fn drive_prebuffer_all(
+    selection: &crate::catalog::DatasetSelection,
+    fetch: &FetchRequest,
+    meter: &mut TextMeter,
+) -> i32 {
+    let plan = match selection.plan_fetch(fetch, meter) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Precache: {e}");
+            return 1;
         }
-    }
-    drop(status);
-    if all_facets.is_empty() {
+    };
+    if plan.is_empty() {
         println!("Precache: no facets across the selected profiles.");
         return 0;
     }
-    if !allow_whole_facet && !unresolvable.is_empty() {
-        report_unresolvable(&unresolvable);
-        return 2;
+    if let Some(code) = refuse(&plan) {
+        return code;
     }
-    if total_bytes >= crate::PREBUFFER_LARGE_WARNING_BYTES {
+    let total = plan.bytes_to_fetch();
+    if total >= crate::PREBUFFER_LARGE_WARNING_BYTES {
         eprintln!(
             "warning: precache announced {} across the selected profiles \
                    (above the {} advisory threshold).",
-            fmt_bytes(total_bytes),
+            fmt_bytes(total),
             fmt_bytes(crate::PREBUFFER_LARGE_WARNING_BYTES)
         );
         eprintln!(
@@ -640,41 +444,36 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup, names: &[String], allow_who
     }
     eprintln!(
         "Prebuffering {} facet(s) across {} profiles, {} to download.",
-        all_facets.len(),
-        names.len(),
-        fmt_bytes(total_bytes)
+        plan.facets().len(),
+        selection.profiles().len(),
+        fmt_bytes(total)
     );
-
-    let mut ctx = LiveCtx::new(all_facets.len(), total_bytes);
-    let result = group.prebuffer_profiles_with_progress(
-        names,
-        whole_facet_fallback(allow_whole_facet),
-        &mut |profile, facet, p| {
-            let qualified = format!("{profile}/{facet}");
-            ctx.on_progress(&qualified, p);
-        },
-        &mut |_total| { /* warning already issued above */ },
-    );
-    ctx.finalize(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
-    if result.is_err() { 1 } else { 0 }
+    execute(plan, meter)
 }
 
-// ─── Plan + Live-update renderer ─────────────────────────────────────
-
-#[derive(Clone, Debug)]
-struct FacetPlanRow {
-    qualified_name: String,
+/// The exit code for a plan the library would refuse, before any
+/// heading announces a download that will not happen. `None` when the
+/// plan may run.
+fn refuse(plan: &FetchPlan) -> Option<i32> {
+    match plan.check() {
+        Ok(()) => None,
+        Err(Error::WindowUnresolvable { facets, .. }) => {
+            report_unresolvable(&facets);
+            Some(2)
+        }
+        Err(e) => {
+            eprintln!("Precache: failed — {e}");
+            Some(1)
+        }
+    }
 }
 
-struct PrebufferPlan {
-    facets: Vec<FacetPlanRow>,
-    /// Bytes the precache will fetch: each facet's declared window,
-    /// decomposed across its shards, net of chunks already resident.
-    total_bytes: u64,
-    /// Facets whose declared window the format cannot map, so
-    /// honouring it means fetching the facet whole. Refused up front
-    /// unless the caller accepts that.
-    unresolvable: Vec<String>,
+/// Run a checked plan; the meter reports success or failure.
+fn execute(plan: FetchPlan, meter: &mut TextMeter) -> i32 {
+    match plan.execute(meter) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
 }
 
 /// The fallback a caller's `--allow-whole-facet` selects.
@@ -687,9 +486,7 @@ fn whole_facet_fallback(allow_whole_facet: bool) -> crate::view::WholeFacetFallb
 }
 
 /// Say which facets a window cannot be honoured for, and what to do
-/// about it, before anything is fetched. Fetching the facets that can
-/// be windowed and then failing on one that cannot would leave the run
-/// half done for a reason the user could have been told up front.
+/// about it, before anything is fetched.
 fn report_unresolvable(refused: &[String]) {
     eprintln!(
         "error: the window cannot be resolved for {}, so honouring it \
@@ -706,414 +503,6 @@ fn report_unresolvable(refused: &[String]) {
         }
     );
     eprintln!("Pass --allow-whole-facet to accept that, or drop --window.");
-}
-
-/// What the planner is doing, for a caller that prints while it works.
-pub(super) enum PlanEvent<'a> {
-    /// About to open and plan facet `index` of `count`; `files` is the
-    /// number of files a sharded facet spans, `None` for a single file.
-    Begin {
-        index: usize,
-        count: usize,
-        name: &'a str,
-        files: Option<usize>,
-    },
-    /// Facet planned.
-    End {
-        name: &'a str,
-        /// Bytes the fetch will pull, net of resident chunks.
-        bytes: u64,
-        /// Nothing left to fetch.
-        resident: bool,
-        /// The declared window cannot be mapped; the fetch would be the
-        /// whole facet, and only `--allow-whole-facet` lets it happen.
-        unresolvable: bool,
-    },
-}
-
-impl<'a> PlanEvent<'a> {
-    fn end_of(name: &'a str, plan: &crate::PrefetchPlan) -> Self {
-        PlanEvent::End {
-            name,
-            bytes: if plan.degrades_to_full_download {
-                plan.facet_bytes
-            } else {
-                plan.bytes_to_fetch()
-            },
-            resident: plan.is_resident(),
-            unresolvable: plan.degrades_to_full_download,
-        }
-    }
-}
-
-/// Size a prebuffer before any of it runs, with the plan the precache
-/// will execute: each facet against the window it declares, a series
-/// decomposed across its shards. One planner for the headline and the
-/// fetch, so the number printed is the number downloaded.
-///
-/// `on` hears a [`PlanEvent::Begin`] before each facet is opened and a
-/// [`PlanEvent::End`] once it is planned. Opening is the slow part —
-/// on a sharded remote base it fetches one merkle reference per shard,
-/// tens of megabytes each, and for a slab its offset index — so a
-/// driver that says nothing until the plan returns shows the user a
-/// blank screen for as long as that takes.
-///
-/// Fails rather than guessing when a facet's window cannot be
-/// interpreted. Reporting the whole file for a malformed window would
-/// announce a terabyte, download it, and only then fail on the read —
-/// the plan is the last cheap place to catch it.
-fn plan_prebuffer(
-    view: &dyn TestDataView,
-    on: &mut dyn FnMut(PlanEvent<'_>),
-) -> crate::Result<PrebufferPlan> {
-    let mut facets = Vec::new();
-    let mut total_bytes = 0u64;
-    let mut unresolvable = Vec::new();
-    let manifest = view.facet_manifest();
-    // The spec's formats, not an element width: a slab holds data and
-    // has no element type, and asking the wrong question left metadata
-    // out of every precache.
-    let mut names: Vec<&String> = manifest
-        .keys()
-        .filter(|name| view.facet_holds_data(name))
-        .collect();
-    names.sort();
-    let count = names.len();
-    for (i, name) in names.into_iter().enumerate() {
-        let desc = &manifest[name];
-        on(PlanEvent::Begin {
-            index: i + 1,
-            count,
-            name,
-            files: desc.shard_count.map(|n| n as usize),
-        });
-        let window = crate::view::facet_declared_window(desc)
-            .map_err(|e| crate::Error::Other(format!("facet '{name}': {e}")))?;
-        if let Ok(plan) = view.prefetch_plan(name, &window) {
-            on(PlanEvent::end_of(name, &plan));
-            if plan.degrades_to_full_download {
-                total_bytes += plan.facet_bytes;
-                unresolvable.push(name.clone());
-            } else {
-                total_bytes += plan.bytes_to_fetch();
-            }
-            facets.push(FacetPlanRow {
-                qualified_name: name.clone(),
-            });
-        }
-    }
-    Ok(PrebufferPlan {
-        facets,
-        total_bytes,
-        unresolvable,
-    })
-}
-
-/// A status line that keeps moving while the planner opens files.
-///
-/// Between "Prebuffering" and the first progress line the planner
-/// opens every facet: on tessera that is five 33 MB merkle references
-/// and a 57 MB slab index, seven seconds during which nothing used to
-/// be printed. The ticker repaints the current step with its elapsed
-/// time four times a second, and closes each step with its result on
-/// its own line, so the screen always says what is happening and how
-/// long it has been happening.
-struct StatusTicker {
-    state: std::sync::Arc<std::sync::Mutex<TickState>>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-struct TickState {
-    /// The step being worked on and when it began; `None` between steps.
-    current: Option<(String, std::time::Instant)>,
-    stop: bool,
-}
-
-impl StatusTicker {
-    fn start() -> Self {
-        let state = std::sync::Arc::new(std::sync::Mutex::new(TickState {
-            current: None,
-            stop: false,
-        }));
-        let shared = state.clone();
-        let handle = std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                // Painting under the lock is what keeps a repaint from
-                // landing after the step's closing line.
-                let st = shared.lock().unwrap();
-                if st.stop {
-                    break;
-                }
-                if let Some((label, since)) = &st.current {
-                    use std::io::Write;
-                    eprint!("\r  {label}\u{2026} {:.1}s\u{1b}[K", since.elapsed().as_secs_f64());
-                    let _ = std::io::stderr().flush();
-                }
-            }
-        });
-        StatusTicker {
-            state,
-            handle: Some(handle),
-        }
-    }
-
-    /// Begin a step: paint its label now, then keep painting its age.
-    fn begin(&mut self, label: String) {
-        use std::io::Write;
-        let mut st = self.state.lock().unwrap();
-        eprint!("\r  {label}\u{2026}\u{1b}[K");
-        let _ = std::io::stderr().flush();
-        st.current = Some((label, std::time::Instant::now()));
-    }
-
-    /// Close the current step with its result, on its own line.
-    fn end(&mut self, line: String) {
-        let mut st = self.state.lock().unwrap();
-        st.current = None;
-        eprintln!("\r  {line}\u{1b}[K");
-    }
-
-    fn on(&mut self, event: PlanEvent<'_>) {
-        self.on_in("", event);
-    }
-
-    /// Like [`Self::on`], with the facet qualified by its profile.
-    fn on_in(&mut self, profile: &str, event: PlanEvent<'_>) {
-        let qualify = |name: &str| {
-            if profile.is_empty() {
-                name.to_string()
-            } else {
-                format!("{profile}/{name}")
-            }
-        };
-        match event {
-            PlanEvent::Begin {
-                index,
-                count,
-                name,
-                files,
-            } => {
-                let span = match files {
-                    Some(n) if n > 1 => format!(" ({n} files)"),
-                    _ => String::new(),
-                };
-                self.begin(format!("[{index}/{count}] {}{span}: opening", qualify(name)));
-            }
-            PlanEvent::End {
-                name,
-                bytes,
-                resident,
-                unresolvable,
-            } => {
-                let outcome = if unresolvable {
-                    format!("{} whole, its window cannot be mapped", fmt_bytes(bytes))
-                } else if resident {
-                    "already resident".to_string()
-                } else {
-                    format!("{} to fetch", fmt_bytes(bytes))
-                };
-                self.end(format!("{}: {outcome}", qualify(name)));
-            }
-        }
-    }
-}
-
-impl Drop for StatusTicker {
-    fn drop(&mut self) {
-        {
-            let mut st = self.state.lock().unwrap();
-            st.stop = true;
-            st.current = None;
-        }
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-pub(super) struct LiveCtx {
-    facet_count: usize,
-    total_bytes: u64,
-    bytes_per_facet: std::collections::HashMap<String, u64>,
-    current_facet: String,
-    facet_index: usize,
-    last_render: std::time::Instant,
-    started: std::time::Instant,
-}
-
-impl LiveCtx {
-    pub(super) fn new(facet_count: usize, total_bytes: u64) -> Self {
-        Self {
-            facet_count,
-            total_bytes,
-            bytes_per_facet: std::collections::HashMap::new(),
-            current_facet: String::new(),
-            facet_index: 0,
-            last_render: std::time::Instant::now() - std::time::Duration::from_secs(1),
-            started: std::time::Instant::now(),
-        }
-    }
-
-    pub(super) fn on_progress(&mut self, facet: &str, p: &PrebufferProgress) {
-        if facet != self.current_facet {
-            self.flush_facet_summary();
-            self.current_facet = facet.to_string();
-            self.facet_index += 1;
-            self.last_render = std::time::Instant::now() - std::time::Duration::from_secs(1);
-            // Print the in-place line immediately on facet switch
-            // so users see the meter flip to the new facet *before*
-            // the .mref network round trip completes.
-            self.render(facet, p);
-            self.last_render = std::time::Instant::now();
-        }
-        // Pre-open events arrive with `total_bytes == 0`; they only
-        // exist to flush the previous facet's summary and surface
-        // the new facet name. Skip the byte-accounting update for
-        // those — otherwise the post-open size briefly appears as
-        // a "regression" (0 bytes verified out of N total bytes).
-        if p.total_bytes > 0 {
-            self.bytes_per_facet
-                .insert(facet.to_string(), p.verified_bytes);
-        }
-        if self.last_render.elapsed().as_millis() >= 250 {
-            self.render(facet, p);
-            self.last_render = std::time::Instant::now();
-        }
-    }
-
-    fn render(&self, facet: &str, p: &PrebufferProgress) {
-        let aggregate_done: u64 = self.bytes_per_facet.values().sum();
-        let pct_total = pct(aggregate_done, self.total_bytes);
-        let facet_state = if p.total_bytes == 0 {
-            // Pre-open — `.mref` fetch in flight, size still unknown.
-            "opening…".to_string()
-        } else {
-            format!(
-                "{}% ({}/{})",
-                pct(p.verified_bytes, p.total_bytes),
-                fmt_bytes(p.verified_bytes),
-                fmt_bytes(p.total_bytes)
-            )
-        };
-        // Throughput + ETA. Held back until we've been downloading
-        // long enough for the rate to be meaningful — the first
-        // second is dominated by TLS handshake + initial chunk
-        // bring-up, so the implied "bytes / elapsed" would suggest
-        // an absurdly long ETA right when the user is most likely
-        // to look at it.
-        let elapsed = self.started.elapsed().as_secs_f64();
-        let trailing = if elapsed > 1.5 && aggregate_done > 0 && self.total_bytes > aggregate_done {
-            let rate = aggregate_done as f64 / elapsed;
-            let remaining = self.total_bytes - aggregate_done;
-            let eta_secs = (remaining as f64 / rate.max(1.0)) as u64;
-            format!(
-                " \u{2022} {}/s \u{2022} ETA {}",
-                fmt_bytes(rate as u64),
-                fmt_duration(eta_secs)
-            )
-        } else {
-            String::new()
-        };
-        use std::io::Write;
-        eprint!(
-            "\r  [{}/{}] {}: {} \u{2022} total {}% ({}/{}){}\u{1b}[K",
-            self.facet_index,
-            self.facet_count,
-            facet,
-            facet_state,
-            pct_total,
-            fmt_bytes(aggregate_done),
-            fmt_bytes(self.total_bytes),
-            trailing
-        );
-        let _ = std::io::stderr().flush();
-    }
-
-    /// Print a permanent "✓" line for the just-finished facet,
-    /// erasing the in-place progress line first.
-    fn flush_facet_summary(&self) {
-        if self.current_facet.is_empty() {
-            return;
-        }
-        let bytes = self
-            .bytes_per_facet
-            .get(&self.current_facet)
-            .copied()
-            .unwrap_or(0);
-        eprintln!(
-            "\r  [{}/{}] {} \u{2713} {}\u{1b}[K",
-            self.facet_index,
-            self.facet_count,
-            self.current_facet,
-            fmt_bytes(bytes)
-        );
-    }
-
-    pub(super) fn finalize<T, E: std::fmt::Display>(&self, result: &Result<T, E>) {
-        self.flush_facet_summary();
-        let elapsed = self.started.elapsed().as_secs_f64();
-        let done: u64 = self.bytes_per_facet.values().sum();
-        match result {
-            Ok(_) => {
-                eprintln!(
-                    "Precache done: {} facet(s), {} in {:.1}s ({}/s).",
-                    self.facet_count,
-                    fmt_bytes(done),
-                    elapsed,
-                    fmt_bytes((done as f64 / elapsed.max(0.001)) as u64)
-                );
-            }
-            Err(e) => {
-                eprintln!("Precache: failed — {e}");
-            }
-        }
-    }
-}
-
-pub(super) fn pct(done: u64, total: u64) -> u32 {
-    if total == 0 {
-        return 100;
-    }
-    ((done as u128 * 100) / total as u128) as u32
-}
-
-pub(super) fn fmt_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    const TIB: u64 = 1024 * GIB;
-    if bytes >= TIB {
-        format!("{:.1} TiB", bytes as f64 / TIB as f64)
-    } else if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
-/// Format a duration in seconds as a compact human string. Picks
-/// the largest unit pair: `45s`, `3m 22s`, `1h 12m`, `2d 04h`. The
-/// double-unit form keeps the resolution useful at the boundary
-/// (so a 60m ETA doesn't display as "1h 00m" right next to a 59s
-/// ETA without showing the seconds context).
-pub(super) fn fmt_duration(secs: u64) -> String {
-    const M: u64 = 60;
-    const H: u64 = 60 * M;
-    const D: u64 = 24 * H;
-    if secs < M {
-        format!("{secs}s")
-    } else if secs < H {
-        format!("{}m {:02}s", secs / M, secs % M)
-    } else if secs < D {
-        format!("{}h {:02}m", secs / H, (secs % H) / M)
-    } else {
-        format!("{}d {:02}h", secs / D, (secs % D) / H)
-    }
 }
 
 #[cfg(test)]
@@ -1220,65 +609,3 @@ mod spec_classification {
     }
 }
 
-#[cfg(test)]
-mod plan_events {
-    use super::*;
-
-    fn write_fvec(path: &Path, dim: i32, records: usize) {
-        use std::io::Write;
-        let mut f = std::fs::File::create(path).unwrap();
-        for i in 0..records {
-            f.write_all(&dim.to_le_bytes()).unwrap();
-            for d in 0..dim as usize {
-                f.write_all(&((i * 10 + d) as f32).to_le_bytes()).unwrap();
-            }
-        }
-    }
-
-    /// The planner announces each facet before it opens it and closes
-    /// it with its plan, so a driver can keep the screen alive through
-    /// the opens; a series says how many files it spans.
-    #[test]
-    fn planning_announces_each_facet_before_opening_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ds = tmp.path().join("ds");
-        std::fs::create_dir_all(&ds).unwrap();
-        write_fvec(&ds.join("base__0000.fvec"), 4, 10);
-        write_fvec(&ds.join("base__0001.fvec"), 4, 10);
-        write_fvec(&ds.join("base__0002.fvec"), 4, 5);
-        write_fvec(&ds.join("query.fvec"), 4, 3);
-        std::fs::write(
-            ds.join("dataset.yaml"),
-            "format_version: 2\nname: plan-events\nprofiles:\n  default:\n    base_vectors:\n      \
-             source: base__NNNN.fvec\n      shard_stride: 10\n      shard_count: 3\n      \
-             record_count: 25\n    query_vectors: query.fvec\n",
-        )
-        .unwrap();
-        let group = crate::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-        let view = group.profile("default").unwrap();
-
-        let mut seen: Vec<String> = Vec::new();
-        let plan = plan_prebuffer(&*view, &mut |e| {
-            seen.push(match e {
-                PlanEvent::Begin { index, count, name, files } => {
-                    format!("begin {index}/{count} {name} files={files:?}")
-                }
-                PlanEvent::End { name, resident, unresolvable, .. } => {
-                    format!("end {name} resident={resident} unresolvable={unresolvable}")
-                }
-            });
-        })
-        .unwrap();
-
-        assert_eq!(plan.facets.len(), 2);
-        assert_eq!(
-            seen,
-            [
-                "begin 1/2 base_vectors files=Some(3)",
-                "end base_vectors resident=true unresolvable=false",
-                "begin 2/2 query_vectors files=None",
-                "end query_vectors resident=true unresolvable=false",
-            ]
-        );
-    }
-}

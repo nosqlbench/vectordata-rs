@@ -1,10 +1,15 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks datasets cache` — list locally cached datasets.
+//! CLI support. `veks datasets cache` — list locally cached datasets.
 
 use std::path::Path;
 
+/// Print the datasets in the cache directory (`cache_dir`, else the
+/// configured one) with their file counts and allocated sizes, and with
+/// `verbose`, each file. Only directories carrying a dataset origin
+/// record are listed. Exits the process with 2 when no cache directory
+/// is given and none is configured.
 pub fn run(cache_dir: Option<&Path>, verbose: bool) {
     let cache_dir = cache_dir
         .map(|p| p.to_path_buf())
@@ -159,7 +164,6 @@ pub fn run_cache_status(
     at: &[String],
 ) {
     use crate::merkle::MerkleState;
-    use crate::catalog::resolver::Catalog;
     use crate::catalog::sources::CatalogSources;
 
     let cache_dir = configured_cache_dir_or_exit();
@@ -175,7 +179,7 @@ pub fn run_cache_status(
             sources = sources.add_catalogs(extra_catalogs);
         }
     }
-    let catalog = Catalog::of(&sources);
+    let catalog = super::open_catalog(&sources);
     let entry = catalog.find_exact(dataset_name);
 
     println!("Cache status: {}", dataset_name);

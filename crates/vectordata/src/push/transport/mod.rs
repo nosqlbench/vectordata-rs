@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Write-side transport for `vectordata push`, dispatched on the URL
+//! Library API. Write-side transport for `vectordata push`, dispatched on the URL
 //! scheme — the mirror of the read-side `Storage`/transport factoring.
 //!
 //! A single [`open`] call picks the implementation for a `.publish_url`
@@ -27,7 +27,10 @@ use super::binding::ParsedPublishUrl;
 /// stores (multipart, MD5, etc.).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteObject {
+    /// Object size in bytes.
     pub size: u64,
+    /// The store's entity tag, used as the `if_match` guard for a
+    /// conditional `put`; `None` when the store reported none.
     pub etag: Option<String>,
 }
 
@@ -111,19 +114,21 @@ pub trait PushTransport: Send + Sync {
 
 /// Select and construct the transport for a bound endpoint. `concurrency`
 /// bounds parallel chunk uploads on transports that support them (the `vecd`
-/// resumable path); others ignore it.
+/// resumable path); others ignore it. `live_progress` lets a transport draw
+/// a live upload display on the terminal — set only when the caller chose
+/// to report on stderr and stderr is a terminal.
 pub fn open(
     binding: &ParsedPublishUrl,
     opts: &TransportOptions,
     concurrency: u32,
+    live_progress: bool,
 ) -> Result<Box<dyn PushTransport>, String> {
     match binding.scheme.as_str() {
         "file" => Ok(Box::new(local::LocalTransport::from_url(&binding.url)?)),
-        "https" | "http" => Ok(Box::new(https::HttpsTransport::with_concurrency(
-            binding.url.clone(),
-            opts.token.clone(),
-            concurrency,
-        ))),
+        "https" | "http" => Ok(Box::new(
+            https::HttpsTransport::with_concurrency(binding.url.clone(), opts.token.clone(), concurrency)
+                .drawing_progress(live_progress),
+        )),
         "s3" => Ok(Box::new(s3::S3Transport::from_url(&binding.url, opts)?)),
         other => Err(format!("no push transport for scheme '{other}'")),
     }

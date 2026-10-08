@@ -365,12 +365,14 @@ fn precaching_a_dataset_visits_its_slab_facets() {
     let view = g.profile("default").unwrap();
 
     let mut visited: Vec<String> = Vec::new();
-    view.prebuffer_all_with_progress(vectordata::WholeFacetFallback::Refuse, &mut |facet: &str, _p| {
-        if !visited.iter().any(|s| s == facet) {
-            visited.push(facet.to_string());
+    let report = view
+        .fetch(&vectordata::fetch::FetchRequest::all(), &mut vectordata::fetch::Silent)
+        .unwrap();
+    for row in &report.facets {
+        if !visited.contains(&row.id.facet) {
+            visited.push(row.id.facet.clone());
         }
-    })
-    .unwrap();
+    }
     visited.sort();
 
     assert!(
@@ -401,12 +403,14 @@ fn a_sharded_slab_facet_reports_its_format_and_is_precached() {
     );
 
     let mut visited: Vec<String> = Vec::new();
-    view.prebuffer_all_with_progress(vectordata::WholeFacetFallback::Refuse, &mut |facet: &str, _p| {
-        if !visited.iter().any(|s| s == facet) {
-            visited.push(facet.to_string());
+    let report = view
+        .fetch(&vectordata::fetch::FetchRequest::all(), &mut vectordata::fetch::Silent)
+        .unwrap();
+    for row in &report.facets {
+        if !visited.contains(&row.id.facet) {
+            visited.push(row.id.facet.clone());
         }
-    })
-    .unwrap();
+    }
     assert!(visited.iter().any(|f| f == "metadata_content"), "{visited:?}");
 }
 

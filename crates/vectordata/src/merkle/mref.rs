@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Read-only merkle reference tree loaded from `.mref` files.
+//! Library API. Read-only merkle reference tree loaded from `.mref` files.
 
 use std::fs;
 use std::io::{self, Cursor, Read};

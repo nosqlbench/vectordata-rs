@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `s3://` push transport via the AWS CLI.
+//! Library API. `s3://` push transport via the AWS CLI.
 //!
 //! This matches `veks publish`: rather than pull in the AWS SDK (which
 //! the read side also deliberately avoids), we shell out to `aws`, so

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cache-root inspection helpers — the read side of the natural cache
+//! Internal. Cache-root inspection helpers — the read side of the natural cache
 //! layout owned by [`crate::cache::layout`].
 //!
 //! # Layout in force
@@ -162,6 +162,8 @@ pub struct PruneReport {
     pub removed: Vec<CacheEntry>,
     /// Total on-disk bytes across `removed`.
     pub bytes_freed: u64,
+    /// Entries that matched but could not be removed, with why.
+    pub failed: Vec<(CacheEntry, String)>,
 }
 
 /// Walk `cache_root` and remove every natural-layout dataset
@@ -192,10 +194,7 @@ pub fn prune_by_filter(
                     report.bytes_freed += entry.size_bytes;
                     report.removed.push(entry.clone());
                 }
-                Err(e) => {
-                    eprintln!("warning: failed to remove {}: {}",
-                        entry.path.display(), e);
-                }
+                Err(e) => report.failed.push((entry.clone(), e.to_string())),
             }
         }
     }

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Catalog source discovery — locates catalog files from config directories,
+//! Library API. Catalog source discovery — locates catalog files from config directories,
 //! explicit paths, and URLs.
 //!
 //! Mirrors the upstream Java `TestDataSources` class. The resolution chain:
@@ -28,6 +28,8 @@ pub struct CatalogSources {
     required: Vec<NamedCatalogSource>,
     /// Optional catalog sources — loading failures are silently ignored.
     optional: Vec<NamedCatalogSource>,
+    /// Problems met while reading configuration and locations.
+    diagnostics: Vec<super::CatalogDiagnostic>,
 }
 
 impl CatalogSources {
@@ -50,7 +52,7 @@ impl CatalogSources {
     /// sources (a missing file is non-fatal). The env-free seam behind
     /// [`Self::configure_default`].
     pub fn configure_optional(mut self, config_dir: &str) -> Self {
-        if let Ok(locations) = load_config(&expand_tilde(config_dir)) {
+        if let Ok(locations) = load_config(&expand_tilde(config_dir), &mut self.diagnostics) {
             self.optional.extend(locations);
         }
         self
@@ -58,15 +60,24 @@ impl CatalogSources {
 
     /// Configure from a specific config directory.
     ///
-    /// Loads `catalogs.yaml` from the directory. If the file does not exist,
-    /// prints a warning but continues.
+    /// Loads `catalogs.yaml` from the directory. If the file cannot be
+    /// read, records a warning in [`diagnostics`](Self::diagnostics) and
+    /// continues.
     pub fn configure(mut self, config_dir: &str) -> Self {
         let config_dir = expand_tilde(config_dir);
-        match load_config(&config_dir) {
+        match load_config(&config_dir, &mut self.diagnostics) {
             Ok(locations) => self.required.extend(locations),
-            Err(e) => eprintln!("warning: {}", e),
+            Err(e) => self.diagnostics.push(super::CatalogDiagnostic::warning(e)),
         }
         self
+    }
+
+    /// Problems met while reading configuration and resolving
+    /// locations, such as a directory with no catalog file in it.
+    /// [`Catalog::of`](super::Catalog::of) carries these forward into
+    /// its own [`diagnostics`](super::Catalog::diagnostics).
+    pub fn diagnostics(&self) -> &[super::CatalogDiagnostic] {
+        &self.diagnostics
     }
 
     /// Add required catalog locations.
@@ -76,7 +87,7 @@ impl CatalogSources {
     pub fn add_catalogs(mut self, paths: &[String]) -> Self {
         for path in paths {
             let expanded = expand_tilde(path);
-            for resolved in resolve_catalog_path(&expanded) {
+            for resolved in resolve_catalog_path(&expanded, &mut self.diagnostics) {
                 let name = self.synthesize_name();
                 self.required.push(NamedCatalogSource { name, location: resolved });
             }
@@ -106,7 +117,7 @@ impl CatalogSources {
     pub fn add_optional_catalogs(mut self, paths: &[String]) -> Self {
         for path in paths {
             let expanded = expand_tilde(path);
-            for resolved in resolve_catalog_path(&expanded) {
+            for resolved in resolve_catalog_path(&expanded, &mut self.diagnostics) {
                 let name = self.synthesize_name();
                 self.optional.push(NamedCatalogSource { name, location: resolved });
             }
@@ -147,35 +158,30 @@ pub fn lookup_catalog_index(value: &str, configured: &[String]) -> Option<Result
     Some(configured.get(n - 1).cloned().ok_or(n))
 }
 
-/// Resolve a `--at`/`--catalog` value for command execution: a
-/// positive integer is a 1-based index into the configured catalog
-/// list (see `config catalog list`); anything else passes through as
-/// a literal URL/path. Exits with an error on an out-of-range index —
-/// this is a CLI-boundary helper for the `datasets` command family,
-/// shared by every binary that dispatches into it.
+/// Resolve a `--at`/`--catalog` value: a positive integer is a 1-based
+/// index into the configured catalog list (see `config catalog list`);
+/// anything else passes through as a literal URL/path. An out-of-range
+/// index is an error naming it.
 ///
 /// Idempotent: resolving an already-resolved URL is a no-op, so
 /// callers layered above (e.g. binary dispatch arms) may resolve
 /// early without harm.
-pub fn resolve_catalog_value(value: &str) -> String {
+pub fn resolve_catalog_value(value: &str) -> crate::Result<String> {
     let configured = raw_catalog_entries(&config_dir());
     match lookup_catalog_index(value, &configured) {
-        None => value.to_string(),
-        Some(Ok(url)) => url,
-        Some(Err(n)) => {
-            eprintln!(
-                "Error: catalog #{n} not found; list configured catalogs with \
-                 the `config catalog list` subcommand."
-            );
-            std::process::exit(1);
-        }
+        None => Ok(value.to_string()),
+        Some(Ok(url)) => Ok(url),
+        Some(Err(n)) => Err(crate::Error::Other(format!(
+            "catalog #{n} not found; list configured catalogs with \
+             the `config catalog list` subcommand."
+        ))),
     }
 }
 
 /// [`resolve_catalog_value`] over a slice — the seam the shared
 /// `datasets` run paths use so numbered shortcuts work identically
 /// from every binary.
-pub fn resolve_catalog_values(values: &[String]) -> Vec<String> {
+pub fn resolve_catalog_values(values: &[String]) -> crate::Result<Vec<String>> {
     values.iter().map(|v| resolve_catalog_value(v)).collect()
 }
 
@@ -255,7 +261,10 @@ pub fn parse_named_catalogs(content: &str) -> Result<Vec<NamedCatalogSource>, St
 /// Load `catalogs.yaml` from a config directory.
 ///
 /// The file contains a YAML list of strings, each a catalog location.
-fn load_config(config_dir: &str) -> Result<Vec<NamedCatalogSource>, String> {
+fn load_config(
+    config_dir: &str,
+    diags: &mut Vec<super::CatalogDiagnostic>,
+) -> Result<Vec<NamedCatalogSource>, String> {
     let dir = Path::new(config_dir);
     let catalogs_yaml = dir.join("catalogs.yaml");
 
@@ -276,7 +285,7 @@ fn load_config(config_dir: &str) -> Result<Vec<NamedCatalogSource>, String> {
     let mut locations = Vec::new();
     for entry in entries {
         let expanded = expand_tilde(&entry.location);
-        for resolved in resolve_catalog_path(&expanded) {
+        for resolved in resolve_catalog_path(&expanded, diags) {
             locations.push(NamedCatalogSource { name: entry.name.clone(), location: resolved });
         }
     }
@@ -293,7 +302,7 @@ fn load_config(config_dir: &str) -> Result<Vec<NamedCatalogSource>, String> {
 /// - Directories containing `catalogs.yaml`: load recursively
 /// - Directories containing `catalog.json`: use the directory URL
 /// - Plain files: use directly
-fn resolve_catalog_path(path: &str) -> Vec<String> {
+fn resolve_catalog_path(path: &str, diags: &mut Vec<super::CatalogDiagnostic>) -> Vec<String> {
     // Any URL the shared transport speaks (currently `http://`,
     // `https://`, `s3://`) passes through verbatim — the catalog
     // fetcher normalises on the way to the wire.
@@ -307,7 +316,7 @@ fn resolve_catalog_path(path: &str) -> Vec<String> {
         // Directory with catalogs.yaml → load recursively
         let catalogs_yaml = p.join("catalogs.yaml");
         if catalogs_yaml.is_file()
-            && let Ok(sources) = load_config(path) {
+            && let Ok(sources) = load_config(path, diags) {
             return sources.into_iter().map(|s| s.location).collect();
         }
 
@@ -330,10 +339,9 @@ fn resolve_catalog_path(path: &str) -> Vec<String> {
         }
 
         // Directory without any catalog file
-        eprintln!(
-            "WARNING: directory {} has no catalogs.yaml / catalog.json / catalog.yaml / knn_entries.yaml",
-            path
-        );
+        diags.push(super::CatalogDiagnostic::warning(format!(
+            "directory {path} has no catalogs.yaml / catalog.json / catalog.yaml / knn_entries.yaml"
+        )));
         return vec![];
     }
 
@@ -540,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_resolve_http_url() {
-        let locations = resolve_catalog_path("https://example.com/catalogs");
+        let locations = resolve_catalog_path("https://example.com/catalogs", &mut Vec::new());
         assert_eq!(locations, vec!["https://example.com/catalogs"]);
     }
 
@@ -556,7 +564,7 @@ mod tests {
         let yaml = "- /some/catalog\n- https://example.com/data\n";
         std::fs::write(tmp.path().join("catalogs.yaml"), yaml).unwrap();
 
-        let sources = load_config(tmp.path().to_str().unwrap()).unwrap();
+        let sources = load_config(tmp.path().to_str().unwrap(), &mut Vec::new()).unwrap();
         // /some/catalog doesn't exist so it still gets returned as-is
         assert!(sources.iter().any(|s| s.location == "/some/catalog"));
         assert!(sources.iter().any(|s| s.location == "https://example.com/data"));
@@ -568,7 +576,7 @@ mod tests {
     #[test]
     fn test_load_config_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = load_config(tmp.path().to_str().unwrap());
+        let result = load_config(tmp.path().to_str().unwrap(), &mut Vec::new());
         assert!(result.is_err());
     }
 
@@ -577,7 +585,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("catalog.json"), "[]").unwrap();
 
-        let locations = resolve_catalog_path(tmp.path().to_str().unwrap());
+        let locations = resolve_catalog_path(tmp.path().to_str().unwrap(), &mut Vec::new());
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0], tmp.path().to_str().unwrap());
     }

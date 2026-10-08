@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parser for `knn_entries.yaml` — jvector-compatible dataset index.
+//! Library API. Parser for `knn_entries.yaml` — jvector-compatible dataset index.
 //!
 //! `knn_entries.yaml` is a simpler alternative to `dataset.yaml` for
 //! describing vector datasets with base, query, and ground-truth files.
@@ -30,15 +30,21 @@ use crate::model::{DatasetConfig, FacetConfig, ProfileConfig};
 /// A single knn_entries.yaml entry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KnnEntry {
+    /// Path or URL of the base vectors file.
     pub base: String,
+    /// Path or URL of the query vectors file.
     pub query: String,
+    /// Path or URL of the ground-truth neighbor indices file.
     pub gt: String,
 }
 
 /// Parsed knn_entries.yaml file.
 #[derive(Debug)]
 pub struct KnnEntries {
+    /// `_defaults.base_url`, with any trailing `/` removed; `None` when
+    /// absent.
     pub base_url: Option<String>,
+    /// Entries keyed by `dataset:profile`, in file order.
     pub entries: IndexMap<String, KnnEntry>,
 }
 

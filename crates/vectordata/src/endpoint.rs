@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Client for a `vecd` endpoint's auth / introspection API — the calls
+//! Library API. Client for a `vecd` endpoint's auth / introspection API — the calls
 //! behind `vectordata login`, `ping`, and `token issue`/`revoke`. The AAA
 //! endpoints live at the **server root**, so requests are addressed to the
 //! origin (`scheme://host[:port]`) of whatever URL the user passes,
@@ -15,11 +15,16 @@ use crate::transport::shared_client_for;
 /// A minted token as returned by `/auth/token` or `/tokens`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenResp {
+    /// The bearer token itself.
     pub token: String,
+    /// Server-side token id, as passed to [`revoke_token`].
     #[serde(default)]
     pub id: Option<i64>,
+    /// User the token was minted for.
     #[serde(default)]
     pub user: Option<String>,
+    /// Expiry as Unix epoch seconds; `None` when the token does not
+    /// expire or the server did not say.
     #[serde(default)]
     pub expires_at: Option<i64>,
 }

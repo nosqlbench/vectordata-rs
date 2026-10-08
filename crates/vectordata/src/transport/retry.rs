@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Retry policy with exponential backoff and jitter.
+//! Internal. Retry policy with exponential backoff and jitter.
 
 use std::io;
 use std::thread;

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `vectordata push` — the low-effort verb for putting an already
+//! Library API. `vectordata push` — the low-effort verb for putting an already
 //! known-good dataset (or an ad-hoc directory) at a remote endpoint so
 //! `vectordata` can read it later.
 //!
@@ -10,9 +10,9 @@
 //! and a single-provenance event log. The full design lives in
 //! `docs/design/push-command.md`; this module is its implementation.
 //!
-//! The orchestration ([`execute`](crate::push::execute)) is transport-agnostic and fully
+//! The orchestration ([`execute`]) is transport-agnostic and fully
 //! exercised against the local `file://` transport in tests; the
-//! `https://` and `s3://` transports ride the same [`PushTransport`](crate::push::transport::PushTransport)
+//! `https://` and `s3://` transports ride the same [`PushTransport`]
 //! contract.
 //!
 //! **What the plan reads from the remote.** Deciding what a push would
@@ -56,13 +56,26 @@ pub enum ChecksumPolicy {
 /// without a process/argv.
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// Source directory to push; must be a directory.
     pub path: PathBuf,
+    /// Destination URL. Must agree with an existing `.publish_url`
+    /// binding; when there is none it stages a new one. `None` uses the
+    /// existing binding, and is an error without one.
     pub to: Option<String>,
+    /// Justification recorded on the `begin` event; required when the
+    /// push overwrites or deletes remote data.
     pub message: Option<String>,
+    /// Push an ad-hoc directory ([`SourceMode::Raw`]) instead of
+    /// requiring a `dataset.yaml` or `knn_entries.yaml`.
     pub raw: bool,
+    /// What to do about a stale or missing `SHA256SUMS`.
     pub checksums: ChecksumPolicy,
+    /// Plan and print without hashing, writing, or uploading.
     pub dry_run: bool,
+    /// Skip known-good validation of the source; binding, overwrite
+    /// and provenance rules still apply.
     pub no_check: bool,
+    /// Proceed without the interactive confirmation.
     pub assume_yes: bool,
     /// Remove remote objects under the publish root that have no local
     /// counterpart (orphans). Opt-in and destructive: gated behind `-m`
@@ -72,6 +85,8 @@ pub struct Options {
     /// contents differ from the current working set, abandon it (record
     /// an `abort`) and push fresh instead of refusing.
     pub abort_incomplete: bool,
+    /// Parallel streams for remote `SHA256SUMS` fetches and uploads; 0
+    /// is treated as 1.
     pub concurrency: u32,
     /// Producer-injected publish set (relative, forward-slashed paths),
     /// used when a caller like `veks publish` has already selected what
@@ -80,6 +95,7 @@ pub struct Options {
     /// those) and publishes exactly this set. When `None`, push scans
     /// the source directory itself.
     pub files: Option<Vec<String>>,
+    /// Credentials and endpoint overrides for the transport.
     pub transport: TransportOptions,
     /// The resolved invocation, recorded verbatim on the `begin` event.
     pub cmd: String,
@@ -96,9 +112,12 @@ pub struct Options {
 /// failure, not a surprise at the terminal.
 #[derive(Debug, Clone, Default)]
 pub enum ProgressSink {
+    /// Write to stderr, redrawing live counters in place on a terminal.
     #[default]
     Stderr,
+    /// Discard all status output.
     Silent,
+    /// Append each status line to the shared buffer.
     Capture(std::sync::Arc<std::sync::Mutex<Vec<String>>>),
 }
 
@@ -113,16 +132,26 @@ impl ProgressSink {
 /// What a (non-dry-run) push accomplished, or what a dry-run would.
 #[derive(Debug, Clone)]
 pub struct Outcome {
+    /// How the source was classified.
     pub mode: SourceMode,
+    /// The resolved destination URL (the publish root).
     pub destination: String,
+    /// The push's `seq`; when the remote was already up to date, its
+    /// current stable version (0 if it has none).
     pub version: u64,
+    /// Files new to the remote.
     pub added: usize,
+    /// Remote files replaced with different content.
     pub overwritten: usize,
+    /// Files already present remotely with the same digest.
     pub skipped: usize,
+    /// Remote orphans removed (or, on a dry run, to be removed) under
+    /// `--delete`.
     pub deleted: usize,
     /// True when this finished a previously-interrupted push (resume)
     /// rather than starting a new version.
     pub resumed: bool,
+    /// Whether this was a dry run, so the counts are a plan only.
     pub dry_run: bool,
     /// Dry run: files whose sums are not current and which a real
     /// push would hash before comparing.
@@ -162,6 +191,68 @@ impl Reporter {
             ProgressSink::Silent => {}
             ProgressSink::Capture(buf) => buf.lock().expect("progress buffer").push(msg.to_string()),
         }
+    }
+
+    /// A line redrawn in place while work runs: drawn on a terminal,
+    /// printed once at its end otherwise, and kept at its end by a
+    /// capturing sink.
+    fn live_line(&self, line: &str, final_line: bool) {
+        match &self.sink {
+            // Clear to the end of the line: a shorter line over a longer
+            // one otherwise leaves the tail of the old one standing.
+            ProgressSink::Stderr if self.tty => {
+                if final_line {
+                    eprintln!("\r{line}\x1b[K");
+                } else {
+                    eprint!("\r{line}\x1b[K");
+                }
+            }
+            ProgressSink::Stderr if final_line => eprintln!("{line}"),
+            ProgressSink::Stderr | ProgressSink::Silent => {}
+            ProgressSink::Capture(buf) if final_line => {
+                buf.lock().expect("progress buffer").push(line.trim_start().to_string())
+            }
+            ProgressSink::Capture(_) => {}
+        }
+    }
+
+    /// A line of the run's output — the plan — rather than its progress:
+    /// stdout for a terminal sink, kept by a capturing one.
+    fn out(&self, line: &str) {
+        match &self.sink {
+            ProgressSink::Stderr => println!("{line}"),
+            ProgressSink::Silent => {}
+            ProgressSink::Capture(buf) => buf.lock().expect("progress buffer").push(line.to_string()),
+        }
+    }
+
+    /// Ask the person at the terminal to confirm the push. Only a run
+    /// reporting to a terminal can ask: any other sink, or a stdin that
+    /// is not a terminal, is refused with a usage error naming `-y`
+    /// (`Options::assume_yes`).
+    fn confirm(&self) -> Result<(), Failure> {
+        use std::io::IsTerminal;
+        if !matches!(self.sink, ProgressSink::Stderr) || !std::io::stdin().is_terminal() {
+            return Err(Failure::Usage(
+                "refusing to push without confirmation in a non-interactive context; pass -y".to_string(),
+            ));
+        }
+        print!("Proceed? [y/N] ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map_err(Failure::op)?;
+        if matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            Ok(())
+        } else {
+            Err(Failure::Usage("aborted by user".to_string()))
+        }
+    }
+
+    /// Whether this run draws live terminal displays: the caller chose
+    /// stderr, and stderr is a terminal.
+    fn draws_live(&self) -> bool {
+        matches!(self.sink, ProgressSink::Stderr) && self.tty
     }
 
     /// A counter: `label: done/total` with an optional detail — the
@@ -236,6 +327,7 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     if !root.is_dir() {
         return Err(Failure::Usage(format!("not a directory: {}", root.display())));
     }
+    let report = Reporter::new(&opts.progress);
 
     // 1. Source mode + known-good validation. When a producer injects an
     //    explicit publish set, it owns selection and validation, so we
@@ -303,7 +395,7 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
                 if opts.dry_run {
                     checksums::ChecksumFile { entries: hash_plan.reuse }
                 } else {
-                    checksums::execute(&dir, &names, hash_plan).map_err(Failure::op)?
+                    checksums::execute(&dir, &names, hash_plan, &report).map_err(Failure::op)?
                 }
             }
             (Freshness::Missing, ChecksumPolicy::Keep) => {
@@ -334,8 +426,8 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     }
 
     // 4. Open transport + auth/reachability preflight (fail fast).
-    let report = Reporter::new(&opts.progress);
-    let tx = transport::open(&endpoint, &opts.transport, opts.concurrency).map_err(Failure::Usage)?;
+    let tx = transport::open(&endpoint, &opts.transport, opts.concurrency, report.draws_live())
+        .map_err(Failure::Usage)?;
     report.note(&format!("remote: reaching {}", tx.describe()));
     tx.preflight().map_err(map_transport)?;
 
@@ -610,14 +702,14 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
 
     // 11. The plan, printed the same way in both modes. A dry run is
     //     this run without its effectors, and this is where they begin.
-    print_plan(opts, &outcome, &added, &overwrites, &deletes, &undetermined, &pending_sums, &scan, seq);
+    print_plan(&report, opts, &outcome, &added, &overwrites, &deletes, &undetermined, &pending_sums, &scan, seq);
     if opts.dry_run {
         return Ok(outcome);
     }
 
     // 12. Confirmation.
     if !opts.assume_yes {
-        confirm()?;
+        report.confirm()?;
     }
 
     // 13. TOCTOU guard: confirm no content file changed since it was
@@ -1067,167 +1159,8 @@ fn display_dir(dir_rel: &str) -> &str {
     if dir_rel.is_empty() { "." } else { dir_rel }
 }
 
-fn confirm() -> Result<(), Failure> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        return Err(Failure::Usage(
-            "refusing to push without confirmation in a non-interactive context; pass -y".to_string(),
-        ));
-    }
-    print!("Proceed? [y/N] ");
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).map_err(Failure::op)?;
-    if matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
-        Ok(())
-    } else {
-        Err(Failure::Usage("aborted by user".to_string()))
-    }
-}
-
-/// When `push` has no destination (`.publish_url` absent, no `--to`) but the
-/// user is logged in, offer to push to that endpoint. Returns the chosen
-/// destination URL (`Some`) once confirmed, or `None` when there's no usable
-/// fallback (not logged in / ambiguous, or non-interactive without `-y`) so the
-/// caller emits the standard "no destination" error.
-///
-/// The default path is *smart*: when the user can write to exactly one
-/// namespace on the endpoint (per `whoami`), the dataset lands under it
-/// (`<endpoint>/<namespace>/<dataset>/`); otherwise it falls back to
-/// `<endpoint>/<dataset>/`. Interactively the default is shown and editable.
-#[cfg(feature = "cli")]
-fn derive_destination(root: &std::path::Path, assume_yes: bool) -> Result<Option<String>, String> {
-    use std::io::{IsTerminal, Write};
-
-    let endpoint = match crate::credentials::resolve_endpoint(None) {
-        Ok(e) => e,
-        Err(_) => return Ok(None), // not logged in, or several — standard error
-    };
-    let base = endpoint.trim_end_matches('/').to_string();
-    let dataset = dataset_name(root);
-
-    // We can only fill in a destination if we can either auto-proceed (`-y`) or
-    // prompt (a terminal). Otherwise leave it to the engine's standard error —
-    // and skip the `whoami` probe below entirely.
-    if !assume_yes && !std::io::stdin().is_terminal() {
-        return Ok(None);
-    }
-
-    let token = crate::credentials::stored_token(&base);
-    let namespaces = crate::endpoint::candidate_namespaces(&base, token.as_deref());
-    let mut default_url = match namespaces.as_slice() {
-        // Exactly one namespace to target → place the dataset under it.
-        [only] => format!("{base}/{}/{dataset}/", only.trim_matches('/')),
-        // None or several — leave the namespace out of the default; the user
-        // edits the prompt (and `--to` tab-completion offers the namespaces).
-        _ => format!("{base}/{dataset}/"),
-    };
-    if !default_url.ends_with('/') {
-        default_url.push('/');
-    }
-
-    // `-y`: don't prompt — announce the derived destination and proceed.
-    if assume_yes {
-        println!("No destination set; using your logged-in endpoint:\n  {default_url}");
-        return Ok(Some(default_url));
-    }
-
-    println!();
-    println!("No .publish_url here and no --to, but you're logged in to");
-    println!("  {base}");
-    println!();
-    print!("Push \"{dataset}\" to [{default_url}]: ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    let n = std::io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| format!("reading destination: {e}"))?;
-    if n == 0 {
-        // EOF (Ctrl-D) — treat as "no, don't push".
-        return Err("aborted — no destination chosen".to_string());
-    }
-    let typed = line.trim();
-    let mut url = if typed.is_empty() { default_url } else { typed.to_string() };
-    if !url.ends_with('/') {
-        url.push('/');
-    }
-    Ok(Some(url))
-}
-
-/// The dataset name used as the remote subdirectory: the canonical basename of
-/// the source path (falling back to `"dataset"`).
-#[cfg(feature = "cli")]
-fn dataset_name(root: &std::path::Path) -> String {
-    std::fs::canonicalize(root)
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "dataset".to_string())
-}
-
-/// Resolve a `--to` value into a full destination URL.
-///
-/// - A URL (contains `://`) is used as-is (trailing slash ensured).
-/// - Otherwise it's a namespace shorthand resolved against the **authenticated**
-///   endpoint: `root` (or `/`) targets the root `/` namespace; a bare name
-///   targets the namespace whose path equals it (or whose last segment does),
-///   provided exactly one matches. The dataset lands under it as
-///   `<endpoint>/<namespace>/<dataset>/`.
-#[cfg(feature = "cli")]
-fn resolve_to(to: &str, root: &std::path::Path) -> Result<String, String> {
-    if to.contains("://") {
-        let mut u = to.to_string();
-        if !u.ends_with('/') {
-            u.push('/');
-        }
-        return Ok(u);
-    }
-    let endpoint = crate::credentials::resolve_endpoint(None)
-        .map_err(|e| format!("--to '{to}' is a namespace name, but {e}"))?;
-    let base = endpoint.trim_end_matches('/');
-    let token = crate::credentials::stored_token(base);
-    let namespaces = crate::endpoint::candidate_namespaces(base, token.as_deref());
-    build_to_url(base, &dataset_name(root), to, &namespaces)
-}
-
-/// Pure core of [`resolve_to`] for a namespace shorthand: build the destination
-/// URL from the resolved endpoint `base`, the local `dataset` name, the `to`
-/// shorthand, and the endpoint's `namespaces`.
-#[cfg(feature = "cli")]
-fn build_to_url(base: &str, dataset: &str, to: &str, namespaces: &[String]) -> Result<String, String> {
-    let base = base.trim_end_matches('/');
-    if to == "root" || to == "/" {
-        return Ok(format!("{base}/{dataset}/"));
-    }
-    let want = to.trim_matches('/');
-    let matches: Vec<&str> = namespaces
-        .iter()
-        .map(|s| s.trim_matches('/'))
-        .filter(|ns| *ns == want || ns.rsplit('/').next() == Some(want))
-        .collect();
-    match matches.as_slice() {
-        [one] => Ok(format!("{base}/{one}/{dataset}/")),
-        [] => {
-            let avail = if namespaces.is_empty() {
-                "no writable namespaces found — check `vecd ns list` (and that a namespace has \
-                 an active backend)"
-                    .to_string()
-            } else {
-                format!("writable namespaces: {}", namespaces.join(", "))
-            };
-            // `candidate_namespaces` only lists writable ones, so a miss can mean
-            // "doesn't exist" OR "exists but has no backend".
-            Err(format!("no writable namespace '{to}' on {base} (it may exist but lack a backend) — {avail}"))
-        }
-        _ => Err(format!(
-            "namespace '{to}' is ambiguous — matches {}; give the full namespace path",
-            matches.join(", ")
-        )),
-    }
-}
-
 fn print_plan(
+    report: &Reporter,
     opts: &Options,
     outcome: &Outcome,
     added: &[String],
@@ -1238,23 +1171,28 @@ fn print_plan(
     scan: &plan::Scan,
     seq: u64,
 ) {
+    // The plan is the run's output, not its progress: stdout on a
+    // terminal sink, kept by a capturing one, dropped by a silent one.
+    macro_rules! out {
+        ($($t:tt)*) => { report.out(&format!($($t)*)) };
+    }
     if opts.dry_run {
-        println!("DRY RUN — nothing will be written.");
+        out!("DRY RUN — nothing will be written.");
     } else {
-        println!("PLAN — what this push will do.");
+        out!("PLAN — what this push will do.");
     }
-    println!("Source:      {} [{}]", opts.path.display(), outcome.mode.label());
-    println!("Destination: {}", outcome.destination);
+    out!("Source:      {} [{}]", opts.path.display(), outcome.mode.label());
+    out!("Destination: {}", outcome.destination);
     if outcome.resumed {
-        println!("Version:     {seq} (RESUMING an interrupted push at this seq)");
+        out!("Version:     {seq} (RESUMING an interrupted push at this seq)");
     } else {
-        println!("Version:     {seq} (next pushlog seq)");
+        out!("Version:     {seq} (next pushlog seq)");
     }
-    println!(
+    out!(
         "Concurrency: {} (upload streams)",
         opts.concurrency.max(1)
     );
-    println!(
+    out!(
         "Plan:        {} new, {} overwrite, {} delete, {} unchanged{} across {} content dir(s)",
         added.len(),
         overwrites.len(),
@@ -1263,16 +1201,16 @@ fn print_plan(
         if undetermined.is_empty() { String::new() } else { format!(", {} awaiting their digest", undetermined.len()) },
         scan.content_dirs.len()
     );
-    println!(
+    out!(
         "Remote:      {} director{} unchanged since the last committed push (judged from its log, not fetched), {} fetched; no content was read",
         outcome.dirs_from_log,
         if outcome.dirs_from_log == 1 { "y" } else { "ies" },
         outcome.dirs_fetched,
     );
     if pending_sums.is_empty() {
-        println!("Checksums:   every SHA256SUMS is current; nothing to hash");
+        out!("Checksums:   every SHA256SUMS is current; nothing to hash");
     } else {
-        println!(
+        out!(
             "Checksums:   {} dir(s) lacked current SHA256SUMS: {} file(s), {}, {} before uploading:",
             pending_sums.len(),
             outcome.to_hash_files,
@@ -1280,7 +1218,7 @@ fn print_plan(
             if opts.dry_run { "to be hashed by the push, not by this dry run," } else { "hashed" }
         );
         for (dir, why, to_hash, kept, bytes) in pending_sums {
-            println!(
+            out!(
                 "  {}: {} file(s) ({}), {} digest(s) kept — {}",
                 if dir.is_empty() { "." } else { dir },
                 to_hash,
@@ -1290,31 +1228,31 @@ fn print_plan(
             );
         }
         if !undetermined.is_empty() {
-            println!(
+            out!(
                 "  {} file(s) are on the remote and await their digest to be compared: unchanged or overwritten is decided by the hashing",
                 undetermined.len()
             );
             for u in undetermined.iter().take(20) {
-                println!("  ? {u}");
+                out!("  ? {u}");
             }
             if undetermined.len() > 20 {
-                println!("  ? ... and {} more", undetermined.len() - 20);
+                out!("  ? ... and {} more", undetermined.len() - 20);
             }
         }
     }
     for a in added {
-        println!("  + {a}");
+        out!("  + {a}");
     }
     for o in overwrites {
-        println!("  ~ {} (was {})", o.key, o.old_digest);
+        out!("  ~ {} (was {})", o.key, o.old_digest);
     }
     for d in deletes {
-        println!("  - {d}");
+        out!("  - {d}");
     }
     if !overwrites.is_empty() || !deletes.is_empty() {
         match &opts.message {
-            Some(m) => println!("Message:     {m}"),
-            None => println!(
+            Some(m) => out!("Message:     {m}"),
+            None => out!(
                 "NOTE: overwrites/deletes present — a real push needs -m/--message."
             ),
         }
@@ -1324,223 +1262,7 @@ fn print_plan(
 // ─── CLI surface ────────────────────────────────────────────────────
 
 #[cfg(feature = "cli")]
-mod cli {
-    use super::*;
-
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub enum ChecksumMode {
-        /// Recompute a stale or missing SHA256SUMS before pushing.
-        Auto,
-        /// Use the existing SHA256SUMS; stale/missing stops the push.
-        Keep,
-    }
-
-    impl std::str::FromStr for ChecksumMode {
-        type Err = String;
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            match s {
-                "auto" => Ok(ChecksumMode::Auto),
-                "keep" => Ok(ChecksumMode::Keep),
-                other => Err(format!("unknown checksum mode '{other}' (expected auto|keep)")),
-            }
-        }
-    }
-
-    /// `vectordata datasets push` — push an already-good dataset or an
-    /// ad-hoc directory to its bound remote.
-    #[derive(Debug, veks_completion_derive::VeksCli)]
-    pub struct PushArgs {
-        /// Dataset directory, catalog directory, or (with --raw) ad-hoc
-        /// directory to push.
-        #[arg(default_value = ".")]
-        pub path: PathBuf,
-
-        /// Target endpoint. Must agree with an existing .publish_url;
-        /// written into the source if none exists yet.
-        #[arg(long)]
-        pub to: Option<String>,
-
-        /// Justification for overwriting remote data. Required when the
-        /// push would overwrite; recorded in the remote pushlog.
-        #[arg(short = 'm', long)]
-        pub message: Option<String>,
-
-        /// Push every file verbatim with no shape validation.
-        #[arg(long)]
-        pub raw: bool,
-
-        /// How to treat a stale/missing SHA256SUMS.
-        #[arg(long, value_parser = ["auto", "keep"], default_value = "auto")]
-        pub checksums: ChecksumMode,
-
-        /// Resolve, validate, and print the plan without writing.
-        #[arg(long)]
-        pub dry_run: bool,
-
-        /// AWS profile for S3 credentials.
-        #[arg(long)]
-        pub profile: Option<String>,
-
-        /// S3-compatible endpoint override.
-        #[arg(long)]
-        pub endpoint_url: Option<String>,
-
-        /// Bearer token for generic https endpoints
-        /// (else $VECTORDATA_PUSH_TOKEN).
-        #[arg(long)]
-        pub token: Option<String>,
-
-        /// Remove remote objects under the publish root with no local
-        /// counterpart. Destructive: requires -m and prompts unless -y.
-        #[arg(long)]
-        pub delete: bool,
-
-        /// If an incomplete push is open on the remote and its contents
-        /// differ from the current working set, abandon it (record an
-        /// abort) and push fresh instead of refusing.
-        #[arg(long)]
-        pub abort_incomplete: bool,
-
-        /// Parallel upload streams.
-        #[arg(long, default_value = "4")]
-        pub concurrency: u32,
-
-        /// Skip known-good validation (binding/overwrite/provenance
-        /// rules still apply).
-        #[arg(long)]
-        pub no_check: bool,
-
-        /// Skip the interactive confirmation.
-        #[arg(short = 'y', long)]
-        pub yes: bool,
-    }
-
-    impl PushArgs {
-        fn into_options(self) -> Options {
-            let actor = format!(
-                "{}@{}",
-                std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".into()),
-                std::env::var("HOSTNAME").unwrap_or_else(|_| "host".into()),
-            );
-            let cmd = std::env::args().collect::<Vec<_>>().join(" ");
-            // Token precedence: --token, then $VECTORDATA_PUSH_TOKEN, then the
-            // stored login credential for the target endpoint (so `vectordata
-            // login` is auto-used for push, not only for reads).
-            let token = self
-                .token
-                .or_else(|| std::env::var("VECTORDATA_PUSH_TOKEN").ok())
-                .or_else(|| {
-                    self.to.as_deref().and_then(|to| {
-                        let t = crate::credentials::stored_token(to);
-                        if t.is_some() {
-                            crate::credentials::warn_if_expiring(to);
-                        }
-                        t
-                    })
-                });
-            Options {
-                path: self.path,
-                to: self.to,
-                message: self.message,
-                raw: self.raw,
-                checksums: match self.checksums {
-                    ChecksumMode::Auto => ChecksumPolicy::Auto,
-                    ChecksumMode::Keep => ChecksumPolicy::Keep,
-                },
-                dry_run: self.dry_run,
-                no_check: self.no_check,
-                assume_yes: self.yes,
-                delete: self.delete,
-                abort_incomplete: self.abort_incomplete,
-                concurrency: self.concurrency,
-                files: None,
-                transport: TransportOptions {
-                    token,
-                    profile: self.profile,
-                    endpoint_url: self.endpoint_url,
-                },
-                progress: ProgressSink::Stderr,
-                cmd,
-                actor,
-            }
-        }
-    }
-
-    /// Dispatch entry point. Returns a process exit code.
-    pub fn run(mut args: PushArgs) -> i32 {
-        // A bare `--to <name>` is expanded before anything reads the
-        // destination (token resolution, the engine, .publish_url). It may be a
-        // configured catalog NAME or 1-based INDEX (→ that catalog's URL), or —
-        // failing that — a vecd namespace shorthand on the logged-in endpoint
-        // (`--to datasets`/`root`). Catalog match wins.
-        if let Some(to) = args.to.clone()
-            && !to.contains("://") {
-                match crate::credentials::resolve_endpoint_spec(&to) {
-                    Ok(url) => args.to = Some(url),
-                    Err(_) => match super::resolve_to(&to, &args.path) {
-                        Ok(url) => args.to = Some(url),
-                        Err(e) => {
-                            eprintln!("push: {e}");
-                            return 2;
-                        }
-                    },
-                }
-            }
-
-        // No destination at all (no --to, no .publish_url)? If the user is
-        // logged in, offer to push to that endpoint — prompting for the path
-        // with a smart default — and fill `--to` in so the engine sees a
-        // concrete destination (and persists the .publish_url on success).
-        if args.to.is_none()
-            && super::binding::read_binding(&args.path).ok().flatten().is_none()
-        {
-            match super::derive_destination(&args.path, args.yes) {
-                Ok(Some(url)) => args.to = Some(url),
-                Ok(None) => {} // no fallback — the engine emits the standard error
-                Err(e) => {
-                    eprintln!("push: {e}");
-                    return 2;
-                }
-            }
-        }
-
-        // `--token` may be a literal token or a file (JSON token record, a
-        // credential store, or a bare token); resolve it to the literal — using
-        // the destination's origin to pick from a store — before the engine sees it.
-        if let Some(t) = &args.token {
-            match crate::credentials::resolve_token_arg(t, args.to.as_deref()) {
-                Ok(r) => args.token = Some(r.token),
-                Err(e) => {
-                    eprintln!("push: {e}");
-                    return 2;
-                }
-            }
-        }
-        match execute(&args.into_options()) {
-            Ok(o) => {
-                if o.dry_run {
-                    0
-                } else {
-                    let verb = if o.resumed { "Resumed and completed" } else { "Pushed" };
-                    println!(
-                        "{verb} version {} to {} — {} new, {} overwritten, {} deleted, {} unchanged.",
-                        o.version, o.destination, o.added, o.overwritten, o.deleted, o.skipped
-                    );
-                    0
-                }
-            }
-            Err(Failure::Usage(m)) => {
-                eprintln!("push: {m}");
-                2
-            }
-            Err(Failure::Operational(m)) => {
-                eprintln!("push: {m}");
-                1
-            }
-        }
-    }
-}
-
+mod cli;
 #[cfg(feature = "cli")]
 pub use cli::{ChecksumMode, PushArgs, run};
 

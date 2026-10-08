@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Color palettes and intensity curves for the explore TUIs.
+//! CLI support. Color palettes and intensity curves for the explore TUIs.
 //!
 //! Shared between the values grid (per-cell heatmap) and the unified
 //! explorer's PCA scatter (per-point hue along PC4) so both surfaces

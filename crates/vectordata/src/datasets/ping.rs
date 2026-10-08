@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `<binary> datasets ping` — verify catalog + dataset access through
+//! CLI support. `<binary> datasets ping` — verify catalog + dataset access through
 //! the unified resolver.
 //!
 //! Ping opens the dataset via [`crate::catalog::Catalog::open`] — the
@@ -53,12 +53,12 @@ pub fn run_args(args: PingArgs, configdir: &str, catalog: &[String], at_extra: &
         // saying "verify the dataset *here*", so don't expand back
         // out to every configured catalog. Numbered shortcuts
         // (`--at 2`) resolve against the configured list.
-        CatalogSources::new().add_catalogs(&[crate::catalog::sources::resolve_catalog_value(&at)])
+        CatalogSources::new().add_catalogs(&super::catalog_args(std::slice::from_ref(&at)))
     } else {
         CatalogSources::new()
             .configure(configdir)
-            .add_catalogs(&crate::catalog::sources::resolve_catalog_values(catalog))
-            .add_catalogs(&crate::catalog::sources::resolve_catalog_values(at_extra))
+            .add_catalogs(&super::catalog_args(catalog))
+            .add_catalogs(&super::catalog_args(at_extra))
     };
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
@@ -77,7 +77,7 @@ pub fn run_args(args: PingArgs, configdir: &str, catalog: &[String], at_extra: &
     let selector = args
         .profile
         .or_else(|| spec.selector.as_ref().map(|s| s.text().to_string()));
-    let cat = Catalog::of(&sources);
+    let cat = super::open_catalog(&sources);
     run_via_catalog(&cat, &spec.head, selector.as_deref())
 }
 

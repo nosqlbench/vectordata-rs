@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fallback parser for the legacy `knn_entries.yaml` catalog format.
+//! Library API. Fallback parser for the legacy `knn_entries.yaml` catalog format.
 //!
 //! A `knn_entries.yaml` file is a flat map keyed by quoted strings
 //! of the form `"<dataset>:<profile>"`, where each value is a map

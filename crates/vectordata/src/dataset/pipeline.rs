@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pipeline configuration for the `upstream` block in `dataset.yaml`.
+//! Library API. Pipeline configuration for the `upstream` block in `dataset.yaml`.
 //!
 //! Defines [`PipelineConfig`], [`StepDef`], and [`OnPartial`] — the schema
 //! types for multi-step dataset build pipelines. These describe step

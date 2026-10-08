@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The metadata **layout** (field schema) namespace.
+//! Library API. The metadata **layout** (field schema) namespace.
 //!
 //! Per the facet design (see
 //! `docs/design/metadata-facets-and-layout-namespace.md`), the metadata

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Mount-point enumeration with available/total space + writability,
+//! Library API. Mount-point enumeration with available/total space + writability,
 //! shared by [`crate::settings`] (auto-bootstrap of `cache_dir`) and
 //! [`crate::config::list_mounts`] (the user-facing CLI).
 //!

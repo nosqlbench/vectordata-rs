@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Binding records to operation parameters.
+//! Library API. Binding records to operation parameters.
 //!
 //! A workload generator addresses a facet per cycle: cycle, ordinal,
 //! record, bound operation. [`crate::records`] delivers the first three.

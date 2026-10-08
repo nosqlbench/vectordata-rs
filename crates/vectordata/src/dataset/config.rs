@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dataset YAML configuration — the top-level `dataset.yaml` model.
+//! Library API. Dataset YAML configuration — the top-level `dataset.yaml` model.
 //!
 //! A `dataset.yaml` file describes a complete benchmark or test dataset using
 //! named profiles. Each profile maps view names (facet names) to data sources.
@@ -606,6 +606,7 @@ impl DatasetConfig {
         changed
     }
 
+    /// Set (or replace) an entry in the `variables:` block.
     pub fn set_variable(&mut self, key: &str, value: &str) {
         self.variables.insert(key.to_string(), value.to_string());
     }

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks interact explore` — unified vector space analysis TUI.
+//! CLI support. `veks interact explore` — unified vector space analysis TUI.
 //!
 //! Single TUI session with tab-switchable views covering norms, distances,
 //! eigenvalue structure, and PCA projection. All computation runs on

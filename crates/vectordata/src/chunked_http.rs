@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! On-demand chunked partial-read for `Storage::Http` — the
+//! Internal. On-demand chunked partial-read for `Storage::Http` — the
 //! `.mref`-less counterpart to [`crate::cache::CachedChannel`].
 //!
 //! Why this exists: a remote `Storage::Http` open against a

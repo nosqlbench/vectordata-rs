@@ -438,10 +438,7 @@ pub fn run(args: DatasetsArgs) {
                 return;
             }
             // Resolve numbered catalog shortcuts
-            let catalog: Vec<String> = raw_catalog
-                .iter()
-                .map(|v| resolve_catalog_value(v))
-                .collect();
+            let catalog: Vec<String> = vectordata::datasets::catalog_args(&raw_catalog);
 
             // Normalize glob patterns to regex (--dataset takes precedence)
             let name_filter = dataset.or(matching_name);
@@ -537,10 +534,7 @@ pub fn run(args: DatasetsArgs) {
             catalog: raw_catalog,
             at,
         } => {
-            let catalog: Vec<String> = raw_catalog
-                .iter()
-                .map(|v| resolve_catalog_value(v))
-                .collect();
+            let catalog: Vec<String> = vectordata::datasets::catalog_args(&raw_catalog);
             if all {
                 cache::run_cache_status_all(verbose, &configdir, &catalog, &at);
             } else if let Some(ds) = dataset {
@@ -571,7 +565,7 @@ pub fn run(args: DatasetsArgs) {
             let sources = if at.is_empty() {
                 crate::catalog::sources::CatalogSources::new().configure_default()
             } else {
-                let resolved: Vec<String> = at.iter().map(|a| resolve_catalog_value(a)).collect();
+                let resolved: Vec<String> = vectordata::datasets::catalog_args(&at);
                 crate::catalog::sources::CatalogSources::new().add_catalogs(&resolved)
             };
             let catalog = crate::catalog::resolver::Catalog::of(&sources);
@@ -662,10 +656,7 @@ pub fn run(args: DatasetsArgs) {
             catalog: raw_catalog,
             at,
         } => {
-            let catalog: Vec<String> = raw_catalog
-                .iter()
-                .map(|v| resolve_catalog_value(v))
-                .collect();
+            let catalog: Vec<String> = vectordata::datasets::catalog_args(&raw_catalog);
             let sharding = match vectordata::dataset::Sharding::from_flags(
                 shard_stride.as_deref(),
                 max_shard_bytes.as_deref(),
@@ -703,10 +694,7 @@ pub fn run(args: DatasetsArgs) {
             plan,
             allow_whole_facet,
         } => {
-            let catalog: Vec<String> = raw_catalog
-                .iter()
-                .map(|v| resolve_catalog_value(v))
-                .collect();
+            let catalog: Vec<String> = vectordata::datasets::catalog_args(&raw_catalog);
             precache::run(precache::PrecacheRequest {
                 dataset_spec: dataset,
                 configdir,
@@ -776,9 +764,9 @@ fn run_config_command(command: ConfigSubcommand) {
 
 /// Resolve a `--at`/`--catalog` value: a positive integer is a
 /// 1-based index into the configured catalog list, anything else a
-/// literal URL/path. Canonical implementation lives with the catalog
-/// sources in vectordata (it also honors `$VECTORDATA_HOME`, which
-/// the old veks-local copy did not); the shared `datasets` run paths
-/// resolve again idempotently, so dispatch-side use here is belt and
-/// braces, not load-bearing.
+/// literal URL/path; an index naming no configured catalog is an
+/// error. Canonical implementation lives with the catalog sources in
+/// vectordata (it also honors `$VECTORDATA_HOME`); dispatch here goes
+/// through [`vectordata::datasets::catalog_args`], which exits on that
+/// error the way a command should.
 pub use vectordata::catalog::sources::resolve_catalog_value;

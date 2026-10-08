@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared infrastructure for explore subcommands: data access, sampling,
+//! CLI support. Shared infrastructure for explore subcommands: data access, sampling,
 //! caching, and common utilities.
 
 use std::path::PathBuf;
@@ -58,7 +58,7 @@ pub(super) fn open_dataset_view(source: &str) -> std::sync::Arc<dyn crate::TestD
         })
     } else {
         let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-        let catalog = crate::catalog::resolver::Catalog::of(&sources);
+        let catalog = crate::datasets::open_catalog(&sources);
         catalog.open(&spec.head).unwrap_or_else(|e| {
             eprintln!("error: {e}");
             std::process::exit(1);

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Typed data access with runtime type negotiation.
+//! Library API. Typed data access with runtime type negotiation.
 //!
 //! [`TypedReader<T>`] opens vector and scalar files with compile-time
 //! type safety and runtime width/signedness validation. The transport
@@ -22,7 +22,7 @@
 //!
 //! // Open with native type — zero-copy
 //! let reader = TypedReader::<u8>::open("metadata.u8").unwrap();
-//! let val: u8 = reader.get_native(42);
+//! let val: u8 = reader.get_native(42).unwrap();
 //!
 //! // Open with wider type — always succeeds
 //! let reader = TypedReader::<i32>::open("metadata.u8").unwrap();
@@ -41,11 +41,35 @@ use crate::storage::Storage;
 /// Element type of a data file, inferred from the file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ElementType {
-    U8, I8, U16, I16, U32, I32, U64, I64,
-    F16, F32, F64,
+    /// Unsigned 8-bit integer (`.u8`, `.bvec`, `.u8vec`, ...).
+    U8,
+    /// Signed 8-bit integer (`.i8`, `.i8vec`, ...).
+    I8,
+    /// Unsigned 16-bit integer (`.u16`, `.u16vec`, ...).
+    U16,
+    /// Signed 16-bit integer (`.i16`, `.svec`, `.i16vec`, ...).
+    I16,
+    /// Unsigned 32-bit integer (`.u32`, `.u32vec`, ...).
+    U32,
+    /// Signed 32-bit integer (`.i32`, `.ivec`, `.i32vec`, ...).
+    I32,
+    /// Unsigned 64-bit integer (`.u64`, `.u64vec`, ...).
+    U64,
+    /// Signed 64-bit integer (`.i64`, `.i64vec`, ...).
+    I64,
+    /// IEEE 754 half-precision float (`.mvec`, `.f16vec`, ...).
+    F16,
+    /// IEEE 754 single-precision float (`.fvec`, `.f32vec`, ...).
+    F32,
+    /// IEEE 754 double-precision float (`.dvec`, `.f64vec`, ...).
+    F64,
 }
 
 impl ElementType {
+    /// Infer the element type from the extension of a local path.
+    ///
+    /// Errors when the path has no extension or the extension is not
+    /// one [`ElementType::from_extension`] recognises.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let ext = path.extension()
@@ -55,6 +79,10 @@ impl ElementType {
             .ok_or_else(|| format!("unknown extension '.{ext}': {}", path.display()))
     }
 
+    /// Infer the element type from the extension of a URL's path
+    /// (the text after the last `.`).
+    ///
+    /// Errors when that text is not a recognised extension.
     pub fn from_url(url: &url::Url) -> Result<Self, String> {
         let path = url.path();
         let ext = path.rsplit('.').next()
@@ -63,6 +91,12 @@ impl ElementType {
             .ok_or_else(|| format!("unknown extension '.{ext}' in URL: {url}"))
     }
 
+    /// Map a file extension (without the leading `.`, case-insensitive)
+    /// to its element type.
+    ///
+    /// Accepts the bare scalar forms (`u8`, `i32`, ...) and every
+    /// uniform and variable-length vector spelling (`fvec`, `f32vecs`,
+    /// `ivvec`, ...). Returns `None` for anything else.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
             "u8" => Some(Self::U8),
@@ -88,6 +122,7 @@ impl ElementType {
         }
     }
 
+    /// Size of one element in bytes: 1, 2, 4 or 8.
     pub fn byte_width(self) -> usize {
         match self {
             Self::U8 | Self::I8 => 1,
@@ -105,6 +140,8 @@ impl ElementType {
         crate::io::is_scalar_ext(ext)
     }
 
+    /// Short lowercase type name (`"u8"`, `"f32"`, ...), as used by
+    /// `Display` and in error messages.
     pub fn name(self) -> &'static str {
         match self {
             Self::U8 => "u8", Self::I8 => "i8",
@@ -115,6 +152,9 @@ impl ElementType {
         }
     }
 
+    /// Whether a file of this type may be opened as a target type of
+    /// `target_width` bytes — true unless that would narrow. Signedness
+    /// is not considered here; cross-sign values are checked per read.
     pub fn can_open_as(self, target_width: usize) -> bool {
         target_width >= self.byte_width()
     }
@@ -130,12 +170,25 @@ impl std::fmt::Display for ElementType {
 // Errors
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Failure opening or reading a [`TypedReader`].
 #[derive(Debug)]
 pub enum TypedAccessError {
     /// Target type is narrower than native type.
-    Narrowing { native: ElementType, target: &'static str },
+    Narrowing {
+        /// Element type of the file.
+        native: ElementType,
+        /// Name of the requested Rust element type.
+        target: &'static str,
+    },
     /// Value at ordinal doesn't fit in the target type.
-    ValueOverflow { ordinal: usize, value: i128, target: &'static str },
+    ValueOverflow {
+        /// Record ordinal being read.
+        ordinal: usize,
+        /// The stored value, widened to `i128`.
+        value: i128,
+        /// Name of the requested Rust element type.
+        target: &'static str,
+    },
     /// I/O error.
     Io(String),
 }
@@ -158,10 +211,19 @@ impl std::error::Error for TypedAccessError {}
 // TypedElement trait
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Rust integer type a [`TypedReader`] can yield.
+///
+/// Implemented for `u8`..`i64`. Values travel through `i128` so that
+/// every supported native type can be widened or range-checked into
+/// every target type.
 pub trait TypedElement: Copy + Send + Sync + 'static {
+    /// Short lowercase type name (`"u8"`, `"i32"`, ...), used in errors.
     fn type_name() -> &'static str;
+    /// Size of the type in bytes.
     fn width() -> usize;
+    /// Convert from `i128`, or `None` when the value is out of range.
     fn from_i128(val: i128) -> Option<Self>;
+    /// Widen to `i128` losslessly.
     fn to_i128(self) -> i128;
 }
 
@@ -374,9 +436,16 @@ impl<T: TypedElement> TypedReader<T> {
         self.storage.mmap_slice(offset as u64, len as u64)
     }
 
+    /// Element type stored in the file (from its extension).
     pub fn native_type(&self) -> ElementType { self.native_type }
+    /// Whether `T` has the same byte width as the native type, i.e. no
+    /// widening is involved.
     pub fn is_native(&self) -> bool { T::width() == self.native_width }
+    /// Number of records (values, for a scalar file); for a series, the
+    /// declared total across all shards.
     pub fn count(&self) -> usize { self.count }
+    /// Elements per record: 1 for a scalar file, otherwise the
+    /// dimension from the first record header.
     pub fn dim(&self) -> usize { self.dim }
 
     /// Force-download every byte into the local cache. No-op for
@@ -455,43 +524,68 @@ impl<T: TypedElement> TypedReader<T> {
 
 // ─── Native zero-copy access (only when T matches native type) ──────────
 
+impl<T: TypedElement> TypedReader<T> {
+    /// The mapped bytes at `offset` of a single-file facet. `None` for a
+    /// series — an offset is only meaningful within the file that holds
+    /// the ordinal, which `get_value` finds — and for storage that is
+    /// not memory-mapped.
+    fn single_file_slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        if self.series.is_some() {
+            return None;
+        }
+        self.mmap_slice(offset, len)
+    }
+}
+
 impl TypedReader<u8> {
-    /// Zero-copy native read. For non-mmap storage falls back to get_value.
-    pub fn get_native(&self, ordinal: usize) -> u8 {
+    /// Native read of a record's first element (the value itself for a
+    /// scalar file), zero-copy when the file is memory-mapped and read
+    /// through [`get_value`](Self::get_value) otherwise — including for
+    /// a sharded facet.
+    pub fn get_native(&self, ordinal: usize) -> Result<u8, TypedAccessError> {
         debug_assert!(self.native_type == ElementType::U8);
         let offset = if self.is_scalar { ordinal } else { 4 + ordinal * (4 + self.dim) };
-        if let Some(slice) = self.mmap_slice(offset, 1) {
-            slice[0]
-        } else {
-            self.get_value(ordinal).unwrap_or(0)
+        match self.single_file_slice(offset, 1) {
+            Some(slice) if ordinal < self.count => Ok(slice[0]),
+            _ => self.get_value(ordinal),
         }
     }
 
-    /// Zero-copy slice of a record's native bytes. `None` when storage
-    /// is not mmap-backed.
+    /// Zero-copy slice of a record's native bytes. `None` when the
+    /// storage is not memory-mapped, when `ordinal` is out of range, and
+    /// for a sharded facet; read through
+    /// [`get_record`](Self::get_record) then.
     pub fn get_native_slice(&self, ordinal: usize) -> Option<&[u8]> {
         debug_assert!(self.native_type == ElementType::U8);
+        if ordinal >= self.count {
+            return None;
+        }
         let (offset, len) = if self.is_scalar {
             (ordinal * self.dim, self.dim)
         } else {
             (ordinal * (4 + self.dim) + 4, self.dim)
         };
-        self.mmap_slice(offset, len)
+        self.single_file_slice(offset, len)
     }
 }
 
 impl TypedReader<i32> {
-    pub fn get_native(&self, ordinal: usize) -> i32 {
+    /// Native read of a record's first element (the value itself for a
+    /// scalar file), zero-copy when the file is memory-mapped and read
+    /// through [`get_value`](Self::get_value) otherwise — including for
+    /// a sharded facet.
+    pub fn get_native(&self, ordinal: usize) -> Result<i32, TypedAccessError> {
         debug_assert!(self.native_type == ElementType::I32);
         let offset = if self.is_scalar {
             ordinal * 4
         } else {
             ordinal * (4 + self.dim * 4) + 4
         };
-        if let Some(slice) = self.mmap_slice(offset, 4) {
-            i32::from_le_bytes(slice.try_into().unwrap())
-        } else {
-            self.get_value(ordinal).unwrap_or(0)
+        match self.single_file_slice(offset, 4) {
+            Some(slice) if ordinal < self.count => {
+                Ok(i32::from_le_bytes(slice.try_into().expect("four bytes")))
+            }
+            _ => self.get_value(ordinal),
         }
     }
 }
@@ -560,8 +654,8 @@ mod tests {
         assert_eq!(r.count(), 4);
         assert_eq!(r.dim(), 1);
         assert!(r.is_native());
-        assert_eq!(r.get_native(0), 0);
-        assert_eq!(r.get_native(3), 255);
+        assert_eq!(r.get_native(0).unwrap(), 0);
+        assert_eq!(r.get_native(3).unwrap(), 255);
     }
 
     #[test]

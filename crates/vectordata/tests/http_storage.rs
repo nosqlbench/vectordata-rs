@@ -362,50 +362,25 @@ fn vvec_cached_via_idxfor_sidecar() {
     }
 }
 
+/// No `IDXFOR__` sidecar and nothing cached: the record boundaries are
+/// unknowable without the whole file, so the open is refused, naming
+/// the file's size and the fix (DX-14). It used to walk — download —
+/// the file before returning.
 #[test]
-fn vvec_cached_falls_back_to_walk_without_idxfor() {
-    // No IDXFOR__ sidecar → reader walks the file via Storage::read_bytes
-    // to rebuild the offset index. Slow first time, but correct.
+fn vvec_cached_without_idxfor_is_refused_rather_than_walked() {
     let tmp = make_tmp();
     let path = tmp.path().join("predicates.ivvec");
     let _ = write_ivvec(&path, 12);
+    write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url = format!("{}predicates.ivvec", server.base_url());
 
-    let remote = IndexedVvecReader::<i32>::open(&url).unwrap();
-    assert_eq!(remote.count(), 12);
-    let r5 = <IndexedVvecReader<i32> as VvecReader<i32>>::get(&remote, 5).unwrap();
-    assert_eq!(r5.len(), 1);
-    assert_eq!(r5[0], 500);
-
-    // The walk persists the rebuilt index next to the local cache
-    // file so reopening doesn't re-pay the whole-file walk. Find the
-    // sidecar by name anywhere under the test cache root (the cache
-    // layout is the storage layer's business, not this test's).
-    fn find_named(root: &Path, prefix: &str) -> Option<std::path::PathBuf> {
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).ok()?.flatten() {
-                let p = e.path();
-                if p.is_dir() { stack.push(p); }
-                else if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(prefix)) {
-                    return Some(p);
-                }
-            }
-        }
-        None
-    }
-    let idx = find_named(TEST_CACHE_DIR.path(), "IDXFOR__predicates.ivvec");
-    assert!(idx.is_some(),
-        "walk must persist the rebuilt offset index next to the cache file");
-
-    // Reopen: must load the persisted index (and still read correctly).
-    drop(remote);
-    let reopened = IndexedVvecReader::<i32>::open(&url).unwrap();
-    assert_eq!(reopened.count(), 12);
-    let r5 = <IndexedVvecReader<i32> as VvecReader<i32>>::get(&reopened, 5).unwrap();
-    assert_eq!(r5[0], 500);
+    let err = IndexedVvecReader::<i32>::open(&url).expect_err("no remote walk on open");
+    let size = std::fs::metadata(&path).unwrap().len();
+    let msg = err.to_string();
+    assert!(msg.contains(&format!("{size} bytes")), "{msg}");
+    assert!(msg.contains("IDXFOR__"), "{msg}");
 }
 
 #[test]
@@ -643,7 +618,11 @@ fn view_open_facet_typed_over_http() {
     assert!(view.facet_manifest().contains_key("metadata_content"));
 }
 
+/// Pins the deprecated `prebuffer_all_with_progress`, which must keep
+/// working — and keep reporting chunk progress — now that it delegates
+/// to `fetch` (SRD DX-34).
 #[test]
+#[allow(deprecated)]
 fn prebuffer_all_drives_every_facet_complete() {
     let tmp = make_tmp();
     make_remote_dataset(tmp.path());
@@ -722,7 +701,7 @@ fn windowed_precache_only_fetches_window_chunks() {
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("windowed").unwrap();
 
-    view.prebuffer_all_with_progress(vectordata::WholeFacetFallback::Refuse, &mut |_facet, _p| {}).unwrap();
+    view.fetch(&vectordata::fetch::FetchRequest::all(), &mut vectordata::fetch::Silent).unwrap();
 
     // The base.fvec storage must NOT be fully fetched — only the
     // chunks covering bytes [0..5200) should be valid.
@@ -1048,7 +1027,7 @@ fn prebuffer_via_view_promotes_other_open_readers() {
         "early reader against remote view should not be complete pre-precache");
 
     // Now drive the view's full precache.
-    view.prebuffer_all().unwrap();
+    view.fetch(&vectordata::fetch::FetchRequest::all(), &mut vectordata::fetch::Silent).unwrap();
 
     // The early reader must now expose zero-copy get_slice and a
     // complete state — the bug being: it stays not-complete and
@@ -1102,7 +1081,7 @@ fn prebuffer_strict_contract_cached() {
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
-    view.prebuffer_all().unwrap();
+    view.fetch(&vectordata::fetch::FetchRequest::all(), &mut vectordata::fetch::Silent).unwrap();
 
     // Walk every facet and assert strict completion.
     for (name, _desc) in view.facet_manifest() {
@@ -1237,7 +1216,7 @@ profiles:
     let group = TestDataGroup::load(local.path().to_str().unwrap()).unwrap();
     let view = group.profile("default").unwrap();
 
-    let result = view.prebuffer_all();
+    let result = view.fetch(&vectordata::fetch::FetchRequest::all(), &mut vectordata::fetch::Silent);
     assert!(result.is_err(),
         "prebuffer_all MUST surface failure when a facet can't be opened/prebuffered");
 }
@@ -1519,7 +1498,10 @@ fn pooled_clients_keep_connection_count_bounded_under_open_close_churn() {
 // All-profiles precache + 250 MiB advisory warning
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Pins the deprecated group form, which delegates to
+/// `TestDataGroup::fetch` (SRD DX-34).
 #[test]
+#[allow(deprecated)]
 fn prebuffer_all_profiles_visits_every_profile_and_facet() {
     let tmp = make_tmp();
     write_fvec(&tmp.path().join("base.fvec"), 60, 8);
@@ -1578,6 +1560,7 @@ profiles:
 }
 
 #[test]
+#[allow(deprecated)]
 #[ignore = "writes ~280 MiB of fixture data; opt in with --ignored when verifying"]
 fn prebuffer_all_profiles_warning_fires_above_threshold() {
     // Build a fixture whose total size exceeds the 250 MiB advisory
@@ -1964,7 +1947,8 @@ fn a_windowed_prefetch_of_a_series_fetches_far_less_than_the_facet() {
 
     // Fetching it leaves the facet incomplete: the other shards were
     // not dragged along.
-    view.prefetch(
+    support::fetch::fetch_window(
+        &*view,
         "base_vectors",
         &window,
         vectordata::view::WholeFacetFallback::Refuse,
@@ -2028,7 +2012,7 @@ fn precaching_a_sized_profile_of_a_series_fetches_only_its_window() {
 
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("small").unwrap();
-    view.prebuffer_all_with_progress(vectordata::WholeFacetFallback::Refuse, &mut |_, _| {})
+    view.fetch(&vectordata::fetch::FetchRequest::all(), &mut vectordata::fetch::Silent)
         .unwrap();
     assert_only_the_window_is_resident(&*view);
 }
@@ -2244,10 +2228,14 @@ fn precaching_a_series_downloads_every_shard() {
     assert!(!storage.is_complete(), "nothing fetched yet");
 
     let mut seen_total = 0u64;
-    view.prebuffer_all_with_progress(vectordata::WholeFacetFallback::Refuse, &mut |_facet: &str,
-                                           p: &vectordata::view::PrebufferProgress| {
-        seen_total = seen_total.max(p.total_bytes);
-    })
+    view.fetch(
+        &vectordata::fetch::FetchRequest::all(),
+        &mut |e: &vectordata::fetch::FetchEvent<'_>| {
+            if let vectordata::fetch::FetchEvent::FacetBegin { bytes, .. } = e {
+                seen_total = seen_total.max(*bytes);
+            }
+        },
+    )
     .expect("precache the dataset");
 
     assert!(
@@ -2821,4 +2809,100 @@ fn declared_forms_are_read_over_http() {
         !storage.is_complete(),
         "reading forms must not have pulled the facet down"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Opening a reader never downloads a whole remote file (SRD DX-14)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// **A uniform remote facet opens lazily.** Opening the reader and
+/// reading one record pulls the chunk it lives in, not the file — with
+/// or without a published `.mref`. The report that prompted DX-14 named
+/// `base_vectors()` among the readers that downloaded a whole file on
+/// open; for a uniform facet this pins that it does not.
+#[test]
+fn opening_a_uniform_reader_without_mref_fetches_one_chunk() {
+    let tmp = make_tmp();
+    // ~18.6 MB at 8 MiB per chunk: three chunks, so "one" is observable.
+    write_fvec(&tmp.path().join("base.fvec"), 36_000, 128);
+    std::fs::write(tmp.path().join("dataset.yaml"), r#"
+name: lazy-open
+profiles:
+  default:
+    base_vectors: base.fvec
+"#).unwrap();
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let base = view.base_vectors().unwrap();
+    let _ = base.get(0).unwrap();
+    let stats = view.open_facet_storage("base_vectors").unwrap().cache_stats().unwrap();
+    assert!(stats.total_chunks >= 3, "fixture spans {} chunks", stats.total_chunks);
+    assert!(
+        stats.valid_chunks <= 1,
+        "opening and reading one record fetched {}/{} chunks",
+        stats.valid_chunks,
+        stats.total_chunks
+    );
+}
+
+/// **A variable-length remote facet with no offset index is refused on
+/// open, not silently downloaded** (DX-14). Its record boundaries can
+/// only be learned by reading every byte, so opening a reader used to
+/// walk — and therefore download — the whole file before returning,
+/// reporting nothing. Now the open says so and names the fix; a fetch
+/// with consent brings the file down, after which the reader opens
+/// locally and persists the index it rebuilt.
+#[test]
+fn opening_a_variable_reader_without_an_index_is_refused_until_fetched() {
+    let tmp = make_tmp();
+    let path = tmp.path().join("results.ivvec");
+    write_ivvec(&path, 20_000);
+    write_mref(&path);
+    std::fs::write(tmp.path().join("dataset.yaml"), r#"
+name: walk-refused
+profiles:
+  default:
+    metadata_results: results.ivvec
+"#).unwrap();
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let refused = match view.metadata_results() {
+        Ok(_) => panic!("opening must not walk the remote file"),
+        Err(e) => e.to_string(),
+    };
+    assert!(refused.contains("fetch"), "the refusal names the fix: {refused}");
+    let storage = view.open_facet_storage("metadata_results").unwrap();
+    let stats = storage.cache_stats().unwrap();
+    assert!(
+        stats.valid_chunks < stats.total_chunks,
+        "the refused open downloaded {}/{} chunks",
+        stats.valid_chunks,
+        stats.total_chunks
+    );
+
+    // The whole facet, asked for: a request, not a fallback.
+    view.fetch(
+        &vectordata::fetch::FetchRequest::facets(["metadata_results"]),
+        &mut vectordata::fetch::Silent,
+    )
+    .unwrap();
+    let results = view.metadata_results().expect("opens locally once fetched");
+    assert_eq!(results.count(), 20_000);
+    let r7 = results.get(7).unwrap();
+    assert_eq!(r7, vec![700, 701, 702]);
+
+    // The rebuilt index is persisted beside the cache file, so the walk
+    // is paid once per cache lifetime.
+    let cache_file = storage.cache_path().expect("a cached facet has a cache file");
+    let dir = cache_file.parent().unwrap();
+    let persisted = std::fs::read_dir(dir).unwrap().flatten().any(|e| {
+        e.file_name().to_string_lossy().starts_with("IDXFOR__results.ivvec")
+    });
+    assert!(persisted, "the rebuilt offset index must be persisted in {}", dir.display());
 }

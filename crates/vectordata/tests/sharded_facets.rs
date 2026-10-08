@@ -9,6 +9,8 @@
 //!
 //! See `docs/design/srd-multifile-facet-shards.md`.
 
+mod support;
+
 use std::io::Write;
 
 /// Write a uniform fvec: `records` rows of `dim` floats, each row
@@ -746,7 +748,7 @@ fn prefetching_a_mapped_series_window_needs_no_consent() {
 
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    view.prefetch(
+    support::fetch::fetch_window(&*view, 
         "base_vectors",
         &parse_window("5..15").unwrap(),
         WholeFacetFallback::Refuse,

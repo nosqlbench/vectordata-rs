@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Catalog resolver — loads catalog entries from multiple sources (local files
+//! Library API. Catalog resolver — loads catalog entries from multiple sources (local files
 //! and HTTP URLs) and provides search methods.
 //!
 //! This is the Rust equivalent of the upstream Java `Catalog` class. It takes
@@ -10,30 +10,42 @@
 
 use crate::dataset::{CatalogEntry, CatalogLayout};
 
+use super::CatalogDiagnostic;
 use super::knn_entries::parse_knn_entries_yaml;
 use super::sources::{
     catalog_file_for, ensure_trailing_slash, looks_like_catalog_file, CatalogSources,
 };
 
 /// A resolved catalog containing dataset entries from all configured sources.
-#[derive(Debug, Clone)]
+///
+/// Library API. Build one with [`Catalog::of`], then go from a name to
+/// data: [`open_spec`](Self::open_spec) for a `name:selector` spec,
+/// [`open_profile`](Self::open_profile) for one profile,
+/// [`fetch`](Self::fetch) to bring a spec's facets into the cache.
+/// Problems met while loading the catalogs are kept, not printed — see
+/// [`diagnostics`](Self::diagnostics).
+#[derive(Debug, Clone, Default)]
 pub struct Catalog {
     entries: Vec<CatalogEntry>,
+    diagnostics: Vec<CatalogDiagnostic>,
 }
 
 impl Catalog {
     /// Build a catalog by loading entries from all locations in the given sources.
     ///
-    /// Required locations that fail to load cause a fatal error (process exit).
-    /// Optional locations that fail are silently ignored.
+    /// Loading never fails as a whole: a location that cannot be read
+    /// or parsed contributes a [`CatalogDiagnostic`] instead of entries —
+    /// an error for a required location, nothing for an optional one
+    /// that is simply absent. Read them with
+    /// [`diagnostics`](Self::diagnostics); each is also logged at
+    /// `warn` level.
     pub fn of(sources: &CatalogSources) -> Self {
         let mut entries = Vec::new();
+        let mut diagnostics = sources.diagnostics().to_vec();
 
-        let load_named = |src: &super::sources::NamedCatalogSource,
-                              entries: &mut Vec<CatalogEntry>,
-                              required: bool| {
+        let mut load_named = |src: &super::sources::NamedCatalogSource, required: bool| {
             let before = entries.len();
-            load_catalog_entries(&src.location, entries, required);
+            load_catalog_entries(&src.location, &mut entries, required, &mut diagnostics);
             // Stamp every entry this source contributed with the
             // catalog's symbolic name so downstream surfaces (the
             // picker's catalog toggle screen, listings) can group
@@ -44,14 +56,17 @@ impl Catalog {
         };
 
         for src in sources.required() {
-            load_named(src, &mut entries, true);
+            load_named(src, true);
         }
 
         for src in sources.optional() {
-            load_named(src, &mut entries, false);
+            load_named(src, false);
         }
 
-        Catalog { entries }
+        for d in &diagnostics {
+            log::warn!("{d}");
+        }
+        Catalog { entries, diagnostics }
     }
 
     /// Returns all dataset entries in the catalog.
@@ -64,25 +79,56 @@ impl Catalog {
         self.entries.is_empty()
     }
 
+    /// What went wrong while the sources were read and the catalogs
+    /// loaded: unreadable locations, unparseable files, skipped
+    /// entries. Empty when everything loaded cleanly. The command-line
+    /// tools print these to stderr; a library caller decides.
+    pub fn diagnostics(&self) -> &[CatalogDiagnostic] {
+        &self.diagnostics
+    }
+
     /// Find a dataset by exact name (case-insensitive).
+    ///
+    /// `None` both when no dataset has the name and when several do;
+    /// [`lookup`](Self::lookup) says which, with suggestions.
     pub fn find_exact(&self, name: &str) -> Option<&CatalogEntry> {
+        self.lookup(name).ok()
+    }
+
+    /// Find a dataset by exact name (case-insensitive), or say why not:
+    /// [`Error::UnknownDataset`](crate::Error::UnknownDataset), carrying
+    /// the datasets whose names contain `name` as suggestions, or
+    /// [`Error::AmbiguousDataset`](crate::Error::AmbiguousDataset).
+    pub fn lookup(&self, name: &str) -> crate::Result<&CatalogEntry> {
         let matches: Vec<_> = self
             .entries
             .iter()
             .filter(|e| e.name.eq_ignore_ascii_case(name))
             .collect();
-        match matches.len() {
-            1 => Some(matches[0]),
-            0 => None,
-            _ => {
-                eprintln!(
-                    "ERROR: multiple datasets matching '{}': {}",
-                    name,
-                    matches.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", ")
-                );
-                None
-            }
+        match matches.as_slice() {
+            [one] => Ok(one),
+            [] => Err(crate::Error::UnknownDataset {
+                name: name.to_string(),
+                suggestions: self.suggestions(name).iter().map(|e| e.name.clone()).collect(),
+            }),
+            _ => Err(crate::Error::AmbiguousDataset {
+                name: name.to_string(),
+                matches: matches.iter().map(|e| e.name.clone()).collect(),
+            }),
         }
+    }
+
+    /// Datasets whose names contain `search`, case-insensitively — the
+    /// "did you mean" list for a name that was not found.
+    pub fn suggestions(&self, search: &str) -> Vec<&CatalogEntry> {
+        if search.is_empty() {
+            return Vec::new();
+        }
+        let lower = search.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| e.name.to_lowercase().contains(&lower))
+            .collect()
     }
 
     /// Match datasets by glob pattern against their names.
@@ -93,12 +139,16 @@ impl Catalog {
     }
 
     /// Match datasets by regex pattern against their names.
+    ///
+    /// Only a simple subset of regex syntax is understood; a pattern
+    /// outside it falls back to a case-insensitive substring match,
+    /// logged at `warn` level.
     pub fn match_regex(&self, pattern: &str) -> Vec<&CatalogEntry> {
         // Use simple substring/pattern matching without pulling in regex crate
         match simple_regex_match(pattern) {
             Some(matcher) => self.entries.iter().filter(|e| matcher(&e.name)).collect(),
             None => {
-                eprintln!("warning: unsupported regex pattern '{}', falling back to substring match", pattern);
+                log::warn!("unsupported regex pattern '{pattern}', falling back to substring match");
                 let lower = pattern.to_lowercase();
                 self.entries
                     .iter()
@@ -111,19 +161,21 @@ impl Catalog {
     /// Open a dataset by name, returning a `TestDataGroup` ready for
     /// facet access.
     ///
-    /// This is the primary entry point for consumers: name → data.
     /// No URL construction needed — the catalog resolves the location.
+    /// A name that is unknown or ambiguous fails as
+    /// [`lookup`](Self::lookup) does. To open by a full
+    /// `name:selector` spec, use [`open_spec`](Self::open_spec).
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # use vectordata::catalog::{Catalog, CatalogSources};
     /// let catalog = Catalog::of(&CatalogSources::new().configure_default());
     /// let group = catalog.open("my-dataset")?;
     /// let view = group.profile("default").unwrap();
     /// let base = view.base_vectors()?;
+    /// # Ok::<(), vectordata::Error>(())
     /// ```
     pub fn open(&self, name: &str) -> crate::Result<crate::TestDataGroup> {
-        let entry = self.find_exact(name)
-            .ok_or_else(|| crate::Error::Other(format!("dataset '{}' not found in catalog", name)))?;
-        Self::open_entry(entry)
+        Self::open_entry(self.lookup(name)?)
     }
 
     /// Open a [`CatalogEntry`] directly, dispatching on its shape:
@@ -141,6 +193,93 @@ impl Catalog {
         crate::TestDataGroup::load(&entry.path)
     }
 
+    /// Open what a dataset spec names: **the call for turning a string
+    /// a user typed into data.**
+    ///
+    /// A spec is `<head>[:<selector>]`. The head is a catalog name, a
+    /// local directory or `dataset.yaml`, or a URL; the selector names
+    /// profiles — a bare name (`default`), an expression
+    /// (`size=10m,predicates=uniform*`), or `profile=*` for all — and
+    /// no selector means `default`. The split is the one
+    /// [`DatasetSpec::parse`](crate::dataset::selector::DatasetSpec::parse)
+    /// makes, which knows that a URL's port and a Windows drive letter
+    /// are not selectors; do not split a spec on `:` yourself.
+    ///
+    /// ```no_run
+    /// # use vectordata::catalog::{Catalog, CatalogSources};
+    /// let catalog = Catalog::of(&CatalogSources::new().configure_default());
+    /// let selection = catalog.open_spec("my-dataset:size=10m")?;
+    /// let view = selection.view()?; // exactly one profile, or an error
+    /// # Ok::<(), vectordata::Error>(())
+    /// ```
+    pub fn open_spec(&self, spec: &str) -> crate::Result<DatasetSelection> {
+        // A path that exists is a path, whatever punctuation it holds.
+        if std::path::Path::new(spec).exists() {
+            return self.open_selection(spec, None);
+        }
+        let parsed = crate::dataset::selector::DatasetSpec::parse(spec).map_err(|e| {
+            crate::Error::Selection {
+                dataset: crate::dataset::selector::DatasetSpec::split_head(spec).0.to_string(),
+                message: e.to_string(),
+            }
+        })?;
+        self.open_selection(&parsed.head, parsed.selector.as_ref().map(|s| s.text()))
+    }
+
+    /// [`open_spec`](Self::open_spec) with the head and the selector
+    /// given separately — for a caller whose selector arrives on its
+    /// own, such as a `--profile` option. `None` selects `default`.
+    pub fn open_selection(&self, head: &str, selector: Option<&str>) -> crate::Result<DatasetSelection> {
+        let opened = |label: &str, e: crate::Error| {
+            crate::Error::Other(format!("failed to open dataset '{label}': {e}"))
+        };
+        let (dataset, group) = if crate::transport::is_remote_url(head) || std::path::Path::new(head).exists() {
+            let group = crate::TestDataGroup::load(head).map_err(|e| opened(head, e))?;
+            (head.to_string(), group)
+        } else {
+            let entry = self.lookup(head)?;
+            // Checked against the catalog's own profile list first, so a
+            // selector that matches nothing fails before the dataset is
+            // fetched (PS-9).
+            entry.select(selector).map_err(|e| crate::Error::Selection {
+                dataset: entry.name.clone(),
+                message: e.to_string(),
+            })?;
+            let group = Self::open_entry(entry).map_err(|e| opened(&entry.name, e))?;
+            (entry.name.clone(), group)
+        };
+        let profiles = group.select(selector).map_err(|e| crate::Error::Selection {
+            dataset: dataset.clone(),
+            message: e.to_string(),
+        })?;
+        Ok(DatasetSelection { dataset, group, profiles })
+    }
+
+    /// Fetch what a dataset spec names into the local cache, with
+    /// progress: [`open_spec`](Self::open_spec), then
+    /// [`TestDataGroup::fetch`](crate::TestDataGroup::fetch) over the
+    /// profiles it selected.
+    ///
+    /// ```no_run
+    /// # use vectordata::catalog::{Catalog, CatalogSources};
+    /// use vectordata::fetch::{FetchRequest, TextMeter};
+    /// let catalog = Catalog::of(&CatalogSources::new().configure_default());
+    /// catalog.fetch(
+    ///     "my-dataset:default",
+    ///     &FetchRequest::facets(["base_vectors", "query_vectors"]),
+    ///     &mut TextMeter::stderr("Fetch"),
+    /// )?;
+    /// # Ok::<(), vectordata::Error>(())
+    /// ```
+    pub fn fetch(
+        &self,
+        spec: &str,
+        request: &crate::fetch::FetchRequest,
+        progress: &mut dyn crate::fetch::FetchProgress,
+    ) -> crate::Result<crate::fetch::FetchReport> {
+        self.open_spec(spec)?.fetch(request, progress)
+    }
+
     /// Open the one profile of a dataset a selector names, returning
     /// the view directly.
     ///
@@ -148,20 +287,25 @@ impl Catalog {
     /// an expression such as `size=10m,predicates=uniform-2`. It must
     /// name exactly one profile; a set is an error here, and
     /// [`open_profiles`](Self::open_profiles) is the surface that takes
-    /// one (PS-10).
+    /// one (PS-10). The same as `open_selection(name, Some(profile))?.view()`.
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # use vectordata::catalog::{Catalog, CatalogSources};
     /// let catalog = Catalog::of(&CatalogSources::new().configure_default());
     /// let view = catalog.open_profile("my-dataset", "default")?;
     /// let base = view.base_vectors()?;
+    /// # Ok::<(), vectordata::Error>(())
     /// ```
     pub fn open_profile(&self, name: &str, profile: &str) -> crate::Result<std::sync::Arc<dyn crate::view::TestDataView>> {
         let group = self.open(name)?;
-        let selected = group.select_one(Some(profile)).map_err(|e| {
-            crate::Error::Other(format!("dataset '{name}': {e}"))
+        let selected = group.select_one(Some(profile)).map_err(|e| crate::Error::Selection {
+            dataset: name.to_string(),
+            message: e.to_string(),
         })?;
-        group.profile(&selected)
-            .ok_or_else(|| crate::Error::Other(format!("profile '{}' not found in dataset '{}'", selected, name)))
+        group.profile(&selected).ok_or_else(|| crate::Error::Selection {
+            dataset: name.to_string(),
+            message: format!("profile '{selected}' not found"),
+        })
     }
 
     /// Open every profile of a dataset a selector names, size-ordered,
@@ -172,63 +316,90 @@ impl Catalog {
         name: &str,
         selector: Option<&str>,
     ) -> crate::Result<Vec<(String, std::sync::Arc<dyn crate::view::TestDataView>)>> {
-        let group = self.open(name)?;
-        let selected = group.select(selector).map_err(|e| {
-            crate::Error::Other(format!("dataset '{name}': {e}"))
-        })?;
-        selected
-            .into_iter()
+        self.open_selection(name, selector)?.views()
+    }
+}
+
+/// What a dataset spec resolved to: the dataset, and the profiles its
+/// selector picked, in size order. Returned by
+/// [`Catalog::open_spec`] and [`Catalog::open_selection`].
+#[derive(Debug)]
+pub struct DatasetSelection {
+    dataset: String,
+    group: crate::TestDataGroup,
+    profiles: Vec<String>,
+}
+
+impl DatasetSelection {
+    /// The dataset as resolved: its catalog name, or the path or URL
+    /// it was opened from.
+    pub fn dataset(&self) -> &str {
+        &self.dataset
+    }
+
+    /// The selected profiles' names, size-ordered (PS-9).
+    pub fn profiles(&self) -> &[String] {
+        &self.profiles
+    }
+
+    /// The opened dataset, for anything beyond the selection.
+    pub fn group(&self) -> &crate::TestDataGroup {
+        &self.group
+    }
+
+    /// The view of the one selected profile. More than one match is an
+    /// [`Error::Selection`](crate::Error::Selection) naming them — use
+    /// [`views`](Self::views) for a set.
+    pub fn view(&self) -> crate::Result<std::sync::Arc<dyn crate::view::TestDataView>> {
+        match self.profiles.as_slice() {
+            [one] => self.group.profile(one).ok_or_else(|| crate::Error::Selection {
+                dataset: self.dataset.clone(),
+                message: format!("profile '{one}' not found"),
+            }),
+            many => Err(crate::Error::Selection {
+                dataset: self.dataset.clone(),
+                message: format!(
+                    "the selector matches {} profiles ({}); narrow it to one",
+                    many.len(),
+                    many.join(", ")
+                ),
+            }),
+        }
+    }
+
+    /// A view of every selected profile, with its name.
+    pub fn views(&self) -> crate::Result<Vec<(String, std::sync::Arc<dyn crate::view::TestDataView>)>> {
+        self.profiles
+            .iter()
             .map(|p| {
-                group
-                    .profile(&p)
+                self.group
+                    .profile(p)
                     .map(|v| (p.clone(), v))
-                    .ok_or_else(|| crate::Error::Other(format!("profile '{p}' not found in dataset '{name}'")))
+                    .ok_or_else(|| crate::Error::Selection {
+                        dataset: self.dataset.clone(),
+                        message: format!("profile '{p}' not found"),
+                    })
             })
             .collect()
     }
 
-    /// Print all datasets to stderr, highlighting any that contain the
-    /// search term as a substring.
-    pub fn list_datasets(&self, search: &str) {
-        if !search.is_empty() {
-            eprintln!("Dataset '{}' not found.", search);
-        }
-
-        if self.entries.is_empty() {
-            eprintln!("No datasets are available in the catalog.");
-            return;
-        }
-
-        if !search.is_empty() {
-            let lower = search.to_lowercase();
-            let matches: Vec<_> = self
-                .entries
-                .iter()
-                .filter(|e| e.name.to_lowercase().contains(&lower))
-                .collect();
-            if !matches.is_empty() {
-                eprintln!("Did you mean one of these datasets?");
-                for entry in &matches {
-                    print_dataset_with_profiles(entry);
-                }
-                eprintln!();
-            }
-        }
-
-        eprintln!("Available datasets ({} total):", self.entries.len());
-        for entry in &self.entries {
-            print_dataset_with_profiles(entry);
-        }
+    /// Fetch the selected profiles' facets — [`TestDataGroup::fetch`](crate::TestDataGroup::fetch)
+    /// over [`profiles`](Self::profiles).
+    pub fn fetch(
+        &self,
+        request: &crate::fetch::FetchRequest,
+        progress: &mut dyn crate::fetch::FetchProgress,
+    ) -> crate::Result<crate::fetch::FetchReport> {
+        self.group.fetch(&self.profiles, request, progress)
     }
-}
 
-/// Print a dataset entry with its profile names to stderr.
-fn print_dataset_with_profiles(entry: &CatalogEntry) {
-    let profiles: Vec<String> = entry.profile_names().into_iter().map(|s| s.to_string()).collect();
-    if profiles.is_empty() {
-        eprintln!("  - {} (no profiles)", entry.name);
-    } else {
-        eprintln!("  - {} (profiles: {})", entry.name, profiles.join(", "));
+    /// Plan a [`fetch`](Self::fetch) without fetching.
+    pub fn plan_fetch(
+        &self,
+        request: &crate::fetch::FetchRequest,
+        progress: &mut dyn crate::fetch::FetchProgress,
+    ) -> crate::Result<crate::fetch::FetchPlan> {
+        self.group.plan_fetch(&self.profiles, request, progress)
     }
 }
 
@@ -250,24 +421,28 @@ fn print_dataset_with_profiles(entry: &CatalogEntry) {
 /// 2. **Directory cascade** — when `location` is a directory or URL
 ///    prefix, the canonical filename set is walked in order:
 ///    `catalog.json`, `catalog.yaml`, `knn_entries.yaml`.
-fn load_catalog_entries(location: &str, entries: &mut Vec<CatalogEntry>, required: bool) {
+fn load_catalog_entries(
+    location: &str,
+    entries: &mut Vec<CatalogEntry>,
+    required: bool,
+    diags: &mut Vec<CatalogDiagnostic>,
+) {
     if looks_like_catalog_file(location) {
-        if !load_from_explicit_catalog_file(location, entries) && required {
-            eprintln!("error: could not load catalog from {}", location);
+        if !load_from_explicit_catalog_file(location, entries, diags) && required {
+            diags.push(CatalogDiagnostic::error(format!("could not load catalog from {location}")));
         }
         return;
     }
 
     // Directory cascade.
-    if try_load_canonical_catalog(location, entries) { return; }
-    if try_load_knn_entries(location, entries) { return; }
+    if try_load_canonical_catalog(location, entries, diags) { return; }
+    if try_load_knn_entries(location, entries, diags) { return; }
 
     if required {
-        eprintln!(
-            "ERROR: no catalog file found at {} \
-             (tried catalog.json, catalog.yaml, knn_entries.yaml)",
-            location,
-        );
+        diags.push(CatalogDiagnostic::error(format!(
+            "no catalog file found at {location} \
+             (tried catalog.json, catalog.yaml, knn_entries.yaml)"
+        )));
     } else {
         log::debug!(
             "optional catalog {} has no catalog.json / catalog.yaml / knn_entries.yaml",
@@ -284,7 +459,11 @@ fn load_catalog_entries(location: &str, entries: &mut Vec<CatalogEntry>, require
 /// the file was parsed but contained no entries (still a success —
 /// the file exists). Returns `false` when the file could not be
 /// fetched at all.
-fn load_from_explicit_catalog_file(location: &str, entries: &mut Vec<CatalogEntry>) -> bool {
+fn load_from_explicit_catalog_file(
+    location: &str,
+    entries: &mut Vec<CatalogEntry>,
+    diags: &mut Vec<CatalogDiagnostic>,
+) -> bool {
     let content = match fetch_location_content(location) {
         Some(c) => c,
         None => return false,
@@ -296,7 +475,7 @@ fn load_from_explicit_catalog_file(location: &str, entries: &mut Vec<CatalogEntr
     let value: serde_yaml::Value = match serde_yaml::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("error: failed to parse catalog {}: {}", location, e);
+            diags.push(CatalogDiagnostic::error(format!("failed to parse catalog {location}: {e}")));
             return true;
         }
     };
@@ -310,13 +489,13 @@ fn load_from_explicit_catalog_file(location: &str, entries: &mut Vec<CatalogEntr
                 let as_json: serde_json::Value = match serde_json::to_value(&item) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("warning: skipping catalog entry: {}", e);
+                        diags.push(CatalogDiagnostic::warning(format!("skipping catalog entry: {e}")));
                         continue;
                     }
                 };
                 match remap_entry(&as_json, &base_url) {
                     Ok(entry) => entries.push(entry),
-                    Err(e) => eprintln!("warning: skipping catalog entry: {}", e),
+                    Err(e) => diags.push(CatalogDiagnostic::warning(format!("skipping catalog entry: {e}"))),
                 }
             }
             true
@@ -340,16 +519,15 @@ fn load_from_explicit_catalog_file(location: &str, entries: &mut Vec<CatalogEntr
                     true
                 }
                 Err(e) => {
-                    eprintln!("error: failed to parse {}: {}", location, e);
+                    diags.push(CatalogDiagnostic::error(format!("failed to parse {location}: {e}")));
                     true
                 }
             }
         }
         _ => {
-            eprintln!(
-                "ERROR: catalog {} is neither a sequence nor a mapping",
-                location,
-            );
+            diags.push(CatalogDiagnostic::error(format!(
+                "catalog {location} is neither a sequence nor a mapping"
+            )));
             true
         }
     }
@@ -385,7 +563,11 @@ fn parent_location_of(location: &str) -> String {
 /// (entries appended); `false` when no canonical catalog file was
 /// found OR the file exists but parsing failed (the caller falls
 /// through to the next probe; the parse failure is logged here).
-fn try_load_canonical_catalog(location: &str, entries: &mut Vec<CatalogEntry>) -> bool {
+fn try_load_canonical_catalog(
+    location: &str,
+    entries: &mut Vec<CatalogEntry>,
+    diags: &mut Vec<CatalogDiagnostic>,
+) -> bool {
     let catalog_url = catalog_file_for(location);
 
     let content = if crate::transport::is_remote_url(&catalog_url) {
@@ -424,7 +606,7 @@ fn try_load_canonical_catalog(location: &str, entries: &mut Vec<CatalogEntry>) -
         Err(_) => match serde_yaml::from_str(&content) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("error: failed to parse catalog {}: {}", catalog_url, e);
+                diags.push(CatalogDiagnostic::error(format!("failed to parse catalog {catalog_url}: {e}")));
                 return true; // file exists, but couldn't parse — don't fall through
             }
         },
@@ -435,7 +617,7 @@ fn try_load_canonical_catalog(location: &str, entries: &mut Vec<CatalogEntry>) -
         match remap_entry(&value, &base_url) {
             Ok(entry) => entries.push(entry),
             Err(e) => {
-                eprintln!("warning: skipping catalog entry: {}", e);
+                diags.push(CatalogDiagnostic::warning(format!("skipping catalog entry: {e}")));
             }
         }
     }
@@ -449,7 +631,11 @@ fn try_load_canonical_catalog(location: &str, entries: &mut Vec<CatalogEntry>) -
 /// Returns `true` if a `knn_entries.yaml` was located and parsed
 /// (whether or not any entries were produced); `false` when no
 /// such file exists at the location.
-fn try_load_knn_entries(location: &str, entries: &mut Vec<CatalogEntry>) -> bool {
+fn try_load_knn_entries(
+    location: &str,
+    entries: &mut Vec<CatalogEntry>,
+    diags: &mut Vec<CatalogDiagnostic>,
+) -> bool {
     let url = knn_entries_url_for(location);
     let content = if url.starts_with("http://") || url.starts_with("https://") {
         match fetch_http(&url) {
@@ -474,7 +660,7 @@ fn try_load_knn_entries(location: &str, entries: &mut Vec<CatalogEntry>) -> bool
             true
         }
         Err(e) => {
-            eprintln!("error: failed to parse {}: {}", url, e);
+            diags.push(CatalogDiagnostic::error(format!("failed to parse {url}: {e}")));
             true
         }
     }
@@ -737,6 +923,7 @@ mod tests {
                 make_entry("vecs-128", &["default"]),
                 make_entry("glove-100", &["default", "10m"]),
             ],
+            ..Catalog::default()
         };
 
         assert!(catalog.find_exact("vecs-128").is_some());
@@ -752,6 +939,7 @@ mod tests {
                 make_entry("vecs-256", &["default"]),
                 make_entry("glove-100", &["default"]),
             ],
+            ..Catalog::default()
         };
 
         let matches = catalog.match_glob("vecs-*");

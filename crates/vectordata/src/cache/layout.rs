@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Natural cache layout — flat per-dataset directories with a single
+//! Internal. Natural cache layout — flat per-dataset directories with a single
 //! origin file at the root of each one.
 //!
 //! ```text

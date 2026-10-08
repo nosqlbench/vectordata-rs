@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Catalog discovery and loading for dataset indexes.
+//! Library API. Catalog discovery and loading for dataset indexes.
 //!
 //! A catalog is a JSON or YAML array of [`CatalogEntry`] values. Each entry
 //! embeds the publishable parts of a [`DatasetConfig`](super::config::DatasetConfig)

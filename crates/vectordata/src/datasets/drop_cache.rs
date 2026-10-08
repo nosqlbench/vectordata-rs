@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks datasets drop-cache` — remove cached dataset directories.
+//! CLI support. `veks datasets drop-cache` — remove cached dataset directories.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

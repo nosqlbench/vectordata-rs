@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `vectordata explore` — interactive visualization and exploration.
+//! CLI support. `vectordata explore` — interactive visualization and exploration.
 //!
 //! Owns the ratatui-based dataset browser, raw-values grid, and REPL
 //! command engine. Originally lived in `veks/src/explore/`; migrated
@@ -459,7 +459,7 @@ fn run_purge(specifier: &str, pause: bool) {
         }
     };
     let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-    let catalog = crate::catalog::resolver::Catalog::of(&sources);
+    let catalog = crate::datasets::open_catalog(&sources);
     let entry = match catalog.datasets().iter().find(|e| e.name == dataset) {
         Some(e) => e.clone(),
         None => {
@@ -540,7 +540,7 @@ fn run_ping(specifier: &str, pause: bool) {
     // so a ping from inside the picker hits exactly the catalogs the
     // user can see.
     let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-    let catalog = crate::catalog::resolver::Catalog::of(&sources);
+    let catalog = crate::datasets::open_catalog(&sources);
     let code = crate::datasets::ping::run_via_catalog(&catalog, &dataset, selector.as_deref());
     if code != 0 {
         eprintln!("(ping exited with status {code})");

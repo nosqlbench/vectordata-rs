@@ -619,3 +619,38 @@ fn a_slab_facet_survives_derive_by_either_plan_builder() {
     let facet = view.open_facet_records("metadata_content").unwrap();
     assert_eq!(facet.count().unwrap(), 100);
 }
+
+/// **A native read on a series reads the shard that holds the ordinal.**
+///
+/// `get_native` had a zero-copy fast path that offset into the *first*
+/// shard's mapping with the facet-wide ordinal. Wherever that offset
+/// still landed inside the first file — here, a first shard holding
+/// more records than the series takes from it — it returned that file's
+/// bytes for a record that lives in the second.
+#[test]
+fn a_native_read_on_a_series_reads_the_shard_holding_the_ordinal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    let write_i32 = |path: &std::path::Path, values: std::ops::Range<i32>| {
+        let bytes: Vec<u8> = values.flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(path, bytes).unwrap();
+    };
+    // The first file holds 150 values; the series takes 100 of them.
+    write_i32(&ds.join("part_a.i32"), 0..150);
+    write_i32(&ds.join("part_b.i32"), 1000..1100);
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "format_version: 2\nname: scalars\nprofiles:\n  default:\n    metadata_layout:\n      \
+         source:\n        - part_a.i32=100\n        - part_b.i32=100\n      record_count: 200\n",
+    )
+    .unwrap();
+    let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = g.profile("default").unwrap();
+    let r: vectordata::TypedReader<i32> =
+        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
+
+    assert_eq!(r.get_value(120).unwrap(), 1020, "the slow path is right");
+    assert_eq!(r.get_native(120).unwrap(), 1020, "and the native path agrees");
+    assert_eq!(r.get_native(5).unwrap(), 5);
+}

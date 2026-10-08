@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-profile step expansion for `dataset.yaml` pipelines.
+//! Library API. Per-profile step expansion for `dataset.yaml` pipelines.
 //!
 //! Transforms `per_profile: true` template steps into concrete per-profile
 //! steps with resolved IDs, dependencies, and option values. This is a core
@@ -38,19 +38,6 @@ pub fn filter_steps_for_profile(steps: Vec<StepDef>, profile: &str) -> Vec<StepD
         .collect()
 }
 
-/// Expand `per_profile` template steps into concrete steps for each profile.
-///
-/// For each profile (sized ascending by base_count, then default), template
-/// steps are cloned with:
-/// - ID suffixed with `-{profile_name}` (no suffix for default)
-/// - `profiles: [profile_name]` set
-/// - `after` references to other template steps similarly suffixed
-/// - Option values with `${profile_dir}`, `${base_count}`, `${base_end}`,
-///   `${query_count}`, `${profile_name}` resolved
-/// - Output paths auto-prefixed with `profiles/{name}/`
-///
-/// Template steps (per_profile=true) are removed; their expansions replace them.
-/// Non-template steps pass through unchanged.
 /// Map a pipeline command name to the facet code it implements.
 /// Returns None for commands that aren't facet-specific (e.g., state set).
 fn command_facet(run: &str) -> Option<char> {
@@ -120,6 +107,22 @@ pub fn refuse_layer_writes(steps: &[StepDef], profiles: &DSProfileGroup) -> Resu
     Ok(())
 }
 
+/// Expand `per_profile` template steps into concrete steps for each profile.
+///
+/// For each profile (sized ascending by base_count, then default), template
+/// steps are cloned with:
+/// - ID suffixed with `-{profile_name}` (no suffix for default)
+/// - `profiles: [profile_name]` set
+/// - `after` references to other template steps similarly suffixed
+/// - Option values with `${profile_dir}`, `${base_count}`, `${base_end}`,
+///   `${query_count}`, `${profile_name}` resolved
+/// - Output paths auto-prefixed with `profiles/{name}/`
+///
+/// Template steps (per_profile=true) are removed; their expansions replace them.
+/// Non-template steps pass through unchanged. Partition profiles are
+/// expanded like any other. `${query_count}` is the number of query
+/// vectors that precede the base vectors in the combined source. See
+/// [`expand_per_profile_steps_scoped`] for the partition-scoped form.
 pub fn expand_per_profile_steps(
     steps: Vec<StepDef>,
     profiles: &DSProfileGroup,

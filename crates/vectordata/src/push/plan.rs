@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Source-mode detection, known-good validation, and content scanning
+//! Library API. Source-mode detection, known-good validation, and content scanning
 //! for `vectordata push`.
 //!
 //! Push transfers a directory subtree (the publish root) — it does not
@@ -32,6 +32,7 @@ pub enum SourceMode {
 }
 
 impl SourceMode {
+    /// Human-readable description of the mode, as printed in the plan.
     pub fn label(self) -> &'static str {
         match self {
             SourceMode::Structured => "structured dataset (dataset.yaml)",

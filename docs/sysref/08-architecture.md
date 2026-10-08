@@ -35,7 +35,8 @@ and UI layer.
 vectordata-rs/
 ├── vectordata/        Access library (consumer crate)
 │   ├── io.rs          VectorReader/VvecReader traits + XvecReader/IndexedVvecReader, open_vec, open_vvec
-│   ├── view.rs        TestDataView trait, FacetStorage, prebuffer_all, open_facet_typed
+│   ├── view.rs        TestDataView trait (fetch, plan_fetch), FacetStorage, open_facet_typed
+│   ├── fetch.rs       FetchRequest, FetchPlan, FetchReport, FetchProgress sinks, TextMeter
 │   ├── typed_access.rs  TypedReader<T> over crate-private Storage
 │   ├── settings.rs    cache_dir resolution (single source of truth, strict — no silent fallback)
 │   ├── storage.rs     pub(crate) Storage enum (Mmap | Http | Cached) — hidden from consumers

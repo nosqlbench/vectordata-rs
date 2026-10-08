@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dataset filtering predicates for `<binary> datasets list`.
+//! CLI support. Dataset filtering predicates for `<binary> datasets list`.
 //!
 //! Each filter option maps to a predicate applied against [`CatalogEntry`]
 //! fields. Filters compose conjunctively — all specified filters must match.
@@ -68,18 +68,39 @@ pub fn normalize_match_pattern(pattern: &str, option_name: &str) -> String {
 /// Plain strings without regex/glob syntax are matched as case-insensitive substrings.
 #[derive(Debug, Default)]
 pub struct DatasetFilter {
+    /// `--matching-name`: pattern the dataset name must match.
     pub name: Option<String>,
+    /// `--with-facet`: facet names (aliases resolved) every one of
+    /// which the entry must provide in some profile.
     pub facet: Vec<String>,
+    /// `--with-metric`: required distance metric; synonyms such as
+    /// `angular` and `cosine` are treated as the same metric.
     pub metric: Option<String>,
+    /// `--matching-desc`: pattern matched against the name, notes,
+    /// model and tag values.
     pub desc: Option<String>,
+    /// `--with-min-count`: inclusive lower bound on the largest
+    /// profile `base_count`.
     pub min_count: Option<u64>,
+    /// `--with-max-count`: inclusive upper bound on the largest
+    /// profile `base_count`.
     pub max_count: Option<u64>,
+    /// `--with-count`: exact largest profile `base_count`.
     pub count: Option<u64>,
+    /// `--with-min-dim`: inclusive lower bound on vector dimension.
     pub min_dim: Option<u32>,
+    /// `--with-max-dim`: inclusive upper bound on vector dimension.
     pub max_dim: Option<u32>,
+    /// `--with-dim`: exact vector dimension.
     pub dim: Option<u32>,
+    /// `--with-vtype`: base-vector element type name, compared
+    /// case-insensitively (`float32`, `uint8`, ...).
     pub vtype: Option<String>,
+    /// `--with-min-data`: inclusive lower bound on total data size, in
+    /// bytes.
     pub min_data: Option<u64>,
+    /// `--with-max-data`: inclusive upper bound on total data size, in
+    /// bytes.
     pub max_data: Option<u64>,
     /// Exact data size as `(bytes, granularity)`: the granularity is
     /// the multiplier of the unit the user spelled (`118MB` →
@@ -277,10 +298,13 @@ impl DatasetFilter {
 /// When neither is set, all profiles are shown.
 #[derive(Debug, Default)]
 pub struct ProfileView {
+    /// Profile-name pattern; `None` shows every profile.
     pub pattern: Option<String>,
 }
 
 impl ProfileView {
+    /// A view limited to profiles matching `pattern`, or unlimited
+    /// when `None`.
     pub fn new(pattern: Option<String>) -> Self {
         Self { pattern }
     }
@@ -420,7 +444,9 @@ pub fn infer_metric(entry: &CatalogEntry) -> Option<String> {
 /// completion layer can memoize a [`FacetProbeCache`] to disk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FacetProbe {
+    /// File length in bytes.
     pub bytes: Option<u64>,
+    /// Vector dimension from the xvec header; `None` for non-xvec files.
     pub dim: Option<u32>,
 }
 

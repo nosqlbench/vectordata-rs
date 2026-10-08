@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Command handlers for the client-side `vecd` integration verbs —
+//! CLI support. Command handlers for the client-side `vecd` integration verbs —
 //! `login`/`logout`/`whoami`/`ping`/`token`. Thin orchestration over
 //! [`crate::endpoint`] (the HTTP API) and [`crate::credentials`] (the
 //! per-origin token store). Each returns a process exit code.
@@ -184,7 +184,9 @@ pub fn list_logins() -> i32 {
 /// non-`vecd` host.
 pub fn ping(url: &str, graceful: bool) -> i32 {
     let token = crate::credentials::stored_token(url);
-    crate::credentials::warn_if_expiring(url);
+    if let Some(w) = crate::credentials::expiry_warning(url) {
+        eprintln!("{w}");
+    }
     match endpoint::whoami(url, token.as_deref()) {
         Ok(view) => {
             print_access(url, &view);
@@ -241,7 +243,9 @@ pub fn token_issue(
         eprintln!("not logged in to {url} — run `vectordata login {url}` first");
         return 2;
     };
-    crate::credentials::warn_if_expiring(url);
+    if let Some(w) = crate::credentials::expiry_warning(url) {
+        eprintln!("{w}");
+    }
     match endpoint::issue_token(url, &session, description, profile, expires) {
         Ok(resp) => {
             println!("token: {}", resp.token);

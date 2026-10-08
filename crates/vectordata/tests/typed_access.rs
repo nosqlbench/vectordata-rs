@@ -93,9 +93,9 @@ fn scalar_u8_native_access() {
     assert!(r.is_native());
     assert_eq!(r.count(), 5);
     assert_eq!(r.dim(), 1);
-    assert_eq!(r.get_native(0), 0);
-    assert_eq!(r.get_native(2), 127);
-    assert_eq!(r.get_native(4), 255);
+    assert_eq!(r.get_native(0).unwrap(), 0);
+    assert_eq!(r.get_native(2).unwrap(), 127);
+    assert_eq!(r.get_native(4).unwrap(), 255);
 }
 
 #[test]
@@ -130,8 +130,8 @@ fn scalar_i32_native_access() {
 
     let r = TypedReader::<i32>::open(&path).unwrap();
     assert_eq!(r.count(), 5);
-    assert_eq!(r.get_native(0), i32::MIN);
-    assert_eq!(r.get_native(4), i32::MAX);
+    assert_eq!(r.get_native(0).unwrap(), i32::MIN);
+    assert_eq!(r.get_native(4).unwrap(), i32::MAX);
 }
 
 #[test]
@@ -426,7 +426,7 @@ profiles:
     let pred_type = view.facet_element_type("metadata_predicates").unwrap();
     assert_eq!(pred_type, ElementType::U8);
 
-    let results_type = view.facet_element_type("predicate_results").unwrap();
+    let results_type = view.facet_element_type("metadata_results").unwrap();
     assert_eq!(results_type, ElementType::I32);
 
     let base_type = view.facet_element_type("base_vectors").unwrap();
@@ -456,8 +456,8 @@ profiles:
     let reader = view.open_facet_typed::<u8>("metadata_content").unwrap();
     assert!(reader.is_native());
     assert_eq!(reader.count(), 5);
-    assert_eq!(reader.get_native(0), 7);
-    assert_eq!(reader.get_native(3), 0);
+    assert_eq!(reader.get_native(0).unwrap(), 7);
+    assert_eq!(reader.get_native(3).unwrap(), 0);
 }
 
 #[test]
@@ -510,11 +510,11 @@ profiles:
     let sum: i64 = match etype {
         ElementType::U8 => {
             let r = view.open_facet_typed::<u8>("metadata_content").unwrap();
-            (0..r.count()).map(|i| r.get_native(i) as i64).sum()
+            (0..r.count()).map(|i| r.get_native(i).unwrap() as i64).sum()
         }
         ElementType::I32 => {
             let r = view.open_facet_typed::<i32>("metadata_content").unwrap();
-            (0..r.count()).map(|i| r.get_native(i) as i64).sum()
+            (0..r.count()).map(|i| r.get_native(i).unwrap() as i64).sum()
         }
         _ => panic!("unexpected type"),
     };
@@ -559,19 +559,19 @@ profiles:
     assert_eq!(view.facet_element_type("base_vectors").unwrap(), ElementType::F32);
     assert_eq!(view.facet_element_type("metadata_content").unwrap(), ElementType::U8);
     assert_eq!(view.facet_element_type("metadata_predicates").unwrap(), ElementType::U8);
-    assert_eq!(view.facet_element_type("predicate_results").unwrap(), ElementType::I32);
+    assert_eq!(view.facet_element_type("metadata_results").unwrap(), ElementType::I32);
 
     // Access metadata as native u8
     let meta = view.open_facet_typed::<u8>("metadata_content").unwrap();
-    assert_eq!(meta.get_native(0), 5);
-    assert_eq!(meta.get_native(1), 10);
+    assert_eq!(meta.get_native(0).unwrap(), 5);
+    assert_eq!(meta.get_native(1).unwrap(), 10);
 
     // Access predicates as wider i32
     let pred = view.open_facet_typed::<i32>("metadata_predicates").unwrap();
     assert_eq!(pred.get_value(0).unwrap(), 5i32);
 
     // Access results as native i32
-    let results = view.open_facet_typed::<i32>("predicate_results").unwrap();
+    let results = view.open_facet_typed::<i32>("metadata_results").unwrap();
     assert_eq!(results.dim(), 1);
     assert_eq!(results.get_record(0).unwrap(), vec![0i32]);
 }

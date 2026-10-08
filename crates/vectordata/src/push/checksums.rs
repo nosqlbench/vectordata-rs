@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `SHA256SUMS` — the standard, externally-verifiable content checksum
+//! Library API. `SHA256SUMS` — the standard, externally-verifiable content checksum
 //! file `vectordata push` materializes per directory level.
 //!
 //! This is separate from the internal `.mrkl` merkle sidecars: the
@@ -48,9 +48,12 @@ pub struct ChecksumEntry {
     pub name: String,
 }
 
-/// A parsed `SHA256SUMS` file, sorted by name for deterministic output.
+/// A `SHA256SUMS` file, its entries sorted by name for deterministic
+/// output.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChecksumFile {
+    /// One entry per described file, sorted by name — whether parsed or
+    /// generated.
     pub entries: Vec<ChecksumEntry>,
 }
 
@@ -225,7 +228,11 @@ pub enum Freshness {
     /// Present and current — safe to ship as-is.
     Current,
     /// Present but stale; `reason` explains why.
-    Stale { reason: String },
+    Stale {
+        /// Human-readable cause, e.g. a described file newer than the
+        /// checksum file or a mismatched file set.
+        reason: String,
+    },
 }
 
 /// Evaluate the `SHA256SUMS` freshness for `dir` against the exact set
@@ -319,7 +326,7 @@ pub fn plan(dir: &Path, names: &[String]) -> std::io::Result<HashPlan> {
 /// then execute. Returns the parsed, freshly written checksum file.
 pub fn generate(dir: &Path, names: &[String]) -> std::io::Result<ChecksumFile> {
     let hash_plan = plan(dir, names)?;
-    execute(dir, names, hash_plan)
+    execute(dir, names, hash_plan, &super::Reporter::new(&super::ProgressSink::Silent))
 }
 
 /// Execute a [`HashPlan`]: hash the files it names, write `SHA256SUMS`
@@ -332,8 +339,13 @@ pub fn generate(dir: &Path, names: &[String]) -> std::io::Result<ChecksumFile> {
 /// longer sends every other file in it back through SHA-256: on
 /// tessera that was two terabytes of base shards untouched for days,
 /// rehashed for one report. Hashing runs across files in parallel and
-/// reports its progress on stderr.
-pub fn execute(dir: &Path, names: &[String], hash_plan: HashPlan) -> std::io::Result<ChecksumFile> {
+/// reports its progress through `report`.
+pub(super) fn execute(
+    dir: &Path,
+    names: &[String],
+    hash_plan: HashPlan,
+    report: &super::Reporter,
+) -> std::io::Result<ChecksumFile> {
     let mut by_name: std::collections::BTreeMap<&str, String> =
         hash_plan.reuse.iter().map(|e| (e.name.as_str(), e.hex.clone())).collect();
     if !hash_plan.hash.is_empty() {
@@ -343,15 +355,18 @@ pub fn execute(dir: &Path, names: &[String], hash_plan: HashPlan) -> std::io::Re
             .enumerate()
             .map(|(i, (name, len))| (i, dir.join(name), *len))
             .collect();
-        let hashed = hash_files(&work, hash_plan.reuse.len(), dir)?;
+        let hashed = hash_files(&work, hash_plan.reuse.len(), dir, report)?;
         for ((name, _), hex) in hash_plan.hash.iter().zip(hashed) {
             by_name.insert(name.as_str(), hex);
         }
     }
-    let entries: Vec<ChecksumEntry> = names
+    let mut entries: Vec<ChecksumEntry> = names
         .iter()
         .map(|name| ChecksumEntry { hex: by_name.remove(name.as_str()).expect("every name resolved"), name: name.clone() })
         .collect();
+    // Sorted, as every `ChecksumFile` is, whatever order the caller
+    // listed the names in.
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
     let sums_path = dir.join(CHECKSUMS_FILE);
     let cf = ChecksumFile { entries };
     std::fs::write(&sums_path, cf.render())?;
@@ -375,6 +390,7 @@ fn hash_files(
     work: &[(usize, std::path::PathBuf, u64)],
     reused: usize,
     dir: &Path,
+    reporter: &super::Reporter,
 ) -> std::io::Result<Vec<String>> {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -398,13 +414,7 @@ fn hash_files(
             work.len(),
             if reused > 0 { format!(", {} reused", reused) } else { String::new() },
         );
-        // Clear to the end of the line: a shorter line over a longer
-        // one otherwise leaves the tail of the old one standing.
-        if final_line {
-            eprintln!("\r{line}\x1b[K");
-        } else {
-            eprint!("\r{line}\x1b[K");
-        }
+        reporter.live_line(&line, final_line);
     };
     std::thread::scope(|s| {
         for _ in 0..workers {

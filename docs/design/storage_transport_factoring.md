@@ -5,6 +5,12 @@ every reader inherits the right caching and mmap-promotion path
 automatically, and downstream consumers can never accidentally pick
 a slow transport variant.
 
+> **Note (2026-10-06).** The `prebuffer_all*`, `prefetch` and
+> `prefetch_with_progress` entry points named below are now deprecated
+> wrappers over `TestDataView::fetch` (`vectordata::fetch`); see
+> `srd-api-discoverability.md`. The factoring described here is
+> unchanged.
+
 ## The factoring
 
 Two orthogonal concerns:

@@ -102,6 +102,44 @@ let mi   = view.metadata_indices()?;       // Arc<dyn VvecReader<i32>>
 
 ---
 
+## 2.1a Layers, and the call behind each command
+
+The library is layered from the outside in; applications use the first
+four:
+
+| Layer | Type | Holds |
+|---|---|---|
+| Catalog | `catalog::Catalog` | names → locations; specs (`name:selector`) → datasets |
+| Group | `TestDataGroup` | one dataset: its `dataset.yaml`, its profiles, selection |
+| View | `TestDataView` | one profile: its facets, and the `fetch` call |
+| Reader | `VectorReader`, `VvecReader`, `TypedReader`, `records` | ordinal access to one facet |
+| Storage | `FacetStorage` (low-level) | a facet's bytes: cache state, range fetches |
+
+Transport and cache internals below storage are crate-private. Nothing
+in these layers prints, prompts or exits: problems are values
+(`Error`, `Catalog::diagnostics`), and progress reaches a terminal only
+through a sink the caller passes (`fetch::FetchProgress`,
+`push::ProgressSink`).
+
+The `vectordata` binary sits on top. Its command implementations live
+in the `datasets`, `config`, `client_cli` and `shell` modules, each
+labelled *CLI support* in its first doc line, and each is a thin
+adapter over a library call:
+
+| Command | Library call |
+|---|---|
+| `datasets precache` | `TestDataView::fetch`, `TestDataGroup::fetch`, `Catalog::fetch` |
+| `datasets list` | `Catalog::datasets`, `Catalog::match_glob` |
+| `datasets describe`, `datasets ping` | `Catalog::open_spec`, `TestDataView::facet_manifest`, readers |
+| `datasets push` | `push::execute` |
+| `cache list`, `cache prune`, `cache prune-legacy` | `cache_admin::{list_entries, prune_by_filter, prune_legacy_layout}` |
+| `config get`, `config set` | `settings::{setting_value, write_setting, cache_dir}` |
+| `login`, `whoami`, `ping`, `token` | `endpoint`, `credentials` |
+| `backup`, `restore` | `backup::{run_backup, run_restore}` |
+
+The full table, one row per command, is in the crate's `AGENTS.md`, and
+a test fails when a command has no row there.
+
 ## 2.2 Catalog-Based Dataset Discovery
 
 ### Catalog configuration
@@ -383,8 +421,8 @@ let etype = view.facet_element_type("metadata_content")?;  // ElementType::U8
 // Resolved source path/URL for any declared facet
 let src: Option<String> = view.facet_source("metadata_content");
 
-// Prebuffer / cache control
-view.prebuffer_all()?;
+// Fetch into the cache / inspect it
+view.fetch(&FetchRequest::all(), &mut Silent)?;
 let storage = view.open_facet_storage("base_vectors")?;    // FacetStorage
 ```
 
@@ -817,9 +855,9 @@ This applies to:
   via HTTP RANGE into the configured cache directory, atomic-renames
   into place, mmap-promotes. (No merkle — bytes are trusted from the
   server. Server-reported size mismatches surface as an error.)
-- `view.prebuffer_all` / `group.prebuffer_all_profiles` →
-  per-facet failure is propagated immediately; no facet is skipped
-  silently.
+- `view.fetch` / `group.fetch` → the whole run is planned and checked
+  before anything moves; per-facet failure is propagated immediately;
+  no facet is skipped silently.
 
 After a prebuffer call returns `Ok(())`, **every reader against the
 same source — including readers opened *before* the prebuffer call —
@@ -842,76 +880,81 @@ held `vectordata explore` to about 50 vectors a second.
 #### From the CLI
 
 ```bash
-# All profiles in the dataset (default — bare name, no profile suffix).
-# Issues a warning to stderr if total cross-profile size exceeds 250 MiB
-# but continues regardless.
-veks datasets prebuffer --dataset my-dataset
+# One profile.
+vectordata datasets precache my-dataset:default
 
-# A specific profile only.
-veks datasets prebuffer --dataset my-dataset:default
+# Every profile (a bare name is refused, naming this spelling).
+# Warns on stderr above 250 MiB across the selected profiles, and continues.
+vectordata datasets precache 'my-dataset:profile=*'
 
-# Other catalog/cache flags.
-veks datasets prebuffer --dataset my-dataset --at https://host/datasets/
-veks datasets prebuffer --dataset my-dataset --cache-dir /tmp/vd-cache
+# Chosen facets, a record window, or just the plan.
+vectordata datasets precache my-dataset:default --facet base_vectors --window 0..1m
+vectordata datasets precache my-dataset:default --plan
+
+# Other catalog flags.
+vectordata datasets precache my-dataset:default --at https://host/datasets/
 ```
 
-#### From Rust — single profile
+`veks datasets precache` is the same command. It is a thin adapter
+over the library calls below.
+
+#### From Rust — one profile
 
 ```rust
-use vectordata::TestDataView;
+use vectordata::fetch::{FetchEvent, FetchRequest, Silent, TextMeter};
 
 let view = catalog.open_profile("my-dataset", "default")?;
 
-// Strict: returns Ok(()) only when every facet of this profile is
-// fully resident and zero-copy ready. Per-facet failure is Err.
-view.prebuffer_all()?;
+// Strict: returns Ok only when every planned byte is resident. The run
+// is planned and checked first: an unknown facet, a window that would
+// silently become a whole-facet download, or a cache directory without
+// room is refused before anything moves.
+view.fetch(&FetchRequest::all(), &mut Silent)?;
 
-// With per-facet progress. Callback fires once per declared facet
-// (after that facet's download completes; for already-resident
-// facets it fires once with total_chunks=0). Every facet is fetched
-// against the window it declares — a series decomposed across its
-// shards — and a declared window the format cannot map is refused
-// under `WholeFacetFallback::Refuse` rather than widened to the
-// whole facet; pass `Allow` to accept the whole facet.
-view.prebuffer_all_with_progress(WholeFacetFallback::Refuse, &mut |facet, p| {
-    let pct = if p.total_chunks > 0 {
-        100.0 * p.verified_chunks as f64 / p.total_chunks as f64
-    } else { 100.0 };
-    eprintln!("  {facet}: {:.0}% ({}/{} chunks, {:.1} MiB)",
-        pct, p.verified_chunks, p.total_chunks,
-        p.total_bytes as f64 / 1_048_576.0);
+// Chosen facets, with the CLI's progress meter.
+view.fetch(
+    &FetchRequest::facets(["base_vectors", "query_vectors"]),
+    &mut TextMeter::stderr("Fetch"),
+)?;
+
+// A record window. A declared or requested window the format cannot
+// map is refused unless the request allows the whole facet.
+let window = vectordata::dataset::source::parse_window("0..1m")?;
+view.fetch(&FetchRequest::facets(["base_vectors"]).window(window), &mut Silent)?;
+
+// Your own display: every step arrives as a FetchEvent.
+view.fetch(&FetchRequest::all(), &mut |e: &FetchEvent<'_>| {
+    if let FetchEvent::Progress { facet, bytes, total, .. } = e {
+        eprintln!("  {facet}: {bytes}/{total} bytes");
+    }
 })?;
 ```
 
-`PrebufferProgress` exposes `verified_chunks`, `total_chunks`,
-`verified_bytes`, `total_bytes`.
+`plan_fetch` is the first half on its own: it returns a `FetchPlan`
+with the per-facet byte ranges, chunk fills and total cost, and
+fetches nothing; `FetchPlan::execute` is the second half.
 
-#### From Rust — all profiles, with size warning
+#### From Rust — several profiles, or straight from a spec
 
 ```rust
 use vectordata::{TestDataGroup, PREBUFFER_LARGE_WARNING_BYTES};
 
 let group = TestDataGroup::load("https://host/datasets/my-dataset/")?;
+let profiles = group.select(Some("profile=*"))?;
 
-// Walks every profile in the dataset, prebuffering every facet of
-// each. If the announced cross-profile total exceeds the 250 MiB
-// (PREBUFFER_LARGE_WARNING_BYTES) advisory threshold, warn_cb is
-// invoked once before any download begins; the call continues
-// regardless of the warning.
-group.prebuffer_all_profiles_with_progress(
-    &mut |profile, facet, p| {
-        eprintln!("  [{profile}] {facet}: {}/{} chunks",
-            p.verified_chunks, p.total_chunks);
-    },
-    &mut |total_bytes| {
-        eprintln!("WARNING: prebuffering {:.1} MiB across all profiles \
-                   (above {} MiB threshold). Pass dataset:profile to \
-                   limit which profiles are downloaded.",
-            total_bytes as f64 / 1_048_576.0,
-            PREBUFFER_LARGE_WARNING_BYTES / 1_048_576);
-    },
-)?;
+let plan = group.plan_fetch(&profiles, &FetchRequest::all(), &mut Silent)?;
+if plan.bytes_to_fetch() >= PREBUFFER_LARGE_WARNING_BYTES {
+    eprintln!("about to fetch {} bytes", plan.bytes_to_fetch());
+}
+plan.execute(&mut TextMeter::stderr("Fetch"))?;
+
+// The same from a spec, in one call:
+catalog.fetch("my-dataset:size=10m", &FetchRequest::all(), &mut Silent)?;
 ```
+
+The `prebuffer_*`, `prefetch` and `prefetch_with_progress` methods
+these replace are deprecated wrappers over `fetch`;
+`prefetch_in_background` remains as the background form.
 
 ### Per-facet cache stats
 
@@ -924,8 +967,15 @@ is cached.
 | `is_local()` | `true` | `true` once promoted | `false` |
 | `is_complete()` | `true` | `true` once every chunk verified | `false` (always) |
 | `cache_stats()` | `None` | `Some(CacheStats)` | `None` |
-| `cache_path()` | `None` | path to cache file | `None` |
-| `prebuffer()` | no-op | downloads + verifies | no-op |
+| `cache_path()` | the source file | the cache file | the cache file, once fetched |
+| `precache()` | no-op | downloads + verifies | downloads |
+
+`cache_path()` is for diagnostics — showing where a facet is cached —
+not an access path. A cache file is pre-sized and sparse until
+complete, its valid chunks are recorded separately, and a series spans
+several files (`cache_path()` names the first); only vectordata's
+readers account for that. Read through the facet readers, which are
+zero-copy once the facet is fetched.
 
 ```rust
 use vectordata::CacheStats;
@@ -938,18 +988,12 @@ if let Some(cs): Option<CacheStats> = storage.cache_stats() {
         pct, cs.valid_chunks, cs.total_chunks, cs.content_size);
 }
 
-// Drive this single facet to full-resident state (without touching
-// the rest of the profile).
-storage.prebuffer()?;
+// Bring this one facet in, without touching the rest of the profile,
+// then read it through its reader — zero-copy once resident.
+view.fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent)?;
 assert!(storage.is_complete());
-assert!(storage.is_local());
-
-// After prebuffer, the bytes are mmap-promoted; cache_path() points
-// to the local cache file so external tools (mmap, hashing, etc.)
-// can address it directly.
-if let Some(path) = storage.cache_path() {
-    println!("cached file landed at: {}", path.display());
-}
+let base = view.base_vectors()?;
+let first: &[f32] = base.get_slice(0).expect("mapped once fetched");
 ```
 
 ### How chunked verification works

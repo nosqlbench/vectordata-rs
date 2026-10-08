@@ -51,6 +51,7 @@ name, read its facets through typed readers.
 ```rust
 use vectordata::catalog::sources::CatalogSources;
 use vectordata::catalog::resolver::Catalog;
+use vectordata::fetch::{FetchRequest, TextMeter};
 use vectordata::{open_facet_typed, TestDataView, TypedReader};
 
 // Catalog → profile → reader. The prescribed entry path.
@@ -59,17 +60,17 @@ let view    = catalog.open_profile("myset", "default")?;
 
 let base = view.base_vectors()?;       // Arc<dyn VectorReader<f32>>  — 1M vectors
 let gt   = view.neighbor_indices()?;   // Arc<dyn VectorReader<i32>>  — exact KNN
-let mi   = view.metadata_indices()?;   // Arc<dyn VvecReader<i32>>    — predicate matches
+let mi   = view.metadata_results()?;   // Arc<dyn VvecReader<i32>>    — predicate matches
 
 let nearest:  Vec<i32> = gt.get(0)?;
 let matching: Vec<i32> = mi.get(0)?;
 
 // Typed scalar metadata via the same view handle
 let label: TypedReader<u8> = open_facet_typed(&*view, "metadata_content")?;
-let v: u8 = label.get_native(42);
+let v: u8 = label.get_native(42)?;
 
-// Make the whole profile zero-copy mmap for hot loops
-view.prebuffer_all()?;
+// Fetch the whole profile so hot loops read zero-copy mmap
+view.fetch(&FetchRequest::all(), &mut TextMeter::stderr("Fetch"))?;
 ```
 
 You never construct URLs, never name a transport, and never decide

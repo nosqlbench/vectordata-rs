@@ -12,6 +12,7 @@
 
 use std::io::Write;
 use vectordata::WholeFacetFallback;
+use vectordata::fetch::{FetchEvent, FetchRequest};
 use vectordata::dataset::source::parse_window;
 
 fn write_fvec(path: &std::path::Path, dim: i32, records: usize) {
@@ -173,8 +174,7 @@ fn a_local_facet_costs_nothing_to_prefetch() {
     assert_eq!(plan.chunks_to_fetch(), 0);
 
     // And actually running it is a no-op that succeeds.
-    let report = view
-        .prefetch(
+    let report = support::fetch::fetch_window(&*view, 
             "base_vectors",
             &parse_window("10..20").unwrap(),
             WholeFacetFallback::Refuse,
@@ -424,10 +424,12 @@ profiles:
         plan.byte_ranges.is_empty(),
         "a partial plan beside the degrade flag would understate the cost"
     );
+    assert!(plan.facet_bytes > 0, "the degrade names the facet's size");
     assert_eq!(
         plan.bytes_to_fetch(),
-        plan.facet_bytes,
-        "the honest cost of the degrade is the whole facet"
+        0,
+        "the honest cost of the degrade is the whole facet less what is \
+         already on disk — which, for a local file, is all of it"
     );
 }
 
@@ -596,8 +598,7 @@ profiles:
 
     // Fetching without permission is refused, and the message carries
     // the size, because that is the decision being asked for.
-    let refused = view
-        .prefetch("metadata_content", &window, WholeFacetFallback::Refuse)
+    let refused = support::fetch::fetch_window(&*view, "metadata_content", &window, WholeFacetFallback::Refuse)
         .expect_err("an unresolvable window must not quietly fetch everything");
     assert!(refused.to_string().contains("whole facet"), "{refused}");
     assert!(refused.to_string().contains("64"), "{refused}");
@@ -610,7 +611,7 @@ profiles:
     assert_eq!(WholeFacetFallback::default(), WholeFacetFallback::Refuse);
 
     // With permission it proceeds.
-    view.prefetch("metadata_content", &window, WholeFacetFallback::Allow)
+    support::fetch::fetch_window(&*view, "metadata_content", &window, WholeFacetFallback::Allow)
         .unwrap();
     view.prefetch_in_background("metadata_content", &window, WholeFacetFallback::Allow)
         .unwrap()
@@ -649,7 +650,7 @@ profiles:
     assert_eq!(plan.byte_ranges, vec![(0, 64)]);
 
     // And so it needs no permission.
-    view.prefetch(
+    support::fetch::fetch_window(&*view, 
         "metadata_content",
         &parse_window("").unwrap(),
         WholeFacetFallback::Refuse,
@@ -1110,7 +1111,7 @@ fn a_remote_vvec_window_uses_the_published_index() {
     );
 
     // And it fetches: afterwards the window reads as resident.
-    view.prefetch(
+    support::fetch::fetch_window(&*view, 
         "metadata_content",
         &parse_window("100..150").unwrap(),
         WholeFacetFallback::Refuse,
@@ -1207,7 +1208,7 @@ fn reading_a_prefetched_window_fetches_nothing_further() {
     let group = vectordata::TestDataGroup::load(&spec).unwrap();
     let view = group.profile("default").unwrap();
 
-    view.prefetch(
+    support::fetch::fetch_window(&*view, 
         "base_vectors",
         &parse_window("500..600").unwrap(),
         WholeFacetFallback::Refuse,
@@ -1275,13 +1276,13 @@ fn a_background_prefetch_reports_bytes_and_ranges() {
     // The blocking form reports through its callback.
     let mut seen_bytes = 0u64;
     let mut calls = 0usize;
-    view.prefetch_with_progress(
-        "metadata_content",
-        &parse_window("0..400").unwrap(),
-        WholeFacetFallback::Refuse,
-        &mut |p| {
-            calls += 1;
-            seen_bytes = seen_bytes.max(p.downloaded_bytes());
+    view.fetch(
+        &FetchRequest::facets(["metadata_content"]).window(parse_window("0..400").unwrap()),
+        &mut |e: &FetchEvent<'_>| {
+            if let FetchEvent::Progress { bytes, .. } = e {
+                calls += 1;
+                seen_bytes = seen_bytes.max(*bytes);
+            }
         },
     )
     .unwrap();
@@ -1390,7 +1391,7 @@ fn a_failed_fetch_surfaces_from_wherever_it_failed() {
 
     // And the blocking form fails the same way.
     assert!(
-        view.prefetch("base_vectors", &window, WholeFacetFallback::Refuse)
+        support::fetch::fetch_window(&*view, "base_vectors", &window, WholeFacetFallback::Refuse)
             .is_err()
     );
     drop(keep_open);
@@ -1417,12 +1418,12 @@ fn allowing_the_fallback_fetches_a_whole_remote_facet() {
     );
 
     assert!(
-        view.prefetch("metadata_predicates", &window, WholeFacetFallback::Refuse)
+        support::fetch::fetch_window(&*view, "metadata_predicates", &window, WholeFacetFallback::Refuse)
             .is_err(),
         "refused without consent even though it is only 40 KB"
     );
 
-    view.prefetch("metadata_predicates", &window, WholeFacetFallback::Allow)
+    support::fetch::fetch_window(&*view, "metadata_predicates", &window, WholeFacetFallback::Allow)
         .unwrap();
     let storage = view.open_facet_storage("metadata_predicates").unwrap();
     assert!(
@@ -1524,7 +1525,7 @@ fn a_server_without_range_support_plans_the_whole_facet() {
 
     // Which means prefetching it is a no-op rather than a second
     // download, and needs no whole-facet consent.
-    view.prefetch(
+    support::fetch::fetch_window(&*view, 
         "base_vectors",
         &parse_window("100..200").unwrap(),
         WholeFacetFallback::Refuse,
@@ -1914,7 +1915,7 @@ fn planning_a_remote_vvec_without_a_sidecar_downloads_nothing() {
     );
 
     // And the gate still governs: the transfer happens only on consent.
-    view.prefetch(
+    support::fetch::fetch_window(&*view, 
         "metadata_content",
         &parse_window("100..200").unwrap(),
         WholeFacetFallback::Refuse,
@@ -1929,7 +1930,7 @@ fn planning_a_remote_vvec_without_a_sidecar_downloads_nothing() {
         "a refused prefetch must leave the facet untouched"
     );
 
-    view.prefetch(
+    support::fetch::fetch_window(&*view, 
         "metadata_content",
         &parse_window("100..200").unwrap(),
         WholeFacetFallback::Allow,
@@ -2041,13 +2042,13 @@ fn a_scalar_window_prefetches_without_whole_facet_consent() {
     let group = scalar_dataset(tmp.path());
     let view = group.profile("default").unwrap();
 
-    view.prefetch(
+    support::fetch::fetch_window(&*view, 
         "metadata_content",
         &parse_window("10..60").unwrap(),
         WholeFacetFallback::Refuse,
     )
     .expect("a mapped window never needs whole-facet consent");
-    view.prefetch(
+    support::fetch::fetch_window(&*view, 
         "metadata_layout",
         &parse_window("2..5").unwrap(),
         WholeFacetFallback::Refuse,
@@ -2200,7 +2201,7 @@ fn a_remote_scalar_window_fetches_only_its_chunks() {
         plan.facet_bytes
     );
 
-    view.prefetch(
+    support::fetch::fetch_window(&*view, 
         "metadata_layout",
         &parse_window("5000..6000").unwrap(),
         WholeFacetFallback::Refuse,

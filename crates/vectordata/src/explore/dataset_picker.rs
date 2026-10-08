@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Interactive dataset picker TUI.
+//! CLI support. Interactive dataset picker TUI.
 //!
 //! Displays a filterable, scrollable list of datasets from configured
 //! catalogs. The user selects a dataset:profile with arrow keys and Enter.
@@ -66,7 +66,6 @@ fn fit_display(s: &str, target: usize) -> String {
 }
 
 use crate::AccessMode;
-use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::CatalogSources;
 
 /// A flattened row: one entry per dataset:profile pair.
@@ -2360,7 +2359,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
         eprintln!("Add one with `vectordata config catalog add <URL-or-path>`.");
         return PickerOutcome::Failed;
     }
-    let catalog = Catalog::of(&sources);
+    let catalog = crate::datasets::open_catalog(&sources);
     let entries = catalog.datasets();
     if entries.is_empty() {
         eprintln!("error: no datasets found in any configured catalog");
