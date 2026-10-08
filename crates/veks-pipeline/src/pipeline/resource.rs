@@ -495,7 +495,12 @@ pub enum ResourceValue {
     /// Fixed value (single number, e.g., `8` or `32GiB`).
     Fixed(u64),
     /// Range with floor and ceiling (e.g., `25%-50%` or `4-8`).
-    Range { floor: u64, ceiling: u64 },
+    Range {
+        /// Lower bound, resolved to an absolute value.
+        floor: u64,
+        /// Upper bound, resolved to an absolute value.
+        ceiling: u64,
+    },
 }
 
 impl ResourceValue {

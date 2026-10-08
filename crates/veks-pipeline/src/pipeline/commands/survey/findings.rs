@@ -22,9 +22,15 @@ use super::types::{IdentifierKind, NumberKind, SemanticType};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    /// Descriptive context (overview, schema summary); nothing to act on.
     Info,
+    /// A pattern worth an operator's attention, such as a partition
+    /// candidate or a strong cross-field association.
     Notable,
+    /// A likely data-quality or stability problem, such as a high
+    /// null rate or an unstable field type.
     Warning,
+    /// A failure condition surfaced by the survey itself.
     Error,
 }
 
@@ -42,13 +48,19 @@ impl Severity {
 /// One curated finding. Both renderers walk the same list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
+    /// Markdown section heading this finding is grouped under
+    /// (e.g. `"Overview"`, `"Cross-field highlights"`).
     pub section: String,
+    /// How prominent the finding is; filtered against
+    /// [`FindingsConfig::min_severity`].
     pub severity: Severity,
     /// Field this finding is anchored to (`None` for section-level
     /// observations like the overview).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
+    /// One-line headline for the finding.
     pub title: String,
+    /// Explanatory Markdown text for the finding.
     pub body: String,
     /// Up to a few reservoir samples making the finding concrete.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -61,15 +73,24 @@ pub struct Finding {
 /// JSON envelope for `survey.findings.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindingsReport {
+    /// Version of this JSON envelope's schema (currently `1`).
     pub schema_version: u32,
+    /// Identifier of the tool that produced the report.
     pub produced_by: String,
+    /// What was surveyed and where the full structured survey lives.
     pub source: FindingsSource,
+    /// Curated findings at or above the configured minimum severity,
+    /// in section order.
     pub findings: Vec<Finding>,
 }
 
+/// Provenance block of a [`FindingsReport`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindingsSource {
+    /// Path of the surveyed metadata source, copied from the survey report.
     pub path: String,
+    /// File name of the companion `survey.json` that the findings'
+    /// `json_path` pointers resolve against.
     pub survey_json: String,
 }
 

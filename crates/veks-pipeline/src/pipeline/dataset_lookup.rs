@@ -70,6 +70,14 @@ pub fn profiles_declaring_facet(workspace: &Path, facet: &str, path: &Path) -> V
         .collect()
 }
 
+/// Resolve a path-valued option for a step.
+///
+/// An explicit `option_key` value wins. Otherwise the path comes from the
+/// `facet_alias` facet of the step's profile in the dataset (an explicit
+/// `profile` option, else the step's own profile when the dataset has it,
+/// else `default`). Errors when the facet is declared in a form that is not
+/// a single file, or when neither source yields a path; the latter message
+/// tells the user which flag to pass.
 pub fn resolve_path_option(
     ctx: &StreamContext,
     options: &Options,
@@ -254,8 +262,11 @@ fn resolve_dataset_paths(ctx: &StreamContext, options: &Options) -> Option<(Path
 /// required-facets manifest. New commands extend this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyKind {
+    /// `verify knn-groundtruth`.
     KnnGroundtruth,
+    /// `verify knn-consolidated`.
     KnnConsolidated,
+    /// `verify knn-faiss-consolidated`.
     KnnFaissConsolidated,
     /// Legacy `verify filtered-knn-consolidated` (kept for
     /// backwards-compat; produces F-facet verification). New pipelines
@@ -266,13 +277,18 @@ pub enum VerifyKind {
     PrefilteredKnnConsolidated,
     /// E-facet verifier — post-filter ground truth (G ∩ R).
     PostfilteredKnnConsolidated,
+    /// `verify dataset-knnutils`.
     DatasetKnnutils,
+    /// `verify predicate-results`.
     PredicateResults,
+    /// `verify predicates-consolidated`.
     PredicatesConsolidated,
+    /// `verify predicates-sqlite`.
     PredicatesSqlite,
 }
 
 impl VerifyKind {
+    /// The command path of this verify command, e.g. `"verify knn-groundtruth"`.
     pub fn label(self) -> &'static str {
         match self {
             Self::KnnGroundtruth          => "verify knn-groundtruth",
@@ -364,6 +380,7 @@ impl VerifyKind {
 /// One profile's status for the active verify command.
 #[derive(Debug, Clone)]
 pub struct ProfileStatus {
+    /// Profile name.
     pub name: String,
     /// True iff every per-profile facet is declared on the profile
     /// AND the corresponding file exists on disk.
@@ -379,13 +396,18 @@ pub struct ProfileStatus {
 /// up-front exactly what will be verified.
 #[derive(Debug, Clone)]
 pub struct ScopeReport {
+    /// The verify command the report is for.
     pub kind: VerifyKind,
+    /// Path of the dataset's `dataset.yaml`.
     pub dataset_yaml: PathBuf,
+    /// Profile whose shared facets the command reads.
     pub anchor_profile: String,
+    /// Status of each candidate profile, in scope or not.
     pub profiles: Vec<ProfileStatus>,
 }
 
 impl ScopeReport {
+    /// Number of profiles in scope.
     pub fn in_scope(&self) -> usize {
         self.profiles.iter().filter(|p| p.in_scope).count()
     }

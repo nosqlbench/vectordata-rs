@@ -30,6 +30,7 @@ const DEFAULT_THRESHOLD: f64 = 1e-6;
 /// Pipeline command: detect near-zero vectors.
 pub struct AnalyzeZerosOp;
 
+/// Creates a boxed [`AnalyzeZerosOp`]; registered as the `analyze zeros` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeZerosOp)
 }

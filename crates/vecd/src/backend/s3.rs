@@ -18,6 +18,8 @@ use crate::backend::Backend;
 use crate::db::BackendRow;
 use crate::model::VecdError;
 
+/// A [`Backend`] over an `s3://bucket/prefix` location, driven through the
+/// `aws s3`/`s3api` CLI with the config's endpoint URL, region and profile.
 pub struct S3Backend {
     bucket: String,
     prefix: String,
@@ -27,6 +29,10 @@ pub struct S3Backend {
 }
 
 impl S3Backend {
+    /// Build from a backend config row: parses `endpoint` as
+    /// `s3://bucket[/prefix]` and takes `endpoint_url`, `region`, and
+    /// `creds_ref` (as the AWS named profile). Fails on a non-`s3://` or
+    /// bucket-less endpoint.
     pub fn new(row: &BackendRow) -> Result<Self, VecdError> {
         let rest = row
             .endpoint

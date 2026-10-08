@@ -31,8 +31,10 @@ fn resolve_path(value: &str, workspace: &Path) -> PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
 }
 
+/// Pipeline command: find duplicate vectors in a source file and report duplicate-group statistics.
 pub struct AnalyzeFindDuplicatesOp;
 
+/// Creates a boxed [`AnalyzeFindDuplicatesOp`]; registered as the `analyze find-duplicates` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeFindDuplicatesOp)
 }

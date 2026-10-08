@@ -18,8 +18,10 @@ use crate::pipeline::command::{
     StreamContext, render_options_table,
 };
 
+/// Pipeline command: write `catalog.json` / `catalog.yaml` index files for every directory level containing datasets.
 pub struct CatalogGenerateOp;
 
+/// Creates a boxed [`CatalogGenerateOp`]; registered as the `catalog generate` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(CatalogGenerateOp)
 }

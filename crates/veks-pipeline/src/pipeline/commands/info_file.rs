@@ -23,6 +23,7 @@ use crate::pipeline::command::{
 /// Pipeline command: display vector file info.
 pub struct InfoFileOp;
 
+/// Creates a boxed [`InfoFileOp`]; registered as the `analyze file` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(InfoFileOp)
 }

@@ -35,6 +35,8 @@
 //! }
 //! ```
 
+#![warn(missing_docs)]
+
 use std::collections::BTreeMap;
 
 // Lets `#[derive(VeksCli)]`-generated code (which emits `::veks_completion::…`
@@ -253,11 +255,17 @@ pub const DEFAULT_LEVEL: u32 = 1;
 pub enum MetadataError {
     /// A registered command lacks a category tag and the tree
     /// was built with [`CommandTree::require_metadata`].
-    MissingCategory { command: String },
+    MissingCategory {
+        /// Name of the offending top-level command.
+        command: String,
+    },
     /// A registered command lacks an explicit `with_level()`
     /// call and the tree was built with
     /// [`CommandTree::require_metadata`].
-    MissingLevel { command: String },
+    MissingLevel {
+        /// Name of the offending top-level command.
+        command: String,
+    },
 }
 
 impl std::fmt::Display for MetadataError {
@@ -2074,10 +2082,15 @@ pub fn shell_ready_candidates(
 /// `--shell` flag without separate dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shell {
+    /// GNU Bash (fully supported).
     Bash,
+    /// Z shell, via its bash-compatible completion mode.
     Zsh,
+    /// fish (placeholder; emits a stub with a warning).
     Fish,
+    /// Elvish (placeholder; emits a stub with a warning).
     Elvish,
+    /// PowerShell (placeholder; emits a stub with a warning).
     PowerShell,
 }
 
@@ -2096,6 +2109,8 @@ impl Shell {
         }
     }
 
+    /// The canonical lowercase name: `"bash"`, `"zsh"`, `"fish"`,
+    /// `"elvish"`, or `"powershell"`. Accepted back by [`Shell::from_name`].
     pub fn name(self) -> &'static str {
         match self {
             Self::Bash => "bash",
@@ -2730,6 +2745,15 @@ fn print_partial_parse(pp: &PartialParse) {
     println!("shell_current_word():  {:?}", pp.shell_current_word());
 }
 
+/// Serve a shell completion request if this process was launched as one.
+///
+/// Active only when the `_<APP>_COMPLETE` environment variable (with
+/// `app_name` uppercased and `-` mapped to `_`) equals `bash`. With no further
+/// arguments it prints the bash registration script; otherwise `argv[1]` is the
+/// command line and `argv[2]` the cursor offset (defaulting to the line
+/// length), and it prints one completion candidate per line resolved against
+/// `tree`. Returns `true` when it handled the request, in which case the caller
+/// should exit; returns `false` (printing nothing) for a normal invocation.
 pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     // ONLY the app-namespaced `_<APP>_COMPLETE` diverts execution. We do NOT
     // honor a bare global `COMPLETE` env var: it's set by clap_complete-era
@@ -3202,11 +3226,14 @@ pub enum ParseError {
     /// `--flag` was given but the tree expects a value to follow,
     /// and argv ended.
     MissingValue {
+        /// The flag that is missing its value.
         flag: String,
     },
     /// A flag appeared that no leaf or ancestor declares.
     UnknownFlag {
+        /// The unknown flag's long token, e.g. `"--foo"`.
         flag: String,
+        /// Subcommand names walked before the flag was seen.
         path: Vec<String>,
     },
     /// A `--flag=value` was given for a closed-set flag whose
@@ -3214,7 +3241,9 @@ pub enum ParseError {
     /// reserved for downstream validators that walk the parse
     /// result.)
     InvalidValue {
+        /// The flag whose value was rejected.
         flag: String,
+        /// The rejected value.
         value: String,
     },
 }

@@ -178,12 +178,18 @@ impl FitConfig {
 /// `c / branching` at level `l - 1`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LevelModel {
+    /// Children per parent cluster at this level (for the top level,
+    /// the cluster count itself).
     pub branching: usize,
+    /// Total clusters at this level: the running product of branchings.
     pub clusters: usize,
+    /// `clusters × dim` centroid components, row-major.
     pub centroids: Vec<f32>,
     /// A cluster no sample row landed in even after repair. Kept in
     /// the layout so codes stay positional, never chosen by descent.
     pub empty: Vec<bool>,
+    /// Stats of each k-means run that fitted this level, one per
+    /// parent cluster (a single run at the top level).
     pub runs: Vec<RunStats>,
 }
 
@@ -196,7 +202,9 @@ impl LevelModel {
 /// The fitted hierarchy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TopicModel {
+    /// Dimensionality of the vectors and centroids.
     pub dim: usize,
+    /// Fitted levels, outermost first.
     pub levels: Vec<LevelModel>,
 }
 
@@ -257,12 +265,19 @@ pub struct RunStats {
 /// The per-level summary written to the model report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LevelReport {
+    /// Children per parent cluster at this level.
     pub branching: usize,
+    /// Total clusters at this level.
     pub clusters: usize,
+    /// Clusters left empty after repair.
     pub empty: usize,
+    /// k-means runs performed for this level (one per parent cluster).
     pub runs: usize,
+    /// Runs whose final centroid movement fell below the tolerance.
     pub converged: usize,
+    /// Largest final mean centroid movement over the level's runs.
     pub max_final_movement: f32,
+    /// Empty-cluster repairs summed over the level's runs.
     pub repairs: u32,
 }
 
@@ -272,20 +287,37 @@ pub struct LevelReport {
 /// the labelling.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicModelReport {
+    /// Report format version.
     pub schema_version: u32,
+    /// Dimensionality of the fitted vectors.
     pub dim: usize,
+    /// Branching per level, outermost first, as given by `levels`.
     pub levels: Vec<usize>,
+    /// Centroids across all levels.
     pub total_centroids: usize,
+    /// The sample facet as given (defaults to the `base` option).
     pub sample: String,
+    /// Rows of the sample facet the model was fitted on.
     pub sample_size: usize,
+    /// How the sample rows were chosen from the sample facet.
     pub sample_order: SampleOrder,
+    /// Seed for k-means++ and sampling.
     pub seed: u64,
+    /// Iteration cap per k-means run.
     pub iterations: usize,
+    /// Convergence threshold on mean centroid movement, in cosine
+    /// distance.
     pub tolerance: f32,
+    /// Whether vectors were unit-normalised before fitting and assigning.
     pub normalize: bool,
+    /// Name of the dot-product kernel selected at runtime.
     pub kernel: String,
+    /// Wall-clock time of the fit, in seconds.
     pub fit_seconds: f64,
+    /// One summary per level, outermost first.
     pub per_level: Vec<LevelReport>,
+    /// Summary of the assignment pass. The command always fills it;
+    /// it is optional so a report without the field still parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment: Option<AssignmentReport>,
 }
@@ -293,9 +325,13 @@ pub struct TopicModelReport {
 /// What the assignment pass did.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssignmentReport {
+    /// The `base` facet as given, whose every vector was assigned.
     pub base: String,
+    /// Vectors assigned.
     pub records: u64,
+    /// Wall-clock time of the assignment pass, in seconds.
     pub seconds: f64,
+    /// Whether the leaf-margin facet was written.
     pub margin_written: bool,
 }
 

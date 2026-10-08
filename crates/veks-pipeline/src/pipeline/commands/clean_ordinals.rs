@@ -25,6 +25,7 @@ use crate::pipeline::command::{
 /// Pipeline command: filter ordinals to produce a clean index.
 pub struct CleanOrdinalsOp;
 
+/// Creates a boxed [`CleanOrdinalsOp`]; registered as the `transform ordinals` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(CleanOrdinalsOp)
 }

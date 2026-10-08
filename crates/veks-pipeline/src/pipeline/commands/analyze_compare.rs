@@ -26,6 +26,7 @@ use crate::pipeline::element_type::ElementType;
 /// Pipeline command: K-S distribution comparison.
 pub struct AnalyzeCompareOp;
 
+/// Creates a boxed [`AnalyzeCompareOp`]; registered as the `analyze compare-files` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeCompareOp)
 }

@@ -30,6 +30,7 @@ pub enum AuthError {
 }
 
 impl AuthError {
+    /// The human-readable reason, used as the body of the 401 response.
     pub fn message(self) -> &'static str {
         match self {
             AuthError::Unknown => "unknown or revoked token",

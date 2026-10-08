@@ -73,14 +73,20 @@ pub fn compare_query_ordinals(computed: &[i32], expected: &[i32]) -> QueryResult
 /// Summary of a batch of query comparisons.
 #[derive(Debug, Default)]
 pub struct VerifySummary {
+    /// Queries recorded.
     pub total: usize,
+    /// Queries whose neighbors matched in exact order.
     pub exact_match: usize,
+    /// Queries with the same neighbor set in a different order.
     pub set_match: usize,
+    /// Queries differing by at most [`BOUNDARY_THRESHOLD`] neighbors.
     pub boundary_mismatch: usize,
+    /// Queries differing by more than [`BOUNDARY_THRESHOLD`] neighbors.
     pub real_mismatch: usize,
 }
 
 impl VerifySummary {
+    /// Count one query's comparison result into the summary.
     pub fn record(&mut self, result: &QueryResult) {
         self.total += 1;
         match result {
@@ -91,10 +97,12 @@ impl VerifySummary {
         }
     }
 
+    /// Whether no recorded query was a real mismatch.
     pub fn all_acceptable(&self) -> bool {
         self.real_mismatch == 0
     }
 
+    /// Queries that passed: exact, set and boundary matches together.
     pub fn pass_count(&self) -> usize {
         self.exact_match + self.set_match + self.boundary_mismatch
     }

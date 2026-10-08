@@ -1,6 +1,9 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
+//! Buffered [`VecSink`] for the xvec family (fvec, ivec,
+//! bvec, dvec, mvec, svec).
+
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;

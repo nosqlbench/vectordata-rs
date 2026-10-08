@@ -25,6 +25,8 @@
 //! backup. Stasis/cleanup, the daemon lifecycle, introspection, and the
 //! client-side `login`/`ping`/`backup` land in Phase 2.
 
+#![warn(missing_docs)]
+
 pub mod auth;
 pub mod authz;
 pub mod backend;

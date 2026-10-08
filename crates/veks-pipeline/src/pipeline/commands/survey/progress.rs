@@ -78,6 +78,8 @@ impl Default for SurveyProgress {
 }
 
 impl SurveyProgress {
+    /// Fresh state in [`SurveyPass::Setup`] with all counters at zero;
+    /// the elapsed-time clock starts now.
     pub fn new() -> Self {
         SurveyProgress {
             pass: AtomicU8::new(SurveyPass::Setup as u8),
@@ -89,10 +91,12 @@ impl SurveyProgress {
         }
     }
 
+    /// Record which pass is now running.
     pub fn set_pass(&self, p: SurveyPass) {
         self.pass.store(p as u8, Ordering::Release);
     }
 
+    /// The pass most recently set with [`set_pass`](Self::set_pass).
     pub fn current_pass(&self) -> SurveyPass {
         match self.pass.load(Ordering::Acquire) {
             0 => SurveyPass::Setup,
@@ -105,42 +109,54 @@ impl SurveyProgress {
         }
     }
 
+    /// Set the number of records the current pass expects to process
+    /// (`0` when unknown); used for the ETA.
     pub fn set_records_total(&self, n: u64) {
         self.records_total.store(n, Ordering::Release);
     }
 
+    /// Records the current pass expects to process (`0` when unknown).
     pub fn records_total(&self) -> u64 {
         self.records_total.load(Ordering::Acquire)
     }
 
+    /// Add `delta` to the count of records processed in the current pass.
     pub fn add_records(&self, delta: u64) {
         self.records_processed.fetch_add(delta, Ordering::AcqRel);
     }
 
+    /// Zero the processed-record count, at the start of a new pass.
     pub fn reset_records(&self) {
         self.records_processed.store(0, Ordering::Release);
     }
 
+    /// Records processed so far in the current pass.
     pub fn records_processed(&self) -> u64 {
         self.records_processed.load(Ordering::Acquire)
     }
 
+    /// Set the number of fields that have received a classification.
     pub fn set_fields_classified(&self, n: u64) {
         self.fields_classified.store(n, Ordering::Release);
     }
 
+    /// Number of fields that have received a classification.
     pub fn fields_classified(&self) -> u64 {
         self.fields_classified.load(Ordering::Acquire)
     }
 
+    /// Set the number of fields classified as `Unstable`.
     pub fn set_unstable_count(&self, n: u64) {
         self.unstable_count.store(n, Ordering::Release);
     }
 
+    /// Number of fields classified as `Unstable`.
     pub fn unstable_count(&self) -> u64 {
         self.unstable_count.load(Ordering::Acquire)
     }
 
+    /// Wall-clock seconds since this progress state was created (not
+    /// reset between passes).
     pub fn elapsed_secs(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
     }
@@ -212,6 +228,10 @@ pub struct ProgressDriver {
 }
 
 impl ProgressDriver {
+    /// Create a driver that updates `progress` and, when `ui` is
+    /// `Some`, a live progress bar per pass. A milestone line is
+    /// logged every `log_every_n_batches` batches (clamped to at
+    /// least 1).
     pub fn new(progress: Arc<SurveyProgress>, ui: Option<UiHandle>, log_every_n_batches: u32) -> Self {
         ProgressDriver {
             progress,

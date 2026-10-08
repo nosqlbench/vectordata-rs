@@ -15,34 +15,69 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum TypeTag {
+    /// UTF-8 string: `u32` LE byte length, then the bytes.
     Text = 0,
+    /// 64-bit signed integer, little-endian.
     Int = 1,
+    /// 64-bit IEEE 754 float, little-endian.
     Float = 2,
+    /// Boolean as one byte; any nonzero value decodes as `true`.
     Bool = 3,
+    /// Opaque byte string: `u32` LE length, then the bytes.
     Bytes = 4,
+    /// Null value; no payload bytes.
     Null = 5,
+    /// Enum value as a length-prefixed UTF-8 label.
     EnumStr = 6,
+    /// Enum value as an `i32` LE ordinal.
     EnumOrd = 7,
+    /// Heterogeneous list: `u32` LE count, then that many tagged values.
     List = 8,
+    /// Nested MNode: `u32` LE byte length, then the encoded sub-record.
     Map = 9,
+    /// Length-prefixed UTF-8 string that was validated on write; decodes
+    /// to the same value as `Text`.
     TextValidated = 10,
+    /// ASCII-only string, length-prefixed like `Text`.
     Ascii = 11,
+    /// 32-bit signed integer, little-endian.
     Int32 = 12,
+    /// 16-bit signed integer, little-endian.
     Short = 13,
+    /// Arbitrary-precision decimal: `i32` LE scale, `u32` LE length, then
+    /// the unscaled-value bytes. Decodes to raw bytes; the scale is discarded.
     Decimal = 14,
+    /// Arbitrary-precision integer: `u32` LE length, then its bytes.
+    /// Decodes to raw bytes.
     Varint = 15,
+    /// 32-bit IEEE 754 float, little-endian.
     Float32 = 16,
+    /// IEEE 754 half-precision float stored as raw `u16` LE bits.
     Half = 17,
+    /// Timestamp as `i64` LE milliseconds since the Unix epoch.
     Millis = 18,
+    /// Timestamp as `i64` LE epoch seconds followed by an `i32` LE
+    /// nanosecond adjustment.
     Nanos = 19,
+    /// Calendar date as a length-prefixed ISO 8601 string.
     Date = 20,
+    /// Time of day as a length-prefixed ISO 8601 string.
     Time = 21,
+    /// Date-time as a length-prefixed ISO 8601 string.
     DateTime = 22,
+    /// Version 1 (time-based) UUID as 16 raw bytes.
     UuidV1 = 23,
+    /// Version 7 (Unix-epoch, sortable) UUID as 16 raw bytes.
     UuidV7 = 24,
+    /// ULID as 16 raw bytes.
     Ulid = 25,
+    /// Homogeneous array: one element-tag byte, `u32` LE count, then that
+    /// many untagged values of the element type.
     Array = 26,
+    /// Unordered set: `u32` LE count, then that many tagged values.
     Set = 27,
+    /// Map of tagged keys to tagged values: `u32` LE entry count, then
+    /// alternating tagged key and tagged value.
     TypedMap = 28,
 }
 

@@ -597,28 +597,52 @@ fn label_level(
 // Report
 // ---------------------------------------------------------------------------
 
+/// How labelling went at one level of the topic hierarchy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LevelLabelReport {
+    /// Clusters at this level.
     pub clusters: usize,
+    /// Clusters given a term-derived label.
     pub labelled: usize,
+    /// Clusters given a positional label because they met fewer than
+    /// `min-sample` passages or yielded no ranked terms.
     pub positional: usize,
+    /// Label clashes within the level resolved by extending the slug
+    /// with further terms or falling back to the code.
     pub collisions: u32,
+    /// Fewest sampled passages any cluster at this level received.
     pub sample_min: u32,
+    /// Median sampled passages per cluster.
     pub sample_median: u32,
+    /// Most sampled passages any cluster received (bounded by the
+    /// per-cluster cap).
     pub sample_max: u32,
 }
 
+/// The JSON report `compute topic-labels` writes beside the labels:
+/// which passages were read and how each level was labelled.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicLabelsReport {
+    /// Report format version (currently 1).
     pub schema_version: u32,
+    /// The `passages` option as given (path of the passage table).
     pub passages: String,
+    /// Branching per level, outermost first, copied from the topic
+    /// model report.
     pub levels: Vec<usize>,
+    /// Row groups in the passage table.
     pub row_groups_available: usize,
+    /// Indices of the row groups read, in the seeded visiting order.
     pub row_groups_read: Vec<usize>,
+    /// Passage rows examined across the row groups read.
     pub rows_visited: u64,
+    /// Passages accepted for at least one level and tokenized.
     pub docs_tokenized: u64,
+    /// Distinct unigram and bigram terms interned.
     pub distinct_terms: usize,
+    /// Wall-clock time of the command, in seconds.
     pub seconds: f64,
+    /// One entry per level, outermost first.
     pub per_level: Vec<LevelLabelReport>,
 }
 

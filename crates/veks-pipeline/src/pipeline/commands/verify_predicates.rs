@@ -24,6 +24,7 @@ use vectordata::formats::pnode::{PNode, ConjugateType, OpType, Comparand};
 /// Pipeline command: verify predicate results via SQLite.
 pub struct VerifyPredicatesOp;
 
+/// Creates a boxed `VerifyPredicatesOp` for command registration.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(VerifyPredicatesOp)
 }

@@ -49,12 +49,23 @@ use vectordata::dataset::DatasetConfig;
 
 use crate::pipeline::commands::gen_predicates_uniform::{level_census, Form, LevelCensus};
 
+/// Arguments for `veks prepare predicate-sets`; each field mirrors the
+/// CLI flag of the same name.
 pub struct PredicateSetsArgs {
+    /// Dataset directory or path to `dataset.yaml`.
     pub path: PathBuf,
+    /// The form every predicate takes: `field.access` parts joined by `+`
+    /// (conjunction) or `|` (disjunction).
     pub form: String,
+    /// Comma-separated selectivity levels to plan sets for, e.g. `1e-2,1e-3`.
     pub levels: String,
+    /// Sized profiles to declare sets under; `None` means every rung that
+    /// builds on `default` and is not itself a set.
     pub sizes: Option<String>,
+    /// Predicates per set; `None` means `${query_count}`, one per query.
     pub count: Option<String>,
+    /// Suffix of the layer declared beside a rung that carries its own
+    /// predicate group.
     pub layer_suffix: String,
     /// The floor of expected matches per predicate a cell must meet; 0
     /// declares every cell.
@@ -66,6 +77,9 @@ fn exit_with(msg: String) -> ! {
     std::process::exit(1);
 }
 
+/// Run `veks prepare predicate-sets`: declare the planned profiles and
+/// generator steps in `dataset.yaml` by textual edit. Exits the process
+/// with an error message on failure.
 pub fn run(args: PredicateSetsArgs) {
     let dataset_path = if args.path.is_file() { args.path.clone() } else { args.path.join("dataset.yaml") };
     if !dataset_path.exists() {

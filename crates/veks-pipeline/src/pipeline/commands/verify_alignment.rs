@@ -25,6 +25,7 @@ use veks_core::formats::reader::probe_source;
 /// Pipeline command: verify row-count alignment between two artifacts.
 pub struct VerifyAlignmentOp;
 
+/// Creates a boxed `VerifyAlignmentOp` for command registration.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(VerifyAlignmentOp)
 }

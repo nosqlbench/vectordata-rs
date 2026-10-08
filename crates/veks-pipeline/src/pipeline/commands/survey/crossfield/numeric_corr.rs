@@ -16,6 +16,9 @@ use super::{PairAnalyzer, PairAnalyzerKind, PairReport};
 use crate::pipeline::commands::survey::measure::MeasureCtx;
 use crate::pipeline::commands::survey::measures::numeric::mvalue_as_f64;
 
+/// Pair analyzer that computes Pearson r and the OLS line of B on A
+/// over pairs where both values are numeric and not NaN, using
+/// streaming (Welford) moments.
 pub struct NumericCorrelationAnalyzer {
     n: u64,
     mean_a: f64,
@@ -31,6 +34,7 @@ impl Default for NumericCorrelationAnalyzer {
 }
 
 impl NumericCorrelationAnalyzer {
+    /// An analyzer with no observations.
     pub fn new() -> Self {
         NumericCorrelationAnalyzer {
             n: 0,
@@ -85,6 +89,7 @@ impl PairAnalyzer for NumericCorrelationAnalyzer {
     }
 }
 
+/// Result of a [`NumericCorrelationAnalyzer`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NumericCorrelationReport {
     /// Number of paired observations contributing to the estimate.
@@ -92,10 +97,14 @@ pub struct NumericCorrelationReport {
     /// Pearson correlation coefficient. `None` if n < 2 or either
     /// variance was zero.
     pub pearson_r: Option<f64>,
+    /// Mean of the A values over the `n` pairs (`0.0` when `n` is 0).
     pub mean_a: f64,
+    /// Mean of the B values over the `n` pairs (`0.0` when `n` is 0).
     pub mean_b: f64,
     /// Slope of the OLS regression line `B = slope · A + intercept`.
     pub slope: Option<f64>,
+    /// Intercept of the same regression line; `None` exactly when
+    /// `slope` is.
     pub intercept: Option<f64>,
 }
 

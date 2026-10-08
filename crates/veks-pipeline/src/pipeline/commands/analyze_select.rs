@@ -23,6 +23,7 @@ use crate::pipeline::element_type::ElementType;
 /// Pipeline command: select a vector by ordinal.
 pub struct AnalyzeSelectOp;
 
+/// Creates a boxed [`AnalyzeSelectOp`]; registered as the `analyze select` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeSelectOp)
 }

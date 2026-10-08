@@ -20,6 +20,8 @@
 //! Each variant becomes a subcommand: unit ⇒ no args, `V(ArgsStruct)` ⇒ delegate,
 //! `V { … }` ⇒ inline fields.
 
+#![warn(missing_docs)]
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TS2;
 use quote::quote;
@@ -28,6 +30,11 @@ use syn::{
     Fields, Lit, Meta, Type,
 };
 
+/// Derives `veks_completion::VeksCli` for a struct with named fields (a
+/// command's arguments) or an enum (its subcommands), following the
+/// `#[arg(...)]` / `#[command(...)]` rules in the crate docs.
+///
+/// Tuple structs, unit structs and unions are rejected with a compile error.
 #[proc_macro_derive(VeksCli, attributes(arg, command))]
 pub fn derive_veks_cli(input: TokenStream) -> TokenStream {
     let di = syn::parse_macro_input!(input as DeriveInput);

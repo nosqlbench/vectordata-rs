@@ -60,10 +60,13 @@ impl Store {
         Ok(())
     }
 
+    /// The stored credential for an endpoint origin, if any.
     pub fn get(&self, origin: &str) -> Option<&Entry> {
         self.entries.get(origin)
     }
 
+    /// Store (or replace) the credential for an endpoint origin. In memory
+    /// only; call [`Store::save`] to persist.
     pub fn set(&mut self, origin: String, entry: Entry) {
         self.entries.insert(origin, entry);
     }

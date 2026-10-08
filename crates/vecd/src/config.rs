@@ -68,7 +68,10 @@ impl ConfigSource {
 /// Disambiguation preference between the local and home configs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Prefer {
+    /// Use `./vecd.conf` (`--config-is-local`, `PREFER_CONFIG=local`).
     Local,
+    /// Use `~/.config/vecd/vecd.conf` (`--config-is-home`,
+    /// `PREFER_CONFIG=home`).
     Home,
 }
 
@@ -85,8 +88,11 @@ pub fn prefer_from_env() -> Option<Prefer> {
 /// whether a `vecd.conf` actually exists there yet.
 #[derive(Debug, Clone)]
 pub struct Resolved {
+    /// The config directory (holds `vecd.conf`, `credentials.json`, …).
     pub dir: PathBuf,
+    /// Which rule selected `dir`.
     pub source: ConfigSource,
+    /// Whether `dir/vecd.conf` exists.
     pub exists: bool,
 }
 
@@ -208,6 +214,7 @@ impl Config {
         Ok(Config { values })
     }
 
+    /// The raw value of `key`, or `None` if the file does not set it.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(|s| s.as_str())
     }

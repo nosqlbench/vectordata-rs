@@ -24,6 +24,7 @@ use crate::pipeline::command::{
 /// Pipeline command: verify vectors match a model profile.
 pub struct AnalyzeVerifyProfilesOp;
 
+/// Creates a boxed [`AnalyzeVerifyProfilesOp`]; registered as the `analyze verify-profiles` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeVerifyProfilesOp)
 }

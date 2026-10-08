@@ -54,6 +54,8 @@
 //! and `serde_json` (JSON vernacular parsing).
 //! No networking, no I/O beyond `std::io::Read`/`Write`.
 
+#![warn(missing_docs)]
+
 pub mod mnode;
 pub mod pnode;
 pub mod anode;

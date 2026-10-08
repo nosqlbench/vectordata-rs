@@ -345,6 +345,7 @@ impl VecReader {
 /// Pipeline command: deduplicate vectors.
 pub struct ComputeDedupOp;
 
+/// Creates a boxed [`ComputeDedupOp`]; registered as the `compute sort` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(ComputeDedupOp)
 }
@@ -1799,11 +1800,18 @@ fn write_ivec_bulk(path: &Path, ordinals: &[u32]) -> Result<(), String> {
 /// Used by `compute sort` (write) and `analyze find-duplicates` (read).
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct DedupReport {
+    /// Number of vectors in the source.
     pub total_vectors: usize,
+    /// Number of distinct vectors kept after deduplication.
     pub unique_vectors: usize,
+    /// Number of vectors dropped as duplicates of an earlier vector.
     pub duplicate_vectors: usize,
+    /// `duplicate_vectors / total_vectors`, or 0.0 for an empty source.
     pub duplicate_ratio: f64,
+    /// Whether any duplicates were found.
     pub has_duplicates: bool,
+    /// Number of leading vector components used as the sort key before
+    /// full-vector comparison (0 for an empty source).
     pub prefix_width: usize,
 }
 

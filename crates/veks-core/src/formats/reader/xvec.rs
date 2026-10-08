@@ -1,6 +1,10 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
+//! Sequential [`VecSource`] readers for the xvec family
+//! (fvec, ivec, bvec, dvec, mvec, svec): single files or directories of
+//! shards.
+
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::Path;

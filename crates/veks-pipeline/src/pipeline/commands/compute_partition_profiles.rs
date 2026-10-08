@@ -23,8 +23,10 @@ use crate::pipeline::command::{
     ResourceDesc, Status, StreamContext, render_options_table,
 };
 
+/// Pipeline command: extract per-label base-vector partitions into separate profiles registered in `dataset.yaml`.
 pub struct ComputePartitionProfilesOp;
 
+/// Creates a boxed [`ComputePartitionProfilesOp`]; registered as the `compute partition-profiles` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(ComputePartitionProfilesOp)
 }

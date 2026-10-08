@@ -22,6 +22,7 @@ pub struct HeadlessSink {
 }
 
 impl HeadlessSink {
+    /// Create a headless sink.
     pub fn new() -> Self {
         HeadlessSink {
             next_id: AtomicU32::new(0),

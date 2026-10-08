@@ -47,7 +47,9 @@ pub fn pipeline_value_completions() -> BTreeMap<String, std::collections::HashMa
 
 /// Metadata payload returned by [`pipeline_command_metadata`].
 pub struct CommandMetadata {
+    /// The command's discovery category ([`super::command::CommandOp::category`]).
     pub category: &'static dyn veks_completion::CategoryTag,
+    /// The command's discovery tier ([`super::command::CommandOp::level`]).
     pub level:    &'static dyn veks_completion::LevelTag,
 }
 

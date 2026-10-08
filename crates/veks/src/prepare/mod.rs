@@ -29,6 +29,7 @@ use std::path::PathBuf;
 #[command(disable_help_subcommand = true)]
 pub struct PrepareArgs {
     #[command(subcommand)]
+    /// The `veks prepare` subcommand to run.
     pub command: PrepareCommand,
 }
 
@@ -274,7 +275,6 @@ pub enum PrepareCommand {
         #[arg(long = "sources")]
         sources: Vec<PathBuf>,
     },
-    /// Add sized profiles to an existing dataset for multi-scale benchmarking
     /// Write the dataset's README.md scaffold: the standard sections with every
     /// fact the definition holds filled in and a marker wherever a person must
     /// write. A README is how a dataset is documented; `veks check` refuses a
@@ -355,6 +355,7 @@ pub enum PrepareCommand {
         #[arg(long)]
         to: u32,
     },
+    /// Add sized profiles to an existing dataset for multi-scale benchmarking
     Stratify {
         /// Dataset directory or path to dataset.yaml
         #[arg(default_value = ".")]
@@ -446,6 +447,7 @@ pub enum PrepareCommand {
     #[command(disable_help_subcommand = true)]
     Catalog {
         #[command(subcommand)]
+        /// The catalog subcommand to run.
         command: CatalogSubcommand,
     },
     /// Remove files under .cache/ that nothing in the current pipeline

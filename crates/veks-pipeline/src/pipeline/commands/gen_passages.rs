@@ -40,6 +40,7 @@ use veks_core::formats::passage_table::{
 /// Pipeline command: derive passages from s2orc-format JSONL shards.
 pub struct GeneratePassagesOp;
 
+/// Creates a boxed [`GeneratePassagesOp`]; registered as the `generate passages` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GeneratePassagesOp)
 }

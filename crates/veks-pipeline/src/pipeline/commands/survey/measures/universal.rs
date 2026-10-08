@@ -38,6 +38,7 @@ impl Default for PresenceMeasure {
 }
 
 impl PresenceMeasure {
+    /// Creates a measure with all counters at zero.
     pub fn new() -> Self {
         PresenceMeasure {
             present: 0,
@@ -89,6 +90,9 @@ pub struct TypeStabilityMeasure {
 }
 
 impl TypeStabilityMeasure {
+    /// Creates a measure that treats the given `MValue` tag names (the
+    /// `Debug` rendering of the tag, e.g. `"Int"`, `"Text"`) as expected;
+    /// any other tag observed is counted as a surprise.
     pub fn new(expected_tags: impl IntoIterator<Item = &'static str>) -> Self {
         TypeStabilityMeasure {
             expected: expected_tags.into_iter().collect(),
@@ -137,6 +141,8 @@ pub struct ReservoirSample {
 }
 
 impl ReservoirSample {
+    /// Creates a reservoir holding at most `capacity` values, using
+    /// `seed` so the retained sample is reproducible across runs.
     pub fn new(capacity: usize, seed: u64) -> Self {
         ReservoirSample {
             inner: Reservoir::new(capacity, seed),

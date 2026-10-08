@@ -144,22 +144,31 @@ pub enum SemanticType {
     Unstable,
 }
 
+/// Refinement of [`SemanticType::Number`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "subkind", rename_all = "PascalCase")]
 pub enum NumberKind {
     /// Integer value.
     Integer {
-        /// True if every observed value was non-negative.
+        /// True if any observed value was negative, so the field needs a
+        /// signed type.
         signed: bool,
         /// Smallest width that covers the observed range.
         bit_width_hint: NumericWidth,
     },
     /// Decimal (fixed-point) value.
-    Decimal { precision_hint: u8, scale_hint: u8 },
+    Decimal {
+        /// Total significant digits (integer plus fractional) seen in
+        /// the sampled literal.
+        precision_hint: u8,
+        /// Digits after the decimal point seen in the sampled literal.
+        scale_hint: u8,
+    },
     /// Floating-point value.
     Floating,
 }
 
+/// Refinement of [`SemanticType::Temporal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum TemporalKind {
@@ -173,11 +182,15 @@ pub enum TemporalKind {
         has_timezone: bool,
     },
     /// Timestamp at a specific granularity.
-    Timestamp { granularity: TimestampGranularity },
+    Timestamp {
+        /// Epoch unit the numeric values are counted in.
+        granularity: TimestampGranularity,
+    },
     /// Duration.
     Duration,
 }
 
+/// Unit of an epoch-based [`TemporalKind::Timestamp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TimestampGranularity {
@@ -191,6 +204,7 @@ pub enum TimestampGranularity {
     Nanos,
 }
 
+/// Refinement of [`SemanticType::Identifier`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "subkind", rename_all = "PascalCase")]
 pub enum IdentifierKind {
@@ -203,11 +217,16 @@ pub enum IdentifierKind {
     /// Fixed-width hex / base64 hash-like identifier.
     HashLike,
     /// Composite identifier (prefix + body).
-    Composite { prefix: Option<String> },
+    Composite {
+        /// Alphabetic prefix before the `_`/`-` separator (e.g. `USR`
+        /// in `USR_00123`); `None` when no prefix was captured.
+        prefix: Option<String>,
+    },
     /// Identifier-shaped but no parser matched.
     Opaque,
 }
 
+/// Refinement of [`SemanticType::Categorical`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum CategoricalKind {
@@ -221,6 +240,7 @@ pub enum CategoricalKind {
     Labelset,
 }
 
+/// Refinement of [`SemanticType::Structured`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum StructuredKind {
@@ -242,6 +262,7 @@ pub enum StructuredKind {
     Json,
 }
 
+/// Refinement of [`SemanticType::Binary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum BinaryKind {
@@ -271,15 +292,29 @@ pub enum CardinalityRegime {
     /// Exactly two distinct values.
     Binary,
     /// Cardinality ≤ `low_card_threshold` and fully enumerated.
-    LowCard { exact_distinct: u32 },
+    LowCard {
+        /// Exact number of distinct values seen in the Pass 1 sample.
+        exact_distinct: u32,
+    },
     /// Cardinality between `low_card_threshold` and `mid_card_threshold`.
-    MidCard { hll_estimate_at_pass1: f64 },
+    MidCard {
+        /// Distinct count observed by the Pass 1 tracker.
+        hll_estimate_at_pass1: f64,
+    },
     /// Cardinality above `mid_card_threshold` (or essentially unique).
-    HighCardOrUnique { uniqueness_ratio: f64 },
+    HighCardOrUnique {
+        /// Distinct values tracked in Pass 1 divided by non-null
+        /// observations, in `[0, 1]`. A lower bound when the bounded
+        /// distinct tracker overflowed; near `1.0` means essentially unique.
+        uniqueness_ratio: f64,
+    },
     /// Counted exactly by the Pass 3 census over every record. Replaces
     /// the sampled verdict for censused fields: `exact_distinct` is a
     /// fact, not an estimate.
-    Censused { exact_distinct: u32 },
+    Censused {
+        /// Exact number of distinct values over every record.
+        exact_distinct: u32,
+    },
     /// Cardinality unknown (Unstable field; nothing meaningful tracked).
     Unknown,
 }

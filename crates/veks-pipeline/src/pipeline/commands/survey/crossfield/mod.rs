@@ -61,6 +61,7 @@ pub enum PairAnalyzerKind {
 }
 
 impl PairAnalyzerKind {
+    /// Stable name of the kind, matching the variant name.
     pub fn as_str(self) -> &'static str {
         match self {
             PairAnalyzerKind::NumericCorrelation => "NumericCorrelation",
@@ -82,9 +83,15 @@ impl PairAnalyzerKind {
 /// presence. Co-presence and functional-dependency analyzers rely
 /// on this for unbiased counting.
 pub trait PairAnalyzer: Send {
+    /// Records one record in which both fields are present, with
+    /// `a` and `b` in the planned pair's order.
     fn observe_pair(&mut self, a: &MValue, b: &MValue, ctx: &MeasureCtx);
+    /// Records that a record was dispatched, with each field's
+    /// presence; the default ignores it.
     fn observe_missing(&mut self, _a_present: bool, _b_present: bool, _ctx: &MeasureCtx) {}
+    /// Consumes the analyzer and produces its report.
     fn finalize(self: Box<Self>) -> PairReport;
+    /// Which analyzer family this is.
     fn kind(&self) -> PairAnalyzerKind;
 }
 
@@ -92,15 +99,22 @@ pub trait PairAnalyzer: Send {
 /// inside the survey's `cross_field` block (§13.8).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PairReport {
+    /// Report of a [`NumericCorrelationAnalyzer`].
     NumericCorrelation(NumericCorrelationReport),
+    /// Report of a [`CategoricalAssociationAnalyzer`].
     CategoricalAssociation(CategoricalAssociationReport),
+    /// Report of a [`LowCardNumericAnalyzer`].
     LowCardNumeric(LowCardNumericReport),
+    /// Report of a [`TrendAnalyzer`].
     Trend(TrendReport),
+    /// Report of a [`CopresenceAnalyzer`].
     Copresence(CopresenceReport),
+    /// Report of a [`FunctionalDependencyAnalyzer`].
     FunctionalDependency(FunctionalDependencyReport),
 }
 
 impl PairReport {
+    /// The analyzer kind that produced this report.
     pub fn kind(&self) -> PairAnalyzerKind {
         match self {
             PairReport::NumericCorrelation(_) => PairAnalyzerKind::NumericCorrelation,
@@ -121,49 +135,73 @@ impl PairReport {
 // the survey's `cross_field` block can serialize as flat lists per
 // family, as documented in §13.8.
 
+/// A numeric-correlation result with the names of its two fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NumericCorrelationEntry {
+    /// First field of the pair (the planner's A side).
     pub a: String,
+    /// Second field of the pair (the planner's B side).
     pub b: String,
+    /// The analyzer's report, flattened into this entry when serialized.
     #[serde(flatten)]
     pub data: NumericCorrelationReport,
 }
 
+/// A categorical-association result with the names of its two fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CategoricalAssociationEntry {
+    /// First field of the pair (the planner's A side).
     pub a: String,
+    /// Second field of the pair (the planner's B side).
     pub b: String,
+    /// The analyzer's report, flattened into this entry when serialized.
     #[serde(flatten)]
     pub data: CategoricalAssociationReport,
 }
 
+/// A co-presence result with the names of its two fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CopresenceEntry {
+    /// First field of the pair (the planner's A side).
     pub a: String,
+    /// Second field of the pair (the planner's B side).
     pub b: String,
+    /// The analyzer's report, flattened into this entry when serialized.
     #[serde(flatten)]
     pub data: CopresenceReport,
 }
 
+/// A low-cardinality × numeric (η²) result with the names of its
+/// two fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LowCardNumericEntry {
+    /// First field of the pair (the planner's A side).
     pub a: String,
+    /// Second field of the pair (the planner's B side).
     pub b: String,
+    /// The analyzer's report, flattened into this entry when serialized.
     #[serde(flatten)]
     pub data: LowCardNumericReport,
 }
 
+/// A trend result (value against record index) for one field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrendEntry {
+    /// The field whose values were correlated with record index.
     pub field: String,
+    /// The analyzer's report, flattened into this entry when serialized.
     #[serde(flatten)]
     pub data: TrendReport,
 }
 
+/// A functional-dependency probe result for `lhs → rhs`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionalDependencyEntry {
+    /// The determining field (the pair's A side).
     pub lhs: String,
+    /// The field tested for being determined by `lhs` (the B side).
     pub rhs: String,
+    /// The analyzer's report, flattened into this entry when serialized.
     #[serde(flatten)]
     pub data: FunctionalDependencyReport,
 }
@@ -177,9 +215,15 @@ pub struct FunctionalDependencyEntry {
 /// budget.
 #[derive(Debug, Clone)]
 pub struct PairPlanEntry {
+    /// First field; passed as `a` to the analyzer.
     pub a: String,
+    /// Second field; passed as `b`. For [`PairAnalyzerKind::Trend`]
+    /// this is the `__record_index__` placeholder.
     pub b: String,
+    /// Analyzer to run on the pair.
     pub kind: PairAnalyzerKind,
+    /// Eligibility score; higher ranks are kept first when the
+    /// budget is applied.
     pub rank: f64,
 }
 

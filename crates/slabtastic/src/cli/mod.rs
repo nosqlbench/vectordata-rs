@@ -55,6 +55,7 @@ use crate::WriterConfig;
 #[derive(veks_completion_derive::VeksCli)]
 #[command(name = "slab", version, about = "Slabtastic file maintenance tool")]
 pub struct Cli {
+    /// The subcommand to run.
     #[command(subcommand)]
     pub command: Command,
 }

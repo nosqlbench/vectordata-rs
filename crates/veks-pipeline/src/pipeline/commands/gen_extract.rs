@@ -3396,6 +3396,7 @@ impl CommandOp for GenerateScalarExtractOp {
 /// appropriate format-specific extraction logic.
 pub struct TransformExtractOp;
 
+/// Creates a boxed [`TransformExtractOp`]; registered as the `transform extract` command.
 pub fn extract_factory() -> Box<dyn CommandOp> {
     Box::new(TransformExtractOp)
 }

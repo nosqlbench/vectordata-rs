@@ -24,19 +24,28 @@ use vectordata::dataset::DatasetConfig;
 
 use crate::pipeline::progress::ProgressLog;
 
+/// Arguments for `veks prepare tags`.
 pub struct TagsArgs {
+    /// Dataset directory or path to `dataset.yaml`.
     pub path: PathBuf,
+    /// Selector naming the profiles to edit.
     pub profile: String,
+    /// Tags to set, each `key=value` with the value read as YAML.
     pub set: Vec<String>,
+    /// Tag keys to remove.
     pub unset: Vec<String>,
+    /// Show the edits without writing anything.
     pub dry_run: bool,
 }
 
 /// One edit: a key set to a value, or removed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Edit {
+    /// Profile the edit applies to.
     pub profile: String,
+    /// Attribute key.
     pub key: String,
+    /// New value, or `None` to remove the key.
     pub value: Option<Yaml>,
 }
 
@@ -45,6 +54,10 @@ fn exit_with(msg: String) -> ! {
     std::process::exit(1);
 }
 
+/// Run `veks prepare tags`: plan the edits, write them to `dataset.yaml`
+/// (with a backup) unless `dry_run` is set, and record them in the
+/// progress log, when one exists, so no compute step turns stale. Exits
+/// the process with an error message on failure.
 pub fn run(args: TagsArgs) {
     let dataset_path = if args.path.is_file() { args.path.clone() } else { args.path.join("dataset.yaml") };
     let text = std::fs::read_to_string(&dataset_path)

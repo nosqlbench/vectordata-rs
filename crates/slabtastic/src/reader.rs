@@ -104,13 +104,24 @@ impl BatchReadResult {
 pub enum OpenProgress {
     /// The file has been memory-mapped and the pages-page parsed.
     /// `page_count` is the number of data pages whose footers will be read.
-    PagesPageRead { page_count: usize },
+    PagesPageRead {
+        /// Number of data pages listed in the pages-page.
+        page_count: usize,
+    },
     /// Progress during the page index build.
     /// `done` pages out of `total` have been processed so far.
-    IndexBuild { done: usize, total: usize },
+    IndexBuild {
+        /// Number of data pages processed so far.
+        done: usize,
+        /// Total number of data pages to process.
+        total: usize,
+    },
     /// The page index build is complete. `total_records` is the sum of
     /// all per-page record counts.
-    IndexComplete { total_records: u64 },
+    IndexComplete {
+        /// Sum of the record counts of all data pages.
+        total_records: u64,
+    },
 }
 
 /// Lightweight metadata from probing a slab file without building the

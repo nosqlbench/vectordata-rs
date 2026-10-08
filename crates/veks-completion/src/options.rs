@@ -101,18 +101,22 @@ impl OptionDef {
         self
     }
 
+    /// Set the single-character short spelling, e.g. `'a'` for `-a`.
     pub fn short(mut self, c: char) -> Self {
         self.short = Some(c);
         self
     }
+    /// Set whether the option may be given more than once.
     pub fn multiple(mut self, yes: bool) -> Self {
         self.multiple = yes;
         self
     }
+    /// Set the value placeholder shown in help, e.g. `"URL"`.
     pub fn value_name(mut self, n: impl Into<String>) -> Self {
         self.value_name = Some(n.into());
         self
     }
+    /// Set the help text.
     pub fn help(mut self, h: impl Into<String>) -> Self {
         self.help = Some(h.into());
         self
@@ -133,6 +137,7 @@ impl OptionDef {
 /// registered definition).
 #[derive(Clone, Debug)]
 pub struct ParseMismatch {
+    /// The option's long name, including leading dashes.
     pub name: String,
     /// Every place the name was observed, with its (differing) definition.
     pub occurrences: Vec<(String, OptionDef)>,
@@ -181,11 +186,14 @@ pub trait CommandOption {
 /// runtime-verifiable guarantee that every uniquely-named option parses one way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OptionConflict {
+    /// The option's long name, including leading dashes.
     pub name: String,
     // Boxed: OptionDef carries several owned collections, and this
     // error rides in `Result` return slots — keep the Err variant
     // pointer-sized rather than inflating every call frame.
+    /// The definition already recorded for `name`.
     pub existing: Box<OptionDef>,
+    /// The differing definition that was rejected.
     pub attempted: Box<OptionDef>,
 }
 
@@ -214,6 +222,7 @@ pub struct OptionRegistry {
 }
 
 impl OptionRegistry {
+    /// An empty registry.
     pub fn new() -> Self {
         Self::default()
     }
@@ -260,6 +269,7 @@ impl OptionRegistry {
     pub fn len(&self) -> usize {
         self.defs.len()
     }
+    /// Whether no option names have been defined.
     pub fn is_empty(&self) -> bool {
         self.defs.is_empty()
     }

@@ -26,8 +26,13 @@ use crate::pipeline::command::{
 };
 use crate::pipeline::progress::StepRecord;
 
+/// Pipeline command `config tag-profiles`: gives the profiles of an existing
+/// dataset the selector tags (`size`, predicate-facet `family`,
+/// `selectivity_ladder`, `forms`, `predicates`, and `inherits: default`) its
+/// generators would write today, by textual edit of `dataset.yaml`.
 pub struct TagProfilesOp;
 
+/// Creates a boxed `TagProfilesOp` for command registration.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(TagProfilesOp)
 }
@@ -168,8 +173,14 @@ fn error(message: String, start: Instant) -> CommandResult {
 /// What the step will write: the tags per profile and the profiles
 /// that gain `inherits: default`.
 pub struct TagPlan {
+    /// Every tag to write, one entry per profile and key.
     pub writes: Vec<AttributeWrite>,
+    /// Profiles that gain `inherits: default`: every profile other than
+    /// `default` and the partitions.
     pub parents: Vec<String>,
+    /// Human-readable reasons a tag could not be derived (for example, a
+    /// predicate facet that is absent or has no completed generator step);
+    /// reported, not failed.
     pub notes: Vec<String>,
 }
 

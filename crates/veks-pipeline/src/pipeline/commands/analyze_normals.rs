@@ -34,8 +34,10 @@ fn resolve_path(value: &str, workspace: &Path) -> std::path::PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
 }
 
+/// Pipeline command: measure how far sampled vector L2 norms deviate from 1.0.
 pub struct AnalyzeNormalsOp;
 
+/// Creates a boxed [`AnalyzeNormalsOp`]; registered as the `analyze measure-normals` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeNormalsOp)
 }

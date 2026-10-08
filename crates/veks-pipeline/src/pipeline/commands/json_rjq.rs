@@ -30,6 +30,7 @@ use crate::pipeline::command::{
 /// Pipeline command: JSON/JSONL transformation via jaq.
 pub struct JsonRjqOp;
 
+/// Creates a boxed [`JsonRjqOp`]; registered as the `query records` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(JsonRjqOp)
 }

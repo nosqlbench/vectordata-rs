@@ -44,6 +44,7 @@ use super::source_window::resolve_source;
 /// Pipeline command: compute exact KNN ground truth.
 pub struct ComputeKnnOp;
 
+/// Creates a boxed [`ComputeKnnOp`]; registered as the `compute knn-metal` and `compute knn` commands.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(ComputeKnnOp)
 }

@@ -23,8 +23,12 @@ fn step_complete(progress: &ProgressLog, step_id: &str) -> bool {
         .is_some_and(|r| r.status == Status::Ok)
 }
 
+/// Pipeline command `pipeline require`: runs another pipeline YAML file to
+/// completion with the same runner, and succeeds only if every step of that
+/// pipeline succeeds.
 pub struct RequirePipelineOp;
 
+/// Creates a boxed `RequirePipelineOp` for command registration.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(RequirePipelineOp)
 }

@@ -39,6 +39,8 @@ impl Default for ExactExtrema {
 }
 
 impl ExactExtrema {
+    /// Creates a measure with no observations; reports `None` extrema
+    /// until a non-NaN value is seen.
     pub fn new() -> Self {
         ExactExtrema {
             min: f64::INFINITY,
@@ -115,6 +117,7 @@ impl Default for ExactMoments {
 }
 
 impl ExactMoments {
+    /// Creates an accumulator with zero observations.
     pub fn new() -> Self {
         ExactMoments {
             n: 0,
@@ -246,6 +249,9 @@ pub struct QuantileSketchMeasure {
 pub const QUANTILE_SKETCH_K_MIN: usize = 1000;
 
 impl QuantileSketchMeasure {
+    /// Creates a KLL sketch with accuracy parameter `k` (raised to
+    /// `QUANTILE_SKETCH_K_MIN` if smaller) and a fixed `seed` so that
+    /// compaction choices, and therefore results, are reproducible.
     pub fn new(k: usize, seed: u64) -> Self {
         let k = k.max(QUANTILE_SKETCH_K_MIN);
         QuantileSketchMeasure {
@@ -284,10 +290,14 @@ impl Measure for QuantileSketchMeasure {
     }
 }
 
+/// Report shape for `QuantileSketchMeasure::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuantileSketchReport {
+    /// Number of non-NaN values fed to the sketch.
     pub count: u64,
+    /// Exact minimum observed value, or `None` if nothing was observed.
     pub min: Option<f64>,
+    /// Exact maximum observed value, or `None` if nothing was observed.
     pub max: Option<f64>,
     /// Quantile/value pairs in ascending quantile order.
     pub quantiles: Vec<(String, f64)>,
@@ -320,6 +330,7 @@ impl Default for BitWidthMeasure {
 }
 
 impl BitWidthMeasure {
+    /// Creates a measure with no observations.
     pub fn new() -> Self {
         BitWidthMeasure {
             n: 0,
@@ -394,11 +405,17 @@ impl Measure for BitWidthMeasure {
     }
 }
 
+/// Report shape for `BitWidthMeasure::finalize`. All numeric fields
+/// are zero when no integer values were observed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BitWidthReport {
+    /// Number of integer-like values observed.
     pub count: u64,
+    /// Smallest observed value.
     pub min: i64,
+    /// Largest observed value.
     pub max: i64,
+    /// `max - min`, saturated to `u64::MAX`.
     pub range: u64,
     /// Bits needed to enumerate the observed range.
     pub bits_used: u32,
@@ -432,6 +449,9 @@ pub struct HistogramFromQuantilesMeasure {
 }
 
 impl HistogramFromQuantilesMeasure {
+    /// Creates a histogram with `bin_count` equal-width bins (clamped
+    /// to at least 1). Every non-NaN observation is retained in memory
+    /// until finalize, since bin edges depend on the final min/max.
     pub fn new(bin_count: usize) -> Self {
         HistogramFromQuantilesMeasure {
             bin_count: bin_count.max(1),
@@ -495,10 +515,15 @@ impl Measure for HistogramFromQuantilesMeasure {
     }
 }
 
+/// Report shape for `HistogramFromQuantilesMeasure::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistogramFromQuantilesReport {
+    /// Number of bins actually emitted: the configured count, or 1 when
+    /// every observation had the same value.
     pub bin_count: u32,
+    /// Smallest observed value, or `None` if nothing was observed.
     pub min: Option<f64>,
+    /// Largest observed value, or `None` if nothing was observed.
     pub max: Option<f64>,
     /// `bin_count + 1` bin edges in ascending order.
     pub edges: Vec<f64>,
@@ -526,6 +551,9 @@ pub struct MonotonicityMeasure {
 }
 
 impl MonotonicityMeasure {
+    /// Creates a measure that retains up to `max_sample` leading
+    /// observations (clamped to at least 2) for the O(n²) τ computation.
+    /// Step counts are tracked over every observation regardless.
     pub fn new(max_sample: usize) -> Self {
         MonotonicityMeasure {
             last: None,
@@ -592,10 +620,14 @@ impl Measure for MonotonicityMeasure {
     }
 }
 
+/// Report shape for `MonotonicityMeasure::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonotonicityReport {
+    /// Consecutive observation pairs where the value increased.
     pub ascending_steps: u64,
+    /// Consecutive observation pairs where the value decreased.
     pub descending_steps: u64,
+    /// Consecutive observation pairs where the value was unchanged.
     pub equal_steps: u64,
     /// Mann-Kendall τ in `[-1, 1]`. `None` if fewer than 2
     /// observations contributed to the sample.
@@ -622,6 +654,7 @@ impl Default for DiscreteIndicatorMeasure {
 }
 
 impl DiscreteIndicatorMeasure {
+    /// Creates a measure with zero observations.
     pub fn new() -> Self {
         DiscreteIndicatorMeasure { n: 0, integer_valued: 0 }
     }
@@ -651,9 +684,12 @@ impl Measure for DiscreteIndicatorMeasure {
     }
 }
 
+/// Report shape for `DiscreteIndicatorMeasure::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiscreteIndicatorReport {
+    /// Number of non-NaN numeric values observed.
     pub count: u64,
+    /// How many of those values had no fractional part.
     pub integer_valued: u64,
     /// `integer_valued / count`. 1.0 → field is really an integer.
     pub integer_rate: f64,

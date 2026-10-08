@@ -61,6 +61,7 @@ fn resolve_path(s: &str, workspace: &Path) -> std::path::PathBuf {
 /// Pipeline command: generate synthetic metadata.
 pub struct GenerateMetadataOp;
 
+/// Creates a boxed [`GenerateMetadataOp`]; registered as the `generate metadata` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenerateMetadataOp)
 }

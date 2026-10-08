@@ -52,8 +52,11 @@ impl VecSource for IoSourceAdapter {
 /// This avoids spawning background threads or loading data — only reads
 /// headers and file metadata.
 pub struct SourceMeta {
+    /// Vector dimension (elements per record).
     pub dimension: u32,
+    /// Bytes per element.
     pub element_size: usize,
+    /// Total record count, or `None` when it cannot be learned from headers.
     pub record_count: Option<u64>,
 }
 

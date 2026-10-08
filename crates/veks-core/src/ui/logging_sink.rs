@@ -36,7 +36,9 @@ pub type LogFileWriter = Arc<Mutex<std::io::BufWriter<std::fs::File>>>;
 /// Both are written synchronously from `UiHandle::log()`.
 #[derive(Clone)]
 pub struct LogWriters {
+    /// Plain-text log file (`run.log`).
     pub text: LogFileWriter,
+    /// Structured JSON-lines log file (`run.jsonl`).
     pub jsonl: LogFileWriter,
 }
 

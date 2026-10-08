@@ -137,6 +137,7 @@ impl std::fmt::Display for ElementType {
 
 /// Trait for converting vector elements to `f64` for analysis.
 pub trait ToF64: Copy {
+    /// Widen `self` to `f64`.
     fn to_f64(self) -> f64;
 }
 

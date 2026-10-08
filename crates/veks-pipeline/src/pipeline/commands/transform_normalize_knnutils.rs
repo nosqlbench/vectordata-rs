@@ -41,6 +41,7 @@ fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
 /// Pipeline command: L2-normalize vectors using numpy (knn\_utils compatible).
 pub struct TransformNormalizeKnnUtilsOp;
 
+/// Creates a boxed [`TransformNormalizeKnnUtilsOp`]; registered as the `transform normalize-knnutils` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(TransformNormalizeKnnUtilsOp)
 }

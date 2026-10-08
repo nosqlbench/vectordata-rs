@@ -28,6 +28,7 @@ use std::path::PathBuf;
 #[command(disable_help_subcommand = true)]
 pub struct DatasetsArgs {
     #[command(subcommand)]
+    /// The `veks datasets` subcommand to run.
     pub command: DatasetsCommand,
 }
 
@@ -152,6 +153,7 @@ pub enum DatasetsCommand {
     #[command(disable_help_subcommand = true)]
     Config {
         #[command(subcommand)]
+        /// The `config` subcommand to run.
         command: ConfigSubcommand,
     },
     /// Show cache status for a dataset (merkle coverage, sizes, completion)
@@ -369,6 +371,7 @@ pub enum ConfigSubcommand {
     /// Manage catalog sources (the list in catalogs.yaml).
     Catalog {
         #[command(subcommand)]
+        /// The catalog-source subcommand to run.
         command: ConfigCatalogSubcommand,
     },
     /// List writable mount points to help pick a cache dir.

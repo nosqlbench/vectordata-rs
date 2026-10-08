@@ -27,21 +27,42 @@ pub enum SlabError {
     /// The page type byte is not a valid variant.
     InvalidPageType(u8),
     /// The page size in the header does not match the footer.
-    PageSizeMismatch { header: u32, footer: u32 },
+    PageSizeMismatch {
+        /// Page size in bytes read from the page header.
+        header: u32,
+        /// Page size in bytes read from the page footer.
+        footer: u32,
+    },
     /// The page size is below the minimum (512 bytes).
     PageTooSmall(u32),
     /// The page size exceeds the maximum.
     PageTooLarge(u64),
     /// A single record exceeds the capacity of a page.
-    RecordTooLarge { record_size: usize, max_size: usize },
+    RecordTooLarge {
+        /// Size in bytes of the rejected record.
+        record_size: usize,
+        /// Largest record size in bytes a single page can hold under the
+        /// writer's configuration.
+        max_size: usize,
+    },
     /// The requested ordinal is not present in the file.
     OrdinalNotFound(i64),
     /// The caller-specified ordinal does not match the writer's next expected ordinal.
-    OrdinalMismatch { expected: i64, actual: i64 },
+    OrdinalMismatch {
+        /// The ordinal the writer expected next.
+        expected: i64,
+        /// The ordinal the caller supplied.
+        actual: i64,
+    },
     /// The footer data is malformed.
     InvalidFooter(String),
     /// The page data is truncated or incomplete.
-    TruncatedPage { expected: usize, actual: usize },
+    TruncatedPage {
+        /// Number of bytes required.
+        expected: usize,
+        /// Number of bytes actually available.
+        actual: usize,
+    },
     /// An underlying I/O error.
     Io(io::Error),
     /// An error with additional location context (file offset, page index,

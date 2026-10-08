@@ -31,6 +31,7 @@
 //! - `embed`, `embed-cuda` — in-process embedding.
 
 #![allow(dead_code)]
+#![warn(missing_docs)]
 
 // Re-export foundation modules from veks-core so that code using
 // `crate::term`, `crate::filters`, etc. continues to compile.

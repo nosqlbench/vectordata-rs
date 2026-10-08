@@ -159,6 +159,8 @@ pub fn add_user(
     })
 }
 
+/// Change a user's management-plane privilege [`Level`]. Errors with a
+/// usage error if the user does not exist.
 pub fn set_level(db: &mut Db, name: &str, level: Level) -> Result<(), VecdError> {
     let id = user_id(db, name)?;
     db.with_cp_txn(|tx| {
@@ -167,6 +169,8 @@ pub fn set_level(db: &mut Db, name: &str, level: Level) -> Result<(), VecdError>
     })
 }
 
+/// Set (or replace) a user's password for the `/auth/token` password
+/// grant. Only the SHA-256 hash is stored.
 pub fn set_password(db: &mut Db, name: &str, password: &str) -> Result<(), VecdError> {
     let id = user_id(db, name)?;
     let hash = auth::hash_token(password);
@@ -176,6 +180,9 @@ pub fn set_password(db: &mut Db, name: &str, password: &str) -> Result<(), VecdE
     })
 }
 
+/// Disable (`true`) or re-enable (`false`) a user. A disabled user keeps
+/// its record but drops out of the snapshot, so its tokens and password
+/// stop authenticating.
 pub fn set_disabled(db: &mut Db, name: &str, disabled: bool) -> Result<(), VecdError> {
     let id = user_id(db, name)?;
     db.with_cp_txn(|tx| {
@@ -184,6 +191,7 @@ pub fn set_disabled(db: &mut Db, name: &str, disabled: bool) -> Result<(), VecdE
     })
 }
 
+/// Delete a user; its tokens go with it (`ON DELETE CASCADE`).
 pub fn remove_user(db: &mut Db, name: &str) -> Result<(), VecdError> {
     let id = user_id(db, name)?;
     db.with_cp_txn(|tx| {
@@ -205,10 +213,13 @@ pub fn list_users(db: &Db) -> Result<Vec<(String, String, bool)>, VecdError> {
 
 /// A freshly minted token — the plaintext is shown once and not stored.
 pub struct TokenCreated {
+    /// The token's row id (what `tokens list` shows and `revoke` takes).
     pub id: i64,
     /// The user this token authenticates as.
     pub user: String,
+    /// The bearer secret (`vd_…`); only its hash is persisted.
     pub plaintext: String,
+    /// Expiry instant, in Unix epoch seconds.
     pub expires_at: i64,
 }
 
@@ -251,6 +262,8 @@ pub fn create_token(
     Ok(TokenCreated { id, user: user.to_string(), plaintext, expires_at })
 }
 
+/// Revoke (delete) a token by its numeric id. Errors with a usage error if
+/// no such token exists.
 pub fn revoke_token(db: &mut Db, id: i64) -> Result<(), VecdError> {
     db.with_cp_txn(|tx| {
         let n = tx.execute("DELETE FROM tokens WHERE id=?1", params![id])?;
@@ -277,6 +290,9 @@ pub fn list_tokens(db: &Db, user: Option<&str>) -> Result<Vec<(i64, String, Stri
 
 // ── roles ───────────────────────────────────────────────────────────
 
+/// Define a custom role named `name` granting the comma-separated
+/// `actions_csv` (validated and stored in canonical form). Fails if the
+/// name is taken.
 pub fn add_role(db: &mut Db, name: &str, actions_csv: &str) -> Result<(), VecdError> {
     let set = crate::model::ActionSet::parse_csv(actions_csv)?;
     db.with_cp_txn(|tx| {
@@ -289,6 +305,8 @@ pub fn add_role(db: &mut Db, name: &str, actions_csv: &str) -> Result<(), VecdEr
     })
 }
 
+/// Remove a custom role. Built-in class roles (`read`/`publish`/
+/// `maintain`/`curate`) cannot be removed.
 pub fn remove_role(db: &mut Db, name: &str) -> Result<(), VecdError> {
     db.with_cp_txn(|tx| {
         let builtin: Option<bool> = tx
@@ -370,6 +388,11 @@ pub fn set_backend_endpoint(db: &mut Db, name: &str, endpoint: &str) -> Result<(
     })
 }
 
+/// Register a named backend config (`kind` is `local`, `s3` or `mem`).
+/// A `local` endpoint must already be normalized to
+/// `local:<absolute-dir>`; `aws_profile` is stored as the S3 credentials
+/// reference. With `active`, the endpoint must not already be held by
+/// another active config (one endpoint, one active config).
 #[allow(clippy::too_many_arguments)]
 pub fn add_backend(
     db: &mut Db,
@@ -399,6 +422,8 @@ pub fn add_backend(
     })
 }
 
+/// Activate or deactivate a backend config. Activation is refused while
+/// another active config holds the same endpoint.
 pub fn set_backend_active(db: &mut Db, name: &str, active: bool) -> Result<(), VecdError> {
     db.with_cp_txn(|tx| {
         let endpoint: String = tx
@@ -413,6 +438,8 @@ pub fn set_backend_active(db: &mut Db, name: &str, active: bool) -> Result<(), V
     })
 }
 
+/// Remove a backend config. Refused while any namespace still references
+/// it.
 pub fn remove_backend(db: &mut Db, name: &str) -> Result<(), VecdError> {
     db.with_cp_txn(|tx| {
         let in_use: bool = tx
@@ -472,6 +499,11 @@ fn ensure_endpoint_free(
 
 // ── namespaces ──────────────────────────────────────────────────────
 
+/// Create a namespace at `path` (normalized; the root cannot be
+/// re-created). `ttl` is a duration string (e.g. `30d`) for the default
+/// version lifetime; `quota` is a size string (e.g. `50G`) and defaults to
+/// [`crate::model::DEFAULT_QUOTA_BYTES`]. A referenced `backend_config`
+/// must exist.
 #[allow(clippy::too_many_arguments)]
 pub fn add_namespace(
     db: &mut Db,
@@ -555,6 +587,9 @@ pub fn set_namespace(
     })
 }
 
+/// Remove a namespace's config entry and its role bindings. The root
+/// cannot be removed, and a namespace (or any descendant) still holding
+/// objects is refused so bytes are not orphaned.
 pub fn remove_namespace(db: &mut Db, path: &str) -> Result<(), VecdError> {
     let path = crate::authz::normalize(path);
     if path.is_empty() {
@@ -686,6 +721,8 @@ fn validate_principal(db: &Db, principal: &str) -> Result<(), VecdError> {
     Ok(())
 }
 
+/// Grant a system privilege (e.g. [`crate::model::PRIV_IGNORE_QUOTAS`]) to
+/// a principal. Idempotent.
 pub fn grant_privilege(db: &mut Db, principal: &str, privilege: &str) -> Result<(), VecdError> {
     db.with_cp_txn(|tx| {
         tx.execute(
@@ -697,6 +734,8 @@ pub fn grant_privilege(db: &mut Db, principal: &str, privilege: &str) -> Result<
     })
 }
 
+/// Revoke a system privilege from a principal. A no-op if it was not
+/// held.
 pub fn revoke_privilege(db: &mut Db, principal: &str, privilege: &str) -> Result<(), VecdError> {
     db.with_cp_txn(|tx| {
         tx.execute(
@@ -724,6 +763,7 @@ pub fn add_profile(db: &mut Db, name: &str, owner: &str, spec: &str) -> Result<(
     })
 }
 
+/// Remove a named privilege profile. Errors if no such profile exists.
 pub fn remove_profile(db: &mut Db, name: &str) -> Result<(), VecdError> {
     db.with_cp_txn(|tx| {
         let n = tx.execute("DELETE FROM profiles WHERE name=?1", params![name])?;

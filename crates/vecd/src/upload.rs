@@ -132,9 +132,11 @@ impl ReceivedRanges {
 /// A persisted in-progress (or just-completed) resumable upload.
 #[derive(Clone, Debug)]
 pub struct Upload {
+    /// Random hex id naming the upload resource (`/-/uploads/<id>`).
     pub upload_id: String,
     /// Storage namespace and namespace-relative key the bytes resolve to.
     pub storage_ns: String,
+    /// Namespace-relative object key the upload commits to.
     pub key: String,
     /// Declared object length (`Upload-Length`).
     pub total_length: u64,
@@ -148,6 +150,7 @@ pub struct Upload {
     /// CAS precondition captured at create, evaluated at finalize: an
     /// `If-Match` ETag, or `If-None-Match: *` (must-not-exist).
     pub if_match: Option<String>,
+    /// `If-None-Match: *` was captured: finalize fails if the object exists.
     pub if_none_match: bool,
 }
 

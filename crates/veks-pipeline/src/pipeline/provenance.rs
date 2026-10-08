@@ -51,6 +51,14 @@ pub const SIDECAR_EXT: &str = "provenance.json";
 /// [`ProvenanceFlags::STRICT`], sixteen hex digits.
 pub type Address = String;
 
+/// The upstream key under which a finalize step holds the dataset
+/// definition as an input (see [`ProvenanceNode::definition`]).
+pub const DEFINITION_INPUT: &str = "dataset.yaml";
+
+/// The upstream key under which a finalize step holds the static
+/// payload as an input (see [`ProvenanceNode::static_payload`]).
+pub const STATIC_PAYLOAD_INPUT: &str = "static-payload";
+
 /// Structured provenance of a single step's execution.
 ///
 /// Every component is captured verbatim; the staleness hash is
@@ -62,14 +70,8 @@ pub type Address = String;
 /// `upstream` names each upstream by the **address** of the node the
 /// step was built on. The node itself is in the graph; two dependents
 /// of one upstream share it.
-/// The upstream key under which a finalize step holds the dataset
-/// definition as an input (see [`ProvenanceNode::definition`]).
-pub const DEFINITION_INPUT: &str = "dataset.yaml";
-
-/// The upstream key under which a finalize step holds the static
-/// payload as an input (see [`ProvenanceNode::static_payload`]).
-pub const STATIC_PAYLOAD_INPUT: &str = "static-payload";
-
+///
+/// Stored in a [`ProvenanceGraph`] under its [`Address`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvenanceNode {
     /// Step identifier — the YAML `id` field.
@@ -344,22 +346,27 @@ pub struct ProvenanceGraph {
 }
 
 impl ProvenanceGraph {
+    /// An empty graph.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Number of nodes in the graph.
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
+    /// Whether the graph holds no nodes.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
+    /// The node stored at `address`, if present.
     pub fn get(&self, address: &str) -> Option<&ProvenanceNode> {
         self.nodes.get(address)
     }
 
+    /// Whether a node is stored at `address`.
     pub fn contains(&self, address: &str) -> bool {
         self.nodes.contains_key(address)
     }
@@ -715,7 +722,9 @@ impl ProvenanceGraph {
 /// address of its node and every node that address reaches.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvenanceSidecar {
+    /// Address of the artifact's own node.
     pub root: Address,
+    /// The root node and every node reachable from it.
     pub nodes: ProvenanceGraph,
 }
 
@@ -732,9 +741,13 @@ impl ProvenanceSidecar {
 pub enum ProvenanceDiff {
     /// A specific component diverged (version, an option, etc.).
     Component {
+        /// The component that differs.
         flag: ProvenanceFlags,
+        /// Display name of the component (an option name, for options).
         label: String,
+        /// The value recorded in the stored node.
         old: String,
+        /// The value in the current node.
         new: String,
     },
     /// An upstream step's provenance changed (likely because that
@@ -762,16 +775,26 @@ impl std::fmt::Display for ProvenanceDiff {
 pub struct ProvenanceFlags(u32);
 
 impl ProvenanceFlags {
+    /// The step's YAML `id`.
     pub const STEP_ID:        Self = Self(1 << 0);
+    /// The command path the step runs.
     pub const COMMAND_PATH:   Self = Self(1 << 1);
+    /// Binary major version.
     pub const VERSION_MAJOR:  Self = Self(1 << 2);
+    /// Binary minor version.
     pub const VERSION_MINOR:  Self = Self(1 << 3);
+    /// Binary patch version.
     pub const VERSION_PATCH:  Self = Self(1 << 4);
+    /// Git short hash the binary was built from.
     pub const GIT_HASH:       Self = Self(1 << 5);
+    /// Whether the binary was built from a dirty working tree.
     pub const DIRTY_FLAG:     Self = Self(1 << 6);
+    /// The step's resolved options.
     pub const OPTIONS:        Self = Self(1 << 7);
+    /// The provenance of the step's upstreams.
     pub const UPSTREAM:       Self = Self(1 << 8);
 
+    /// No components selected.
     pub const fn empty() -> Self { Self(0) }
 
     /// Strict: every component.
@@ -811,10 +834,13 @@ impl ProvenanceFlags {
     /// here reaches all of them.
     pub const DEFAULT_NAME: &'static str = "config-only";
 
+    /// Whether every component in `other` is selected. Always `false` for an
+    /// empty `other`.
     pub fn contains(&self, other: ProvenanceFlags) -> bool {
         (self.0 & other.0) == other.0 && other.0 != 0
     }
 
+    /// The raw bitmask.
     pub fn bits(&self) -> u32 { self.0 }
 
     /// Parse a comma-separated component list (case-insensitive,
@@ -883,10 +909,15 @@ impl Default for ProvenanceFlags {
 /// unrecognised string still produces a usable node.
 #[derive(Debug, Clone, Default)]
 pub struct BinaryVersion {
+    /// Major version.
     pub major: u32,
+    /// Minor version.
     pub minor: u32,
+    /// Patch version.
     pub patch: u32,
+    /// Git short hash; empty when the stamp carries none.
     pub git_hash: String,
+    /// Whether the stamp carries `+dirty`.
     pub dirty: bool,
     /// The cargo profile the binary was built under (`debug`,
     /// `release`), empty for a stamp from before profiles were stated.

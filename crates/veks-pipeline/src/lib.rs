@@ -49,5 +49,6 @@
 //! - `embed`, `embed-cuda` — in-process embedding (`generate embed`).
 
 #![allow(dead_code)]
+#![warn(missing_docs)]
 
 pub mod pipeline;

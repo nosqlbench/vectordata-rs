@@ -28,8 +28,10 @@ use crate::pipeline::command::{
 use super::compute_knn::Neighbor;
 use super::source_window::resolve_source;
 
+/// Pipeline command: compute exact KNN by streaming the base file through pread buffers instead of memory-mapping it.
 pub struct ComputeKnnStdarchOp;
 
+/// Creates a boxed [`ComputeKnnStdarchOp`]; registered as the `compute knn-stdarch` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(ComputeKnnStdarchOp)
 }

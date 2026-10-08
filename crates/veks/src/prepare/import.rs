@@ -18,20 +18,37 @@ use crate::formats::VecFormat;
 /// Arguments for `datasets import`.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ImportArgs {
+    /// Dataset name, written as `name` in `dataset.yaml`.
     pub name: String,
+    /// Directory the dataset is created in.
     pub output: PathBuf,
+    /// Base vectors source (file or directory).
     pub base_vectors: Option<PathBuf>,
+    /// Separate query vectors source (file or directory); `None` means
+    /// queries come from the base (self-search) or are absent.
     pub query_vectors: Option<PathBuf>,
+    /// Extract queries from the base vectors by shuffle.
     pub self_search: bool,
+    /// Number of queries extracted in self-search mode.
     pub query_count: u32,
+    /// Metadata source (file or directory).
     pub metadata: Option<PathBuf>,
+    /// Pre-computed ground-truth neighbor indices (ivec); when set, KNN is
+    /// not recomputed.
     pub ground_truth: Option<PathBuf>,
+    /// Pre-computed ground-truth neighbor distances (fvec).
     pub ground_truth_distances: Option<PathBuf>,
+    /// Distance metric for KNN, or `auto` to detect it from the data.
     pub metric: String,
+    /// Number of ground-truth neighbors (k).
     pub neighbors: u32,
+    /// Random seed for the query shuffle.
     pub seed: u32,
+    /// Free-text dataset description.
     pub description: Option<String>,
+    /// Skip the deduplication stage.
     pub no_dedup: bool,
+    /// Skip the zero-vector check and ordinal cleaning.
     pub no_zero_check: bool,
     /// User-supplied count asserted when `no_dedup=true`. When set,
     /// bootstrap writes `duplicate_count=<v>` into `variables.yaml` and
@@ -43,8 +60,11 @@ pub struct ImportArgs {
     /// User-supplied zero count. Same semantics as `duplicate_count`
     /// but for `no_zero_check` / `scan-zeros` / `is_zero_vector_free`.
     pub zero_count: Option<u64>,
+    /// Skip filtered KNN even when metadata is present.
     pub no_filtered: bool,
+    /// L2-normalize vectors during extraction.
     pub normalize: bool,
+    /// Overwrite an existing `dataset.yaml`.
     pub force: bool,
     /// Target format for base vectors precision conversion (e.g., "mvec" for f32→f16).
     /// When set, a `convert` step is emitted after the base import/identity step.
@@ -220,6 +240,9 @@ pub const FACET_CODES: &[(&str, char, &str)] = &[
     ("oracle_partitions",          'O', "Oracle partition profiles"),
 ];
 
+/// All recognized single-letter facet codes.
+const ALL_FACET_CHARS: &str = "BQGDMPRFObqgdmprfo";
+
 /// Parse a facet specification string into a canonical code string.
 ///
 /// Accepts:
@@ -227,10 +250,12 @@ pub const FACET_CODES: &[(&str, char, &str)] = &[
 /// - `"B,Q,G,D"` or `"base,query,gt,dist"` — comma-separated
 /// - `"base query gt dist"` — space-separated names
 /// - Full facet names like `"base_vectors,query_vectors"`
+/// - `*` or `all` for every facet
 ///
-/// All recognized single-letter facet codes.
-const ALL_FACET_CHARS: &str = "BQGDMPRFObqgdmprfo";
-
+/// Returns a string of uppercase facet codes, e.g. `"BQGD"`, without
+/// duplicates. A `+` prefix on compact codes is
+/// stripped; the caller merges those with the inferred set. Unknown names
+/// are warned about on stderr and ignored.
 pub fn parse_facet_spec(spec: &str) -> String {
     let spec = spec.trim();
 

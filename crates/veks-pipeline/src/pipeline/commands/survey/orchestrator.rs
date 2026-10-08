@@ -137,10 +137,15 @@ impl SurveyConfig {
 /// Top-level survey report — serialized to `survey.json` per §13.8.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurveyReport {
+    /// Version of the `survey.json` schema (currently `2`).
     pub schema_version: u32,
+    /// Identifier of the tool that produced the report.
     pub produced_by: String,
+    /// What was surveyed and how it was sampled.
     pub source: SourceInfo,
+    /// Per-field profiles keyed by field name, in first-seen order.
     pub fields: IndexMap<String, FieldProfile>,
+    /// Pairwise cross-field analysis results.
     pub cross_field: CrossFieldReport,
     /// Verified, counted trees for each declared hierarchy (Pass 3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -148,33 +153,56 @@ pub struct SurveyReport {
     /// Exact joint tables for each declared pair (Pass 3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pair_census: Vec<PairCensusReport>,
+    /// Non-fatal problems encountered while surveying (skipped
+    /// records, census fallbacks, and the like).
     pub warnings: Vec<Warning>,
 }
 
+/// Provenance of a [`SurveyReport`]: the surveyed file and how much
+/// of it was read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceInfo {
+    /// Path of the surveyed file, as given to the survey.
     pub path: String,
+    /// Container format of the source (currently always `"slab"`).
     pub format: String,
+    /// Total records in the source file.
     pub total_records: u64,
+    /// Records profiled by the sampled passes.
     pub sampled_records: u64,
+    /// How the sampled records were chosen.
     pub sampling: SamplingInfo,
     /// Present when the census pass ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub census: Option<CensusInfo>,
 }
 
+/// Sampling strategy recorded in [`SourceInfo`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingInfo {
+    /// Sampling mode name (currently always `"page_stride"`: whole
+    /// slab pages taken at a regular stride).
     pub mode: String,
+    /// Number of slab pages the sample was drawn from.
     pub page_count: u64,
 }
 
+/// Everything the survey learned about one field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldProfile {
+    /// How the field's values are encoded on the wire.
     pub wire_encoding: WireEncoding,
+    /// What the values mean, as decided in Pass 1; `None` when no
+    /// verdict was reached (e.g. only nulls were observed).
     pub semantic_type: Option<SemanticType>,
+    /// Confidence in `semantic_type`, in `[0, 1]`: the winning probe's
+    /// match rate, or the encoding-only verdict's confidence when no
+    /// probe cleared the threshold.
     pub semantic_confidence: f64,
+    /// Cardinality bucket, which selected the cardinality measures run
+    /// in Pass 2.
     pub cardinality_regime: CardinalityRegime,
+    /// Presence and null counts for the field.
     pub presence: PresenceReport,
     /// True when the census pass counted this field: `presence` and
     /// the cardinality regime are then exact over every record, and
@@ -333,16 +361,25 @@ where
 /// so a sparse report stays compact.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrossFieldReport {
+    /// Correlations between pairs of numeric fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub numeric_correlation: Vec<super::crossfield::NumericCorrelationEntry>,
+    /// Associations between pairs of categorical fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub categorical_association: Vec<super::crossfield::CategoricalAssociationEntry>,
+    /// How often pairs of fields are present together in a record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub copresence: Vec<super::crossfield::CopresenceEntry>,
+    /// Share of a numeric field's variance explained (eta-squared) by
+    /// the groups of a low-cardinality field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lowcard_numeric: Vec<super::crossfield::LowCardNumericEntry>,
+    /// Correlation of numeric fields with record index, flagging drift
+    /// with stream position.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trend: Vec<super::crossfield::TrendEntry>,
+    /// Candidate functional dependencies, where one field's value
+    /// determines another's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub functional_dependencies: Vec<super::crossfield::FunctionalDependencyEntry>,
     /// Number of pair-analyses scheduled by Pass 1.
@@ -354,10 +391,14 @@ pub struct CrossFieldReport {
     pub executed: u32,
 }
 
+/// A non-fatal problem recorded in [`SurveyReport::warnings`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Warning {
+    /// Severity tag: `"info"` or `"warning"`.
     pub severity: String,
+    /// Field the warning concerns; `None` for survey-wide warnings.
     pub field: Option<String>,
+    /// Human-readable description.
     pub message: String,
 }
 

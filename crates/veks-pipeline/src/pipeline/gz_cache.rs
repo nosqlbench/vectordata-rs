@@ -136,16 +136,21 @@ pub fn gz_uncompressed_size_hint(path: &Path) -> Option<u32> {
 
 /// Compression statistics for logging.
 pub struct GzStats {
+    /// Uncompressed size in bytes.
     pub original_size: u64,
+    /// Size of the `.gz` file in bytes.
     pub compressed_size: u64,
 }
 
 impl GzStats {
+    /// Compression ratio, `original / compressed` (0 when nothing was written).
     pub fn ratio(&self) -> f64 {
         if self.compressed_size == 0 { 0.0 }
         else { self.original_size as f64 / self.compressed_size as f64 }
     }
 
+    /// Space saved as a percentage of the original size (0 for an empty
+    /// original).
     pub fn savings_pct(&self) -> f64 {
         if self.original_size == 0 { 0.0 }
         else { (1.0 - self.compressed_size as f64 / self.original_size as f64) * 100.0 }

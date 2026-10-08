@@ -17,8 +17,10 @@ use crate::pipeline::command::{
     Status, StreamContext, render_options_table,
 };
 
+/// Pipeline command: write `dataset.json` as a JSON copy of `dataset.yaml` when it is missing or stale.
 pub struct DatasetJsonOp;
 
+/// Creates a boxed [`DatasetJsonOp`]; registered as the `generate dataset-json` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(DatasetJsonOp)
 }

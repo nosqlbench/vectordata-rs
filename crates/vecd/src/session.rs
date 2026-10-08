@@ -33,9 +33,14 @@ use crate::store;
 /// What a commit produced.
 #[derive(Clone, Debug)]
 pub struct Committed {
+    /// The new version's per-namespace sequence number (1-based, monotonic).
     pub seq: i64,
+    /// The version's tag (`v<seq>`).
     pub tag: String,
+    /// SHA-256 hex over the sorted `key → content_key` manifest.
     pub manifest_hash: String,
+    /// When the version expires into stasis, in Unix epoch seconds; `None`
+    /// when the namespace has no TTL.
     pub expires_at: Option<i64>,
 }
 
@@ -190,13 +195,22 @@ pub fn commit(db: &mut Db, ns: &str, ttl_seconds: Option<i64>) -> Result<Committ
 /// A committed (or stasis) version's metadata.
 #[derive(Clone, Debug)]
 pub struct VersionRow {
+    /// Row id in `versions`.
     pub id: i64,
+    /// Per-namespace sequence number.
     pub seq: i64,
+    /// User-facing label (default `v<seq>`).
     pub tag: String,
+    /// SHA-256 hex over the sorted `key → content_key` manifest.
     pub manifest_hash: String,
+    /// Lifecycle state: `committed` or `stasis`.
     pub state: String,
+    /// Commit time, in Unix epoch seconds.
     pub committed_at: Option<i64>,
+    /// Expiry time in Unix epoch seconds; `None` = never expires.
     pub expires_at: Option<i64>,
+    /// When the version entered stasis, in Unix epoch seconds; `None` while
+    /// committed.
     pub stasis_at: Option<i64>,
 }
 

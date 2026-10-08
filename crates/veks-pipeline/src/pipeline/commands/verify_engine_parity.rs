@@ -56,10 +56,13 @@ const ENGINES: [&str; 8] = [
 // now inlined at the top of execute() above. See pipeline::blas_abi
 // for the production-grade variant gated on the `faiss` feature.
 
+/// Creates a boxed `VerifyEngineParityOp` for command registration.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(VerifyEngineParityOp)
 }
 
+/// Pipeline command `verify engine-parity`: runs every available KNN engine
+/// on the same inputs and reports cross-engine parity of the results.
 pub struct VerifyEngineParityOp;
 
 /// What we ran an engine with, so we can render the result table.

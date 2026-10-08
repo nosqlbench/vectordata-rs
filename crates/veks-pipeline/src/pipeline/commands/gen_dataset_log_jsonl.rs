@@ -14,8 +14,10 @@ use crate::pipeline::command::{
     Status, StreamContext, render_options_table,
 };
 
+/// Pipeline command: convert the `dataset.log` provenance log into `dataset.jsonl`, one JSON object per entry.
 pub struct GenDatasetLogJsonlOp;
 
+/// Creates a boxed [`GenDatasetLogJsonlOp`]; registered as the `generate dataset-log-jsonl` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenDatasetLogJsonlOp)
 }

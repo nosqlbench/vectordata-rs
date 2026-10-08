@@ -15,9 +15,13 @@ use std::str::FromStr;
 /// (GET/HEAD→READ, PUT→WRITE, DELETE→DELETE, governance→ADMIN).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Action {
+    /// Fetch objects and listings (GET/HEAD).
     Read,
+    /// Create or replace objects (PUT, uploads).
     Write,
+    /// Remove objects (DELETE).
     Delete,
+    /// Governance of the subtree: delegate bindings, ownership, and TTL.
     Admin,
 }
 
@@ -66,11 +70,13 @@ impl FromStr for Action {
 pub struct ActionSet(u8);
 
 impl ActionSet {
+    /// No actions.
     pub const EMPTY: ActionSet = ActionSet(0);
     /// Every action — the authority an owner holds at the apex of a cone.
     pub const ALL: ActionSet =
         ActionSet(Action::READ | Action::WRITE | Action::DELETE | Action::ADMIN);
 
+    /// The set containing exactly `actions`.
     pub fn of(actions: &[Action]) -> Self {
         let mut s = ActionSet::EMPTY;
         for a in actions {
@@ -79,10 +85,12 @@ impl ActionSet {
         s
     }
 
+    /// Whether `a` is in the set.
     pub fn contains(self, a: Action) -> bool {
         self.0 & a.bit() != 0
     }
 
+    /// Whether the set holds no actions.
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -132,9 +140,13 @@ impl ActionSet {
 /// `publish` ⊃ `read`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Class {
+    /// `read` only.
     Read,
+    /// `read` + `write`.
     Publish,
+    /// `read` + `write` + `delete`.
     Maintain,
+    /// Every action, including `admin`.
     Curate,
 }
 
@@ -149,6 +161,7 @@ impl Class {
         }
     }
 
+    /// Lower-case canonical name (also the built-in role's name).
     pub fn name(self) -> &'static str {
         match self {
             Class::Read => "read",
@@ -178,13 +191,19 @@ impl FromStr for Class {
 /// grant or assume a level above its own.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {
+    /// Data plane only — no management.
     User = 0,
+    /// Run cleanup, read logs, set TTL; no user/token/role management.
     Operator = 1,
+    /// Manage users at or below their level, tokens, bindings, ownership
+    /// and TTL within the scopes they administer.
     Admin = 2,
+    /// Everything, including managing admins and server-wide settings.
     Superuser = 3,
 }
 
 impl Level {
+    /// Lower-case canonical name (as stored in `users.level`).
     pub fn name(self) -> &'static str {
         match self {
             Level::User => "user",
@@ -194,6 +213,7 @@ impl Level {
         }
     }
 
+    /// Every level, lowest first.
     pub const ALL: [Level; 4] = [Level::User, Level::Operator, Level::Admin, Level::Superuser];
 }
 
@@ -231,6 +251,7 @@ pub enum Listable {
 }
 
 impl Listable {
+    /// Lower-case canonical name (as stored in `namespaces.listable`).
     pub fn name(self) -> &'static str {
         match self {
             Listable::Public => "public",
@@ -279,16 +300,20 @@ pub enum VecdError {
     /// Operational failure — I/O, DB, backend, transport. Exit code 1.
     #[error("{0}")]
     Operational(String),
+    /// A SQLite error from the control-plane DB. Exit code 1.
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
+    /// A filesystem or other I/O error. Exit code 1.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 impl VecdError {
+    /// Build a [`VecdError::Usage`] from a message.
     pub fn usage(m: impl Into<String>) -> Self {
         VecdError::Usage(m.into())
     }
+    /// Build a [`VecdError::Operational`] from a message.
     pub fn op(m: impl Into<String>) -> Self {
         VecdError::Operational(m.into())
     }

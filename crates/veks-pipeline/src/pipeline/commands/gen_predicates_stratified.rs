@@ -84,14 +84,24 @@ const DEFAULT_BUCKETS: u64 = 16_777_216;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+/// The predicate families of a stratified set, spanning how strongly a
+/// filter correlates with the query.
 pub enum Family {
+    /// A topic at any level of the hierarchy, optionally conjoined with
+    /// one bibliographic qualifier to reach a lower decade.
     Topical,
+    /// Passage-level fields, free of paper blocking.
     Structural,
+    /// Paper-level fields.
     Bibliographic,
+    /// A seeded hash range: the null hypothesis, and the only family
+    /// that can fill any cell on demand.
     Control,
 }
 
 impl Family {
+    /// The lowercase name used in the `families` option, cell names and
+    /// serialised reports.
     pub fn as_str(self) -> &'static str {
         match self {
             Family::Topical => "topical",
@@ -112,14 +122,17 @@ impl Family {
     }
 }
 
-/// The decade a selectivity belongs to: `⌊log10 s + ½⌋`, so the band
-/// `[d/√10, d·√10)` tiles the axis without gaps or overlap and its
-/// upper edge belongs to the next decade up.
 /// The ladder a stratified set is generated for when `--decades` is
 /// not given; the tagging of an existing dataset reads the same
 /// default from the generator's record (PS-12).
 pub const DEFAULT_DECADES: &str = "1e-1..1e-7";
 
+/// The decade a selectivity belongs to: `⌊log10 s + ½⌋`, so the band
+/// `[d/√10, d·√10)` tiles the axis without gaps or overlap and its
+/// upper edge belongs to the next decade up.
+///
+/// Returns the decade exponent (for example `-3` for 10⁻³), or `None`
+/// for a selectivity that is zero, negative or not finite.
 pub fn decade_of(selectivity: f64) -> Option<i32> {
     if selectivity <= 0.0 || !selectivity.is_finite() {
         return None;
@@ -255,7 +268,9 @@ fn parse_fields(spec: &str) -> Vec<String> {
 pub enum Placement {
     /// Half in-topic, half out-of-topic, each backfilling the other.
     Mixed,
+    /// Pair each topical predicate only with queries inside its topic.
     InTopic,
+    /// Pair each topical predicate only with queries outside its topic.
     OutOfTopic,
     /// Draw without regard to placement; still labelled.
     Any,
@@ -563,6 +578,7 @@ pub struct QueryTopics {
 }
 
 impl QueryTopics {
+    /// Number of queries placed.
     pub fn count(&self) -> usize {
         self.per_query.len()
     }
@@ -679,10 +695,13 @@ fn query_topics(
 /// What one cell did.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CellReport {
+    /// The cell's predicate family.
     pub family: Family,
+    /// The cell's decade exponent (see [`decade_of`]).
     pub decade: i32,
     /// Query slots apportioned to the cell (TS-156).
     pub target: usize,
+    /// Candidates in the cell's pool before drawing.
     pub candidates: usize,
     /// Distinct predicates drawn.
     pub drawn: usize,
@@ -690,12 +709,18 @@ pub struct CellReport {
     pub filled: usize,
     /// Slots the cell could not fill.
     pub shortfall: usize,
+    /// Filled slots whose predicate is a topic-plus-qualifier
+    /// conjunction.
     pub conjunctions: usize,
+    /// Filled slots paired with a query inside the predicate's topic.
     pub in_topic: usize,
+    /// Filled slots paired with a query outside the predicate's topic.
     pub out_of_topic: usize,
     /// Pairs whose query's own passage satisfies the predicate, when
     /// the queries' metadata rows are given (TS-166).
     pub in_filter: usize,
+    /// Pairs whose query's own passage does not satisfy the predicate,
+    /// when the queries' metadata rows are given.
     pub out_of_filter: usize,
 }
 
@@ -969,25 +994,41 @@ fn fill_cell(
     report
 }
 
+/// Whether one decade's predicates can be promised enough matches at
+/// the reported base count.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FloorReport {
+    /// The decade exponent.
     pub decade: i32,
     /// Smallest base count at which `s · N ≥ M + 3√M` for this decade.
     pub min_base_for_floor: u64,
+    /// True when the base count reaches both `reliability_threshold`
+    /// and `min_base_for_floor`.
     pub reliable_at_base_count: bool,
 }
 
+/// The JSON report the stratified strategy writes beside the predicate
+/// slab: its configuration, per-cell outcomes and reliability floors.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationReport {
+    /// Report format version (currently 1).
     pub schema_version: u32,
+    /// Seed that drove every draw.
     pub seed: u64,
+    /// N of the full base used for the floors (`base-count`, or the
+    /// census population when not given).
     pub base_count: u64,
+    /// Records the survey's census covers.
     pub census_population: u64,
+    /// Families generated, in option order.
     pub families: Vec<Family>,
+    /// Decade exponents generated, coarsest first.
     pub decades: Vec<i32>,
     /// The `per-cell` spec, one entry per decade (TS-159).
     pub per_cell: Vec<String>,
+    /// M in the floor `s · N ≥ M + 3√M`.
     pub min_matches: u64,
+    /// Base count above which the floors are promised.
     pub reliability_threshold: u64,
     /// Records written: one per query ordinal (TS-156).
     pub predicates: usize,
@@ -997,15 +1038,25 @@ pub struct GenerationReport {
     pub slots_per_cell: Vec<usize>,
     /// Records filled from the control family because no cell could.
     pub backfilled: usize,
+    /// Candidates contributed by each census source, keyed as
+    /// `hierarchy <fields>`, `pair <a>:<b>` or `field <name>`.
     pub candidates: HashMap<String, usize>,
+    /// One report per `(family, decade)` cell.
     pub cells: Vec<CellReport>,
+    /// One reliability floor per decade.
     pub floors: Vec<FloorReport>,
+    /// Number of queries placed in the topic hierarchy; `None` when
+    /// query placement was not configured.
     pub query_count: Option<usize>,
+    /// How topical cells mixed query placement.
     pub placement: Placement,
     /// Pairs labelled against the queries' own metadata rows (TS-166);
     /// absent when `query-metadata` was not given.
     pub in_filter: Option<usize>,
+    /// Pairs whose query's own row fails its predicate; absent when
+    /// `query-metadata` was not given.
     pub out_of_filter: Option<usize>,
+    /// Wall-clock time of the strategy, in seconds.
     pub seconds: f64,
 }
 

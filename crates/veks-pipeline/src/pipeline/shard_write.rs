@@ -256,8 +256,11 @@ pub enum FacetWriter {
     /// abandoned single-file write cleans up after itself exactly as
     /// an abandoned sharded one does.
     One {
+        /// The temp-file writer, renamed to the final path on finish.
         writer: AtomicWriter,
+        /// Bytes written so far.
         bytes: u64,
+        /// Size of one record in bytes, used to report the record count.
         record_bytes: u64,
     },
     /// A capped series.

@@ -28,6 +28,7 @@ use super::source_window::resolve_source;
 /// Pipeline command: verify KNN results.
 pub struct AnalyzeVerifyKnnOp;
 
+/// Creates a boxed [`AnalyzeVerifyKnnOp`]; registered as the `analyze verify-knn` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeVerifyKnnOp)
 }

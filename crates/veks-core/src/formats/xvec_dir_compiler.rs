@@ -111,21 +111,30 @@ const PROGRESS_TICK: std::time::Duration = std::time::Duration::from_millis(250)
 /// Per-source metadata gathered during the probe phase.
 #[derive(Debug)]
 pub struct XvecDirProbe {
+    /// Shard files that belong to the source, in natural sort order.
     pub files: Vec<PathBuf>,
+    /// Size in bytes of each file in `files`, same order.
     pub per_file_bytes: Vec<u64>,
+    /// Record count of each file in `files`, same order.
     pub per_file_records: Vec<u64>,
+    /// Vector dimension shared by every shard.
     pub dimension: u32,
+    /// Bytes per element for `format`.
     pub element_size: usize,
+    /// The xvec format of the shards.
     pub format: VecFormat,
 }
 
 impl XvecDirProbe {
+    /// Combined size in bytes of all shard files.
     pub fn total_bytes(&self) -> u64 {
         self.per_file_bytes.iter().sum()
     }
+    /// Combined record count of all shard files.
     pub fn total_records(&self) -> u64 {
         self.per_file_records.iter().sum()
     }
+    /// Number of shard files.
     pub fn file_count(&self) -> usize {
         self.files.len()
     }

@@ -52,6 +52,7 @@ fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
 /// Pipeline command: remove zero/near-zero vectors from fvec file.
 pub struct TransformRemoveZerosKnnUtilsOp;
 
+/// Creates a boxed [`TransformRemoveZerosKnnUtilsOp`]; registered as the `transform remove-zeros-knnutils` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(TransformRemoveZerosKnnUtilsOp)
 }

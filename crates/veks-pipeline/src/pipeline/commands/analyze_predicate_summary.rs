@@ -41,8 +41,10 @@ use crate::pipeline::command::{
 
 use super::compute_prefiltered_knn::PredicateIndices;
 
+/// Pipeline command: aggregate statistics across a predicate slab and its matching-ordinal indices.
 pub struct AnalyzePredicateSummaryOp;
 
+/// Creates a boxed [`AnalyzePredicateSummaryOp`]; registered as the `analyze predicate-summary` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzePredicateSummaryOp)
 }

@@ -34,8 +34,10 @@ fn resolve_path(value: &str, workspace: &Path) -> std::path::PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
 }
 
+/// Pipeline command: display the L2-norm distribution of a vector file as percentiles and an ASCII histogram.
 pub struct AnalyzeNormsOp;
 
+/// Creates a boxed [`AnalyzeNormsOp`]; registered as the `analyze display-norms` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeNormsOp)
 }

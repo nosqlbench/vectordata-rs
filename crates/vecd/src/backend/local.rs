@@ -16,6 +16,8 @@ use crate::model::VecdError;
 /// objects, so finalize is an atomic same-fs rename.
 const STAGING_DIR: &str = ".uploads";
 
+/// A [`Backend`] storing each object as a file under a root directory,
+/// keyed by its relative path; writes land via temp file + rename.
 pub struct LocalBackend {
     root: PathBuf,
 }
@@ -62,6 +64,8 @@ pub fn resolve_dir(raw: &str) -> Result<String, VecdError> {
 }
 
 impl LocalBackend {
+    /// Open a backend rooted at `dir` (the part after `local:`), creating
+    /// the directory if it does not exist.
     pub fn new(dir: &str) -> Result<Self, VecdError> {
         let root = PathBuf::from(dir);
         std::fs::create_dir_all(&root)?;

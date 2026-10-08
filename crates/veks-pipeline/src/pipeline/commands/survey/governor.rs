@@ -36,6 +36,9 @@ pub struct GovernorAdapter<'g> {
 }
 
 impl<'g> GovernorAdapter<'g> {
+    /// Wrap `governor`, with checkpoints rate-limited to one per
+    /// 200 ms. The checkpoint timer starts already elapsed, so the
+    /// first [`maybe_checkpoint`](Self::maybe_checkpoint) call runs.
     pub fn new(governor: &'g ResourceGovernor) -> Self {
         GovernorAdapter {
             governor,
@@ -111,15 +114,30 @@ impl<'g> GovernorAdapter<'g> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownscaleAction {
     /// Shrink every reservoir to the next-smaller tier.
-    ShrinkReservoirs { from: usize, to: usize },
+    ShrinkReservoirs {
+        /// Reservoir capacity (samples per field) before this step.
+        from: usize,
+        /// Reservoir capacity (samples per field) after this step.
+        to: usize,
+    },
     /// Drop the lowest-priority pair analyzers. The orchestrator
     /// supplies the priority ranking; this action just signals
     /// "drop one tier".
     DropLowPriorityPairAnalyzers,
     /// Reduce KLL precision parameter `k`.
-    ReduceKllK { from: usize, to: usize },
+    ReduceKllK {
+        /// KLL `k` before this step.
+        from: usize,
+        /// KLL `k` after this step.
+        to: usize,
+    },
     /// Reduce HLL precision exponent.
-    ReduceHllPrecision { from: u8, to: u8 },
+    ReduceHllPrecision {
+        /// HLL precision exponent `p` (2^p registers) before this step.
+        from: u8,
+        /// HLL precision exponent `p` (2^p registers) after this step.
+        to: u8,
+    },
     /// Drop measures for the lowest-priority fields (those with the
     /// largest distinct-tracker / uniqueness scores).
     DropLowPriorityFields,
@@ -144,6 +162,8 @@ impl Default for Downscaler {
 }
 
 impl Downscaler {
+    /// Start a fresh sequence at full precision: 1024-sample
+    /// reservoirs, KLL `k = 200`, HLL `p = 14`, nothing dropped.
     pub fn new() -> Self {
         Downscaler {
             reservoir_tier: 0,

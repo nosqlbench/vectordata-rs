@@ -18,10 +18,15 @@ pub mod dyncomp;
 /// Supported shells for completion script generation.
 #[derive(Clone, Copy, Debug)]
 pub enum Shell {
+    /// GNU Bash.
     Bash,
+    /// Z shell.
     Zsh,
+    /// fish shell.
     Fish,
+    /// Elvish shell.
     Elvish,
+    /// PowerShell.
     PowerShell,
 }
 

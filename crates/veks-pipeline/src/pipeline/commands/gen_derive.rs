@@ -25,6 +25,7 @@ use crate::pipeline::command::{
 /// Pipeline command: derive a synthetic dataset from an existing one.
 pub struct GenerateDeriveOp;
 
+/// Creates a boxed [`GenerateDeriveOp`]; registered as the `generate derive` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenerateDeriveOp)
 }

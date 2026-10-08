@@ -16,6 +16,12 @@ use crate::pipeline::commands::survey::measure::{
     Measure, MeasureCtx, MeasureKind, MeasureReport,
 };
 
+/// Byte-value entropy measure for `Bytes` fields.
+///
+/// Accumulates a 256-bucket histogram over every byte of every
+/// observed `MValue::Bytes` value (other value kinds are ignored) and
+/// reports the Shannon entropy of that distribution, banded into a
+/// coarse content classification.
 pub struct ByteEntropyMeasure {
     /// Per-byte-value histogram across every observation's bytes.
     histogram: [u64; 256],
@@ -28,6 +34,7 @@ impl Default for ByteEntropyMeasure {
 }
 
 impl ByteEntropyMeasure {
+    /// Creates a measure with an empty histogram and zero counters.
     pub fn new() -> Self {
         ByteEntropyMeasure {
             histogram: [0u64; 256],
@@ -82,9 +89,12 @@ impl Measure for ByteEntropyMeasure {
     }
 }
 
+/// Report shape for `ByteEntropyMeasure::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ByteEntropyReport {
+    /// Number of `Bytes` values observed.
     pub observations: u64,
+    /// Sum of the lengths of all observed values, in bytes.
     pub total_bytes: u64,
     /// Shannon entropy of the byte-value distribution, in bits.
     /// 0 .. 8 (uniform random reaches the upper bound).

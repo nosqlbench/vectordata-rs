@@ -27,6 +27,7 @@ use crate::pipeline::commands::compute_prefiltered_knn::PredicateIndices;
 /// Pipeline command: inspect predicate ↔ metadata cross-reference.
 pub struct InspectPredicateOp;
 
+/// Creates a boxed [`InspectPredicateOp`]; registered as the `analyze explain-predicates` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(InspectPredicateOp)
 }

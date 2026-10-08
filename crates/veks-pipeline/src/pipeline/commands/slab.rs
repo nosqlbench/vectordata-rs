@@ -26,6 +26,7 @@ use crate::pipeline::command::{
 /// Pipeline command: import records into a slab file.
 pub struct SlabImportOp;
 
+/// Creates a boxed `SlabImportOp` for command registration.
 pub fn import_factory() -> Box<dyn CommandOp> {
     Box::new(SlabImportOp)
 }
@@ -217,6 +218,7 @@ fn read_source_records(path: &Path, format: &str) -> Result<Vec<Vec<u8>>, String
 /// Pipeline command: export records from a slab file.
 pub struct SlabExportOp;
 
+/// Creates a boxed `SlabExportOp` for command registration.
 pub fn export_factory() -> Box<dyn CommandOp> {
     Box::new(SlabExportOp)
 }
@@ -367,6 +369,7 @@ for debugging predicate or metadata issues during pipeline development.
 /// Pipeline command: append records from one slab to another.
 pub struct SlabAppendOp;
 
+/// Creates a boxed `SlabAppendOp` for command registration.
 pub fn append_factory() -> Box<dyn CommandOp> {
     Box::new(SlabAppendOp)
 }
@@ -517,6 +520,7 @@ datasets where a full re-import would be prohibitively expensive.
 /// Pipeline command: rewrite a slab file with clean page alignment.
 pub struct SlabRewriteOp;
 
+/// Creates a boxed `SlabRewriteOp` for command registration.
 pub fn rewrite_factory() -> Box<dyn CommandOp> {
     Box::new(SlabRewriteOp)
 }
@@ -674,6 +678,7 @@ production queries where page I/O efficiency matters.
 /// Pipeline command: validate a slab file for structural integrity.
 pub struct SlabCheckOp;
 
+/// Creates a boxed `SlabCheckOp` for command registration.
 pub fn check_factory() -> Box<dyn CommandOp> {
     Box::new(SlabCheckOp)
 }
@@ -818,6 +823,7 @@ attempt to read from a corrupted file.
 /// Pipeline command: extract specific records by ordinal.
 pub struct SlabGetOp;
 
+/// Creates a boxed `SlabGetOp` for command registration.
 pub fn get_factory() -> Box<dyn CommandOp> {
     Box::new(SlabGetOp)
 }
@@ -986,6 +992,7 @@ pub(crate) fn parse_ordinals(spec: &str) -> Result<Vec<i64>, String> {
 /// Pipeline command: analyze a slab file and report statistics.
 pub struct SlabAnalyzeOp;
 
+/// Creates a boxed `SlabAnalyzeOp` for command registration.
 pub fn analyze_factory() -> Box<dyn CommandOp> {
     Box::new(SlabAnalyzeOp)
 }
@@ -1171,6 +1178,7 @@ produced the expected number of records and ordinal range.
 /// Pipeline command: display slab page layout diagrams.
 pub struct SlabExplainOp;
 
+/// Creates a boxed `SlabExplainOp` for command registration.
 pub fn explain_factory() -> Box<dyn CommandOp> {
     Box::new(SlabExplainOp)
 }
@@ -1584,6 +1592,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// Pipeline command: list namespaces in a slab file.
 pub struct SlabNamespacesOp;
 
+/// Creates a boxed `SlabNamespacesOp` for command registration.
 pub fn namespaces_factory() -> Box<dyn CommandOp> {
     Box::new(SlabNamespacesOp)
 }
@@ -1690,6 +1699,7 @@ useful for orienting yourself when working with an unfamiliar slab file.
 /// Pipeline command: decode and render slab records as ANode vernacular text.
 pub struct SlabInspectOp;
 
+/// Creates a boxed `SlabInspectOp` for command registration.
 pub fn inspect_factory() -> Box<dyn CommandOp> {
     Box::new(SlabInspectOp)
 }

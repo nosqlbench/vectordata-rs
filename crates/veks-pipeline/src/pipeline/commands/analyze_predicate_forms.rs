@@ -29,8 +29,10 @@ use crate::pipeline::command::{
 use super::compute_prefiltered_knn::PredicateIndices;
 use super::verify_predicate_strata::{read_mnodes, text};
 
+/// Pipeline command: enumerate the distinct literal-abstracted predicate forms in a predicate facet.
 pub struct AnalyzePredicateFormsOp;
 
+/// Creates a boxed [`AnalyzePredicateFormsOp`]; registered as the `analyze predicate-forms` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzePredicateFormsOp)
 }
@@ -302,7 +304,11 @@ pub(crate) fn parts_of(p: &PNode) -> usize {
 /// distinct forms it holds, and, when it holds one, how many parts
 /// that form has.
 pub struct FormClasses {
+    /// Number of distinct literal-abstracted forms across all predicates.
     pub forms: usize,
+    /// Conjunct count of the single form when `forms` is 1 (a bare
+    /// predicate counts as one part); `None` when the facet holds more
+    /// than one form or is empty.
     pub parts: Option<usize>,
 }
 

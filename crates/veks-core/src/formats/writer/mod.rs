@@ -47,10 +47,16 @@ impl VecSink for IoSinkAdapter {
 
 /// Configuration for opening a sink writer
 pub struct SinkConfig {
+    /// Vector dimension (elements per record) of the output.
     pub dimension: u32,
+    /// Format of the source data. For slab output it sets the element width of
+    /// each record (xvec and scalar sources keep theirs; npy and parquet land as
+    /// `f32`).
     pub source_format: VecFormat,
     /// Preferred slab page size override. `None` uses the slabtastic default.
     pub slab_page_size: Option<u32>,
+    /// Slab namespace index the records are written into. Ignored by non-slab
+    /// sinks.
     pub slab_namespace: u8,
     /// Optional schema descriptor to emit alongside the content
     /// records as a `:schema` namespace sidecar. Honored only by slab

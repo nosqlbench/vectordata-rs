@@ -465,6 +465,7 @@ fn mref_path(file_path: &Path) -> PathBuf {
 /// Pipeline command: create merkle tree reference files.
 pub struct MerkleCreateOp;
 
+/// Creates a boxed `MerkleCreateOp` for command registration.
 pub fn create_factory() -> Box<dyn CommandOp> {
     Box::new(MerkleCreateOp)
 }
@@ -829,6 +830,7 @@ byte ranges rather than requiring a full file re-download.
 /// Pipeline command: verify file integrity against merkle reference.
 pub struct MerkleVerifyOp;
 
+/// Creates a boxed `MerkleVerifyOp` for command registration.
 pub fn verify_factory() -> Box<dyn CommandOp> {
     Box::new(MerkleVerifyOp)
 }
@@ -1029,6 +1031,7 @@ predicate computation.
 /// Pipeline command: compare two merkle references.
 pub struct MerkleDiffOp;
 
+/// Creates a boxed `MerkleDiffOp` for command registration.
 pub fn diff_factory() -> Box<dyn CommandOp> {
     Box::new(MerkleDiffOp)
 }
@@ -1241,6 +1244,7 @@ chunks or spread across the file.
 /// Pipeline command: display merkle tree summary.
 pub struct MerkleSummaryOp;
 
+/// Creates a boxed `MerkleSummaryOp` for command registration.
 pub fn summary_factory() -> Box<dyn CommandOp> {
     Box::new(MerkleSummaryOp)
 }
@@ -1375,6 +1379,7 @@ or integrity reports.
 /// Pipeline command: ASCII tree visualization of a merkle tree.
 pub struct MerkleTreeviewOp;
 
+/// Creates a boxed `MerkleTreeviewOp` for command registration.
 pub fn treeview_factory() -> Box<dyn CommandOp> {
     Box::new(MerkleTreeviewOp)
 }
@@ -1636,6 +1641,7 @@ fn format_hash(hash: &[u8; HASH_SIZE], max_bytes: usize) -> String {
 /// Pipeline command: show authentication path from leaf to root.
 pub struct MerklePathOp;
 
+/// Creates a boxed `MerklePathOp` for command registration.
 pub fn path_factory() -> Box<dyn CommandOp> {
     Box::new(MerklePathOp)
 }
@@ -1951,6 +1957,7 @@ fn error_result(message: String, start: Instant) -> CommandResult {
 /// Pipeline command: corrupt merkle tree leaf bits to simulate data corruption.
 pub struct MerkleSpoilbitsOp;
 
+/// Creates a boxed `MerkleSpoilbitsOp` for command registration.
 pub fn spoilbits_factory() -> Box<dyn CommandOp> {
     Box::new(MerkleSpoilbitsOp)
 }
@@ -2138,6 +2145,7 @@ and integration testing rather than in production dataset preparation.
 /// Pipeline command: corrupt merkle leaf bits AND the corresponding source file chunks.
 pub struct MerkleSpoilchunksOp;
 
+/// Creates a boxed `MerkleSpoilchunksOp` for command registration.
 pub fn spoilchunks_factory() -> Box<dyn CommandOp> {
     Box::new(MerkleSpoilchunksOp)
 }

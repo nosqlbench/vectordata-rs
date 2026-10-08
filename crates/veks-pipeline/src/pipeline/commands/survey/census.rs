@@ -313,7 +313,10 @@ pub struct PairCensusReport {
 /// A field the census could not keep, and why.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DroppedField {
+    /// Name of the dropped field.
     pub field: String,
+    /// Why it was dropped: the overflow reasons of each of its
+    /// accumulators, joined with `; `.
     pub reason: String,
 }
 
@@ -804,7 +807,10 @@ impl FieldCensus {
 /// What the pass produced for one field.
 #[derive(Debug)]
 pub struct FieldCensusResult {
+    /// Field name.
     pub name: String,
+    /// Named by the operator rather than selected by regime; a listed
+    /// field without a value table fails the pass.
     pub listed: bool,
     /// Non-null observations.
     pub present: u64,
@@ -1087,6 +1093,7 @@ impl PairCensus {
 /// One field the pass will census.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CensusFieldPlan {
+    /// Field name.
     pub name: String,
     /// Named by the operator rather than selected by regime; over cap
     /// is an error rather than a drop.
@@ -1098,10 +1105,17 @@ pub struct CensusFieldPlan {
 /// What the pass counts, resolved against the survey's fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CensusPlan {
+    /// Fields to census, each with its own value table.
     pub fields: Vec<CensusFieldPlan>,
+    /// Ordered field lists, outermost first, whose nested value tree
+    /// is counted.
     pub hierarchies: Vec<Vec<String>>,
+    /// Field pairs whose joint table is counted.
     pub pairs: Vec<(String, String)>,
+    /// Distinct values (or histogram width) per field, or per
+    /// hierarchy level, before it is over cap.
     pub cap: usize,
+    /// Cells per pair table before the pair is over cap.
     pub pair_cells_cap: usize,
 }
 
@@ -1110,8 +1124,11 @@ pub struct CensusPlan {
 pub struct CensusOutcome {
     /// Records scanned.
     pub records: u64,
+    /// One result per planned field, in plan order.
     pub fields: Vec<FieldCensusResult>,
+    /// One report per planned hierarchy, in plan order.
     pub hierarchies: Vec<HierarchyCensusReport>,
+    /// One joint table per planned pair, in plan order.
     pub pairs: Vec<PairCensusReport>,
     /// Records that failed to decode and were skipped.
     pub decode_errors: u64,

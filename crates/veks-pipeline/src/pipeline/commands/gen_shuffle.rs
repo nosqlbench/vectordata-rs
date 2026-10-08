@@ -22,6 +22,7 @@ use crate::pipeline::rng;
 /// Pipeline command: generate ivec-shuffle permutation.
 pub struct GenerateIvecShuffleOp;
 
+/// Creates a boxed [`GenerateIvecShuffleOp`]; registered as the `generate shuffle` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenerateIvecShuffleOp)
 }

@@ -36,8 +36,12 @@ use crate::pipeline::command::{
 /// The default folder of the rendered tree, under the dataset root.
 pub const DEFAULT_OUTPUT: &str = "docs/html";
 
+/// Pipeline command `generate docs-html`: renders the dataset's Markdown
+/// documents (root static payload plus everything under `docs/`) to a
+/// self-contained HTML mirror, under [`DEFAULT_OUTPUT`] by default.
 pub struct RenderDocsOp;
 
+/// Creates a boxed `RenderDocsOp` for command registration.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(RenderDocsOp)
 }
@@ -186,7 +190,9 @@ regenerated whenever a document changes.
 /// both relative to the dataset root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
+    /// The Markdown document the page was rendered from, relative to the dataset root.
     pub source: PathBuf,
+    /// The rendered HTML page, relative to the dataset root (see [`page_path`]).
     pub page: PathBuf,
 }
 

@@ -248,6 +248,7 @@ impl fmt::Display for MValue {
 /// field ordering.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MNode {
+    /// Field names mapped to their typed values, in wire order.
     pub fields: IndexMap<String, MValue>,
 }
 

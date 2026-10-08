@@ -38,6 +38,7 @@ impl Default for WireEncodingHistogramMeasure {
 }
 
 impl WireEncodingHistogramMeasure {
+    /// Creates an empty histogram.
     pub fn new() -> Self {
         WireEncodingHistogramMeasure {
             counts: IndexMap::new(),
@@ -72,8 +73,10 @@ impl Measure for WireEncodingHistogramMeasure {
     }
 }
 
+/// Report shape for `WireEncodingHistogramMeasure::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireEncodingHistogramReport {
+    /// Total observations, across all wire encodings.
     pub total: u64,
     /// MValue tag name → fraction of observations. Sorted by
     /// descending fraction.
@@ -100,6 +103,7 @@ impl Default for ByteOrCharLengthRangeMeasure {
 }
 
 impl ByteOrCharLengthRangeMeasure {
+    /// Creates a measure with no observations on either axis.
     pub fn new() -> Self {
         ByteOrCharLengthRangeMeasure {
             bytes: None,
@@ -159,13 +163,24 @@ impl Measure for ByteOrCharLengthRangeMeasure {
     }
 }
 
+/// Report shape for `ByteOrCharLengthRangeMeasure::finalize`.
+///
+/// The byte axis covers `Bytes` values and the UTF-8 byte length of
+/// string-like values; the char axis covers string-like values only.
+/// The min/max fields are `None` when the axis saw no values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ByteOrCharLengthRangeReport {
+    /// Number of values that contributed a byte length.
     pub bytes_count: u64,
+    /// Shortest observed byte length.
     pub bytes_min: Option<u64>,
+    /// Longest observed byte length.
     pub bytes_max: Option<u64>,
+    /// Number of string-like values that contributed a character length.
     pub chars_count: u64,
+    /// Shortest observed length in Unicode scalar values.
     pub chars_min: Option<u64>,
+    /// Longest observed length in Unicode scalar values.
     pub chars_max: Option<u64>,
 }
 
@@ -186,6 +201,7 @@ pub struct ProbeAttemptMeasure {
 }
 
 impl ProbeAttemptMeasure {
+    /// Wraps the per-probe tallies captured during Pass 1.
     pub fn from_tallies(
         tallies: Vec<crate::pipeline::commands::survey::probes::ProbeTally>,
     ) -> Self {
@@ -221,16 +237,23 @@ impl Measure for ProbeAttemptMeasure {
     }
 }
 
+/// Report shape for `ProbeAttemptMeasure::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeAttemptReport {
+    /// One entry per semantic probe, in descending match-rate order.
     pub attempts: Vec<ProbeAttemptEntry>,
 }
 
+/// Pass 1 outcome for a single semantic probe on one field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeAttemptEntry {
+    /// The probe's kind identifier.
     pub kind: String,
+    /// Number of sampled values the probe accepted.
     pub matches: u64,
+    /// Number of sampled values the probe was run against.
     pub samples: u64,
+    /// `matches / samples`, or `0.0` when no samples were seen.
     pub match_rate: f64,
 }
 

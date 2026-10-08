@@ -37,7 +37,11 @@ use crate::model::{Action, ActionSet, Class, Level, Listable};
 /// profile. `scope` is a namespace path (`""` = whole server).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileEntry {
+    /// The aggregate class name (`read`/`publish`/`maintain`/`curate`, or
+    /// an alias such as `reader`) bounding actions under `scope`.
     pub class: String,
+    /// Namespace path the class applies to (and below); `""` is the whole
+    /// server.
     pub scope: String,
 }
 
@@ -52,32 +56,41 @@ pub enum Caller {
     /// A valid token resolved to its issuing user, narrowed by the token's
     /// profile.
     User {
+        /// The issuing user's name.
         name: String,
+        /// The issuing user's management-plane privilege level.
         level: Level,
         /// `None` = the user's full authority; `Some` = the token ceiling.
         profile: Option<Profile>,
         /// The token's mandatory description (shown at every usage point).
         token_desc: String,
+        /// Row id of the presented token.
         token_id: i64,
     },
 }
 
 impl Caller {
+    /// Whether a valid token was presented (the caller is in `KNOWN`).
     pub fn is_authenticated(&self) -> bool {
         matches!(self, Caller::User { .. })
     }
+    /// The authenticated user's name; `None` for an anonymous caller.
     pub fn name(&self) -> Option<&str> {
         match self {
             Caller::User { name, .. } => Some(name),
             Caller::Anonymous => None,
         }
     }
+    /// The presented token's description (for access logging); `None` for
+    /// an anonymous caller.
     pub fn token_desc(&self) -> Option<&str> {
         match self {
             Caller::User { token_desc, .. } => Some(token_desc),
             Caller::Anonymous => None,
         }
     }
+    /// The authenticated user's privilege level; `None` for an anonymous
+    /// caller.
     pub fn level(&self) -> Option<Level> {
         match self {
             Caller::User { level, .. } => Some(*level),
@@ -89,9 +102,11 @@ impl Caller {
 /// One namespace as a caller sees it — for `ping`/`whoami`.
 #[derive(Clone, Debug)]
 pub struct NsAccess {
+    /// Normalized namespace path (`""` is the root).
     pub path: String,
     /// Effective actions after the cone + token narrowing.
     pub actions: ActionSet,
+    /// Who may see that this namespace exists.
     pub listable: Listable,
     /// Whether the caller owns this namespace.
     pub owner: bool,
@@ -100,12 +115,22 @@ pub struct NsAccess {
 /// A namespace as the snapshot sees it.
 #[derive(Clone, Debug)]
 pub struct Ns {
+    /// Normalized namespace path (`""` is the root).
     pub path: String,
+    /// Owning principal: a user name, or a system role such as `@admin`.
     pub owner: String,
+    /// Name of the backend config serving this namespace; `None` for a
+    /// config-only namespace that stores nothing itself.
     pub backend_config: Option<String>,
+    /// Whether active storage is enabled here (writes are rejected when
+    /// not).
     pub active: bool,
+    /// Who may see that this namespace exists.
     pub listable: Listable,
+    /// Storage cap in bytes.
     pub quota_bytes: u64,
+    /// Default lifetime, in seconds, of versions committed here; `None` =
+    /// no expiry set at this level.
     pub ttl_seconds: Option<i64>,
 }
 
@@ -128,11 +153,17 @@ impl Ns {
 /// path.
 #[derive(Clone, Debug)]
 pub struct TokenInfo {
+    /// The token's row id.
     pub token_id: i64,
+    /// Name of the (enabled) user the token authenticates as.
     pub user_name: String,
+    /// That user's privilege level.
     pub level: Level,
+    /// The token's mandatory description.
     pub description: String,
+    /// The token ceiling; `None` = the user's full authority.
     pub profile: Option<Profile>,
+    /// Expiry instant, in Unix epoch seconds.
     pub expires_at: i64,
 }
 
@@ -140,6 +171,8 @@ pub struct TokenInfo {
 /// decisions. Cheap to build, atomically swapped on reload.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
+    /// The `auth_generation` the snapshot was built from; a reload is
+    /// needed when the DB's generation moves past it.
     pub generation: i64,
     /// user name → level
     user_levels: HashMap<String, Level>,
@@ -261,10 +294,12 @@ impl Snapshot {
         self.user_levels.get(name).copied()
     }
 
+    /// The namespace record at exactly `path` (normalized), if one exists.
     pub fn namespace(&self, path: &str) -> Option<&Ns> {
         self.namespaces.get(&normalize(path))
     }
 
+    /// Every namespace record, in no particular order.
     pub fn namespaces(&self) -> impl Iterator<Item = &Ns> {
         self.namespaces.values()
     }

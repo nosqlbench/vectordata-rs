@@ -64,12 +64,17 @@ const BAND: f64 = 3.162_277_660_168_379_5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
+    /// Equality on one value (`field.eq`).
     Eq,
+    /// Lower-bound range, `field >= v` (`field.range`).
     Ge,
+    /// Upper-bound range, `field <= v` (`field.le`).
     Le,
 }
 
 impl Access {
+    /// The access name used in form specs and form ids: `eq`, `range`
+    /// (for [`Access::Ge`]) or `le`.
     pub fn label(self) -> &'static str {
         match self {
             Access::Eq => "eq",
@@ -88,24 +93,31 @@ impl Access {
     }
 }
 
+/// How the parts of a form combine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Junction {
+    /// Conjunction: parts joined by `+` in the form spec.
     And,
+    /// Disjunction: parts joined by `|` in the form spec.
     Or,
 }
 
 /// One part of a form: a field and the access it takes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormPart {
+    /// The metadata field the part filters on.
     pub field: String,
+    /// The access the part takes on that field.
     pub access: Access,
 }
 
 /// A form: parts under one junction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Form {
+    /// The parts, in the order the spec gave them.
     pub parts: Vec<FormPart>,
+    /// How the parts combine; `And` for a single-part form.
     pub junction: Junction,
 }
 
@@ -157,9 +169,14 @@ impl Form {
 /// One literal a part may take, with its exact count over the census.
 #[derive(Debug, Clone)]
 pub struct Leaf {
+    /// The single-comparison predicate this literal produces.
     pub pnode: PNode,
+    /// The census key of the literal: the value itself for equality,
+    /// or `>=v` / `<=v` for a range bound.
     pub key: String,
+    /// Census records matching the literal.
     pub count: u64,
+    /// `count` divided by the census population.
     pub selectivity: f64,
     /// Matches everything: holds the form constant without filtering.
     pub noop: bool,
@@ -296,10 +313,18 @@ fn part_leaves(survey: &SurveyReport, part: &FormPart, n: f64) -> Result<Vec<Lea
 /// One drawn predicate: a leaf per part, in form order.
 #[derive(Debug, Clone)]
 pub struct Draw {
+    /// For each part, the index of the chosen literal in that part's
+    /// leaf list.
     pub leaves: Vec<usize>,
+    /// Planned selectivity: exact from a pair census, otherwise the
+    /// independence estimate from the parts' marginals.
     pub selectivity: f64,
+    /// Matching records: the tabulated count when `exact`; 0 from
+    /// [`draw_independent`] until the caller fills in the estimate.
     pub count: u64,
+    /// Whether `selectivity` and `count` come from a pair census.
     pub exact: bool,
+    /// Parts filled by a no-op literal.
     pub noops: usize,
 }
 
@@ -530,39 +555,63 @@ pub fn level_census(survey_path: &Path, form: &Form, level: f64) -> Result<Optio
 // The command
 // ---------------------------------------------------------------------------
 
+/// What one part of the form had to draw from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartReport {
+    /// The part's field.
     pub field: String,
+    /// The part's access.
     pub access: Access,
+    /// Literals available to the part.
     pub candidates: usize,
+    /// Of those, literals that match every record.
     pub noops: usize,
 }
 
+/// The JSON report the uniform strategy writes beside the predicate
+/// slab.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniformReport {
+    /// Report format version (currently 1).
     pub schema_version: u32,
+    /// Seed that drove the draws.
     pub seed: u64,
+    /// The `form` option as given.
     pub form: String,
+    /// The derived form id (see [`Form::id`]).
     pub form_id: String,
+    /// The literal-abstracted rendering of the generated predicates.
     pub form_shape: String,
+    /// How the parts combine.
     pub junction: Junction,
+    /// One report per part, in form order.
     pub parts: Vec<PartReport>,
     /// The level as planned, spelled as given.
     pub level: String,
+    /// The level as a number.
     pub level_value: f64,
+    /// The admitted selectivity band `[lo, hi)`: the level divided and
+    /// multiplied by the band factor.
     pub band: (f64, f64),
     /// Records written, one per query ordinal.
     pub predicates: usize,
+    /// Distinct predicates among the records.
     pub distinct: usize,
     /// Counts read from a pair census rather than estimated.
     pub exact: bool,
+    /// Records that repeat an earlier predicate because the band held
+    /// fewer distinct predicates than records.
     pub shortfall: usize,
+    /// Draw attempts made under independence; 0 when exact pairs were
+    /// used.
     pub attempts: usize,
     /// Records with at least one no-op part.
     pub with_noop: usize,
+    /// Records the survey's census covers.
     pub census_population: u64,
 }
 
+/// The options the uniform strategy adds to `generate predicates`.
 pub fn describe_options() -> Vec<OptionDesc> {
     vec![
         opt(

@@ -20,6 +20,8 @@ use crate::pipeline::commands::survey::measure::MeasureCtx;
 use crate::pipeline::commands::survey::measures::cardinality::canonical_distinct_key;
 use crate::pipeline::commands::survey::measures::numeric::mvalue_as_f64;
 
+/// Pair analyzer that groups a numeric field by a low-cardinality
+/// categorical field and reports the one-way ANOVA η².
 pub struct LowCardNumericAnalyzer {
     /// `categorical_key → (count, running_mean, m2)` per group.
     groups: IndexMap<String, GroupStats>,
@@ -40,6 +42,8 @@ struct GroupStats {
 }
 
 impl LowCardNumericAnalyzer {
+    /// An analyzer reading the categorical value from `observe_pair`'s
+    /// `a` argument when `category_on_a` is true, otherwise from `b`.
     pub fn new(category_on_a: bool) -> Self {
         LowCardNumericAnalyzer {
             groups: IndexMap::new(),
@@ -117,17 +121,25 @@ impl PairAnalyzer for LowCardNumericAnalyzer {
     }
 }
 
+/// Result of a [`LowCardNumericAnalyzer`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LowCardNumericReport {
+    /// Pairs whose numeric side parsed as a non-NaN number.
     pub n: u64,
+    /// Distinct categorical values (groups) seen.
     pub groups: u32,
     /// η² ∈ [0, 1]. 0 = category explains no variance; 1 = perfect.
     /// `None` when n < 2 or fewer than 2 groups or zero total
     /// variance.
     pub eta_squared: Option<f64>,
+    /// Total sum of squares of the numeric values about the grand mean.
     pub ss_total: f64,
+    /// Between-group sum of squares, `Σ n_g · (mean_g − grand_mean)²`.
     pub ss_between: f64,
+    /// Within-group sum of squares, `ss_total − ss_between` (floored at 0).
     pub ss_within: f64,
+    /// Mean of the numeric field per group, keyed by the canonical
+    /// categorical value; empty when `eta_squared` is `None`.
     pub group_means: IndexMap<String, f64>,
 }
 

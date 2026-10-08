@@ -1,6 +1,8 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
+//! [`VecSink`] that writes vector records into a `.slab` file.
+
 use std::path::{Path, PathBuf};
 
 use slabtastic::{SlabWriter as SlabtasticWriter, WriterConfig};

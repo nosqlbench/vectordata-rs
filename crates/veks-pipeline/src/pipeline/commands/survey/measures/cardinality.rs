@@ -84,6 +84,8 @@ pub struct HeavyHittersMeasure {
 }
 
 impl HeavyHittersMeasure {
+    /// Creates a measure tracking up to `top_k` candidate values in the
+    /// underlying Misra-Gries sketch.
     pub fn new(top_k: usize) -> Self {
         HeavyHittersMeasure {
             inner: MisraGries::new(top_k),
@@ -132,9 +134,15 @@ pub struct HeavyHittersReport {
     pub error_bound: u64,
 }
 
+/// One heavy-hitter entry: a value and its Misra-Gries lower-bound
+/// count.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeavyHitterEntry {
+    /// The value, rendered as its canonical distinct-key string
+    /// (debug form, truncated to at most 256 bytes).
     pub value: String,
+    /// Lower bound on the value's true occurrence count; the true count
+    /// is at most `count_lower_bound + error_bound`.
     pub count_lower_bound: u64,
 }
 
@@ -160,6 +168,9 @@ pub struct ExactFrequencyTable {
 }
 
 impl ExactFrequencyTable {
+    /// Creates a table that tracks at most `cap` distinct values;
+    /// values first seen after the cap is reached are counted in the
+    /// total but not tracked, and the report is marked `overflowed`.
     pub fn new(cap: usize) -> Self {
         ExactFrequencyTable {
             counts: IndexMap::with_capacity(cap.min(1024)),
@@ -232,9 +243,13 @@ impl Measure for ExactFrequencyTable {
     }
 }
 
+/// Report shape for `ExactFrequencyTable::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExactFrequencyTableReport {
+    /// Number of distinct values tracked (at most the configured cap).
     pub distinct_count: u32,
+    /// Total observations, including any that arrived after overflow
+    /// and were therefore not tracked in `counts`.
     pub total_observed: u64,
     /// True if the measure ran past its configured capacity. Should
     /// be `false` for fields where Pass 1's `LowCard` verdict was

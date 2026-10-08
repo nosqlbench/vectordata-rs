@@ -35,8 +35,11 @@ pub const SECTIONS: [&str; 6] = [
     "Predicates and example queries",
 ];
 
+/// Arguments for `veks prepare readme`.
 pub struct ReadmeArgs {
+    /// Dataset directory or path to `dataset.yaml`.
     pub path: PathBuf,
+    /// Replace an existing `README.md` (a backup is taken).
     pub force: bool,
 }
 
@@ -45,6 +48,9 @@ fn exit_with(msg: String) -> ! {
     std::process::exit(1);
 }
 
+/// Run `veks prepare readme`: write the `README.md` scaffold beside
+/// `dataset.yaml`. Exits the process with an error message on failure,
+/// including when a README already exists and `force` is not set.
 pub fn run(args: ReadmeArgs) {
     let dir = if args.path.is_file() { args.path.parent().map(|p| p.to_path_buf()).unwrap_or_default() } else { args.path.clone() };
     let dataset_path = dir.join("dataset.yaml");

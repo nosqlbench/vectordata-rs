@@ -60,6 +60,8 @@ pub struct TrigramHeavyHittersMeasure {
 }
 
 impl TrigramHeavyHittersMeasure {
+    /// Creates a measure tracking up to `top_k` candidate trigrams
+    /// (clamped to at least 1).
     pub fn new(top_k: usize) -> Self {
         let top_k = top_k.max(1);
         TrigramHeavyHittersMeasure {
@@ -151,7 +153,10 @@ pub struct TrigramHeavyHittersReport {
 /// Misra-Gries lower-bound count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrigramEntry {
+    /// The three-character window (three `char`s, up to 12 bytes).
     pub trigram: String,
+    /// Lower bound on the trigram's true occurrence count; the true
+    /// count is at most `count_lower_bound + error_bound`.
     pub count_lower_bound: u64,
 }
 

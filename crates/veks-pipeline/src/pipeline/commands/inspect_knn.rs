@@ -23,8 +23,10 @@ use crate::pipeline::command::{
     Status, StreamContext, render_options_table,
 };
 
+/// Pipeline command: trace the unfiltered KNN ground truth for a single query ordinal.
 pub struct ExplainKnnOp;
 
+/// Creates a boxed [`ExplainKnnOp`]; registered as the `analyze explain-knn` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(ExplainKnnOp)
 }

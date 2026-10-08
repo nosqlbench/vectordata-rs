@@ -46,7 +46,10 @@ use super::gen_predicates_proto::{PredicateProto, SelectivitySpec};
 /// produces exactly one proto file at that path.
 #[derive(Debug, Clone)]
 pub struct WizardInputs {
+    /// A pre-computed survey JSON file; when set it is loaded instead
+    /// of surveying `source_path`.
     pub survey_path: Option<PathBuf>,
+    /// A metadata slab to survey inline when `survey_path` is `None`.
     pub source_path: Option<PathBuf>,
     /// Number of inline samples when scanning a slab. Ignored
     /// when `survey_path` is set.

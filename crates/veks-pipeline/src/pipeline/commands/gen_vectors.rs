@@ -30,6 +30,7 @@ fn parse_suffixed_u64(s: &str) -> Result<u64, String> {
 /// Pipeline command: generate random vectors.
 pub struct GenerateVectorsOp;
 
+/// Creates a boxed [`GenerateVectorsOp`]; registered as the `generate vectors` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenerateVectorsOp)
 }

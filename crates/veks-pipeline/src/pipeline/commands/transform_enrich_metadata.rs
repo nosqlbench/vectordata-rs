@@ -372,6 +372,7 @@ impl CitationRanks {
         }
     }
 
+    /// Number of distinct publication years with a citation distribution.
     pub fn years(&self) -> usize {
         self.by_year.len()
     }
@@ -752,19 +753,33 @@ fn paper_citations(
 // Report
 // ---------------------------------------------------------------------------
 
+/// The JSON report `transform enrich-metadata` writes beside its output
+/// (the `report` option, or the output path with a `.json` extension).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnrichReport {
+    /// Version of this report's layout.
     pub schema_version: u32,
+    /// Passage rows written to the enriched table.
     pub rows: u64,
+    /// Papers in the parent table, over which citation percentiles are ranked.
     pub papers: usize,
+    /// Distinct publication years with a citation distribution.
     pub years: usize,
+    /// Depth of the topic assignment: the number of `topic_l*` columns written.
     pub levels: usize,
+    /// Path of the topic label slab used, or `positional` when none was given.
     pub labels: String,
+    /// Whether topic labels are positional placeholders rather than read from a label slab.
     pub positional_labels: bool,
+    /// Distinct section headings seen across all passages.
     pub distinct_headings: usize,
+    /// Fraction of rows (0.0 to 1.0) whose section heading classified as `other`.
     pub headings_other_share: f64,
+    /// Modulus of the `sample_bucket` column.
     pub buckets: u32,
+    /// Hash seed used for the `sample_bucket` column.
     pub seed: u64,
+    /// Wall-clock duration of the step, in seconds.
     pub seconds: f64,
 }
 

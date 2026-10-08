@@ -139,6 +139,8 @@ pub(crate) fn is_labelset_shape(s: &str) -> bool {
 // Direct-tag probes (zero-cost)
 // ---------------------------------------------------------------------------
 
+/// Classifies natively UUID-tagged values (`UuidV1`, `UuidV7`, and
+/// `Ulid`) as `Identifier(Uuid)` with no parsing.
 pub struct DirectUuidProbe;
 impl SemanticProbe for DirectUuidProbe {
     fn kind(&self) -> &'static str { "DirectUuidProbe" }
@@ -152,6 +154,7 @@ impl SemanticProbe for DirectUuidProbe {
     }
 }
 
+/// Classifies natively boolean-tagged values as `Boolean`.
 pub struct DirectBoolProbe;
 impl SemanticProbe for DirectBoolProbe {
     fn kind(&self) -> &'static str { "DirectBoolProbe" }
@@ -163,6 +166,12 @@ impl SemanticProbe for DirectBoolProbe {
     }
 }
 
+/// Classifies byte blobs by their leading magic bytes.
+///
+/// A blob starting with a known signature (PNG, gzip, Parquet, JPEG,
+/// ZIP, Zstd) is `Binary(Magic)`; a blob shorter than four bytes is
+/// `Binary(Opaque)`; any other blob is not matched. Non-byte values
+/// are never matched.
 pub struct MagicByteProbe;
 impl SemanticProbe for MagicByteProbe {
     fn kind(&self) -> &'static str { "MagicByteProbe" }
@@ -207,6 +216,8 @@ const EPOCH_SEC_MAX: i64 = 4_102_444_800;
 const EPOCH_MS_MIN: i64 = EPOCH_SEC_MIN * 1_000;
 const EPOCH_MS_MAX: i64 = EPOCH_SEC_MAX * 1_000;
 
+/// Classifies integers as `Temporal(Timestamp { granularity: Seconds })`
+/// when they fall in the epoch-seconds range for years 2000–2099.
 pub struct EpochSecondsPlausibility;
 impl SemanticProbe for EpochSecondsPlausibility {
     fn kind(&self) -> &'static str { "EpochSecondsPlausibility" }
@@ -226,6 +237,9 @@ impl SemanticProbe for EpochSecondsPlausibility {
     }
 }
 
+/// Classifies integers and `Millis` values as
+/// `Temporal(Timestamp { granularity: Millis })` when they fall in the
+/// epoch-milliseconds range for years 2000–2099.
 pub struct EpochMillisPlausibility;
 impl SemanticProbe for EpochMillisPlausibility {
     fn kind(&self) -> &'static str { "EpochMillisPlausibility" }
@@ -257,6 +271,9 @@ fn as_text(v: &MValue) -> Option<&str> {
     }
 }
 
+/// Classifies text that parses as an `i64` as `Number(Integer)`,
+/// recording whether the value is negative and the narrowest width
+/// that holds it.
 pub struct IntegerLiteralProbe;
 impl SemanticProbe for IntegerLiteralProbe {
     fn kind(&self) -> &'static str { "IntegerLiteralProbe" }
@@ -282,6 +299,9 @@ fn narrowest_int_width(v: i64) -> NumericWidth {
     else { NumericWidth::I64 }
 }
 
+/// Classifies plain decimal text (contains `.`, no exponent) as
+/// `Number(Decimal)`, with precision = total digits and scale =
+/// digits after the point.
 pub struct DecimalLiteralProbe;
 impl SemanticProbe for DecimalLiteralProbe {
     fn kind(&self) -> &'static str { "DecimalLiteralProbe" }
@@ -302,6 +322,8 @@ impl SemanticProbe for DecimalLiteralProbe {
     }
 }
 
+/// Classifies scientific-notation text (contains `e`/`E` and parses
+/// as `f64`) as `Number(Floating)`.
 pub struct FloatLiteralProbe;
 impl SemanticProbe for FloatLiteralProbe {
     fn kind(&self) -> &'static str { "FloatLiteralProbe" }
@@ -313,6 +335,8 @@ impl SemanticProbe for FloatLiteralProbe {
     }
 }
 
+/// Classifies boolean-like text (`true`/`false`, `t`/`f`, `yes`/`no`,
+/// `y`/`n`, `1`/`0`, case-insensitive) as `Boolean`.
 pub struct BooleanLiteralProbe;
 impl SemanticProbe for BooleanLiteralProbe {
     fn kind(&self) -> &'static str { "BooleanLiteralProbe" }
@@ -333,6 +357,8 @@ impl SemanticProbe for BooleanLiteralProbe {
 // Textual structured-format probes
 // ---------------------------------------------------------------------------
 
+/// Classifies canonical 36-character hyphenated hex UUID text as
+/// `Identifier(Uuid)`.
 pub struct UuidStringProbe;
 impl SemanticProbe for UuidStringProbe {
     fn kind(&self) -> &'static str { "UuidStringProbe" }
@@ -352,6 +378,7 @@ impl SemanticProbe for UuidStringProbe {
     }
 }
 
+/// Classifies exact `YYYY-MM-DD` text as `Temporal(Date)`.
 pub struct Iso8601DateProbe;
 impl SemanticProbe for Iso8601DateProbe {
     fn kind(&self) -> &'static str { "Iso8601DateProbe" }
@@ -371,6 +398,9 @@ impl SemanticProbe for Iso8601DateProbe {
     }
 }
 
+/// Classifies text starting with `YYYY-MM-DDTHH:MM:SS` (or a space
+/// in place of `T`) as `Temporal(DateTime)`, noting whether a
+/// timezone suffix appears to be present.
 pub struct Iso8601DateTimeProbe;
 impl SemanticProbe for Iso8601DateTimeProbe {
     fn kind(&self) -> &'static str { "Iso8601DateTimeProbe" }
@@ -390,6 +420,8 @@ impl SemanticProbe for Iso8601DateTimeProbe {
     }
 }
 
+/// Classifies `local@domain.tld` text with conventional character
+/// classes and a total length of 3–254 as `Structured(Email)`.
 pub struct EmailProbe;
 impl SemanticProbe for EmailProbe {
     fn kind(&self) -> &'static str { "EmailProbe" }
@@ -412,6 +444,8 @@ impl SemanticProbe for EmailProbe {
     }
 }
 
+/// Classifies text with an `http://`, `https://`, `s3://`, or
+/// `file://` scheme and a non-empty remainder as `Structured(Url)`.
 pub struct UrlProbe;
 impl SemanticProbe for UrlProbe {
     fn kind(&self) -> &'static str { "UrlProbe" }
@@ -428,6 +462,8 @@ impl SemanticProbe for UrlProbe {
     }
 }
 
+/// Classifies dotted-quad text with four octets in `0..=255` as
+/// `Structured(Ipv4)`.
 pub struct Ipv4Probe;
 impl SemanticProbe for Ipv4Probe {
     fn kind(&self) -> &'static str { "Ipv4Probe" }
@@ -443,6 +479,8 @@ impl SemanticProbe for Ipv4Probe {
     }
 }
 
+/// Classifies text accepted by the standard library's IPv6 address
+/// parser as `Structured(Ipv6)`.
 pub struct Ipv6Probe;
 impl SemanticProbe for Ipv6Probe {
     fn kind(&self) -> &'static str { "Ipv6Probe" }
@@ -455,6 +493,8 @@ impl SemanticProbe for Ipv6Probe {
     }
 }
 
+/// Classifies text with 7–15 digits, phone punctuation (`+`, `(`, or
+/// `-`), and no letters as `Structured(PhoneNumber)`.
 pub struct PhoneNumberProbe;
 impl SemanticProbe for PhoneNumberProbe {
     fn kind(&self) -> &'static str { "PhoneNumberProbe" }
@@ -473,6 +513,8 @@ impl SemanticProbe for PhoneNumberProbe {
     }
 }
 
+/// Classifies `lat,lng` text with latitude in `[-90, 90]` and
+/// longitude in `[-180, 180]` as `Structured(Geocode)`.
 pub struct GeocodeProbe;
 impl SemanticProbe for GeocodeProbe {
     fn kind(&self) -> &'static str { "GeocodeProbe" }
@@ -487,6 +529,8 @@ impl SemanticProbe for GeocodeProbe {
     }
 }
 
+/// Classifies amounts prefixed with `$`, `€`, `£`, or `¥` (thousands
+/// separators allowed) as `Structured(Currency)`.
 pub struct CurrencyProbe;
 impl SemanticProbe for CurrencyProbe {
     fn kind(&self) -> &'static str { "CurrencyProbe" }
@@ -510,6 +554,8 @@ impl SemanticProbe for CurrencyProbe {
     }
 }
 
+/// Classifies hex strings of at least eight digits, with an optional
+/// `0x` prefix, as `Identifier(HashLike)`.
 pub struct HexFixedWidthProbe;
 impl SemanticProbe for HexFixedWidthProbe {
     fn kind(&self) -> &'static str { "HexFixedWidthProbe" }
@@ -523,6 +569,8 @@ impl SemanticProbe for HexFixedWidthProbe {
     }
 }
 
+/// Classifies text that begins with `{` or `[` and parses as JSON as
+/// `Structured(Json)`.
 pub struct JsonProbe;
 impl SemanticProbe for JsonProbe {
     fn kind(&self) -> &'static str { "JsonProbe" }
@@ -534,6 +582,11 @@ impl SemanticProbe for JsonProbe {
     }
 }
 
+/// Classifies prefixed identifiers such as `USR_00123` or
+/// `ORD-A12345` as `Identifier(Composite)`, capturing the prefix.
+///
+/// The prefix must be at least two ASCII letters, followed by `_` or
+/// `-` and an alphanumeric body that is at least half digits.
 pub struct CompositeIdentifierProbe;
 impl SemanticProbe for CompositeIdentifierProbe {
     fn kind(&self) -> &'static str { "CompositeIdentifierProbe" }
@@ -565,12 +618,17 @@ impl SemanticProbe for CompositeIdentifierProbe {
 /// measure emitted for Unstable fields.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProbeTally {
+    /// The probe's [`SemanticProbe::kind`] identifier.
     pub kind: String,
+    /// Number of sampled values the probe accepted.
     pub matches: u64,
+    /// Number of sampled values the probe was run against.
     pub samples: u64,
 }
 
 impl ProbeTally {
+    /// Fraction of samples the probe accepted, in `[0, 1]`; `0.0`
+    /// when no samples were seen.
     pub fn match_rate(&self) -> f64 {
         if self.samples == 0 { 0.0 } else { self.matches as f64 / self.samples as f64 }
     }

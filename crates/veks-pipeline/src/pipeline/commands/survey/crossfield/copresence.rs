@@ -16,6 +16,9 @@ use veks_core::formats::mnode::MValue;
 use super::{PairAnalyzer, PairAnalyzerKind, PairReport};
 use crate::pipeline::commands::survey::measure::MeasureCtx;
 
+/// Pair analyzer that counts, per dispatched record, which of the
+/// two fields are present, and reports Jaccard overlap and both
+/// conditional presence probabilities.
 pub struct CopresenceAnalyzer {
     both: u64,
     a_only: u64,
@@ -28,6 +31,7 @@ impl Default for CopresenceAnalyzer {
 }
 
 impl CopresenceAnalyzer {
+    /// An analyzer with all four presence cells at zero.
     pub fn new() -> Self {
         CopresenceAnalyzer {
             both: 0,
@@ -78,6 +82,8 @@ impl PairAnalyzer for CopresenceAnalyzer {
     }
 }
 
+/// Result of a [`CopresenceAnalyzer`]; ratios are `0.0` when their
+/// denominator is zero.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CopresenceReport {
     /// Total records observed (sum of the four cells).

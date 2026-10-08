@@ -23,6 +23,7 @@ use crate::pipeline::variables;
 /// Pipeline command: set a variable from an expression.
 pub struct SetVariableOp;
 
+/// Creates a boxed `SetVariableOp` for command registration.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(SetVariableOp)
 }
@@ -212,6 +213,7 @@ Then reference in a downstream step:
 /// Pipeline command: clear all variables in `variables.yaml`.
 pub struct ClearVariablesOp;
 
+/// Creates a boxed `ClearVariablesOp` for command registration.
 pub fn clear_factory() -> Box<dyn CommandOp> {
     Box::new(ClearVariablesOp)
 }

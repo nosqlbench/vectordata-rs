@@ -22,6 +22,9 @@ use super::{PairAnalyzer, PairAnalyzerKind, PairReport};
 use crate::pipeline::commands::survey::measure::MeasureCtx;
 use crate::pipeline::commands::survey::measures::cardinality::canonical_distinct_key;
 
+/// Pair analyzer that probes how nearly field A determines field B
+/// (`A → B`), by counting records consistent with each A value's
+/// most common B.
 pub struct FunctionalDependencyAnalyzer {
     /// `A_value → set of observed B_values (bounded)`. Once a set
     /// exceeds `distinct_cap`, it's promoted to None (= overflow).
@@ -36,9 +39,13 @@ pub struct FunctionalDependencyAnalyzer {
 }
 
 impl FunctionalDependencyAnalyzer {
+    /// An analyzer tracking up to 256 distinct B values per A value.
     pub fn new() -> Self {
         Self::with_cap(256)
     }
+    /// An analyzer tracking up to `distinct_cap` distinct B values
+    /// per A value; an A value that exceeds it is treated as
+    /// non-deterministic, though it still contributes to `support`.
     pub fn with_cap(distinct_cap: usize) -> Self {
         FunctionalDependencyAnalyzer {
             map: IndexMap::new(),
@@ -108,8 +115,10 @@ impl PairAnalyzer for FunctionalDependencyAnalyzer {
     }
 }
 
+/// Result of a [`FunctionalDependencyAnalyzer`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionalDependencyReport {
+    /// Records in which both fields were present.
     pub n: u64,
     /// Distinct A values observed.
     pub distinct_a: u32,

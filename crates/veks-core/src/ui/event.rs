@@ -87,9 +87,13 @@ pub enum UiEvent {
 
     /// Create a new progress indicator.
     ProgressCreate {
+        /// Identifier for the new indicator, used by later events.
         id: ProgressId,
+        /// Rendering style of the indicator.
         kind: ProgressKind,
+        /// Position at which the indicator is complete.
         total: u64,
+        /// Text shown before the indicator.
         label: String,
         /// The unit label for rate display (e.g., "rec", "files", "chunks").
         unit: String,
@@ -97,24 +101,31 @@ pub enum UiEvent {
 
     /// Update the absolute position of a progress indicator.
     ProgressUpdate {
+        /// Indicator to update.
         id: ProgressId,
+        /// New absolute position.
         position: u64,
     },
 
     /// Increment the position of a progress indicator by a delta.
     ProgressInc {
+        /// Indicator to advance.
         id: ProgressId,
+        /// Amount added to the current position.
         delta: u64,
     },
 
     /// Change the trailing message on a progress indicator.
     ProgressMessage {
+        /// Indicator whose message changes.
         id: ProgressId,
+        /// New trailing message text.
         message: String,
     },
 
     /// Mark a progress indicator as finished and remove it.
     ProgressFinish {
+        /// Indicator to finish.
         id: ProgressId,
     },
 
@@ -125,6 +136,7 @@ pub enum UiEvent {
     /// (e.g. resumed-from-cache shards that complete in microseconds)
     /// from the displayed throughput.
     ProgressAnchorRate {
+        /// Indicator whose rate is re-anchored.
         id: ProgressId,
     },
 
@@ -135,16 +147,19 @@ pub enum UiEvent {
     /// Backends that support a fixed progress area insert this text above
     /// that area.  Non-TTY backends simply write a line.
     Log {
+        /// The log line text, without a trailing newline.
         message: String,
     },
 
     /// Raw text output (no trailing newline).
     Emit {
+        /// Text written as-is.
         text: String,
     },
 
     /// Raw text output with a trailing newline.
     EmitLn {
+        /// Text written before the newline.
         text: String,
     },
 
@@ -155,7 +170,9 @@ pub enum UiEvent {
     /// `line` is the formatted text for display; `metrics` carries the
     /// structured numeric values for chart rendering.
     ResourceStatus {
+        /// Formatted status line for display.
         line: String,
+        /// Structured values behind `line`, for charting.
         metrics: ResourceMetrics,
     },
 
@@ -169,6 +186,7 @@ pub enum UiEvent {
 
     /// Set the context label (dataset name, profile, current step).
     SetContext {
+        /// New context label.
         label: String,
     },
 
@@ -177,6 +195,7 @@ pub enum UiEvent {
     /// Displayed as a scrollable panel alongside the throughput chart.
     /// Send an empty string to clear it.
     SetStepYaml {
+        /// YAML text of the step, or empty to clear the panel.
         yaml: String,
     },
 

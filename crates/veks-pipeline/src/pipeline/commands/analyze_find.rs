@@ -23,6 +23,7 @@ use crate::pipeline::element_type::ElementType;
 /// Pipeline command: find a specific vector in a target file.
 pub struct AnalyzeFindOp;
 
+/// Creates a boxed [`AnalyzeFindOp`]; registered as the `analyze find` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeFindOp)
 }

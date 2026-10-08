@@ -146,11 +146,28 @@ pub enum ListKind {
 /// element types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorElement {
-    F32, F64, F16,
-    U8, I8,
-    U16, I16,
-    U32, I32,
-    U64, I64,
+    /// 32-bit float (fvec).
+    F32,
+    /// 64-bit float (dvec).
+    F64,
+    /// 16-bit half-precision float (mvec).
+    F16,
+    /// Unsigned 8-bit integer (bvec).
+    U8,
+    /// Signed 8-bit integer.
+    I8,
+    /// Unsigned 16-bit integer.
+    U16,
+    /// Signed 16-bit integer (svec).
+    I16,
+    /// Unsigned 32-bit integer.
+    U32,
+    /// Signed 32-bit integer (ivec).
+    I32,
+    /// Unsigned 64-bit integer.
+    U64,
+    /// Signed 64-bit integer.
+    I64,
 }
 
 impl VectorElement {
@@ -1746,8 +1763,12 @@ impl VecSink for BufSink<'_> {
 /// the total row count. Used by the convert command to decide whether the
 /// fast path applies without opening the full reader.
 pub struct ParquetVectorProbe {
+    /// Extractor compiled against the first file's schema: element type, list
+    /// kind, and (for `FixedSizeList`) dimension.
     pub extractor: CompiledVectorExtractor,
+    /// Number of `.parquet` files in the source.
     pub file_count: usize,
+    /// Total row count across all files, from parquet footer metadata.
     pub row_count: u64,
     /// Row count per file, in the same sort order as `collect_parquet_files`.
     /// Used by the parallel pwrite path to compute per-file byte offsets so
@@ -1756,6 +1777,12 @@ pub struct ParquetVectorProbe {
     pub per_file_rows: Vec<u64>,
 }
 
+/// Probe a parquet file or directory of parquet files for its vector column.
+///
+/// `column_hint` names the column to use; `None` lets the extractor pick the
+/// vector column from the schema. Reads only the first file's schema and each
+/// file's footer metadata, never row data. Errors if no parquet files are
+/// found, a file cannot be opened, or no usable vector column exists.
 pub fn probe_parquet_vectors(
     source: &Path,
     column_hint: Option<&str>,

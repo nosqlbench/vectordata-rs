@@ -39,7 +39,9 @@ use super::{Comparand, ConjugateNode, ConjugateType, FieldRef, OpType, PNode, Pr
 /// original input where the parser bailed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
+    /// Human-readable description of what the parser expected or found.
     pub msg: String,
+    /// Byte offset into the input at which parsing failed.
     pub pos: usize,
 }
 

@@ -41,6 +41,7 @@ use crate::pipeline::command::{
 /// Pipeline command: download S2AG Datasets API bulk files.
 pub struct FetchS2agOp;
 
+/// Creates a boxed [`FetchS2agOp`]; registered as the `download s2ag` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(FetchS2agOp)
 }

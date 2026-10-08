@@ -100,8 +100,11 @@ pub(super) fn internal_k(k: usize, margin: usize) -> usize {
 /// invalidates existing caches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
+    /// Squared Euclidean distance, smaller is nearer; cache tag `l2`.
     L2,
+    /// Inner product, larger is nearer; cache tag `dot_product`.
     DotProduct,
+    /// Cosine similarity, larger is nearer; cache tag `cosine`.
     Cosine,
 }
 

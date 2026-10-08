@@ -31,10 +31,15 @@ fn now() -> i64 {
 /// A version awaiting an admin decision (in the cleanup queue).
 #[derive(Clone, Debug)]
 pub struct StasisItem {
+    /// Namespace the version belongs to.
     pub namespace_path: String,
+    /// The version's per-namespace sequence number.
     pub seq: i64,
+    /// The version's tag (default `v<seq>`).
     pub tag: String,
+    /// When it entered stasis, in Unix epoch seconds.
     pub stasis_at: Option<i64>,
+    /// SHA-256 hex over the version's sorted manifest.
     pub manifest_hash: String,
 }
 

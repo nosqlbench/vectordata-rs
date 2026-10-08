@@ -105,6 +105,11 @@ pub struct StagedParquetWriter {
 }
 
 impl StagedParquetWriter {
+    /// Open a staged writer for `path` with the given Arrow schema.
+    ///
+    /// Creates the parent directory if needed and writes to
+    /// `<path>.parquet.partial` (SNAPPY-compressed) until [`finish`](Self::finish)
+    /// renames it into place.
     pub fn create(path: &Path, schema: SchemaRef) -> Result<Self, String> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -128,6 +133,7 @@ impl StagedParquetWriter {
         })
     }
 
+    /// Append one record batch to the staged file, counting its rows.
     pub fn write_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
         self.rows_written += batch.num_rows() as u64;
         self.writer
@@ -135,6 +141,10 @@ impl StagedParquetWriter {
             .map_err(|e| format!("parquet write failed: {}", e))
     }
 
+    /// Close the parquet writer and rename the partial file to its final path.
+    ///
+    /// Returns the total number of rows written. Until this succeeds, nothing
+    /// exists at the final path.
     pub fn finish(self) -> Result<u64, String> {
         self.writer
             .close()

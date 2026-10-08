@@ -44,6 +44,8 @@
 //! - `parquet` — Apache Parquet directory reading (adds arrow/parquet dependencies)
 //! - `slab` — Slab format read/write (adds slabtastic dependency)
 
+#![warn(missing_docs)]
+
 pub mod format;
 pub mod scalar;
 pub mod traits;

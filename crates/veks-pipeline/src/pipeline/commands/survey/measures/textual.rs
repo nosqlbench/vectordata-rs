@@ -33,6 +33,7 @@ impl Default for ExactLengthMoments {
 }
 
 impl ExactLengthMoments {
+    /// Creates a measure with empty byte- and char-length accumulators.
     pub fn new() -> Self {
         ExactLengthMoments {
             bytes: LenAccumulator::new(),
@@ -61,18 +62,29 @@ impl Measure for ExactLengthMoments {
     }
 }
 
+/// Report shape for `ExactLengthMoments::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExactLengthMomentsReport {
+    /// Length statistics in UTF-8 bytes.
     pub bytes: LenSummary,
+    /// Length statistics in Unicode scalar values (`char`s).
     pub chars: LenSummary,
 }
 
+/// Summary statistics over a set of string lengths, in the unit of
+/// the axis that holds it (bytes or chars).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LenSummary {
+    /// Number of strings measured.
     pub count: u64,
+    /// Shortest length; `0` when `count` is zero.
     pub min: u64,
+    /// Longest length; `0` when `count` is zero.
     pub max: u64,
+    /// Mean length, or `None` when `count` is zero.
     pub mean: Option<f64>,
+    /// Sample standard deviation (Bessel-corrected), or `None` when
+    /// fewer than two strings were measured.
     pub stddev: Option<f64>,
 }
 
@@ -133,6 +145,8 @@ pub struct LengthQuantiles {
 }
 
 impl LengthQuantiles {
+    /// Creates a length sketch with KLL accuracy parameter `kll_k` and a
+    /// fixed `seed` for reproducible compaction.
     pub fn new(kll_k: usize, seed: u64) -> Self {
         LengthQuantiles {
             sketch: KllSketch::with_seed(kll_k, seed),
@@ -168,10 +182,15 @@ impl Measure for LengthQuantiles {
     }
 }
 
+/// Report shape for `LengthQuantiles::finalize`. Lengths are in
+/// UTF-8 bytes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LengthQuantilesReport {
+    /// Number of strings fed to the sketch.
     pub count: u64,
+    /// Shortest observed length, or `None` if nothing was observed.
     pub min: Option<f64>,
+    /// Longest observed length, or `None` if nothing was observed.
     pub max: Option<f64>,
     /// Quantile/value pairs, sorted by quantile ascending.
     pub quantiles: Vec<(String, f64)>,
@@ -201,6 +220,7 @@ impl Default for CharClassMix {
 }
 
 impl CharClassMix {
+    /// Creates a measure with zero observations.
     pub fn new() -> Self {
         CharClassMix {
             n: 0,
@@ -260,13 +280,25 @@ impl Measure for CharClassMix {
     }
 }
 
+/// Report shape for `CharClassMix::finalize`.
+///
+/// Each class value is the mean, over non-empty strings, of that
+/// class's share of the string's characters; the five values sum to
+/// roughly 1.0 (all are `0.0` when nothing was observed).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CharClassMixReport {
+    /// Number of non-empty strings observed.
     pub count: u64,
+    /// Mean fraction of alphabetic characters (any script).
     pub alpha: f64,
+    /// Mean fraction of ASCII digits.
     pub digit: f64,
+    /// Mean fraction of ASCII punctuation.
     pub punct: f64,
+    /// Mean fraction of whitespace characters.
     pub whitespace: f64,
+    /// Mean fraction of characters in none of the other classes
+    /// (e.g. non-ASCII symbols and digits).
     pub other: f64,
 }
 
@@ -289,6 +321,8 @@ pub struct PatternSkeletonMeasure {
 }
 
 impl PatternSkeletonMeasure {
+    /// Creates a measure tracking up to `top_k` candidate skeletons in
+    /// the underlying Misra-Gries sketch.
     pub fn new(top_k: usize) -> Self {
         PatternSkeletonMeasure {
             inner: crate::pipeline::commands::survey::sketches::MisraGries::new(top_k),
@@ -368,9 +402,12 @@ impl Measure for PatternSkeletonMeasure {
     }
 }
 
+/// Report shape for `PatternSkeletonMeasure::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PatternSkeletonReport {
+    /// Number of strings whose skeleton was fed to the sketch.
     pub observed: u64,
+    /// Configured sketch capacity.
     pub top_k: u32,
     /// `(skeleton, fraction)` pairs in descending fraction order.
     pub patterns: Vec<(String, f64)>,

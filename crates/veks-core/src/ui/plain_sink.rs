@@ -36,6 +36,7 @@ pub struct PlainSink {
 }
 
 impl PlainSink {
+    /// Create a plain sink with no active progress bars.
     pub fn new() -> Self {
         PlainSink {
             next_id: AtomicU32::new(0),

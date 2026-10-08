@@ -13,8 +13,16 @@ use memmap2::Mmap;
 /// Error type for mmap operations.
 #[derive(Debug)]
 pub enum MmapError {
+    /// Opening or mapping the file failed.
     Io(std::io::Error),
-    InvalidSize { file_size: u64, element_size: usize },
+    /// The file size is not a whole multiple of the element size.
+    InvalidSize {
+        /// File size in bytes.
+        file_size: u64,
+        /// Bytes per element of the requested type.
+        element_size: usize,
+    },
+    /// The file is zero bytes long.
     EmptyFile,
 }
 

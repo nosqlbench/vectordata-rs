@@ -238,8 +238,11 @@ pub struct StepRecord {
 /// text, so the record compares with the file as the reader reads it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttributeRecord {
+    /// Profile the tag was written on.
     pub profile: String,
+    /// Attribute key.
     pub key: String,
+    /// The value as rendered YAML text.
     pub value: String,
 }
 
@@ -1064,10 +1067,12 @@ impl Default for FnvHasher {
 }
 
 impl FnvHasher {
+    /// Create a hasher at the FNV-1a 64-bit offset basis.
     pub fn new() -> Self {
         FnvHasher { state: 0xcbf29ce484222325 } // FNV offset basis
     }
 
+    /// Fold `bytes` into the hash (FNV-1a: xor, then multiply by the prime).
     pub fn write(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             self.state ^= byte as u64;
@@ -1075,6 +1080,7 @@ impl FnvHasher {
         }
     }
 
+    /// The 64-bit hash of everything written so far.
     pub fn finish(&self) -> u64 {
         self.state
     }

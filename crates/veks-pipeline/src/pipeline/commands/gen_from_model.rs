@@ -39,6 +39,7 @@ use crate::pipeline::rng;
 /// Pipeline command: generate vectors from a statistical model.
 pub struct GenerateFromModelOp;
 
+/// Creates a boxed [`GenerateFromModelOp`]; registered as the `generate from-model` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenerateFromModelOp)
 }

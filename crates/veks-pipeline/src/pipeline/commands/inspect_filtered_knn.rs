@@ -37,6 +37,7 @@ use crate::pipeline::commands::compute_prefiltered_knn::PredicateIndices;
 /// Pipeline command: explain filtered KNN for a single query.
 pub struct ExplainFilteredKnnOp;
 
+/// Creates a boxed [`ExplainFilteredKnnOp`]; registered as the `analyze explain-filtered-knn` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(ExplainFilteredKnnOp)
 }

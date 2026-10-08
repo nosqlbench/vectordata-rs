@@ -34,6 +34,7 @@ fn resolve_path(s: &str, workspace: &Path) -> std::path::PathBuf {
 /// Pipeline command: SQLite oracle verification for predicates.
 pub struct VerifyPredicatesSqliteOp;
 
+/// Creates a boxed `VerifyPredicatesSqliteOp` for command registration.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(VerifyPredicatesSqliteOp)
 }

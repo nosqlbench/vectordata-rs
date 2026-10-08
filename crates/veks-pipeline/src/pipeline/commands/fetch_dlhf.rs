@@ -20,6 +20,7 @@ use crate::pipeline::command::{
 /// Pipeline command: download from HuggingFace Hub.
 pub struct FetchDlhfOp;
 
+/// Creates a boxed [`FetchDlhfOp`]; registered as the `download huggingface` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(FetchDlhfOp)
 }

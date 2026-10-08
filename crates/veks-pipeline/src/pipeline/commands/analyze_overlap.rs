@@ -21,8 +21,10 @@ use crate::pipeline::command::{
 };
 use crate::pipeline::element_type::ElementType;
 
+/// Pipeline command: count query vectors that also appear verbatim in the base set.
 pub struct AnalyzeOverlapOp;
 
+/// Creates a boxed [`AnalyzeOverlapOp`]; registered as the `analyze overlap` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeOverlapOp)
 }

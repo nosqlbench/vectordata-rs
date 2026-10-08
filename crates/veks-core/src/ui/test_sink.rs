@@ -16,6 +16,7 @@ pub struct TestSink {
 }
 
 impl TestSink {
+    /// Create a sink with an empty event record.
     pub fn new() -> Self {
         TestSink {
             next_id: AtomicU32::new(0),

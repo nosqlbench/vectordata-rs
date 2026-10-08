@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use crate::model::{Level, Listable, VecdError};
 use crate::{admin, backup, config, db::Db, server};
 
+/// The parsed `vecd` command line: global config/data-dir flags plus one
+/// subcommand.
 #[derive(veks_completion_derive::VeksCli)]
 #[command(
     name = "vecd",
@@ -41,20 +43,24 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config_is_home: bool,
 
+    /// The subcommand to run.
     #[command(subcommand)]
     pub command: Cmd,
 }
 
+/// The top-level `vecd` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum Cmd {
     /// Run the gateway in the foreground — the workhorse that `daemon
     /// start` execs and that a systemd unit runs.
     Serve {
+        /// Bind, TLS, backup, and rate-limit settings.
         #[command(flatten)]
         serve: ServeArgs,
     },
     /// Run and manage vecd as a background service (ad-hoc or systemd).
     Daemon {
+        /// The daemon lifecycle action.
         #[command(subcommand)]
         command: DaemonCmd,
     },
@@ -73,31 +79,37 @@ pub enum Cmd {
     },
     /// Inspect and edit operator configuration (`vecd.conf`) and TLS.
     Config {
+        /// The config action.
         #[command(subcommand)]
         command: ConfigCmd,
     },
     /// Identity and access control: users, roles, tokens, bindings, privileges.
     Access {
+        /// The access-control action.
         #[command(subcommand)]
         command: AccessCmd,
     },
     /// Storage admin: backend configs, namespaces, objects, versions, cleanup.
     Store {
+        /// The storage-admin action.
         #[command(subcommand)]
         command: StoreCmd,
     },
     /// Act as a client to a remote vecd endpoint (login/logout/whoami).
     Endpoint {
+        /// The client action.
         #[command(subcommand)]
         command: EndpointCmd,
     },
     /// Control-plane DB maintenance (backup/restore).
     Db {
+        /// The DB maintenance action.
         #[command(subcommand)]
         command: DbCmd,
     },
     /// Read the access log (newest last), with optional filters.
     Log {
+        /// Show at most this many of the newest matching rows.
         #[arg(long, default_value = "50")]
         tail: usize,
         /// Only rows for this principal.
@@ -113,6 +125,8 @@ pub enum Cmd {
     /// Emit a sourceable shell snippet that activates dynamic completions:
     ///   eval "$(vecd completions)"
     Completions {
+        /// Emit the completion script for this shell directly; omit to
+        /// auto-detect the shell and emit the `source <(…)` wrapper.
         #[arg(long, value_parser = ["bash", "zsh", "fish", "elvish", "powershell"])]
         shell: Option<String>,
     },
@@ -125,6 +139,7 @@ pub enum Cmd {
 pub enum DaemonCmd {
     /// Start the gateway as a background daemon (self-daemonizing).
     Start {
+        /// Bind, TLS, backup, and rate-limit settings.
         #[command(flatten)]
         serve: ServeArgs,
     },
@@ -132,6 +147,7 @@ pub enum DaemonCmd {
     Stop,
     /// Restart the background daemon.
     Restart {
+        /// Bind, TLS, backup, and rate-limit settings.
         #[command(flatten)]
         serve: ServeArgs,
     },
@@ -171,16 +187,19 @@ pub enum DaemonCmd {
 pub enum AccessCmd {
     /// Manage users.
     Users {
+        /// The user action.
         #[command(subcommand)]
         command: UsersCmd,
     },
     /// Manage roles.
     Roles {
+        /// The role action.
         #[command(subcommand)]
         command: RolesCmd,
     },
     /// Manage API tokens.
     Tokens {
+        /// The token action.
         #[command(subcommand)]
         command: TokensCmd,
     },
@@ -244,11 +263,13 @@ pub enum AccessCmd {
     },
     /// Manage system privileges (e.g. IGNORE-QUOTAS).
     Priv {
+        /// The system-privilege action.
         #[command(subcommand)]
         command: PrivCmd,
     },
     /// Manage named, parameterized privilege profiles.
     Profiles {
+        /// The profile action.
         #[command(subcommand)]
         command: ProfilesCmd,
     },
@@ -260,11 +281,13 @@ pub enum AccessCmd {
 pub enum StoreCmd {
     /// Manage named storage backend configs.
     Backends {
+        /// The backend action.
         #[command(subcommand)]
         command: BackendsCmd,
     },
     /// Manage namespaces.
     Ns {
+        /// The namespace action.
         #[command(subcommand)]
         command: NsCmd,
     },
@@ -282,6 +305,7 @@ pub enum StoreCmd {
     },
     /// Inspect and act on the lifecycle cleanup queue (stasis versions).
     Cleanup {
+        /// The cleanup-queue action.
         #[command(subcommand)]
         command: CleanupCmd,
     },
@@ -330,6 +354,7 @@ pub enum EndpointCmd {
 pub enum DbCmd {
     /// Control-plane DB backup.
     Backup {
+        /// The backup action.
         #[command(subcommand)]
         command: BackupCmd,
     },
@@ -384,6 +409,7 @@ pub struct ServeArgs {
     pub ratelimit_client_upload: Option<String>,
 }
 
+/// `vecd config tls` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum TlsCmd {
     /// Generate a self-signed cert + key and configure vecd to serve HTTPS.
@@ -408,10 +434,12 @@ pub enum TlsCmd {
     },
 }
 
+/// `vecd config` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum ConfigCmd {
     /// Generate or export the server's TLS certificate.
     Tls {
+        /// The TLS action.
         #[command(subcommand)]
         command: TlsCmd,
     },
@@ -465,6 +493,7 @@ pub enum ConfigCmd {
     },
 }
 
+/// `vecd access users` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum UsersCmd {
     /// Create a user (a principal you can bind roles to and mint tokens for).
@@ -515,6 +544,7 @@ pub enum UsersCmd {
     },
 }
 
+/// `vecd access tokens` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum TokensCmd {
     /// Mint an API token for a user (used by clients to authenticate).
@@ -562,6 +592,7 @@ pub enum TokensCmd {
     },
 }
 
+/// `vecd access roles` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum RolesCmd {
     /// List roles and the actions each grants.
@@ -582,6 +613,7 @@ pub enum RolesCmd {
     },
 }
 
+/// `vecd store backends` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum BackendsCmd {
     /// Register a storage backend — the physical store a namespace writes into.
@@ -644,6 +676,7 @@ pub enum BackendsCmd {
     },
 }
 
+/// `vecd store ns` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum NsCmd {
     /// Create a namespace — a path prefix served by one storage backend.
@@ -715,54 +748,82 @@ pub enum NsCmd {
     },
 }
 
+/// `vecd access priv` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum PrivCmd {
+    /// Grant a system privilege to a principal.
     Grant {
+        /// Privilege name, e.g. `IGNORE-QUOTAS`.
         privilege: String,
+        /// Principal to grant it to.
         #[arg(long)]
         to: String,
     },
+    /// Revoke a system privilege from a principal.
     Revoke {
+        /// Privilege name, e.g. `IGNORE-QUOTAS`.
         privilege: String,
+        /// Principal to revoke it from.
         #[arg(long)]
         to: String,
     },
 }
 
+/// `vecd access profiles` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum ProfilesCmd {
+    /// Define a named profile (expand it with `tokens create --from`).
     Add {
+        /// Profile name.
         name: String,
+        /// Principal recorded as the profile's owner.
         #[arg(long)]
         owner: String,
+        /// `(class, scope)` template, e.g. "publish datasets/{dataset}";
+        /// each `{placeholder}` is filled by `tokens create --set`.
         #[arg(long)]
         spec: String,
     },
+    /// List profiles with owner and spec.
     List,
-    Remove { name: String },
+    /// Remove a profile.
+    Remove {
+        /// Profile name to remove.
+        name: String,
+    },
 }
 
+/// `vecd store cleanup` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum CleanupCmd {
     /// List versions in stasis (expired, awaiting extend or purge).
     List,
     /// Restore a stasis version (`<ns>@<selector>`), optionally re-lifecycled.
     Extend {
+        /// Version to restore, as `<ns>@<selector>`.
         target: String,
+        /// New lifetime counted from now, e.g. `30d`; omit for no expiry.
         #[arg(long)]
         duration: Option<String>,
     },
     /// Physically delete a stasis version (`<ns>@<selector>`) — removes bytes.
-    Purge { target: String },
+    Purge {
+        /// Version to purge, as `<ns>@<selector>`.
+        target: String,
+    },
 }
 
+/// `vecd db backup` subcommands.
 #[derive(veks_completion_derive::VeksCli)]
 pub enum BackupCmd {
+    /// Take a control-plane DB snapshot now.
     Now {
         /// Destination (file path or `s3://…`); defaults to config `db_backup`.
         dest: Option<String>,
     },
+    /// List the snapshots at a backup destination.
     List {
+        /// Destination (file path or `s3://…`); defaults to config `db_backup`.
         dest: Option<String>,
     },
 }

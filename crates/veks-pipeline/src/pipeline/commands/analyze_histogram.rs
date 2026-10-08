@@ -24,6 +24,7 @@ use super::analyze_stats::DimensionStats;
 /// Pipeline command: histogram visualization.
 pub struct AnalyzeHistogramOp;
 
+/// Creates a boxed [`AnalyzeHistogramOp`]; registered as the `analyze display-histogram` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeHistogramOp)
 }

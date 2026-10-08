@@ -34,6 +34,7 @@ use crate::pipeline::rng;
 /// Pipeline command: generate sketch vectors.
 pub struct GenerateSketchOp;
 
+/// Creates a boxed [`GenerateSketchOp`]; registered as the `generate sketch` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenerateSketchOp)
 }

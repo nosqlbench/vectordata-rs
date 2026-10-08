@@ -20,8 +20,10 @@ use crate::pipeline::command::{
     ResourceDesc, Status, StreamContext, render_options_table,
 };
 
+/// Pipeline command: generate `dataset.md` (and optionally `exemplars.md`) documenting a dataset's structure and data flow.
 pub struct DescribeDatasetOp;
 
+/// Creates a boxed [`DescribeDatasetOp`]; registered as the `analyze describe-dataset` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(DescribeDatasetOp)
 }

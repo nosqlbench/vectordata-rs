@@ -382,6 +382,7 @@ fn check_ivecs(
 /// Pipeline command: unified knn\_utils-style dataset verification.
 pub struct VerifyDatasetKnnUtilsOp;
 
+/// Creates a boxed [`VerifyDatasetKnnUtilsOp`]; registered as the `verify dataset-knnutils` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(VerifyDatasetKnnUtilsOp)
 }

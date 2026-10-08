@@ -35,6 +35,8 @@ pub fn open_shared(endpoint: &str) -> Arc<dyn Backend> {
     Arc::new(MemBackend { endpoint: endpoint.to_string(), store })
 }
 
+/// A [`Backend`] handle onto one `mem:<id>` endpoint's shared in-process
+/// store (obtained via [`open_shared`]).
 pub struct MemBackend {
     endpoint: String,
     store: Store,

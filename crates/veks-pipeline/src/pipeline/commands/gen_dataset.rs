@@ -34,6 +34,7 @@ use crate::pipeline::simd_distance;
 /// Pipeline command: generate complete dataset.
 pub struct GenerateDatasetOp;
 
+/// Creates a boxed [`GenerateDatasetOp`]; registered as the `generate dataset` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenerateDatasetOp)
 }

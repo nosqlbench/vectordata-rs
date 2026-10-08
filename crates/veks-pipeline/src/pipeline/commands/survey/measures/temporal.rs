@@ -32,6 +32,13 @@ const EPOCH_MS_MAX: i64 = EPOCH_SEC_MAX * 1_000;
 // TemporalRangeMeasure
 // ---------------------------------------------------------------------------
 
+/// Min/max range of a temporal field, normalized to seconds since
+/// the Unix epoch.
+///
+/// Accepts `Millis` and `Nanos` values directly, and `Int` values
+/// only when they fall in the plausible 2000–2100 window as either
+/// epoch seconds or epoch milliseconds; everything else is ignored.
+/// Also infers the field's storage granularity.
 pub struct TemporalRangeMeasure {
     count: u64,
     min_secs: f64,
@@ -52,6 +59,7 @@ impl Default for TemporalRangeMeasure {
 }
 
 impl TemporalRangeMeasure {
+    /// Creates a measure with no observations and unknown granularity.
     pub fn new() -> Self {
         TemporalRangeMeasure {
             count: 0,
@@ -126,10 +134,16 @@ impl Measure for TemporalRangeMeasure {
     }
 }
 
+/// Report shape for `TemporalRangeMeasure::finalize`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TemporalRangeReport {
+    /// Number of values that contributed to the range.
     pub count: u64,
+    /// Earliest observed instant in seconds since 1970, or `None` if no
+    /// value contributed.
     pub min_epoch_seconds: Option<f64>,
+    /// Latest observed instant in seconds since 1970, or `None` if no
+    /// value contributed.
     pub max_epoch_seconds: Option<f64>,
     /// Inferred granularity: `seconds` / `millis` / `nanos` /
     /// `unknown`.
@@ -140,6 +154,10 @@ pub struct TemporalRangeReport {
 // EpochPlausibilityMeasure
 // ---------------------------------------------------------------------------
 
+/// Classifies integer observations (`Int`, `Int32`, `Millis`) by
+/// whether they fall in the 2000–2100 window as epoch seconds, as
+/// epoch milliseconds, or neither, to flag integer fields that are
+/// really timestamps.
 pub struct EpochPlausibilityMeasure {
     n: u64,
     looks_like_seconds: u64,
@@ -152,6 +170,7 @@ impl Default for EpochPlausibilityMeasure {
 }
 
 impl EpochPlausibilityMeasure {
+    /// Creates a measure with zero observations.
     pub fn new() -> Self {
         EpochPlausibilityMeasure {
             n: 0,
@@ -195,8 +214,11 @@ impl Measure for EpochPlausibilityMeasure {
     }
 }
 
+/// Report shape for `EpochPlausibilityMeasure::finalize`. Rates are
+/// `0.0` when nothing was observed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EpochPlausibilityReport {
+    /// Number of integer observations classified.
     pub count: u64,
     /// Fraction of integer observations in the seconds-since-1970
     /// plausible range (2000–2100).

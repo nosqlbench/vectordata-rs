@@ -414,16 +414,23 @@ impl Options {
     }
 }
 
-/// Execution context shared across all pipeline steps.
 /// A tag a command asks the runner to write on a profile once the
 /// step succeeds (PS-12, PS-13).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttributeWrite {
+    /// Name of the profile to tag.
     pub profile: String,
+    /// Attribute key to set.
     pub key: String,
+    /// Value to write under `key`.
     pub value: serde_yaml::Value,
 }
 
+/// Execution context shared across all pipeline steps.
+///
+/// The runner hands it to every step's `execute`: the dataset,
+/// workspace and profile being run, run-wide settings, and the shared
+/// progress log, resource governor and UI handle.
 pub struct StreamContext {
     /// Tags to write on profiles when this step succeeds (PS-13); the
     /// runner clears it before each step and applies it after.
@@ -493,19 +500,35 @@ pub enum OptionRole {
 /// single verb (cross-cutting utilities) use [`PipelineCategory::Pipeline`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PipelineCategory {
+    /// `analyze ...` commands: statistics and inspection of vector files.
     Analyze,
+    /// `catalog ...` commands: catalog index generation.
     Catalog,
+    /// `cleanup ...` commands: cleaning vector files (bad records, overlap).
     Cleanup,
+    /// `compute ...` commands: KNN ground truth and other heavy computation.
     Compute,
+    /// `config ...` commands: edits to the dataset definition, such as
+    /// `config tag-profiles`.
     Config,
+    /// Commands that fetch source data from remote hosts.
     Download,
+    /// `generate ...` commands: synthesizing vectors, metadata and predicates.
     Generate,
+    /// `merkle ...` commands: merkle tree creation and verification.
     Merkle,
+    /// Pipeline control steps that fit no single verb (`pipeline require`,
+    /// barriers).
     Pipeline,
+    /// `query ...` commands: record lookups against dataset files.
     Query,
+    /// `slab ...` commands: slab file operations.
     Slab,
+    /// `state ...` commands: setting and clearing pipeline variables.
     State,
+    /// `transform ...` commands: conversion, extraction and reordering.
     Transform,
+    /// `verify ...` commands: correctness checks on computed facets.
     Verify,
 }
 
@@ -533,19 +556,33 @@ impl veks_completion::CategoryTag for PipelineCategory {
 // Static instances per variant. `CommandOp::category()` returns
 // `&'static dyn CategoryTag`, so impls reference these by name
 // instead of constructing a static binding inline.
+/// [`PipelineCategory::Analyze`], for `CommandOp::category()` to return by reference.
 pub static CAT_ANALYZE:   PipelineCategory = PipelineCategory::Analyze;
+/// [`PipelineCategory::Catalog`], for `CommandOp::category()` to return by reference.
 pub static CAT_CATALOG:   PipelineCategory = PipelineCategory::Catalog;
+/// [`PipelineCategory::Cleanup`], for `CommandOp::category()` to return by reference.
 pub static CAT_CLEANUP:   PipelineCategory = PipelineCategory::Cleanup;
+/// [`PipelineCategory::Compute`], for `CommandOp::category()` to return by reference.
 pub static CAT_COMPUTE:   PipelineCategory = PipelineCategory::Compute;
+/// [`PipelineCategory::Config`], for `CommandOp::category()` to return by reference.
 pub static CAT_CONFIG:    PipelineCategory = PipelineCategory::Config;
+/// [`PipelineCategory::Download`], for `CommandOp::category()` to return by reference.
 pub static CAT_DOWNLOAD:  PipelineCategory = PipelineCategory::Download;
+/// [`PipelineCategory::Generate`], for `CommandOp::category()` to return by reference.
 pub static CAT_GENERATE:  PipelineCategory = PipelineCategory::Generate;
+/// [`PipelineCategory::Merkle`], for `CommandOp::category()` to return by reference.
 pub static CAT_MERKLE:    PipelineCategory = PipelineCategory::Merkle;
+/// [`PipelineCategory::Pipeline`], for `CommandOp::category()` to return by reference.
 pub static CAT_PIPELINE:  PipelineCategory = PipelineCategory::Pipeline;
+/// [`PipelineCategory::Query`], for `CommandOp::category()` to return by reference.
 pub static CAT_QUERY:     PipelineCategory = PipelineCategory::Query;
+/// [`PipelineCategory::Slab`], for `CommandOp::category()` to return by reference.
 pub static CAT_SLAB:      PipelineCategory = PipelineCategory::Slab;
+/// [`PipelineCategory::State`], for `CommandOp::category()` to return by reference.
 pub static CAT_STATE:     PipelineCategory = PipelineCategory::State;
+/// [`PipelineCategory::Transform`], for `CommandOp::category()` to return by reference.
 pub static CAT_TRANSFORM: PipelineCategory = PipelineCategory::Transform;
+/// [`PipelineCategory::Verify`], for `CommandOp::category()` to return by reference.
 pub static CAT_VERIFY:    PipelineCategory = PipelineCategory::Verify;
 
 /// `veks-pipeline`'s discovery-tier enum. Mirrors the
@@ -564,8 +601,11 @@ pub static CAT_VERIFY:    PipelineCategory = PipelineCategory::Verify;
 ///     specialized/internal/diagnostic. Third tap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PipelineLevel {
+    /// Common everyday commands (rank 1); revealed by the first tab tap.
     Primary,
+    /// Less common workflow-completing commands (rank 2).
     Secondary,
+    /// Specialized, internal or diagnostic commands (rank 3).
     Advanced,
 }
 
@@ -586,11 +626,18 @@ impl veks_completion::LevelTag for PipelineLevel {
     }
 }
 
+/// [`PipelineLevel::Primary`], for `CommandOp::level()` to return by reference.
 pub static LVL_PRIMARY:   PipelineLevel = PipelineLevel::Primary;
+/// [`PipelineLevel::Secondary`], for `CommandOp::level()` to return by reference.
 pub static LVL_SECONDARY: PipelineLevel = PipelineLevel::Secondary;
+/// [`PipelineLevel::Advanced`], for `CommandOp::level()` to return by reference.
 pub static LVL_ADVANCED:  PipelineLevel = PipelineLevel::Advanced;
 
 #[derive(Debug, Clone)]
+/// One option a [`CommandOp`] accepts, as returned by
+/// [`CommandOp::describe_options`]. The same description defines the
+/// option's YAML key in a step, its CLI flag, its help text, and how the
+/// TUI and manifests treat it.
 pub struct OptionDesc {
     /// Option name (key in the YAML step definition).
     pub name: String,

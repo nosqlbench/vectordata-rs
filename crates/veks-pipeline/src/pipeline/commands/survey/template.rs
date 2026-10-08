@@ -99,6 +99,8 @@ impl Default for TemplateConfig {
 }
 
 impl ExplorationProbe {
+    /// Create an empty per-field probe governed by `cfg`, with a
+    /// reservoir sized and seeded from it.
     pub fn new(cfg: TemplateConfig) -> Self {
         let reservoir_size = cfg.reservoir_size;
         let reservoir_seed = cfg.reservoir_seed;

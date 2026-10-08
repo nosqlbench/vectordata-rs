@@ -45,6 +45,7 @@ use crate::pipeline::command::{
 /// Pipeline command: bulk download files (template URLs or COS prefix).
 pub struct FetchBulkdlOp;
 
+/// Creates a boxed [`FetchBulkdlOp`]; registered as the `download bulk` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(FetchBulkdlOp)
 }

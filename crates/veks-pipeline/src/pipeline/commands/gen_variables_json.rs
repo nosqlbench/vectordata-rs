@@ -14,8 +14,10 @@ use crate::pipeline::command::{
     Status, StreamContext, render_options_table,
 };
 
+/// Pipeline command: write `variables.json` as a JSON copy of the pipeline variables in `variables.yaml`.
 pub struct GenVariablesJsonOp;
 
+/// Creates a boxed [`GenVariablesJsonOp`]; registered as the `generate variables-json` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenVariablesJsonOp)
 }

@@ -50,13 +50,19 @@ impl std::fmt::Debug for OptionSpec {
 }
 
 impl OptionSpec {
+    /// Wrap a shared option shape as an optional option with no default and
+    /// no value completer.
     pub fn new(def: OptionDef) -> Self {
         OptionSpec { def, required: false, default: None, value_completion: None }
     }
+    /// Set whether [`parse`] fails with [`ParseError::MissingRequiredOption`]
+    /// when this option is absent and has no default.
     pub fn required(mut self, yes: bool) -> Self {
         self.required = yes;
         self
     }
+    /// Set the value [`parse`] fills in when the option is absent. A default
+    /// also satisfies [`required`](Self::required).
     pub fn default(mut self, v: impl Into<String>) -> Self {
         self.default = Some(v.into());
         self
@@ -77,24 +83,32 @@ impl OptionSpec {
 pub struct PositionalSpec {
     /// Display name, e.g. `"DATASET"`.
     pub name: String,
+    /// Whether the command fails with
+    /// [`ParseError::MissingRequiredPositional`] when this argument is absent.
     pub required: bool,
     /// Greedy trailing positional (collects the rest).
     pub multiple: bool,
+    /// One-line description shown in `--help`; `None` shows the name alone.
     pub help: Option<String>,
 }
 
 impl PositionalSpec {
+    /// An optional, single-valued positional with the given display name and
+    /// no help text.
     pub fn new(name: impl Into<String>) -> Self {
         PositionalSpec { name: name.into(), required: false, multiple: false, help: None }
     }
+    /// Set whether this positional must be supplied.
     pub fn required(mut self, yes: bool) -> Self {
         self.required = yes;
         self
     }
+    /// Set whether this positional greedily collects all remaining words.
     pub fn multiple(mut self, yes: bool) -> Self {
         self.multiple = yes;
         self
     }
+    /// Set the `--help` description for this positional.
     pub fn help(mut self, h: impl Into<String>) -> Self {
         self.help = Some(h.into());
         self
@@ -105,11 +119,17 @@ impl PositionalSpec {
 /// the parser, the help renderer, and the completion-tree builder.
 #[derive(Clone, Debug, Default)]
 pub struct CommandSpec {
+    /// The word that selects this command (for the root, the program name).
     pub name: String,
+    /// One-line summary shown in `--help` and subcommand listings.
     pub about: Option<String>,
+    /// Alternate names that also select this command.
     pub aliases: Vec<String>,
+    /// Options accepted at this command level, in declaration order.
     pub options: Vec<OptionSpec>,
+    /// Positional arguments, in the order they are consumed.
     pub positionals: Vec<PositionalSpec>,
+    /// Nested subcommands; a bare word before any positional selects one.
     pub subcommands: Vec<CommandSpec>,
     /// When true, a subcommand must be given (a group command).
     pub subcommand_required: bool,
@@ -123,9 +143,12 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
+    /// An empty command with the given name: no options, positionals, or
+    /// subcommands, and `Stable` maturity.
     pub fn new(name: impl Into<String>) -> Self {
         CommandSpec { name: name.into(), ..Default::default() }
     }
+    /// Set the one-line summary.
     pub fn about(mut self, a: impl Into<String>) -> Self {
         self.about = Some(a.into());
         self
@@ -135,6 +158,7 @@ impl CommandSpec {
         self.aliases.push(a.into());
         self
     }
+    /// Set the free-form text appended after the options block in `--help`.
     pub fn after_help(mut self, a: impl Into<String>) -> Self {
         self.after_help = Some(a.into());
         self
@@ -144,14 +168,17 @@ impl CommandSpec {
         self.stability = s;
         self
     }
+    /// Append an option.
     pub fn option(mut self, o: OptionSpec) -> Self {
         self.options.push(o);
         self
     }
+    /// Append a positional; positionals are consumed in the order added.
     pub fn positional(mut self, p: PositionalSpec) -> Self {
         self.positionals.push(p);
         self
     }
+    /// Append a subcommand.
     pub fn subcommand(mut self, c: CommandSpec) -> Self {
         self.subcommands.push(c);
         self
@@ -187,6 +214,8 @@ pub struct ParsedArgs {
 }
 
 impl ParsedArgs {
+    /// Whether the boolean flag `name` was given. `name` is the canonical long
+    /// token, with or without leading dashes.
     pub fn has_flag(&self, name: &str) -> bool {
         self.flags.contains(name.trim_start_matches('-'))
     }
@@ -199,9 +228,12 @@ impl ParsedArgs {
         const EMPTY: &[String] = &[];
         self.values.get(name.trim_start_matches('-')).map(|v| v.as_slice()).unwrap_or(EMPTY)
     }
+    /// Positional arguments at this command level, in order.
     pub fn positionals(&self) -> &[String] {
         &self.positionals
     }
+    /// The selected subcommand's canonical name and its parsed args, or
+    /// `None` when no subcommand was given.
     pub fn subcommand(&self) -> Option<(&str, &ParsedArgs)> {
         self.subcommand.as_ref().map(|(n, p)| (n.as_str(), p.as_ref()))
     }
@@ -210,19 +242,75 @@ impl ParsedArgs {
 /// A parse failure, with enough context to render a useful message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParseError {
-    UnknownFlag { command: String, flag: String },
-    MissingValue { command: String, flag: String },
-    MissingRequiredOption { command: String, flag: String },
-    MissingRequiredPositional { command: String, name: String },
-    UnexpectedPositional { command: String, value: String },
-    UnknownSubcommand { command: String, name: String },
-    MissingSubcommand { command: String },
+    /// An `--long` or `-s` token that the command does not define.
+    UnknownFlag {
+        /// Name of the command level being parsed.
+        command: String,
+        /// The offending token as typed.
+        flag: String,
+    },
+    /// A value option appeared as the last word with no value after it.
+    MissingValue {
+        /// Name of the command level being parsed.
+        command: String,
+        /// The option token as typed.
+        flag: String,
+    },
+    /// A required option with no default was not supplied.
+    MissingRequiredOption {
+        /// Name of the command level being parsed.
+        command: String,
+        /// The option's canonical long token, e.g. `"--dataset"`.
+        flag: String,
+    },
+    /// Fewer positionals were given than the command requires.
+    MissingRequiredPositional {
+        /// Name of the command level being parsed.
+        command: String,
+        /// Display name of the first missing positional.
+        name: String,
+    },
+    /// A bare word that the command has no positional slot for.
+    UnexpectedPositional {
+        /// Name of the command level being parsed.
+        command: String,
+        /// The surplus word.
+        value: String,
+    },
+    /// A bare word in subcommand position that matches no subcommand name or
+    /// alias.
+    UnknownSubcommand {
+        /// Name of the parent command.
+        command: String,
+        /// The unmatched word.
+        name: String,
+    },
+    /// A group command (see [`CommandSpec::subcommand_required`]) was given
+    /// no subcommand.
+    MissingSubcommand {
+        /// Name of the group command.
+        command: String,
+    },
     /// A value failed to convert to the field's type (e.g. `--count abc` for a
     /// `usize`). Produced during typed extraction by the derive macro.
-    InvalidValue { flag: String, value: String, message: String },
+    InvalidValue {
+        /// The option (or positional) whose value failed to convert.
+        flag: String,
+        /// The raw string that failed to convert.
+        value: String,
+        /// The conversion error's message.
+        message: String,
+    },
     /// Two mutually exclusive options were both supplied (see
     /// [`OptionDef::conflicts_with`]).
-    ConflictingOptions { command: String, flag: String, other: String },
+    ConflictingOptions {
+        /// Name of the command level being parsed.
+        command: String,
+        /// Canonical long token of the option declaring the conflict.
+        flag: String,
+        /// The conflicting option, as listed in `conflicts_with`.
+        other: String,
+    },
 }
 
 /// Implemented by `#[derive(VeksCli)]` types: a command/args struct or a

@@ -22,8 +22,10 @@ use crate::pipeline::command::{
 };
 use crate::pipeline::element_type::ElementType;
 
+/// Pipeline command: rewrite the query file without any vectors that also appear in the base set.
 pub struct CleanupOverlapOp;
 
+/// Creates a boxed [`CleanupOverlapOp`]; registered as the `cleanup overlap` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(CleanupOverlapOp)
 }

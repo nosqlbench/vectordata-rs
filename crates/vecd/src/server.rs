@@ -57,9 +57,14 @@ const UPLOAD_FLUSH_BYTES: usize = 1 << 20;
 /// Lightweight Prometheus-style counters.
 #[derive(Default)]
 pub struct Metrics {
+    /// Data-plane requests received.
     pub requests: AtomicU64,
+    /// Presented tokens or passwords that failed authentication (401s).
     pub auth_failures: AtomicU64,
+    /// Authenticated-or-anonymous requests the privilege cone refused.
     pub denials: AtomicU64,
+    /// Requests rejected with 429 because their source IP is throttled
+    /// after repeated auth failures.
     pub throttled: AtomicU64,
 }
 
@@ -1816,7 +1821,9 @@ pub fn spawn_sweeper(state: AppState, interval: std::time::Duration) {
 
 /// TLS material for [`serve`].
 pub struct TlsConfig {
+    /// Path to the PEM certificate chain.
     pub cert: PathBuf,
+    /// Path to the PEM private key.
     pub key: PathBuf,
 }
 

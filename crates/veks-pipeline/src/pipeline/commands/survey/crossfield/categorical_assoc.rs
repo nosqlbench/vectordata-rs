@@ -19,6 +19,9 @@ use super::{PairAnalyzer, PairAnalyzerKind, PairReport};
 use crate::pipeline::commands::survey::measure::MeasureCtx;
 use crate::pipeline::commands::survey::measures::cardinality::canonical_distinct_key;
 
+/// Pair analyzer that tallies a contingency table of two
+/// categorical fields' canonical values and reports χ², Cramér's V
+/// and mutual information.
 pub struct CategoricalAssociationAnalyzer {
     /// Contingency table: a_value → (b_value → count).
     table: IndexMap<String, IndexMap<String, u64>>,
@@ -35,9 +38,13 @@ pub struct CategoricalAssociationAnalyzer {
 }
 
 impl CategoricalAssociationAnalyzer {
+    /// An analyzer with the default cap of 10,000 distinct cells.
     pub fn new() -> Self {
         Self::with_cap(10_000)
     }
+    /// An analyzer that stops adding new cells once the table holds
+    /// `cell_cap` of them; later unseen combinations still count
+    /// toward the row, column and grand totals but set `overflowed`.
     pub fn with_cap(cell_cap: usize) -> Self {
         CategoricalAssociationAnalyzer {
             table: IndexMap::new(),
@@ -150,11 +157,17 @@ impl PairAnalyzer for CategoricalAssociationAnalyzer {
     }
 }
 
+/// Result of a [`CategoricalAssociationAnalyzer`]; all statistics
+/// are zero when no pairs were observed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CategoricalAssociationReport {
+    /// Records in which both fields were present.
     pub n: u64,
+    /// Distinct values of the A field.
     pub rows: u32,
+    /// Distinct values of the B field.
     pub cols: u32,
+    /// Pearson's χ² statistic over the full `rows × cols` table.
     pub chi_squared: f64,
     /// Cramér's V in `[0, 1]`. 0 = independent, 1 = perfectly
     /// associated.

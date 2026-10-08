@@ -398,71 +398,120 @@ CREATE INDEX IF NOT EXISTS idx_access_ts ON access_log(ts);
 
 // ── row types (raw control-plane rows the snapshot is built from) ───
 
+/// A `users` row.
 #[derive(Clone, Debug)]
 pub struct UserRow {
+    /// Row id (what `tokens.user_id` references).
     pub id: i64,
+    /// Unique user name — the principal name bindings and ownership use.
     pub name: String,
+    /// Whether the user is disabled (excluded from authentication).
     pub disabled: bool,
+    /// Privilege level name (`user`/`operator`/`admin`/`superuser`).
     pub level: String,
+    /// SHA-256 hex of the user's password; `None` = no password grant.
     pub password_hash: Option<String>,
 }
 
+/// A `tokens` row.
 #[derive(Clone, Debug)]
 pub struct TokenRow {
+    /// Row id (the id `tokens list` shows and `revoke` takes).
     pub id: i64,
+    /// Id of the issuing user.
     pub user_id: i64,
+    /// SHA-256 hex of the token plaintext (the lookup key).
     pub token_hash: String,
+    /// Mandatory human-readable description.
     pub description: String,
+    /// JSON-encoded token ceiling (`[{class,scope},…]`); `None` = the
+    /// issuer's full authority.
     pub profile: Option<String>,
+    /// Expiry instant, in Unix epoch seconds.
     pub expires_at: i64,
 }
 
+/// A `roles` row.
 #[derive(Clone, Debug)]
 pub struct RoleRow {
+    /// Role name, referenced by bindings.
     pub name: String,
+    /// Comma-separated granted actions (subset of `read,write,delete,admin`).
     pub actions: String,
+    /// Whether this is a seeded class role (not removable).
     pub builtin: bool,
 }
 
+/// A `role_bindings` row: `principal` holds `role` over the subtree at
+/// `namespace_path`.
 #[derive(Clone, Debug)]
 pub struct BindingRow {
+    /// A user name, or the group `PUBLIC` / `KNOWN`.
     pub principal: String,
+    /// The bound role's name.
     pub role: String,
+    /// Namespace path the binding covers (and everything below it).
     pub namespace_path: String,
 }
 
+/// A `backends` row — a named storage connection namespaces route to.
 #[derive(Clone, Debug)]
 pub struct BackendRow {
+    /// Config name, referenced by `namespaces.backend_config`.
     pub name: String,
+    /// Backend kind: `local`, `s3`, or `mem`.
     pub kind: String,
+    /// Physical location: `local:<abs-dir>`, `s3://bucket/prefix`, or
+    /// `mem:<id>`.
     pub endpoint: String,
+    /// S3-compatible service URL (e.g. MinIO); `None` = AWS default.
     pub endpoint_url: Option<String>,
+    /// S3 region; `None` = the `aws` CLI default.
     pub region: Option<String>,
+    /// Credentials reference — for `s3`, an AWS named profile; `None` =
+    /// the default credential chain.
     pub creds_ref: Option<String>,
+    /// Whether the config is active (at most one active config per
+    /// endpoint); inactive configs are standby.
     pub active: bool,
 }
 
+/// A `namespaces` row.
 #[derive(Clone, Debug)]
 pub struct NamespaceRow {
+    /// Namespace path (`""` is the root).
     pub path: String,
+    /// Owning principal: a user name or a system role (`@admin`, …).
     pub owner: String,
+    /// Backend config serving this namespace; `None` = config-only.
     pub backend_config: Option<String>,
+    /// Whether active storage is enabled here.
     pub active: bool,
+    /// Listability name (`public`/`known`/`grantees`).
     pub listable: String,
+    /// Storage cap in bytes.
     pub quota_bytes: i64,
+    /// Default version lifetime in seconds; `None` = unset here.
     pub ttl_seconds: Option<i64>,
 }
 
+/// A `profiles` row — a named, parameterized privilege profile.
 #[derive(Clone, Debug)]
 pub struct ProfileRow {
+    /// Profile name (what `tokens create --from` takes).
     pub name: String,
+    /// Principal recorded as the profile's owner.
     pub owner: String,
+    /// The `(class, scope)` template, with `{placeholder}`s in scopes.
     pub spec: String,
 }
 
+/// A `system_privileges` row: `principal` holds `privilege`.
 #[derive(Clone, Debug)]
 pub struct SystemPrivRow {
+    /// Principal the privilege is granted to (normally a user name).
     pub principal: String,
+    /// Privilege name, e.g. `IGNORE-QUOTAS`.
     pub privilege: String,
 }
 
@@ -471,14 +520,23 @@ pub struct SystemPrivRow {
 /// CLI reads pieces of it for listing.
 #[derive(Clone, Debug, Default)]
 pub struct ControlPlane {
+    /// Every user, enabled or not.
     pub users: Vec<UserRow>,
+    /// Every token, including expired ones.
     pub tokens: Vec<TokenRow>,
+    /// Built-in and custom roles.
     pub roles: Vec<RoleRow>,
+    /// All role bindings.
     pub bindings: Vec<BindingRow>,
+    /// All backend configs, active or standby.
     pub backends: Vec<BackendRow>,
+    /// All namespaces, including the root.
     pub namespaces: Vec<NamespaceRow>,
+    /// Named privilege profiles.
     pub profiles: Vec<ProfileRow>,
+    /// System privilege grants.
     pub system_privileges: Vec<SystemPrivRow>,
+    /// `auth_generation` at the time of the read.
     pub generation: i64,
 }
 

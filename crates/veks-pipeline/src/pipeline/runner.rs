@@ -64,9 +64,13 @@ use super::schema::OnPartial;
 
 /// Summary of a pipeline run, returned to the caller for post-TUI display.
 pub struct RunSummary {
+    /// Number of steps in the run.
     pub total: usize,
+    /// Steps skipped because their outputs were already fresh.
     pub skipped: usize,
+    /// Steps that executed.
     pub executed: usize,
+    /// Wall-clock duration of the whole run.
     pub total_elapsed: std::time::Duration,
     /// Per-step outcomes: (step_id, was_executed, message)
     pub step_outcomes: Vec<(String, bool, String)>,

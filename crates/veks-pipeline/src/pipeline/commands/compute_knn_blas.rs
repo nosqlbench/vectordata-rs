@@ -520,8 +520,10 @@ fn resolve_path(s: &str, workspace: &Path) -> std::path::PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
 }
 
+/// Pipeline command: compute exact KNN by scoring query blocks against base chunks with an sgemm matrix multiply.
 pub struct ComputeKnnBlasOp;
 
+/// Creates a boxed [`ComputeKnnBlasOp`]; registered as the `compute knn-blas` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(ComputeKnnBlasOp)
 }

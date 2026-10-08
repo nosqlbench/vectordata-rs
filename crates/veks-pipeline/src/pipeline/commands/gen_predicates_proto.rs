@@ -98,8 +98,16 @@ fn default_selectivity() -> SelectivitySpec { SelectivitySpec::Scalar(0.1) }
 /// proto file stays human-readable.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SelectivitySpec {
+    /// One fixed target selectivity for every predicate.
     Scalar(f64),
-    Interval { lo: f64, hi: f64 },
+    /// A closed range `[lo, hi]` from which each predicate's target is
+    /// drawn uniformly.
+    Interval {
+        /// Lower bound of the target range.
+        lo: f64,
+        /// Upper bound of the target range.
+        hi: f64,
+    },
 }
 
 impl SelectivitySpec {
@@ -278,16 +286,22 @@ impl PredicateProto {
 /// placeholder, Some = literal pin).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PredicateTemplate {
+    /// A single comparison leaf.
     Predicate {
+        /// The metadata field the leaf compares.
         field: FieldRef,
+        /// The comparison operator.
         op: OpType,
         /// One slot per comparand position. `None` = the user
         /// wrote `?` and the generator must fill from the
         /// survey. `Some(c)` = literal pin.
         comparands: Vec<Option<Comparand>>,
     },
+    /// A boolean combination of child templates.
     Conjugate {
+        /// How the children combine (`And` or `Or`).
         conjugate_type: ConjugateType,
+        /// The combined sub-templates, in source order.
         children: Vec<PredicateTemplate>,
     },
 }

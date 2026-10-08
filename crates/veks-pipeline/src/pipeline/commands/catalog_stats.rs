@@ -46,8 +46,10 @@ const PRIORITY_COLUMNS: &[&str] = &[
     "min_normal_epsilon",
 ];
 
+/// Pipeline command: write one CSV with a row of collected `variables.yaml` values per dataset under the catalog root.
 pub struct CatalogStatsOp;
 
+/// Creates a boxed [`CatalogStatsOp`]; registered as the `catalog stats` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(CatalogStatsOp)
 }

@@ -35,8 +35,10 @@ use crate::pipeline::element_type::ElementType;
 use crate::pipeline::simd_distance::{self, Metric};
 use super::knn_segment::{CosineMode, resolve_cosine_mode_for};
 
+/// Pipeline command: fill in neighbor distances for an existing neighbor-indices file.
 pub struct ComputeKnnDistancesOp;
 
+/// Creates a boxed [`ComputeKnnDistancesOp`]; registered as the `compute knn-distances` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(ComputeKnnDistancesOp)
 }

@@ -24,6 +24,7 @@ use crate::pipeline::element_type::ElementType;
 /// Pipeline command: slice vector data.
 pub struct AnalyzeSliceOp;
 
+/// Creates a boxed [`AnalyzeSliceOp`]; registered as the `analyze slice` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeSliceOp)
 }

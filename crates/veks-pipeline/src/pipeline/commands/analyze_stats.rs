@@ -26,6 +26,7 @@ use super::source_window::resolve_source;
 /// Pipeline command: compute vector statistics.
 pub struct AnalyzeStatsOp;
 
+/// Creates a boxed [`AnalyzeStatsOp`]; registered as the `analyze stats` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeStatsOp)
 }
@@ -33,13 +34,22 @@ pub fn factory() -> Box<dyn CommandOp> {
 /// Statistics for a single dimension.
 #[derive(Debug, Clone)]
 pub struct DimensionStats {
+    /// Number of values the statistics were computed over.
     pub count: usize,
+    /// Smallest value (0.0 when `count` is 0).
     pub min: f64,
+    /// Largest value (0.0 when `count` is 0).
     pub max: f64,
+    /// Arithmetic mean.
     pub mean: f64,
+    /// Population variance (second central moment divided by `count`).
     pub variance: f64,
+    /// Population standard deviation, the square root of `variance`.
     pub std_dev: f64,
+    /// Moment coefficient of skewness; 0.0 when `std_dev` is 0.
     pub skewness: f64,
+    /// Non-excess kurtosis (a normal distribution gives 3.0); 0.0 when
+    /// `std_dev` is 0.
     pub kurtosis: f64,
 }
 

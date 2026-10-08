@@ -12,7 +12,22 @@ use std::fmt;
 /// Element type for scalar conversion dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarType {
-    U8, I8, U16, I16, U32, I32, U64, I64,
+    /// Unsigned 8-bit integer.
+    U8,
+    /// Signed 8-bit integer.
+    I8,
+    /// Unsigned 16-bit integer.
+    U16,
+    /// Signed 16-bit integer.
+    I16,
+    /// Unsigned 32-bit integer.
+    U32,
+    /// Signed 32-bit integer.
+    I32,
+    /// Unsigned 64-bit integer.
+    U64,
+    /// Signed 64-bit integer.
+    I64,
 }
 
 impl ScalarType {
@@ -46,9 +61,13 @@ impl fmt::Display for ScalarType {
 /// Error from a narrowing or sign-mismatch conversion.
 #[derive(Debug)]
 pub struct ConvertError {
+    /// Ordinal of the element that did not fit.
     pub ordinal: u64,
+    /// The offending source value, widened to `i128` so any source type fits.
     pub value: i128,
+    /// Element type being converted from.
     pub from_type: ScalarType,
+    /// Element type being converted to.
     pub to_type: ScalarType,
 }
 

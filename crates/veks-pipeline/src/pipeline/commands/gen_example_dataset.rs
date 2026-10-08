@@ -45,6 +45,7 @@ const METADATA_FILE: &str = "metadata_content.u8";
 /// Pipeline command: scaffold an example dataset directory (source files only).
 pub struct GenerateExampleDatasetOp;
 
+/// Creates a boxed [`GenerateExampleDatasetOp`]; registered as the `generate example-dataset` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenerateExampleDatasetOp)
 }

@@ -221,10 +221,12 @@ impl SharedMmapWriter {
         SharedMmapWriter { inner: Arc::clone(&self.inner) }
     }
 
+    /// Total number of records the underlying writer was sized for.
     pub fn total_records(&self) -> u64 {
         self.inner.total_records()
     }
 
+    /// Bytes per record, including the 4-byte dimension header.
     pub fn record_stride(&self) -> usize {
         self.inner.record_stride()
     }

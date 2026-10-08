@@ -37,6 +37,7 @@
 //! ```
 
 #![allow(dead_code)]
+#![warn(missing_docs)]
 
 /// Unified filtering rules — re-exported from `vectordata` (the base crate),
 /// where the single definition lives so the push engine shares the same rules.

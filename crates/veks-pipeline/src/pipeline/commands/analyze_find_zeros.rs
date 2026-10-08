@@ -34,8 +34,10 @@ fn resolve_path(value: &str, workspace: &Path) -> std::path::PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
 }
 
+/// Pipeline command: brute-force scan for vectors whose L2 norm falls below the zero threshold.
 pub struct AnalyzeFindZerosOp;
 
+/// Creates a boxed [`AnalyzeFindZerosOp`]; registered as the `analyze find-zeros` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeFindZerosOp)
 }

@@ -52,6 +52,8 @@ pub struct LabelsetHeavyHittersMeasure {
 }
 
 impl LabelsetHeavyHittersMeasure {
+    /// Creates a measure tracking up to `top_k` candidate labels
+    /// (clamped to at least 1).
     pub fn new(top_k: usize) -> Self {
         let top_k = top_k.max(1);
         LabelsetHeavyHittersMeasure {
@@ -139,7 +141,10 @@ pub struct LabelsetHeavyHittersReport {
 /// bound count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelsetEntry {
+    /// The label, trimmed of outer whitespace.
     pub label: String,
+    /// Lower bound on the label's true occurrence count; the true count
+    /// is at most `count_lower_bound + error_bound`.
     pub count_lower_bound: u64,
 }
 

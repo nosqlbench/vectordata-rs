@@ -19,6 +19,7 @@ use crate::pipeline::command::{
 /// Pipeline command: display compute environment info.
 pub struct InfoComputeOp;
 
+/// Creates a boxed [`InfoComputeOp`]; registered as the `analyze compute-info` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(InfoComputeOp)
 }

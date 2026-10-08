@@ -19,6 +19,10 @@ use super::{PairAnalyzer, PairAnalyzerKind, PairReport};
 use crate::pipeline::commands::survey::measure::MeasureCtx;
 use crate::pipeline::commands::survey::measures::numeric::mvalue_as_f64;
 
+/// Single-field analyzer that correlates a numeric field's values
+/// with the record index (taken from the `MeasureCtx`) to detect
+/// drift along the stream; the `b` argument of `observe_pair` is
+/// ignored.
 pub struct TrendAnalyzer {
     n: u64,
     mean_v: f64,
@@ -33,6 +37,7 @@ impl Default for TrendAnalyzer {
 }
 
 impl TrendAnalyzer {
+    /// An analyzer with no observations.
     pub fn new() -> Self {
         TrendAnalyzer {
             n: 0,
@@ -85,8 +90,10 @@ impl PairAnalyzer for TrendAnalyzer {
     }
 }
 
+/// Result of a [`TrendAnalyzer`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrendReport {
+    /// Observations whose value was numeric and not NaN.
     pub n: u64,
     /// Pearson r between the field's values and the record index.
     /// Near ±1 → strong monotone drift with stream position. `None`

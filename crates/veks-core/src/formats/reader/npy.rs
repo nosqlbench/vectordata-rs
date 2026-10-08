@@ -28,8 +28,11 @@ use super::VecSource;
 /// Detected element type from the npy descriptor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NpyDtype {
+    /// Little-endian half-precision float (`<f2`).
     F16, // <f2
+    /// Little-endian single-precision float (`<f4`).
     F32, // <f4
+    /// Little-endian double-precision float (`<f8`).
     F64, // <f8
 }
 
@@ -118,8 +121,19 @@ impl WorkQueue {
 
 /// Loaded npy array data, polymorphic over element type
 pub enum NpyArrayData {
-    F16 { data: Vec<u8>, rows: usize, cols: usize },
+    /// Half-precision data kept as raw little-endian bytes, row-major, since
+    /// `ndarray-npy` has no `f16` element type.
+    F16 {
+        /// `rows × cols` elements, two bytes each.
+        data: Vec<u8>,
+        /// Number of rows (vectors).
+        rows: usize,
+        /// Number of columns (vector dimension).
+        cols: usize,
+    },
+    /// Single-precision `rows × cols` array.
     F32(Array2<f32>),
+    /// Double-precision `rows × cols` array.
     F64(Array2<f64>),
 }
 
@@ -191,15 +205,22 @@ impl NpyArrayData {
 
 /// Result of scanning npy file headers (no data loaded)
 pub struct NpyScanResult {
+    /// The `.npy` files to read, sorted by path; truncated to the files
+    /// needed to cover `max_count` when one was given.
     pub files: Vec<std::path::PathBuf>,
+    /// Element type shared by every file.
     pub dtype: NpyDtype,
+    /// Column count (vector dimension) shared by every file.
     pub dimension: u32,
+    /// Sum of row counts over `files`.
     pub total_rows: u64,
 }
 
 /// Per-file manifest entry for parallel conversion.
 pub struct NpyFileManifest {
+    /// Path of the `.npy` file.
     pub path: std::path::PathBuf,
+    /// Number of rows (vectors) in the file.
     pub rows: u64,
     /// Cumulative row offset (first record ordinal in this file).
     pub offset: u64,

@@ -19,8 +19,10 @@ use crate::pipeline::command::{
     ResourceDesc, Status, StreamContext, render_options_table,
 };
 
+/// Pipeline command: trace how a query's predicate selects and remaps base vectors into a partition profile.
 pub struct ExplainPartitionsOp;
 
+/// Creates a boxed [`ExplainPartitionsOp`]; registered as the `analyze explain-partitions` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(ExplainPartitionsOp)
 }

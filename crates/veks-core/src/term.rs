@@ -54,19 +54,31 @@ pub fn is_interactive() -> bool {
 
 // ── ANSI escape helpers ──────────────────────────────────────────────────
 
+/// ANSI SGR reset: clears all colour and style attributes.
 pub const RESET: &str = "\x1b[0m";
+/// ANSI bold (increased intensity).
 pub const BOLD: &str = "\x1b[1m";
+/// ANSI dim (decreased intensity).
 pub const DIM: &str = "\x1b[2m";
 
+/// ANSI red foreground.
 pub const RED: &str = "\x1b[31m";
+/// ANSI green foreground.
 pub const GREEN: &str = "\x1b[32m";
+/// ANSI yellow foreground.
 pub const YELLOW: &str = "\x1b[33m";
+/// ANSI blue foreground.
 pub const BLUE: &str = "\x1b[34m";
+/// ANSI cyan foreground.
 pub const CYAN: &str = "\x1b[36m";
 
+/// ANSI bold red foreground.
 pub const BOLD_RED: &str = "\x1b[1;31m";
+/// ANSI bold green foreground.
 pub const BOLD_GREEN: &str = "\x1b[1;32m";
+/// ANSI bold yellow foreground.
 pub const BOLD_YELLOW: &str = "\x1b[1;33m";
+/// ANSI bold cyan foreground.
 pub const BOLD_CYAN: &str = "\x1b[1;36m";
 
 /// Wrap text in an ANSI color code, or return it unchanged if color is off.

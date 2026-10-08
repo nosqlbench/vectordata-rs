@@ -170,8 +170,12 @@ fn predicate_results_candidates(workspace: &Path, profile: &str) -> Vec<PathBuf>
 // on the same backend, so distances are bit-identical and verify can't
 // false-positive on ULP boundary tie-swaps. Its `backend` option must
 // therefore name the backend the ground truth was computed with.
+/// Pipeline command `verify knn-consolidated`: verifies the KNN ground truth
+/// of every sized profile in one multi-threaded pass over the base vectors,
+/// comparing sampled queries' top-k at each profile's `base_count` boundary.
 pub struct VerifyKnnConsolidatedOp;
 
+/// Creates a boxed `VerifyKnnConsolidatedOp` for command registration.
 pub fn knn_consolidated_factory() -> Box<dyn CommandOp> {
     Box::new(VerifyKnnConsolidatedOp)
 }
@@ -899,8 +903,13 @@ fn verify_heaps_against_gt(
 // verify filtered-knn-consolidated (stub — shares scan in future)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Pipeline command `verify filtered-knn-consolidated`: verifies the
+/// filtered KNN ground truth of every profile in one pass over the base
+/// vectors, considering only the base vectors each sampled query's predicate
+/// admits.
 pub struct VerifyFilteredKnnConsolidatedOp;
 
+/// Creates a boxed `VerifyFilteredKnnConsolidatedOp` for command registration.
 pub fn filtered_knn_consolidated_factory() -> Box<dyn CommandOp> {
     Box::new(VerifyFilteredKnnConsolidatedOp)
 }
@@ -1218,8 +1227,12 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
 // verify predicates-consolidated (stub — no base vector scan needed)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Pipeline command `verify predicates-consolidated`: verifies predicate
+/// evaluation results for every profile by loading a sample of metadata
+/// records into SQLite and comparing SQL results against the stored ones.
 pub struct VerifyPredicatesConsolidatedOp;
 
+/// Creates a boxed `VerifyPredicatesConsolidatedOp` for command registration.
 pub fn predicates_consolidated_factory() -> Box<dyn CommandOp> {
     Box::new(VerifyPredicatesConsolidatedOp)
 }
@@ -1457,6 +1470,7 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
 /// partition predicate), so partition profiles are skipped here.
 pub struct VerifyPostfilteredKnnConsolidatedOp;
 
+/// Creates a boxed `VerifyPostfilteredKnnConsolidatedOp` for command registration.
 pub fn postfiltered_knn_consolidated_factory() -> Box<dyn CommandOp> {
     Box::new(VerifyPostfilteredKnnConsolidatedOp)
 }

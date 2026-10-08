@@ -1,6 +1,8 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
+//! Streaming [`VecSource`] over a `.slab` vector file.
+
 use std::path::Path;
 
 use slabtastic::{OpenProgress, SlabBatchIter, SlabReader as SlabtasticReader};

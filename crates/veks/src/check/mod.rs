@@ -80,8 +80,11 @@ pub struct CheckArgs {
 
 /// Result of a single check category.
 pub struct CheckResult {
+    /// Category name shown in the report.
     pub name: &'static str,
+    /// Whether every check in the category passed.
     pub passed: bool,
+    /// Detail lines for the report: the failures, or a summary on success.
     pub messages: Vec<String>,
 }
 

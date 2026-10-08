@@ -22,6 +22,7 @@ use crate::pipeline::element_type::ElementType;
 /// Pipeline command: check endianness of xvec files.
 pub struct AnalyzeCheckEndianOp;
 
+/// Creates a boxed [`AnalyzeCheckEndianOp`]; registered as the `analyze check-endian` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeCheckEndianOp)
 }

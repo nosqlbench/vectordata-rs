@@ -23,6 +23,7 @@ use crate::pipeline::command::{
 /// Pipeline command: diff two model.json files.
 pub struct AnalyzeModelDiffOp;
 
+/// Creates a boxed [`AnalyzeModelDiffOp`]; registered as the `analyze model-diff` command.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeModelDiffOp)
 }

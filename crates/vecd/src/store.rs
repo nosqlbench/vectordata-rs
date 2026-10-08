@@ -58,17 +58,25 @@ pub enum Precondition {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PutResult {
     /// Stored; the new ETag (content-key).
-    Written { etag: String },
+    Written {
+        /// The stored object's envelope ETag.
+        etag: String,
+    },
     /// A precondition (`If-Match`/`If-None-Match`) was not satisfied → 412.
     PreconditionFailed,
     /// The write would exceed the namespace's quota → 507.
-    QuotaExceeded { quota: u64 },
+    QuotaExceeded {
+        /// The governing namespace's quota, in bytes.
+        quota: u64,
+    },
 }
 
 /// Object metadata for `HEAD`/`GET` responses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectMeta {
+    /// Object length in bytes.
     pub size: u64,
+    /// The object's envelope ETag (its content-key).
     pub etag: String,
 }
 

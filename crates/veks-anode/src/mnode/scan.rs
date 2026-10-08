@@ -660,6 +660,9 @@ pub fn discover_schema(data: &[u8]) -> Result<RecordSchema, ScanError> {
 // Schema-compiled predicates
 // ---------------------------------------------------------------------------
 
+/// A single compiled condition: `(predicate_index, operator, comparand_values)`.
+pub type FieldCondition = (usize, OpType, Vec<Comparand>);
+
 /// Predicates compiled against a known [`RecordSchema`] for zero-allocation
 /// evaluation.
 ///
@@ -671,9 +674,6 @@ pub fn discover_schema(data: &[u8]) -> Result<RecordSchema, ScanError> {
 /// compile time: `Eq Null` / `In Null` conditions always pass (the required
 /// count is decremented), while other conditions mark the predicate as
 /// unmatchable.
-/// A single compiled condition: `(predicate_index, operator, comparand_values)`.
-pub type FieldCondition = (usize, OpType, Vec<Comparand>);
-
 pub struct CompiledScanPredicates {
     /// Total number of predicates.
     pub pred_count: usize,

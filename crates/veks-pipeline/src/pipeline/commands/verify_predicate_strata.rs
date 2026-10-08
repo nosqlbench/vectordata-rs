@@ -63,8 +63,12 @@ use crate::pipeline::commands::survey::SurveyReport;
 
 use super::gen_predicates_common::{error_result, resolve_path};
 
+/// Pipeline command `verify predicate-strata`: checks a stratified predicate
+/// set's recorded claims against the results facets of every profile (see
+/// the module docs for the individual checks) and writes a [`StrataReport`].
 pub struct VerifyPredicateStrataOp;
 
+/// Creates a boxed `VerifyPredicateStrataOp` for command registration.
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(VerifyPredicateStrataOp)
 }
@@ -81,15 +85,21 @@ struct Claim {
 /// What one profile showed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileReport {
+    /// Name of the profile.
     pub profile: String,
+    /// Base vector count of the profile; the census population when the
+    /// profile declares none.
     pub base_count: u64,
     /// Whether the profile's base is the census population, where
     /// counts must match exactly.
     pub census_profile: bool,
+    /// Whether `base_count` reaches the `reliability-threshold`, so the
+    /// non-empty and cell-coverage checks apply.
     pub above_threshold: bool,
     /// Matches a record needs at this profile to apply to it (TS-51):
     /// `M + 3√M`.
     pub floor: f64,
+    /// Records in this profile's results facet; must equal the predicate count.
     pub records: usize,
     /// Censused records whose count differs at the census profile.
     pub exact_mismatches: usize,
@@ -120,13 +130,17 @@ pub struct ProfileReport {
     pub uncovered_cells: usize,
     /// Every `family:1e-d` cell at this profile.
     pub cells: BTreeMap<String, CellReport>,
+    /// Per-family tallies at this profile, keyed by family name.
     pub per_family: BTreeMap<String, FamilyReport>,
+    /// The first violation messages found at this profile (capped at
+    /// eight), for the reader.
     pub first_violations: Vec<String>,
 }
 
 /// One cell of the ladder at one profile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CellReport {
+    /// Records whose claimed cell is this one.
     pub records: usize,
     /// Whether the cell's decade clears the floor at this base count:
     /// `10^d · N ≥ M + 3√M`.
@@ -141,12 +155,18 @@ pub struct CellReport {
     pub empty: usize,
 }
 
+/// One predicate family's tallies at one profile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FamilyReport {
+    /// Records of the family.
     pub records: usize,
+    /// Mean selectivity the generator claimed over the census population.
     pub mean_claimed_selectivity: f64,
+    /// Mean selectivity realised at this profile: match count over `base_count`.
     pub mean_realised_selectivity: f64,
+    /// Records realised outside their cell's half-decade band (TS-43).
     pub out_of_band: usize,
+    /// Records with no matches at this profile.
     pub empties: usize,
     /// Records of the family whose count is not credible (TS-173).
     pub incredible: usize,
@@ -163,19 +183,37 @@ struct FamilySums {
     incredible: usize,
 }
 
+/// The JSON report `verify predicate-strata` writes to its `output`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrataReport {
+    /// Version of this report's layout.
     pub schema_version: u32,
+    /// Predicate records in the facet.
     pub predicates: usize,
+    /// Query vectors in the `queries` file, when one was given; must equal
+    /// `predicates`.
     pub query_count: Option<usize>,
+    /// Census population the generator drew against, from the survey the
+    /// predicate facet carries.
     pub census_population: u64,
+    /// Base count from which a record that clears the floor must be
+    /// non-empty (the `reliability-threshold` option).
     pub reliability_threshold: u64,
     /// `M` in the floor `M + 3√M` (TS-11).
     pub min_matches: u64,
+    /// Number of recorded `query_in_filter` labels re-derived against the
+    /// queries' own metadata rows; `None` when `query-metadata` was not given.
     pub label_checks: Option<usize>,
+    /// How many of those labels disagreed with evaluation; `None` when
+    /// `query-metadata` was not given.
     pub label_disagreements: Option<usize>,
+    /// One report per profile that holds a results facet, sorted by base
+    /// count with the census profile last.
     pub profiles: Vec<ProfileReport>,
+    /// Number of violation entries: set-level failures plus one per profile
+    /// with any failing check. Any violation fails the step.
     pub violations: usize,
+    /// Wall-clock duration of the step, in seconds.
     pub seconds: f64,
 }
 
@@ -790,10 +828,23 @@ pub const CREDIBILITY_ALPHA: f64 = 1e-9;
 pub enum CountModel {
     /// A hash predicate of selectivity `p` over `n` independent rows
     /// (the control family, TS-115).
-    Binomial { n: u64, p: f64 },
+    Binomial {
+        /// Rows drawn: the profile's base count.
+        n: u64,
+        /// Per-row match probability: the constructed selectivity.
+        p: f64,
+    },
     /// A censused predicate with `k` matches in a population of `pop`,
     /// seen through the shuffled prefix of `n` rows.
-    Hypergeometric { pop: u64, k: u64, n: u64 },
+    Hypergeometric {
+        /// Size of the census population.
+        pop: u64,
+        /// Matches in the census population.
+        k: u64,
+        /// Rows drawn: the length of the shuffled prefix (the profile's
+        /// base count).
+        n: u64,
+    },
 }
 
 impl CountModel {
