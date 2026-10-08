@@ -604,8 +604,24 @@ fn completion_resolvers() -> std::collections::BTreeMap<String, veks_completion:
 }
 
 /// Binary entry point over explicit args (everything after the program
-/// name). Wrapper binaries pass their own tail.
+/// name), for the `vectordata` binary itself. Wrapper binaries that
+/// embed this CLI under another name call [`bin_main_as`].
 pub fn bin_main(argv: Vec<String>) {
+    bin_main_as("vectordata", argv)
+}
+
+/// [`bin_main`] for a binary that embeds this CLI: `invoked` is what the
+/// user typed to reach it — `"vectordata"`, or e.g. `"fvec bench
+/// vectordata"` — and is what help, usage lines, `--version` and parse
+/// errors name, so a user is told about the command they ran rather than
+/// a binary they may not have installed.
+///
+/// Shell completion stays bound to the real `vectordata` executable
+/// (`COMPLETE=<shell>` / `_VECTORDATA_COMPLETE`, and the scripts
+/// `vectordata completions` prints): completing an embedded CLI means
+/// answering to the embedding executable's own variable, which is that
+/// executable's to set up.
+pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
     // Detached update-probe child (see update_check module docs):
     // marked by an internal env var, does one fetch + state write,
     // and exits before any CLI machinery runs.
@@ -613,13 +629,16 @@ pub fn bin_main(argv: Vec<String>) {
         return;
     }
 
-    let spec = Cli::veks_command_spec("vectordata");
+    // Two specs, one tree: the completion machinery keys on the
+    // executable's own name; everything a user reads names `invoked`.
+    let spec = Cli::veks_command_spec(invoked);
+    let exe_spec = Cli::veks_command_spec("vectordata");
 
     // Dynamic-completion entry: when invoked with `COMPLETE=<shell>` (or
     // `_VECTORDATA_COMPLETE=…`), emit candidates and exit. The snippet from
     // `vectordata completions` re-invokes the binary with that env var set, so
     // completion logic lives in the spec rather than a frozen script.
-    let tree = vcli::build_completion_tree(&spec, &completion_resolvers());
+    let tree = vcli::build_completion_tree(&exe_spec, &completion_resolvers());
     if veks_completion::handle_complete_env("vectordata", &tree) {
         return;
     }
@@ -629,7 +648,7 @@ pub fn bin_main(argv: Vec<String>) {
     veks_completion::hint_completions_unregistered("vectordata");
 
     if argv.iter().any(|a| a == "--version" || a == "-V") {
-        println!("vectordata {LONG_VERSION}");
+        println!("{invoked} {LONG_VERSION}");
         return;
     }
     if argv.is_empty() || argv.iter().any(|a| a == "--help" || a == "-h") {
@@ -639,11 +658,11 @@ pub fn bin_main(argv: Vec<String>) {
     }
 
     let parsed = vcli::parse(&spec, &argv).unwrap_or_else(|e| {
-        eprintln!("vectordata: {e}");
+        eprintln!("{invoked}: {e}");
         std::process::exit(2);
     });
     let cli = <Cli as VeksCli>::veks_from_parsed(&parsed).unwrap_or_else(|e| {
-        eprintln!("vectordata: {e}");
+        eprintln!("{invoked}: {e}");
         std::process::exit(2);
     });
     // After parsing only — completion, --help, --version, and
@@ -1242,6 +1261,19 @@ mod tests {
         out
     }
 
+    /// **An embedding binary's invocation is what help names.** The
+    /// spec `bin_main_as` builds carries the path the user typed, so the
+    /// usage line at every depth reads as a command they can rerun.
+    #[test]
+    fn help_names_the_embedding_invocation() {
+        let spec = <Cli as VeksCli>::veks_command_spec("fvec bench vectordata");
+        let top = vcli::render_help_for(&spec, &["--help"]);
+        assert!(top.contains("Usage: fvec bench vectordata <COMMAND>"), "{top}");
+        let leaf = vcli::render_help_for(&spec, &["datasets", "list", "--help"]);
+        assert!(leaf.contains("Usage: fvec bench vectordata datasets list"), "{leaf}");
+        let err = vcli::parse(&spec, &["no-such-command".to_string()]).unwrap_err();
+        assert!(!err.to_string().contains("vectordata vectordata"), "{err}");
+    }
 
     /// **Every command names the library call it runs** (SRD DX-28).
     ///

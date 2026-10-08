@@ -582,23 +582,35 @@ fn render_two_col(out: &mut String, rows: &[(String, String)]) {
 /// renders whatever level was reached (the root when `argv` names none).
 pub fn render_help_for<S: AsRef<str>>(root: &CommandSpec, argv: &[S]) -> String {
     let mut spec = root;
+    let mut path = root.name.clone();
     for word in argv {
         let word = word.as_ref();
         if word.starts_with('-') {
             break;
         }
         match spec.find_subcommand(word) {
-            Some(sub) => spec = sub,
+            Some(sub) => {
+                spec = sub;
+                path.push(' ');
+                path.push_str(&sub.name);
+            }
             None => break,
         }
     }
-    render_help(spec)
+    render_help_at(spec, &path)
 }
 
 /// Render `--help` text for a command spec, formatted comparably to clap:
 /// about, usage, aliases, commands, arguments, options (with an auto
 /// `-h, --help`), and any `after_help`.
 pub fn render_help(spec: &CommandSpec) -> String {
+    render_help_at(spec, &spec.name)
+}
+
+/// [`render_help`] with the usage line naming the full command path a
+/// user types — `vectordata datasets precache`, not `precache` — which is
+/// what [`render_help_for`] passes for a subcommand.
+pub fn render_help_at(spec: &CommandSpec, path: &str) -> String {
     let mut s = String::new();
 
     if let Some(about) = &spec.about {
@@ -610,7 +622,7 @@ pub fn render_help(spec: &CommandSpec) -> String {
     }
 
     // Usage line.
-    s.push_str(&format!("Usage: {}", spec.name));
+    s.push_str(&format!("Usage: {path}"));
     if !spec.options.is_empty() {
         s.push_str(" [OPTIONS]");
     }
@@ -797,6 +809,20 @@ mod tests {
             .option(vopt("--at").def_multiple())
             .option(OptionSpec::new(OptionDef::value("--dataset")).required(true))
             .option(OptionSpec::new(OptionDef::value("--profile")).default("default"))
+    }
+
+    /// Help for a subcommand names the whole path the user types, from
+    /// the root's name — which for an embedded CLI is the embedding
+    /// binary's invocation, several words long.
+    #[test]
+    fn subcommand_help_usage_names_the_full_path() {
+        let root = CommandSpec::new("fvec bench vectordata")
+            .subcommand(CommandSpec::new("datasets").subcommand(datasets_ping()));
+        let words = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let help = render_help_for(&root, &words(&["datasets", "ping", "--help"]));
+        assert!(help.contains("Usage: fvec bench vectordata datasets ping [OPTIONS]"), "{help}");
+        let top = render_help_for(&root, &words(&[]));
+        assert!(top.contains("Usage: fvec bench vectordata"), "{top}");
     }
 
     // small helper so tests can flip the OptionDef.multiple bit inline
