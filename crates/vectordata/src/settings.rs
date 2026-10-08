@@ -511,6 +511,46 @@ pub fn cache_dir_from(settings: &Path) -> Result<PathBuf, SettingsError> {
 /// `vectordata config get`) so users can see at a glance that the
 /// file is guarded against accidental overwrites.
 ///
+/// Settings key for offline mode (`offline: on`).
+pub const OFFLINE_KEY: &str = "offline";
+
+/// Environment variable for offline mode. When set it decides, whatever
+/// the settings file says: `1`/`on`/`true`/`yes` turn offline mode on,
+/// `0`/`off`/`false`/`no` turn it off.
+pub const OFFLINE_ENV: &str = "VECTORDATA_OFFLINE";
+
+/// Pure resolution of offline mode from the [`OFFLINE_KEY`] settings
+/// value and the [`OFFLINE_ENV`] value: the environment decides when it
+/// says anything recognizable, else the setting; unset means online.
+pub fn offline_from(setting: Option<&str>, env: Option<&str>) -> bool {
+    let parse = |v: &str| match v.trim().to_lowercase().as_str() {
+        "1" | "on" | "true" | "yes" | "enabled" => Some(true),
+        "0" | "off" | "false" | "no" | "disabled" => Some(false),
+        _ => None,
+    };
+    env.and_then(parse).or_else(|| setting.and_then(parse)).unwrap_or(false)
+}
+
+/// Whether offline mode is on: no request is made to any dataset
+/// server. Catalogs, dataset definitions and offset indexes come from
+/// the copies kept when they were last fetched, data from complete cache
+/// copies; anything not available locally is an error naming it. A
+/// `fetch` cannot download in offline mode, and does not revalidate.
+/// Explicit server commands — `login`, `push`, `backup` — are not
+/// affected.
+///
+/// Resolved once per process, from [`OFFLINE_ENV`] and the
+/// [`OFFLINE_KEY`] setting.
+pub fn offline() -> bool {
+    static OFFLINE: OnceLock<bool> = OnceLock::new();
+    *OFFLINE.get_or_init(|| {
+        offline_from(
+            setting_value(OFFLINE_KEY).as_deref(),
+            std::env::var(OFFLINE_ENV).ok().as_deref(),
+        )
+    })
+}
+
 /// Returns `false` if the file does not exist or does not declare the
 /// flag — matching the historical default which only set it on
 /// explicit `set-cache` writes.
@@ -736,6 +776,21 @@ fn add_yaml_list_item(content: &str, key: &str, item: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Offline mode resolves from the environment when it says
+    /// anything recognizable, else the setting; unset is online.
+    #[test]
+    fn offline_mode_resolution() {
+        use super::offline_from;
+        assert!(!offline_from(None, None));
+        assert!(offline_from(Some("on"), None));
+        assert!(!offline_from(Some("off"), None));
+        assert!(offline_from(None, Some("1")));
+        assert!(offline_from(Some("off"), Some("yes")), "the environment wins");
+        assert!(!offline_from(Some("on"), Some("0")), "both ways");
+        assert!(offline_from(Some("true"), Some("")), "an empty variable says nothing");
+        assert!(!offline_from(Some("sometimes"), None), "unrecognized is online");
+    }
+
     use super::*;
 
     /// `setting_value_from` reads top-level scalars, skipping

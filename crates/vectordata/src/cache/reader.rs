@@ -250,6 +250,9 @@ pub struct CacheListing {
     /// identity (catalog-anchored opens always use the dataset-keyed
     /// layout). Live data — never pruned by [`prune_legacy_layout`].
     pub url_derived: Vec<CacheEntry>,
+    /// The directory of kept remote-catalog copies (`.catalogs/`), read
+    /// when a catalog server is unreachable or offline mode is on.
+    pub catalogs: Vec<CacheEntry>,
     /// Pre-cutover detritus — `blobs/`, `http/`, and the older
     /// `<host>[:<port>]/` shape. Cleaned up by
     /// [`prune_legacy_layout`].
@@ -263,7 +266,7 @@ impl CacheListing {
     /// Total bytes across every category.
     pub fn total_bytes(&self) -> u64 {
         let s = |v: &[CacheEntry]| v.iter().map(|e| e.size_bytes).sum::<u64>();
-        s(&self.datasets) + s(&self.url_derived) + s(&self.legacy) + s(&self.other)
+        s(&self.datasets) + s(&self.url_derived) + s(&self.catalogs) + s(&self.legacy) + s(&self.other)
     }
 }
 
@@ -301,7 +304,9 @@ pub fn list_entries(cache_root: &Path) -> io::Result<CacheListing> {
             origin_url: origin.as_ref().map(|o| o.source.clone()),
             origin_host: origin.as_ref().and_then(|o| origin_host(&o.source)),
         };
-        if origin.is_some() {
+        if name == crate::cache::layout::CATALOG_COPIES_DIR {
+            listing.catalogs.push(cache_entry);
+        } else if origin.is_some() {
             listing.datasets.push(cache_entry);
         } else if contains_origin_json(&path) {
             listing.url_derived.push(cache_entry);

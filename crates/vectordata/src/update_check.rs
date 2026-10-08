@@ -164,7 +164,7 @@ fn fetch_latest_tag() -> Option<String> {
 /// can block, fail, or print mid-command.
 pub fn startup(current_version: &str) {
     use std::io::IsTerminal;
-    if !std::io::stderr().is_terminal() { return; }
+    if !std::io::stderr().is_terminal() || crate::settings::offline() { return; }
     let enabled = enabled_from(
         crate::settings::setting_value(SETTING_KEY).as_deref(),
         std::env::var(OPT_OUT_ENV).ok().as_deref(),

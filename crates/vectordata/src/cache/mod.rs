@@ -298,6 +298,9 @@ pub struct CachedChannel {
     /// `.mrkl` on disk: the file's (modified time, length), when it
     /// looked, and the answer it read. `None` until the first probe.
     sibling_probe: Mutex<Option<SiblingProbe>>,
+    /// The URL the bytes come from, when the opener recorded it — what
+    /// a revalidation asks about.
+    source_url: Option<String>,
 }
 
 /// One inspection of the on-disk `.mrkl` by
@@ -450,7 +453,63 @@ impl CachedChannel {
             concurrency: download_concurrency(),
             in_flight: Mutex::new(HashMap::new()),
             sibling_probe: Mutex::new(None),
+            source_url: None,
         })
+    }
+
+    /// Open a channel from its `.mrkl` state with no network: the
+    /// reference is the one embedded in the state. Normally only a
+    /// complete, verified copy opens this way; with `allow_partial` (offline
+    /// mode) a partial one does too, serving the chunks it holds. `None`
+    /// when there is no state, it is incomplete and partial is not
+    /// allowed, or the data file is missing.
+    ///
+    /// Whether the upstream still publishes the same content is not
+    /// asked here — that is the job of an explicit revalidation (see
+    /// [`crate::storage::Storage::revalidate`]), so that reading a
+    /// complete copy never depends on the network.
+    pub(crate) fn open_complete(
+        transport: Arc<dyn ChunkedTransport>,
+        cache_dir: &Path,
+        name: &str,
+        allow_partial: bool,
+    ) -> Option<Self> {
+        let cache_path = cache_dir.join(name);
+        let state_path = cache_dir.join(format!("{}.mrkl", name));
+        let complete = MerkleState::complete_on_disk(&state_path).ok()?;
+        if !cache_path.is_file() || !(complete || allow_partial) {
+            return None;
+        }
+        let state = MerkleState::load(&state_path).ok()?;
+        let reference = state.to_ref();
+        if fs::metadata(&cache_path).ok()?.len() != reference.shape().total_content_size {
+            return None;
+        }
+        let cache_file = OpenOptions::new().read(true).write(true).open(&cache_path).ok()?;
+        Some(CachedChannel {
+            cache_file: CacheFile::new(cache_file),
+            cache_path,
+            state,
+            state_path,
+            transport,
+            reference,
+            retry_policy: RetryPolicy::default(),
+            concurrency: download_concurrency(),
+            in_flight: Mutex::new(HashMap::new()),
+            sibling_probe: Mutex::new(None),
+            source_url: None,
+        })
+    }
+
+    /// Record the URL the bytes come from.
+    pub(crate) fn with_source_url(mut self, url: &str) -> Self {
+        self.source_url = Some(url.to_string());
+        self
+    }
+
+    /// The URL recorded by [`with_source_url`](Self::with_source_url).
+    pub(crate) fn source_url(&self) -> Option<&str> {
+        self.source_url.as_deref()
     }
 
     /// Whether the cache on disk is fully verified, counting work done

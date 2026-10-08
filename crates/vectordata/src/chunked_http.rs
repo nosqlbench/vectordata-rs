@@ -201,6 +201,11 @@ impl ChunkStore {
     pub(crate) fn cache_path(&self) -> &Path {
         &self.cache_path
     }
+    /// The URL this store fetches from.
+    pub(crate) fn url(&self) -> &url::Url {
+        self.transport.url()
+    }
+
     pub(crate) fn total_size(&self) -> u64 {
         self.total_size
     }
@@ -656,6 +661,20 @@ impl std::io::Write for PositionalWriter<'_> {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// The size of the file at `cache_path` when its `.chunks` bitmap
+/// records every chunk as fetched — a complete download that can be
+/// opened without asking the server for its length. `None` when the
+/// file, its bitmap, or any chunk of it is missing.
+pub(crate) fn complete_size_on_disk(cache_path: &Path, allow_partial: bool) -> Option<u64> {
+    let size = std::fs::metadata(cache_path).ok()?.len();
+    if size == 0 {
+        return None;
+    }
+    let chunks = size.div_ceil(DEFAULT_CHUNK_SIZE) as usize;
+    let bitmap = load_bitmap(&chunks_sidecar_path(cache_path), chunks).ok()?;
+    (allow_partial || bitmap.iter().all(|b| *b != 0)).then_some(size)
 }
 
 fn chunks_sidecar_path(cache_path: &Path) -> PathBuf {

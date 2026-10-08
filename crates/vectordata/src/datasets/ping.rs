@@ -165,6 +165,28 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&
         // get out of sync.
         match view.open_facet_storage(facet_name) {
             Ok(storage) => {
+                // A complete copy opens from disk without the server, so
+                // ask it directly: reaching the remote is ping's job.
+                if storage.is_complete() && crate::transport::is_remote_url(&source) {
+                    if crate::settings::offline() {
+                        println!("NOT CHECKED: offline mode is on (a complete copy is cached)");
+                        fail += 1;
+                        continue;
+                    }
+                    match storage.revalidate() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            println!("FAILED: unreachable (a complete copy is cached and still readable offline)");
+                            fail += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            println!("FAILED: {e}");
+                            fail += 1;
+                            continue;
+                        }
+                    }
+                }
                 let size = storage.total_size();
                 let locality = if storage.is_local() { " local" } else { " remote" };
                 // Read the first record's header — proving the bytes

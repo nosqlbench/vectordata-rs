@@ -73,6 +73,7 @@ pub fn show() -> i32 {
         Err(_) => println!("  cache_dir: (not set)"),
     }
     println!("  protect_settings: {}", settings::protect_settings());
+    println!("  offline: {}", if settings::offline() { "on" } else { "off" });
 
     println!();
     println!("Catalogs: {}", cats_path.display());
@@ -549,6 +550,41 @@ pub fn set_ui_setting(key: &str, value: &str) -> i32 {
     }
     match crate::settings::write_setting(key, &value) {
         Ok(path) => { println!("{key} = {value}\nSaved to {}", path.display()); 0 }
+        Err(e) => { eprintln!("error: {e}"); 1 }
+    }
+}
+
+/// Print offline mode as it is in effect for this process: `on` / `off`
+/// (standard: off), with the environment variable named when it is
+/// what decided.
+pub fn get_offline() -> i32 {
+    let state = if crate::settings::offline() { "on" } else { "off" };
+    match std::env::var(crate::settings::OFFLINE_ENV) {
+        Ok(v) if !v.is_empty() => println!("{state} (from {}={v})", crate::settings::OFFLINE_ENV),
+        _ => println!("{state}"),
+    }
+    0
+}
+
+/// Validate and persist offline mode to `settings.yaml` via the
+/// comment-preserving line editor.
+pub fn set_offline(value: &str) -> i32 {
+    let norm = match value.trim().to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" | "enabled" => "on",
+        "off" | "false" | "no" | "0" | "disabled" => "off",
+        other => {
+            eprintln!("invalid offline value '{other}' (use on or off)");
+            return 1;
+        }
+    };
+    match crate::settings::write_setting(crate::settings::OFFLINE_KEY, norm) {
+        Ok(path) => {
+            println!("offline = {norm}\nSaved to {}", path.display());
+            if std::env::var(crate::settings::OFFLINE_ENV).is_ok_and(|v| !v.is_empty()) {
+                println!("(note: {} is set in this environment and takes precedence)", crate::settings::OFFLINE_ENV);
+            }
+            0
+        }
         Err(e) => { eprintln!("error: {e}"); 1 }
     }
 }

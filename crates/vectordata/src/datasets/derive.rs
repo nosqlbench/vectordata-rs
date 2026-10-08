@@ -1955,20 +1955,7 @@ fn load_rich_config(group_path: &str) -> Result<RichDatasetConfig, String> {
 }
 
 fn fetch_yaml_url(url: &str) -> io::Result<String> {
-    use crate::transport::shared_client_for;
-    let mut u = url::Url::parse(url)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    if !u.path().ends_with(".yaml") && !u.path().ends_with(".yml") {
-        if !u.path().ends_with('/') {
-            u.set_path(&(u.path().to_owned() + "/"));
-        }
-        u = u.join("dataset.yaml")
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    }
-    let resp = shared_client_for(u.as_str()).get(u).send()
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    resp.text().map_err(|e| io::Error::other(e.to_string()))
+    crate::group::fetch_dataset_yaml(url).map_err(|e| io::Error::other(e.to_string()))
 }
 
 #[cfg(test)]

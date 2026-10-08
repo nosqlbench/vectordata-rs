@@ -316,9 +316,23 @@ impl<T: TypedElement> TypedReader<T> {
         Self::from_storage(storage, native_type, is_scalar)
     }
 
+    /// Deprecated: open a remote dataset through
+    /// [`Catalog`](crate::catalog::Catalog) or
+    /// [`TestDataGroup`](crate::TestDataGroup) and read the facet with
+    /// [`open_facet_typed`](crate::open_facet_typed), which fetch, plan
+    /// and track it as part of its dataset. Its bytes do land in that
+    /// dataset's cache directory when one covers the URL.
+    #[deprecated(
+        since = "2.5.0",
+        note = "open the dataset by catalog or TestDataGroup and use open_facet_typed"
+    )]
+    pub fn open_url(url: url::Url, native_type: ElementType) -> Result<Self, TypedAccessError> {
+        Self::open_remote(url, native_type)
+    }
+
     /// Open a remote URL with cache-first dispatch (merkle cache when
     /// `.mref` is published, direct HTTP otherwise).
-    pub fn open_url(url: url::Url, native_type: ElementType) -> Result<Self, TypedAccessError> {
+    fn open_remote(url: url::Url, native_type: ElementType) -> Result<Self, TypedAccessError> {
         if T::width() < native_type.byte_width() {
             return Err(TypedAccessError::Narrowing { native: native_type, target: T::type_name() });
         }
@@ -328,12 +342,15 @@ impl<T: TypedElement> TypedReader<T> {
         Self::from_storage(storage, native_type, is_scalar)
     }
 
-    /// Open from a path-or-URL string, dispatching automatically.
+    /// Open from a path-or-URL string, dispatching automatically. For a
+    /// remote dataset, prefer opening it by catalog or
+    /// [`TestDataGroup`](crate::TestDataGroup) and reading the facet with
+    /// [`open_facet_typed`](crate::open_facet_typed).
     pub fn open_auto(path_or_url: &str, native_type: ElementType) -> Result<Self, TypedAccessError> {
         if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
             let url = url::Url::parse(path_or_url)
                 .map_err(|e| TypedAccessError::Io(format!("invalid URL: {e}")))?;
-            Self::open_url(url, native_type)
+            Self::open_remote(url, native_type)
         } else {
             Self::open(path_or_url)
         }

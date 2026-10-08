@@ -92,7 +92,11 @@ fn build_client(insecure: bool) -> reqwest::blocking::Client {
         .user_agent(concat!("vectordata/", env!("CARGO_PKG_VERSION")))
         .pool_max_idle_per_host(64)
         .redirect(reqwest::redirect::Policy::limited(10))
-        .timeout(Duration::from_secs(60 * 60)); // 1 h ceiling on long-running large fetches
+        .timeout(Duration::from_secs(60 * 60)) // 1 h ceiling on long-running large fetches
+        // An unreachable server is reported in seconds, not after the
+        // operating system's TCP timeout: a complete local copy is then
+        // used without the caller waiting minutes to learn it is offline.
+        .connect_timeout(Duration::from_secs(10));
     // Augment the system trust roots with any configured CA/leaf certs (e.g. a
     // private vecd's exported cert). Verification stays ON — this is the secure
     // way to trust a self-signed deployment.
@@ -129,6 +133,25 @@ pub(crate) fn shared_client() -> reqwest::blocking::Client {
 /// if `url`'s origin is listed there, returns a client that skips cert
 /// verification; otherwise the normal verifying client. Use this for any request
 /// to a user-configured endpoint so a self-signed local vecd is reachable.
+/// Refuse a request to `url` in offline mode, naming what is missing
+/// and the two ways out. Called at every point the read path would
+/// talk to a dataset server; everything that has a local copy is
+/// served before reaching one.
+pub(crate) fn ensure_online(url: &str) -> io::Result<()> {
+    if crate::settings::offline() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "offline mode is on ({} / settings `{}`): {url} is not available locally. \
+                 Fetch it while online, or turn offline mode off.",
+                crate::settings::OFFLINE_ENV,
+                crate::settings::OFFLINE_KEY
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn shared_client_for(url: &str) -> reqwest::blocking::Client {
     pick(client_pool(trusts_self_signed(url)))
 }

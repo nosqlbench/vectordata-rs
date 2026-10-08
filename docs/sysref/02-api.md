@@ -956,6 +956,49 @@ The `prebuffer_*`, `prefetch` and `prefetch_with_progress` methods
 these replace are deprecated wrappers over `fetch`;
 `prefetch_in_background` remains as the background form.
 
+### Offline opens
+
+A remote facet whose cache copy is complete opens from disk: the merkle
+reference comes from its `.mrkl` state (or, without a `.mref`, the size
+from the cache file and its full chunk bitmap), so no `.mref` fetch and
+no HEAD request is made. A variable-length facet's offset index is read
+from the copy kept beside its cache file. A dataset's `dataset.yaml` is
+fetched first — it can change upstream — with the copy kept in its
+cache directory used when the server cannot be reached (connects time
+out after 10 s). A warmed cache therefore opens and reads with no
+network.
+
+Staleness is checked where the network is meant to be used: `fetch`
+asks the upstream whether each complete copy is still current, and
+reports `FacetFetch::upstream_checked = false` when it could not ask; a
+changed upstream is an error naming the stale cache. `datasets ping`
+does the same and reports an unreachable server as a failure.
+
+A remote catalog file is fetched first too, keeping a copy under
+`<cache>/.catalogs/`, named from its URL with special characters
+collapsed (`https://example.com:8443/data/catalog.json` is kept as
+`example.com_8443_data_catalog.json`); the copy is read when the server
+cannot be reached. A cached dataset therefore opens by name with no
+network.
+
+A file URL opened with no catalog context (`XvecReader::open(url)`,
+`io::open_vec(url)`, `TypedReader::open_auto(url)`) lands in the cache
+directory of the dataset whose recorded origin covers it, so it shares
+the copy a fetch filled instead of keying a second one.
+`XvecReader::open_url` and `TypedReader::open_url` are deprecated in
+favour of opening the dataset by catalog or `TestDataGroup`.
+
+#### Offline mode
+
+`VECTORDATA_OFFLINE=1`, or `offline: on` in `settings.yaml`
+(`vectordata config set offline on`), makes no request to any dataset
+server. Catalogs, definitions and offset indexes come from their kept
+copies, data from the cache — a partially fetched file serves the chunks
+it holds — and anything not held locally is an error saying offline mode
+is on. `fetch` does not revalidate or download. The environment variable
+overrides the setting in both directions. Explicit server commands
+(`login`, `push`, `backup`) are not affected.
+
 ### Per-facet cache stats
 
 `view.open_facet_storage(name)` returns a `FacetStorage` handle —

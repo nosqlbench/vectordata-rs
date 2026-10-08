@@ -2379,6 +2379,28 @@ impl FacetStorage {
         };
         storage.prebuffer_range_with_progress(byte_start, byte_end, cb)
     }
+    /// Ask the upstream whether this facet's complete local copy is
+    /// still what it publishes: `Ok(true)` when it is (or the facet is
+    /// local, or not yet complete — then the open itself went online),
+    /// `Ok(false)` when the server could not be reached and the copy
+    /// stands on its own, an error when the upstream has changed.
+    pub(crate) fn revalidate(&self) -> std::io::Result<bool> {
+        use crate::storage::Revalidation;
+        let parts: Vec<std::sync::Arc<crate::storage::Storage>> = match &self.series {
+            None => vec![self.storage.clone()],
+            Some(s) => (0..s.file_count())
+                .map(|i| s.file(i).map_err(|e| std::io::Error::other(e.to_string())))
+                .collect::<std::io::Result<_>>()?,
+        };
+        let mut reached = true;
+        for p in parts {
+            if p.revalidate()? == Revalidation::Unreachable {
+                reached = false;
+            }
+        }
+        Ok(reached)
+    }
+
     /// Whether every byte this facet can address is resident.
     ///
     /// For whole-file shards — every form but a sliced series — that is

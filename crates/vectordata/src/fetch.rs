@@ -327,6 +327,7 @@ pub struct PlannedFacet {
     window: DSWindow,
     plan: PrefetchPlan,
     storage: FacetStorage,
+    upstream_checked: bool,
 }
 
 impl PlannedFacet {
@@ -344,6 +345,13 @@ impl PlannedFacet {
     /// The byte ranges, chunks and cost the window resolved to.
     pub fn plan(&self) -> &PrefetchPlan {
         &self.plan
+    }
+
+    /// Whether the upstream was reached to confirm a complete local
+    /// copy is current. `false` means it was unreachable and the copy is
+    /// used as cached — the offline case.
+    pub fn upstream_checked(&self) -> bool {
+        self.upstream_checked
     }
 }
 
@@ -448,7 +456,7 @@ impl FetchPlan {
 
         let mut rows = Vec::with_capacity(count);
         for (i, planned) in self.facets.into_iter().enumerate() {
-            let PlannedFacet { id, plan, storage, .. } = planned;
+            let PlannedFacet { id, plan, storage, upstream_checked, .. } = planned;
             let total = plan.bytes_to_fetch();
             progress.on_event(&FetchEvent::FacetBegin {
                 index: i + 1,
@@ -480,16 +488,21 @@ impl FetchPlan {
                     return Err(error);
                 }
             };
+            // What crossed the network is at most what the plan found
+            // missing: the transports also count chunks that were already
+            // resident when a range is asked for, which moved nothing.
+            let moved = fetched.bytes.min(total);
             progress.on_event(&FetchEvent::FacetEnd {
                 facet: &id,
-                bytes: fetched.bytes,
+                bytes: moved,
             });
             rows.push(FacetFetch {
                 id,
                 planned: plan,
                 ranges_fetched: fetched.ranges,
-                bytes_fetched: fetched.bytes,
+                bytes_fetched: moved,
                 complete: storage.is_complete(),
+                upstream_checked,
             });
         }
         let report = FetchReport {
@@ -546,6 +559,10 @@ pub struct FacetFetch {
     /// True after a fetch without a window; after a windowed fetch only
     /// the window's chunks are local.
     pub complete: bool,
+    /// Whether the upstream was reached to confirm the copy is current.
+    /// `false` when it was unreachable and a complete cached copy was
+    /// used as it stands — a fetch on a warmed cache works offline.
+    pub upstream_checked: bool,
 }
 
 // ─── Planning ────────────────────────────────────────────────────────
@@ -621,10 +638,18 @@ pub(crate) fn plan_view<V: TestDataView + ?Sized>(
                 None => facet_declared_window(desc)?,
             };
             let storage = view.open_facet_storage(name)?;
+            // A complete copy opened from disk without asking the
+            // server; a fetch is where it asks. Unreachable is fine —
+            // the copy stands — but a changed upstream is stale.
+            let upstream_checked = if storage.is_complete() {
+                storage.revalidate().map_err(|e| Error::Other(e.to_string()))?
+            } else {
+                true
+            };
             let plan = view.prefetch_plan_on(&storage, name, &window)?;
-            Ok::<_, Error>((window, storage, plan))
+            Ok::<_, Error>((window, storage, plan, upstream_checked))
         })();
-        let (window, storage, plan) = match planned {
+        let (window, storage, plan, upstream_checked) = match planned {
             Ok(p) => p,
             Err(e) => {
                 let error = Error::Other(format!("facet '{id}': {e}"));
@@ -633,7 +658,7 @@ pub(crate) fn plan_view<V: TestDataView + ?Sized>(
             }
         };
         progress.on_event(&FetchEvent::PlanEnd { facet: &id, plan: &plan });
-        out.push(PlannedFacet { id, window, plan, storage });
+        out.push(PlannedFacet { id, window, plan, storage, upstream_checked });
     }
     Ok(())
 }
@@ -674,7 +699,12 @@ pub(crate) fn fetch_planned(
     on_range: &mut dyn FnMut(usize),
 ) -> std::io::Result<Fetched> {
     // Bytes and chunks from the parts or ranges already finished, and
-    // from the one in flight.
+    // from the one in flight. A range that was already resident reports
+    // itself as done — its full size downloaded, out of zero chunks — so
+    // a display can show its size; none of those bytes moved.
+    let moved = |p: &crate::transport::DownloadProgress| {
+        if p.total_chunks() == 0 { (0, 0) } else { (p.downloaded_bytes(), p.completed_chunks()) }
+    };
     let (mut done, mut done_chunks) = (0u64, 0u32);
     if plan.degrades_to_full_download {
         let mut part = None;
@@ -686,7 +716,7 @@ pub(crate) fn fetch_planned(
                 (in_part, in_part_chunks) = (0, 0);
                 part = Some(i);
             }
-            (in_part, in_part_chunks) = (p.downloaded_bytes(), p.completed_chunks());
+            (in_part, in_part_chunks) = moved(p);
             on_progress(done + in_part, done_chunks + in_part_chunks);
         })?;
         on_range(1);
@@ -702,7 +732,7 @@ pub(crate) fn fetch_planned(
         }
         let (mut in_range, mut in_range_chunks) = (0u64, 0u32);
         storage.prebuffer_shard_range(r.shard, r.start, r.end, |p| {
-            (in_range, in_range_chunks) = (p.downloaded_bytes(), p.completed_chunks());
+            (in_range, in_range_chunks) = moved(p);
             on_progress(done + in_range, done_chunks + in_range_chunks);
         })?;
         done += in_range;

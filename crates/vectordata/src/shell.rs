@@ -436,18 +436,22 @@ enum ConfigCmd {
     ///   vectordata config get          # settings.yaml path, cache_dir, etc.
     ///   vectordata config get cache    # the cache_dir on one line (scriptable)
     Get {
-        /// A single setting key (currently `cache`); omit to show everything.
+        /// A single setting key (`cache`, `palette`, `curve`, `update_check`,
+        /// `offline`); omit to show everything.
         key: Option<String>,
     },
     /// Write a config value, e.g. `vectordata config set cache <dir>`.
     ///
     /// For `cache`, the special value `auto` (alias `largest-writable-mount`)
     /// auto-resolves to the largest writable mount with `vectordata-cache` as a
-    /// subdir, falling back to `$HOME/.cache/vectordata`.
+    /// subdir, falling back to `$HOME/.cache/vectordata`. `offline on` stops
+    /// every request to dataset servers: cached data, definitions and
+    /// catalogs are used as kept (VECTORDATA_OFFLINE overrides it).
     Set {
-        /// Setting key (currently `cache`).
+        /// Setting key: `cache`, `palette`, `curve`, `update_check` or `offline`.
         key: String,
-        /// New value (for `cache`: a path, or `auto`).
+        /// New value (for `cache`: a path, or `auto`; for `update_check` and
+        /// `offline`: `on` or `off`).
         value: String,
         /// Overwrite a protected settings.yaml.
         #[arg(long)]
@@ -535,6 +539,7 @@ fn complete_config_set(partial: &str, ctx: &[&str]) -> Vec<String> {
             "palette".to_string(),
             "curve".to_string(),
             "update_check".to_string(),
+            "offline".to_string(),
         ],
         Some(&"palette") => crate::config::ui_palette_names()
             .iter()
@@ -544,7 +549,7 @@ fn complete_config_set(partial: &str, ctx: &[&str]) -> Vec<String> {
             .iter()
             .map(|s| s.to_string())
             .collect(),
-        Some(&"update_check") => vec!["on".to_string(), "off".to_string()],
+        Some(&"update_check" | &"offline") => vec!["on".to_string(), "off".to_string()],
         Some(&"cache") => {
             let mut vals = vec!["auto".to_string()];
             if let Some(home) = std::env::var_os("HOME") {
@@ -572,7 +577,7 @@ fn complete_config_set(partial: &str, ctx: &[&str]) -> Vec<String> {
 /// Tab-completion for `config get <key>` — the same key set as
 /// `config set`.
 fn complete_config_get(partial: &str, _ctx: &[&str]) -> Vec<String> {
-    ["cache", "palette", "curve", "update_check"]
+    ["cache", "palette", "curve", "update_check", "offline"]
         .iter()
         .filter(|k| partial.is_empty() || k.starts_with(partial))
         .map(|k| k.to_string())
@@ -783,9 +788,10 @@ pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
                     Some("cache") => crate::config::get_cache(),
                     Some(k @ ("palette" | "curve")) => crate::config::get_ui_setting(k),
                     Some("update_check") => crate::config::get_update_check(),
+                    Some("offline") => crate::config::get_offline(),
                     Some(other) => {
                         eprintln!(
-                            "unknown config key '{other}' (keys: cache, palette, curve, update_check; or `config get` for all)"
+                            "unknown config key '{other}' (keys: cache, palette, curve, update_check, offline; or `config get` for all)"
                         );
                         2
                     }
@@ -794,9 +800,10 @@ pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
                     "cache" => crate::config::set_cache(std::path::Path::new(&value), force),
                     k @ ("palette" | "curve") => crate::config::set_ui_setting(k, &value),
                     "update_check" => crate::config::set_update_check(&value),
+                    "offline" => crate::config::set_offline(&value),
                     other => {
                         eprintln!(
-                            "unknown config key '{other}' (settable keys: cache, palette, curve, update_check)"
+                            "unknown config key '{other}' (settable keys: cache, palette, curve, update_check, offline)"
                         );
                         2
                     }
@@ -1137,6 +1144,12 @@ fn print_listing(root: &std::path::Path, l: &CacheListing, verbose: bool) {
         println!();
     }
 
+    if !l.catalogs.is_empty() {
+        println!("Kept catalog copies (read when a catalog server is unreachable, or offline):");
+        print_simple_rows(&l.catalogs, root);
+        println!();
+    }
+
     if !l.other.is_empty() {
         println!("Other top-level entries (unrecognised):");
         print_simple_rows(&l.other, root);
@@ -1145,6 +1158,7 @@ fn print_listing(root: &std::path::Path, l: &CacheListing, verbose: bool) {
 
     if l.datasets.is_empty()
         && l.url_derived.is_empty()
+        && l.catalogs.is_empty()
         && l.legacy.is_empty()
         && l.other.is_empty()
     {

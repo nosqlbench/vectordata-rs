@@ -174,8 +174,8 @@ impl TestDataGroup {
         // the URL's parent directory.
         if url.path().ends_with(".yaml") || url.path().ends_with(".yml") {
             let base_url = url.join(".")?;
-            let resp = client.get(url.clone()).send()?.error_for_status()?;
-            let yaml_content = resp.text()?;
+            let yaml_content = fetch_descriptor(&client, &url, &base_url)?
+                .ok_or_else(|| Error::Other(format!("{url}: not found")))?;
             let dir_name = base_url
                 .path_segments()
                 .and_then(|s| s.collect::<Vec<_>>().iter().rev().find(|seg| !seg.is_empty()).cloned())
@@ -203,9 +203,7 @@ impl TestDataGroup {
 
         // Try dataset.yaml first
         let dataset_url = base_url.join("dataset.yaml")?;
-        let resp = client.get(dataset_url.clone()).send()?;
-        if resp.status().is_success() {
-            let yaml_content = resp.text()?;
+        if let Some(yaml_content) = fetch_descriptor(&client, &dataset_url, &base_url)? {
             let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
             let dataset_name = base_url
                 .path_segments()
@@ -224,8 +222,8 @@ impl TestDataGroup {
         // multiple datasets, prefer the one whose name matches the
         // last path segment of the URL; otherwise return the first.
         let knn_url = base_url.join("knn_entries.yaml")?;
-        let resp = client.get(knn_url).send()?.error_for_status()?;
-        let yaml_content = resp.text()?;
+        let yaml_content = fetch_descriptor(&client, &knn_url, &base_url)?
+            .ok_or_else(|| Error::Other(format!("{base_url}: no dataset.yaml or knn_entries.yaml")))?;
         let entries = crate::knn_entries::KnnEntries::parse(&yaml_content)
             .map_err(Error::Other)?;
         let url_dir_name = base_url
@@ -427,6 +425,95 @@ impl TestDataGroup {
     }
 }
 
+/// Fetch a dataset's descriptor (`dataset.yaml`, `knn_entries.yaml`, or
+/// an explicitly named file) from `url`, keeping a copy in the dataset's
+/// cache directory, and falling back to that copy when the server
+/// cannot be reached.
+///
+/// The server is asked first because a descriptor is mutable — a
+/// republished dataset can gain profiles — unlike the verified data it
+/// describes, whose complete copies open with no network at all. The
+/// kept copy is what lets a cached dataset still open when the server
+/// is down or the machine is offline. `Ok(None)` when the server
+/// answered that there is no such file; errors only when it could not
+/// be reached and nothing was kept.
+fn fetch_descriptor(
+    client: &reqwest::blocking::Client,
+    url: &Url,
+    base_url: &Url,
+) -> Result<Option<String>> {
+    let kept = kept_descriptor_path(url, base_url);
+    if crate::settings::offline() {
+        return match kept.filter(|p| p.is_file()) {
+            Some(path) => std::fs::read_to_string(&path).map(Some).map_err(Error::ConfigIo),
+            None => Err(Error::Other(
+                crate::transport::ensure_online(url.as_str()).unwrap_err().to_string(),
+            )),
+        };
+    }
+    let resp = crate::transport::apply_read_auth(client.get(url.clone()), Some(url)).send();
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let text = r.text()?;
+            if let Some(path) = &kept {
+                // Best effort: a cache directory that cannot be written
+                // only costs the offline fallback.
+                let _ = path.parent().map(std::fs::create_dir_all);
+                let _ = std::fs::write(path, &text);
+            }
+            Ok(Some(text))
+        }
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => Ok(None),
+        Ok(r) => Err(Error::Other(format!("{url}: {}", r.status()))),
+        Err(e) if e.is_connect() || e.is_timeout() => match kept.filter(|p| p.is_file()) {
+            Some(path) => {
+                log::warn!("{url} is unreachable ({e}); using the copy kept at {}", path.display());
+                std::fs::read_to_string(&path).map(Some).map_err(Error::ConfigIo)
+            }
+            None => Err(Error::Http(e)),
+        },
+        Err(e) => Err(Error::Http(e)),
+    }
+}
+
+/// Fetch a dataset's `dataset.yaml` from a URL naming the dataset
+/// directory or the file itself, through [`fetch_descriptor`]: read
+/// auth, a kept copy, and that copy when the server is unreachable. For
+/// callers that need the raw text rather than a parsed group.
+pub(crate) fn fetch_dataset_yaml(url_str: &str) -> Result<String> {
+    let mut url = Url::parse(url_str)?;
+    if !url.path().ends_with(".yaml") && !url.path().ends_with(".yml") {
+        if !url.path().ends_with('/') {
+            url.set_path(&(url.path().to_owned() + "/"));
+        }
+        url = url.join("dataset.yaml")?;
+    }
+    let base_url = url.join(".")?;
+    let client = crate::transport::shared_client_for(url.as_str());
+    fetch_descriptor(&client, &url, &base_url)?
+        .ok_or_else(|| Error::Other(format!("{url}: not found")))
+}
+
+/// Where a descriptor fetched from `url` is kept: under the dataset's
+/// cache directory, `<cache>/<dataset>/<path below the dataset's base>`
+/// — the same place the published layout puts it. `None` without a
+/// configured cache.
+fn kept_descriptor_path(url: &Url, base_url: &Url) -> Option<std::path::PathBuf> {
+    let cache_root = crate::settings::cache_dir().ok()?;
+    let dataset = base_url
+        .path_segments()?
+        .rfind(|s| !s.is_empty())?
+        .to_string();
+    let rel = url.path().strip_prefix(base_url.path()).unwrap_or(url.path()).trim_start_matches('/');
+    if rel.is_empty() || rel.contains("..") {
+        return None;
+    }
+    let dir = crate::cache::layout::dataset_cache_dir(&cache_root, &dataset);
+    // The directory belongs to one origin; a same-named dataset from
+    // elsewhere neither reads nor overwrites this one's descriptor.
+    crate::cache::layout::verify_or_record_origin(&dir, &with_trailing_slash(base_url.as_str())).ok()?;
+    Some(dir.join(rel))
+}
 
 /// Planned download size at which a fetch deserves a "this is a lot of
 /// data" notice before it starts: what `vectordata datasets precache`

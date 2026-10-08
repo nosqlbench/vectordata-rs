@@ -45,6 +45,99 @@ pub(crate) const DATASET_ORIGIN_FILE: &str = "origin.json";
 /// apply to them.
 pub(crate) const DOWNLOAD_SUFFIX: &str = ".download";
 
+/// The dataset directory under `cache_root` whose recorded origin covers
+/// `url`, with the file's path inside it: where a URL opened with no
+/// catalog context belongs when its dataset was ever opened through one.
+///
+/// A dataset directory's `origin.json` names the dataset's home URL; a
+/// URL below it is one of that dataset's files, and its cache file is
+/// the one the dataset-anchored open uses (`<dataset>/<path below the
+/// home>`). Without this, a URL open keyed a second, URL-derived entry
+/// for the same file and downloaded it again. The longest covering
+/// origin wins. A top-level directory named after the URL's own
+/// authority is a URL-derived entry, not a dataset, and is skipped.
+pub(crate) fn dataset_dir_covering(cache_root: &Path, url: &url::Url) -> Option<(PathBuf, String, String)> {
+    let authority = match url.port() {
+        Some(port) => format!("{}_{port}", url.host_str().unwrap_or("")),
+        None => url.host_str().unwrap_or("").to_string(),
+    };
+    let target = url.as_str();
+    let mut best: Option<(PathBuf, String)> = None;
+    for entry in std::fs::read_dir(cache_root).ok()?.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() || entry.file_name().to_string_lossy() == authority {
+            continue;
+        }
+        let Some(origin) = read_dataset_origin(&dir) else { continue };
+        let home = if origin.source.ends_with('/') { origin.source.clone() } else { format!("{}/", origin.source) };
+        if target.starts_with(&home) && best.as_ref().is_none_or(|(_, h)| home.len() > h.len()) {
+            best = Some((dir, home));
+        }
+    }
+    let (dir, home) = best?;
+    let rel = target[home.len()..].split(['?', '#']).next().unwrap_or("").to_string();
+    (!rel.is_empty()).then(|| {
+        let origin = read_dataset_origin(&dir).map(|o| o.source).unwrap_or(home);
+        (dir, origin, rel)
+    })
+}
+
+/// Directory under the cache root holding the kept copy of each remote
+/// catalog file — what a catalog is read from when its server cannot be
+/// reached, or in offline mode. A dot directory: it holds no dataset.
+pub(crate) const CATALOG_COPIES_DIR: &str = ".catalogs";
+
+/// The file name a remote catalog's kept copy is stored under: its URL
+/// without the scheme, query or fragment, every run of characters
+/// outside `[A-Za-z0-9._-]` collapsed to one `_`, host lowercased.
+/// Readable at a glance — `https://Example.com:8443/data/catalog.json`
+/// is `example.com_8443_data_catalog.json` — where a hash would not be.
+pub(crate) fn kept_catalog_name(url: &str) -> String {
+    let parsed = url::Url::parse(url).ok();
+    let canonical = match &parsed {
+        Some(u) => {
+            let host = u.host_str().unwrap_or("").to_lowercase();
+            let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
+            format!("{host}{port}{}", percent_decode(u.path()))
+        }
+        None => url.to_string(),
+    };
+    let mut out = String::with_capacity(canonical.len());
+    for c in canonical.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') {
+            out.push(c);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches(|c| c == '_' || c == '.');
+    if trimmed.is_empty() { "catalog".to_string() } else { trimmed.to_string() }
+}
+
+/// `%XX` escapes in a URL path decoded to the characters they stand for,
+/// so a name built from the path reflects what was written, not how it
+/// was encoded. Invalid escapes and non-UTF-8 results pass through.
+fn percent_decode(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| path.to_string())
+}
+
 /// Compute the per-dataset cache directory under `cache_root`. The
 /// directory mirrors the dataset name verbatim — no host prefix, no
 /// hash, no shape distinction (`blobs/` vs `http/`). Two catalogs
@@ -320,6 +413,54 @@ fn extract_json_string(content: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A catalog's kept copy is named from its URL, readably: no
+    /// scheme or query, special characters collapsed to `_`.
+    #[test]
+    fn kept_catalog_names_are_sanitized_urls() {
+        use super::kept_catalog_name;
+        assert_eq!(
+            kept_catalog_name("https://Example.com:8443/data/catalog.json"),
+            "example.com_8443_data_catalog.json"
+        );
+        assert_eq!(
+            kept_catalog_name("https://host/a b/knn entries.yaml?x=1#f"),
+            "host_a_b_knn_entries.yaml"
+        );
+        assert_eq!(kept_catalog_name("https://host/"), "host");
+        assert_eq!(kept_catalog_name("not a url"), "not_a_url");
+        assert_eq!(kept_catalog_name("https://h/caf%C3%A9/%é/x%2"), "h_caf_x_2", "non-ASCII collapses; stray %s are safe");
+    }
+
+    /// A URL below a dataset directory's recorded origin resolves into
+    /// that directory, at its path below the origin; the longest origin
+    /// wins, and a directory named for the URL's authority is skipped.
+    #[test]
+    fn a_url_resolves_into_the_dataset_directory_that_covers_it() {
+        use super::{dataset_dir_covering, write_dataset_origin};
+        let root = tempfile::tempdir().unwrap();
+        let ds = root.path().join("mydata");
+        let nested = root.path().join("mydata-sub");
+        let authority = root.path().join("h.example_8080");
+        for d in [&ds, &nested, &authority] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        write_dataset_origin(&ds, "http://h.example:8080/sets/mydata/").unwrap();
+        write_dataset_origin(&nested, "http://h.example:8080/sets/mydata/sub/").unwrap();
+        write_dataset_origin(&authority, "http://h.example:8080/").unwrap();
+
+        let url = url::Url::parse("http://h.example:8080/sets/mydata/profiles/1m/base.fvec").unwrap();
+        let (dir, origin, rel) = dataset_dir_covering(root.path(), &url).unwrap();
+        assert_eq!(dir, ds);
+        assert_eq!(origin, "http://h.example:8080/sets/mydata/");
+        assert_eq!(rel, "profiles/1m/base.fvec");
+
+        let deeper = url::Url::parse("http://h.example:8080/sets/mydata/sub/q.fvec").unwrap();
+        assert_eq!(dataset_dir_covering(root.path(), &deeper).unwrap().0, nested, "the longest origin wins");
+
+        let elsewhere = url::Url::parse("http://h.example:8080/other/x.fvec").unwrap();
+        assert!(dataset_dir_covering(root.path(), &elsewhere).is_none(), "the authority entry is not a dataset");
+    }
+
     use super::*;
 
     #[test]

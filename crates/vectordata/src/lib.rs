@@ -116,6 +116,15 @@
 //!
 //! ## Traps
 //!
+//! - **A fetched facet needs no network.** A complete cached copy opens
+//!   from disk — no `.mref` fetch, no HEAD — and a dataset's definition
+//!   and its catalog fall back to the copies kept when they were last
+//!   fetched, so a warmed cache works offline. Whether the upstream has
+//!   since changed is asked by [`TestDataView::fetch`] (and `datasets
+//!   ping`), not by opening;
+//!   [`FacetFetch::upstream_checked`](fetch::FacetFetch::upstream_checked)
+//!   says whether it could be. [`settings::offline`] (`VECTORDATA_OFFLINE=1`
+//!   or `offline: on`) goes further and makes no request at all.
 //! - **Opening a reader does not fetch the facet.** Reads fetch the
 //!   chunks they touch, one request at a time. For a scan, fetch first
 //!   ([`TestDataView::fetch`]) — in parallel, with progress — and read

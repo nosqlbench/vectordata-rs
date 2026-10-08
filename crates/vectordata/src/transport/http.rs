@@ -80,6 +80,7 @@ impl HttpTransport {
     /// probe retried once. All subsequent `fetch_range` calls
     /// pick up the corrected URL.
     fn probe(&self) -> io::Result<(u64, bool)> {
+        super::ensure_online(self.url.as_str())?;
         let target = self.effective_url().clone();
         let resp = super::apply_read_auth(self.client.head(target.clone()), Some(&target))
             .send()
@@ -208,6 +209,7 @@ impl ChunkedTransport for HttpTransport {
         // original (wrong) URL and S3 returns a 301 XML body that
         // confuses the byte-count assertion downstream.
         self.ensure_probed()?;
+        super::ensure_online(self.url.as_str())?;
         // Pick a client off the round-robin pool **per call**, not
         // per transport. A single shared `Client` puts every worker's
         // HTTP completion + TLS decryption on the same internal

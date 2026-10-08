@@ -790,7 +790,51 @@ fn dir_name_of_path(path: &str) -> String {
 /// forms `is_remote_url` recognises — `http(s)://` pass through, and
 /// `s3://bucket/key` is rewritten via `normalize_remote_url` to the
 /// virtual-hosted HTTPS endpoint before the wire.
+/// A remote catalog file's text: from its server, keeping a copy under
+/// the cache root; from that copy when the server cannot be reached; and
+/// only from it in offline mode. A server that answers with an error
+/// status is an error, so a missing catalog file is never papered over
+/// by an old copy.
 fn fetch_http(url: &str) -> Result<String, String> {
+    let kept = crate::settings::cache_dir().ok().map(|root| {
+        root.join(crate::cache::layout::CATALOG_COPIES_DIR)
+            .join(crate::cache::layout::kept_catalog_name(url))
+    });
+    let from_kept = |why: &str| -> Result<String, String> {
+        match kept.as_ref().filter(|p| p.is_file()) {
+            Some(path) => {
+                log::warn!("{why}; using the copy of {url} kept at {}", path.display());
+                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+            }
+            None => Err(format!("{why}, and no copy of {url} is kept")),
+        }
+    };
+    if crate::settings::offline() {
+        return from_kept("offline mode is on");
+    }
+    match fetch_http_online(url) {
+        Ok(text) => {
+            if let Some(path) = &kept {
+                // Best effort: an unwritable cache only costs the offline copy.
+                let _ = path.parent().map(std::fs::create_dir_all);
+                let _ = std::fs::write(path, &text);
+            }
+            Ok(text)
+        }
+        Err(Fetch::Unreachable(e)) => from_kept(&format!("{url} is unreachable ({e})")),
+        Err(Fetch::Failed(e)) => Err(e),
+    }
+}
+
+/// Why an online catalog fetch failed.
+enum Fetch {
+    /// The server could not be reached at all.
+    Unreachable(String),
+    /// It answered, with an error or an unreadable body.
+    Failed(String),
+}
+
+fn fetch_http_online(url: &str) -> Result<String, Fetch> {
     let client = crate::transport::shared_client_for(url);
     let normalized = crate::transport::normalize_remote_url(url);
 
@@ -804,16 +848,18 @@ fn fetch_http(url: &str) -> Result<String, String> {
         && let Some(token) = crate::credentials::resolve_read_token(&parsed) {
             rb = rb.bearer_auth(token);
         }
-    let response = rb.send()
-        .map_err(|e| format!("HTTP request to {} failed: {}", url, e))?;
+    let response = rb.send().map_err(|e| {
+        let msg = format!("HTTP request to {url} failed: {e}");
+        if e.is_connect() || e.is_timeout() { Fetch::Unreachable(msg) } else { Fetch::Failed(msg) }
+    })?;
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("HTTP {} from {}", status.as_u16(), url));
+        return Err(Fetch::Failed(format!("HTTP {} from {}", status.as_u16(), url)));
     }
 
     response.text()
-        .map_err(|e| format!("failed to read response from {}: {}", url, e))
+        .map_err(|e| Fetch::Failed(format!("failed to read response from {}: {}", url, e)))
 }
 
 /// Convert a simple glob pattern to a regex-style matcher.

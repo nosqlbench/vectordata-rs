@@ -35,6 +35,15 @@ use crate::transport::HttpTransport;
 /// Variants are deliberately not exposed: `pub(crate)` on the enum and
 /// every constructor. Public reader types embed `Arc<Storage>` and
 /// expose only shape-aware methods.
+/// What [`Storage::revalidate`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Revalidation {
+    /// The local copy is what the upstream publishes, or is local.
+    Current,
+    /// The upstream could not be reached; the local copy stands.
+    Unreachable,
+}
+
 pub(crate) enum Storage {
     /// Local file, mmap'd. Zero-copy, no fallback.
     Mmap {
@@ -242,6 +251,18 @@ pub(crate) struct LayoutChoice {
 pub(crate) fn layout_for_url(url: &Url) -> io::Result<LayoutChoice> {
     let cache_root = crate::settings::cache_dir()
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
+    // A file of a dataset already cached under its own name belongs in
+    // that dataset's directory: one cache file per remote file, however
+    // it is opened.
+    if let Some((dataset_dir, origin_source, file_relpath)) =
+        layout::dataset_dir_covering(&cache_root, url)
+    {
+        return Ok(LayoutChoice {
+            dataset_dir,
+            file_relpath,
+            origin_source,
+        });
+    }
     let host = url.host_str().unwrap_or("_remote");
     // Include explicit port in the authority component so two
     // servers on the same host (different ports) — common in
@@ -550,9 +571,141 @@ impl Storage {
             Some(l) => l,
             None => layout_for_url(&url)?,
         };
+        // A complete copy opens from disk: no `.mref` fetch, no HEAD.
+        // Its content was verified as it arrived, and reading it must
+        // not depend on the network being there.
+        if let Some(local) = Self::open_url_complete(&url, &layout)? {
+            return Ok(local);
+        }
         match Self::open_url_cached(url.clone(), &layout) {
             Ok(s) => Ok(s),
             Err(_) => Self::open_url_http(url, &layout),
+        }
+    }
+
+    /// Open a remote URL whose cache copy is already complete, without
+    /// touching the network: a merkle-verified copy from its `.mrkl`
+    /// state, else a chunk-store copy whose bitmap is full. `Ok(None)`
+    /// when there is no complete copy, and the caller goes online.
+    fn open_url_complete(url: &Url, layout: &LayoutChoice) -> io::Result<Option<Self>> {
+        let cache_path = layout.dataset_dir.join(&layout.file_relpath);
+        if !cache_path.is_file() {
+            return Ok(None);
+        }
+        layout::verify_or_record_origin(&layout.dataset_dir, &layout.origin_source)
+            .map_err(io::Error::from)?;
+        // Offline, a partial copy opens too and serves what it holds;
+        // a read of a missing chunk then says offline mode is on.
+        let allow_partial = crate::settings::offline();
+        let client = crate::transport::shared_client_for(url.as_str());
+        if let Some(channel) = CachedChannel::open_complete(
+            Arc::new(HttpTransport::with_client(client, url.clone())),
+            &layout.dataset_dir,
+            &layout.file_relpath,
+            allow_partial,
+        ) {
+            let channel = channel.with_source_url(url.as_str());
+            let mmap = OnceLock::new();
+            if channel.is_complete()
+                && let Ok(file) = std::fs::File::open(channel.cache_path())
+                && let Ok(m) = unsafe { Mmap::map(&file) }
+            {
+                let _ = mmap.set(m);
+            }
+            return Ok(Some(Storage::Cached { channel, mmap }));
+        }
+        if let Some(total_size) = crate::chunked_http::complete_size_on_disk(&cache_path, allow_partial) {
+            let chunks = Arc::new(crate::chunked_http::ChunkStore::open(
+                HttpTransport::new(url.clone()),
+                total_size,
+                cache_path,
+            )?);
+            let mmap = OnceLock::new();
+            if chunks.is_complete()
+                && let Ok(file) = std::fs::File::open(chunks.cache_path())
+                && let Ok(m) = unsafe { Mmap::map(&file) }
+            {
+                let _ = mmap.set(m);
+            }
+            return Ok(Some(Storage::Http { chunks, mmap }));
+        }
+        Ok(None)
+    }
+
+    /// Ask the upstream whether a complete local copy is still what it
+    /// publishes — the check a complete open skips, made at the points
+    /// whose job is to talk to the server: a fetch, a ping.
+    ///
+    /// [`Revalidation::Unreachable`] when the server cannot be asked: a
+    /// complete copy stays usable offline. An upstream that has changed
+    /// is an error naming the stale cache, as a fresh open has always
+    /// reported it. Local files and incomplete copies — which went
+    /// online to open — have nothing to revalidate.
+    pub(crate) fn revalidate(&self) -> io::Result<Revalidation> {
+        if crate::settings::offline() && !matches!(self, Storage::Mmap { .. }) {
+            return Ok(Revalidation::Unreachable);
+        }
+        match self {
+            Storage::Mmap { .. } => Ok(Revalidation::Current),
+            Storage::Series { parts, .. } => {
+                let mut outcome = Revalidation::Current;
+                for p in parts {
+                    if p.revalidate()? == Revalidation::Unreachable {
+                        outcome = Revalidation::Unreachable;
+                    }
+                }
+                Ok(outcome)
+            }
+            Storage::Cached { channel, .. } => {
+                let Some(url) = channel.source_url().map(str::to_string) else {
+                    return Ok(Revalidation::Current);
+                };
+                let mref_url = format!("{url}.mref");
+                let client = crate::transport::shared_client_for(&url);
+                let parsed = Url::parse(&mref_url).ok();
+                let resp = match crate::transport::apply_read_auth(client.get(&mref_url), parsed.as_ref()).send() {
+                    Ok(r) => r,
+                    Err(e) if e.is_connect() || e.is_timeout() => return Ok(Revalidation::Unreachable),
+                    Err(e) => return Err(io::Error::other(format!("revalidate {url}: {e}"))),
+                };
+                if !resp.status().is_success() {
+                    return Err(io::Error::other(format!(
+                        "revalidate {url}: the server no longer publishes its .mref ({})",
+                        resp.status()
+                    )));
+                }
+                let bytes = resp.bytes().map_err(|e| io::Error::other(format!("revalidate {url}: {e}")))?;
+                let upstream = MerkleRef::from_bytes(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("mref parse: {e}")))?;
+                if upstream.root_hash() != channel.reference().root_hash() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "cache for {url} is stale: the remote resource has changed since it \
+                             was cached. Remove its dataset with `vectordata cache prune` and \
+                             fetch again."
+                        ),
+                    ));
+                }
+                Ok(Revalidation::Current)
+            }
+            Storage::Http { chunks, .. } => {
+                use crate::transport::ChunkedTransport;
+                let transport = HttpTransport::new(chunks.url().clone());
+                match transport.content_length() {
+                    Ok(len) if len == chunks.total_size() => Ok(Revalidation::Current),
+                    Ok(len) => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "cache for {} is stale: the remote file is {len} bytes, the cached copy \
+                             {}. Remove its dataset with `vectordata cache prune` and fetch again.",
+                            chunks.url(),
+                            chunks.total_size()
+                        ),
+                    )),
+                    Err(_) => Ok(Revalidation::Unreachable),
+                }
+            }
         }
     }
 
@@ -560,6 +713,7 @@ impl Storage {
     /// published `.mref`. Crate-internal; callers go through
     /// `open_url` so the fallback path runs uniformly.
     pub(crate) fn open_url_cached(url: Url, layout: &LayoutChoice) -> io::Result<Self> {
+        crate::transport::ensure_online(url.as_str())?;
         let client = crate::transport::shared_client_for(url.as_str());
         let mref_url_str = format!("{}.mref", url.as_str());
         let mref_url = Url::parse(&mref_url_str).map_err(|e| {
@@ -589,13 +743,15 @@ impl Storage {
 
         layout::verify_or_record_origin(&layout.dataset_dir, &layout.origin_source)
             .map_err(io::Error::from)?;
+        let url_for_revalidation = url.clone();
         let transport = HttpTransport::with_client(client, url);
         let channel = CachedChannel::open(
             Arc::new(transport),
             reference,
             &layout.dataset_dir,
             &layout.file_relpath,
-        )?;
+        )?
+        .with_source_url(url_for_revalidation.as_str());
 
         let mmap = OnceLock::new();
         if channel.is_complete()

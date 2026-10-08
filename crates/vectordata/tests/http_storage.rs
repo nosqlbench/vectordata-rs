@@ -414,7 +414,7 @@ fn typed_reader_open_url_scalar_u8_native() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
-    let r = TypedReader::<u8>::open_url(url, ElementType::U8).unwrap();
+    let r = TypedReader::<u8>::open_auto(url.as_str(), ElementType::U8).unwrap();
     assert_eq!(r.count(), 256);
     assert_eq!(r.dim(), 1);
     assert!(r.is_native());
@@ -432,7 +432,7 @@ fn typed_reader_open_url_widening_u8_to_i32() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
-    let r = TypedReader::<i32>::open_url(url, ElementType::U8).unwrap();
+    let r = TypedReader::<i32>::open_auto(url.as_str(), ElementType::U8).unwrap();
     assert!(!r.is_native());
     assert_eq!(r.get_value(0).unwrap(), 0i32);
     assert_eq!(r.get_value(42).unwrap(), 42i32);
@@ -449,7 +449,7 @@ fn typed_reader_open_url_narrowing_rejected() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.i32", server.base_url())).unwrap();
 
-    let result = TypedReader::<u8>::open_url(url, ElementType::I32);
+    let result = TypedReader::<u8>::open_auto(url.as_str(), ElementType::I32);
     assert!(result.is_err(), "narrowing must be rejected at open time");
 }
 
@@ -467,7 +467,7 @@ fn typed_reader_open_url_no_mref_still_works() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
-    let r = TypedReader::<u8>::open_url(url, ElementType::U8).unwrap();
+    let r = TypedReader::<u8>::open_auto(url.as_str(), ElementType::U8).unwrap();
     assert_eq!(r.count(), 64);
     assert_eq!(r.get_value(7).unwrap(), 7);
 }
@@ -481,7 +481,7 @@ fn typed_reader_open_url_ivec_record() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}data.ivec", server.base_url())).unwrap();
 
-    let r = TypedReader::<i32>::open_url(url, ElementType::I32).unwrap();
+    let r = TypedReader::<i32>::open_auto(url.as_str(), ElementType::I32).unwrap();
     assert_eq!(r.count(), 5);
     assert_eq!(r.dim(), 3);
     let rec = r.get_record(2).unwrap();
@@ -1050,11 +1050,11 @@ fn prebuffer_propagates_failure_for_typed_reader_too() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
-    let early = TypedReader::<u8>::open_url(url.clone(), ElementType::U8).unwrap();
+    let early = TypedReader::<u8>::open_auto(url.as_str(), ElementType::U8).unwrap();
     assert!(!early.is_complete());
 
     // Precache on a separate TypedReader.
-    let pb = TypedReader::<u8>::open_url(url.clone(), ElementType::U8).unwrap();
+    let pb = TypedReader::<u8>::open_auto(url.as_str(), ElementType::U8).unwrap();
     pb.precache().unwrap();
 
     // Early reader picks up promotion on next access.

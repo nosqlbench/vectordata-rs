@@ -506,6 +506,12 @@ impl<T: VvecElement> XvecReader<T> {
     /// Open from a path or URL string. Local paths use mmap; URLs try
     /// the merkle-cache path first and fall back to direct HTTP.
     ///
+    /// For a remote dataset, prefer opening it by
+    /// [`Catalog`](crate::catalog::Catalog) or
+    /// [`TestDataGroup`](crate::TestDataGroup) and reading the facet from
+    /// its view; a URL opened here shares that dataset's cache directory
+    /// when one covers it, but has no fetch or profiles around it.
+    ///
     /// Opening a URL reads only the header. Reads then fetch the chunks
     /// they touch — except against a server without HTTP range support,
     /// where the first read downloads the whole file, because no other
@@ -525,8 +531,17 @@ impl<T: VvecElement> XvecReader<T> {
         Self::from_storage(storage)
     }
 
-    /// Open a remote URL with cache-first dispatch. Equivalent to
-    /// `open(url.as_str())` but takes a parsed `Url` directly.
+    /// Deprecated: open a remote dataset through
+    /// [`Catalog`](crate::catalog::Catalog) or
+    /// [`TestDataGroup`](crate::TestDataGroup) and read its facets from
+    /// the view, which fetch, plan and track it as one dataset. A URL
+    /// opened here has no dataset around it: no fetch, no profiles, no
+    /// windows. Its bytes do land in that dataset's cache directory when
+    /// one covers the URL.
+    #[deprecated(
+        since = "2.5.0",
+        note = "open the dataset by catalog or TestDataGroup and read the facet from its view"
+    )]
     pub fn open_url(url: Url) -> Result<Self, IoError> {
         let storage = Storage::open_url(url)?;
         Self::from_storage(storage)
@@ -1052,7 +1067,9 @@ impl<'a, T: VvecElement> Drop for StreamReclaim<'a, T> {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Open a uniform vector file for typed random access. Local or
-/// remote — the source string is the dispatch.
+/// remote — the source string is the dispatch. For a remote dataset,
+/// prefer [`Catalog`](crate::catalog::Catalog) or
+/// [`TestDataGroup`](crate::TestDataGroup) and the view's readers.
 ///
 /// ```no_run
 /// use vectordata::io::open_vec;
@@ -1149,7 +1166,7 @@ fn load_or_build_local_offsets(
     let opened = storage.local_path();
     let data_path = opened.as_deref().unwrap_or(data_path);
     let index_path = index_path_for(data_path, total_size);
-    if let Some(cached) = load_local_index(&index_path, data_path)? {
+    if let Some(cached) = load_local_index(&index_path, data_path, true)? {
         return Ok(cached);
     }
     // Build by walking the mmap (local storage always has mmap).
@@ -1197,24 +1214,33 @@ fn load_or_fetch_remote_offsets(
         ),
         (format!("{base_str}/IDXFOR__{data_name}.{other}"), other),
     ];
+    // The local copy first: an index this cache already holds — one a
+    // previous open fetched, or rebuilt by walking a complete copy —
+    // needs no network, and a complete dataset must open without one.
+    let cache_path = storage.local_path();
+    if let Some(cp) = &cache_path {
+        let index_path = index_path_for(cp, total_size);
+        if let Some(cached) = load_local_index(&index_path, cp, false)? {
+            return Ok(cached);
+        }
+    }
+    // Then the published sidecar, kept beside the cache file once
+    // fetched so the next open is local. Same read-side auth as every
+    // data fetch, or a token-protected server answers 401 and the open
+    // falls through to the walk.
     let client = crate::transport::shared_client_for(&base_str);
-    for (cand, ext) in &candidates {
-        if let Ok(resp) = client.get(cand).send()
+    let candidates: &[(String, &str)] = if crate::settings::offline() { &[] } else { &candidates };
+    for (cand, ext) in candidates {
+        let parsed = Url::parse(cand).ok();
+        if let Ok(resp) = crate::transport::apply_read_auth(client.get(cand), parsed.as_ref()).send()
             && resp.status().is_success()
             && let Ok(bytes) = resp.bytes()
         {
-            return Ok(parse_index_bytes(&bytes, ext, total_size));
-        }
-    }
-    // Second chance before the expensive walk: a prior open of this
-    // URL already walked the file and persisted the rebuilt index
-    // next to the local cache file. Without this, every open of a
-    // remote vvec with no published sidecar re-paid the full walk.
-    let cache_path = storage.local_path();
-    if let Some(cp) = &cache_path {
-        let index_path = index_path_for(cp, storage.total_size());
-        if let Some(cached) = load_local_index(&index_path, cp)? {
-            return Ok(cached);
+            let offsets = parse_index_bytes(&bytes, ext, total_size);
+            if let Some(cp) = &cache_path {
+                let _ = write_index(&index_path_for(cp, total_size), &offsets, total_size);
+            }
+            return Ok(offsets);
         }
     }
     // Everything cheap is exhausted; only the walk remains. Over a
@@ -1346,19 +1372,33 @@ fn index_path_for(data_path: &Path, file_size: u64) -> std::path::PathBuf {
     parent.join(format!("IDXFOR__{name}.{}", index_ext_for(file_size)))
 }
 
-fn load_local_index(index_path: &Path, data_path: &Path) -> Result<Option<Vec<u64>>, IoError> {
+/// Load an offset sidecar beside `data_path`.
+///
+/// `data_can_change` says whether the data file's mtime means anything:
+/// for a local source file it does — an index older than its data was
+/// built from a previous version — but a cache copy's mtime moves every
+/// time a chunk lands while its content stays fixed, so for one the
+/// check would only throw away good indexes. A cache copy whose upstream
+/// changed is caught by revalidation, not here.
+fn load_local_index(
+    index_path: &Path,
+    data_path: &Path,
+    data_can_change: bool,
+) -> Result<Option<Vec<u64>>, IoError> {
     if !index_path.is_file() {
         return Ok(None);
     }
     let data_meta = std::fs::metadata(data_path)?;
-    let data_mtime = data_meta
-        .modified()
-        .map_err(|e| IoError::InvalidFormat(format!("mtime: {e}")))?;
-    let index_mtime = std::fs::metadata(index_path)?
-        .modified()
-        .map_err(|e| IoError::InvalidFormat(format!("mtime: {e}")))?;
-    if index_mtime < data_mtime {
-        return Ok(None);
+    if data_can_change {
+        let data_mtime = data_meta
+            .modified()
+            .map_err(|e| IoError::InvalidFormat(format!("mtime: {e}")))?;
+        let index_mtime = std::fs::metadata(index_path)?
+            .modified()
+            .map_err(|e| IoError::InvalidFormat(format!("mtime: {e}")))?;
+        if index_mtime < data_mtime {
+            return Ok(None);
+        }
     }
     let data = std::fs::read(index_path)?;
     let ext = index_path

@@ -478,6 +478,7 @@ mod tests {
                 ranges_fetched: 0,
                 bytes_fetched: 0,
                 complete: true,
+                upstream_checked: true,
             }],
             elapsed: Duration::ZERO,
         };

@@ -144,6 +144,20 @@ Each of these exists, is tested, and handles cases that are easy to miss.
 
 ## Traps
 
+- **A fetched facet needs no network.** Complete copies open from disk,
+  and dataset definitions fall back to a kept copy, so a warmed cache
+  works offline. Upstream changes are detected by `fetch` (and
+  `datasets ping`), not by opening; a fetch that could not reach the
+  server says so in
+  [`FacetFetch::upstream_checked`](crate::fetch::FacetFetch::upstream_checked).
+  Remote catalogs keep a copy too, under `<cache>/.catalogs/`.
+  `VECTORDATA_OFFLINE=1` (or `vectordata config set offline on`) makes
+  no request at all; what was never fetched is then an error saying so.
+- **Open remote datasets by catalog or `TestDataGroup`, not by file
+  URL.** `XvecReader::open_url` and `TypedReader::open_url` are
+  deprecated; a file URL opened with the path-or-URL constructors lands
+  in its dataset's cache directory when one covers it, but has no
+  fetch, profiles or windows around it.
 - **Opening a reader does not fetch the facet.** Reads fetch the chunks
   they touch, one at a time. For a scan, `fetch` first and read locally.
 - **A remote variable-length facet with no published offset index

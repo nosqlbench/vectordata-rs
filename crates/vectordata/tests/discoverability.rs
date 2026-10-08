@@ -318,3 +318,63 @@ fn the_fetch_surface_is_the_budgeted_one() {
         assert!(seen.contains_key(*name), "budgeted `{name}` ({why}) no longer exists; drop it");
     }
 }
+
+/// The files allowed to open a network client or transport, and why.
+/// Every remote **data** byte goes through `storage` and lands in a
+/// cache file; everything else here is a descriptor, a control-plane
+/// call, or a probe that reads no data.
+const NETWORK_ENTRY_POINTS: &[(&str, &str)] = &[
+    ("transport/mod.rs", "the HTTP client pool and transport layer itself"),
+    ("transport/http.rs", "the HTTP transport the caches fetch through"),
+    ("storage.rs", "opening remote storage: the .mref probe and revalidation; bytes land in a cache file"),
+    ("io.rs", "the offset-index sidecar, kept beside the cache file once fetched"),
+    ("group.rs", "dataset descriptors, kept in the dataset's cache directory and used offline"),
+    ("catalog/resolver.rs", "catalog files"),
+    ("endpoint.rs", "the vecd control-plane API (login, whoami, tokens) — no dataset bytes"),
+    ("push/transport/https.rs", "uploads"),
+    ("update_check.rs", "the release check — no dataset bytes"),
+    ("datasets/filter.rs", "list/filter size and dimension probes: a HEAD and a 4-byte header, no data"),
+    ("explore/dataset_picker.rs", "picker size probes: a HEAD and a 4-byte header, no data"),
+];
+
+/// **No remote data is read except through the cache.** Opening a
+/// network client or transport anywhere else is how a reader ends up
+/// fetching bytes that never land in the cache — read over the network
+/// on every run, invisible to `fetch`, `is_complete()` and the offline
+/// open. A new entry point has to be added here with its reason, which
+/// is the moment to route it through storage instead.
+#[test]
+fn remote_bytes_are_read_only_through_the_cache() {
+    let patterns = [
+        "shared_client_for(",
+        "shared_client()",
+        "HttpTransport::new(",
+        "HttpTransport::with_client(",
+        "reqwest::blocking::Client::builder",
+        "reqwest::blocking::get",
+    ];
+    let mut found = Vec::new();
+    for (rel, text) in source_files() {
+        if NETWORK_ENTRY_POINTS.iter().any(|(f, _)| *f == rel) {
+            continue;
+        }
+        for (n, line) in shipped_code(&text).lines().enumerate() {
+            if let Some(p) = patterns.iter().find(|p| line.contains(**p)) {
+                found.push(format!("{rel}:{}: {p} — {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "network access outside the allowed entry points; read remote data through storage:\n{}",
+        found.join("\n")
+    );
+    let files = source_files();
+    for (rel, why) in NETWORK_ENTRY_POINTS {
+        let text = &files.iter().find(|(r, _)| r == rel).unwrap_or_else(|| panic!("{rel} gone")).1;
+        assert!(
+            patterns.iter().any(|p| shipped_code(text).contains(p)),
+            "{rel} is allow-listed ({why}) but opens no client; drop the entry"
+        );
+    }
+}
