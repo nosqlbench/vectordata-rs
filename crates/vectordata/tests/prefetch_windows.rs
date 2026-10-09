@@ -2220,3 +2220,75 @@ fn a_remote_scalar_window_fetches_only_its_chunks() {
         assert_eq!(reader.get_value(o).unwrap(), vals[o], "value at {o}");
     }
 }
+
+/// Every file named `name` under `dir`, at any depth.
+fn files_named(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.file_name().is_some_and(|n| n == name) {
+                found.push(p);
+            }
+        }
+    }
+    found
+}
+
+/// **A degraded plan prices what the chunk state holds, not what the
+/// cache file occupies.** A process killed between writing a chunk's
+/// bytes and recording it leaves bytes on disk that are not held; and
+/// where a platform reports no sparse allocation, the pre-sized cache
+/// file occupies the whole facet before anything is fetched. Either
+/// way the file's size is not residency, and the whole facet is still
+/// owed until its chunks are recorded.
+#[test]
+fn a_degraded_plan_counts_recorded_chunks_not_bytes_on_disk() {
+    init_test_cache();
+    let tmp = tempfile::tempdir().unwrap();
+    let published = tmp.path().join("pub");
+    std::fs::create_dir_all(&published).unwrap();
+    let vv = published.join("crashmeta.ivvec");
+    let dims: Vec<i32> = (0..1500).map(|i| 1 + (i % 19)).collect();
+    write_ivvec(&vv, &dims);
+    let content = std::fs::read(&vv).unwrap();
+    MerkleRef::from_content(&content, REMOTE_CHUNK)
+        .save(&published.join("crashmeta.ivvec.mref"))
+        .unwrap();
+    let server = TestServer::start(&published).unwrap();
+    let ds = tmp.path().join("crash-left");
+    std::fs::create_dir_all(&ds).unwrap();
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        format!(
+            "name: crash-left\nprofiles:\n  default:\n    metadata_content: {}crashmeta.ivvec\n",
+            server.base_url()
+        ),
+    )
+    .unwrap();
+    let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+    let window = parse_window("10..20").unwrap();
+    let plan = view.prefetch_plan("metadata_content", &window).unwrap();
+    assert!(plan.degrades_to_full_download);
+    assert_eq!(plan.bytes_to_fetch(), plan.facet_bytes);
+
+    // What the killed process left: every byte written, none recorded.
+    let cached = files_named(TEST_CACHE_DIR.path(), "crashmeta.ivvec");
+    assert_eq!(cached.len(), 1, "{cached:?}");
+    let mut f = std::fs::OpenOptions::new().write(true).open(&cached[0]).unwrap();
+    f.write_all(&content).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    let plan = view.prefetch_plan("metadata_content", &window).unwrap();
+    assert_eq!(plan.bytes_to_fetch(), plan.facet_bytes, "unrecorded bytes are not held");
+
+    // Once fetched, the recorded chunks are the whole facet.
+    support::fetch::fetch_window(&*view, "metadata_content", &window, WholeFacetFallback::Allow).unwrap();
+    let plan = view.prefetch_plan("metadata_content", &window).unwrap();
+    assert_eq!(plan.bytes_to_fetch(), 0, "a fetched facet owes nothing");
+}
