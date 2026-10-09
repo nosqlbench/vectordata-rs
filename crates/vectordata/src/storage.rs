@@ -249,7 +249,7 @@ pub(crate) struct LayoutChoice {
 ///     → file_relpath: `data.fvec`
 ///     → origin: `https://example.com/`
 pub(crate) fn layout_for_url(url: &Url) -> io::Result<LayoutChoice> {
-    let cache_root = crate::settings::cache_dir()
+    let cache_root = crate::settings::data_cache_dir()
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
     // A file of a dataset already cached under its own name belongs in
     // that dataset's directory: one cache file per remote file, however
@@ -358,7 +358,7 @@ impl Storage {
             let _ = (dataset_name, file_relpath, catalog_source);
             return Self::open(fetch_url);
         }
-        let cache_root = crate::settings::cache_dir()
+        let cache_root = crate::settings::data_cache_dir()
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
         let dataset_dir = layout::dataset_cache_dir(&cache_root, dataset_name);
         // Pre-flight: surface OriginMismatch before anything else.

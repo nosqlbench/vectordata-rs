@@ -72,7 +72,10 @@ documentation's **Common tasks** table is the same index with examples.
   [`TestDataGroup::profile_names`](crate::TestDataGroup::profile_names),
   [`TestDataView::facet_manifest`](crate::TestDataView::facet_manifest).
 - Find the cache directory:
-  [`settings::cache_dir`](crate::settings::cache_dir). Inspect what is
+  [`settings::cache_dir`](crate::settings::cache_dir). Keep a cache of
+  your own, leaving the user's settings alone: call
+  [`settings::set_cache_dir`](crate::settings::set_cache_dir) before
+  the first open or fetch. Inspect what is
   cached for a facet:
   [`TestDataView::open_facet_storage`](crate::TestDataView::open_facet_storage)
   → [`FacetStorage::cache_stats`](crate::FacetStorage::cache_stats).

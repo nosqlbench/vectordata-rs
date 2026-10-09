@@ -801,15 +801,37 @@ Remote downloads are cached under `vectordata::settings::cache_dir()`,
 the single source of truth for cache resolution shared with the
 `veks-pipeline` crate. Resolution order:
 
-1. `--cache-dir` CLI flag (per-command override).
+1. A cache directory set for the process with
+   `vectordata::settings::set_cache_dir`.
 2. `cache_dir:` entry in `~/.config/vectordata/settings.yaml`
-   (or `$VECTORDATA_HOME/settings.yaml` for tests).
+   (or `$VECTORDATA_HOME/settings.yaml`).
+3. `$VECTORDATA_HOME/cache`, when `$VECTORDATA_HOME` is set.
+4. `$HOME/.cache/vectordata`, written to `settings.yaml`, when `$HOME`
+   is on the largest writable mount.
 
-If neither is set, every API that needs the cache returns
+Otherwise every API that needs the cache returns
 `vectordata::settings::SettingsError::NotConfigured`. Print the
-error directly — its `Display` impl includes the `veks` CLI
-command and the manual `mkdir`+`echo` sequence the user can paste
-to fix it. There is no silent fallback to `$HOME/.cache/vectordata/`.
+error directly — its `Display` impl includes the CLI command and the
+manual `mkdir`+`cat` sequence the user can paste to fix it.
+
+A program that embeds vectordata and keeps its own cache calls
+`set_cache_dir` before its first open or fetch:
+
+```rust
+vectordata::settings::set_cache_dir(&my_cache)?;
+```
+
+Only the cache moves: the user's settings and credentials are read
+where they are, and nothing is written to `settings.yaml`. The choice
+holds for the rest of the process. Repeating it is a no-op; a
+different path, or a call after a dataset file was opened in the
+configured cache, is refused with `CacheDirConflict` rather than
+splitting the process's data between two caches. Loading catalogs and
+dataset definitions first is fine: the copies kept of remote ones
+(`.catalogs/`, a dataset's `dataset.yaml`) are refreshed on each load,
+and from the call on they are kept in the new directory.
+(`override_cache_dir_for_process` is the test hook: first call wins,
+silently.)
 
 Configure via the CLI:
 
@@ -819,8 +841,9 @@ veks datasets config get
 ```
 
 The directory layout under the resolved root is
-`<host>:<port>/<url-path-prefix>/<filename>`, with a sibling
-`<filename>.mrkl` carrying merkle state.
+`<dataset>/<filename>`, with a sibling `<filename>.mrkl` carrying
+merkle state and `origin.json` binding the directory to its publish
+URL. Kept catalog copies live in `.catalogs/`.
 
 ### Prebuffering datasets
 

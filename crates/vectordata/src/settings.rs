@@ -24,22 +24,139 @@ use crate::mounts;
 const CONFIG_DIR: &str = ".config/vectordata";
 const SETTINGS_FILE: &str = "settings.yaml";
 
-/// Process-wide override for the cache directory. When set, [`cache_dir`]
-/// returns this value verbatim and never reads `settings.yaml`. Intended
-/// for tests that need to isolate cache state in a tempdir without
-/// touching the user's real configuration or racing on `$VECTORDATA_HOME`
-/// (which is a process-wide env var and tests share a process when run
-/// with `cargo test`).
+/// The cache directory this process was given — by [`set_cache_dir`]
+/// or the test hook [`override_cache_dir_for_process`]. When set,
+/// [`cache_dir`] returns it verbatim and never reads `settings.yaml`.
 static CACHE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
-/// Install a process-wide override for [`cache_dir`]. First call wins;
-/// subsequent calls are silent no-ops so racing test initializers
-/// converge on a single value instead of panicking.
+/// The configured cache directory, once this process has opened a
+/// dataset file in it ([`data_cache_dir`]). From then on a cache
+/// directory set for the process would split its data between two
+/// caches.
+static CONFIGURED_CACHE_HOLDS_DATA: OnceLock<PathBuf> = OnceLock::new();
+
+/// Use `path` as the cache directory for the rest of this process, in
+/// place of the user's configured one.
 ///
-/// Use this from a one-time test initializer (a `LazyLock<TempDir>` or
-/// equivalent) — never from production code. There is intentionally no
-/// way to clear the override once set, so tests cannot stomp on each
-/// other by alternating overrides.
+/// For a program that embeds vectordata and keeps its own cache: the
+/// user's settings and credentials stay where they are and nothing is
+/// written to `settings.yaml`. Call it before the first open or fetch.
+/// A relative `path` is resolved against the current directory now.
+/// The directory need not exist yet; it is created as data lands.
+///
+/// Setting the path the process already uses is a no-op. Refused, and
+/// nothing changes, when the process already uses another cache for
+/// dataset files: a different path set earlier, or the configured
+/// cache, once a dataset file has been opened in it.
+///
+/// Loading catalogs and dataset definitions does not count. The copies
+/// kept of remote ones — `<cache>/.catalogs/`, and a dataset's
+/// `dataset.yaml` — are refreshed on each load and only read when the
+/// server cannot be reached; after this call they are kept in, and read
+/// from, `path`. So catalogs may be opened first.
+pub fn set_cache_dir(path: impl AsRef<Path>) -> Result<(), CacheDirConflict> {
+    let requested = std::path::absolute(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
+    let current = CACHE_DIR_OVERRIDE.get().map(PathBuf::as_path);
+    let holding = CONFIGURED_CACHE_HOLDS_DATA.get().map(PathBuf::as_path);
+    let Some(install) = cache_dir_conflict(current, holding, &requested)? else {
+        return Ok(());
+    };
+    if CACHE_DIR_OVERRIDE.set(install).is_err() {
+        // Another thread set one in between: the same path, or a conflict.
+        let winner = CACHE_DIR_OVERRIDE.get().map(PathBuf::as_path);
+        cache_dir_conflict(winner, None, &requested)?;
+    }
+    Ok(())
+}
+
+/// Pure decision behind [`set_cache_dir`]: `Ok(Some(path))` to install
+/// it, `Ok(None)` when it is already the process's cache, or the
+/// conflict. `holding_data` is the configured cache, when dataset files
+/// have been opened in it.
+fn cache_dir_conflict(
+    current: Option<&Path>,
+    holding_data: Option<&Path>,
+    requested: &Path,
+) -> Result<Option<PathBuf>, CacheDirConflict> {
+    match (current, holding_data) {
+        (Some(c), _) if c == requested => Ok(None),
+        (Some(c), _) => {
+            Err(CacheDirConflict::AlreadySet { current: c.to_path_buf(), requested: requested.to_path_buf() })
+        }
+        (None, Some(configured)) if configured == requested => Ok(Some(requested.to_path_buf())),
+        (None, Some(configured)) => Err(CacheDirConflict::ConfiguredCacheHoldsData {
+            configured: configured.to_path_buf(),
+            requested: requested.to_path_buf(),
+        }),
+        (None, None) => Ok(Some(requested.to_path_buf())),
+    }
+}
+
+/// The cache directory a dataset file is opened in: [`cache_dir`],
+/// recording when that is the configured one, which a later
+/// [`set_cache_dir`] then may not move away from. The path every
+/// cache-backed file open takes; copies of catalogs and definitions use
+/// [`cache_dir`].
+pub(crate) fn data_cache_dir() -> Result<PathBuf, SettingsError> {
+    let dir = cache_dir()?;
+    if CACHE_DIR_OVERRIDE.get().is_none() {
+        let _ = CONFIGURED_CACHE_HOLDS_DATA.set(dir.clone());
+    }
+    Ok(dir)
+}
+
+/// Why [`set_cache_dir`] refused: this process already uses another
+/// cache directory for dataset files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheDirConflict {
+    /// A different cache directory was set for this process earlier.
+    AlreadySet {
+        /// The one in use.
+        current: PathBuf,
+        /// The one refused.
+        requested: PathBuf,
+    },
+    /// The process has already opened dataset files in the configured
+    /// cache directory.
+    ConfiguredCacheHoldsData {
+        /// The configured one, in use.
+        configured: PathBuf,
+        /// The one refused.
+        requested: PathBuf,
+    },
+}
+
+impl std::fmt::Display for CacheDirConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheDirConflict::AlreadySet { current, requested } => write!(
+                f,
+                "cannot use cache directory {}: this process already uses {}",
+                requested.display(),
+                current.display()
+            ),
+            CacheDirConflict::ConfiguredCacheHoldsData { configured, requested } => write!(
+                f,
+                "cannot use cache directory {}: this process has already opened dataset files in \
+                 the configured cache {}; set the cache directory before the first dataset is opened",
+                requested.display(),
+                configured.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CacheDirConflict {}
+
+/// Test hook: install a process-wide cache directory for [`cache_dir`],
+/// first call wins, later calls silent no-ops — so racing test
+/// initializers converge on one value instead of failing.
+///
+/// For a one-time test initializer (a `LazyLock<TempDir>` or
+/// equivalent). A program choosing its cache uses [`set_cache_dir`],
+/// which says when the choice did not take effect. There is no way to
+/// clear the value once set, so tests cannot stomp on each other by
+/// alternating.
 pub fn override_cache_dir_for_process(path: PathBuf) {
     let _ = CACHE_DIR_OVERRIDE.set(path);
 }
@@ -206,8 +323,8 @@ pub fn settings_path() -> PathBuf {
 /// `$HOME` unreadable, etc.), returns [`SettingsError::NotConfigured`] —
 /// its `Display` impl carries ready-to-paste commands.
 ///
-/// If [`override_cache_dir_for_process`] has been called, that value
-/// takes precedence and `settings.yaml` is not consulted.
+/// A cache directory set for the process ([`set_cache_dir`]) takes
+/// precedence, and `settings.yaml` is not consulted.
 pub fn cache_dir() -> Result<PathBuf, SettingsError> {
     if let Some(p) = CACHE_DIR_OVERRIDE.get() {
         return Ok(p.clone());
@@ -776,6 +893,29 @@ fn add_yaml_list_item(content: &str, key: &str, item: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A process's cache directory is chosen once: the first choice is
+    /// installed, repeating it changes nothing, and any other choice —
+    /// a different path, or one away from a configured cache that
+    /// already holds the process's dataset files — is refused naming
+    /// both sides. Choosing the configured cache itself is no move.
+    #[test]
+    fn a_process_cache_directory_is_chosen_once() {
+        use super::{cache_dir_conflict, CacheDirConflict};
+        use std::path::{Path, PathBuf};
+        let a = Path::new("/data/a");
+        let b = Path::new("/data/b");
+        assert_eq!(cache_dir_conflict(None, None, a), Ok(Some(PathBuf::from(a))));
+        assert_eq!(cache_dir_conflict(Some(a), None, a), Ok(None));
+        assert_eq!(cache_dir_conflict(Some(a), Some(b), a), Ok(None), "set before any dataset file opened");
+        let err = cache_dir_conflict(Some(a), None, b).unwrap_err();
+        assert_eq!(err, CacheDirConflict::AlreadySet { current: a.into(), requested: b.into() });
+        assert_eq!(err.to_string(), "cannot use cache directory /data/b: this process already uses /data/a");
+        assert_eq!(cache_dir_conflict(None, Some(a), a), Ok(Some(PathBuf::from(a))), "the configured cache itself");
+        let err = cache_dir_conflict(None, Some(a), b).unwrap_err();
+        assert_eq!(err, CacheDirConflict::ConfiguredCacheHoldsData { configured: a.into(), requested: b.into() });
+        assert!(err.to_string().contains("already opened dataset files in the configured cache /data/a"), "{err}");
+    }
+
     /// Offline mode resolves from the environment when it says
     /// anything recognizable, else the setting; unset is online.
     #[test]
