@@ -10,10 +10,11 @@
 //! [`Catalog::open_selection`](crate::catalog::Catalog::open_selection),
 //! plans with [`TestDataView::plan_fetch`]
 //! or [`TestDataGroup::plan_fetch`](crate::TestDataGroup::plan_fetch),
-//! and executes the plan with a [`TextMeter`] attached. What this module
-//! adds is only what a command line needs: string-shaped input,
-//! headings, the `--plan` table, and an exit code. A program should call
-//! [`crate::fetch`] directly.
+//! and executes the plan with a [`TextMeter`](crate::fetch::TextMeter)
+//! attached on a terminal, a [`LogMeter`](crate::fetch::LogMeter)
+//! otherwise. What this module adds is only what a command line needs:
+//! string-shaped input, headings, the `--plan` table, and an exit code.
+//! A program should call [`crate::fetch`] directly.
 //!
 //! Per facet, the reader layer decides how bytes arrive:
 //!
@@ -30,7 +31,7 @@ use super::build_sources;
 use crate::catalog::resolver::Catalog;
 use crate::dataset::selector::{DatasetSpec, SelectorError};
 use crate::fetch::meter::fmt_bytes;
-use crate::fetch::{FetchPlan, FetchRequest, TextMeter};
+use crate::fetch::{FetchPlan, FetchProgress, FetchRequest};
 use crate::{Error, TestDataView};
 
 /// Everything a precache run needs, in command-line shape. A program
@@ -199,7 +200,7 @@ pub fn run(req: PrecacheRequest) -> i32 {
         Some(w) => fetch.window(w),
         None => fetch,
     };
-    let mut meter = TextMeter::stderr("Precache");
+    let mut meter = crate::fetch::meter::stderr_meter("Precache");
 
     let names = selection.profiles();
     if let [profile_name] = names {
@@ -212,10 +213,10 @@ pub fn run(req: PrecacheRequest) -> i32 {
         };
         let label = format!("{descriptor}:{profile_name}");
         if req.is_selective() {
-            return drive_selective(&*view, &label, &fetch, req.plan_only, &mut meter);
+            return drive_selective(&*view, &label, &fetch, req.plan_only, &mut *meter);
         }
         eprintln!("Prebuffering {label}");
-        return drive_prebuffer(&*view, &fetch, &mut meter);
+        return drive_prebuffer(&*view, &fetch, &mut *meter);
     }
     if req.is_selective() {
         // A facet or window selection needs one profile to resolve
@@ -236,7 +237,7 @@ pub fn run(req: PrecacheRequest) -> i32 {
         names.len(),
         names.join(", ")
     );
-    drive_prebuffer_all(&selection, &fetch, &mut meter)
+    drive_prebuffer_all(&selection, &fetch, &mut *meter)
 }
 
 /// Split a spec into the part that names a dataset and the selector
@@ -279,7 +280,7 @@ fn bare_spec_refusal(head: &str) -> String {
 // ─── Drivers ─────────────────────────────────────────────────────────
 
 /// Fetch one whole profile.
-fn drive_prebuffer(view: &dyn TestDataView, fetch: &FetchRequest, meter: &mut TextMeter) -> i32 {
+fn drive_prebuffer(view: &dyn TestDataView, fetch: &FetchRequest, meter: &mut dyn FetchProgress) -> i32 {
     let plan = match view.plan_fetch(fetch, meter) {
         Ok(p) => p,
         Err(e) => {
@@ -317,7 +318,7 @@ fn drive_selective(
     label: &str,
     fetch: &FetchRequest,
     plan_only: bool,
-    meter: &mut TextMeter,
+    meter: &mut dyn FetchProgress,
 ) -> i32 {
     // A requested window overrides every selected facet's own. Absent
     // one, each facet is planned against the window it declares — the
@@ -410,7 +411,7 @@ fn render_plan(plan: &FetchPlan) -> String {
 fn drive_prebuffer_all(
     selection: &crate::catalog::DatasetSelection,
     fetch: &FetchRequest,
-    meter: &mut TextMeter,
+    meter: &mut dyn FetchProgress,
 ) -> i32 {
     let plan = match selection.plan_fetch(fetch, meter) {
         Ok(p) => p,
@@ -466,7 +467,7 @@ fn refuse(plan: &FetchPlan) -> Option<i32> {
 }
 
 /// Run a checked plan; the meter reports success or failure.
-fn execute(plan: FetchPlan, meter: &mut TextMeter) -> i32 {
+fn execute(plan: FetchPlan, meter: &mut dyn FetchProgress) -> i32 {
     match plan.execute(meter) {
         Ok(_) => 0,
         Err(_) => 1,

@@ -39,7 +39,11 @@ documentation's **Common tasks** table is the same index with examples.
   [`FetchPlan::bytes_to_fetch`](crate::fetch::FetchPlan::bytes_to_fetch)
   and [`FetchPlan::execute`](crate::fetch::FetchPlan::execute).
 - Show the CLI's progress meter:
-  [`TextMeter::stderr`](crate::fetch::TextMeter::stderr). Hear raw
+  [`TextMeter::stderr`](crate::fetch::TextMeter::stderr). Report it
+  as log lines instead (files, CI, the `log` crate):
+  [`LogMeter`](crate::fetch::LogMeter), with
+  [`step`](crate::fetch::LogMeter::step) and
+  [`min_interval`](crate::fetch::LogMeter::min_interval). Hear raw
   progress: pass a closure taking
   [`&FetchEvent`](crate::fetch::FetchEvent). Show nothing:
   [`Silent`](crate::fetch::Silent).

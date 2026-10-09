@@ -27,6 +27,7 @@
 //! | Fetch only a record window | [`FetchRequest::window`](fetch::FetchRequest::window) | `examples/stream_base_vectors.rs` |
 //! | Know what a fetch will cost first | [`TestDataView::plan_fetch`] → [`FetchPlan`](fetch::FetchPlan) | — |
 //! | Draw the CLI's progress meter | [`TextMeter`](fetch::TextMeter) | `examples/fetch_with_progress.rs` |
+//! | Report fetch progress as log lines | [`LogMeter`](fetch::LogMeter), throttled by [`ProgressStep`](fetch::ProgressStep) | — |
 //! | Warm a window in the background while reading | [`TestDataView::prefetch_in_background`] | `examples/stream_base_vectors.rs` |
 //! | Read vectors by ordinal | [`TestDataView::base_vectors`] → [`VectorReader::get`] | below |
 //! | Load or stream records in bulk, into your own buffer | [`VectorReader::read_into`] | `examples/stream_base_vectors.rs` |

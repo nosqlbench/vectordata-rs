@@ -345,7 +345,7 @@ fn derive_via_access_layer(
     eprintln!("Prebuffering source profile so windows can be sliced locally…");
     if let Err(e) = view.fetch(
         &crate::fetch::FetchRequest::all(),
-        &mut crate::fetch::TextMeter::stderr("Prebuffer"),
+        &mut *crate::fetch::meter::stderr_meter("Prebuffer"),
     ) {
         eprintln!("error: failed to precache source: {e}");
         return 1;

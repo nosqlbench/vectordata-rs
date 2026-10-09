@@ -42,7 +42,9 @@
 //!    [`FetchProgress`] sink the caller passed.
 //!
 //! A sink is anything that implements [`FetchProgress`]: [`Silent`],
-//! [`TextMeter`], or a closure taking `&FetchEvent<'_>`. The library
+//! [`TextMeter`] for a terminal, [`LogMeter`] for a log — whole lines,
+//! throttled to a percent step and a minimum interval, with a warning
+//! when the fetch stalls — or a closure taking `&FetchEvent<'_>`. The library
 //! never writes to the terminal on its own; whatever a fetch shows, the
 //! caller chose.
 
@@ -54,7 +56,7 @@ use crate::view::{FacetStorage, PrefetchPlan, WholeFacetFallback, facet_declared
 use crate::{Error, Result, TestDataView};
 
 pub(crate) mod meter;
-pub use meter::TextMeter;
+pub use meter::{LogMeter, ProgressStep, TextMeter};
 
 // ─── Request ─────────────────────────────────────────────────────────
 
@@ -281,7 +283,7 @@ pub enum FetchEvent<'a> {
 
 /// Where a fetch reports what it is doing.
 ///
-/// Implemented by [`Silent`], [`TextMeter`], and every
+/// Implemented by [`Silent`], [`TextMeter`], [`LogMeter`], and every
 /// `FnMut(&FetchEvent<'_>)`, so a closure is a sink:
 ///
 /// ```no_run

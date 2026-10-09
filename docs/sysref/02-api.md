@@ -954,6 +954,27 @@ view.fetch(&FetchRequest::all(), &mut |e: &FetchEvent<'_>| {
 })?;
 ```
 
+`TextMeter` redraws its line in place, which suits a terminal. For a
+log, CI output or the `log` crate, `LogMeter` reports the same run as
+whole lines: one per facet planned, started and finished, a progress
+line each time the run's total crosses a step (`step`, 10% by
+default, parsed from `0.1` or `10%`) but never sooner than
+`min_interval` after the last (2 s by default), a 100% line at the
+end, and a warning in the same form when nothing has moved for a
+minute (`stall_warning`), repeated while the stall lasts.
+`vectordata datasets precache` draws `TextMeter` when standard error
+is a terminal and `LogMeter` otherwise.
+
+```rust
+use std::time::Duration;
+use vectordata::fetch::LogMeter;
+
+let mut meter = LogMeter::to_log("Fetch")
+    .step(Some("10%".parse()?))
+    .min_interval(Duration::from_secs(2));
+view.fetch(&FetchRequest::all(), &mut meter)?;
+```
+
 `plan_fetch` is the first half on its own: it returns a `FetchPlan`
 with the per-facet byte ranges, chunk fills and total cost, and
 fetches nothing; `FetchPlan::execute` is the second half.
