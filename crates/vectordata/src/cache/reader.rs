@@ -273,7 +273,9 @@ impl CacheListing {
 /// Walk `cache_root` and classify every top-level entry. Read-only.
 ///
 /// The classification rule:
+///   - The kept-catalog directory (`.catalogs/`) → [`CacheListing::catalogs`]
 ///   - Directory contains `origin.json` → [`CacheListing::datasets`]
+///   - Directory holds `origin.json` deeper inside → [`CacheListing::url_derived`]
 ///   - Directory name matches [`is_legacy_layout_dir`] → [`CacheListing::legacy`]
 ///   - Anything else → [`CacheListing::other`]
 ///
@@ -587,6 +589,67 @@ mod tests {
         assert_eq!(report.removed.len(), 1);
         assert!(!root.join("vecs1m").exists());
         assert!(root.join("blobs").exists(), "legacy must survive dataset prune");
+    }
+
+    /// **A dataset that cannot be removed is reported, not dropped.** It
+    /// stays in `matched`, appears in `failed` with the reason, and is
+    /// neither in `removed` nor counted in `bytes_freed`; the datasets
+    /// that could be removed still are.
+    #[cfg(unix)]
+    #[test]
+    fn prune_by_filter_reports_a_dataset_it_could_not_remove() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let stuck = seed_dataset(root, "vecs-stuck", "https://example.com/vecs-stuck/");
+        seed_dataset(root, "vecs-free", "https://example.com/vecs-free/");
+        // A file inside a directory that cannot be written: removing the
+        // dataset fails at that file.
+        let locked = stuck.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("f"), b"x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(locked.join("probe"), b"").is_ok() {
+            // Permissions are not enforced here (running as root).
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let report = prune_by_filter(root, &PruneFilter { dataset: Some("vecs-*".into()) }, false).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(report.matched.len(), 2);
+        let removed: Vec<_> = report.removed.iter().map(|e| e.path.clone()).collect();
+        assert_eq!(removed, [root.join("vecs-free")]);
+        assert_eq!(report.bytes_freed, report.removed[0].size_bytes);
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        let (entry, why) = &report.failed[0];
+        assert_eq!(entry.path, stuck);
+        assert!(why.to_lowercase().contains("permission"), "{why}");
+        assert!(stuck.exists() && !root.join("vecs-free").exists());
+    }
+
+    /// **Kept catalog copies are their own category**: listed under
+    /// `catalogs`, counted in the total, and never a dataset — so a
+    /// dataset prune, even `*`, leaves them.
+    #[test]
+    fn kept_catalog_copies_are_listed_apart_and_survive_a_dataset_prune() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let copies = root.join(crate::cache::layout::CATALOG_COPIES_DIR);
+        fs::create_dir_all(&copies).unwrap();
+        fs::write(copies.join("example.com_catalog.json"), b"[]").unwrap();
+        seed_dataset(root, "vecs1m", "https://example.com/vecs1m/");
+
+        let listing = list_entries(root).unwrap();
+        assert_eq!(listing.catalogs.len(), 1, "{listing:?}");
+        assert_eq!(listing.catalogs[0].path, copies);
+        assert_eq!(listing.datasets.len(), 1);
+        assert!(listing.other.is_empty(), "{:?}", listing.other);
+        assert_eq!(listing.total_bytes(), listing.catalogs[0].size_bytes + listing.datasets[0].size_bytes);
+
+        prune_by_filter(root, &PruneFilter { dataset: Some("*".into()) }, false).unwrap();
+        assert!(copies.join("example.com_catalog.json").is_file(), "a dataset prune keeps the catalog copies");
     }
 
     // Unix-only: the legacy <host>:<port> shape this test simulates
