@@ -685,3 +685,42 @@ fn source_problems_are_carried_into_the_catalog() {
     assert!(diag[0].starts_with("warning: directory") && diag[0].contains("has no catalogs.yaml"), "{diag:?}");
     assert!(diag[1].starts_with("error: could not load catalog"), "{diag:?}");
 }
+
+/// **A file gone upstream fails a read at once.** The server answers
+/// 404 for a chunk of an open facet whose file was removed; no retry
+/// can change that answer, so the read fails on the first attempt —
+/// for a merkle-published facet and a chunk-store one alike — instead
+/// of waiting out minutes of backoff.
+#[test]
+fn a_read_answered_with_404_is_not_retried() {
+    let tmp = make_tmp();
+    write_fvec(&tmp.path().join("base.fvec"), 2000, 8, 1.6e7);
+    write_mref(&tmp.path().join("base.fvec"));
+    // Without a `.mref`, chunks are 8 MiB: two of them, so a read past
+    // the first needs the server.
+    write_fvec(&tmp.path().join("query.fvec"), 300_000, 8, 1.7e7);
+    std::fs::write(
+        tmp.path().join("dataset.yaml"),
+        "name: gone-ds\nprofiles:\n  default:\n    base_vectors: base.fvec\n    query_vectors: query.fvec\n",
+    )
+    .unwrap();
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+    let base = view.base_vectors().unwrap();
+    let query = view.query_vectors().unwrap();
+
+    std::fs::remove_file(tmp.path().join("base.fvec")).unwrap();
+    std::fs::remove_file(tmp.path().join("query.fvec")).unwrap();
+    for (facet, read) in [
+        ("base_vectors", Box::new(|| base.get(1999).map(|_| ())) as Box<dyn Fn() -> _>),
+        ("query_vectors", Box::new(|| query.get(299_999).map(|_| ()))),
+    ] {
+        let started = std::time::Instant::now();
+        let err = read().expect_err("the file is gone upstream").to_string();
+        let waited = started.elapsed();
+        assert!(err.contains("404"), "{facet}: {err}");
+        assert!(waited < std::time::Duration::from_secs(5), "{facet}: failed after {waited:?}");
+    }
+}

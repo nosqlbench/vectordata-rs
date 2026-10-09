@@ -290,3 +290,80 @@ mod tests {
         assert_eq!(corrected.host_str().unwrap(), "b.s3.ap-southeast-3.amazonaws.com");
     }
 }
+
+/// What reaches the retry policy from a real HTTP response: the status
+/// survives `fetch_range`'s error mapping, so a client error — a
+/// refused credential, a missing file — is given back at once, and a
+/// server error or throttle is retried.
+#[cfg(test)]
+mod retry_classification {
+    use super::*;
+    use crate::transport::RetryPolicy;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Serve one object of 8 bytes: HEAD answers its size, and each GET
+    /// is answered with the next status in `gets` (206 sends the range).
+    /// Returns the URL and the count of GETs seen.
+    fn scripted_server(gets: Vec<u16>) -> (Url, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/object", listener.local_addr().unwrap())).unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut request = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                let response = if request.starts_with("HEAD") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    match gets.get(n).copied().unwrap_or(500) {
+                        206 => "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\
+                                Content-Range: bytes 0-3/8\r\nConnection: close\r\n\r\nabcd"
+                            .to_string(),
+                        s => format!("HTTP/1.1 {s} Scripted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (url, seen)
+    }
+
+    fn fast_policy() -> RetryPolicy {
+        RetryPolicy { max_retries: 3, base_delay_ms: 1, max_delay_ms: 1, jitter_fraction: 0.0 }
+    }
+
+    #[test]
+    fn a_client_error_is_asked_once() {
+        for status in [401, 403, 404] {
+            let (url, gets) = scripted_server(vec![status; 4]);
+            let transport = HttpTransport::with_client(Client::new(), url);
+            let err = fast_policy().execute(|| transport.fetch_range(0, 4)).unwrap_err();
+            assert!(err.to_string().contains(&status.to_string()), "{status}: {err}");
+            assert_eq!(gets.load(Ordering::SeqCst), 1, "{status} was retried");
+        }
+    }
+
+    #[test]
+    fn a_server_error_or_throttle_is_retried_until_it_passes() {
+        for status in [503, 429, 408] {
+            let (url, gets) = scripted_server(vec![status, status, 206]);
+            let transport = HttpTransport::with_client(Client::new(), url);
+            let bytes = fast_policy().execute(|| transport.fetch_range(0, 4)).unwrap();
+            assert_eq!(bytes, b"abcd");
+            assert_eq!(gets.load(Ordering::SeqCst), 3, "{status}: two failures, then the range");
+        }
+    }
+}
