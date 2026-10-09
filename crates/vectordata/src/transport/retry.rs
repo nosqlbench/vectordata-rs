@@ -37,7 +37,8 @@ impl RetryPolicy {
     /// Execute a fallible operation with retries.
     ///
     /// Returns the first successful result, or the last error after all
-    /// retries are exhausted.
+    /// retries are exhausted. An error no retry can change — an
+    /// offline-mode refusal — is returned at once.
     pub fn execute<T, F>(&self, mut op: F) -> io::Result<T>
     where
         F: FnMut() -> io::Result<T>,
@@ -47,6 +48,7 @@ impl RetryPolicy {
         for attempt in 0..=self.max_retries {
             match op() {
                 Ok(data) => return Ok(data),
+                Err(e) if super::is_permanent(&e) => return Err(e),
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < self.max_retries {
@@ -134,6 +136,27 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::Relaxed), 3); // 1 initial + 2 retries
+    }
+
+    /// An offline-mode refusal is given back after one attempt, also
+    /// when another error wraps it: no retry can change it, and the
+    /// default backoff would otherwise hold the caller for minutes.
+    #[test]
+    fn an_offline_refusal_is_not_retried() {
+        let policy = RetryPolicy { max_retries: 5, base_delay_ms: 1, max_delay_ms: 1, jitter_fraction: 0.0 };
+        let refusal = || {
+            io::Error::new(io::ErrorKind::NotConnected, super::super::OfflineRefusal { url: "https://h/f".into() })
+        };
+        for wrap in [false, true] {
+            let attempts = AtomicU32::new(0);
+            let result: io::Result<()> = policy.execute(|| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(if wrap { io::Error::other(refusal()) } else { refusal() })
+            });
+            let err = result.unwrap_err();
+            assert_eq!(attempts.load(Ordering::Relaxed), 1, "wrapped: {wrap}");
+            assert!(err.to_string().contains("offline mode is on"), "{err}");
+        }
     }
 
     #[test]

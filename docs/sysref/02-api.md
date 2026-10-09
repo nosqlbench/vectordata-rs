@@ -968,6 +968,10 @@ cache directory used when the server cannot be reached (connects time
 out after 10 s). A warmed cache therefore opens and reads with no
 network.
 
+In offline mode a partly fetched facet opens too and serves the chunks
+it holds; a read of a missing chunk is refused at once, saying offline
+mode is on — the refusal is never retried.
+
 Staleness is checked where the network is meant to be used: `fetch`
 asks the upstream whether each complete copy is still current, and
 reports `FacetFetch::upstream_checked = false` when it could not ask; a

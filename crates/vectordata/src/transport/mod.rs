@@ -133,21 +133,53 @@ pub(crate) fn shared_client() -> reqwest::blocking::Client {
 /// if `url`'s origin is listed there, returns a client that skips cert
 /// verification; otherwise the normal verifying client. Use this for any request
 /// to a user-configured endpoint so a self-signed local vecd is reachable.
+/// The error [`ensure_online`] refuses with: a request offline mode
+/// does not make. Decided locally, so retrying cannot change it — the
+/// retry policy gives it back at once ([`is_permanent`]).
+#[derive(Debug)]
+struct OfflineRefusal {
+    url: String,
+}
+
+impl std::fmt::Display for OfflineRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "offline mode is on ({} / settings `{}`): {} is not available locally. \
+             Fetch it while online, or turn offline mode off.",
+            crate::settings::OFFLINE_ENV,
+            crate::settings::OFFLINE_KEY,
+            self.url
+        )
+    }
+}
+
+impl std::error::Error for OfflineRefusal {}
+
+/// Whether `error` is one that no retry can change: an offline-mode
+/// refusal, found anywhere in its source chain.
+pub(crate) fn is_permanent(error: &io::Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = error.get_ref().map(|e| e as _);
+    while let Some(e) = cause {
+        if e.is::<OfflineRefusal>() {
+            return true;
+        }
+        if let Some(inner) = e.downcast_ref::<io::Error>() {
+            cause = inner.get_ref().map(|e| e as _);
+            continue;
+        }
+        cause = e.source();
+    }
+    false
+}
+
 /// Refuse a request to `url` in offline mode, naming what is missing
 /// and the two ways out. Called at every point the read path would
 /// talk to a dataset server; everything that has a local copy is
 /// served before reaching one.
 pub(crate) fn ensure_online(url: &str) -> io::Result<()> {
     if crate::settings::offline() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            format!(
-                "offline mode is on ({} / settings `{}`): {url} is not available locally. \
-                 Fetch it while online, or turn offline mode off.",
-                crate::settings::OFFLINE_ENV,
-                crate::settings::OFFLINE_KEY
-            ),
-        ));
+        return Err(io::Error::new(io::ErrorKind::NotConnected, OfflineRefusal { url: url.to_string() }));
     }
     Ok(())
 }

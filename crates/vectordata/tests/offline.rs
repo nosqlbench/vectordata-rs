@@ -275,3 +275,66 @@ fn a_remote_catalog_loads_from_its_kept_copy_when_unreachable() {
     assert!(offline.diagnostics().is_empty(), "{:?}", offline.diagnostics());
     assert_eq!(offline.datasets()[0].name, "listed");
 }
+
+const PARTIAL_URL: &str = "VECTORDATA_TEST_PARTIAL_URL";
+
+/// **Offline, a partly fetched facet serves what it holds.** A window
+/// of the base vectors is fetched online; a process in offline mode
+/// opens the dataset and reads inside the window, and a read outside
+/// it is refused saying offline mode is on — not a request, not a hang.
+#[test]
+fn offline_mode_reads_what_a_partial_fetch_holds() {
+    let tmp = make_tmp();
+    dataset(tmp.path(), "partial", 1.4e8);
+    let server = TestServer::start(tmp.path()).unwrap();
+    vectordata::settings::override_cache_dir_for_process(TEST_CACHE_DIR.path().to_path_buf());
+    let url = format!("{}partial/", server.base_url());
+    let window = vectordata::dataset::source::parse_window("[0..100]").unwrap();
+    let report = TestDataGroup::load(&url)
+        .unwrap()
+        .profile("default")
+        .unwrap()
+        .fetch(&FetchRequest::facets(["base_vectors"]).window(window), &mut Silent)
+        .unwrap();
+    assert!(!report.facets[0].complete, "only a window was fetched");
+    let before = server.accepted_connections();
+
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["read_partially_offline_in_a_child", "--exact", "--nocapture", "--test-threads=1"])
+        .env(PARTIAL_URL, &url)
+        .env(CHILD_CACHE, TEST_CACHE_DIR.path())
+        .env(CHILD_SEED, "140000000")
+        .env(vectordata::settings::OFFLINE_ENV, "1")
+        .output()
+        .expect("run the offline process");
+    assert!(
+        child.status.success(),
+        "the offline process failed:\n{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert_eq!(server.accepted_connections(), before, "offline mode contacted the server");
+}
+
+/// The offline half of the test above.
+#[test]
+fn read_partially_offline_in_a_child() {
+    let (Ok(url), Ok(cache), Ok(seed)) =
+        (std::env::var(PARTIAL_URL), std::env::var(CHILD_CACHE), std::env::var(CHILD_SEED))
+    else {
+        return;
+    };
+    assert!(vectordata::settings::offline());
+    let seed: f32 = seed.parse().unwrap();
+    vectordata::settings::override_cache_dir_for_process(cache.into());
+
+    let group = TestDataGroup::load(&url).expect("the kept dataset.yaml opens it offline");
+    let base = group.profile("default").unwrap().base_vectors().expect("a partial copy opens offline");
+    assert!(!vectordata::VectorReader::is_complete(&*base));
+    assert_eq!(base.get(42).unwrap()[5], fvec_value(seed, 8, 42, 5));
+    let started = std::time::Instant::now();
+    let refused = base.get(1999).expect_err("a record outside the fetched window").to_string();
+    assert!(refused.contains("offline mode is on"), "{refused}");
+    // Refused at once: the refusal is not retried with backoff.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "refused after {:?}", started.elapsed());
+}
