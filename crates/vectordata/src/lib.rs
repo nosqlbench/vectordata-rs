@@ -367,11 +367,17 @@ pub enum Error {
         suggestions: Vec<String>,
     },
     /// More than one dataset matches this name (case-insensitively).
-    #[error("multiple datasets match '{name}': {}", .matches.join(", "))]
+    ///
+    /// Two catalogs that both declare the name are a collision to fix —
+    /// narrow the catalogs consulted — not something resolved by
+    /// precedence.
+    #[error("multiple datasets match '{name}': {}", .matches.join("; "))]
     AmbiguousDataset {
         /// The name looked up.
         name: String,
-        /// Every dataset it matches.
+        /// Every dataset it matches, each with the catalog it came from
+        /// and that catalog's location when known:
+        /// `ds (catalog 'lab': /data/lab/)`.
         matches: Vec<String>,
     },
     /// A dataset spec or profile selector is malformed, or matches no

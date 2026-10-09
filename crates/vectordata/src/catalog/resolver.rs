@@ -28,6 +28,10 @@ use super::sources::{
 pub struct Catalog {
     entries: Vec<CatalogEntry>,
     diagnostics: Vec<CatalogDiagnostic>,
+    /// Each source's location by its symbolic name, so an entry's
+    /// [`catalog_name`](CatalogEntry::catalog_name) can say where it
+    /// came from.
+    locations: Vec<(String, String)>,
 }
 
 impl Catalog {
@@ -42,6 +46,12 @@ impl Catalog {
     pub fn of(sources: &CatalogSources) -> Self {
         let mut entries = Vec::new();
         let mut diagnostics = sources.diagnostics().to_vec();
+        let locations = sources
+            .required()
+            .iter()
+            .chain(sources.optional())
+            .map(|s| (s.name.clone(), s.location.clone()))
+            .collect();
 
         let mut load_named = |src: &super::sources::NamedCatalogSource, required: bool| {
             let before = entries.len();
@@ -66,7 +76,7 @@ impl Catalog {
         for d in &diagnostics {
             log::warn!("{d}");
         }
-        Catalog { entries, diagnostics }
+        Catalog { entries, diagnostics, locations }
     }
 
     /// Returns all dataset entries in the catalog.
@@ -113,8 +123,23 @@ impl Catalog {
             }),
             _ => Err(crate::Error::AmbiguousDataset {
                 name: name.to_string(),
-                matches: matches.iter().map(|e| e.name.clone()).collect(),
+                matches: matches.iter().map(|e| self.provenance(e)).collect(),
             }),
+        }
+    }
+
+    /// An entry's name and the catalog it came from, for telling apart
+    /// datasets that share a name: `ds (catalog 'lab': /data/lab/)`.
+    fn provenance(&self, entry: &CatalogEntry) -> String {
+        let Some(catalog) = &entry.catalog_name else {
+            return entry.name.clone();
+        };
+        let location = entry.catalog_file.as_deref().or_else(|| {
+            self.locations.iter().find(|(n, _)| n == catalog).map(|(_, l)| l.as_str())
+        });
+        match location {
+            Some(location) => format!("{} (catalog '{catalog}': {location})", entry.name),
+            None => format!("{} (catalog '{catalog}')", entry.name),
         }
     }
 
@@ -1072,6 +1097,45 @@ mod tests {
         let catalog = Catalog::of(&sources);
         assert_eq!(catalog.datasets().len(), 1);
         assert_eq!(catalog.datasets()[0].name, "alpha");
+    }
+
+    /// **A name two catalogs both declare is ambiguous, and the error
+    /// says which catalogs.** The entries are otherwise identical, so
+    /// a list of names alone would read `ds, ds`.
+    #[test]
+    fn a_name_collision_names_each_catalog() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let tmp = tempfile::tempdir_in(&base).unwrap();
+        let json = serde_json::json!([{
+            "name": "twin",
+            "path": "twin/dataset.yaml",
+            "dataset_type": "dataset.yaml",
+            "layout": { "profiles": { "default": { "base_vectors": "base.fvec" } } }
+        }]);
+        let dirs: Vec<String> = ["first", "second"]
+            .iter()
+            .map(|d| {
+                let dir = tmp.path().join(d);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("catalog.json"), json.to_string()).unwrap();
+                dir.to_string_lossy().to_string()
+            })
+            .collect();
+        let sources = CatalogSources::new().add_catalogs(&dirs);
+        let catalog = Catalog::of(&sources);
+
+        let err = catalog.lookup("TWIN").unwrap_err();
+        let crate::Error::AmbiguousDataset { matches, .. } = &err else { panic!("{err}") };
+        assert_eq!(matches.len(), 2, "{err}");
+        for (src, m) in sources.required().iter().zip(matches) {
+            assert!(m.starts_with("twin (catalog '"), "{m}");
+            assert!(m.contains(&format!("'{}'", src.name)) && m.contains(&src.location), "{m} / {src:?}");
+        }
+        assert_ne!(matches[0], matches[1], "the two matches can be told apart");
+        let text = err.to_string();
+        assert!(text.starts_with("multiple datasets match 'TWIN': twin (catalog '"), "{text}");
+        assert!(text.contains(&dirs[0]) && text.contains(&dirs[1]), "{text}");
     }
 
     #[test]
