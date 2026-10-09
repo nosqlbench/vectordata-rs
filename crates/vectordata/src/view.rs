@@ -1301,6 +1301,9 @@ pub struct RangeFill {
     pub chunks: u32,
     /// Of those, how many are already resident. These cost nothing.
     pub chunks_resident: u32,
+    /// Bytes of the resident chunks, each at its real length — the
+    /// file's last chunk holds only what is left of the file.
+    pub resident_bytes: u64,
     /// Byte range the fetch actually spans once widened to chunk
     /// boundaries — always a superset of what was asked for.
     pub aligned_start: u64,
@@ -1314,9 +1317,11 @@ impl RangeFill {
         self.chunks.saturating_sub(self.chunks_resident)
     }
 
-    /// Bytes that will cross the network, at chunk granularity.
+    /// Bytes that will cross the network, at chunk granularity: the
+    /// chunk-aligned span less what is resident. A span ending at the
+    /// end of the file ends with a short chunk, charged at its length.
     pub fn bytes_to_fetch(&self) -> u64 {
-        self.chunks_to_fetch() as u64 * self.chunk_size
+        self.aligned_end.saturating_sub(self.aligned_start).saturating_sub(self.resident_bytes)
     }
 
     /// Bytes fetched beyond the requested range because chunks are the
@@ -2615,7 +2620,7 @@ impl FacetStorage {
                 s.file(i).ok()?
             }
         };
-        let (first, last, chunk_size, resident) = storage.range_fill(byte_start, byte_end)?;
+        let (first, last, chunk_size, resident, resident_bytes) = storage.range_fill(byte_start, byte_end)?;
         let aligned_start = first as u64 * chunk_size;
         let aligned_end = ((last as u64 + 1) * chunk_size).min(storage.total_size());
         Some(RangeFill {
@@ -2624,6 +2629,7 @@ impl FacetStorage {
             chunk_size,
             chunks: last - first + 1,
             chunks_resident: resident,
+            resident_bytes,
             aligned_start,
             aligned_end,
         })
@@ -2633,7 +2639,7 @@ impl FacetStorage {
     /// granularity, and how much of it is already resident. `None` for
     /// storage without chunks (local files).
     pub fn range_fill(&self, byte_start: u64, byte_end: u64) -> Option<RangeFill> {
-        let (first, last, chunk_size, resident) = self.storage.range_fill(byte_start, byte_end)?;
+        let (first, last, chunk_size, resident, resident_bytes) = self.storage.range_fill(byte_start, byte_end)?;
         let aligned_start = first as u64 * chunk_size;
         let aligned_end = ((last as u64 + 1) * chunk_size).min(self.total_size());
         Some(RangeFill {
@@ -2642,6 +2648,7 @@ impl FacetStorage {
             chunk_size,
             chunks: last - first + 1,
             chunks_resident: resident,
+            resident_bytes,
             aligned_start,
             aligned_end,
         })
@@ -4159,6 +4166,7 @@ mod tests {
             chunk_size: 8 << 20,
             chunks: 2,
             chunks_resident: 1,
+            resident_bytes: 8 << 20,
             aligned_start: 0,
             aligned_end: 16 << 20,
         };
@@ -4169,10 +4177,21 @@ mod tests {
 
         let warm = RangeFill {
             chunks_resident: 2,
+            resident_bytes: 16 << 20,
             ..f
         };
         assert!(warm.is_resident());
         assert_eq!(warm.bytes_to_fetch(), 0);
+
+        // A span ending at the end of a file ends with a short chunk,
+        // charged at its length, not at the chunk size.
+        let tail = RangeFill {
+            chunks_resident: 0,
+            resident_bytes: 0,
+            aligned_end: (8 << 20) + 100,
+            ..f
+        };
+        assert_eq!(tail.bytes_to_fetch(), (8 << 20) + 100);
     }
 
     /// Local storage has no chunks, so it has no plan — and a caller

@@ -122,10 +122,12 @@ pub struct RangeFill {          // implemented
     pub chunk_size: u64,
     pub chunks: u32,
     pub chunks_resident: u32,   // range-aware, not whole-file
+    pub resident_bytes: u64,    // those chunks at their real length
     pub aligned_start: u64,
     pub aligned_end: u64,
 }
-// with chunks_to_fetch(), bytes_to_fetch(),
+// with chunks_to_fetch(), bytes_to_fetch() (the aligned span less
+// resident_bytes, so a file's short last chunk costs its length),
 // overfetch_bytes(requested_start, requested_end), is_resident()
 ```
 

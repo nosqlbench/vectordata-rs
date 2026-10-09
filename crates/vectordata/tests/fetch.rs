@@ -161,7 +161,9 @@ fn facet_names_resolve_aliases_and_unknown_names_are_refused_up_front() {
     assert_eq!(report.facets[0].id.facet, "base_vectors", "`base` is base_vectors");
 }
 
-/// **A plan reports its cost and moves nothing.**
+/// **A plan reports its cost and moves nothing.** The cost of whole
+/// files is their size: a file's last chunk is only as long as what is
+/// left of the file, and is not charged as a whole chunk.
 #[test]
 fn planning_fetches_nothing() {
     let (_tmp, server) = served(4.0e6);
@@ -169,13 +171,23 @@ fn planning_fetches_nothing() {
     let view = group.profile("default").unwrap();
     let plan = view.plan_fetch(&FetchRequest::all(), &mut Silent).unwrap();
     assert_eq!(plan.facets().len(), 3);
-    assert!(plan.bytes_to_fetch() > 0);
+    // 2000 + 200 + 200 records of 8 f32s; none a multiple of the 4 KiB chunk.
+    assert_eq!(plan.bytes_to_fetch(), (2000 + 200 + 200) * 36);
     assert!(!plan.is_resident());
     for f in ["base_vectors", "query_vectors", "neighbor_distances"] {
         assert!(!resident(&*view, f), "{f} was fetched by planning");
     }
     drop(plan);
     assert!(view.plan_fetch(&FetchRequest::all(), &mut Silent).unwrap().bytes_to_fetch() > 0);
+
+    // Fetching the base file's short last chunk takes exactly its length
+    // off what the rest of the file costs.
+    let window = |w: &str| FetchRequest::facets(["base_vectors"]).window(vectordata::dataset::source::parse_window(w).unwrap());
+    let cost = || view.plan_fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent).unwrap().bytes_to_fetch();
+    view.fetch(&window("[0..1]"), &mut Silent).unwrap();
+    let before = cost();
+    view.fetch(&window("[1999..2000]"), &mut Silent).unwrap();
+    assert_eq!(before - cost(), 72000 % 4096, "the last chunk, charged at its length");
 }
 
 /// Events arrive in the documented order: a plan pair per facet, then

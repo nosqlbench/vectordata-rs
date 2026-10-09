@@ -1404,6 +1404,42 @@ impl Storage {
         }
     }
 
+    /// Chunk-level residency for a byte range, or `None` when the
+    /// storage has no chunks — local mmap is always fully resident and
+    /// a range question about it has no meaning beyond "yes".
+    ///
+    /// Returns `(first_chunk, last_chunk, chunk_size, resident_chunks,
+    /// resident_bytes)` with both chunk indices inclusive.
+    /// `resident_bytes` counts each resident chunk at its real length:
+    /// the file's last chunk holds only what is left of the file. The
+    /// caller turns that into a cost; this layer does not know what the
+    /// range was *for*.
+    pub(crate) fn range_fill(
+        &self,
+        byte_start: u64,
+        byte_end: u64,
+    ) -> Option<(u32, u32, u64, u32, u64)> {
+        let (_, total_chunks, chunk_size, content_size, _) = self.fill_stats()?;
+        let (first, last) =
+            chunk_span(byte_start, byte_end, chunk_size, total_chunks, content_size)?;
+        let resident_in = |a: u32, b: u32| match self {
+            Storage::Http { chunks, .. } => Some(chunks.valid_count_in_range(a, b)),
+            Storage::Cached { channel, .. } => Some(channel.valid_count_in_range(a, b)),
+            Storage::Mmap { .. } => None,
+            // Chunk fill is a property of one transport. A series
+            // spans several, each with its own chunk map, so there is
+            // no single span to report — residency for a series is
+            // asked per shard.
+            Storage::Series { .. } => None,
+        };
+        let resident = resident_in(first, last)?;
+        let last_resident = resident_in(last, last)? == 1;
+        let last_len = ((last as u64 + 1) * chunk_size).min(content_size) - last as u64 * chunk_size;
+        let resident_bytes = (resident - last_resident as u32) as u64 * chunk_size
+            + if last_resident { last_len } else { 0 };
+        Some((first, last, chunk_size, resident, resident_bytes))
+    }
+
     /// Live cache-fill statistics for chunk-backed remote storage:
     /// `(valid_chunks, total_chunks, chunk_size, content_size,
     /// is_complete)`. Covers both the merkle-verified (`Cached`) and
@@ -1411,34 +1447,6 @@ impl Storage {
     /// no-`.mref` download must see the same fill progress as a
     /// `.mref` one. `None` for local mmap, which is always fully
     /// resident and has no fill state to report.
-    /// Chunk-level residency for a byte range, or `None` when the
-    /// storage has no chunks — local mmap is always fully resident and
-    /// a range question about it has no meaning beyond "yes".
-    ///
-    /// Returns `(first_chunk, last_chunk, chunk_size, resident_chunks)`
-    /// with both chunk indices inclusive. The caller turns that into
-    /// bytes; this layer does not know what the range was *for*.
-    pub(crate) fn range_fill(
-        &self,
-        byte_start: u64,
-        byte_end: u64,
-    ) -> Option<(u32, u32, u64, u32)> {
-        let (_, total_chunks, chunk_size, content_size, _) = self.fill_stats()?;
-        let (first, last) =
-            chunk_span(byte_start, byte_end, chunk_size, total_chunks, content_size)?;
-        let resident = match self {
-            Storage::Mmap { .. } => return None,
-            // Chunk fill is a property of one transport. A series
-            // spans several, each with its own chunk map, so there is
-            // no single span to report — residency for a series is
-            // asked per shard.
-            Storage::Series { .. } => return None,
-            Storage::Http { chunks, .. } => chunks.valid_count_in_range(first, last),
-            Storage::Cached { channel, .. } => channel.valid_count_in_range(first, last),
-        };
-        Some((first, last, chunk_size, resident))
-    }
-
     pub(crate) fn fill_stats(&self) -> Option<(u32, u32, u64, u64, bool)> {
         match self {
             Storage::Mmap { .. } => None,
