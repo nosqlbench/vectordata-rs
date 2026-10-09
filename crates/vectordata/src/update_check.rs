@@ -67,14 +67,19 @@ fn setting_disables(value: &str) -> bool {
         "off" | "false" | "no" | "0" | "disabled")
 }
 
-/// Pure resolution of the enabled state from its three inputs: the
-/// `update_check` settings value, the [`OPT_OUT_ENV`] value, and the
-/// `CI` env value. Env values disable when present and non-empty.
+/// Pure resolution of the enabled state from its four inputs: the
+/// `update_check` settings value, the [`OPT_OUT_ENV`] value, the `CI`
+/// env value, and whether offline mode is on
+/// ([`settings::offline`](crate::settings::offline)). Env values
+/// disable when present and non-empty; offline mode disables, since the
+/// probe is a request to GitHub.
 pub fn enabled_from(
     setting: Option<&str>,
     opt_out_env: Option<&str>,
     ci_env: Option<&str>,
+    offline: bool,
 ) -> bool {
+    if offline { return false; }
     if opt_out_env.is_some_and(|v| !v.is_empty()) { return false; }
     if ci_env.is_some_and(|v| !v.is_empty()) { return false; }
     !setting.is_some_and(setting_disables)
@@ -164,11 +169,12 @@ fn fetch_latest_tag() -> Option<String> {
 /// can block, fail, or print mid-command.
 pub fn startup(current_version: &str) {
     use std::io::IsTerminal;
-    if !std::io::stderr().is_terminal() || crate::settings::offline() { return; }
+    if !std::io::stderr().is_terminal() { return; }
     let enabled = enabled_from(
         crate::settings::setting_value(SETTING_KEY).as_deref(),
         std::env::var(OPT_OUT_ENV).ok().as_deref(),
         std::env::var("CI").ok().as_deref(),
+        crate::settings::offline(),
     );
     if !enabled { return; }
 
@@ -243,18 +249,21 @@ mod tests {
     #[test]
     fn enabled_resolution_matrix() {
         // Default: no setting, no env → enabled.
-        assert!(enabled_from(None, None, None));
+        assert!(enabled_from(None, None, None, false));
         // Settings value disables in any usual spelling; "on" keeps it.
         for off in ["off", "false", "no", "0", "disabled", " OFF "] {
-            assert!(!enabled_from(Some(off), None, None), "{off:?} must disable");
+            assert!(!enabled_from(Some(off), None, None, false), "{off:?} must disable");
         }
-        assert!(enabled_from(Some("on"), None, None));
-        assert!(enabled_from(Some("true"), None, None));
+        assert!(enabled_from(Some("on"), None, None, false));
+        assert!(enabled_from(Some("true"), None, None, false));
         // Opt-out env wins over an enabling setting.
-        assert!(!enabled_from(Some("on"), Some("1"), None));
+        assert!(!enabled_from(Some("on"), Some("1"), None, false));
         // CI env disables; empty env values do not.
-        assert!(!enabled_from(None, None, Some("true")));
-        assert!(enabled_from(None, Some(""), Some("")));
+        assert!(!enabled_from(None, None, Some("true"), false));
+        assert!(enabled_from(None, Some(""), Some(""), false));
+        // Offline mode disables, whatever the setting says.
+        assert!(!enabled_from(None, None, None, true));
+        assert!(!enabled_from(Some("on"), None, None, true));
     }
 
     #[test]
