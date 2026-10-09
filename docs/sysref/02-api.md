@@ -973,6 +973,13 @@ In offline mode a partly fetched facet opens too and serves the chunks
 it holds; a read of a missing chunk is refused at once, saying offline
 mode is on — the refusal is never retried.
 
+Reads of remote chunks retry with backoff (up to 10 attempts, delays
+capped at 30 s) when the failure may pass: a lost connection, a
+timeout, a server error (5xx), or 408, 425 and 429. A response that
+every repeat would get too — any other client error, such as 404 for a
+file gone upstream or 401 and 403 for a refused credential — fails the
+read on the first attempt.
+
 Staleness is checked where the network is meant to be used: `fetch`
 asks the upstream whether each complete copy is still current, and
 reports `FacetFetch::upstream_checked = false` when it could not ask; a
