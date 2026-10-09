@@ -174,8 +174,7 @@ impl TestDataGroup {
         // the URL's parent directory.
         if url.path().ends_with(".yaml") || url.path().ends_with(".yml") {
             let base_url = url.join(".")?;
-            let yaml_content = fetch_descriptor(&client, &url, &base_url)?
-                .ok_or_else(|| Error::Other(format!("{url}: not found")))?;
+            let yaml_content = fetch_descriptor(&client, &url, &base_url)?.required(&url)?;
             let dir_name = base_url
                 .path_segments()
                 .and_then(|s| s.collect::<Vec<_>>().iter().rev().find(|seg| !seg.is_empty()).cloned())
@@ -201,29 +200,43 @@ impl TestDataGroup {
         }
         let base_url = url.clone();
 
-        // Try dataset.yaml first
+        // Try dataset.yaml first. When the server cannot be asked and no
+        // copy of it was kept, the dataset may still be a kept
+        // `knn_entries.yaml` one: go on to that before giving up.
         let dataset_url = base_url.join("dataset.yaml")?;
-        if let Some(yaml_content) = fetch_descriptor(&client, &dataset_url, &base_url)? {
-            let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
-            let dataset_name = base_url
-                .path_segments()
-                .and_then(|s| s.collect::<Vec<_>>()
-                    .iter().rev().find(|seg| !seg.is_empty()).cloned())
-                .map(|s| s.to_string());
-            return Ok(Self {
-                source: DataSource::Http(base_url.clone()),
-                config,
-                catalog_source: Some(with_trailing_slash(base_url.as_str())),
-                dataset_name,
-            });
+        let mut unavailable = None;
+        match fetch_descriptor(&client, &dataset_url, &base_url)? {
+            Descriptor::Text(yaml_content) => {
+                let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
+                let dataset_name = base_url
+                    .path_segments()
+                    .and_then(|s| s.collect::<Vec<_>>()
+                        .iter().rev().find(|seg| !seg.is_empty()).cloned())
+                    .map(|s| s.to_string());
+                return Ok(Self {
+                    source: DataSource::Http(base_url.clone()),
+                    config,
+                    catalog_source: Some(with_trailing_slash(base_url.as_str())),
+                    dataset_name,
+                });
+            }
+            Descriptor::Absent => {}
+            Descriptor::Unavailable(e) => unavailable = Some(e),
         }
 
         // Fall back to knn_entries.yaml. When the file describes
         // multiple datasets, prefer the one whose name matches the
         // last path segment of the URL; otherwise return the first.
         let knn_url = base_url.join("knn_entries.yaml")?;
-        let yaml_content = fetch_descriptor(&client, &knn_url, &base_url)?
-            .ok_or_else(|| Error::Other(format!("{base_url}: no dataset.yaml or knn_entries.yaml")))?;
+        let yaml_content = match (fetch_descriptor(&client, &knn_url, &base_url)?, unavailable) {
+            (Descriptor::Text(text), _) => text,
+            // dataset.yaml went unasked: that is the reason, whatever
+            // came of knn_entries.yaml.
+            (_, Some(e)) | (Descriptor::Unavailable(e), None) => return Err(e),
+            (Descriptor::Absent, None) => {
+                return Err(Error::Other(format!("{base_url}: no dataset.yaml or knn_entries.yaml")));
+            }
+        };
         let entries = crate::knn_entries::KnnEntries::parse(&yaml_content)
             .map_err(Error::Other)?;
         let url_dir_name = base_url
@@ -434,45 +447,71 @@ impl TestDataGroup {
 /// republished dataset can gain profiles — unlike the verified data it
 /// describes, whose complete copies open with no network at all. The
 /// kept copy is what lets a cached dataset still open when the server
-/// is down or the machine is offline. `Ok(None)` when the server
-/// answered that there is no such file; errors only when it could not
-/// be reached and nothing was kept.
+/// is down or the machine is offline. Errors only for a server answer
+/// that is neither the file nor "no such file", or a kept copy that
+/// cannot be read.
 fn fetch_descriptor(
     client: &reqwest::blocking::Client,
     url: &Url,
     base_url: &Url,
-) -> Result<Option<String>> {
-    let kept = kept_descriptor_path(url, base_url);
+) -> Result<Descriptor> {
+    let kept = kept_descriptor_path(url, base_url).filter(|p| p.is_file());
+    let read_kept = |path: &std::path::Path| {
+        std::fs::read_to_string(path).map(Descriptor::Text).map_err(Error::ConfigIo)
+    };
     if crate::settings::offline() {
-        return match kept.filter(|p| p.is_file()) {
-            Some(path) => std::fs::read_to_string(&path).map(Some).map_err(Error::ConfigIo),
-            None => Err(Error::Other(
+        return match &kept {
+            Some(path) => read_kept(path),
+            None => Ok(Descriptor::Unavailable(Error::Other(
                 crate::transport::ensure_online(url.as_str()).unwrap_err().to_string(),
-            )),
+            ))),
         };
     }
     let resp = crate::transport::apply_read_auth(client.get(url.clone()), Some(url)).send();
     match resp {
         Ok(r) if r.status().is_success() => {
             let text = r.text()?;
-            if let Some(path) = &kept {
+            if let Some(path) = kept_descriptor_path(url, base_url) {
                 // Best effort: a cache directory that cannot be written
                 // only costs the offline fallback.
                 let _ = path.parent().map(std::fs::create_dir_all);
                 let _ = std::fs::write(path, &text);
             }
-            Ok(Some(text))
+            Ok(Descriptor::Text(text))
         }
-        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => Ok(None),
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => Ok(Descriptor::Absent),
         Ok(r) => Err(Error::Other(format!("{url}: {}", r.status()))),
-        Err(e) if e.is_connect() || e.is_timeout() => match kept.filter(|p| p.is_file()) {
+        Err(e) if e.is_connect() || e.is_timeout() => match &kept {
             Some(path) => {
                 log::warn!("{url} is unreachable ({e}); using the copy kept at {}", path.display());
-                std::fs::read_to_string(&path).map(Some).map_err(Error::ConfigIo)
+                read_kept(path)
             }
-            None => Err(Error::Http(e)),
+            None => Ok(Descriptor::Unavailable(Error::Http(e))),
         },
         Err(e) => Err(Error::Http(e)),
+    }
+}
+
+/// What [`fetch_descriptor`] found for one descriptor file.
+enum Descriptor {
+    /// The file's text: from the server, or the kept copy.
+    Text(String),
+    /// The server answered that there is no such file.
+    Absent,
+    /// The server could not be asked — unreachable, or offline mode —
+    /// and no copy was kept. The error says which.
+    Unavailable(Error),
+}
+
+impl Descriptor {
+    /// The text of a descriptor the caller cannot do without: absent is
+    /// "not found", unavailable is why it could not be asked for.
+    fn required(self, url: &Url) -> Result<String> {
+        match self {
+            Descriptor::Text(text) => Ok(text),
+            Descriptor::Absent => Err(Error::Other(format!("{url}: not found"))),
+            Descriptor::Unavailable(e) => Err(e),
+        }
     }
 }
 
@@ -490,8 +529,7 @@ pub(crate) fn fetch_dataset_yaml(url_str: &str) -> Result<String> {
     }
     let base_url = url.join(".")?;
     let client = crate::transport::shared_client_for(url.as_str());
-    fetch_descriptor(&client, &url, &base_url)?
-        .ok_or_else(|| Error::Other(format!("{url}: not found")))
+    fetch_descriptor(&client, &url, &base_url)?.required(&url)
 }
 
 /// Where a descriptor fetched from `url` is kept: under the dataset's

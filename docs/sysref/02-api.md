@@ -965,8 +965,9 @@ no HEAD request is made. A variable-length facet's offset index is read
 from the copy kept beside its cache file. A dataset's `dataset.yaml` is
 fetched first — it can change upstream — with the copy kept in its
 cache directory used when the server cannot be reached (connects time
-out after 10 s). A warmed cache therefore opens and reads with no
-network.
+out after 10 s). When there is no kept `dataset.yaml`, a kept
+`knn_entries.yaml` opens the dataset instead, as the online cascade
+would. A warmed cache therefore opens and reads with no network.
 
 In offline mode a partly fetched facet opens too and serves the chunks
 it holds; a read of a missing chunk is refused at once, saying offline

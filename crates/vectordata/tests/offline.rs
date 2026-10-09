@@ -338,3 +338,37 @@ fn read_partially_offline_in_a_child() {
     // Refused at once: the refusal is not retried with backoff.
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "refused after {:?}", started.elapsed());
 }
+
+/// **A `knn_entries.yaml` dataset opens with the server gone.** The
+/// directory cascade asks for `dataset.yaml` first; with the server
+/// unreachable and no copy of that kept, it goes on to the kept
+/// `knn_entries.yaml` rather than failing at the first question.
+#[test]
+fn a_knn_entries_dataset_opens_with_the_server_gone() {
+    let tmp = make_tmp();
+    let ds = tmp.path().join("knn-ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    write_fvec(&ds.join("base.fvec"), 500, 8, 1.1e8);
+    write_mref(&ds.join("base.fvec"));
+    write_fvec(&ds.join("query.fvec"), 20, 8, 1.15e8);
+    write_ivvec(&ds.join("gt.ivec"), 20, 0);
+    std::fs::write(
+        ds.join("knn_entries.yaml"),
+        "\"knn-ds:default\":\n  base: base.fvec\n  query: query.fvec\n  gt: gt.ivec\n",
+    )
+    .unwrap();
+    let server = TestServer::start(tmp.path()).unwrap();
+    vectordata::settings::override_cache_dir_for_process(TEST_CACHE_DIR.path().to_path_buf());
+    let url = format!("{}knn-ds/", server.base_url());
+    TestDataGroup::load(&url)
+        .unwrap()
+        .profile("default")
+        .unwrap()
+        .fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent)
+        .unwrap();
+    drop(server);
+
+    let group = TestDataGroup::load(&url).expect("the kept knn_entries.yaml opens it");
+    let base = group.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(base.get(499).unwrap()[0], fvec_value(1.1e8, 8, 499, 0));
+}
