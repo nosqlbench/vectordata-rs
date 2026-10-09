@@ -49,11 +49,18 @@ impl CatalogSources {
     }
 
     /// Load `catalogs.yaml` from an explicit config directory as *optional*
-    /// sources (a missing file is non-fatal). The env-free seam behind
+    /// sources. Having no `catalogs.yaml` is the ordinary case and says
+    /// nothing; one that cannot be read or parsed records a warning in
+    /// [`diagnostics`](Self::diagnostics). The env-free seam behind
     /// [`Self::configure_default`].
     pub fn configure_optional(mut self, config_dir: &str) -> Self {
-        if let Ok(locations) = load_config(&expand_tilde(config_dir), &mut self.diagnostics) {
-            self.optional.extend(locations);
+        let config_dir = expand_tilde(config_dir);
+        if !Path::new(&config_dir).join("catalogs.yaml").is_file() {
+            return self;
+        }
+        match load_config(&config_dir, &mut self.diagnostics) {
+            Ok(locations) => self.optional.extend(locations),
+            Err(e) => self.diagnostics.push(super::CatalogDiagnostic::warning(e)),
         }
         self
     }
@@ -521,6 +528,45 @@ mod tests {
             "expected the dir's catalogs.yaml entry, got {:?}",
             s.optional()
         );
+    }
+
+    /// **Configuration problems are diagnostics on the sources**, never
+    /// stderr: a required config directory without `catalogs.yaml`, a
+    /// location that is a directory with no catalog file in it (named
+    /// directly or listed in `catalogs.yaml`), and a malformed
+    /// `catalogs.yaml` — which the default, optional configuration
+    /// reports too. Only an absent optional `catalogs.yaml` says
+    /// nothing: having none is the ordinary case.
+    #[test]
+    fn configuration_problems_are_diagnostics() {
+        use super::super::Severity;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let s = CatalogSources::new().configure(&path);
+        assert_eq!(s.diagnostics().len(), 1, "{:?}", s.diagnostics());
+        assert_eq!(s.diagnostics()[0].severity, Severity::Warning);
+        assert!(s.diagnostics()[0].message.contains("no catalogs.yaml found"), "{}", s.diagnostics()[0]);
+        assert!(CatalogSources::new().configure_optional(&path).diagnostics().is_empty());
+
+        let bare = dir.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let s = CatalogSources::new().add_catalogs(&[bare.to_string_lossy().to_string()]);
+        assert!(s.required().is_empty());
+        assert_eq!(s.diagnostics().len(), 1, "{:?}", s.diagnostics());
+        assert!(s.diagnostics()[0].message.contains("has no catalogs.yaml / catalog.json"), "{}", s.diagnostics()[0]);
+
+        std::fs::write(dir.path().join("catalogs.yaml"), format!("lab: {}\n", bare.display())).unwrap();
+        let s = CatalogSources::new().configure_optional(&path);
+        assert!(s.optional().is_empty());
+        assert_eq!(s.diagnostics().len(), 1, "a listed bare directory: {:?}", s.diagnostics());
+
+        std::fs::write(dir.path().join("catalogs.yaml"), "lab: [unclosed\n").unwrap();
+        for s in [CatalogSources::new().configure(&path), CatalogSources::new().configure_optional(&path)] {
+            assert_eq!(s.diagnostics().len(), 1, "a malformed catalogs.yaml: {:?}", s.diagnostics());
+            assert!(s.diagnostics()[0].message.contains("failed to parse"), "{}", s.diagnostics()[0]);
+            assert!(s.required().is_empty() && s.optional().is_empty());
+        }
     }
 
     #[test]

@@ -563,3 +563,24 @@ fn read_the_fetched_facets_in_a_child() {
     assert!(typed.is_complete(), "and so does the typed reader");
     assert_eq!(typed.get_native(300).unwrap(), (300 % 251) as u8);
 }
+
+/// **Problems met reading the sources reach the catalog's diagnostics**,
+/// alongside the ones met loading: a configured directory with no
+/// catalog file in it, then a catalog that cannot be loaded.
+#[test]
+fn source_problems_are_carried_into_the_catalog() {
+    let tmp = make_tmp();
+    let bare = tmp.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let missing = tmp.path().join("missing.json");
+    let sources = vectordata::catalog::CatalogSources::new().add_catalogs(&[
+        bare.to_str().unwrap().to_string(),
+        missing.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(sources.diagnostics().len(), 1);
+    let catalog = Catalog::of(&sources);
+    let diag: Vec<String> = catalog.diagnostics().iter().map(|d| d.to_string()).collect();
+    assert_eq!(diag.len(), 2, "{diag:?}");
+    assert!(diag[0].starts_with("warning: directory") && diag[0].contains("has no catalogs.yaml"), "{diag:?}");
+    assert!(diag[1].starts_with("error: could not load catalog"), "{diag:?}");
+}
