@@ -564,6 +564,107 @@ fn read_the_fetched_facets_in_a_child() {
     assert_eq!(typed.get_native(300).unwrap(), (300 % 251) as u8);
 }
 
+/// Bytes free on the filesystem holding `path`, as the cache check
+/// measures them.
+#[cfg(unix)]
+fn free_bytes(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::statvfs(c.as_ptr(), &mut stat) }, 0);
+    stat.f_bavail as u64 * stat.f_frsize as u64
+}
+
+/// **A fetch the cache cannot hold is refused before anything moves**
+/// (§9 case 6). The served base file is sparse and larger than the free
+/// space under the cache; the run, which also asks for a small facet, is
+/// refused as a whole with the three numbers a user acts on, the sink
+/// hears only the failure, and neither facet lands in the cache.
+#[cfg(unix)]
+#[test]
+fn a_fetch_larger_than_the_cache_is_refused_before_anything_moves() {
+    let tmp = make_tmp();
+    init_test_cache();
+    let free = free_bytes(TEST_CACHE_DIR.path());
+    // One-element records: any multiple of 8 bytes is a whole file.
+    let size = (free + (64 << 30)) / 8 * 8;
+    let huge = tmp.path().join("huge.fvec");
+    std::fs::write(&huge, 1i32.to_le_bytes()).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&huge).unwrap();
+    if let Err(e) = f.set_len(size) {
+        // A filesystem whose largest file is smaller than its free space
+        // cannot stage this case.
+        eprintln!("skipping: cannot make a {size}-byte sparse file here: {e}");
+        return;
+    }
+    drop(f);
+    write_fvec(&tmp.path().join("small.fvec"), 100, 8, 9.0e6);
+    std::fs::write(
+        tmp.path().join("dataset.yaml"),
+        "name: too-big\nprofiles:\n  default:\n    base_vectors: huge.fvec\n    query_vectors: small.fvec\n",
+    )
+    .unwrap();
+    let server = TestServer::start(tmp.path()).unwrap();
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let mut events = Vec::new();
+    let err = view
+        .fetch(&FetchRequest::facets(["query_vectors", "base_vectors"]), &mut |e: &FetchEvent<'_>| {
+            events.push(format!("{e:?}"))
+        })
+        .expect_err("the cache cannot hold it");
+    match &err {
+        vectordata::Error::InsufficientCacheSpace(s) => {
+            assert!(s.needed >= size - (1 << 20), "needed {} of {size}", s.needed);
+            assert!(s.available < s.needed);
+            assert!(s.cache_dir.starts_with(TEST_CACHE_DIR.path()) || TEST_CACHE_DIR.path().starts_with(&s.cache_dir));
+        }
+        other => panic!("expected InsufficientCacheSpace, got {other:?}"),
+    }
+    assert!(err.to_string().contains("not enough free space in cache directory"), "{err}");
+    // Planning is heard; nothing that moves bytes is, and the failure ends it.
+    assert!(events.iter().all(|e| e.starts_with("Plan") || e.starts_with("Failed")), "{events:?}");
+    assert!(events.last().unwrap().starts_with("Failed"), "{events:?}");
+    assert!(!resident(&*view, "query_vectors"), "the small facet was not fetched either");
+}
+
+/// **A selection that matches several profiles opens one view only when
+/// asked for one.** `view` names the matches and asks to narrow; `views`
+/// returns them all; a selector naming one profile gives its view.
+#[test]
+fn a_selection_of_several_profiles_refuses_a_single_view() {
+    let tmp = make_tmp();
+    write_fvec(&tmp.path().join("base.fvec"), 100, 4, 8.0e6);
+    write_fvec(&tmp.path().join("small.fvec"), 10, 4, 8.5e6);
+    std::fs::write(
+        tmp.path().join("dataset.yaml"),
+        "name: multi\nprofiles:\n  default:\n    base_vectors: base.fvec\n  \
+         small:\n    base_vectors: small.fvec\n",
+    )
+    .unwrap();
+    let catalog = Catalog::of(&vectordata::catalog::CatalogSources::new());
+    let spec = tmp.path().to_str().unwrap();
+
+    let all = catalog.open_spec(&format!("{spec}:profile=*")).unwrap();
+    assert_eq!(all.profiles().len(), 2, "{:?}", all.profiles());
+    let err = all.view().map(|_| ()).unwrap_err();
+    match &err {
+        vectordata::Error::Selection { message, .. } => {
+            assert!(message.contains("matches 2 profiles"), "{message}");
+            assert!(message.contains("default") && message.contains("small"), "{message}");
+        }
+        other => panic!("expected a Selection error, got {other:?}"),
+    }
+    let views = all.views().unwrap();
+    let names: Vec<&str> = views.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"default") && names.contains(&"small"), "{names:?}");
+
+    let one = catalog.open_spec(&format!("{spec}:small")).unwrap();
+    assert_eq!(one.view().unwrap().base_vectors().unwrap().count(), 10);
+}
+
 /// **Problems met reading the sources reach the catalog's diagnostics**,
 /// alongside the ones met loading: a configured directory with no
 /// catalog file in it, then a catalog that cannot be loaded.
