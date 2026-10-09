@@ -276,6 +276,119 @@ fn a_remote_catalog_loads_from_its_kept_copy_when_unreachable() {
     assert_eq!(offline.datasets()[0].name, "listed");
 }
 
+/// **A changed upstream is caught for a file with no `.mref` too.** The
+/// chunk-store copy has only the file's size to compare; when the
+/// publisher's file changes size, the fetch says the cache is stale.
+#[test]
+fn a_resized_upstream_without_an_mref_is_stale_at_fetch_time() {
+    let tmp = make_tmp();
+    dataset(tmp.path(), "resized", 8.0e7);
+    let server = TestServer::start(tmp.path()).unwrap();
+    vectordata::settings::override_cache_dir_for_process(TEST_CACHE_DIR.path().to_path_buf());
+    let url = format!("{}resized/", server.base_url());
+    let fetch_query = || {
+        TestDataGroup::load(&url)
+            .unwrap()
+            .profile("default")
+            .unwrap()
+            .fetch(&FetchRequest::facets(["query_vectors"]), &mut Silent)
+    };
+    let first = fetch_query().unwrap();
+    assert!(first.facets[0].complete && first.facets[0].upstream_checked);
+    assert!(fetch_query().unwrap().facets[0].upstream_checked, "an unchanged upstream is current");
+
+    write_fvec(&tmp.path().join("resized/query.fvec"), 60, 8, 8.5e7);
+    let err = fetch_query().expect_err("the upstream changed size");
+    assert!(err.to_string().contains("stale"), "{err}");
+}
+
+/// **A dataset opened by its `dataset.yaml` URL keeps that file too**,
+/// so the same URL opens it with the server gone.
+#[test]
+fn a_dataset_opened_by_its_yaml_url_opens_with_the_server_gone() {
+    let tmp = make_tmp();
+    dataset(tmp.path(), "by-yaml", 9.0e7);
+    let server = TestServer::start(tmp.path()).unwrap();
+    vectordata::settings::override_cache_dir_for_process(TEST_CACHE_DIR.path().to_path_buf());
+    let url = format!("{}by-yaml/dataset.yaml", server.base_url());
+    TestDataGroup::load(&url)
+        .unwrap()
+        .profile("default")
+        .unwrap()
+        .fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent)
+        .unwrap();
+    drop(server);
+
+    let group = TestDataGroup::load(&url).expect("the kept dataset.yaml opens it");
+    let base = group.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(base.get(1234).unwrap()[3], fvec_value(9.0e7, 8, 1234, 3));
+}
+
+/// **A `knn_entries.yaml` dataset opens with the server gone.** The
+/// directory cascade asks for `dataset.yaml` first; with the server
+/// unreachable and no copy of that kept, it goes on to the kept
+/// `knn_entries.yaml` rather than failing at the first question.
+#[test]
+fn a_knn_entries_dataset_opens_with_the_server_gone() {
+    let tmp = make_tmp();
+    let ds = tmp.path().join("knn-ds");
+    std::fs::create_dir_all(&ds).unwrap();
+    write_fvec(&ds.join("base.fvec"), 500, 8, 1.1e8);
+    write_mref(&ds.join("base.fvec"));
+    write_fvec(&ds.join("query.fvec"), 20, 8, 1.15e8);
+    write_ivvec(&ds.join("gt.ivec"), 20, 0);
+    std::fs::write(
+        ds.join("knn_entries.yaml"),
+        "\"knn-ds:default\":\n  base: base.fvec\n  query: query.fvec\n  gt: gt.ivec\n",
+    )
+    .unwrap();
+    let server = TestServer::start(tmp.path()).unwrap();
+    vectordata::settings::override_cache_dir_for_process(TEST_CACHE_DIR.path().to_path_buf());
+    let url = format!("{}knn-ds/", server.base_url());
+    TestDataGroup::load(&url)
+        .unwrap()
+        .profile("default")
+        .unwrap()
+        .fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent)
+        .unwrap();
+    drop(server);
+
+    let group = TestDataGroup::load(&url).expect("the kept knn_entries.yaml opens it");
+    let base = group.profile("default").unwrap().base_vectors().unwrap();
+    assert_eq!(base.get(499).unwrap()[0], fvec_value(1.1e8, 8, 499, 0));
+}
+
+/// **A kept definition belongs to its origin.** A same-named dataset
+/// from another server opens online, but neither replaces the first
+/// server's kept copy nor, once its own server is gone, is answered
+/// with it.
+#[test]
+fn a_kept_definition_is_never_served_for_another_origin() {
+    let first = make_tmp();
+    let second = make_tmp();
+    dataset(first.path(), "twin-ds", 1.2e8);
+    dataset(second.path(), "twin-ds", 1.3e8);
+    std::fs::write(
+        second.path().join("twin-ds/dataset.yaml"),
+        "name: twin-ds\nprofiles:\n  default:\n    base_vectors: base.fvec\n  other:\n    base_vectors: base.fvec\n",
+    )
+    .unwrap();
+    let a = TestServer::start(first.path()).unwrap();
+    let b = TestServer::start(second.path()).unwrap();
+    vectordata::settings::override_cache_dir_for_process(TEST_CACHE_DIR.path().to_path_buf());
+    let kept = TEST_CACHE_DIR.path().join("twin-ds/dataset.yaml");
+
+    TestDataGroup::load(&format!("{}twin-ds/", a.base_url())).unwrap();
+    let a_yaml = std::fs::read_to_string(&kept).expect("the first origin's copy is kept");
+    let b_url = format!("{}twin-ds/", b.base_url());
+    let from_b = TestDataGroup::load(&b_url).expect("the other origin opens online");
+    assert!(from_b.profile("other").is_some(), "with its own definition");
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), a_yaml, "the first origin's copy is untouched");
+
+    drop(b);
+    assert!(TestDataGroup::load(&b_url).is_err(), "the first origin's copy is not served for the second");
+}
+
 const PARTIAL_URL: &str = "VECTORDATA_TEST_PARTIAL_URL";
 
 /// **Offline, a partly fetched facet serves what it holds.** A window
@@ -339,36 +452,47 @@ fn read_partially_offline_in_a_child() {
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "refused after {:?}", started.elapsed());
 }
 
-/// **A `knn_entries.yaml` dataset opens with the server gone.** The
-/// directory cascade asks for `dataset.yaml` first; with the server
-/// unreachable and no copy of that kept, it goes on to the kept
-/// `knn_entries.yaml` rather than failing at the first question.
+/// Occupy `port` with a listener that never accepts, and fill its
+/// accept queue: a further connection is then neither accepted nor
+/// refused, and hangs — what a dead host behind a firewall looks like.
+fn hanging_listener(port: u16) -> (std::net::TcpListener, Vec<std::net::TcpStream>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind the stopped server's port");
+    let addr = listener.local_addr().unwrap();
+    let mut held = Vec::new();
+    for _ in 0..4096 {
+        match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)) {
+            Ok(s) => held.push(s),
+            Err(_) => return (listener, held),
+        }
+    }
+    panic!("the accept queue never filled");
+}
+
+/// **A server that hangs instead of refusing is given up on in
+/// seconds.** The connection attempt times out, and the kept copy is
+/// used, as for a refused connection — rather than waiting out the
+/// operating system's TCP timeout of minutes.
 #[test]
-fn a_knn_entries_dataset_opens_with_the_server_gone() {
+fn a_hanging_server_falls_back_to_the_kept_copy_in_seconds() {
     let tmp = make_tmp();
-    let ds = tmp.path().join("knn-ds");
-    std::fs::create_dir_all(&ds).unwrap();
-    write_fvec(&ds.join("base.fvec"), 500, 8, 1.1e8);
-    write_mref(&ds.join("base.fvec"));
-    write_fvec(&ds.join("query.fvec"), 20, 8, 1.15e8);
-    write_ivvec(&ds.join("gt.ivec"), 20, 0);
-    std::fs::write(
-        ds.join("knn_entries.yaml"),
-        "\"knn-ds:default\":\n  base: base.fvec\n  query: query.fvec\n  gt: gt.ivec\n",
-    )
-    .unwrap();
+    dataset(tmp.path(), "hanging", 1.5e8);
     let server = TestServer::start(tmp.path()).unwrap();
     vectordata::settings::override_cache_dir_for_process(TEST_CACHE_DIR.path().to_path_buf());
-    let url = format!("{}knn-ds/", server.base_url());
+    let url = format!("{}hanging/", server.base_url());
     TestDataGroup::load(&url)
         .unwrap()
         .profile("default")
         .unwrap()
         .fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent)
         .unwrap();
+    let port = server.port();
     drop(server);
+    let _hang = hanging_listener(port);
 
-    let group = TestDataGroup::load(&url).expect("the kept knn_entries.yaml opens it");
+    let started = std::time::Instant::now();
+    let group = TestDataGroup::load(&url).expect("the kept copy, once the connection times out");
+    let waited = started.elapsed();
+    assert!(waited < std::time::Duration::from_secs(30), "waited {waited:?}");
     let base = group.profile("default").unwrap().base_vectors().unwrap();
-    assert_eq!(base.get(499).unwrap()[0], fvec_value(1.1e8, 8, 499, 0));
+    assert_eq!(base.get(7).unwrap()[1], fvec_value(1.5e8, 8, 7, 1));
 }

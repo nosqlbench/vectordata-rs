@@ -2,10 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The `vectordata` commands that show or set offline behaviour, run as
-//! the binary a user runs, each in its own `VECTORDATA_HOME`.
+//! the binary a user runs, each in its own `VECTORDATA_HOME`: `config
+//! get/set offline`, `datasets ping` on a cached dataset whose server is
+//! gone or not to be asked, and the kept catalogs in `cache list`.
+
+mod support;
 
 use std::path::Path;
 use std::process::{Command, Output};
+
+use support::fixtures::{write_fvec, write_mref};
+use support::testserver::TestServer;
 
 fn make_tmp() -> tempfile::TempDir {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
@@ -78,4 +85,74 @@ fn config_sets_and_reports_offline_mode() {
     assert!(off.status.success());
     assert!(stdout(&off).contains("VECTORDATA_OFFLINE is set in this environment and takes precedence"), "{}", stdout(&off));
     assert_eq!(get(&[]), "off\n");
+}
+
+/// Serve `name`, with two facets, from a remote catalog under `root`.
+fn served_catalog(root: &Path, name: &str, seed: f32) {
+    let ds = root.join(name);
+    std::fs::create_dir_all(&ds).unwrap();
+    write_fvec(&ds.join("base.fvec"), 300, 4, seed);
+    write_mref(&ds.join("base.fvec"));
+    write_fvec(&ds.join("query.fvec"), 20, 4, seed + 0.5);
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        format!("name: {name}\nprofiles:\n  default:\n    base_vectors: base.fvec\n    query_vectors: query.fvec\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("catalog.json"),
+        format!(
+            r#"[{{"name":"{name}","path":"{name}/dataset.yaml","dataset_type":"dataset.yaml","layout":{{"profiles":{{"default":{{}}}}}}}}]"#
+        ),
+    )
+    .unwrap();
+}
+
+/// **`datasets ping` on a cached dataset says why it could not check**,
+/// and fails: with the server gone, each complete facet is reported
+/// unreachable but still readable; in offline mode it is reported not
+/// checked, with no request made. The catalog loads from its kept copy
+/// either way, and `cache list` shows that copy in its own section.
+#[test]
+fn ping_and_cache_list_report_a_cached_dataset_whose_server_is_gone() {
+    let tmp = make_tmp();
+    let home = home(tmp.path());
+    let served = tmp.path().join("served");
+    served_catalog(&served, "pinged", 3.0e8);
+    let server = TestServer::start(&served).unwrap();
+    let at = server.base_url();
+
+    let precache = vectordata(&home, &["datasets", "precache", "--at", &at, "pinged:default"], &[]);
+    assert!(precache.status.success(), "{}\n{}", stdout(&precache), stderr(&precache));
+    let online = vectordata(&home, &["datasets", "ping", "--at", &at, "pinged"], &[]);
+    assert!(online.status.success(), "{}\n{}", stdout(&online), stderr(&online));
+
+    let before = server.accepted_connections();
+    let offline = vectordata(&home, &["datasets", "ping", "--at", &at, "pinged"], &[("VECTORDATA_OFFLINE", "1")]);
+    let out = stdout(&offline);
+    assert!(!offline.status.success(), "{out}");
+    assert_eq!(out.matches("NOT CHECKED: offline mode is on (a complete copy is cached)").count(), 2, "{out}");
+    assert_eq!(server.accepted_connections(), before, "offline ping contacted the server");
+
+    drop(server);
+    let gone = vectordata(&home, &["datasets", "ping", "--at", &at, "pinged"], &[]);
+    let out = stdout(&gone);
+    assert!(!gone.status.success(), "{out}");
+    assert_eq!(
+        out.matches("FAILED: unreachable (a complete copy is cached and still readable offline)").count(),
+        2,
+        "{out}\n{}",
+        stderr(&gone)
+    );
+
+    let list = vectordata(&home, &["cache", "list"], &[]);
+    let out = stdout(&list);
+    assert!(list.status.success(), "{}", stderr(&list));
+    let section = out
+        .split("Kept catalog copies (read when a catalog server is unreachable, or offline):\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no kept-catalog section:\n{out}"));
+    let first_row = section.lines().next().unwrap();
+    assert!(first_row.trim_start().starts_with(".catalogs"), "{out}");
+    assert!(first_row.ends_with("(1 file)"), "{out}");
 }
