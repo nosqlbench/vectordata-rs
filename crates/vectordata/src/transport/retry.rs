@@ -38,7 +38,9 @@ impl RetryPolicy {
     ///
     /// Returns the first successful result, or the last error after all
     /// retries are exhausted. An error no retry can change — an
-    /// offline-mode refusal — is returned at once.
+    /// offline-mode refusal, or an HTTP client error such as 404 or
+    /// 401 ([`is_permanent`](super::is_permanent)) — is returned at
+    /// once.
     pub fn execute<T, F>(&self, mut op: F) -> io::Result<T>
     where
         F: FnMut() -> io::Result<T>,

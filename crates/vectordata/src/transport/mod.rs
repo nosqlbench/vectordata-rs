@@ -156,13 +156,17 @@ impl std::fmt::Display for OfflineRefusal {
 
 impl std::error::Error for OfflineRefusal {}
 
-/// Whether `error` is one that no retry can change: an offline-mode
-/// refusal, found anywhere in its source chain.
+/// Whether `error` is one that no retry can change, found anywhere in
+/// its source chain: an offline-mode refusal, or an HTTP response whose
+/// status says the request itself is refused ([`status_is_permanent`]).
 pub(crate) fn is_permanent(error: &io::Error) -> bool {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = error.get_ref().map(|e| e as _);
     while let Some(e) = cause {
         if e.is::<OfflineRefusal>() {
             return true;
+        }
+        if let Some(status) = e.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status) {
+            return status_is_permanent(status.as_u16());
         }
         if let Some(inner) = e.downcast_ref::<io::Error>() {
             cause = inner.get_ref().map(|e| e as _);
@@ -171,6 +175,16 @@ pub(crate) fn is_permanent(error: &io::Error) -> bool {
         cause = e.source();
     }
     false
+}
+
+/// Whether an HTTP status answers every repeat of the request the same
+/// way. A client error does — a missing file (404), a refused or
+/// expired credential (401, 403), a range past the end (416) — except
+/// the ones that mean "not now": a request timeout (408), too early
+/// (425), or too many requests (429). Server errors (5xx) are
+/// transient and retried.
+fn status_is_permanent(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
 }
 
 /// Refuse a request to `url` in offline mode, naming what is missing
@@ -531,6 +545,18 @@ pub(crate) mod semaphore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Client errors are permanent except the "not now" ones; server
+    /// errors and anything outside 4xx are retried.
+    #[test]
+    fn client_errors_are_permanent_but_not_now_ones() {
+        for s in [400, 401, 403, 404, 410, 416] {
+            assert!(status_is_permanent(s), "{s} is permanent");
+        }
+        for s in [408, 425, 429, 500, 502, 503, 504, 301] {
+            assert!(!status_is_permanent(s), "{s} is retried");
+        }
+    }
 
     /// In-memory transport for testing.
     struct MemTransport {
