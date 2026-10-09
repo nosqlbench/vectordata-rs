@@ -558,12 +558,30 @@ pub fn set_ui_setting(key: &str, value: &str) -> i32 {
 /// (standard: off), with the environment variable named when it is
 /// what decided.
 pub fn get_offline() -> i32 {
-    let state = if crate::settings::offline() { "on" } else { "off" };
-    match std::env::var(crate::settings::OFFLINE_ENV) {
-        Ok(v) if !v.is_empty() => println!("{state} (from {}={v})", crate::settings::OFFLINE_ENV),
-        _ => println!("{state}"),
-    }
+    let setting = crate::settings::setting_value(crate::settings::OFFLINE_KEY);
+    let env = std::env::var(crate::settings::OFFLINE_ENV).ok();
+    println!("{}", offline_state_line(setting.as_deref(), env.as_deref()));
     0
+}
+
+/// What `config get offline` prints for this settings value and
+/// environment value: the state, and the variable when it is what
+/// decided. A value the variable does not recognize decides nothing,
+/// so it is not named.
+fn offline_state_line(setting: Option<&str>, env: Option<&str>) -> String {
+    let state = if crate::settings::offline_from(setting, env) { "on" } else { "off" };
+    match env {
+        Some(v) if offline_env_decides(v) => format!("{state} (from {}={v})", crate::settings::OFFLINE_ENV),
+        _ => state.to_string(),
+    }
+}
+
+/// Whether an [`OFFLINE_ENV`](crate::settings::OFFLINE_ENV) value
+/// decides offline mode over the setting: it does when the outcome no
+/// longer depends on the setting.
+fn offline_env_decides(env: &str) -> bool {
+    use crate::settings::offline_from;
+    offline_from(Some("on"), Some(env)) == offline_from(Some("off"), Some(env))
 }
 
 /// Validate and persist offline mode to `settings.yaml` via the
@@ -580,7 +598,7 @@ pub fn set_offline(value: &str) -> i32 {
     match crate::settings::write_setting(crate::settings::OFFLINE_KEY, norm) {
         Ok(path) => {
             println!("offline = {norm}\nSaved to {}", path.display());
-            if std::env::var(crate::settings::OFFLINE_ENV).is_ok_and(|v| !v.is_empty()) {
+            if std::env::var(crate::settings::OFFLINE_ENV).is_ok_and(|v| offline_env_decides(&v)) {
                 println!("(note: {} is set in this environment and takes precedence)", crate::settings::OFFLINE_ENV);
             }
             0
@@ -900,6 +918,19 @@ fn dir_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `config get offline` names the environment variable only when it
+    /// is what decided: a recognized value, either way; an empty or
+    /// unrecognized one leaves the setting in charge and goes unnamed.
+    #[test]
+    fn offline_state_names_the_variable_only_when_it_decided() {
+        assert_eq!(offline_state_line(None, None), "off");
+        assert_eq!(offline_state_line(Some("on"), None), "on");
+        assert_eq!(offline_state_line(Some("off"), Some("1")), "on (from VECTORDATA_OFFLINE=1)");
+        assert_eq!(offline_state_line(Some("on"), Some("off")), "off (from VECTORDATA_OFFLINE=off)");
+        assert_eq!(offline_state_line(Some("on"), Some("")), "on");
+        assert_eq!(offline_state_line(Some("on"), Some("maybe")), "on", "an unrecognized value decides nothing");
+    }
 
     const HAND_EDITED: &str = "\
 # my catalogs — keep sorted
