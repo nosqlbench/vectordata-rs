@@ -933,7 +933,7 @@ pub trait TestDataView: Send + Sync {
             (None, Some(_)) => String::new(),
             (None, None) => {
                 plan.degrades_to_full_download = true;
-                plan.resident_bytes = storage.allocated_cache_bytes().min(facet_bytes);
+                plan.resident_bytes = storage.resident_bytes().min(facet_bytes);
                 return Ok(plan);
             }
         };
@@ -979,7 +979,7 @@ pub trait TestDataView: Send + Sync {
                     // full download; reporting a partial plan beside it
                     // would understate what is about to happen.
                     plan.degrades_to_full_download = true;
-                    plan.resident_bytes = storage.allocated_cache_bytes().min(facet_bytes);
+                    plan.resident_bytes = storage.resident_bytes().min(facet_bytes);
                     plan.requested_ranges.clear();
                     plan.byte_ranges.clear();
                     plan.fills.clear();
@@ -2555,27 +2555,21 @@ impl FacetStorage {
         }
     }
 
-    /// Bytes this facet's backing cache file *actually* occupies on
-    /// disk right now (`du` semantics — allocated blocks, not the
-    /// apparent length the file was sparse-pre-sized to). `0` when no
-    /// local file backs the facet yet (nothing downloaded) or its
-    /// metadata can't be read. Used by the precache capacity check to
-    /// discount already-resident bytes from what a download still
-    /// needs to fetch.
-    pub(crate) fn allocated_cache_bytes(&self) -> u64 {
-        let of = |s: &crate::storage::Storage| -> u64 {
-            s.local_path()
-                .and_then(|p| std::fs::metadata(&p).ok())
-                .map(|m| crate::cache::reader::allocated_size(&m))
-                .unwrap_or(0)
-        };
-        match &self.series {
-            None => of(&self.storage),
-            Some(s) => (0..s.file_count())
-                .filter_map(|i| s.file(i).ok())
-                .map(|f| of(&f))
-                .sum(),
-        }
+    /// Bytes of this facet already held, summed over its shards, as the
+    /// chunk state records them: each resident chunk at its real length.
+    /// A file with no chunk state — a local file, or a cache copy opened
+    /// complete — is held whole. Never read from the cache file's size:
+    /// it is pre-sized to the whole facet, and where the platform
+    /// reports no sparse allocation that size says everything is held.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.shard_sizes()
+            .into_iter()
+            .enumerate()
+            .map(|(shard, size)| match self.shard_range_fill(shard, 0, size) {
+                Some(fill) => fill.resident_bytes,
+                None => size,
+            })
+            .sum()
     }
 
     /// Live cache-fill statistics. Reports chunk fill for both the
