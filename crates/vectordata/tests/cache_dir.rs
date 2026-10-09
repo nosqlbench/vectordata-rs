@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A program that embeds vectordata choosing its own cache directory
-//! with `settings::set_cache_dir`: data lands in the chosen cache, the
+//! with `settings::set_cache_dir`, and `precache --cache-dir` doing the
+//! same from the command line: data lands in the chosen cache, the
 //! user's configured cache and `settings.yaml` are left as they were,
 //! and a choice that cannot take effect is refused. The choice is
 //! per-process, so each case runs in a fresh process.
@@ -173,4 +174,27 @@ fn catalog_first_in_a_child() {
     assert_eq!(group.view().unwrap().base_vectors().unwrap().get(5).unwrap()[2], fvec_value(2.4e8, 8, 5, 2));
     let again = vectordata::catalog::Catalog::of(&sources);
     assert!(again.diagnostics().is_empty(), "{:?}", again.diagnostics());
+}
+
+/// **`precache --cache-dir` fetches into that directory**, leaving the
+/// configured cache and `settings.yaml` as they were.
+#[test]
+fn precache_fetches_into_the_cache_dir_it_is_given() {
+    let tmp = make_tmp();
+    let (home, settings_text) = user_home(tmp.path());
+    let server = serve(tmp.path(), "flagged", 2.2e8);
+    let own = tmp.path().join("flag-cache");
+    let out = Command::new(env!("CARGO_BIN_EXE_vectordata"))
+        .args(["datasets", "precache", "--at", &server.base_url(), "flagged:default", "--cache-dir"])
+        .arg(&own)
+        .env("VECTORDATA_HOME", &home)
+        .env("VECTORDATA_NO_UPDATE_CHECK", "1")
+        .env_remove(settings::OFFLINE_ENV)
+        .output()
+        .unwrap();
+    let report = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{report}");
+    assert!(own.join("flagged/base.fvec").is_file(), "{report}");
+    assert!(!home.join("user-cache").exists(), "{report}");
+    assert_eq!(std::fs::read_to_string(home.join("settings.yaml")).unwrap(), settings_text);
 }

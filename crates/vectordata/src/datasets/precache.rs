@@ -49,7 +49,8 @@ pub struct PrecacheRequest {
     pub extra_catalogs: Vec<String>,
     /// Catalog locations used instead of the configured ones (`--at`).
     pub at: Vec<String>,
-    /// Recorded and reported; the active cache root comes from settings.
+    /// Cache directory for this run in place of the configured one
+    /// (`--cache-dir`), set with [`crate::settings::set_cache_dir`].
     pub cache_dir: Option<PathBuf>,
     /// Profile to use, when the spec does not name one.
     ///
@@ -109,9 +110,9 @@ impl PrecacheRequest {
 /// now (PS-1).
 ///
 /// `configdir`, `extra_catalogs`, and `at` are the catalog-source
-/// inputs (same shape both binaries pass). `cache_dir` is purely
-/// informational; the actual cache root is resolved via
-/// [`crate::settings::cache_dir`].
+/// inputs (same shape both binaries pass). `cache_dir`, when given, is
+/// the cache this run fetches into; otherwise the configured one
+/// ([`crate::settings::cache_dir`]).
 ///
 /// Returns a process exit code: 0 on success, 1 when the fetch or a
 /// lookup fails, 2 when the request itself is refused (a malformed
@@ -132,6 +133,12 @@ pub fn run(req: PrecacheRequest) -> i32 {
         None => None,
     };
 
+    if let Some(dir) = req.cache_dir.as_deref()
+        && let Err(e) = crate::settings::set_cache_dir(dir)
+    {
+        eprintln!("error: --cache-dir: {e}");
+        return 2;
+    }
     let configured = match crate::settings::cache_dir() {
         Ok(p) => Some(p),
         Err(e) => {
@@ -142,16 +149,6 @@ pub fn run(req: PrecacheRequest) -> i32 {
             None
         }
     };
-    if let Some(override_) = req.cache_dir.as_deref() {
-        eprintln!(
-            "note: --cache-dir {} is recorded but the active cache root is {}",
-            override_.display(),
-            configured
-                .as_deref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(unconfigured)".to_string())
-        );
-    }
 
     let (head, spec_selector) = match classify_spec(&req.dataset_spec) {
         Ok(split) => split,

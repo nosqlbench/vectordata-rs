@@ -802,7 +802,8 @@ the single source of truth for cache resolution shared with the
 `veks-pipeline` crate. Resolution order:
 
 1. A cache directory set for the process with
-   `vectordata::settings::set_cache_dir`.
+   `vectordata::settings::set_cache_dir` — or, on the command line,
+   `datasets precache --cache-dir`.
 2. `cache_dir:` entry in `~/.config/vectordata/settings.yaml`
    (or `$VECTORDATA_HOME/settings.yaml`).
 3. `$VECTORDATA_HOME/cache`, when `$VECTORDATA_HOME` is set.

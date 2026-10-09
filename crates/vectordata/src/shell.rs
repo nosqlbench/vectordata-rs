@@ -403,8 +403,8 @@ enum DatasetsCmd {
         /// Catalog URLs or paths to use *instead* of configured catalogs.
         #[arg(long = "at")]
         at: Vec<String>,
-        /// Override cache directory location (informational; the
-        /// active cache root still comes from `settings.yaml`).
+        /// Fetch into this cache directory instead of the configured
+        /// one; `settings.yaml` is left unchanged.
         #[arg(long)]
         cache_dir: Option<PathBuf>,
         /// Fetch only these facets. Repeatable. Default: every facet

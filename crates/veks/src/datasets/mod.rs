@@ -322,7 +322,8 @@ pub enum DatasetsCommand {
         #[arg(long = "at")]
         at: Vec<String>,
 
-        /// Override cache directory location
+        /// Fetch into this cache directory instead of the configured
+        /// one; `settings.yaml` is left unchanged.
         #[arg(long)]
         cache_dir: Option<PathBuf>,
 
