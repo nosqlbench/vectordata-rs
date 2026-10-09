@@ -979,3 +979,112 @@ fn keep_policy_refuses_stale_checksums() {
     let err = execute(&o).expect_err("keep with missing sums");
     assert!(matches!(err, Failure::Usage(m) if m.contains("SHA256SUMS")));
 }
+
+/// **The plan is the run's output, and it goes where the caller says.**
+/// A capturing sink holds every plan line — the header, the source and
+/// destination, each file to add — so a library caller can show or
+/// keep it; nothing of it reaches the terminal.
+#[test]
+fn the_plan_is_written_to_the_callers_sink() {
+    let src = unique("plan-sink-src");
+    let remote = unique("plan-sink-remote");
+    make_dataset(&src);
+    let (sink, lines) = ProgressSink::capture();
+    let mut o = opts(&src, &remote);
+    o.progress = sink;
+    o.dry_run = true;
+    execute(&o).expect("dry run ok");
+    let lines = lines.lock().unwrap().clone();
+    assert!(lines.iter().any(|l| l == "DRY RUN — nothing will be written."), "{lines:?}");
+    assert!(lines.iter().any(|l| l == &format!("Destination: {}", file_url(&remote))), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "  + base.fvec"), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "  + profiles/1m/neighbor.ivec"), "{lines:?}");
+
+    let (sink, lines) = ProgressSink::capture();
+    o.progress = sink;
+    o.dry_run = false;
+    execute(&o).expect("push ok");
+    assert!(lines.lock().unwrap().iter().any(|l| l == "PLAN — what this push will do."));
+}
+
+/// **Only a run reporting to a terminal can ask for confirmation.** A
+/// capturing or silent sink is a program, not a person: without `-y`
+/// the push is refused with a usage error naming `-y`, before anything
+/// is uploaded — whatever stdin is.
+#[test]
+fn a_push_without_a_terminal_sink_is_refused_without_assume_yes() {
+    for (tag, sink) in [("capture", ProgressSink::capture().0), ("silent", ProgressSink::Silent)] {
+        let src = unique(&format!("confirm-{tag}-src"));
+        let remote = unique(&format!("confirm-{tag}-remote"));
+        make_dataset(&src);
+        let mut o = opts(&src, &remote);
+        o.progress = sink;
+        o.assume_yes = false;
+        match execute(&o) {
+            Err(Failure::Usage(m)) => assert!(m.contains("pass -y"), "{tag}: {m}"),
+            other => panic!("{tag}: expected a usage refusal, got {other:?}"),
+        }
+        assert!(!remote.join("base.fvec").exists(), "{tag}: nothing uploaded");
+        assert!(!remote.join(pushlog::PUSHLOG_FILE).exists(), "{tag}: nothing logged");
+    }
+}
+
+/// **A live line reaches a capturing sink once, at its end**, trimmed;
+/// the redraws before it and a silent sink keep nothing. This is how
+/// the checksum hashing reports through the caller's sink.
+#[test]
+fn live_lines_keep_only_their_final_state_in_a_capturing_sink() {
+    let (sink, lines) = ProgressSink::capture();
+    let report = Reporter::new(&sink);
+    report.live_line("  hashing .: 1 B / 4 B", false);
+    report.live_line("  hashing .: 4 B / 4 B", true);
+    assert_eq!(*lines.lock().unwrap(), ["hashing .: 4 B / 4 B"]);
+    let silent = Reporter::new(&ProgressSink::Silent);
+    silent.live_line("x", true);
+    silent.out("y");
+}
+
+/// **A checksum file is sorted by name however its names were listed.**
+/// Generation takes the names in the caller's order; the parsed value
+/// and the file on disk both come out sorted, so two runs over the same
+/// files write the same bytes.
+#[test]
+fn generated_checksums_are_sorted_whatever_the_name_order() {
+    let dir = unique("sums-order");
+    for n in ["c.bin", "a.bin", "b.bin"] {
+        std::fs::write(dir.join(n), n.as_bytes()).unwrap();
+    }
+    let names: Vec<String> = ["c.bin", "a.bin", "b.bin"].iter().map(|s| s.to_string()).collect();
+    let generated = checksums::generate(&dir, &names).unwrap();
+    let order: Vec<&str> = generated.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(order, ["a.bin", "b.bin", "c.bin"]);
+    let on_disk = std::fs::read_to_string(dir.join(checksums::CHECKSUMS_FILE)).unwrap();
+    assert_eq!(checksums::ChecksumFile::parse(&on_disk).unwrap(), generated);
+    let listed: Vec<&str> = on_disk.lines().map(|l| l.rsplit(' ').next().unwrap()).collect();
+    assert_eq!(listed, ["a.bin", "b.bin", "c.bin"], "{on_disk}");
+}
+
+/// **Hashing reports through the caller's sink.** A push that hashes a
+/// gigabyte or more of content shows a live hashing line; through a
+/// capturing sink it arrives once, finished, naming the files and bytes.
+/// The file is sparse, so the gigabyte costs no disk, and the
+/// destination refuses connections: the sums are made before the remote
+/// is reached, so the push hashes and then stops, uploading nothing.
+#[test]
+fn hashing_progress_reaches_the_callers_sink() {
+    let src = tempfile::tempdir().unwrap();
+    make_dataset(src.path());
+    let f = std::fs::OpenOptions::new().write(true).open(src.path().join("base.fvec")).unwrap();
+    f.set_len(1 << 30).unwrap();
+    drop(f);
+    let (sink, lines) = ProgressSink::capture();
+    let mut o = opts(src.path(), src.path());
+    o.to = Some("http://127.0.0.1:1/hash-progress/".to_string());
+    o.progress = sink;
+    execute(&o).expect_err("the destination refuses connections");
+    assert!(src.path().join("SHA256SUMS").is_file(), "the sums were made before the remote was reached");
+    let lines = lines.lock().unwrap().clone();
+    let hashing: Vec<&String> = lines.iter().filter(|l| l.starts_with("hashing ")).collect();
+    assert_eq!(hashing.len(), 1, "one finished line per hashed directory: {lines:?}");
+    assert!(hashing[0].contains("1.0 GiB / 1.0 GiB"), "{}", hashing[0]);
+}
