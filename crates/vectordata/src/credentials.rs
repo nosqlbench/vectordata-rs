@@ -133,12 +133,17 @@ impl Store {
     /// (`https://host`) for reads under that catalog, while still covering the
     /// rest of the origin from the origin key.
     pub fn token_for_url(&self, url: &str) -> Option<&Entry> {
+        self.governing(url).map(|(_, e)| e)
+    }
+
+    /// [`token_for_url`](Self::token_for_url) with the key that matched.
+    fn governing(&self, url: &str) -> Option<(&str, &Entry)> {
         let q = credential_key(url)?;
         self.entries
             .iter()
             .filter(|(k, _)| q == **k || q.starts_with(&format!("{k}/")))
             .max_by_key(|(k, _)| k.len())
-            .map(|(_, e)| e)
+            .map(|(k, e)| (k.as_str(), e))
     }
 
     /// Store `entry` under the key `origin` (a [`credential_key`]),
@@ -490,8 +495,10 @@ fn epoch_str(v: &serde_json::Value) -> Option<String> {
 /// Credentials within this window of expiry get a heads-up warning.
 const EXPIRY_WARN_SECS: i64 = 7 * 24 * 3600;
 
-/// A warning to show when the stored credential for `url`'s origin is past
-/// expiry, or within a week of it — so a lapsing token surfaces as a clear
+/// A warning to show when the stored credential that governs `url` — the
+/// one [`Store::token_for_url`] picks, so a catalog-scoped credential under
+/// its catalog — is past expiry, or within a week of it, naming its key
+/// and the re-login command — so a lapsing token surfaces as a clear
 /// "go re-login" rather than an opaque 401 later. `None` when there is no
 /// stored credential, it carries no expiry, or it is not close to expiring.
 /// The commands that rely on a stored credential print it.
@@ -501,18 +508,17 @@ pub fn expiry_warning(url: &str) -> Option<String> {
 
 /// Testable core of [`expiry_warning`] (time + store injected).
 fn expiry_warning_in(url: &str, now: i64, store: &Store) -> Option<String> {
-    let origin = origin_of_str(url)?;
-    let entry = store.get(&origin)?;
+    let (key, entry) = store.governing(url)?;
     match entry.expiry_status(now) {
         Expiry::Expired { .. } => Some(format!(
-            "warning: your stored credential for {origin} has expired — \
+            "warning: your stored credential for {key} has expired — \
              run `vectordata login {url}` to refresh it."
         )),
         Expiry::Active { secs_left } if secs_left <= EXPIRY_WARN_SECS => {
             // Round up to whole days (secs_left > 0 in the Active arm).
             let days = (secs_left + 24 * 3600 - 1) / (24 * 3600);
             Some(format!(
-                "warning: your stored credential for {origin} expires in ~{days} day(s) — \
+                "warning: your stored credential for {key} expires in ~{days} day(s) — \
                  run `vectordata login {url}` to refresh it."
             ))
         }
@@ -676,6 +682,53 @@ mod tests {
             mk(Some("1000000")).expiry_status(1_000_000),
             Expiry::Expired { secs_ago: 0 }
         );
+    }
+
+    /// **The expiry warning speaks for the credential a request would
+    /// use**: past expiry, or within a week of it, a warning naming the
+    /// key and the re-login command; otherwise, or with no expiry
+    /// recorded, nothing. A catalog-scoped credential is the one that
+    /// governs reads under its catalog, so its expiry is the one warned
+    /// about there — not the origin-wide one beside it.
+    #[test]
+    fn expiry_warning_names_the_governing_credential() {
+        const DAY: i64 = 24 * 3600;
+        let now = 1_000_000_000;
+        let mk = |expires: Option<i64>| Entry {
+            token: "t".into(),
+            user: None,
+            expires: expires.map(|e| e.to_string()),
+            catalog: None,
+        };
+        let url = "https://vecd-host:8443/datasets/glove/";
+        let mut store = Store::default();
+        assert_eq!(expiry_warning_in(url, now, &store), None, "no credential, no warning");
+
+        store.set("https://vecd-host:8443".into(), mk(None));
+        assert_eq!(expiry_warning_in(url, now, &store), None, "no expiry recorded");
+        store.set("https://vecd-host:8443".into(), mk(Some(now + 30 * DAY)));
+        assert_eq!(expiry_warning_in(url, now, &store), None, "not close to expiring");
+
+        store.set("https://vecd-host:8443".into(), mk(Some(now + 2 * DAY + 1)));
+        let w = expiry_warning_in(url, now, &store).expect("within a week");
+        assert!(w.contains("https://vecd-host:8443 expires in ~3 day(s)"), "{w}");
+        assert!(w.contains(&format!("vectordata login {url}")), "{w}");
+
+        store.set("https://vecd-host:8443".into(), mk(Some(now - 1)));
+        let w = expiry_warning_in(url, now, &store).expect("expired");
+        assert!(w.contains("https://vecd-host:8443 has expired"), "{w}");
+
+        // A current catalog-scoped credential governs reads under it: no
+        // warning there, though the origin-wide one has lapsed …
+        store.set("https://vecd-host:8443/datasets".into(), mk(Some(now + 30 * DAY)));
+        assert_eq!(expiry_warning_in(url, now, &store), None);
+        // … and when it is the one lapsing, it is the one named.
+        store.set("https://vecd-host:8443/datasets".into(), mk(Some(now - 1)));
+        let w = expiry_warning_in(url, now, &store).expect("the catalog credential expired");
+        assert!(w.contains("https://vecd-host:8443/datasets has expired"), "{w}");
+        // Elsewhere on the origin, the origin-wide credential still speaks.
+        let other = expiry_warning_in("https://vecd-host:8443/other/", now, &store).unwrap();
+        assert!(other.contains("https://vecd-host:8443 has expired"), "{other}");
     }
 
     #[test]
