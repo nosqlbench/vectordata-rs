@@ -93,6 +93,13 @@ pub struct DatasetAttributes {
     /// Freeform key-value tags for categorization.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub tags: IndexMap<String, String>,
+
+    /// Every other attribute the file states (`dimension`, a pipeline's
+    /// own keys), kept as written. Readers look such keys up by name,
+    /// and a save writes them back, so neither reading nor saving a
+    /// dataset loses what it says about itself.
+    #[serde(flatten)]
+    pub other: IndexMap<String, serde_yaml::Value>,
 }
 
 impl DatasetAttributes {
@@ -207,6 +214,9 @@ impl<'de> Deserialize<'de> for DatasetConfig {
             format_version: Option<u32>,
             #[serde(default)]
             profile_tags: IndexMap<String, serde_yaml::Value>,
+            // Many datasets in circulation state no name; a loader that
+            // knows where the file lives names it after its directory.
+            #[serde(default)]
             name: String,
             #[serde(default)]
             description: Option<String>,
@@ -311,17 +321,64 @@ impl DatasetConfig {
         let raw = defaults.get(super::shard_sizing::SHARD_SIZE_KEY)?;
         super::source::parse_number_with_suffix(raw).ok()
     }
-    /// Load a `DatasetConfig` from a YAML file on disk.
-    ///
-    /// After deserialization, applies the `partition_profiles` list to
-    /// set `partition: true` on the named profiles.
+    /// Parse `dataset.yaml` content held in memory: the step every
+    /// loader takes once it has the text. A file that states no `name`
+    /// comes back with an empty one; [`load`](Self::load) and
+    /// [`load_from`](Self::load_from) name it after its directory.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut config: Self = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+        config.unify_strata();
+        Ok(config)
+    }
+
+    /// Load a `DatasetConfig` from a YAML file on disk. A file that
+    /// states no `name` is named after its directory.
     pub fn load(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        let mut config: Self = serde_yaml::from_str(&content)
-            .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
-        config.unify_strata();
+        let mut config = Self::parse(&content)
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+        if config.name.is_empty() {
+            config.name = crate::Location::from_path(path)
+                .parent()
+                .and_then(|dir| dir.last_segment().map(str::to_string))
+                .unwrap_or_default();
+        }
         Ok(config)
+    }
+
+    /// Load the `dataset.yaml` a location names: a local directory or
+    /// file, or a URL naming the dataset's directory or the file, read
+    /// as [`TestDataGroup::load`](crate::TestDataGroup::load) reads it
+    /// (auth, and the kept copy when the server cannot be reached). A
+    /// file that states no `name` is named after its directory.
+    pub fn load_from(location: &crate::Location) -> Result<Self, String> {
+        match location {
+            crate::Location::Path(path) => {
+                let file = if path.extension().is_some_and(|e| e == "yaml" || e == "yml") {
+                    path.clone()
+                } else {
+                    path.join("dataset.yaml")
+                };
+                Self::load(&file)
+            }
+            crate::Location::Url(url) => {
+                let text = crate::group::fetch_dataset_yaml(url.as_str()).map_err(|e| e.to_string())?;
+                let mut config = Self::parse(&text)
+                    .map_err(|e| format!("Failed to parse the dataset.yaml at {url}: {e}"))?;
+                if config.name.is_empty() {
+                    let dir = if url.path().ends_with(".yaml") || url.path().ends_with(".yml") {
+                        location.parent()
+                    } else {
+                        Some(location.clone())
+                    };
+                    config.name = dir
+                        .and_then(|d| d.last_segment().map(str::to_string))
+                        .unwrap_or_default();
+                }
+                Ok(config)
+            }
+        }
     }
 
     /// Unify root-level `strata:` with the legacy `profiles.sized:`
@@ -744,6 +801,23 @@ impl DatasetConfig {
             for (k, v) in &attrs.tags {
                 out.push_str(&format!("  {}: {}\n", k, v));
             }
+            for (k, v) in &attrs.other {
+                match v {
+                    serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_) => {
+                        let block = serde_yaml::to_string(v)
+                            .map_err(|e| format!("attribute '{k}': {e}"))?;
+                        out.push_str(&format!("  {k}:\n"));
+                        for line in block.lines() {
+                            out.push_str(&format!("    {line}\n"));
+                        }
+                    }
+                    _ => {
+                        let rendered = Self::scalar_yaml(v)
+                            .map_err(|e| format!("attribute '{k}': {e}"))?;
+                        out.push_str(&format!("  {k}: {rendered}\n"));
+                    }
+                }
+            }
         }
 
         // upstream
@@ -835,12 +909,6 @@ impl DatasetConfig {
                 let b_bc = self.profiles.profiles.get(*b).and_then(|p| p.base_count);
                 crate::dataset::profile::profile_sort_by_size(a, a_bc, b, b_bc)
             });
-            // Cache default's views for inheritance suppression below.
-            // Non-default profiles inherit views from default at parse
-            // time, so emitting a view whose source/window match default's
-            // is just noise — skip it to keep the file compact.
-            let default_views = self.profiles.profiles.get("default")
-                .map(|p| &p.views);
             for name in save_names {
                 if !expand_sized && self.profiles.is_generated_profile(name) {
                     continue;
@@ -873,21 +941,13 @@ impl DatasetConfig {
                 }
                 // partition is derived structurally (non-default + has own
                 // base_vectors) — not stored in the YAML.
-                // Suppression compares against the profile's **actual**
-                // parent, not always `default`: a profile inheriting
-                // from `1m` re-derives `1m`'s views on load, so writing
-                // them back is the same noise the default case avoids.
-                let parent_views = profile
-                    .inherits
-                    .as_deref()
-                    .and_then(|parent| self.profiles.profiles.get(parent))
-                    .map(|p| &p.views)
-                    .or(default_views);
                 for (key, view) in &profile.views {
-                    // For non-default profiles, suppress views that the
-                    // deserializer will re-derive by inheritance from
-                    // default. Without this, expanded-save bloats the
-                    // file with N copies of every shared view.
+                    // A view the next load derives again by inheritance
+                    // is left out — by the same rule the load applies
+                    // (`DSProfileGroup::inherited_view`), so what a save
+                    // drops is exactly what a load restores. Without
+                    // this, an expanded save bloats the file with N
+                    // copies of every shared view.
                     // The comparison is by what the view *reads*: the
                     // path, the namespace and the effective window. A
                     // window read from the file sits on the view and
@@ -895,8 +955,7 @@ impl DatasetConfig {
                     // field by field they differed, so a save emitted
                     // what the next one suppressed and the file never
                     // settled.
-                    if name != "default"
-                        && let Some(dv) = parent_views.and_then(|m| m.get(key))
+                    if let Some(dv) = self.profiles.inherited_view(name, key)
                         && dv.source.path == view.source.path
                         && dv.source.namespace == view.source.namespace
                         && dv.effective_window() == view.effective_window()
@@ -1036,6 +1095,79 @@ impl DatasetConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A profile naming `default` at another size gets none of its
+    /// ground truth.** The size step withholds the per-profile outputs
+    /// whatever the parent is called (PL-5). Naming `default`
+    /// explicitly once copied them across, so every `*-unfiltered`
+    /// profile of a large dataset pointed at the full-base ground truth,
+    /// and catalogs generated from it listed those files.
+    #[test]
+    fn naming_default_at_another_size_takes_none_of_its_ground_truth() {
+        let config: DatasetConfig = serde_yaml::from_str(
+            "format_version: 3\nname: ds\nprofiles:\n  default:\n    base_count: 1000\n\
+             \x20   base_vectors: base.fvec\n    query_vectors: q.fvec\n\
+             \x20   neighbor_indices: profiles/default/gt.ivec\n\
+             \x20   prefiltered_neighbor_indices: profiles/default/pre.ivec\n\
+             \x20   metadata_results: profiles/default/results.slab\n\
+             \x20 10-unfiltered:\n    inherits: default\n    base_count: 10\n\
+             \x20   neighbor_indices: profiles/10/gt.ivec\n",
+        )
+        .unwrap();
+        let p = &config.profiles.profiles["10-unfiltered"];
+        for facet in ["prefiltered_neighbor_indices", "metadata_results"] {
+            assert!(!p.views.contains_key(facet), "{facet} crossed a size step: {:?}", p.views.get(facet));
+        }
+        assert_eq!(p.views["query_vectors"].source.path, "q.fvec", "a shared facet still crosses");
+        assert_eq!(p.views["base_vectors"].effective_window().to_string(), "[0..10]", "re-cut to the child's count");
+    }
+
+    /// **A dataset that states no name is named after its directory**,
+    /// as readers have always named it. Every jvector-style dataset
+    /// omits it, and the pipeline once refused to load them at all.
+    #[test]
+    fn a_dataset_without_a_name_takes_its_directory_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ada-1k");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("dataset.yaml"), "profiles:\n  default:\n    base_vectors: base.fvec\n").unwrap();
+        let config = DatasetConfig::load(&dir.join("dataset.yaml")).expect("a nameless dataset loads");
+        assert_eq!(config.name, "ada-1k");
+        let by_location = DatasetConfig::load_from(&crate::Location::from_path(&dir)).unwrap();
+        assert_eq!(by_location.name, "ada-1k");
+    }
+
+    /// **A save leaves out exactly what the next load restores**, by the
+    /// rule the load applies. A partition inherits nothing, so it keeps
+    /// even a facet that names the default's file; a save once dropped
+    /// that facet as if inherited, and the reloaded partition had no
+    /// queries. Attributes the type has no field for survive too.
+    #[test]
+    fn a_save_and_load_keep_every_facet_and_attribute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("dataset.yaml");
+        std::fs::write(
+            &path,
+            "name: ds\nattributes:\n  distance_function: L2\n  dimension: 128\nprofiles:\n  default:\n\
+             \x20   base_vectors: profiles/base/base.fvec\n    query_vectors: profiles/base/q.fvec\n\
+             \x20 label_00:\n    base_count: 40\n    base_vectors: profiles/label_00/base.fvec\n\
+             \x20   query_vectors: profiles/base/q.fvec\n\
+             \x20 sel:\n    neighbor_indices: profiles/sel/gt.ivec\n",
+        )
+        .unwrap();
+        let loaded = DatasetConfig::load(&path).unwrap();
+        loaded.save(&path).unwrap();
+        let reloaded = DatasetConfig::load(&path).unwrap();
+        for name in ["default", "label_00", "sel"] {
+            assert_eq!(
+                reloaded.profiles.profiles[name].views, loaded.profiles.profiles[name].views,
+                "profile {name} after a save:\n{}",
+                std::fs::read_to_string(&path).unwrap()
+            );
+        }
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("dimension: 128"), "the attribute was dropped:\n{saved}");
+    }
 
     /// A sized profile generated from a stratum takes every facet in
     /// its role: the base and metadata windowed, the neighbours and the

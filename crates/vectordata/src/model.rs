@@ -1,9 +1,12 @@
-//! Library API. Legacy data model types for `dataset.yaml` parsing.
+//! Library API. The reader's view of a `dataset.yaml`.
 //!
-//! This module contains the original `DatasetConfig`, `ProfileConfig`, and
-//! `FacetConfig` types used by [`TestDataGroup`](crate::TestDataGroup).
-//! The newer, richer configuration model lives in [`crate::dataset::config`] and
-//! [`crate::dataset::profile`].
+//! [`DatasetConfig`], [`ProfileConfig`] and [`FacetConfig`] are what
+//! [`TestDataGroup`](crate::TestDataGroup) and the dataset views read:
+//! each profile's standard facets, resolved. They are a **projection** of
+//! the one description type, [`crate::dataset::DatasetConfig`], which
+//! parses the file, applies the version gates and the inheritance rule,
+//! and is what the pipeline reads; the reader never parses a file on its
+//! own. Deserializing [`DatasetConfig`] runs that parse and projects it.
 //!
 //! # Example `dataset.yaml`
 //!
@@ -171,171 +174,143 @@ pub fn check_stated_against_content(stated: Option<u32>, required: u32) -> Resul
     }
 }
 
-// Hand-written deserialize so the client tolerates the compact `sized:`
-// spec sitting next to concrete profile entries. The spec is a sequence
-// (or mapping with a `ranges:` key) used by the pipeline as a shorthand
-// for generating sized profiles; the client doesn't understand the
-// grammar but must not reject datasets that carry it alongside the
-// expanded entries. Any profile-map entry whose value isn't a struct
-// (i.e. not a `ProfileConfig` shape) is skipped with a trace-level log.
-//
-// After parsing, applies default-profile inheritance: non-default
-// profiles that omit shared facets (`base_vectors`, `query_vectors`,
-// etc.) pick them up from `default`. `base_vectors` and
-// `metadata_content` additionally receive a `[0..base_count)` window
-// when the child profile sets `base_count`. Mirrors the inheritance
-// the pipeline-side `DSProfileGroup` deserializer already implements
-// — without it, every sized profile in a canonical `dataset.yaml`
-// loses its base/query facets and precache (or any consumer that
-// iterates `facet_manifest`) silently skips them.
+/// The reader's view of a `dataset.yaml` is a **projection** of the one
+/// description type, [`crate::dataset::DatasetConfig`]: the text is
+/// parsed once, by that type, with its version gates, declaration checks
+/// and the one inheritance rule
+/// ([`DSProfileGroup`](crate::dataset::DSProfileGroup)), and this view is
+/// computed from the result. The pipeline and a reader therefore see the
+/// same profiles with the same facets.
+///
+/// Sized profiles written compactly (`strata:`, `sized:`) are expanded
+/// where the file alone says enough: from its own `variables:` block.
+/// Specs that wait on a pipeline's `variables.yaml` stay unexpanded, as
+/// a reader of a published dataset has no such file.
 impl<'de> Deserialize<'de> for DatasetConfig {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        struct Raw {
-            #[serde(default)]
-            format_version: Option<u32>,
-            #[serde(default)]
-            attributes: HashMap<String, serde_yaml::Value>,
-            #[serde(default)]
-            profile_tags: indexmap::IndexMap<String, serde_yaml::Value>,
-            #[serde(default)]
-            profiles: HashMap<String, serde_yaml::Value>,
+        let mut description = crate::dataset::DatasetConfig::deserialize(deserializer)?;
+        description.unify_strata();
+        if description.profiles.has_deferred() {
+            let vars = description.variables.clone();
+            description.expand_sized_profiles(&vars);
         }
-
-        let raw = Raw::deserialize(deserializer)?;
-
-        // Refuse anything this build cannot read, before a single facet
-        // is opened (V-9, V-10). A dataset half-read is a view with a
-        // hole in it, and a caller that checks only what it touched will
-        // not find the hole.
-        let format_version =
-            check_supported_version(raw.format_version).map_err(serde::de::Error::custom)?;
-        let mut profiles: HashMap<String, ProfileConfig> = HashMap::new();
-        for (name, value) in raw.profiles {
-            // Skip the compact sized-spec shorthand and any other
-            // non-profile entries. A valid `ProfileConfig` is always
-            // a mapping; sequences (`sized: ["mul:1m/2", ...]`) and
-            // `sized: {ranges: [...], facets: {...}}` maps (which
-            // contain no profile fields) are ignored here and
-            // handled by the pipeline-side `vectordata::dataset`
-            // parser instead.
-            if name == "sized" {
-                continue;
-            }
-            // A mapping carrying shard fields is unambiguously a
-            // profile, so a parse failure there is a broken declaration
-            // and not the compact `sized:` shorthand. Skipping it would
-            // make the facet vanish rather than complain — the silent
-            // shape SH-74 exists to forbid. Narrowed to the shard keys
-            // so nothing that parses today changes behaviour.
-            let declares_shards = value.as_mapping().is_some_and(|m| {
-                m.values().any(|v| {
-                    v.as_mapping().is_some_and(|f| {
-                        ["shard_stride", "shard_count", "record_count"]
-                            .iter()
-                            .any(|k| f.contains_key(serde_yaml::Value::from(*k)))
-                    })
-                })
-            });
-            match serde_yaml::from_value::<ProfileConfig>(value) {
-                Ok(cfg) => { profiles.insert(name, cfg); }
-                Err(e) if declares_shards => {
-                    return Err(serde::de::Error::custom(format!(
-                        "profile '{name}' declares shard fields but does not parse: {e}"
-                    )));
-                }
-                Err(e) => {
-                    log::trace!(
-                        "skipping unparseable profile entry '{}': {}", name, e);
-                }
-            }
-        }
-
-        // Realize every facet's declaration far enough to catch a
-        // declaration that disagrees with itself, before anything else
-        // sees it (SH-85). Lengths that only a file can answer are
-        // deferred — there is no dataset root here to resolve a relative
-        // path against.
-        for (profile_name, cfg) in &profiles {
-            for (facet_name, facet) in cfg.facets() {
-                crate::dataset::shards::validate_declaration(facet_name, &facet.declaration())
-                    .map_err(|e| {
-                        serde::de::Error::custom(format!("profile '{profile_name}': {e}"))
-                    })?;
-            }
-        }
-
-        // Stated parents (PL-6): at version 3 every parent is real and
-        // stated, or the load is refused naming the profiles; below 3
-        // the fallbacks below stand.
-        let facts: Vec<crate::dataset::parents::ParentFacts<'_>> = profiles
-            .iter()
-            .map(|(name, p)| crate::dataset::parents::ParentFacts {
-                name,
-                partition: p.partition,
-                inherits: p.inherits.as_deref(),
-            })
-            .collect();
-        crate::dataset::parents::check_parents(format_version, &facts)
-            .map_err(serde::de::Error::custom)?;
-
-        apply_default_inheritance(&mut profiles);
-
-        // A *stated* version lower than the content requires is a
-        // declaration contradicting itself, and is refused here — the
-        // same class of fault as a record count that disagrees with its
-        // shards (SH-8).
-        //
-        // An **absent** field means 1, and the dataset is held to it
-        // (V-24): content that needs more is refused naming the version
-        // to declare, so a file that never said what it is is read as
-        // the least it could be rather than the most a new reader can
-        // make of it.
-        let config = DatasetConfig {
-            format_version,
-            attributes: raw.attributes,
-            profile_tags: raw.profile_tags,
-            profiles,
-        };
-        let required = config.min_format_version();
-        check_stated_against_content(raw.format_version, required)
-            .map_err(serde::de::Error::custom)?;
-
-        Ok(config)
+        Ok(DatasetConfig::from_description(&description))
     }
 }
 
-/// Apply default-profile inheritance. Non-default, non-partition
-/// profiles inherit any missing shared-facet field from `default`.
-/// `base_vectors` and `metadata_content` additionally receive a
-/// `[0..base_count)` window suffix when the child profile declares
-/// `base_count`. Per-profile output facets (`neighbor_*`,
-/// `prefiltered_*`, `postfiltered_*`) are never inherited — a sized
-/// profile's GT lives at `profiles/<name>/neighbor_*.ivecs`, not at
-/// the default's path.
-fn apply_default_inheritance(profiles: &mut HashMap<String, ProfileConfig>) {
-    // Resolve each profile against its parent, parents first, so a
-    // chain (`1m-sel001` → `1m` → `default`) resolves in one pass with
-    // the grandparent's facets already in place.
-    for name in inheritance_order(profiles) {
-        let Some(parent_name) = parent_of(profiles, &name) else {
-            continue;
-        };
-        let Some(parent) = profiles.get(&parent_name).cloned() else {
-            continue;
-        };
-        let Some(profile) = profiles.get_mut(&name) else {
-            continue;
-        };
-        // The axis of a step is derived from `base_count` (PL-5): a
-        // size step when the child's count differs from the parent's
-        // effective one, whatever the parent is called; otherwise the
-        // step is at one size and every facet crosses as it is.
-        let size_axis = profile.base_count.is_some() && profile.base_count != parent.base_count;
-        inherit_from(profile, &parent, size_axis);
+impl DatasetConfig {
+    /// The reader's view of a dataset description.
+    pub fn from_description(description: &crate::dataset::DatasetConfig) -> Self {
+        Self::from_parts(
+            description.format_version,
+            description.attributes.as_ref(),
+            &description.profile_tags,
+            &description.profiles,
+        )
+    }
+
+    /// The reader's view of a description given by its parts, as a
+    /// catalog entry's layout carries them.
+    pub fn from_parts(
+        format_version: u32,
+        attributes: Option<&crate::dataset::DatasetAttributes>,
+        profile_tags: &indexmap::IndexMap<String, serde_yaml::Value>,
+        profiles: &crate::dataset::DSProfileGroup,
+    ) -> Self {
+        let attributes = attributes
+            .and_then(|a| serde_yaml::to_value(a).ok())
+            .and_then(|v| match v {
+                serde_yaml::Value::Mapping(m) => Some(
+                    m.into_iter()
+                        // An attribute the file does not state is absent,
+                        // not a null the reader would find by name.
+                        .filter(|(_, v)| !v.is_null())
+                        .filter_map(|(k, v)| k.as_str().map(|k| (k.to_string(), v)))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        DatasetConfig {
+            format_version,
+            attributes,
+            profile_tags: profile_tags.clone(),
+            profiles: profiles
+                .profiles
+                .iter()
+                .map(|(name, p)| (name.clone(), project_profile(p)))
+                .collect(),
+        }
+    }
+}
+
+/// A profile as the reader holds it: the standard facets, by key. A
+/// custom facet key has no slot here and is reached through the
+/// description.
+fn project_profile(p: &crate::dataset::DSProfile) -> ProfileConfig {
+    let facet = |key: &str| p.views.get(key).map(project_view);
+    ProfileConfig {
+        base_count: p.base_count,
+        maxk: p.maxk,
+        partition: p.partition,
+        attributes: p.attributes.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        inherits: p.inherits.clone(),
+        base_vectors: facet("base_vectors"),
+        base_content: facet("base_content"),
+        query_vectors: facet("query_vectors"),
+        query_terms: facet("query_terms"),
+        query_filters: facet("query_filters"),
+        neighbor_indices: facet("neighbor_indices"),
+        neighbor_distances: facet("neighbor_distances"),
+        prefiltered_neighbor_indices: facet("prefiltered_neighbor_indices"),
+        prefiltered_neighbor_distances: facet("prefiltered_neighbor_distances"),
+        postfiltered_neighbor_indices: facet("postfiltered_neighbor_indices"),
+        postfiltered_neighbor_distances: facet("postfiltered_neighbor_distances"),
+        metadata_content: facet("metadata_content"),
+        metadata_predicates: facet("metadata_predicates"),
+        predicate_results: facet("metadata_results"),
+        metadata_layout: facet("metadata_layout"),
+    }
+}
+
+/// A facet as the reader holds it. A single file keeps its source as
+/// written (path, namespace and window, through `DSSource`'s `Display`,
+/// the inverse of the source-string parser); a series keeps its pattern
+/// or list, with the facet window in its own field (SH-67, SH-102).
+fn project_view(v: &crate::dataset::DSView) -> FacetConfig {
+    let window = v.window.as_ref().map(|w| w.to_string());
+    if v.is_series() {
+        if v.shard_count.is_some() {
+            // A window written on the pattern is the facet's window.
+            let (source, window) = if window.is_none() && !v.source.window.is_empty() {
+                let bare = crate::dataset::source::DSSource {
+                    window: Default::default(),
+                    ..v.source.clone()
+                };
+                (bare.to_string(), Some(v.source.window.to_string()))
+            } else {
+                (v.source.to_string(), window)
+            };
+            return FacetConfig::Sharded(ShardedFacet::Uniform {
+                source,
+                shard_stride: v.shard_stride.unwrap_or_default(),
+                shard_count: v.shard_count.unwrap_or_default(),
+                record_count: v.record_count.unwrap_or_default(),
+                window,
+            });
+        }
+        return FacetConfig::Sharded(ShardedFacet::Explicit {
+            source: v.declaration_sources(),
+            record_count: v.record_count.unwrap_or_default(),
+            window,
+        });
+    }
+    match window {
+        None => FacetConfig::Simple(v.source.to_string()),
+        Some(window) => FacetConfig::Detailed { source: v.source.to_string(), window: Some(window) },
     }
 }
 
@@ -355,196 +330,6 @@ where
             serde_yaml::to_string(&other).unwrap_or_default().trim()
         ))),
     }
-}
-
-/// The parent a profile inherits from, or `None` when it inherits from
-/// nothing.
-///
-/// A named parent must exist and must not be the profile itself; an
-/// unresolvable name falls back to `default` rather than failing the
-/// load, because the facets a profile *does* declare are still readable
-/// and `veks check` is where a broken declaration should be reported.
-fn parent_of(profiles: &HashMap<String, ProfileConfig>, name: &str) -> Option<String> {
-    if name == "default" {
-        return None;
-    }
-    let profile = profiles.get(name)?;
-    // Partition profiles are self-contained: they carry their own base
-    // bytes and must not pick up another profile's shared facets.
-    if profile.partition {
-        return None;
-    }
-    match profile.inherits.as_deref() {
-        Some(parent) if parent != name && profiles.contains_key(parent) => {
-            Some(parent.to_string())
-        }
-        _ => profiles.contains_key("default").then(|| "default".to_string()),
-    }
-}
-
-/// Profile names ordered so a parent is always resolved before its
-/// children.
-///
-/// A cycle — `a: inherits: b`, `b: inherits: a` — leaves both members
-/// unresolved rather than looping. They keep whatever they declared,
-/// which is the same outcome as having no parent, and `veks check`
-/// names the cycle.
-fn inheritance_order(profiles: &HashMap<String, ProfileConfig>) -> Vec<String> {
-    let mut names: Vec<String> = profiles.keys().cloned().collect();
-    names.sort();
-    let mut done: Vec<String> = Vec::with_capacity(names.len());
-    let mut settled: std::collections::HashSet<String> =
-        std::collections::HashSet::from(["default".to_string()]);
-    // At most one profile is settled per pass, so the depth of the
-    // deepest chain bounds the passes.
-    for _ in 0..names.len() {
-        let mut progressed = false;
-        for name in &names {
-            if settled.contains(name) {
-                continue;
-            }
-            let ready = match parent_of(profiles, name) {
-                None => true,
-                Some(parent) => settled.contains(&parent),
-            };
-            if ready {
-                done.push(name.clone());
-                settled.insert(name.clone());
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    done
-}
-
-/// Copy the facets `profile` did not declare from `parent`.
-///
-/// **What inherits depends on the axis** (P-2). Per-profile outputs —
-/// the unfiltered and filtered ground truth — cannot be shared across a
-/// *size* family, because they are derived from `base_count`; a 1m
-/// profile inheriting the default's full-base ground truth would
-/// mis-route every verify. Across a *selectivity* family they are
-/// invariant, and restating them per member is the drift hazard the
-/// axis was supposed to remove.
-///
-/// `base_count` decides which it is (PL-5): a child whose count differs
-/// from its parent's is a size step, whatever the parent is called, so
-/// a `20m` that names `10m` re-cuts the windows and takes no ground
-/// truth; a child at its parent's count is a parameterization of it,
-/// and everything it does not override comes across — the general case
-/// of which the default rule is one instance (P-3).
-fn inherit_from(profile: &mut ProfileConfig, parent: &ProfileConfig, size_axis: bool) {
-    let bc = profile.base_count;
-    inherit_with_window(&mut profile.base_vectors, &parent.base_vectors, bc);
-    inherit_with_window(&mut profile.metadata_content, &parent.metadata_content, bc);
-    inherit(&mut profile.base_content, &parent.base_content);
-    inherit(&mut profile.query_vectors, &parent.query_vectors);
-    inherit(&mut profile.query_terms, &parent.query_terms);
-    inherit(&mut profile.query_filters, &parent.query_filters);
-    inherit(&mut profile.metadata_predicates, &parent.metadata_predicates);
-    inherit(&mut profile.metadata_layout, &parent.metadata_layout);
-    if !size_axis {
-        // Everything derived from `base_count` stays on its own rung: a
-        // results index maps each predicate to base ordinals, so a
-        // parent's index at another size is wrong for this profile in
-        // the same way its ground truth is. The predicate slab itself
-        // crosses, because the predicates are the same at every size;
-        // what they match is not.
-        inherit(&mut profile.predicate_results, &parent.predicate_results);
-        inherit(&mut profile.neighbor_indices, &parent.neighbor_indices);
-        inherit(&mut profile.neighbor_distances, &parent.neighbor_distances);
-        inherit(
-            &mut profile.prefiltered_neighbor_indices,
-            &parent.prefiltered_neighbor_indices,
-        );
-        inherit(
-            &mut profile.prefiltered_neighbor_distances,
-            &parent.prefiltered_neighbor_distances,
-        );
-        inherit(
-            &mut profile.postfiltered_neighbor_indices,
-            &parent.postfiltered_neighbor_indices,
-        );
-        inherit(
-            &mut profile.postfiltered_neighbor_distances,
-            &parent.postfiltered_neighbor_distances,
-        );
-        if profile.base_count.is_none() {
-            profile.base_count = parent.base_count;
-        }
-    }
-    if profile.maxk.is_none() {
-        profile.maxk = parent.maxk;
-    }
-}
-
-/// Copy `source` into `target` when `target.is_none()`.
-fn inherit(target: &mut Option<FacetConfig>, source: &Option<FacetConfig>) {
-    if target.is_none() {
-        *target = source.clone();
-    }
-}
-
-/// Inherit `source` into `target` under a `[0..base_count)` window.
-/// The window is *only* applied to the inherited copy — an explicit
-/// per-profile facet is left alone — and a window the parent already
-/// carries is **re-cut** to the child's count (PL-5): a `20m` that
-/// builds on `10m` reads the first twenty million of the same file,
-/// not its parent's ten. No-op when `base_count.is_none()`.
-fn inherit_with_window(
-    target: &mut Option<FacetConfig>,
-    source: &Option<FacetConfig>,
-    base_count: Option<u64>,
-) {
-    if target.is_some() { return; }
-    let Some(src) = source.clone() else { return; };
-    let Some(bc) = base_count else {
-        *target = Some(src);
-        return;
-    };
-    let windowed = match src {
-        FacetConfig::Simple(path) => {
-            let bare = crate::dataset::catalog::strip_window_suffix(&path).to_string();
-            FacetConfig::Simple(format!("{bare}[0..{bc})"))
-        }
-        FacetConfig::Detailed { source, .. } => FacetConfig::Detailed {
-            source: crate::dataset::catalog::strip_window_suffix(&source).to_string(),
-            window: Some(format!("0..{bc}")),
-        },
-        // A profile window is in *facet* ordinals; an entry window
-        // inside a series source is in *file* ordinals (SH-67). Only the
-        // former is what inheritance sets, so a series is windowed
-        // through its own field and never by inspecting its entries,
-        // which describe a different coordinate space.
-        FacetConfig::Sharded(sh) => FacetConfig::Sharded(match sh {
-            ShardedFacet::Uniform {
-                source,
-                shard_stride,
-                shard_count,
-                record_count,
-                ..
-            } => ShardedFacet::Uniform {
-                source,
-                shard_stride,
-                shard_count,
-                record_count,
-                window: Some(format!("0..{bc}")),
-            },
-            ShardedFacet::Explicit {
-                source,
-                record_count,
-                ..
-            } => ShardedFacet::Explicit {
-                source,
-                record_count,
-                window: Some(format!("0..{bc}")),
-            },
-        }),
-        };
-    *target = Some(windowed);
 }
 
 /// Configuration for a specific profile within a dataset.
@@ -1007,6 +792,39 @@ impl FacetConfig {
 mod tests {
     use super::*;
 
+    /// **A reader sees the sized profiles a file declares compactly.**
+    /// The reader once skipped `sized:` and served only the profiles
+    /// written out, so a program never saw the sizes the pipeline
+    /// builds and lists.
+    #[test]
+    fn a_reader_sees_compactly_declared_sized_profiles() {
+        let config: DatasetConfig = serde_yaml::from_str(
+            "name: ds\nprofiles:\n  default:\n    base_vectors: base.fvec\n    query_vectors: q.fvec\n\
+             \x20 sized: [10k, 20k]\n",
+        )
+        .unwrap();
+        let p = config.profiles.get("20k").expect("the 20k profile is visible");
+        assert_eq!(p.base_count, Some(20_000));
+        assert_eq!(p.query_vectors.as_ref().and_then(|f| f.source()), Some("q.fvec"));
+    }
+
+    /// **A partition reads only its own facets.** A profile whose base
+    /// vectors live in its own directory holds other rows than the
+    /// default's, so the default's metadata, cut to its count, would
+    /// describe the wrong rows. The reader once served exactly that.
+    #[test]
+    fn a_partition_gets_none_of_the_defaults_metadata() {
+        let config: DatasetConfig = serde_yaml::from_str(
+            "name: ds\nprofiles:\n  default:\n    base_vectors: profiles/base/base.fvec\n\
+             \x20   metadata_content: profiles/base/meta.u8\n\
+             \x20 label_03:\n    base_count: 82915\n    base_vectors: profiles/label_03/base.fvec\n",
+        )
+        .unwrap();
+        let p = &config.profiles["label_03"];
+        assert!(p.partition);
+        assert!(p.metadata_content.is_none(), "{:?}", p.metadata_content);
+    }
+
     /// SH-102 at the model layer: the spelling tessera's sized profiles
     /// were published with reads as a facet window, and the reader that
     /// opens the profile sees it through `window()`.
@@ -1081,7 +899,9 @@ profiles:
         match profile.base_vectors.as_ref().unwrap() {
             FacetConfig::Detailed { source, window } => {
                 assert_eq!(source, "base.fvec");
-                assert_eq!(window.as_deref(), Some("0..1000"));
+                // Windows come back in the canonical grammar the
+                // description's parser writes; the bounds are what count.
+                assert_eq!(window.as_deref(), Some("[0..1000]"));
             },
             _ => panic!("Expected Detailed config"),
         }
@@ -1176,8 +996,8 @@ profiles:
 "#;
         let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
         let p = &config.profiles["20m"];
-        assert_eq!(p.base_vectors.as_ref().and_then(|f| f.source()), Some("base.fvec[0..20000000)"), "the window is re-cut, not the parent's");
-        assert_eq!(p.metadata_content.as_ref().and_then(|f| f.source()), Some("meta.slab[0..20000000)"));
+        assert_eq!(p.base_vectors.as_ref().and_then(|f| f.source()), Some("base.fvec[0..20000000]"), "the window is re-cut, not the parent's");
+        assert_eq!(p.metadata_content.as_ref().and_then(|f| f.source()), Some("meta.slab[0..20000000]"));
         assert_eq!(p.query_vectors.as_ref().and_then(|f| f.source()), Some("q.fvec"));
         assert!(p.neighbor_indices.is_none(), "ground truth does not cross a size step, whatever the parent is called");
     }
@@ -1213,7 +1033,7 @@ profiles:
 "#;
         let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
         let set = &config.profiles["10m-mixed"];
-        assert_eq!(set.base_vectors.as_ref().and_then(|f| f.source()), Some("base.fvec[0..10000000)"));
+        assert_eq!(set.base_vectors.as_ref().and_then(|f| f.source()), Some("base.fvec[0..10000000]"));
         assert_eq!(set.neighbor_indices.as_ref().and_then(|f| f.source()), Some("profiles/10m/gt.ivec"), "the unfiltered ground truth crosses a same-size step");
         assert_eq!(set.metadata_predicates.as_ref().and_then(|f| f.source()), Some("profiles/base/predicates.slab"), "the invariant slab reaches the set through the layer");
         assert_eq!(set.predicate_results.as_ref().and_then(|f| f.source()), Some("profiles/10m-mixed/results.slab"));
@@ -1251,7 +1071,7 @@ profiles:
 
         // Inherited from default with windowing applied.
         let bv = p.base_vectors.as_ref().expect("base_vectors inherited from default");
-        assert_eq!(bv.source(), Some("profiles/base/base_vectors.fvecs[0..10000000)"),
+        assert_eq!(bv.source(), Some("profiles/base/base_vectors.fvecs[0..10000000]"),
             "inherited base_vectors must carry a [0..base_count) window suffix");
 
         // Inherited as-is (query sets are shared across profiles).

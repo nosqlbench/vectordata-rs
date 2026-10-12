@@ -780,3 +780,100 @@ which are not dataset or catalog locations.
 reports warnings in files this step did not touch (`veks-completion`,
 `slabtastic`, `tools`, and a few vectordata files). They come from the
 newer clippy (rust 1.99) lints, not from this change.
+
+### 12.2 Step 2: one dataset description (2026-10-12)
+
+**Found first.** RC-3 assumed the two `DatasetConfig` types were two
+copies of one model. On the 105 real `dataset.yaml` files on the
+development machine, the two loaders disagreed on 46. Four causes:
+
+1. The producer required `name`, so 34 datasets (jvector-style, which
+   omit it) did not load for the pipeline, catalog generation or `veks`.
+2. The reader skipped compactly declared sized profiles (`sized:`,
+   `strata:`), so programs never saw them.
+3. A profile whose base vectors live in its own directory, an oracle
+   partition, got the default's metadata cut to its count from the
+   reader. That metadata describes other rows. The producer gave it
+   nothing.
+4. A profile naming `default` explicitly at another size got the
+   default's per-profile outputs from the producer: its full-base ground
+   truth and predicate results. The reader withheld them, as PL-5
+   requires.
+
+**Traced before deciding.** For cause 4, the pipeline was not misled.
+Template gating runs a template only where the profile's view for that
+facet lies in its own directory, and saves did not write the copied
+views. The copies did reach generated catalogs: tessera's `catalog.json`
+listed `default`'s ground truth under 46 of its 223 profiles, every
+`*-unfiltered` one, and that catalog is published.
+
+**Decided by the user on 2026-10-12:**
+- one effective view, for readers and the pipeline alike;
+- a dataset with no `name` takes its directory's name;
+- readers expand compact sized profiles where the file alone says
+  enough, from its own `variables:` block.
+
+Cause 3 was settled on evidence: the affected sift1m profiles are
+oracle partitions (listed in the dataset's `partition_profiles`), so the
+producer's rule (a partition inherits nothing) is the right one.
+
+**Built:**
+- **One inheritance rule**, `DSProfileGroup::resolve_inheritance` with
+  `crossing_view`, following PL-5:
+  - parents first, along `inherits` or else `default`;
+  - a facet the child declares is kept;
+  - on a size step (`base_count` differs) the per-profile outputs stay
+    behind;
+  - `base_vectors` and `metadata_content` are re-cut to the child's
+    count;
+  - everything else crosses;
+  - `maxk` always crosses, and `base_count` crosses only at one size;
+  - a partition inherits nothing.
+
+  It replaces the producer's default-merge with its named-parent pass,
+  and the reader's `apply_default_inheritance` chain.
+- **Pending rungs:** a profile whose named parent is a sized rung still
+  waiting on variables waits too, and expansion resolves it.
+- **One save rule:** the renderer leaves a view out exactly when
+  `DSProfileGroup::inherited_view`, the same rule, would restore it. The
+  old rule compared with the parent's views and dropped a partition's
+  facet that named the default's file, which the next load did not
+  restore.
+- **The reader's config is a projection.** `model::DatasetConfig` is
+  computed from `dataset::DatasetConfig` (`from_description`,
+  `from_parts`), and deserializing it runs the one parse. Catalog
+  layouts project the same way; `from_catalog_entry` no longer
+  round-trips YAML.
+- **No attribute is lost.** `DatasetAttributes::other` keeps attributes
+  the type has no field for, such as `dimension`, which readers look up.
+  Saves dropped them before.
+- **`name` is optional.** `DatasetConfig::parse`, `load` and `load_from`
+  (`&Location`) fill an empty name from the directory. `load_from`
+  replaced derive's own loader.
+- **Errors name where they are**, for example
+  `profile 'default': base_vectors: shard_stride: …`.
+
+**Measured on the same 105 datasets afterwards:**
+- Every file loads on both sides. The producer had refused 34.
+- The two sides agree on every profile and facet. The one exception is
+  119 sized profiles that only `variables.yaml` can expand, which a
+  reader without that file cannot see.
+- Readers see 40 more profiles (the compact sized ones). The 48
+  partition profiles of the sift1m copies lost the wrong metadata. The
+  46 tessera `*-unfiltered` profiles lost the default's ground truth on
+  the producer side.
+- Reader attributes are unchanged.
+- Windows now read in the parser's canonical spelling (`[0..1000]` for
+  `0..1000`). Delimiters are structural, so the bounds are the same.
+
+**Guards that fail on the previous code:**
+- `naming_default_at_another_size_takes_none_of_its_ground_truth`
+- `a_dataset_without_a_name_takes_its_directory_name`
+- `a_save_and_load_keep_every_facet_and_attribute`, which covers both
+  the partition facet and the unknown attribute
+- `a_reader_sees_compactly_declared_sized_profiles`
+- `a_partition_gets_none_of_the_defaults_metadata`
+
+**Left for the user:** tessera's published catalog still lists the
+default's ground truth under its `*-unfiltered` profiles until it is
+regenerated and republished.

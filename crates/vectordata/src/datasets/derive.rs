@@ -327,7 +327,7 @@ fn derive_via_access_layer(
     };
     let profile_name = profile_name.as_str();
     let view = group.profile(profile_name).expect("a selected profile exists");
-    let rich = match load_rich_config(&yaml_url) {
+    let rich = match crate::Location::parse(&yaml_url).map_err(|e| e.to_string()).and_then(|l| RichDatasetConfig::load_from(&l)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: failed to re-parse dataset.yaml for window info: {e}");
@@ -1900,7 +1900,7 @@ fn resolve_spec(
     };
     if entry.dataset_type == "knn_entries.yaml" {
         // derive needs the per-dataset `dataset.yaml` to extract
-        // window metadata (see [`load_rich_config`]). knn_entries-
+        // window metadata (see [`RichDatasetConfig::load_from`]). knn_entries-
         // shape catalogs don't publish one — the catalog's embedded
         // layout *is* the dataset description but lacks the rich
         // window info derive depends on. Fail early with a clear
@@ -1920,43 +1920,12 @@ fn resolve_spec(
 enum Resolved {
     /// Catalog-resolved canonical entry. `yaml_url` is the absolute
     /// URL or path of the per-dataset `dataset.yaml` (needed by
-    /// `load_rich_config` for window metadata).
+    /// `RichDatasetConfig::load_from` for window metadata).
     CatalogEntry { catalog: Catalog, name: String, yaml_url: String },
     Local(String),
     Url(String),
 }
 
-/// Fetch the dataset.yaml as raw text and parse it as the rich
-/// [`crate::dataset::config::DatasetConfig`] (the one that exposes
-/// per-view windows). `group_path` is either an HTTPS URL or a
-/// local filesystem path — the same shape `TestDataGroup::load`
-/// accepts.
-fn load_rich_config(group_path: &str) -> Result<RichDatasetConfig, String> {
-    let yaml = if group_path.starts_with("http://") || group_path.starts_with("https://") {
-        fetch_yaml_url(group_path).map_err(|e| e.to_string())?
-    } else {
-        let p = Path::new(group_path);
-        let yaml_path = if p.is_dir() {
-            p.join("dataset.yaml")
-        } else if p.extension().is_some_and(|e| e == "yaml" || e == "yml") {
-            p.to_path_buf()
-        } else {
-            p.join("dataset.yaml")
-        };
-        fs::read_to_string(&yaml_path).map_err(|e| format!("{}: {e}", yaml_path.display()))?
-    };
-    let mut config: RichDatasetConfig = serde_yaml::from_str(&yaml)
-        .map_err(|e| format!("parsing dataset.yaml: {e}"))?;
-    // Same strata-vs-profiles.raw_sized unification `DatasetConfig::load`
-    // applies, so downstream window resolution works the same way it
-    // does on a `load()`ed config.
-    config.unify_strata();
-    Ok(config)
-}
-
-fn fetch_yaml_url(url: &str) -> io::Result<String> {
-    crate::group::fetch_dataset_yaml(url).map_err(|e| io::Error::other(e.to_string()))
-}
 
 #[cfg(test)]
 mod tests {

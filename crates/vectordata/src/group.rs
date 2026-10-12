@@ -555,15 +555,16 @@ impl TestDataGroup {
     /// (`catalog.json`-shape) entries the layout is a summary,
     /// not the full config — use [`Self::load`] instead.
     pub fn from_catalog_entry(entry: &crate::dataset::CatalogEntry) -> Result<Self> {
-        // Round-trip the layout through YAML so the canonical
-        // `DatasetConfig` deserializer maps each `DSView` to a
-        // `FacetConfig` (Simple or Detailed). The serialisers on
-        // both sides agree on the wire shape — this is the
-        // documented path for crossing the layout↔config gap
-        // without hand-coding a converter that would drift.
-        let layout_yaml = serde_yaml::to_string(&entry.layout)
-            .map_err(Error::from)?;
-        let config: DatasetConfig = serde_yaml::from_str(&layout_yaml)?;
+        // The reader's view of the layout, by the one projection every
+        // load uses: the layout's profiles were resolved when it was
+        // parsed (or built complete by the knn_entries parser).
+        let layout = &entry.layout;
+        let config = DatasetConfig::from_parts(
+            layout.format_version,
+            layout.attributes.as_ref(),
+            &layout.profile_tags,
+            &layout.profiles,
+        );
         let source = Location::parse(&entry.path)?;
         // The dataset's *home URL* is the URL the cache should
         // mirror under `<cache>/<dataset_name>/`. For

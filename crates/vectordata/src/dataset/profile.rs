@@ -802,6 +802,9 @@ impl DSProfileGroup {
             self.profiles.insert(prof_name, merged);
             added += 1;
         }
+        // A profile naming one of these rungs as its parent waited for
+        // it (see `resolve_inheritance`); it can settle now.
+        self.resolve_inheritance();
 
         added
     }
@@ -988,9 +991,21 @@ impl<'de> Deserialize<'de> for DSView {
                         "window" => {
                             window = Some(map.next_value()?);
                         }
-                        "shard_stride" => shard_stride = Some(map.next_value()?),
-                        "shard_count" => shard_count = Some(map.next_value()?),
-                        "record_count" => record_count = Some(map.next_value()?),
+                        "shard_stride" => {
+                            shard_stride = Some(map.next_value().map_err(|e| {
+                                de::Error::custom(format_args!("shard_stride: {e}"))
+                            })?)
+                        }
+                        "shard_count" => {
+                            shard_count = Some(map.next_value().map_err(|e| {
+                                de::Error::custom(format_args!("shard_count: {e}"))
+                            })?)
+                        }
+                        "record_count" => {
+                            record_count = Some(map.next_value().map_err(|e| {
+                                de::Error::custom(format_args!("record_count: {e}"))
+                            })?)
+                        }
                         _ => {
                             let _ = map.next_value::<serde::de::IgnoredAny>()?;
                         }
@@ -1112,7 +1127,8 @@ impl<'de> Deserialize<'de> for DSProfile {
             // Resolve alias to canonical name; custom facets pass through as-is
             let canonical = resolve_standard_key(&key).unwrap_or_else(|| key.clone());
 
-            let view: DSView = serde_yaml::from_value(value).map_err(de::Error::custom)?;
+            let view: DSView = serde_yaml::from_value(value)
+                .map_err(|e| de::Error::custom(format_args!("{canonical}: {e}")))?;
             views.insert(canonical, view);
         }
 
@@ -1427,75 +1443,137 @@ fn interpolation_objection(name: &str, facet_key: &str, template: &str) -> Optio
     ))
 }
 
-/// Fill each profile that names a parent with the parent's views it/// Fill each profile that names a parent with the parent's views it
-/// does not already have (P-2, P-3).
+/// The view a profile takes for `facet` from its parent's effective
+/// view when it does not declare one (PL-5), or `None` when the facet
+/// does not cross.
 ///
-/// Default-inheritance runs first and withholds the per-profile
-/// outputs, because on a **size** axis they cannot be shared: ground
-/// truth is derived from `base_count`, so a 1m profile inheriting the
-/// default's full-base neighbours would mis-route every verify. On a
-/// **selectivity** axis every member has one `base_count` and the
-/// unfiltered ground truth is invariant, so withholding it forces each
-/// member to restate the same path — a duplication that drifts the
-/// moment one is edited.
-///
-/// Naming a parent is the statement that decides which axis this is.
-/// Nothing names one unless it was written to, so every dataset
-/// predating this inherits exactly as before (P-13).
-///
-/// Parents are resolved before their children so a chain
-/// (`1m-sel001` → `1m` → `default`) settles in one pass. A cycle, or a
-/// parent that does not exist, leaves the profile with what it
-/// declared — the same outcome as naming no parent — and is reported by
-/// `veks check` rather than failing the load, because the facets it
-/// does declare are still readable.
-fn apply_named_parent_inheritance(profiles: &mut IndexMap<String, DSProfile>) {
-    let mut settled: std::collections::HashSet<String> =
-        std::collections::HashSet::from(["default".to_string()]);
-    let names: Vec<String> = profiles.keys().cloned().collect();
-    for name in &names {
-        if profiles.get(name).is_some_and(|p| p.inherits.is_none()) {
-            settled.insert(name.clone());
+/// **What crosses depends on the axis** (P-2). On a *size* step (the
+/// child's `base_count` differs from its parent's) the per-profile
+/// outputs, ground truth and predicate results, are derived from the
+/// count and stay on their own rung; across a step at one size they
+/// are invariant and cross. The windowed facets cross on either axis,
+/// re-cut to the child's count: a `20m` building on `10m` reads the
+/// first twenty million rows of the same file, not its parent's ten.
+/// Everything else is the same file for every profile.
+fn crossing_view(
+    facet: &str,
+    parent_view: &DSView,
+    child_count: Option<u64>,
+    size_axis: bool,
+) -> Option<DSView> {
+    match facet_role(facet) {
+        FacetRole::PerProfile if size_axis => None,
+        FacetRole::Windowed => Some(match child_count {
+            Some(count) => recut(parent_view, count),
+            None => parent_view.clone(),
+        }),
+        _ => Some(parent_view.clone()),
+    }
+}
+
+/// `view` cut to its first `count` rows. A series is windowed in facet
+/// ordinals through its own field (SH-67); a single file through its
+/// source, replacing any window it had.
+fn recut(view: &DSView, count: u64) -> DSView {
+    let mut cut = view.clone();
+    let window = DSWindow(vec![DSInterval { min_incl: 0, max_excl: count }]);
+    if cut.is_series() {
+        cut.window = Some(window);
+    } else {
+        cut.window = None;
+        cut.source.window = window;
+        cut.source.declared_count = None;
+    }
+    cut
+}
+
+impl DSProfileGroup {
+    /// Give every profile the facets it inherits from its parent
+    /// ([`parent_name`](Self::parent_name)), parents first, so a chain
+    /// (`1m-sel001` → `1m` → `default`) settles in one pass with the
+    /// grandparent's facets in place. The **one** inheritance rule:
+    /// the reader's view ([`crate::model::DatasetConfig`]) and the
+    /// pipeline's are both this group, and [`inherited_view`](Self::inherited_view)
+    /// is what a save leaves out, so loading and saving cannot drift.
+    ///
+    /// A child keeps every facet it declares; a missing one comes from
+    /// the parent by [`crossing_view`]'s rule. `maxk` always crosses;
+    /// `base_count` crosses only on a step at one size. A partition has
+    /// no parent and keeps only what it declares. A cycle leaves its
+    /// members with what they declared, as naming no parent would, and
+    /// `veks check` names it.
+    ///
+    /// A profile naming a parent that is not here yet, while sized
+    /// profiles are still waiting on variables to be expanded, waits
+    /// too: its parent may be one of them, and falling back to
+    /// `default` would give it the wrong facets. Expansion resolves it.
+    pub(crate) fn resolve_inheritance(&mut self) {
+        for name in self.inheritance_order() {
+            let waits = self.has_deferred()
+                && self.profiles[&name]
+                    .inherits
+                    .as_deref()
+                    .is_some_and(|p| p != name && !self.profiles.contains_key(p));
+            if waits {
+                continue;
+            }
+            let Some(parent_name) = self.parent_name(&name) else { continue };
+            let Some(parent) = self.profiles.get(&parent_name).cloned() else { continue };
+            let Some(child) = self.profiles.get_mut(&name) else { continue };
+            let size_axis = child.base_count.is_some() && child.base_count != parent.base_count;
+            for (facet, parent_view) in &parent.views {
+                if child.views.contains_key(facet) {
+                    continue;
+                }
+                if let Some(view) = crossing_view(facet, parent_view, child.base_count, size_axis) {
+                    child.views.insert(facet.clone(), view);
+                }
+            }
+            if !size_axis && child.base_count.is_none() {
+                child.base_count = parent.base_count;
+            }
+            if child.maxk.is_none() {
+                child.maxk = parent.maxk;
+            }
         }
     }
-    for _ in 0..names.len() {
-        let mut progressed = false;
-        for name in &names {
-            if settled.contains(name) {
-                continue;
-            }
-            let Some(parent_name) = profiles.get(name).and_then(|p| p.inherits.clone()) else {
-                continue;
-            };
-            if parent_name == *name || !settled.contains(&parent_name) {
-                continue;
-            }
-            let Some(parent) = profiles.get(&parent_name).cloned() else {
-                // A parent that is not a profile at all: nothing to
-                // inherit, and nothing to wait for.
-                settled.insert(name.clone());
-                progressed = true;
-                continue;
-            };
-            if let Some(child) = profiles.get_mut(name) {
-                for (key, view) in &parent.views {
-                    if !child.views.contains_key(key) {
-                        child.views.insert(key.clone(), view.clone());
-                    }
+
+    /// The view `name` would take for `facet` from its parent if it did
+    /// not declare one: what the load's inheritance pass gives it. A save leaves a view out exactly when it equals this,
+    /// because the next load derives it again.
+    pub fn inherited_view(&self, name: &str, facet: &str) -> Option<DSView> {
+        let parent_name = self.parent_name(name)?;
+        let parent = self.profiles.get(&parent_name)?;
+        let child = self.profiles.get(name)?;
+        let size_axis = child.base_count.is_some() && child.base_count != parent.base_count;
+        crossing_view(facet, parent.views.get(facet)?, child.base_count, size_axis)
+    }
+
+    /// Profile names ordered so a parent always comes before its
+    /// children. Members of a cycle are left out, so they keep what
+    /// they declared.
+    fn inheritance_order(&self) -> Vec<String> {
+        let names: Vec<String> = self.profiles.keys().cloned().collect();
+        let mut settled: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut order = Vec::with_capacity(names.len());
+        for _ in 0..names.len() {
+            let mut progressed = false;
+            for name in &names {
+                if settled.contains(name) {
+                    continue;
                 }
-                if child.maxk.is_none() {
-                    child.maxk = parent.maxk;
-                }
-                if child.base_count.is_none() {
-                    child.base_count = parent.base_count;
+                let ready = self.parent_name(name).is_none_or(|p| settled.contains(&p));
+                if ready {
+                    order.push(name.clone());
+                    settled.insert(name.clone());
+                    progressed = true;
                 }
             }
-            settled.insert(name.clone());
-            progressed = true;
+            if !progressed {
+                break;
+            }
         }
-        if !progressed {
-            break;
-        }
+        order
     }
 }
 
@@ -2050,8 +2128,8 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
 
         // Pass 1: parse default profile
         let default_profile = if let Some(default_val) = raw.get("default") {
-            let p: DSProfile =
-                serde_yaml::from_value(default_val.clone()).map_err(de::Error::custom)?;
+            let p: DSProfile = serde_yaml::from_value(default_val.clone())
+                .map_err(|e| de::Error::custom(format_args!("profile 'default': {e}")))?;
             Some(p)
         } else {
             None
@@ -2198,105 +2276,22 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                 continue;
             }
 
-            // Parse child profile
-            let child: DSProfile =
-                serde_yaml::from_value(value.clone()).map_err(de::Error::custom)?;
-
-            // Inherit views from default only if the child doesn't declare
-            // its own base_vectors. Profiles with their own base_vectors are
-            // self-contained (partition profiles, externally provided data)
-            // and should NOT inherit metadata, filtered KNN, etc.
-            // Self-contained: profile has base_vectors in its own directory
-            // (e.g., profiles/label_0/base_vectors.fvec). Sized profiles that
-            // reference the default's file with a window are NOT self-contained.
+            // Parse child profile. What it declares is all it holds
+            // here; inheritance runs once, for every profile, below.
+            let mut child: DSProfile = serde_yaml::from_value(value.clone())
+                .map_err(|e| de::Error::custom(format_args!("profile '{name}': {e}")))?;
+            // A profile whose base vectors live in its own directory
+            // (`profiles/label_03/base_vectors.fvec`) carries its own
+            // base rows: an oracle partition. The parent's windowed
+            // facets describe other rows, so it inherits nothing. A
+            // sized profile windowing the default's file is not one.
             let own_dir = format!("profiles/{}/", name);
-            let is_self_contained = name != "default" && child.views.get("base_vectors")
-                .map(|v| v.source.path.starts_with(&own_dir))
-                .unwrap_or(false);
-            let merged = if is_self_contained {
-                // Self-contained: inherit only maxk
-                DSProfile {
-                    maxk: child.maxk.or(default_profile.as_ref().and_then(|dp| dp.maxk)),
-                    base_count: child.base_count,
-                    partition: is_self_contained,
-                    views: child.views,
-                    // What the child said about *itself* survives the
-                    // merge: a merge combines views, and these describe
-                    // the profile rather than what it points at.
-                    attributes: child.attributes,
-                    inherits: child.inherits,
-                }
-            } else if let Some(ref dp) = default_profile {
-                // Inherit shared views (base_vectors, query_vectors, ...)
-                // from default. Per-profile output views are excluded —
-                // every sized/derived profile owns its own
-                // `profiles/{name}/neighbor_*` files; inheriting default's
-                // path silently routes verifies and downstream consumers
-                // to the wrong GT.
-                //
-                // Per-vector shared views (`base_vectors`,
-                // `metadata_content`) get a `[0..base_count)` window
-                // applied on inherit so the reader API can clip
-                // automatically. The child can still override with an
-                // explicit view (handled by the loop below). Without
-                // a `base_count`, the window is meaningless — copy
-                // through unchanged.
-                let child_bc = child.base_count;
-                let mut merged_views: IndexMap<String, DSView> = dp.views.iter()
-                    .filter(|(k, _)| facet_role(k) != FacetRole::PerProfile)
-                    .map(|(k, v)| {
-                        if let Some(bc) = child_bc
-                            && facet_role(k) == FacetRole::Windowed
-                            && v.window.is_none()
-                            && v.source.window.is_empty()
-                        {
-                            let mut windowed = v.clone();
-                            let window = DSWindow(vec![DSInterval { min_incl: 0, max_excl: bc }]);
-                            // The same cut `derive_sized_profile` makes: a
-                            // series is windowed in facet ordinals through
-                            // its own field (SH-67), a file through its
-                            // source. Cutting a series through the source
-                            // wrote a window the writer then suppressed
-                            // and re-emitted on alternate saves, so the
-                            // file never settled.
-                            if windowed.is_series() {
-                                windowed.window = Some(window);
-                            } else {
-                                windowed.source.window = window;
-                                windowed.source.declared_count = None;
-                            }
-                            return (k.clone(), windowed);
-                        }
-                        (k.clone(), v.clone())
-                    })
-                    .collect();
-                let child_attributes = child.attributes;
-                let child_inherits = child.inherits;
-                for (k, v) in child.views {
-                    merged_views.insert(k, v);
-                }
-                DSProfile {
-                    maxk: child.maxk.or(dp.maxk),
-                    base_count: child.base_count,
-                    partition: child.partition,
-                    views: merged_views,
-                    attributes: child_attributes,
-                    inherits: child_inherits,
-                }
-            } else {
-                child
-            };
-
+            if child.views.get("base_vectors").is_some_and(|v| v.source.path.starts_with(&own_dir)) {
+                child.partition = true;
+            }
+            let merged = child;
             profiles.insert(name.clone(), merged);
         }
-
-        // Resolve profiles that name a parent other than `default`.
-        // The loop above has already applied default-inheritance, so
-        // what remains missing on such a profile is exactly what the
-        // size axis withholds — the per-profile outputs — which is
-        // what a family varying along a *different* axis needs to
-        // share (P-2).
-        apply_named_parent_inheritance(&mut profiles);
 
         // Collect all raw sized entries for round-trip serialization
         let raw_sized: Vec<String> = raw.get("sized").map(|value| {
@@ -2315,11 +2310,21 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
             }
         }).unwrap_or_default();
 
+        let mut group = DSProfileGroup {
+            profiles,
+            deferred_sized,
+            deferred_facet_templates,
+            raw_sized,
+            series_by_spec,
+            layered: false,
+        };
+        group.resolve_inheritance();
+
         // Realize every view's declaration far enough to catch one that
         // disagrees with itself — through the same code the
         // `dataset.yaml` loader runs, so a dataset cannot be accepted by
         // one path and rejected by the other (SH-85, SH-90).
-        for (profile_name, profile) in &profiles {
+        for (profile_name, profile) in &group.profiles {
             for (facet_name, view) in &profile.views {
                 let sources = view.declaration_sources();
                 crate::dataset::shards::validate_declaration(
@@ -2332,14 +2337,7 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
             }
         }
 
-        Ok(DSProfileGroup {
-            profiles,
-            deferred_sized,
-            deferred_facet_templates,
-            raw_sized,
-            series_by_spec,
-            layered: false,
-        })
+        Ok(group)
     }
 }
 

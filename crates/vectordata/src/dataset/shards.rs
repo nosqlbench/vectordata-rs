@@ -2064,7 +2064,7 @@ mod loader_wiring {
         .expect("plain declarations must keep loading");
         let d = &cfg.profiles["default"];
         assert_eq!(d.base_vectors.as_ref().unwrap().source(), Some("base.fvec"));
-        assert_eq!(d.query_vectors.as_ref().unwrap().window(), Some("0..1000"));
+        assert_eq!(d.query_vectors.as_ref().unwrap().window(), Some("[0..1000]"));
         assert!(d.base_vectors.as_ref().unwrap().shard_stride().is_none());
     }
 
