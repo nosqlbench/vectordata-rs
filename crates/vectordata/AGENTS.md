@@ -113,6 +113,12 @@ Each of these exists, is tested, and handles cases that are easy to miss.
   chunks recorded separately, so its bytes are only meaningful through
   vectordata. `FacetStorage::cache_path` and `local_files` are for
   diagnostics and cache administration, never for reading data.
+- **Joining a facet or entry path onto a dataset or catalog location.**
+  [`Location::resolve`](crate::Location::resolve) is the rule the open
+  reads by: a URL or leading `/` kept as written, `file://` read as its
+  path, anything else joined by URL rules (so `..` resolves). Formatting
+  `"{home}{path}"` yourself names a different file than the open
+  reads.
 - **"Did you mean" for unknown datasets.**
   [`Catalog::lookup`](crate::catalog::Catalog::lookup) returns
   [`Error::UnknownDataset`](crate::Error::UnknownDataset) with

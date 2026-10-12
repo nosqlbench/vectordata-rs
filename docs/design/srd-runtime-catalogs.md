@@ -695,3 +695,88 @@ keeps it unchanged.
    stays public, so a program can implement it for any backing store.
 
    **Decision:** accepted 2026-10-12. No cache in `Catalog::of`. The `CatalogSource` docs say `entries` may be called once per `Catalog::of` and that an expensive source memoizes internally.
+
+## 12. Implementation
+
+### 12.1 Step 1: `Location` (2026-10-12)
+
+**Built:**
+- `vectordata::Location` (`src/location.rs`, re-exported at the crate
+  root), with two variants: `Path` (`file://` URIs are read into it) and
+  `Url`. Its methods are `parse`, `from_path`, `is_remote`, `as_dir`,
+  `resolve`, `join`, `parent` and `last_segment`.
+- `resolve` is the one joining rule: a URL or a leading `/` is kept as
+  written, `file://` becomes its path, and anything else joins onto the
+  location read as a directory, by RFC 3986 for URLs and `Path::join`
+  for paths. `join` is `resolve` read back as a `Location`.
+- `file://` URIs go through `Url::to_file_path`, so Windows drive URIs
+  (`file:///C:/x`) are read. None of the three old strippers handled
+  them.
+- These use it:
+  - the dataset view's facet resolution, whose two copies became one;
+  - `TestDataGroup::load` dispatch;
+  - `CatalogEntry::resolve_facet_url`;
+  - catalog entry paths (`remap_entry`);
+  - catalog location handling in `catalogs.yaml`.
+- `DataSource` is removed. `GenericTestDataView::new` and
+  `with_attributes` take a `Location`. This is a semver-breaking change.
+
+**Decided during the step: cache identities are never re-spelled.** A
+dataset's home string is recorded in its `origin.json`, and a facet's
+cache path is its resolved string minus that home. URL parsing changes
+spellings (host case, percent-encoding, `..`), so parsing either string
+would move or orphan cached bytes. So:
+- **`resolve` keeps absolute references as written.** It only joins
+  relative ones, which the runtime already joined by URL rules.
+- **Three string helpers sit beside the type** and change only what
+  their name says:
+  - `dir_form` adds a trailing `/`;
+  - `parent_form` cuts the last segment;
+  - `concat_form` concatenates.
+
+  They replaced six trailing-slash copies, `parent_location_of`, and the
+  `knn_entries` parser's `join_url`.
+- **`knn_entries.yaml` catalogs keep resolving facets by
+  concatenation** (`concat_form`). That is their jvector rule, and the
+  strings it gives are the identities their datasets were cached under.
+  Both the listing and the open read those strings, so they agree.
+
+**Bugs fixed, each with a guard that fails on the previous code:**
+- **B-1:** `TestDataGroup::load` with `s3://` or `file://` URLs. An
+  unsupported scheme (`gs://`) is now named in the error, not reported as
+  a missing file.
+  - `group.rs`: `a_file_uri_opens_the_local_dataset` and
+    `an_unsupported_scheme_is_named_in_the_error`.
+  - `tests/offline.rs`: `s3_locations_open_from_their_kept_copies_offline`,
+    run offline against kept copies.
+  - An `s3://` dataset definition is fetched through its HTTPS endpoint.
+    Auth and the kept copy stay keyed by the `s3://` URL.
+- **B-2:** an `s3://` catalog directory finds its `knn_entries.yaml`. It
+  is guarded by the same offline test.
+- **B-4:** the catalog-time and open-time resolution of a facet agree.
+  The guard is `view.rs` `the_catalog_and_the_open_resolve_a_facet_alike`,
+  which covers `..`, a space, `/`, `file://` and foreign URLs.
+  - On the old code, a `../shared/b.fvec` facet listed as
+    `…/ds/../shared/b.fvec` but opened as `…/shared/b.fvec`.
+  - The picker's cache drop then derived a `../` cache path. The drop
+    only deletes files it finds under the dataset's own cache directory,
+    so the effect was a drop that missed files, not deletion elsewhere.
+
+**Behaviour that changed:**
+- `resolve_facet_url` gives `/x` for a `file:///x` source, as the open
+  does, instead of the URI.
+- A canonical catalog entry's relative `path` joins onto the catalog's
+  location by URL rules instead of concatenation. This is the form the
+  open already used, so the listing's home now matches the `origin.json`
+  the open records.
+- An entry whose `path` is already absolute is kept as written. It was
+  concatenated onto the catalog's location.
+
+**Left out, on purpose:** the trailing-slash handling in `push/`,
+`vecd` and `veks check publish_url`. These normalize publishing URLs,
+which are not dataset or catalog locations.
+
+**Unrelated, seen while checking:** `cargo clippy --workspace` now
+reports warnings in files this step did not touch (`veks-completion`,
+`slabtastic`, `tools`, and a few vectordata files). They come from the
+newer clippy (rust 1.99) lints, not from this change.

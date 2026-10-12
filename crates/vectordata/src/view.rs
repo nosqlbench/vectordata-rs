@@ -12,76 +12,13 @@
 
 use crate::dataset::facet::StandardFacet;
 use crate::dataset::source::DSWindow;
-use crate::group::DataSource;
+use crate::location::Location;
 use crate::io::IoError;
 use crate::io::{self, VectorReader, VvecElement, VvecReader};
 use crate::model::{FacetConfig, ProfileConfig};
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// True for `http://` and `https://` schemes — the only schemes the
-/// crate handles as remote.
-fn is_absolute_url(s: &str) -> bool {
-    s.starts_with("http://") || s.starts_with("https://")
-}
-
-/// True when `s` starts with `<scheme>://` for any RFC 3986-style
-/// scheme (letter followed by letters/digits/`+`/`-`/`.`). Used to
-/// short-circuit base-URL joining for any absolutely-scoped facet
-/// path the catalog might publish (`http://`, `https://`,
-/// `file://`, `s3://`, `gs://`, etc.) — even when the actual
-/// scheme isn't one vectordata's I/O layer speaks. Joining e.g.
-/// `s3://x/y` onto a base URL would produce a bogus double-
-/// prefixed path that nothing can open; passing the original
-/// through lets the storage layer fail with a precise
-/// "scheme not supported" error instead.
-fn has_absolute_uri_scheme(s: &str) -> bool {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphabetic() {
-        return false;
-    }
-    let scheme_end = s.find("://").unwrap_or(usize::MAX);
-    if scheme_end == usize::MAX {
-        return false;
-    }
-    s[1..scheme_end]
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-}
-
-/// True for facet paths that should bypass the catalog's base
-/// location and open directly as a local file. Covers absolute
-/// filesystem paths (`/abs/foo.fvec`) and `file://` URIs — both
-/// are treated identically by the I/O stack. The point is parity
-/// with a fully-precached remote facet: no URL joins, no
-/// download/cache layer, just mmap.
-fn is_local_facet_source(s: &str) -> bool {
-    s.starts_with("file://") || s.starts_with('/')
-}
-
-/// Strip a `file://` prefix to produce a plain filesystem path
-/// string. Pass-through for everything else. Mirrors
-/// `crate::storage::local_source_path` but lives at the view
-/// layer so we can avoid a cross-module dependency for what is a
-/// trivial inline transform.
-fn file_uri_to_path(s: &str) -> &str {
-    if let Some(rest) = s.strip_prefix("file://") {
-        // `file:///abs/path` → `/abs/path`
-        // `file://host/abs/path` → `/abs/path` (host dropped)
-        if rest.starts_with('/') {
-            return rest;
-        }
-        if let Some(slash) = rest.find('/') {
-            return &rest[slash..];
-        }
-        return rest;
-    }
-    s
-}
 
 /// Parse a window string using the canonical dataset-source parser
 /// (`crate::dataset::source::parse_window`). Returns the FIRST
@@ -2995,7 +2932,8 @@ impl<T: VvecElement> VvecReader<T> for ShardedVvecReader<T> {
 /// creating the appropriate `VectorReader` (Mmap or Http) on demand.
 #[derive(Debug)]
 pub struct GenericTestDataView {
-    source: DataSource,
+    /// Where the dataset lives; relative facet paths resolve against it.
+    source: Location,
     config: ProfileConfig,
     /// Dataset-level attributes for metadata accessors.
     attributes: HashMap<String, serde_yaml::Value>,
@@ -3016,7 +2954,7 @@ pub struct GenericTestDataView {
 
 impl GenericTestDataView {
     /// Creates a new `GenericTestDataView`.
-    pub fn new(source: DataSource, config: ProfileConfig) -> Self {
+    pub fn new(source: Location, config: ProfileConfig) -> Self {
         Self {
             source,
             config,
@@ -3028,7 +2966,7 @@ impl GenericTestDataView {
 
     /// Creates a new `GenericTestDataView` with dataset attributes.
     pub fn with_attributes(
-        source: DataSource,
+        source: Location,
         config: ProfileConfig,
         attributes: HashMap<String, serde_yaml::Value>,
     ) -> Self {
@@ -3147,33 +3085,14 @@ impl GenericTestDataView {
     }
 
     /// Resolve a bare path string (no window suffix) against the
-    /// data source root. Mirrors `resolve_as_string` but takes a raw
-    /// path so callers that pre-parsed the suffix can join it
-    /// correctly without round-tripping through `FacetConfig`.
-    ///
-    /// Absolute URLs (`http://`, `https://`) in the YAML pass
-    /// through unchanged regardless of the dataset's base location —
-    /// so a local `dataset.yaml` can reference remote facets and a
-    /// remote dataset can reference facets hosted elsewhere.
+    /// dataset's location, by [`Location::resolve`]: a URL or `file://`
+    /// URI stands alone, a leading `/` is a local path (a remote
+    /// dataset may point a facet at a local copy), and anything else
+    /// is relative to the dataset. The picker, `datasets list` and the
+    /// cache drop resolve through the same join, so they name the file
+    /// this reads.
     fn resolve_path_str(&self, path: &str) -> Result<String> {
-        if is_absolute_url(path) {
-            return Ok(path.to_string());
-        }
-        if is_local_facet_source(path) {
-            return Ok(file_uri_to_path(path).to_string());
-        }
-        if has_absolute_uri_scheme(path) {
-            return Ok(path.to_string());
-        }
-        match &self.source {
-            DataSource::FileSystem(base_path) => {
-                Ok(base_path.join(path).to_string_lossy().to_string())
-            }
-            DataSource::Http(base_url) => {
-                let url = base_url.join(path)?;
-                Ok(url.to_string())
-            }
-        }
+        self.source.resolve(path)
     }
 
     /// Open a variable-length vector facet with the unified `open_vvec` API.
@@ -3210,25 +3129,7 @@ impl GenericTestDataView {
 
     /// Resolve a facet to a path string (local) or URL string (remote).
     fn resolve_as_string(&self, facet: &FacetConfig) -> Result<String> {
-        let source_str = single_source(facet, "resolve")?;
-        if is_absolute_url(source_str) {
-            return Ok(source_str.to_string());
-        }
-        if is_local_facet_source(source_str) {
-            return Ok(file_uri_to_path(source_str).to_string());
-        }
-        if has_absolute_uri_scheme(source_str) {
-            return Ok(source_str.to_string());
-        }
-        match &self.source {
-            DataSource::FileSystem(base_path) => {
-                Ok(base_path.join(source_str).to_string_lossy().to_string())
-            }
-            DataSource::Http(base_url) => {
-                let url = base_url.join(source_str)?;
-                Ok(url.to_string())
-            }
-        }
+        self.resolve_path_str(single_source(facet, "resolve")?)
     }
 
     /// Collect all facets declared in the profile config.
@@ -3692,11 +3593,7 @@ impl TestDataView for GenericTestDataView {
         // rejected before any byte lands — see the guard below.
         let storage = match (&self.dataset_name, &self.catalog_source) {
             (Some(ds_name), Some(home)) => {
-                let home_norm = if home.ends_with('/') {
-                    home.clone()
-                } else {
-                    format!("{home}/")
-                };
+                let home_norm = crate::location::dir_form(home);
                 let file_relpath = facet_cache_relpath(&resolved, &home_norm);
                 self.reject_relpath_collisions(name, &resolved, &file_relpath, &home_norm)?;
                 crate::storage::Storage::open_layered(&resolved, ds_name, &file_relpath, home)
@@ -3716,11 +3613,7 @@ impl GenericTestDataView {
         let resolved = self.resolve_path_str(path_str)?;
         Ok(match (&self.dataset_name, &self.catalog_source) {
             (Some(ds_name), Some(home)) => {
-                let home_norm = if home.ends_with('/') {
-                    home.clone()
-                } else {
-                    format!("{home}/")
-                };
+                let home_norm = crate::location::dir_form(home);
                 let relpath = facet_cache_relpath(&resolved, &home_norm);
                 self.reject_relpath_collisions(facet, &resolved, &relpath, &home_norm)?;
                 ShardOpen::Layered {
@@ -3794,6 +3687,42 @@ mod tests {
     use std::path::PathBuf;
     use url::Url;
 
+    /// **The catalog and the open name the same file for a facet.** A
+    /// listing, the picker's cache column and its cache drop resolve a
+    /// facet through [`CatalogEntry::resolve_facet_url`]; the open
+    /// resolves it through the view. A `..` segment or a character the
+    /// request encodes once made them differ, and the cache drop then
+    /// derived a cache path outside the dataset's directory.
+    #[test]
+    fn the_catalog_and_the_open_resolve_a_facet_alike() {
+        let entry: crate::dataset::CatalogEntry = serde_json::from_str(
+            r#"{"name":"ds","path":"https://h/cat/ds/dataset.yaml",
+                "dataset_type":"dataset.yaml","layout":{"profiles":{}}}"#,
+        )
+        .unwrap();
+        let home = crate::location::dir_form(&entry.dataset_home_url());
+        let config: crate::model::DatasetConfig =
+            serde_yaml::from_str("name: ds\nprofiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
+        let view = GenericTestDataView::new(
+            Location::parse(&home).unwrap(),
+            config.profiles["default"].clone(),
+        );
+        for raw in [
+            "profiles/base/b.fvec",
+            "../shared/b.fvec",
+            "a b.fvec",
+            "/local/b.fvec",
+            "file:///local/b.fvec",
+            "https://elsewhere/x/b.fvec",
+        ] {
+            let listed = entry.resolve_facet_url(raw).unwrap();
+            let opened = view.resolve_path_str(raw).unwrap();
+            assert_eq!(listed, opened, "{raw}");
+            let relpath = facet_cache_relpath(&listed, &home);
+            assert!(!relpath.split('/').any(|seg| seg == ".."), "{raw} caches at {relpath}");
+        }
+    }
+
     #[test]
     fn facet_cache_relpath_keeps_the_home_relative_path() {
         assert_eq!(facet_cache_relpath("https://h/ds/a/b.fvec", "https://h/ds/"), "a/b.fvec");
@@ -3808,39 +3737,6 @@ mod tests {
     fn facet_cache_relpath_reads_windows_separators() {
         assert_eq!(facet_cache_relpath(r"C:\tmp\ds\a/b__0001.fvec", r"C:\tmp\ds/"), "a/b__0001.fvec");
         assert_eq!(facet_cache_relpath(r"C:\tmp\ds\a\b.fvec", r"C:\tmp\ds\"), "a/b.fvec");
-    }
-
-    #[test]
-    fn is_absolute_url_recognises_http_schemes() {
-        assert!(is_absolute_url("http://example.com/data.fvec"));
-        assert!(is_absolute_url("https://example.com/data.fvec"));
-        assert!(!is_absolute_url("file:///tmp/data.fvec"));
-        assert!(!is_absolute_url("/absolute/local/path.fvec"));
-        assert!(!is_absolute_url("relative/path.fvec"));
-        assert!(!is_absolute_url("data.fvec"));
-        assert!(!is_absolute_url(""));
-    }
-
-    #[test]
-    fn local_facet_source_covers_abs_path_and_file_uri() {
-        assert!(is_local_facet_source("/abs/path.fvec"));
-        assert!(is_local_facet_source("file:///abs/path.fvec"));
-        assert!(is_local_facet_source("file://host/abs/path.fvec"));
-        assert!(!is_local_facet_source("relative/path.fvec"));
-        assert!(!is_local_facet_source("data.fvec"));
-        assert!(!is_local_facet_source("http://x/path.fvec"));
-        assert!(!is_local_facet_source(""));
-    }
-
-    #[test]
-    fn file_uri_to_path_strips_scheme_and_host() {
-        assert_eq!(file_uri_to_path("file:///abs/path.fvec"), "/abs/path.fvec");
-        assert_eq!(
-            file_uri_to_path("file://localhost/abs/path.fvec"),
-            "/abs/path.fvec"
-        );
-        assert_eq!(file_uri_to_path("/abs/path.fvec"), "/abs/path.fvec");
-        assert_eq!(file_uri_to_path("relative/path.fvec"), "relative/path.fvec");
     }
 
     /// When a remote-loaded `TestDataGroup` has a facet whose source
@@ -3885,7 +3781,7 @@ mod tests {
         profile.query_vectors = Some(FacetConfig::Simple("/tank/share/query.fvec".to_string()));
 
         let base_url = Url::parse("https://catalog.example.com/datasets/x/").unwrap();
-        let view = GenericTestDataView::new(DataSource::Http(base_url), profile);
+        let view = GenericTestDataView::new(Location::Url(base_url), profile);
 
         let bv = view.config.base_vectors.as_ref().unwrap();
         let q = view.config.query_vectors.as_ref().unwrap();

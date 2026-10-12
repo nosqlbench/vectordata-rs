@@ -496,3 +496,65 @@ fn a_hanging_server_falls_back_to_the_kept_copy_in_seconds() {
     let base = group.profile("default").unwrap().base_vectors().unwrap();
     assert_eq!(base.get(7).unwrap()[1], fvec_value(1.5e8, 8, 7, 1));
 }
+
+const S3_CHILD_CACHE: &str = "VECTORDATA_TEST_OFFLINE_S3_CACHE";
+
+/// **`s3://` locations go through the transport, for datasets and for
+/// `knn_entries` catalogs alike.** Offline, with kept copies in place, a
+/// dataset opened by an `s3://` URL comes from its kept definition, and
+/// an `s3://` catalog directory finds its kept `knn_entries.yaml`. Both
+/// were once taken for local paths: the dataset failed as a missing
+/// file, and the catalog came back empty.
+#[test]
+fn s3_locations_open_from_their_kept_copies_offline() {
+    let cache = make_tmp();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["open_s3_offline_in_a_child", "--exact", "--nocapture", "--test-threads=1"])
+        .env(S3_CHILD_CACHE, cache.path())
+        .env(vectordata::settings::OFFLINE_ENV, "1")
+        .output()
+        .expect("run the offline process");
+    assert!(
+        child.status.success(),
+        "the offline process failed:\n{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+/// The offline half of the test above; does nothing unless launched by
+/// it.
+#[test]
+fn open_s3_offline_in_a_child() {
+    let Ok(cache) = std::env::var(S3_CHILD_CACHE) else { return };
+    let cache = std::path::PathBuf::from(cache);
+    vectordata::settings::override_cache_dir_for_process(cache.clone());
+
+    // A dataset's kept definition lives in its cache directory,
+    // `<cache>/<dataset>/dataset.yaml`.
+    let kept = cache.join("s3-kept");
+    std::fs::create_dir_all(&kept).unwrap();
+    std::fs::write(
+        kept.join("dataset.yaml"),
+        "name: s3-kept\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
+    )
+    .unwrap();
+    let group = TestDataGroup::load("s3://example-bucket/datasets/s3-kept/")
+        .expect("an s3:// dataset opens from its kept definition");
+    assert_eq!(group.profile_names(), vec!["default".to_string()]);
+
+    // A catalog's kept copy lives under `<cache>/.catalogs/`, named by
+    // its URL with the scheme dropped and separators collapsed to `_`.
+    let copies = cache.join(".catalogs");
+    std::fs::create_dir_all(&copies).unwrap();
+    std::fs::write(
+        copies.join("example-bucket_cat_knn_entries.yaml"),
+        "_defaults:\n  base_url: s3://example-bucket/data/\nds-one:\n  base: one/base.fvec\n  query: one/query.fvec\n  gt: one/gt.ivec\n",
+    )
+    .unwrap();
+    let sources = vectordata::catalog::CatalogSources::new()
+        .add_catalogs(&["s3://example-bucket/cat/".to_string()]);
+    let catalog = vectordata::catalog::Catalog::of(&sources);
+    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["ds-one"], "diagnostics: {:?}", catalog.diagnostics());
+}

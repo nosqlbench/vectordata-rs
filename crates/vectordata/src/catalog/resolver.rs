@@ -13,7 +13,7 @@ use crate::dataset::{CatalogEntry, CatalogLayout};
 use super::CatalogDiagnostic;
 use super::knn_entries::parse_knn_entries_yaml;
 use super::sources::{
-    catalog_file_for, ensure_trailing_slash, looks_like_catalog_file, CatalogSources,
+    catalog_file_for, looks_like_catalog_file, CatalogSources,
 };
 
 /// A resolved catalog containing dataset entries from all configured sources.
@@ -505,8 +505,7 @@ fn load_from_explicit_catalog_file(
         }
     };
 
-    let parent = parent_location_of(location);
-    let base_url = ensure_trailing_slash(&parent);
+    let base_url = crate::location::parent_form(location);
 
     match value {
         serde_yaml::Value::Sequence(seq) => {
@@ -530,7 +529,7 @@ fn load_from_explicit_catalog_file(
             // to the catalog file's parent directory (matching
             // jvector's per-entry resolution against the entry's
             // cache directory, with `_defaults.base_url` overriding).
-            match parse_knn_entries_yaml(&content, &parent) {
+            match parse_knn_entries_yaml(&content, &base_url) {
                 Ok(mut parsed) => {
                     // The parser only sees the parent directory; the
                     // resolver knows which document these entries came
@@ -569,17 +568,6 @@ fn fetch_location_content(location: &str) -> Option<String> {
         fetch_http(location).ok()
     } else {
         std::fs::read_to_string(location).ok()
-    }
-}
-
-/// Return the parent directory of a catalog file URL or path, with
-/// no trailing slash. For `https://a/b/c.yaml` → `https://a/b`. For
-/// `/x/y/z.yaml` → `/x/y`. For something with no separators returns
-/// the empty string.
-fn parent_location_of(location: &str) -> String {
-    match location.rfind('/') {
-        Some(idx) => location[..idx].to_string(),
-        None => String::new(),
     }
 }
 
@@ -637,7 +625,7 @@ fn try_load_canonical_catalog(
         },
     };
 
-    let base_url = ensure_trailing_slash(location);
+    let base_url = crate::location::dir_form(location);
     for value in parsed {
         match remap_entry(&value, &base_url) {
             Ok(entry) => entries.push(entry),
@@ -662,7 +650,7 @@ fn try_load_knn_entries(
     diags: &mut Vec<CatalogDiagnostic>,
 ) -> bool {
     let url = knn_entries_url_for(location);
-    let content = if url.starts_with("http://") || url.starts_with("https://") {
+    let content = if crate::transport::is_remote_url(&url) {
         match fetch_http(&url) {
             Ok(c) => c,
             Err(_) => return false,
@@ -702,8 +690,7 @@ pub(crate) fn knn_entries_url_for(location: &str) -> String {
     {
         return location.to_string();
     }
-    let base = ensure_trailing_slash(location);
-    format!("{}knn_entries.yaml", base)
+    format!("{}knn_entries.yaml", crate::location::dir_form(location))
 }
 
 /// Remap a raw JSON/YAML catalog entry into a `CatalogEntry`.
@@ -726,8 +713,9 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
             dir_name_of_path(path)
         };
 
-        // Resolve path relative to base URL to get the full URL
-        let full_path = format!("{}{}", base_url, path);
+        // Resolve the path against the catalog's location, by the
+        // rule the dataset open uses for it.
+        let full_path = resolve_entry_path(base_url, path)?;
 
         let layout: CatalogLayout = serde_json::from_value(value["layout"].clone())
             .map_err(|e| format!("failed to parse layout: {}", e))?;
@@ -759,7 +747,7 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let full_path = format!("{}{}", base_url, path_str);
+        let full_path = resolve_entry_path(base_url, path_str)?;
 
         let dataset_type = value
             .get("dataset_type")
@@ -790,6 +778,17 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
             catalog_name: None,
         })
     }
+}
+
+/// An entry's `path` resolved against its catalog's location
+/// (`base_url`, ending in `/`), by [`Location::resolve`](crate::Location::resolve):
+/// the same rule [`TestDataGroup::load`](crate::TestDataGroup::load)
+/// applies when the entry is opened, so the listing, the picker and the
+/// open agree on the dataset's home.
+fn resolve_entry_path(base_url: &str, path: &str) -> Result<String, String> {
+    crate::Location::parse(base_url)
+        .and_then(|base| base.resolve(path))
+        .map_err(|e| e.to_string())
 }
 
 /// Extract the directory name from a path, similar to Java's `dirNameOfPath`.

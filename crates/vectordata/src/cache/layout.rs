@@ -69,7 +69,7 @@ pub(crate) fn dataset_dir_covering(cache_root: &Path, url: &url::Url) -> Option<
             continue;
         }
         let Some(origin) = read_dataset_origin(&dir) else { continue };
-        let home = if origin.source.ends_with('/') { origin.source.clone() } else { format!("{}/", origin.source) };
+        let home = crate::location::dir_form(&origin.source);
         if target.starts_with(&home) && best.as_ref().is_none_or(|(_, h)| home.len() > h.len()) {
             best = Some((dir, home));
         }

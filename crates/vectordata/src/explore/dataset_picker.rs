@@ -433,10 +433,7 @@ fn profile_cache_coverage(
     // Same home URL the storage open anchors the cache layout on —
     // single authority, so the picker's expectation of where a facet
     // caches cannot drift from where the runtime actually puts it.
-    let home = {
-        let h = entry.dataset_home_url();
-        if h.ends_with('/') { h } else { format!("{h}/") }
-    };
+    let home = crate::location::dir_form(&entry.dataset_home_url());
     let mut valid = 0u32;
     let mut total = 0u32;
     for (_facet, view) in &profile.views {
@@ -1277,10 +1274,7 @@ pub(super) fn purge_cache_for_profiles(
         ));
         return out;
     }
-    let home_slash = {
-        let h = entry.dataset_home_url();
-        if h.ends_with('/') { h } else { format!("{h}/") }
-    };
+    let home_slash = crate::location::dir_form(&entry.dataset_home_url());
     // The cache leaves each profile's facets live in, by the same
     // forward derivation the storage open uses.
     let leaves_of = |profile: &crate::dataset::profile::DSProfile| -> Vec<String> {
@@ -1467,10 +1461,7 @@ fn profile_access_mode(
     let clean = strip_window_suffix(&view.source.path);
 
     if let Some(url) = resolve_facet_url(entry, view) {
-        let home = {
-            let h = entry.dataset_home_url();
-            if h.ends_with('/') { h } else { format!("{h}/") }
-        };
+        let home = crate::location::dir_form(&entry.dataset_home_url());
         let expected = ds_cache.join(crate::view::facet_cache_relpath(&url, &home));
         match survey.get(&expected) {
             // Chunk-store file: fully valid bitmap means every read
@@ -1610,10 +1601,7 @@ fn collect_local_knowledge(
 ) {
     for entry in entries {
         let ds_workspace = cache_dir.join(&entry.name);
-        let home = {
-            let h = entry.dataset_home_url();
-            if h.ends_with('/') { h } else { format!("{h}/") }
-        };
+        let home = crate::location::dir_form(&entry.dataset_home_url());
         for pname in entry.profile_names() {
             let Some(profile) = entry.layout.profiles.profile(pname) else { continue };
             for (_facet, view) in &profile.views {

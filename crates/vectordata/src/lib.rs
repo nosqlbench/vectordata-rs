@@ -36,6 +36,7 @@
 //! | Read a record (slab) facet | [`TestDataView::open_facet_records`] | — |
 //! | List profiles and facets | [`TestDataGroup::profile_names`], [`TestDataView::facet_manifest`] | below |
 //! | Find datasets by pattern | [`Catalog::match_glob`](catalog::Catalog::match_glob), [`Catalog::datasets`](catalog::Catalog::datasets) | — |
+//! | Resolve a path against a dataset or catalog location | [`Location::resolve`] | — |
 //! | Locate the cache | [`settings::cache_dir`] | — |
 //! | Inspect what is cached | [`FacetStorage::cache_stats`] via [`TestDataView::open_facet_storage`] | — |
 //!
@@ -222,6 +223,7 @@ pub mod typed_access;
 pub mod view;
 pub mod fetch;
 pub mod group;
+pub mod location;
 
 /// Library API. The guide for coding agents shipped in this package
 /// (`AGENTS.md`), rendered here so its links are checked with the rest
@@ -254,6 +256,7 @@ pub mod cache_admin {
 }
 
 pub use group::{TestDataGroup, PREBUFFER_LARGE_WARNING_BYTES};
+pub use location::Location;
 pub use model::FacetConfig;
 pub use view::{
     CacheStats, FacetDescriptor, FacetStorage, PrebufferProgress, PrefetchHandle, PrefetchPlan,

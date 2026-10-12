@@ -5,29 +5,22 @@
 //! instances for reading vectors and metadata.
 
 use crate::dataset::selector::{self, ProfileFacts, SelectionError};
+use crate::location::{dir_form, Location};
 use crate::model::DatasetConfig;
 use crate::view::{GenericTestDataView, TestDataView};
 use crate::{Error, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use url::Url;
-
-/// The location of the dataset source.
-#[derive(Clone, Debug)]
-pub enum DataSource {
-    /// The dataset is located on the local file system.
-    FileSystem(PathBuf),
-    /// The dataset is located at a remote HTTP(S) URL.
-    Http(Url),
-}
 
 /// Represents a loaded vector dataset configuration.
 ///
 /// Use `TestDataGroup::load` to parse a `dataset.yaml` and prepare for data access.
 #[derive(Debug)]
 pub struct TestDataGroup {
-    source: DataSource,
+    /// Where the dataset lives; relative facet paths resolve against it.
+    source: Location,
     config: DatasetConfig,
     /// URL the dataset description was loaded from — the
     /// `dataset.yaml` URL for canonical-shape catalogs, the
@@ -63,10 +56,13 @@ impl TestDataGroup {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn load(path_or_url: &str) -> Result<Self> {
-        if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
-            Self::load_from_url(path_or_url)
-        } else {
-            Self::load_from_path(path_or_url)
+        match Location::parse(path_or_url)? {
+            Location::Path(path) => Self::load_from_path(path),
+            remote if remote.is_remote() => Self::load_from_url(&remote.to_string()),
+            Location::Url(url) => Err(Error::Other(format!(
+                "{url}: the '{}' scheme is not one vectordata reads (http, https, s3)",
+                url.scheme(),
+            ))),
         }
     }
 
@@ -94,9 +90,9 @@ impl TestDataGroup {
             let dataset_name = dir.file_name()
                 .and_then(|n| n.to_str()).map(|s| s.to_string());
             return Ok(Self {
-                source: DataSource::FileSystem(dir.clone()),
+                source: Location::Path(dir.clone()),
                 config,
-                catalog_source: dir.to_str().map(with_trailing_slash),
+                catalog_source: dir.to_str().map(dir_form),
                 dataset_name,
             });
         }
@@ -110,9 +106,9 @@ impl TestDataGroup {
             let dataset_name = dir.file_name()
                 .and_then(|n| n.to_str()).map(|s| s.to_string());
             return Ok(Self {
-                source: DataSource::FileSystem(dir.clone()),
+                source: Location::Path(dir.clone()),
                 config,
-                catalog_source: dir.to_str().map(with_trailing_slash),
+                catalog_source: dir.to_str().map(dir_form),
                 dataset_name,
             });
         }
@@ -136,9 +132,9 @@ impl TestDataGroup {
             let dataset_name = dir.file_name()
                 .and_then(|n| n.to_str()).map(|s| s.to_string());
             return Ok(Self {
-                source: DataSource::FileSystem(dir.clone()),
+                source: Location::Path(dir.clone()),
                 config,
-                catalog_source: dir.to_str().map(with_trailing_slash),
+                catalog_source: dir.to_str().map(dir_form),
                 dataset_name,
             });
         }
@@ -150,9 +146,9 @@ impl TestDataGroup {
         let dataset_name = dir.file_name()
             .and_then(|n| n.to_str()).map(|s| s.to_string());
         Ok(Self {
-            source: DataSource::FileSystem(dir.clone()),
+            source: Location::Path(dir.clone()),
             config,
-            catalog_source: dir.to_str().map(|s| s.to_string()),
+            catalog_source: dir.to_str().map(dir_form),
             dataset_name,
         })
     }
@@ -175,20 +171,13 @@ impl TestDataGroup {
         if url.path().ends_with(".yaml") || url.path().ends_with(".yml") {
             let base_url = url.join(".")?;
             let yaml_content = fetch_descriptor(&client, &url, &base_url)?.required(&url)?;
-            let dir_name = base_url
-                .path_segments()
-                .and_then(|s| s.collect::<Vec<_>>().iter().rev().find(|seg| !seg.is_empty()).cloned())
-                .unwrap_or("");
-            let config = parse_catalog_content_for(&yaml_content, dir_name)?;
-            let dataset_name = base_url
-                .path_segments()
-                .and_then(|s| s.collect::<Vec<_>>()
-                    .iter().rev().find(|seg| !seg.is_empty()).cloned())
-                .map(|s| s.to_string());
+            let dir_name = last_segment(&base_url).unwrap_or_default();
+            let config = parse_catalog_content_for(&yaml_content, &dir_name)?;
+            let dataset_name = last_segment(&base_url);
             return Ok(Self {
-                source: DataSource::Http(base_url.clone()),
+                source: Location::Url(base_url.clone()),
                 config,
-                catalog_source: Some(with_trailing_slash(base_url.as_str())),
+                catalog_source: Some(dir_form(base_url.as_str())),
                 dataset_name,
             });
         }
@@ -208,15 +197,11 @@ impl TestDataGroup {
         match fetch_descriptor(&client, &dataset_url, &base_url)? {
             Descriptor::Text(yaml_content) => {
                 let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
-                let dataset_name = base_url
-                    .path_segments()
-                    .and_then(|s| s.collect::<Vec<_>>()
-                        .iter().rev().find(|seg| !seg.is_empty()).cloned())
-                    .map(|s| s.to_string());
+                let dataset_name = last_segment(&base_url);
                 return Ok(Self {
-                    source: DataSource::Http(base_url.clone()),
+                    source: Location::Url(base_url.clone()),
                     config,
-                    catalog_source: Some(with_trailing_slash(base_url.as_str())),
+                    catalog_source: Some(dir_form(base_url.as_str())),
                     dataset_name,
                 });
             }
@@ -239,23 +224,16 @@ impl TestDataGroup {
         };
         let entries = crate::knn_entries::KnnEntries::parse(&yaml_content)
             .map_err(Error::Other)?;
-        let url_dir_name = base_url
-            .path_segments()
-            .and_then(|s| s.collect::<Vec<_>>().iter().rev().find(|seg| !seg.is_empty()).cloned())
-            .unwrap_or("");
+        let url_dir_name = last_segment(&base_url).unwrap_or_default();
         let config = entries
-            .to_config_for(url_dir_name)
+            .to_config_for(&url_dir_name)
             .unwrap_or_else(|| entries.to_config());
 
-        let dataset_name = base_url
-            .path_segments()
-            .and_then(|s| s.collect::<Vec<_>>()
-                .iter().rev().find(|seg| !seg.is_empty()).cloned())
-            .map(|s| s.to_string());
+        let dataset_name = last_segment(&base_url);
         Ok(Self {
-            source: DataSource::Http(base_url.clone()),
+            source: Location::Url(base_url.clone()),
             config,
-            catalog_source: Some(with_trailing_slash(base_url.as_str())),
+            catalog_source: Some(dir_form(base_url.as_str())),
             dataset_name,
         })
     }
@@ -467,7 +445,10 @@ fn fetch_descriptor(
             ))),
         };
     }
-    let resp = crate::transport::apply_read_auth(client.get(url.clone()), Some(url)).send();
+    // An `s3://` URL is fetched over its HTTPS endpoint; auth and the
+    // kept copy stay keyed by the URL as the dataset names it.
+    let wire = crate::transport::normalize_remote_url(url.as_str());
+    let resp = crate::transport::apply_read_auth(client.get(wire.as_ref()), Some(url)).send();
     match resp {
         Ok(r) if r.status().is_success() => {
             let text = r.text()?;
@@ -538,10 +519,7 @@ pub(crate) fn fetch_dataset_yaml(url_str: &str) -> Result<String> {
 /// configured cache.
 fn kept_descriptor_path(url: &Url, base_url: &Url) -> Option<std::path::PathBuf> {
     let cache_root = crate::settings::cache_dir().ok()?;
-    let dataset = base_url
-        .path_segments()?
-        .rfind(|s| !s.is_empty())?
-        .to_string();
+    let dataset = last_segment(base_url)?;
     let rel = url.path().strip_prefix(base_url.path()).unwrap_or(url.path()).trim_start_matches('/');
     if rel.is_empty() || rel.contains("..") {
         return None;
@@ -549,7 +527,7 @@ fn kept_descriptor_path(url: &Url, base_url: &Url) -> Option<std::path::PathBuf>
     let dir = crate::cache::layout::dataset_cache_dir(&cache_root, &dataset);
     // The directory belongs to one origin; a same-named dataset from
     // elsewhere neither reads nor overwrites this one's descriptor.
-    crate::cache::layout::verify_or_record_origin(&dir, &with_trailing_slash(base_url.as_str())).ok()?;
+    crate::cache::layout::verify_or_record_origin(&dir, &dir_form(base_url.as_str())).ok()?;
     Some(dir.join(rel))
 }
 
@@ -586,7 +564,7 @@ impl TestDataGroup {
         let layout_yaml = serde_yaml::to_string(&entry.layout)
             .map_err(Error::from)?;
         let config: DatasetConfig = serde_yaml::from_str(&layout_yaml)?;
-        let source = data_source_for(&entry.path)?;
+        let source = Location::parse(&entry.path)?;
         // The dataset's *home URL* is the URL the cache should
         // mirror under `<cache>/<dataset_name>/`. For
         // knn_entries-shape catalogs `entry.path` is the catalog
@@ -606,37 +584,10 @@ impl TestDataGroup {
     }
 }
 
-/// Choose a [`DataSource`] for an arbitrary catalog-entry path or
-/// URL. `http(s)://` → `Http(url)`; `file://` is normalised to a
-/// plain filesystem path; everything else is treated as a local
-/// path. Returns an error for malformed URLs.
-/// Normalise a dataset-home URL/path so the trailing `/` is always
-/// present. Required because [`crate::view::GenericTestDataView::open_facet_storage`]
-/// derives `file_relpath` via prefix strip; an inconsistent trailing
-/// slash would either fail the strip (`<home>` vs `<home>/facet`) or
-/// erase the first segment of the relpath.
-fn with_trailing_slash<S: AsRef<str>>(s: S) -> String {
-    let s = s.as_ref();
-    if s.ends_with('/') { s.to_string() } else { format!("{s}/") }
-}
-
-fn data_source_for(location: &str) -> Result<DataSource> {
-    if location.starts_with("http://") || location.starts_with("https://") {
-        return Ok(DataSource::Http(Url::parse(location)?));
-    }
-    let path = if let Some(rest) = location.strip_prefix("file://") {
-        // file:///abs → /abs; file://host/abs → /abs (host dropped).
-        if rest.starts_with('/') {
-            rest.to_string()
-        } else if let Some(slash) = rest.find('/') {
-            rest[slash..].to_string()
-        } else {
-            format!("/{rest}")
-        }
-    } else {
-        location.to_string()
-    };
-    Ok(DataSource::FileSystem(PathBuf::from(path)))
+/// The last non-empty path segment of a dataset's base URL: its
+/// directory name, which names the dataset when nothing else does.
+fn last_segment(base_url: &Url) -> Option<String> {
+    Location::Url(base_url.clone()).last_segment().map(str::to_string)
 }
 
 /// Parse a catalog YAML by content shape and return the resulting
@@ -673,6 +624,30 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+
+    /// **A `file://` URI opens the local dataset it names**, as the
+    /// path itself does. It was once taken for a relative path that
+    /// does not exist.
+    #[test]
+    fn a_file_uri_opens_the_local_dataset() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dataset.yaml"),
+            "name: local\nprofiles:\n  default:\n    base_vectors: b.fvec\n",
+        )
+        .unwrap();
+        let uri = url::Url::from_directory_path(dir.path()).unwrap().to_string();
+        let group = TestDataGroup::load(&uri).expect("a file:// URI opens");
+        assert_eq!(group.profile_names(), vec!["default".to_string()]);
+    }
+
+    /// **A scheme vectordata does not read is named as such**, not
+    /// reported as a missing local file.
+    #[test]
+    fn an_unsupported_scheme_is_named_in_the_error() {
+        let err = TestDataGroup::load("gs://bucket/ds/").unwrap_err().to_string();
+        assert!(err.contains("'gs' scheme"), "{err}");
+    }
 
     #[test]
     fn dataset_home_url_canonical_strips_dataset_yaml_basename() {

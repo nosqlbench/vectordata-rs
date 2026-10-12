@@ -314,7 +314,7 @@ fn load_config(
 /// `location` as written in a `catalogs.yaml` in `dir`: a relative
 /// local path is joined onto `dir`; URLs and absolute paths are kept.
 fn relative_to(dir: &Path, location: &str) -> String {
-    if crate::transport::is_remote_url(location) || Path::new(location).is_absolute() {
+    if crate::location::has_scheme(location) || Path::new(location).is_absolute() {
         return location.to_string();
     }
     dir.join(location).to_string_lossy().into_owned()
@@ -423,15 +423,6 @@ fn home_dir() -> Option<String> {
     std::env::var("HOME").ok()
 }
 
-/// Ensure a URL/path string ends with `/`.
-pub fn ensure_trailing_slash(s: &str) -> String {
-    if s.ends_with('/') {
-        s.to_string()
-    } else {
-        format!("{}/", s)
-    }
-}
-
 /// Resolve a catalog location to the actual catalog file URL/path.
 ///
 /// If `location` already names a YAML or JSON file (any filename ending
@@ -457,8 +448,7 @@ pub fn catalog_file_for(location: &str) -> String {
         return location.to_string();
     }
 
-    let base = ensure_trailing_slash(location);
-    format!("{}catalog.json", base)
+    format!("{}catalog.json", crate::location::dir_form(location))
 }
 
 /// Returns true when `location` ends in `.yaml`, `.yml`, or `.json`
@@ -592,13 +582,6 @@ mod tests {
             assert!(s.diagnostics()[0].message.contains("failed to parse"), "{}", s.diagnostics()[0]);
             assert!(s.required().is_empty() && s.optional().is_empty());
         }
-    }
-
-    #[test]
-    fn test_ensure_trailing_slash() {
-        assert_eq!(ensure_trailing_slash("http://example.com"), "http://example.com/");
-        assert_eq!(ensure_trailing_slash("http://example.com/"), "http://example.com/");
-        assert_eq!(ensure_trailing_slash("/path/to/dir"), "/path/to/dir/");
     }
 
     #[test]

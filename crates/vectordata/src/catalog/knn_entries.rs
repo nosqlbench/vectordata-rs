@@ -120,7 +120,7 @@ pub fn parse_knn_entries_yaml(
             .get(serde_yaml::Value::String("base_url".to_string()))
             .and_then(|v| v.as_str())
             .map(expand_env_vars)
-            .map(|s| ensure_trailing_slash(&s))
+            .map(|s| crate::location::dir_form(&s))
             .unwrap_or_else(|| default_base_url.clone());
         let entry_cache_dir = raw
             .get(serde_yaml::Value::String("cache_dir".to_string()))
@@ -210,11 +210,11 @@ pub fn parse_knn_entries_yaml(
 
 /// Extract `(default_base_url, default_cache_dir)` from a parsed
 /// `_defaults` mapping. `base_url` defaults to the catalog
-/// location (with a trailing `/` so `join_url` composes cleanly).
+/// location (with a trailing `/` so `concat_form` composes cleanly).
 /// `cache_dir` has no default — its absence simply means "no
 /// local cache layer; always use the remote URL".
 fn extract_defaults(top: &serde_yaml::Mapping, catalog_location: &str) -> (String, Option<String>) {
-    let mut base_url = ensure_trailing_slash(catalog_location);
+    let mut base_url = crate::location::dir_form(catalog_location);
     let mut cache_dir: Option<String> = None;
     if let Some(defaults) = top
         .get(serde_yaml::Value::String("_defaults".to_string()))
@@ -224,7 +224,7 @@ fn extract_defaults(top: &serde_yaml::Mapping, catalog_location: &str) -> (Strin
             .get(serde_yaml::Value::String("base_url".to_string()))
             .and_then(|v| v.as_str())
         {
-            base_url = ensure_trailing_slash(&expand_env_vars(bu));
+            base_url = crate::location::dir_form(&expand_env_vars(bu));
         }
         if let Some(cd) = defaults
             .get(serde_yaml::Value::String("cache_dir".to_string()))
@@ -264,7 +264,7 @@ fn resolve_facet_path(rel: &str, cache_dir: Option<&str>, base_url: &str) -> Str
                 .unwrap_or_else(|| candidate.to_string_lossy().to_string());
         }
     }
-    join_url(base_url, rel)
+    crate::location::concat_form(base_url, rel)
 }
 
 /// Expand `${VAR}` and `${VAR:-default}` references in a string
@@ -333,37 +333,6 @@ pub(crate) fn parse_dataset_profile_key(key: &str) -> Option<(&str, &str)> {
     }
     if key.is_empty() { return None; }
     Some((key, "default"))
-}
-
-/// Append a trailing `/` if missing. Idempotent for empty strings
-/// (returns `"/"`).
-fn ensure_trailing_slash(s: &str) -> String {
-    if s.ends_with('/') { s.to_string() } else { format!("{s}/") }
-}
-
-/// Concatenate `base` (assumed to end with `/`) and `rel`, taking
-/// care to avoid `//` collisions when `rel` happens to start with
-/// `/`. Absolute `rel` (containing `://` or starting with `/`)
-/// shortcuts the base entirely so a caller can opt into per-entry
-/// overrides without having to strip the default.
-fn join_url(base: &str, rel: &str) -> String {
-    if rel.contains("://") { return rel.to_string(); }
-    if rel.starts_with('/') {
-        // Absolute path component — keep just the scheme://host of
-        // the base, if it's a URL; otherwise the literal path.
-        if let Some(scheme_end) = base.find("://") {
-            // Find the next '/' after the scheme to slice the host.
-            let after_scheme = scheme_end + 3;
-            if let Some(host_end) = base[after_scheme..].find('/') {
-                let host_prefix = &base[..after_scheme + host_end];
-                return format!("{host_prefix}{rel}");
-            }
-            // base = "scheme://host" with no path — append rel.
-            return format!("{base}{rel}");
-        }
-        return rel.to_string();
-    }
-    format!("{base}{rel}")
 }
 
 #[cfg(test)]
@@ -622,22 +591,6 @@ _defaults:
         let yaml = "{}";
         let entries = parse_knn_entries_yaml(yaml, "https://host/").unwrap();
         assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn join_url_strips_double_slashes() {
-        assert_eq!(join_url("https://h/p/", "a/b"), "https://h/p/a/b");
-        assert_eq!(join_url("https://h/p", "a/b"), "https://h/pa/b"); // explicit no-slash form
-    }
-
-    #[test]
-    fn join_url_passes_absolute_urls_through() {
-        assert_eq!(join_url("https://h/p/", "s3://other/x"), "s3://other/x");
-    }
-
-    #[test]
-    fn join_url_absolute_path_targets_host_root() {
-        assert_eq!(join_url("https://h/p/d/", "/abs/path"), "https://h/abs/path");
     }
 
     #[test]

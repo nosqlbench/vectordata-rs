@@ -183,32 +183,12 @@ fn registry_key(source: &str) -> String {
             Err(_) => translated.into_owned(),
         }
     } else {
-        let local = local_source_path(source);
+        let local = crate::location::file_uri_path(source);
         std::fs::canonicalize(local.as_ref())
             .ok()
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_else(|| local.into_owned())
     }
-}
-
-/// Convert a source string to a plain filesystem path string. A
-/// `file://` URI is stripped to its path component (`file:///x/y`
-/// → `/x/y`); everything else passes through unchanged. The point
-/// is to give a single short-circuit for "this is a local file"
-/// regardless of which syntactic form the catalog uses.
-pub(crate) fn local_source_path(source: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(rest) = source.strip_prefix("file://") {
-        // file:///abs/path → /abs/path
-        // file://localhost/abs/path → /abs/path  (host stripped)
-        if let Some(after_root) = rest.strip_prefix('/') {
-            return std::borrow::Cow::Owned(format!("/{after_root}"));
-        }
-        if let Some(slash) = rest.find('/') {
-            return std::borrow::Cow::Owned(rest[slash..].to_string());
-        }
-        return std::borrow::Cow::Owned(format!("/{rest}"));
-    }
-    std::borrow::Cow::Borrowed(source)
 }
 
 /// Concrete decision of where bytes for a particular open land on
@@ -443,12 +423,12 @@ impl Storage {
                 Self::open_url_uncached(url, layout_override)?
             } else {
                 // `file://` URIs and bare paths both open as local
-                // mmap — `local_source_path` normalises both to a
+                // mmap — `location::file_uri_path` normalises both to a
                 // filesystem path string before we hand it to Path.
                 // Layout override is meaningless for local mmap
                 // (no cache directory involved), so it's dropped.
                 let _ = layout_override;
-                let local = local_source_path(source);
+                let local = crate::location::file_uri_path(source);
                 Self::open_path_uncached(Path::new(local.as_ref()))?
             };
             let arc = Arc::new(storage);

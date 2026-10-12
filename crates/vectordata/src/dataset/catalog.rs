@@ -128,31 +128,25 @@ impl CatalogEntry {
     }
 
     /// Resolve a facet view's raw source path to an absolute URL/path
-    /// to read. Window notation (`base.fvec[0..1M)`) is stripped, an
-    /// already-absolute source (`http(s)://`, `s3://`, `file://`, or a
-    /// leading `/`) passes through, and a relative source is joined
-    /// against [`Self::dataset_home_url`] — the single authority for
-    /// the dataset's home location. `None` for an empty source.
+    /// to read. Window notation (`base.fvec[0..1M)`) is stripped, then
+    /// the source is resolved against [`Self::dataset_home_url`] (the
+    /// single authority for the dataset's home) by
+    /// [`Location::resolve`](crate::Location::resolve), the rule the
+    /// dataset open reads facets by: a URL or leading `/` is kept as
+    /// written, `file://` becomes its path, and a relative source joins
+    /// by URL rules, so `..` resolves. `None` for an empty source.
     ///
-    /// This is the one resolver the picker's facet probes, `ping`, and
-    /// the `datasets list` filter/completion probes all go through, so
-    /// a `dataset.yaml`-shaped catalog (relative facet paths) resolves
-    /// the same everywhere instead of a raw relative string being
-    /// mistaken for a local file.
+    /// This is the one resolver the picker's facet probes and cache
+    /// drop, `ping`, and the `datasets list` filter/completion probes
+    /// all go through, so each names the file the open reads.
     pub fn resolve_facet_url(&self, raw_path: &str) -> Option<String> {
         let raw = strip_window_suffix(raw_path);
         if raw.is_empty() {
             return None;
         }
-        if raw.starts_with("http://")
-            || raw.starts_with("https://")
-            || raw.starts_with("s3://")
-            || raw.starts_with("file://")
-            || raw.starts_with('/')
-        {
-            return Some(raw.to_string());
-        }
-        Some(format!("{}{}", self.dataset_home_url(), raw))
+        crate::Location::parse(&self.dataset_home_url())
+            .and_then(|home| home.resolve(raw))
+            .ok()
     }
 
     /// Returns view names from the default profile (convenience accessor).
