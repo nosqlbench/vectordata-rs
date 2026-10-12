@@ -24,69 +24,36 @@ struct ParsedStep {
     options: HashMap<String, String>,
 }
 
-/// Parse the `upstream: steps:` section of a dataset.yaml into structured
-/// `ParsedStep` values. The YAML format emitted by `import::run` uses a
-/// flat key/value layout per step, so we split on `- id:` boundaries.
+/// The `upstream: steps:` of a dataset.yaml as `ParsedStep` values, read
+/// as a loader reads them rather than by the layout of the text. Option
+/// values are their text; `finalize` and `phase` appear among them when
+/// set, as the step's own fields.
 fn parse_steps(yaml: &str) -> Vec<ParsedStep> {
-    let mut steps = Vec::new();
-
-    // Find the steps section
-    let steps_section = match yaml.find("  steps:") {
-        Some(pos) => &yaml[pos..],
-        None => return steps,
-    };
-
-    // Split on step boundaries (each step starts with "    - id: ")
-    let chunks: Vec<&str> = steps_section.split("\n    - id: ").collect();
-
-    for (i, chunk) in chunks.iter().enumerate() {
-        if i == 0 {
-            // First chunk is the "  steps:\n" header, skip it
-            continue;
-        }
-        let lines: Vec<&str> = chunk.lines().collect();
-        if lines.is_empty() {
-            continue;
-        }
-
-        let id = lines[0].trim().to_string();
-        let mut run = String::new();
-        let mut after = Vec::new();
-        let mut options = HashMap::new();
-
-        for line in &lines[1..] {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("run: ") {
-                run = rest.trim().to_string();
-            } else if let Some(rest) = trimmed.strip_prefix("after: ") {
-                // Parse [dep1, dep2] format
-                let inner = rest.trim_start_matches('[').trim_end_matches(']');
-                after = inner
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            } else if let Some((key, val)) = trimmed.split_once(": ") {
-                // Skip known non-option fields
-                if key != "description" && key != "per_profile" {
-                    let val = val.trim_matches('"').to_string();
-                    options.insert(key.to_string(), val);
-                }
-            }
-        }
-
-        steps.push(ParsedStep {
-            id,
-            run,
-            after,
-            options,
-        });
-    }
-
+    let config = vectordata::dataset::DatasetConfig::parse(yaml).expect("the generated dataset.yaml parses");
+    let steps = config.upstream.and_then(|u| u.steps).unwrap_or_default();
     steps
+        .into_iter()
+        .map(|step| {
+            let mut options: HashMap<String, String> = step
+                .options
+                .iter()
+                .map(|(k, v)| {
+                    let text = match v {
+                        serde_yaml::Value::String(s) => s.clone(),
+                        other => serde_yaml::to_string(other).unwrap_or_default().trim().to_string(),
+                    };
+                    (k.clone(), text)
+                })
+                .collect();
+            if step.finalize {
+                options.insert("finalize".to_string(), "true".to_string());
+            }
+            if step.phase > 0 {
+                options.insert("phase".to_string(), step.phase.to_string());
+            }
+            ParsedStep { id: step.id.unwrap_or_default(), run: step.run, after: step.after, options }
+        })
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

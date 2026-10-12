@@ -2530,83 +2530,39 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
 // YAML generation
 // ---------------------------------------------------------------------------
 
-/// Produce a human-readable description for a sized profile spec.
-fn describe_sized_spec(spec: &str) -> String {
-    let spec = spec.trim();
-    if let Some(rest) = spec.strip_prefix("mul:") {
-        if let Some((range, factor)) = rest.split_once('/') {
-            if range.contains("..") {
-                let (start, end) = range.split_once("..").unwrap();
-                format!("geometric series from {} to {}, multiplying by {} each step", start.trim(), end.trim(), factor.trim())
-            } else {
-                format!("geometric series from {}, multiplying by {} each step, up to dataset size", range.trim(), factor.trim())
-            }
-        } else {
-            "geometric series".into()
-        }
-    } else if let Some(rest) = spec.strip_prefix("fib:") {
-        if let Some((start, end)) = rest.split_once("..") {
-            format!("fibonacci series from {} to {}", start.trim(), end.trim())
-        } else {
-            "fibonacci series".into()
-        }
-    } else if spec == "decade" {
-        "decade-stepped series (100k, 200k, …, 900k, 1m, 2m, …) up to dataset size".into()
-    } else if let Some(rest) = spec.strip_prefix("decade:") {
-        if let Some((start, end)) = rest.split_once("..") {
-            format!("decade-stepped series from {} to {} (1×, 2×, …, 9×, 10×, … per decade)", start.trim(), end.trim())
-        } else {
-            format!("decade-stepped series from {} (1×, 2×, …, 9×, 10×, … per decade) up to dataset size", rest.trim())
-        }
-    } else if let Some((range, step)) = spec.split_once('/') {
-        if let Some((start, end)) = range.split_once("..") {
-            let step = step.trim();
-            if step.bytes().any(|b| b.is_ascii_alphabetic()) {
-                format!("linear series from {} to {}, stepping by {}", start.trim(), end.trim(), step)
-            } else {
-                format!("linear series from {} to {}, {} equal divisions", start.trim(), end.trim(), step)
-            }
-        } else {
-            format!("profile at {}", spec)
-        }
-    } else {
-        format!("single profile at {}", spec)
-    }
-}
 
-fn generate_yaml(
+/// The description a bootstrap writes: name, attributes, the pipeline
+/// that builds the dataset, its strata and tag schema, and the default
+/// profile's facets. A save renders it, with the strata explained and
+/// the tag schema annotated in comments.
+fn bootstrap_description(
     args: &ImportArgs,
     steps: &[Step],
     views: &[(String, String)],
-    _slots: &PipelineSlots,
-) -> String {
-    let mut out = String::new();
-
-    // A generated dataset.yaml is data metadata, not source code — no
-    // copyright/license header. (The dataset's own license, if any, belongs
-    // in `attributes.license`.)
+) -> Result<vectordata::dataset::DatasetConfig, String> {
     // A new dataset states the version its content needs (V-25) and
     // declares its tag schema (PS-19): the naming tags, in order, each
-    // without a default so a generator sets the planned value.
-    out.push_str(&format!("format_version: {}\n", vectordata::model::FORMAT_VERSION_TAGGED));
-    out.push_str(&format!("name: {}\n", args.name));
+    // without a default so a generator sets the planned value. A
+    // generated dataset.yaml is data metadata, not source code — no
+    // copyright/license header. (The dataset's own license, if any,
+    // belongs in `attributes.license`.)
+    let mut b = vectordata::dataset::DatasetConfig::builder(args.name.clone())
+        .format_version(vectordata::model::FORMAT_VERSION_TAGGED);
     if let Some(ref desc) = args.description {
-        out.push_str(&format!("description: >-\n  {}\n", desc));
+        b = b.description(desc.clone());
     }
-
-    // Attributes
-    out.push_str("\nattributes:\n");
     if args.personality != "native" {
-        out.push_str(&format!("  personality: {}\n", args.personality));
+        b = b.attribute("personality", args.personality.as_str());
     }
-    out.push_str(&format!("  distance_function: {}\n", args.metric));
-    out.push_str(&format!("  veks_version: {}\n", env!("CARGO_PKG_VERSION")));
-    out.push_str(&format!("  veks_build: {}.{}\n", env!("VEKS_BUILD_HASH"), env!("VEKS_BUILD_NUMBER")));
+    b = b
+        .distance_function(&args.metric)
+        .attribute("veks_version", env!("CARGO_PKG_VERSION"))
+        .attribute("veks_build", format!("{}.{}", env!("VEKS_BUILD_HASH"), env!("VEKS_BUILD_NUMBER")));
     // Record oracle partition scope if O facet is active
     let facets_for_scope = resolve_facets(args);
     let (_, oracle_scope_opt) = parse_oracle_scope(&facets_for_scope);
     if let Some(ref scope) = oracle_scope_opt {
-        out.push_str(&format!("  oracle_scope: {}\n", scope));
+        b = b.attribute("oracle_scope", scope.as_str());
     }
     // Bake user-asserted counts directly into the attributes so they
     // survive any subsequent `veks run --reset` that wipes
@@ -2615,107 +2571,92 @@ fn generate_yaml(
     // (bootstrap skipped them based on the same assertion), and
     // `update_dataset_attributes` would have nothing to sync — so
     // `veks check dataset-attributes` would go red again despite the
-    // wizard answer being accurate.
+    // wizard answer being accurate. Otherwise `is_normalized`,
+    // `is_duplicate_vector_free` and `is_zero_vector_free` are set by
+    // the pipeline once the relevant steps have verified them.
     if let Some(z) = args.zero_count {
-        out.push_str(&format!("  is_zero_vector_free: {}\n", z == 0));
+        b = b.attribute("is_zero_vector_free", z == 0);
     }
     if let Some(d) = args.duplicate_count {
-        out.push_str(&format!("  is_duplicate_vector_free: {}\n", d == 0));
+        b = b.attribute("is_duplicate_vector_free", d == 0);
     }
-    // is_normalized, is_duplicate_vector_free, and is_zero_vector_free
-    // are set by the pipeline after the relevant steps complete — not
-    // at generation time when correctness hasn't been verified yet.
-    // Exception: when the user asserted the counts up front (above),
-    // we can record the derived boolean immediately.
 
     // Upstream pipeline
     if !steps.is_empty() {
-        out.push_str("\nupstream:\n");
-        out.push_str("  defaults:\n");
-        out.push_str(&format!("    query_count: {}\n", args.query_count));
-        out.push_str(&format!("    seed: {}\n", args.seed));
+        let mut defaults = indexmap::IndexMap::new();
+        defaults.insert("query_count".to_string(), args.query_count.to_string());
+        defaults.insert("seed".to_string(), args.seed.to_string());
         // The cap this dataset's facets were sized for, so a run on
         // another machine produces the same layout. `--resources
         // shardsize:` still overrides it per run.
-        out.push_str(&format!(
-            "    {}: {}\n",
-            vectordata::dataset::shard_sizing::SHARD_SIZE_KEY,
-            args.max_shard_bytes,
-        ));
-        out.push_str("\n  steps:\n");
-
-        for step in steps {
-            out.push_str(&format!("    - id: {}\n", step.id));
-            if let Some(ref desc) = step.description {
-                out.push_str(&format!("      description: {}\n", desc));
-            }
-            out.push_str(&format!("      run: {}\n", step.run));
-            if step.per_profile {
-                out.push_str("      per_profile: true\n");
-            }
-            if step.phase > 0 {
-                out.push_str(&format!("      phase: {}\n", step.phase));
-            }
-            if step.finalize {
-                out.push_str("      finalize: true\n");
-            }
-            if !step.after.is_empty() {
-                out.push_str(&format!("      after: [{}]\n", step.after.join(", ")));
-            }
-            for (k, v) in &step.options {
-                // Quote values that contain YAML-special characters
-                if v.contains('[') || v.contains('{') || v.contains('$')
-                    || v.contains(':') || v.contains('#') || v.contains('&')
-                {
-                    out.push_str(&format!("      {}: \"{}\"\n", k, v));
-                } else {
-                    out.push_str(&format!("      {}: {}\n", k, v));
-                }
-            }
-            out.push('\n');
-        }
+        defaults.insert(
+            vectordata::dataset::shard_sizing::SHARD_SIZE_KEY.to_string(),
+            args.max_shard_bytes.to_string(),
+        );
+        b = b.upstream(vectordata::dataset::PipelineConfig {
+            defaults: Some(defaults),
+            steps: Some(steps.iter().map(Step::to_step_def).collect()),
+        });
     }
 
     // strata — root-level sized-profile generator specs (the
-    // `mul:/fib:/linear:/N..M/K` grammar). Moved out from under
-    // `profiles:` so consumers reading the profile map never have
-    // to special-case a non-profile key. Per-profile view paths
-    // are derived at expand time from the per_profile pipeline
-    // templates (`derive_views_from_templates`), so we no longer
-    // need the `facets:` sub-map here either.
+    // `mul:/fib:/linear:/N..M/K` grammar). Per-profile view paths are
+    // derived at expand time from the per_profile pipeline templates
+    // (`derive_views_from_templates`).
     if let Some(spec) = args.sized_profiles.as_ref() {
-        let specs: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
-        // Human-readable header comments explaining each expression,
-        // then the flat sequence `serde` expects for `Vec<String>`.
-        out.push('\n');
-        for s in &specs {
-            let desc = describe_sized_spec(s);
-            out.push_str(&format!("# strata \"{}\": {}\n", s, desc));
+        for s in spec.split(',').map(|s| s.trim()) {
+            b = b.stratum(s);
         }
-        let formatted: Vec<String> = specs.iter().map(|s| format!("\"{}\"", s)).collect();
-        out.push_str(&format!("strata: [{}]\n", formatted.join(", ")));
     }
 
     // The tag schema (PS-19): naming order first, no default on a
     // planned value. `size` is written per profile from its rung
     // (PS-20); `predicates` wherever a predicate facet is declared
     // (PS-23); `selectivity` only on single-level sets.
-    out.push_str("\n# profile tags: the naming tags in order (PS-19); a selector reads them,\n");
-    out.push_str("# and a generated profile is named by their values joined with '-'.\n");
-    out.push_str("profile_tags:\n");
-    out.push_str("  size: ~\n");
-    out.push_str("  predicates: ~\n");
-    out.push_str("  selectivity: ~\n");
-
-    // Profiles
-    out.push_str("\nprofiles:\n");
-    out.push_str("  default:\n");
-    out.push_str(&format!("    maxk: {}\n", args.neighbors));
-    for (facet, path) in views {
-        out.push_str(&format!("    {}: {}\n", facet, path));
+    for tag in ["size", "predicates", "selectivity"] {
+        b = b.profile_tag(tag, serde_yaml::Value::Null);
     }
 
-    out
+    b.profile("default", |p| {
+        views.iter().fold(p.maxk(args.neighbors), |p, (facet, path)| p.custom_facet(facet, path))
+    })
+    .build()
+}
+
+impl Step {
+    /// This step as the pipeline type a description holds. Each option
+    /// value is read as YAML reads the same text: a value quoted for its
+    /// special characters stays a string, anything else takes the type
+    /// YAML gives it (a number, a boolean).
+    fn to_step_def(&self) -> vectordata::dataset::StepDef {
+        let options = self
+            .options
+            .iter()
+            .map(|(k, v)| {
+                let special = v.contains('[') || v.contains('{') || v.contains('$')
+                    || v.contains(':') || v.contains('#') || v.contains('&');
+                let value = if special {
+                    serde_yaml::Value::String(v.clone())
+                } else {
+                    serde_yaml::from_str(v).unwrap_or_else(|_| serde_yaml::Value::String(v.clone()))
+                };
+                (k.clone(), value)
+            })
+            .collect();
+        vectordata::dataset::StepDef {
+            id: Some(self.id.clone()),
+            run: self.run.clone(),
+            description: self.description.clone(),
+            after: self.after.clone(),
+            per_profile: self.per_profile,
+            phase: self.phase,
+            sequence_after: Vec::new(),
+            profiles: Vec::new(),
+            finalize: self.finalize,
+            on_partial: Default::default(),
+            options,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2857,11 +2798,8 @@ pub fn run(mut args: ImportArgs) {
         count_identity(&slots),
     );
 
-    // Generate YAML
-    let yaml = generate_yaml(&args, &steps, &views, &slots);
-
     let dataset_path = output_dir.join("dataset.yaml");
-    if let Err(e) = std::fs::write(&dataset_path, &yaml) {
+    if let Err(e) = bootstrap_description(&args, &steps, &views).and_then(|d| d.save(&dataset_path)) {
         eprintln!("Error: failed to write {}: {}", crate::check::rel_display(&dataset_path), e);
         std::process::exit(1);
     }

@@ -1363,17 +1363,9 @@ fn clean_single_dataset(workspace: &std::path::Path) {
             .unwrap_or_else(|e| {
                 eprintln!("Warning: could not load dataset.yaml: {}", e);
                 eprintln!("Cleaning without profile information.");
-                vectordata::dataset::DatasetConfig {
-                    format_version: vectordata::model::FORMAT_VERSION_BASE,
-                    profile_tags: Default::default(),
-                    name: String::new(),
-                    description: None,
-                    attributes: None,
-                    profiles: Default::default(),
-                    upstream: None,
-                    strata: Default::default(),
-                    variables: Default::default(),
-                }
+                vectordata::dataset::DatasetConfig::builder(String::new())
+                    .build()
+                    .expect("an empty description is valid")
             });
         crate::pipeline::reset_pipeline(workspace, &dataset_path, &config);
     } else {

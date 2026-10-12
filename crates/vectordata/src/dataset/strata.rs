@@ -311,6 +311,53 @@ impl<'de> Deserialize<'de> for Strata {
     }
 }
 
+/// A plain-language description of a sized-profile spec, as a save
+/// writes it in a comment above `strata:` so a reader of the file need
+/// not know the generator grammar: `mul:1m/2` is "geometric series from
+/// 1m, multiplying by 2 each step, up to dataset size".
+pub fn describe_spec(spec: &str) -> String {
+    let spec = spec.trim();
+    if let Some(rest) = spec.strip_prefix("mul:") {
+        if let Some((range, factor)) = rest.split_once('/') {
+            if range.contains("..") {
+                let (start, end) = range.split_once("..").unwrap();
+                format!("geometric series from {} to {}, multiplying by {} each step", start.trim(), end.trim(), factor.trim())
+            } else {
+                format!("geometric series from {}, multiplying by {} each step, up to dataset size", range.trim(), factor.trim())
+            }
+        } else {
+            "geometric series".into()
+        }
+    } else if let Some(rest) = spec.strip_prefix("fib:") {
+        if let Some((start, end)) = rest.split_once("..") {
+            format!("fibonacci series from {} to {}", start.trim(), end.trim())
+        } else {
+            "fibonacci series".into()
+        }
+    } else if spec == "decade" {
+        "decade-stepped series (100k, 200k, …, 900k, 1m, 2m, …) up to dataset size".into()
+    } else if let Some(rest) = spec.strip_prefix("decade:") {
+        if let Some((start, end)) = rest.split_once("..") {
+            format!("decade-stepped series from {} to {} (1×, 2×, …, 9×, 10×, … per decade)", start.trim(), end.trim())
+        } else {
+            format!("decade-stepped series from {} (1×, 2×, …, 9×, 10×, … per decade) up to dataset size", rest.trim())
+        }
+    } else if let Some((range, step)) = spec.split_once('/') {
+        if let Some((start, end)) = range.split_once("..") {
+            let step = step.trim();
+            if step.bytes().any(|b| b.is_ascii_alphabetic()) {
+                format!("linear series from {} to {}, stepping by {}", start.trim(), end.trim(), step)
+            } else {
+                format!("linear series from {} to {}, {} equal divisions", start.trim(), end.trim(), step)
+            }
+        } else {
+            format!("profile at {}", spec)
+        }
+    } else {
+        format!("single profile at {}", spec)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

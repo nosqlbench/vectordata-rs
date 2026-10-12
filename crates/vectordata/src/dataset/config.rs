@@ -103,6 +103,49 @@ pub struct DatasetAttributes {
 }
 
 impl DatasetAttributes {
+    /// Store `value` in the field `key` names, when the type has one:
+    /// a string for the text fields, `true`/`false` (or their spelling)
+    /// for the flags. Returns `false` for a key with no field, or a
+    /// value that does not fit it, so the caller can keep it as given.
+    pub fn set_known(&mut self, key: &str, value: &serde_yaml::Value) -> bool {
+        let text = || match value {
+            serde_yaml::Value::String(s) => Some(s.clone()),
+            serde_yaml::Value::Number(n) => Some(n.to_string()),
+            serde_yaml::Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        };
+        let flag = || match value {
+            serde_yaml::Value::Bool(b) => Some(*b),
+            serde_yaml::Value::String(s) => Some(s == "true"),
+            _ => None,
+        };
+        let slot = match key {
+            "is_normalized" => return flag().map(|b| self.is_normalized = Some(b)).is_some(),
+            "is_zero_vector_free" => return flag().map(|b| self.is_zero_vector_free = Some(b)).is_some(),
+            "is_duplicate_vector_free" => {
+                return flag().map(|b| self.is_duplicate_vector_free = Some(b)).is_some();
+            }
+            "distance_function" => &mut self.distance_function,
+            "model" => &mut self.model,
+            "model_revision" => &mut self.model_revision,
+            "model_revision_requested" => &mut self.model_revision_requested,
+            "url" => &mut self.url,
+            "license" => &mut self.license,
+            "vendor" => &mut self.vendor,
+            "notes" => &mut self.notes,
+            "veks_version" => &mut self.veks_version,
+            "veks_build" => &mut self.veks_build,
+            _ => return false,
+        };
+        match text() {
+            Some(t) => {
+                *slot = Some(t);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Check for required attributes. Returns a list of missing fields.
     pub fn missing_required(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
@@ -189,6 +232,13 @@ pub struct DatasetConfig {
     /// dataset properties without a separate file.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub variables: IndexMap<String, String>,
+
+    /// Comment lines a **new** file starts with, without their `# `: a
+    /// generator saying what wrote the file and what to run next. A file
+    /// that already has a leading comment block keeps its own, and
+    /// nothing is ever stamped on a file that was not created here.
+    #[serde(skip)]
+    pub header: Vec<String>,
 }
 
 /// Hand-written so the version gate runs on **every** deserialization
@@ -233,27 +283,9 @@ impl<'de> Deserialize<'de> for DatasetConfig {
         }
 
         let raw = Raw::deserialize(deserializer)?;
-        let format_version = crate::model::check_supported_version(raw.format_version)
-            .map_err(serde::de::Error::custom)?;
-        crate::model::check_stated_against_content(
-            raw.format_version,
-            required_format_version(&raw.profiles, &raw.profile_tags),
-        )
-        .map_err(serde::de::Error::custom)?;
-
-        // Stated parents (PL-6), by the one rule both loaders share.
-        let facts: Vec<crate::dataset::parents::ParentFacts<'_>> = raw
-            .profiles
-            .profiles
-            .iter()
-            .map(|(name, p)| crate::dataset::parents::ParentFacts {
-                name,
-                partition: p.partition,
-                inherits: p.inherits.as_deref(),
-            })
-            .collect();
-        crate::dataset::parents::check_parents(format_version, &facts)
-            .map_err(serde::de::Error::custom)?;
+        let format_version =
+            check_description(raw.format_version, &raw.profile_tags, &raw.profiles)
+                .map_err(serde::de::Error::custom)?;
         let mut profiles = raw.profiles;
         profiles.layered = format_version >= crate::model::FORMAT_VERSION_TAGGED;
 
@@ -267,8 +299,33 @@ impl<'de> Deserialize<'de> for DatasetConfig {
             strata: raw.strata,
             profiles,
             variables: raw.variables,
+            header: Vec::new(),
         })
     }
+}
+
+/// The checks every description passes, parsed or built (V-9, V-14,
+/// PL-6): the version is one this build reads, a stated version does
+/// not understate the content, and stated parents are real. Returns
+/// the effective version.
+pub(crate) fn check_description(
+    stated: Option<u32>,
+    profile_tags: &IndexMap<String, serde_yaml::Value>,
+    profiles: &DSProfileGroup,
+) -> Result<u32, String> {
+    let format_version = crate::model::check_supported_version(stated)?;
+    crate::model::check_stated_against_content(stated, required_format_version(profiles, profile_tags))?;
+    let facts: Vec<crate::dataset::parents::ParentFacts<'_>> = profiles
+        .profiles
+        .iter()
+        .map(|(name, p)| crate::dataset::parents::ParentFacts {
+            name,
+            partition: p.partition,
+            inherits: p.inherits.as_deref(),
+        })
+        .collect();
+    crate::dataset::parents::check_parents(format_version, &facts)?;
+    Ok(format_version)
 }
 
 /// The lowest format version that can express this dataset.
@@ -671,26 +728,11 @@ impl DatasetConfig {
     /// Set an attribute field. Returns `false` if the key is not recognized.
     pub fn set_attribute(&mut self, key: &str, value: &str) -> bool {
         let attrs = self.attributes.get_or_insert_with(DatasetAttributes::default);
-        match key {
-            "is_normalized" => { attrs.is_normalized = Some(value == "true"); true }
-            "is_zero_vector_free" => { attrs.is_zero_vector_free = Some(value == "true"); true }
-            "is_duplicate_vector_free" => { attrs.is_duplicate_vector_free = Some(value == "true"); true }
-            "distance_function" => { attrs.distance_function = Some(value.to_string()); true }
-            "model" => { attrs.model = Some(value.to_string()); true }
-            "model_revision" => { attrs.model_revision = Some(value.to_string()); true }
-            "model_revision_requested" => { attrs.model_revision_requested = Some(value.to_string()); true }
-            "url" => { attrs.url = Some(value.to_string()); true }
-            "license" => { attrs.license = Some(value.to_string()); true }
-            "vendor" => { attrs.vendor = Some(value.to_string()); true }
-            "notes" => { attrs.notes = Some(value.to_string()); true }
-            "veks_version" => { attrs.veks_version = Some(value.to_string()); true }
-            "veks_build" => { attrs.veks_build = Some(value.to_string()); true }
-            "personality" => {
-                attrs.tags.insert("personality".to_string(), value.to_string());
-                true
-            }
-            _ => false,
+        if key == "personality" {
+            attrs.tags.insert("personality".to_string(), value.to_string());
+            return true;
         }
+        attrs.set_known(key, &serde_yaml::Value::from(value))
     }
 
     // -- Save ---------------------------------------------------------------
@@ -756,7 +798,10 @@ impl DatasetConfig {
         // one. A dataset.yaml describes data — often a third party's — and must
         // not be stamped with our source-code copyright/license header. Doing
         // so also made re-serialized copies disagree with the origin file.
-        let header = existing_header.unwrap_or_default();
+        // A new file takes the header its writer gave it, if any.
+        let header = existing_header.unwrap_or_else(|| {
+            self.header.iter().map(|line| format!("# {line}\n")).collect()
+        });
 
         let mut out = header;
 
@@ -850,7 +895,18 @@ impl DatasetConfig {
             Strata::from_specs(self.profiles.raw_sized.iter().cloned())
         };
         if !strata.is_empty() {
-            out.push_str("\nstrata:\n");
+            // Each generator in plain words, so a reader of the file need
+            // not know the grammar. Derived from the spec, so every save
+            // writes the same lines.
+            out.push('\n');
+            for (_, stratum) in strata.iter() {
+                out.push_str(&format!(
+                    "# strata \"{}\": {}\n",
+                    stratum.spec,
+                    crate::dataset::strata::describe_spec(&stratum.spec),
+                ));
+            }
+            out.push_str("strata:\n");
             for (name, stratum) in strata.iter() {
                 out.push_str(&format!("  {}:\n", name));
                 out.push_str(&format!("    spec: \"{}\"\n", stratum.spec));
@@ -878,7 +934,9 @@ impl DatasetConfig {
         // written exactly as loaded: a dropped tag would silently
         // change every generated profile name.
         if !self.profile_tags.is_empty() {
-            out.push_str("\nprofile_tags:\n");
+            out.push_str("\n# profile tags: the naming tags in order (PS-19); a selector reads them,\n");
+            out.push_str("# and a generated profile is named by their values joined with '-'.\n");
+            out.push_str("profile_tags:\n");
             for (key, value) in &self.profile_tags {
                 let rendered = crate::dataset::yaml_edit::render_scalar(value)
                     .map_err(|e| format!("profile_tags '{key}': {e}"))?;
@@ -1095,6 +1153,31 @@ impl DatasetConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A save explains the strata and the tag schema in comments, and
+    /// writes the same comments every time.** Bootstrap once wrote them
+    /// by hand, so they lasted only until the first save rewrote the
+    /// file without them.
+    #[test]
+    fn a_save_explains_its_strata_and_tag_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("dataset.yaml");
+        std::fs::write(
+            &path,
+            "format_version: 3\nname: ds\nstrata: [\"mul:1m/2\"]\nprofile_tags:\n  size: ~\n\
+             profiles:\n  default:\n    base_vectors: base.fvec\n",
+        )
+        .unwrap();
+        DatasetConfig::load(&path).unwrap().save(&path).unwrap();
+        let once = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            once.contains("# strata \"mul:1m/2\": geometric series from 1m, multiplying by 2 each step"),
+            "{once}"
+        );
+        assert!(once.contains("# profile tags: the naming tags in order"), "{once}");
+        DatasetConfig::load(&path).unwrap().save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), once, "a second save changes nothing");
+    }
 
     /// **A profile naming `default` at another size gets none of its
     /// ground truth.** The size step withholds the per-profile outputs

@@ -86,6 +86,14 @@ documentation's **Common tasks** table is the same index with examples.
 - Publish a dataset: [`push::execute`](crate::push::execute), reporting
   through [`push::ProgressSink`](crate::push::ProgressSink).
 
+- Build a dataset description in code, or write a `dataset.yaml`:
+  [`DatasetConfig::builder`](crate::dataset::DatasetConfig::builder), then
+  [`build`](crate::dataset::DatasetBuilder::build) and
+  [`save`](crate::dataset::DatasetConfig::save). The result passes the
+  checks a parsed file passes and equals the parse of what it saves.
+  Parse text you hold with
+  [`DatasetConfig::parse`](crate::dataset::DatasetConfig::parse).
+
 ## Do not hand-roll
 
 Each of these exists, is tested, and handles cases that are easy to miss.
@@ -113,6 +121,9 @@ Each of these exists, is tested, and handles cases that are easy to miss.
   chunks recorded separately, so its bytes are only meaningful through
   vectordata. `FacetStorage::cache_path` and `local_files` are for
   diagnostics and cache administration, never for reading data.
+- **`dataset.yaml` text.** Do not format one with `format!`: the
+  builder and `save` write the version a dataset needs, quote what YAML
+  would misread, and leave out what inheritance restores.
 - **Joining a facet or entry path onto a dataset or catalog location.**
   [`Location::resolve`](crate::Location::resolve) is the rule the open
   reads by: a URL or leading `/` kept as written, `file://` read as its

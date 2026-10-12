@@ -76,8 +76,11 @@ Line numbers are as of 2026-10-12. Paths are under `crates/`.
     `veks/src/prepare/import.rs:2577` (`generate_yaml`, the bootstrap
     path), `veks-pipeline/.../gen_dataset.rs:211`, `gen_derive.rs:240`,
     `gen_example_dataset.rs:353`, `vectordata/src/datasets/derive.rs:1795`.
-    None of them writes YAML comments, so nothing is lost by building
-    through the struct instead.
+    Four of them write comments: bootstrap explains each strata spec
+    and the tag schema, and `example-dataset` and `derive` start with a
+    header. The renderer kept only a file's existing leading comment
+    block, so bootstrap's comments lasted until the first save (§12.3).
+    *(Corrected 2026-10-12; this said none did.)*
   - In-place text edits through `yaml_edit` (tags, predicate sets,
     downgrade, runner, check fix) edit an existing file. They are edits,
     not constructions, and stay as they are (§8).
@@ -877,3 +880,66 @@ producer's rule (a partition inherits nothing) is the right one.
 **Left for the user:** tessera's published catalog still lists the
 default's ground truth under its `*-unfiltered` profiles until it is
 regenerated and republished.
+
+### 12.3 Step 3: the dataset builder and the writers (2026-10-12)
+
+**Found first.** §2.1 said the five hand-built writers write no
+comments. Four do. The SRD also asked for byte-identical output, which
+the renderer cannot give: it writes its own canonical layout. For
+example, it writes structured `strata:` where bootstrap wrote a
+one-line list, and quotes step options by YAML's rules. Every save of a
+bootstrapped file already rewrote it that way and dropped its comments.
+
+**Decided by the user on 2026-10-12:**
+- The renderer writes the strata and tag-schema comments on every save.
+- The builder takes a header for a new file.
+- Acceptance is "parses to the same description, with its comments",
+  not "byte-identical".
+
+**Built:**
+- **`DatasetConfig::builder(name)`** (`dataset/builder.rs`):
+  - dataset level: `description`, `attribute` (known keys go to their
+    fields through `DatasetAttributes::set_known`, the rest to `other`),
+    `distance_function`, `model`, `license`, `format_version`,
+    `profile_tag`, `stratum`, `variable`, `upstream` and `header_line`;
+  - `profile(name, |p| …)`, whose profile builder offers `facet`
+    (`StandardFacet`), `custom_facet`, `view`, `base_count`, `maxk`,
+    `inherits`, `partition` and `attribute`. Facet aliases are stored
+    under their canonical keys, as a parse stores them.
+- **`build()` runs the checks a parse runs**, factored out so both
+  paths share them: `DSProfileGroup::settle` (inheritance and shard
+  declarations) and `check_description` (version gate, stated version
+  against content, stated parents). Without `format_version` a built
+  description states the lowest version its content needs.
+- **Rendering:**
+  - every save writes `# strata "<spec>": <description>` above
+    `strata:`, using `strata::describe_spec`, moved from bootstrap;
+  - every save writes the two-line tag-schema comment above
+    `profile_tags:`;
+  - a new file starts with the description's `header` lines, while an
+    existing file keeps its own leading block.
+- **The five writers build and save:**
+  - `veks prepare bootstrap`, whose steps convert to `StepDef` with each
+    option read as YAML reads its old text;
+  - `gen_dataset` and `gen_derive`;
+  - `generate example-dataset` and `datasets derive`, each keeping its
+    header.
+
+  `derive`'s own format-version fold is gone, because the builder
+  folds. The `veks prepare clean` fallback literal is now an empty build.
+- **Each writer was compared before its old code was deleted.** Its old
+  and new output, rendered through `save`, came out equal on
+  representative inputs: three bootstrap variants (base only; base,
+  queries, strata, description and asserted counts; knn_utils
+  personality with synthesized metadata), plain and sharded derive
+  output, and all three example-dataset facet sets.
+- **Two `veks` test helpers parsed bootstrap's text layout.**
+  `check_and_import.rs`'s `step_ids_from_yaml` and `after_for_step`, and
+  `dag_configurations.rs`'s `parse_steps`, matched `after: [..]` and
+  fixed indents. They now read the steps from the parsed description.
+
+**Guards:**
+- `a_save_explains_its_strata_and_tag_schema` checks the comments and
+  that a second save changes nothing. It fails on the previous code.
+- `a_built_description_equals_the_parse_of_its_save` and
+  `a_builder_refuses_what_a_parse_refuses` cover the builder.

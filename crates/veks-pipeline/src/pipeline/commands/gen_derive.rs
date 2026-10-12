@@ -237,25 +237,8 @@ statistics.
         }
 
         // Write dataset.yaml
-        let dataset_yaml = format!(
-            "name: {}\n\
-             description: \"Derived from {}\"\n\
-             \n\
-             attributes:\n\
-             \x20 derived_from: \"{}\"\n\
-             \x20 generation_mode: virtdata\n\
-             \x20 dimensions: {}\n\
-             \n\
-             profiles:\n\
-             \x20 default:\n\
-             \x20   base_vectors: base_vectors.fvec\n",
-            name,
-            source_path.display(),
-            source_path.display(),
-            dim,
-        );
         let yaml_path = target_path.join("dataset.yaml");
-        if let Err(e) = std::fs::write(&yaml_path, &dataset_yaml) {
+        if let Err(e) = derived_description(name, &source_path, dim).and_then(|d| d.save(&yaml_path)) {
             return error_result(format!("failed to write dataset.yaml: {}", e), start);
         }
 
@@ -445,6 +428,20 @@ fn error_result(message: String, start: Instant) -> CommandResult {
         produced: vec![],
         elapsed: start.elapsed(),
     }
+}
+
+/// The description of a derived dataset: where it came from, how it
+/// was made, and one profile over the base vectors it wrote.
+fn derived_description(name: &str, source: &Path, dim: usize) -> Result<vectordata::dataset::DatasetConfig, String> {
+    vectordata::dataset::DatasetConfig::builder(name)
+        .description(format!("Derived from {}", source.display()))
+        .attribute("derived_from", source.display().to_string())
+        .attribute("generation_mode", "virtdata")
+        .attribute("dimensions", dim as u64)
+        .profile("default", |p| {
+            p.facet(vectordata::dataset::StandardFacet::BaseVectors, "base_vectors.fvec")
+        })
+        .build()
 }
 
 #[cfg(test)]

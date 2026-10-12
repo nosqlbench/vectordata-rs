@@ -36,6 +36,7 @@
 //! | Read a record (slab) facet | [`TestDataView::open_facet_records`] | — |
 //! | List profiles and facets | [`TestDataGroup::profile_names`], [`TestDataView::facet_manifest`] | below |
 //! | Find datasets by pattern | [`Catalog::match_glob`](catalog::Catalog::match_glob), [`Catalog::datasets`](catalog::Catalog::datasets) | — |
+//! | Build a dataset description in code | [`DatasetConfig::builder`](dataset::DatasetConfig::builder) → [`save`](dataset::DatasetConfig::save) | — |
 //! | Resolve a path against a dataset or catalog location | [`Location::resolve`] | — |
 //! | Locate the cache | [`settings::cache_dir`] | — |
 //! | Inspect what is cached | [`FacetStorage::cache_stats`] via [`TestDataView::open_facet_storage`] | — |

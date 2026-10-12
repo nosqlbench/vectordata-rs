@@ -18,6 +18,7 @@
 //! - **pipeline** — `PipelineConfig`, `StepDef`, `OnPartial` (upstream build steps).
 //! - **catalog** — `CatalogEntry`, `CatalogLayout` (dataset index files).
 
+pub mod builder;
 pub mod catalog;
 pub mod conformance;
 pub mod config;
@@ -34,6 +35,7 @@ pub mod source;
 pub mod strata;
 pub mod yaml_edit;
 
+pub use builder::{DatasetBuilder, ProfileBuilder};
 pub use catalog::{CatalogEntry, CatalogLayout, find_catalog, load_catalog};
 pub use config::{DatasetAttributes, DatasetConfig};
 pub use expansion::{collect_all_steps, expand_per_profile_steps, expand_per_profile_steps_scoped, filter_steps_for_profile, refuse_layer_writes, resolve_steps};

@@ -1539,41 +1539,28 @@ fn project_artifacts_clear_variables_empty() {
 // Import flow tests: prepare-vectors, normalize, and dependency graph
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Collect step IDs from YAML by parsing "- id: <step-id>" lines.
+/// The ids of the pipeline steps the dataset.yaml declares.
 fn step_ids_from_yaml(yaml: &str) -> Vec<String> {
-    yaml.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with("- id: ") {
-                Some(trimmed.strip_prefix("- id: ").unwrap().to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
+    pipeline_steps(yaml).into_iter().filter_map(|s| s.id).collect()
 }
 
-/// Extract the "after: [...]" line for a given step ID from the YAML.
-fn after_for_step(yaml: &str, step_id: &str) -> Option<String> {
-    let lines: Vec<&str> = yaml.lines().collect();
-    let mut in_step = false;
-    for line in lines.iter() {
-        let trimmed = line.trim();
-        if trimmed == format!("- id: {}", step_id) {
-            in_step = true;
-            continue;
-        }
-        if in_step {
-            // New step starts with "- id:"
-            if trimmed.starts_with("- id: ") {
-                return None; // no after found for this step
-            }
-            if trimmed.starts_with("after:") {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
+/// The pipeline steps the dataset.yaml declares, read as a loader reads
+/// them rather than by the layout of the text.
+fn pipeline_steps(yaml: &str) -> Vec<vectordata::dataset::StepDef> {
+    vectordata::dataset::DatasetConfig::parse(yaml)
+        .expect("the generated dataset.yaml parses")
+        .upstream
+        .and_then(|u| u.steps)
+        .unwrap_or_default()
+}
+
+/// The steps a given step runs after, or `None` when it names none.
+fn after_for_step(yaml: &str, step_id: &str) -> Option<Vec<String>> {
+    pipeline_steps(yaml)
+        .into_iter()
+        .find(|s| s.id.as_deref() == Some(step_id))
+        .map(|s| s.after)
+        .filter(|after| !after.is_empty())
 }
 
 #[test]
@@ -1891,9 +1878,9 @@ fn import_shuffle_depends_on_prepare_vectors() {
     let after = after_for_step(&yaml, "generate-shuffle");
     assert!(after.is_some(),
         "generate-shuffle should have an after clause");
-    let after_str = after.unwrap();
-    assert!(after_str.contains("prepare-vectors"),
-        "generate-shuffle should depend on prepare-vectors, got: {}", after_str);
+    let after = after.unwrap();
+    assert!(after.iter().any(|s| s == "prepare-vectors"),
+        "generate-shuffle should depend on prepare-vectors, got: {:?}", after);
 }
 
 #[test]
@@ -1915,12 +1902,12 @@ fn import_shuffle_depends_on_prepare_vectors_not_count_base() {
     let after = after_for_step(&yaml, "generate-shuffle");
     assert!(after.is_some(),
         "generate-shuffle should have an after clause");
-    let after_str = after.unwrap();
-    assert!(after_str.contains("prepare-vectors"),
-        "generate-shuffle should depend on prepare-vectors, got: {}", after_str);
+    let after = after.unwrap();
+    assert!(after.iter().any(|s| s == "prepare-vectors"),
+        "generate-shuffle should depend on prepare-vectors, got: {:?}", after);
     // It should NOT depend on count-base (that comes after extraction)
-    assert!(!after_str.contains("count-base"),
-        "generate-shuffle should not depend on count-base, got: {}", after_str);
+    assert!(!after.iter().any(|s| s == "count-base"),
+        "generate-shuffle should not depend on count-base, got: {:?}", after);
 }
 
 #[test]

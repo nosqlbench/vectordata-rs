@@ -1538,6 +1538,23 @@ impl DSProfileGroup {
         }
     }
 
+    /// Finish a group however it was made, parsed or built: resolve
+    /// inheritance, then realize every view's declaration far enough to
+    /// catch one that disagrees with itself, through the same code the
+    /// `dataset.yaml` loader runs, so a dataset cannot be accepted by one
+    /// path and rejected by the other (SH-85, SH-90).
+    pub(crate) fn settle(&mut self) -> Result<(), String> {
+        self.resolve_inheritance();
+        for (profile_name, profile) in &self.profiles {
+            for (facet_name, view) in &profile.views {
+                let sources = view.declaration_sources();
+                crate::dataset::shards::validate_declaration(facet_name, &view.declaration(&sources))
+                    .map_err(|e| format!("profile '{profile_name}': {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
     /// The view `name` would take for `facet` from its parent if it did
     /// not declare one: what the load's inheritance pass gives it. A save leaves a view out exactly when it equals this,
     /// because the next load derives it again.
@@ -2318,25 +2335,7 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
             series_by_spec,
             layered: false,
         };
-        group.resolve_inheritance();
-
-        // Realize every view's declaration far enough to catch one that
-        // disagrees with itself — through the same code the
-        // `dataset.yaml` loader runs, so a dataset cannot be accepted by
-        // one path and rejected by the other (SH-85, SH-90).
-        for (profile_name, profile) in &group.profiles {
-            for (facet_name, view) in &profile.views {
-                let sources = view.declaration_sources();
-                crate::dataset::shards::validate_declaration(
-                    facet_name,
-                    &view.declaration(&sources),
-                )
-                .map_err(|e| {
-                    de::Error::custom(format!("profile '{profile_name}': {e}"))
-                })?;
-            }
-        }
-
+        group.settle().map_err(de::Error::custom)?;
         Ok(group)
     }
 }
