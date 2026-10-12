@@ -90,13 +90,15 @@ impl CatalogSources {
     /// Add required catalog locations.
     ///
     /// Each path can be a directory (containing `catalog.json` or
-    /// `catalogs.yaml`), a file path, or an HTTP(S) URL.
+    /// `catalogs.yaml`), a file path, or an HTTP(S) URL. Sources from
+    /// a directory's `catalogs.yaml` keep the names that file gives
+    /// them; any other path gets the next free stringified index.
     pub fn add_catalogs(mut self, paths: &[String]) -> Self {
         for path in paths {
             let expanded = expand_tilde(path);
-            for resolved in resolve_catalog_path(&expanded, &mut self.diagnostics) {
-                let name = self.synthesize_name();
-                self.required.push(NamedCatalogSource { name, location: resolved });
+            for (named, location) in resolve_catalog_path(&expanded, &mut self.diagnostics) {
+                let name = named.unwrap_or_else(|| self.synthesize_name());
+                self.required.push(NamedCatalogSource { name, location });
             }
         }
         self
@@ -124,9 +126,9 @@ impl CatalogSources {
     pub fn add_optional_catalogs(mut self, paths: &[String]) -> Self {
         for path in paths {
             let expanded = expand_tilde(path);
-            for resolved in resolve_catalog_path(&expanded, &mut self.diagnostics) {
-                let name = self.synthesize_name();
-                self.optional.push(NamedCatalogSource { name, location: resolved });
+            for (named, location) in resolve_catalog_path(&expanded, &mut self.diagnostics) {
+                let name = named.unwrap_or_else(|| self.synthesize_name());
+                self.optional.push(NamedCatalogSource { name, location });
             }
         }
         self
@@ -196,11 +198,14 @@ pub fn resolve_catalog_values(values: &[String]) -> crate::Result<Vec<String>> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedCatalogSource {
     /// Symbolic name — the map key in the map form of
-    /// `catalogs.yaml`, or a synthesized `catalog-N` for the legacy
+    /// `catalogs.yaml`, or a stringified 0-based index for the legacy
     /// list form (and any other entry whose name can't be
     /// determined).
     pub name: String,
-    /// Catalog URL or path, verbatim from the file.
+    /// Catalog URL or path. [`named_catalog_entries`] gives it
+    /// verbatim from the file; [`CatalogSources`] holds it resolved,
+    /// with a relative path joined onto the directory of the
+    /// `catalogs.yaml` that lists it.
     pub location: String,
 }
 
@@ -267,7 +272,10 @@ pub fn parse_named_catalogs(content: &str) -> Result<Vec<NamedCatalogSource>, St
 
 /// Load `catalogs.yaml` from a config directory.
 ///
-/// The file contains a YAML list of strings, each a catalog location.
+/// The file is a map of name → location, or a legacy list of
+/// locations. A relative local location is resolved against
+/// `config_dir`, not the process's working directory, so a
+/// `catalogs.yaml` means the same thing wherever it is read from.
 fn load_config(
     config_dir: &str,
     diags: &mut Vec<super::CatalogDiagnostic>,
@@ -288,19 +296,33 @@ fn load_config(
     let entries = parse_named_catalogs(&content)
         .map_err(|e| format!("failed to parse {}: {e}", catalogs_yaml.display()))?;
 
-    // Resolve each entry relative to the config directory.
+    // Resolve each entry relative to the config directory. An entry
+    // naming a directory with its own catalogs.yaml yields that file's
+    // sources under that file's names.
     let mut locations = Vec::new();
     for entry in entries {
-        let expanded = expand_tilde(&entry.location);
-        for resolved in resolve_catalog_path(&expanded, diags) {
-            locations.push(NamedCatalogSource { name: entry.name.clone(), location: resolved });
+        let expanded = relative_to(dir, &expand_tilde(&entry.location));
+        for (named, location) in resolve_catalog_path(&expanded, diags) {
+            let name = named.unwrap_or_else(|| entry.name.clone());
+            locations.push(NamedCatalogSource { name, location });
         }
     }
 
     Ok(locations)
 }
 
-/// Resolve a catalog path to a concrete URL or file path.
+/// `location` as written in a `catalogs.yaml` in `dir`: a relative
+/// local path is joined onto `dir`; URLs and absolute paths are kept.
+fn relative_to(dir: &Path, location: &str) -> String {
+    if crate::transport::is_remote_url(location) || Path::new(location).is_absolute() {
+        return location.to_string();
+    }
+    dir.join(location).to_string_lossy().into_owned()
+}
+
+/// Resolve a catalog path to concrete URLs or file paths, each with
+/// the name a nested `catalogs.yaml` gave it (`None` when the path
+/// names a catalog directly and the caller must name it).
 ///
 /// Smart detection:
 /// - Remote URLs (`http(s)://`, `s3://`) are kept as-is — the
@@ -309,12 +331,15 @@ fn load_config(
 /// - Directories containing `catalogs.yaml`: load recursively
 /// - Directories containing `catalog.json`: use the directory URL
 /// - Plain files: use directly
-fn resolve_catalog_path(path: &str, diags: &mut Vec<super::CatalogDiagnostic>) -> Vec<String> {
+fn resolve_catalog_path(
+    path: &str,
+    diags: &mut Vec<super::CatalogDiagnostic>,
+) -> Vec<(Option<String>, String)> {
     // Any URL the shared transport speaks (currently `http://`,
     // `https://`, `s3://`) passes through verbatim — the catalog
     // fetcher normalises on the way to the wire.
     if crate::transport::is_remote_url(path) {
-        return vec![path.to_string()];
+        return vec![(None, path.to_string())];
     }
 
     let p = Path::new(path);
@@ -324,17 +349,17 @@ fn resolve_catalog_path(path: &str, diags: &mut Vec<super::CatalogDiagnostic>) -
         let catalogs_yaml = p.join("catalogs.yaml");
         if catalogs_yaml.is_file()
             && let Ok(sources) = load_config(path, diags) {
-            return sources.into_iter().map(|s| s.location).collect();
+            return sources.into_iter().map(|s| (Some(s.name), s.location)).collect();
         }
 
         // Directory with catalog.json or catalog.yaml → use it
         let catalog_json = p.join("catalog.json");
         if catalog_json.is_file() {
-            return vec![path.to_string()];
+            return vec![(None, path.to_string())];
         }
         let catalog_yaml = p.join("catalog.yaml");
         if catalog_yaml.is_file() {
-            return vec![path.to_string()];
+            return vec![(None, path.to_string())];
         }
 
         // Fallback: `knn_entries.yaml` (legacy simplified format).
@@ -342,7 +367,7 @@ fn resolve_catalog_path(path: &str, diags: &mut Vec<super::CatalogDiagnostic>) -
         // `super::knn_entries`.
         let knn_entries = p.join("knn_entries.yaml");
         if knn_entries.is_file() {
-            return vec![path.to_string()];
+            return vec![(None, path.to_string())];
         }
 
         // Directory without any catalog file
@@ -353,11 +378,11 @@ fn resolve_catalog_path(path: &str, diags: &mut Vec<super::CatalogDiagnostic>) -
     }
 
     if p.is_file() {
-        return vec![path.to_string()];
+        return vec![(None, path.to_string())];
     }
 
     // Path doesn't exist — might be a remote URL without scheme
-    vec![path.to_string()]
+    vec![(None, path.to_string())]
 }
 
 /// Expand `~` prefix to the user's home directory.
@@ -595,7 +620,7 @@ mod tests {
     #[test]
     fn test_resolve_http_url() {
         let locations = resolve_catalog_path("https://example.com/catalogs", &mut Vec::new());
-        assert_eq!(locations, vec!["https://example.com/catalogs"]);
+        assert_eq!(locations, vec![(None, "https://example.com/catalogs".to_string())]);
     }
 
     #[test]
@@ -633,7 +658,48 @@ mod tests {
 
         let locations = resolve_catalog_path(tmp.path().to_str().unwrap(), &mut Vec::new());
         assert_eq!(locations.len(), 1);
-        assert_eq!(locations[0], tmp.path().to_str().unwrap());
+        assert_eq!(locations[0], (None, tmp.path().to_str().unwrap().to_string()));
+    }
+
+    /// A relative entry in catalogs.yaml names a file beside that
+    /// catalogs.yaml, whatever the process's working directory is.
+    #[test]
+    fn a_relative_entry_resolves_against_its_catalogs_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("catalogs.yaml"), "shipped: shipped-catalog.yaml\n").unwrap();
+        std::fs::write(tmp.path().join("shipped-catalog.yaml"), "[]").unwrap();
+
+        let sources = CatalogSources::new().configure(tmp.path().to_str().unwrap());
+        let expected = tmp.path().join("shipped-catalog.yaml");
+        assert_eq!(sources.required().len(), 1);
+        assert_eq!(sources.required()[0].name, "shipped");
+        assert_eq!(sources.required()[0].location, expected.to_string_lossy());
+    }
+
+    /// A directory added ad hoc keeps the names its own catalogs.yaml
+    /// gives, through any depth of nesting, rather than being numbered.
+    #[test]
+    fn a_directory_added_by_path_keeps_its_catalogs_yaml_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(inner.join("catalogs.yaml"), "deep: deep-catalog.yaml\n").unwrap();
+        std::fs::write(inner.join("deep-catalog.yaml"), "[]").unwrap();
+        std::fs::write(
+            tmp.path().join("catalogs.yaml"),
+            "near: https://example.com/near/\nouter: inner\n",
+        ).unwrap();
+
+        let sources = CatalogSources::new()
+            .add_catalogs(&[tmp.path().to_string_lossy().to_string()]);
+        let got: Vec<(&str, &str)> = sources.required().iter()
+            .map(|s| (s.name.as_str(), s.location.as_str()))
+            .collect();
+        let deep = inner.join("deep-catalog.yaml");
+        assert_eq!(got, vec![
+            ("near", "https://example.com/near/"),
+            ("deep", deep.to_str().unwrap()),
+        ]);
     }
 
     #[test]

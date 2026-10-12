@@ -9,13 +9,28 @@ datasets can be discovered. Configured in
 `~/.config/vectordata/catalogs.yaml`:
 
 ```yaml
-- https://example.com/datasets/production/
-- https://internal.example.com/datasets/staging/
-- /mnt/data/local-datasets/
+production: https://example.com/datasets/production/
+staging: https://internal.example.com/datasets/staging/
+local: /mnt/data/local-datasets/
+shipped: shipped-catalog.yaml
 ```
 
+Each key names its catalog; the name is what an ambiguous-dataset
+error shows beside each match. The legacy list form (`- <location>`)
+is still read, and its entries are named by 0-based index.
+
 Each location must contain (or serve) a `catalog.json` that indexes
-the datasets under it.
+the datasets under it, or be a catalog file itself.
+
+- **Relative paths** resolve against the directory holding that
+  `catalogs.yaml`, never the process's working directory, so a
+  `catalogs.yaml` vendored with a program means the same thing
+  wherever it is run from. `~` expands to the home directory.
+- **Nesting:** a location that is a directory with its own
+  `catalogs.yaml` contributes that file's sources, under that file's
+  names. The same holds for a directory passed by path
+  (`CatalogSources::add_catalogs`, `--catalogs <dir>`). Any other ad-hoc
+  location is named by the next free index.
 
 ### CLI management
 
