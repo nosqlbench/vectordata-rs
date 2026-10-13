@@ -21,30 +21,7 @@ use std::time::SystemTime;
 
 use super::CheckResult;
 
-/// Sentinel file marking the top of the catalog hierarchy.
-const CATALOG_ROOT_FILE: &str = ".catalog_root";
-
-/// Sentinel file that prevents catalog generation in this directory and below.
-const DO_NOT_CATALOG_FILE: &str = ".do_not_catalog";
-
-/// Walk up from `dir` looking for `.catalog_root`.
-/// Returns a relative path from `dir`.
-fn find_catalog_root(dir: &Path) -> Option<PathBuf> {
-    let abs = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let mut current = abs.clone();
-    let mut levels_up: usize = 0;
-    loop {
-        if current.join(CATALOG_ROOT_FILE).is_file() {
-            let mut rel = dir.to_path_buf();
-            for _ in 0..levels_up { rel = rel.join(".."); }
-            return Some(rel);
-        }
-        if !current.pop() {
-            return None;
-        }
-        levels_up += 1;
-    }
-}
+use vectordata::catalog::generate::{find_catalog_root, is_withheld, DO_NOT_CATALOG_FILE};
 
 /// Check that catalog files are present and current at every directory level.
 ///
@@ -97,10 +74,12 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
     // Only publishable datasets (those with a .publish sentinel file)
     // require catalog coverage. Non-publishable datasets are local-only
     // and don't need to be in the catalog hierarchy.
+    // A dataset under a `.do_not_catalog` directory is in no catalog,
+    // by the generator's rule, so it needs none.
     let publishable_datasets: Vec<&PathBuf> = dataset_files.iter()
         .filter(|ds| {
             let ds_dir = ds.parent().unwrap_or(Path::new("."));
-            ds_dir.join(".publish").exists()
+            ds_dir.join(".publish").exists() && !is_withheld(ds_dir, &bound_root)
         })
         .collect();
 

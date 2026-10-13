@@ -1,92 +1,22 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks catalog generate` — scan directory trees for `dataset.yaml` files
-//! and write `catalog.json` / `catalog.yaml` index files at each directory
-//! level in the hierarchy.
+//! `veks prepare catalog generate` — write `catalog.json` /
+//! `catalog.yaml` (and `knn_entries.yaml`) at each directory level of a
+//! publish hierarchy.
 //!
-//! The output uses layout-embedded catalog entries compatible with the
-//! upstream Java catalog specification. Each entry contains:
-//!
-//! - `name` — the dataset name (from `dataset.yaml`)
-//! - `path` — relative path from the catalog file to `dataset.yaml`
-//! - `dataset_type` — always `"dataset.yaml"`
-//! - `layout` — embedded dataset configuration containing `attributes`
-//!   and `profiles`
+//! What a catalog lists and how its files are written is the shared
+//! generator, [`vectordata::catalog::generate`], which the pipeline's
+//! `catalog generate` step also runs, so a tree gets the same catalogs
+//! from either. This command adds the choice of scan root (the publish
+//! root above the input, or the publish roots below it), the
+//! `.catalog_root` limit on how far up catalogs are written, and
+//! `--update`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use vectordata::dataset::{CatalogEntry, CatalogLayout, DatasetConfig};
-
-/// Sentinel file that marks the top of the catalog hierarchy.
-///
-/// When present in a parent directory, `catalog generate` automatically
-/// uses that directory as the scan root and generates catalogs at every
-/// level from there down. This allows the user to keep an uncataloged
-/// leading path in a remote URL while still getting automatic updates.
-const CATALOG_ROOT_FILE: &str = ".catalog_root";
-
-/// Sentinel file that prevents catalog generation in this directory and below.
-const DO_NOT_CATALOG_FILE: &str = ".do_not_catalog";
-
-/// Walk up from `dir` looking for a `.catalog_root` file.
-/// Returns the directory containing it, or `None`.
-fn find_catalog_root(dir: &Path) -> Option<PathBuf> {
-    let mut current = dir.to_path_buf();
-
-    loop {
-        let candidate = current.join(CATALOG_ROOT_FILE);
-        if candidate.is_file() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
-}
-
-/// Internal representation of a discovered dataset before path relativization.
-struct DiscoveredDataset {
-    /// Absolute (canonical) path to the `dataset.yaml` file.
-    yaml_path: PathBuf,
-    /// The loaded dataset configuration.
-    config: DatasetConfig,
-}
-
-impl DiscoveredDataset {
-    /// Create a catalog entry with the path relativized to the given directory.
-    ///
-    /// Both `self.yaml_path` and `catalog_dir` are expected to be canonical
-    /// (absolute, symlink-resolved) paths so that `strip_prefix` works
-    /// reliably.
-    fn to_entry(&self, catalog_dir: &Path) -> CatalogEntry {
-        let rel_path = self
-            .yaml_path
-            .strip_prefix(catalog_dir)
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| self.yaml_path.clone());
-
-        // Elide "." components (e.g., "a/./b" → "a/b")
-        let cleaned: std::path::PathBuf = rel_path.components()
-            .filter(|c| !matches!(c, std::path::Component::CurDir))
-            .collect();
-
-        let layout = CatalogLayout {
-            // The dataset's own version travels into the catalog,
-            // so a consumer too old for it can say so from the
-            // listing rather than after fetching (V-13).
-            format_version: self.config.format_version,
-            profile_tags: self.config.profile_tags.clone(),
-            attributes: self.config.attributes.clone(),
-            profiles: self.config.profiles.clone(),
-        };
-        CatalogEntry::builder(self.config.name.clone())
-            .descriptor(&vectordata::Location::from_path(cleaned), layout)
-            .build()
-            .expect("an entry with a descriptor always builds")
-    }
-}
+use vectordata::catalog::generate::{self, CatalogTree, GenerateEvent};
 
 /// Run `veks catalog generate`.
 ///
@@ -113,11 +43,7 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
             .unwrap_or_else(|_| p.to_string_lossy().to_string())
     };
 
-    let input_path = if input.is_absolute() {
-        input.to_path_buf()
-    } else {
-        cwd.join(input)
-    };
+    let input_path = generate::logical_path(input);
 
     if !input_path.is_dir() {
         eprintln!("error: {} is not a directory", rel(&input_path));
@@ -126,130 +52,86 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
 
     // Resolve the effective scan root.
     //
-    // Priority: always prefer the outermost enclosing publish root so that
-    // catalogs are generated for the full publish hierarchy. Inner publish
-    // roots are naturally included because we scan downward from the root.
-    //
-    // 1. Walk up from input_path (including itself) to find .publish_url
-    // 2. If not found above, scan immediate children for .publish_url
-    // 3. No .publish_url found → refuse to run
-    let scan_root = {
-        // Walk up from input_path to find enclosing .publish_url
-        match crate::check::publish_url::find_publish_file(&input_path) {
-            Some(pf) => {
-                let root = pf.parent().unwrap().to_path_buf();
-                let root = if root.is_absolute() { root } else { cwd.join(&root) };
-                // Normalize without resolving symlinks (canonicalize breaks
-                // symlink-contained views by crossing into the physical path)
-                let root = normalize_path(&root);
-                eprintln!("Publish root: {} (from {})", rel(&root), rel(&pf));
-                root
+    // 1. The closest `.publish_url` at or above input_path names it.
+    // 2. Else each child directory holding a `.publish_url` gets its own
+    //    run, and input_path a top-level catalog over them all.
+    // 3. No `.publish_url` found → refuse to run.
+    let scan_root = match crate::check::publish_url::find_publish_file(&input_path) {
+        Some(pf) => {
+            // Logical, not canonical: canonicalize would cross a
+            // symlinked view into the physical path.
+            let root = generate::logical_path(pf.parent().unwrap());
+            eprintln!("Publish root: {} (from {})", rel(&root), rel(&pf));
+            root
+        }
+        None => {
+            let mut child_roots: Vec<PathBuf> = std::fs::read_dir(&input_path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir() && path.join(".publish_url").exists())
+                .collect();
+            if child_roots.is_empty() {
+                eprintln!("error: no .publish_url found at, within, or above {}", rel(&input_path));
+                eprintln!("  Catalog generation requires a publish tree.");
+                eprintln!("  Create one with: echo 's3://bucket/prefix/' > .publish_url");
+                std::process::exit(1);
             }
-            None => {
-                // No .publish_url at or above input_path — scan children
-                let mut child_roots: Vec<PathBuf> = Vec::new();
-                if let Ok(entries) = std::fs::read_dir(&input_path) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() && path.join(".publish_url").exists() {
-                            child_roots.push(path);
-                        }
-                    }
-                }
-
-                if !child_roots.is_empty() {
-                    // Found publish roots in children — generate catalogs for each
-                    child_roots.sort();
-                    for child_root in &child_roots {
-                        eprintln!("Found child publish root: {}", rel(child_root));
-                        run(child_root, basename, for_publish_url, update);
-                    }
-                    // Also generate a top-level catalog covering all children
-                    eprintln!("Generating top-level catalog at {}", rel(&input_path));
-                    input_path.clone()
-                } else {
-                    eprintln!("error: no .publish_url found at, within, or above {}", rel(&input_path));
-                    eprintln!("  Catalog generation requires a publish tree.");
-                    eprintln!("  Create one with: echo 's3://bucket/prefix/' > .publish_url");
-                    std::process::exit(1);
-                }
+            child_roots.sort();
+            for child_root in &child_roots {
+                eprintln!("Found child publish root: {}", rel(child_root));
+                run(child_root, basename, for_publish_url, update);
             }
+            eprintln!("Generating top-level catalog at {}", rel(&input_path));
+            input_path.clone()
         }
     };
 
-    let effective_update = update;
-
-    // Scan from the publish/catalog root so that all datasets in the tree
-    // are included — running from a single dataset directory should not
-    // elide sibling datasets from the catalog.
-    eprintln!("Scanning {} for datasets...", rel(&scan_root));
-
-    let mut all_datasets: Vec<DiscoveredDataset> = Vec::new();
-    walk_for_datasets(&scan_root, &mut all_datasets, &cwd);
-    // Only include publishable datasets (those with .publish sentinel)
-    let datasets: Vec<DiscoveredDataset> = all_datasets.into_iter()
-        .filter(|ds| {
-            let ds_dir = ds.yaml_path.parent().unwrap_or(std::path::Path::new("."));
-            ds_dir.join(".publish").exists()
-        })
-        .collect();
-    let mut datasets = datasets;
-    datasets.sort_by(|a, b| a.yaml_path.cmp(&b.yaml_path));
-
-    eprintln!("Found {} publishable dataset(s)", datasets.len());
-
-    if datasets.is_empty() {
+    // Scan from the publish root so that every dataset in the tree is
+    // listed: running from one dataset directory must not drop its
+    // siblings from the catalogs above it.
+    let mut progress = |event: GenerateEvent| match event {
+        GenerateEvent::Scanning(dir) => eprintln!("Scanning {} for datasets...", rel(dir)),
+        GenerateEvent::Found(ds) => eprintln!(
+            "  {} — {} profile(s) [{}]",
+            ds.config().name,
+            ds.config().profile_names().len(),
+            rel(ds.yaml_path()),
+        ),
+        GenerateEvent::Unreadable { path, error } => eprintln!("WARNING: failed to load {}: {error}", rel(path)),
+        GenerateEvent::Marked(dir) => eprintln!("  Skipping {} (.do_not_catalog)", rel(dir)),
+        GenerateEvent::Wrote { entries, files, .. } => {
+            let names: Vec<String> = files.iter().map(|f| rel(f)).collect();
+            eprintln!("Wrote {entries} entries to {}", names.join(", "));
+        }
+    };
+    let tree = CatalogTree::scan(&scan_root, &mut progress);
+    eprintln!("Found {} publishable dataset(s)", tree.datasets().len());
+    if tree.datasets().is_empty() {
         eprintln!("No publishable datasets found (no .publish sentinels).");
         return;
     }
 
-    for ds in &datasets {
-        let profile_count = ds.config.profile_names().len();
-        eprintln!(
-            "  {} — {} profile(s) [{}]",
-            ds.config.name,
-            profile_count,
-            rel(&ds.yaml_path)
-        );
-    }
+    let mut catalog_dirs: BTreeSet<PathBuf> = tree.catalog_dirs();
 
-    // Determine all candidate catalog directories (hierarchical): every
-    // directory between a dataset root and the scan root gets a catalog.
-    let mut catalog_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    catalog_dirs.insert(scan_root.clone());
-    for ds in &datasets {
-        let ds_dir = ds.yaml_path.parent().unwrap_or(&ds.yaml_path);
-        let mut dir = ds_dir.to_path_buf();
-        while dir.starts_with(&scan_root) {
-            catalog_dirs.insert(dir.clone());
-            match dir.parent() {
-                Some(parent) => dir = parent.to_path_buf(),
-                None => break,
-            }
-        }
-    }
-
-    // Respect .catalog_root: don't write catalogs above it.
-    // The scan_root (from .publish_url) may be higher, but .catalog_root
-    // limits how far up the catalog hierarchy extends.
-    if let Some(catalog_root) = find_catalog_root(&input_path) {
+    // Respect .catalog_root: don't write catalogs above it. The scan
+    // root (from .publish_url) may be higher, but .catalog_root limits
+    // how far up the catalog hierarchy extends.
+    if let Some(catalog_root) = generate::find_catalog_root(&input_path) {
         let before = catalog_dirs.len();
         catalog_dirs.retain(|dir| dir.starts_with(&catalog_root));
         let skipped = before - catalog_dirs.len();
         if skipped > 0 {
-            eprintln!("  .catalog_root at {} — skipping {} parent directories",
-                rel(&catalog_root), skipped);
+            eprintln!("  .catalog_root at {} — skipping {} parent directories", rel(&catalog_root), skipped);
         }
     }
 
-    // In --update mode (and no .catalog_root override), filter to only
-    // directories that already have a catalog
-    if effective_update && !for_publish_url {
+    // In --update mode, only directories that already have a catalog.
+    if update && !for_publish_url {
         let before = catalog_dirs.len();
         catalog_dirs.retain(|dir| {
-            let json_path = dir.join(format!("{}.json", basename));
-            let yaml_path = dir.join(format!("{}.yaml", basename));
-            json_path.exists() || yaml_path.exists()
+            dir.join(format!("{basename}.json")).exists() || dir.join(format!("{basename}.yaml")).exists()
         });
         let skipped = before - catalog_dirs.len();
         if skipped > 0 {
@@ -262,280 +144,17 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
         }
     }
 
-    let mut total_files = 0usize;
-
-    // Write catalogs bottom-up (deepest directories first) so that parent
-    // catalog mtimes are always newer than their children. The staleness
-    // check compares parent vs child mtimes.
-    let mut sorted_dirs: Vec<&PathBuf> = catalog_dirs.iter().collect();
-    sorted_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count())
-        .then_with(|| a.cmp(b)));
-
-    for catalog_dir in &sorted_dirs {
-        // Skip directories with .do_not_catalog sentinel
-        if catalog_dir.join(DO_NOT_CATALOG_FILE).exists() {
-            eprintln!("  Skipping {} (.do_not_catalog)", rel(catalog_dir));
-            continue;
-        }
-
-        // Collect entries whose dataset.yaml is under this directory
-        let entries: Vec<CatalogEntry> = datasets
-            .iter()
-            .filter(|ds| {
-                ds.yaml_path.starts_with(catalog_dir)
-            })
-            .map(|ds| ds.to_entry(catalog_dir))
-            .collect();
-
-        if entries.is_empty() {
-            continue;
-        }
-
-        // Write catalog.json
-        let json_path = catalog_dir.join(format!("{}.json", basename));
-        let json = serde_json::to_string_pretty(&entries).unwrap_or_else(|e| {
-            eprintln!("error: JSON serialization failed: {}", e);
+    match tree.write(&catalog_dirs, basename, &mut progress) {
+        Ok(files) => eprintln!(
+            "{} datasets cataloged across {} directories ({} files written)",
+            tree.datasets().len(),
+            catalog_dirs.len(),
+            files.len()
+        ),
+        Err(e) => {
+            eprintln!("error: {e}");
             std::process::exit(1);
-        });
-        if let Err(e) = std::fs::write(&json_path, &json) {
-            eprintln!("error: failed to write {}: {}", rel(&json_path), e);
-            std::process::exit(1);
-        }
-
-        // Write catalog.yaml
-        let yaml_path = catalog_dir.join(format!("{}.yaml", basename));
-        let yaml = serde_yaml::to_string(&entries).unwrap_or_else(|e| {
-            eprintln!("error: YAML serialization failed: {}", e);
-            std::process::exit(1);
-        });
-        if let Err(e) = std::fs::write(&yaml_path, &yaml) {
-            eprintln!("error: failed to write {}: {}", rel(&yaml_path), e);
-            std::process::exit(1);
-        }
-
-
-        eprintln!(
-            "Wrote {} entries to {} and {}",
-            entries.len(),
-            rel(&json_path),
-            rel(&yaml_path)
-        );
-        total_files += 2;
-    }
-
-    eprintln!(
-        "{} datasets cataloged across {} directories ({} files written)",
-        datasets.len(),
-        catalog_dirs.len(),
-        total_files
-    );
-}
-
-/// Recursively walk directories to find dataset.yaml files.
-///
-/// When a directory contains `dataset.yaml`, it is treated as a dataset
-/// root: the config is loaded and no further descent occurs.
-fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>, cwd: &Path) {
-    // Note: .do_not_catalog prevents catalog *placement* at a directory,
-    // but does NOT prevent descending through it to find datasets below.
-    // The filtering happens in the catalog-writing loop, not here.
-
-    let yaml_path = dir.join("dataset.yaml");
-    if yaml_path.exists() {
-        match DatasetConfig::load(&yaml_path) {
-            Ok(config) => {
-                datasets.push(DiscoveredDataset {
-                    yaml_path,
-                    config,
-                });
-            }
-            Err(e) => {
-                let rel = yaml_path.strip_prefix(cwd)
-                    .map(|r| r.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| yaml_path.to_string_lossy().to_string());
-                eprintln!("WARNING: failed to load {}: {}", rel, e);
-            }
-        }
-        // Don't descend into dataset directories
-        return;
-    }
-
-    if let Ok(read_dir) = std::fs::read_dir(dir) {
-        let mut subdirs: Vec<PathBuf> = read_dir
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.path())
-            .collect();
-        subdirs.sort();
-
-        for subdir in subdirs {
-            let name = subdir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if crate::filters::is_excluded_dir(name) {
-                continue;
-            }
-            walk_for_datasets(&subdir, datasets, cwd);
         }
     }
 }
 
-/// Normalize a path by resolving `.` and `..` components without following
-/// symlinks. Unlike `canonicalize`, this preserves the logical path through
-/// symlinks so that relative path computations stay within the user's view.
-fn normalize_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => { result.pop(); }
-            Component::CurDir => {}
-            other => result.push(other),
-        }
-    }
-    result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_walk_empty_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut datasets = Vec::new();
-        walk_for_datasets(tmp.path(), &mut datasets, tmp.path());
-        assert!(datasets.is_empty());
-    }
-
-    #[test]
-    fn test_walk_finds_datasets() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        let ds1 = tmp.path().join("ds-a");
-        std::fs::create_dir(&ds1).unwrap();
-        std::fs::write(
-            ds1.join("dataset.yaml"),
-            "name: alpha\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
-        )
-        .unwrap();
-
-        let ds2 = tmp.path().join("ds-b");
-        std::fs::create_dir(&ds2).unwrap();
-        std::fs::write(
-            ds2.join("dataset.yaml"),
-            "name: beta\nprofiles:\n  default:\n    base_vectors: base.fvec\n    query_vectors: query.fvec\n",
-        )
-        .unwrap();
-
-        let mut datasets = Vec::new();
-        walk_for_datasets(tmp.path(), &mut datasets, tmp.path());
-        datasets.sort_by(|a, b| a.config.name.cmp(&b.config.name));
-
-        assert_eq!(datasets.len(), 2);
-        assert_eq!(datasets[0].config.name, "alpha");
-        assert_eq!(datasets[1].config.name, "beta");
-    }
-
-    #[test]
-    fn test_entry_layout_format() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        let ds = tmp.path().join("my-dataset");
-        std::fs::create_dir(&ds).unwrap();
-        std::fs::write(
-            ds.join("dataset.yaml"),
-            r#"name: glove-100
-attributes:
-  distance_function: L2
-  license: MIT
-profiles:
-  default:
-    base_vectors: base.fvec
-    query_vectors: query.fvec
-"#,
-        )
-        .unwrap();
-
-        let mut datasets = Vec::new();
-        walk_for_datasets(tmp.path(), &mut datasets, tmp.path());
-        assert_eq!(datasets.len(), 1);
-
-        let root = tmp.path().canonicalize().unwrap();
-        let entry = datasets[0].to_entry(&root);
-
-        assert_eq!(entry.name(), "glove-100");
-        assert_eq!(entry.dataset_type(), "dataset.yaml");
-        assert!(entry.location().contains("dataset.yaml"));
-
-        // Verify layout has attributes and profiles
-        let attrs = entry.attributes().unwrap();
-        assert_eq!(attrs.distance_function.as_deref(), Some("L2"));
-        assert_eq!(attrs.license.as_deref(), Some("MIT"));
-        assert!(!entry.profiles().is_empty());
-
-        // Verify JSON serialization is layout-embedded
-        let json = serde_json::to_value(&entry).unwrap();
-        assert!(json["layout"].is_object());
-        assert!(json["layout"]["profiles"]["default"].is_object());
-        assert_eq!(json["layout"]["attributes"]["distance_function"], "L2");
-        assert_eq!(json["dataset_type"], "dataset.yaml");
-    }
-
-    #[test]
-    fn test_entry_no_attributes() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("dataset.yaml"),
-            "name: simple\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
-        )
-        .unwrap();
-
-        let mut datasets = Vec::new();
-        walk_for_datasets(tmp.path(), &mut datasets, tmp.path());
-        assert_eq!(datasets.len(), 1);
-
-        let root = tmp.path().canonicalize().unwrap();
-        let entry = datasets[0].to_entry(&root);
-
-        // JSON should omit attributes when None
-        let json = serde_json::to_value(&entry).unwrap();
-        assert!(json.get("layout").unwrap().get("attributes").is_none());
-        assert!(json["layout"]["profiles"]["default"].is_object());
-    }
-
-    #[test]
-    fn test_skips_hidden_and_target_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Hidden dir with a dataset — should be skipped
-        let hidden = tmp.path().join(".hidden");
-        std::fs::create_dir(&hidden).unwrap();
-        std::fs::write(
-            hidden.join("dataset.yaml"),
-            "name: hidden\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
-        )
-        .unwrap();
-
-        // target dir with a dataset — should be skipped
-        let target = tmp.path().join("target");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::write(
-            target.join("dataset.yaml"),
-            "name: target\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
-        )
-        .unwrap();
-
-        // Real dataset
-        let real = tmp.path().join("real");
-        std::fs::create_dir(&real).unwrap();
-        std::fs::write(
-            real.join("dataset.yaml"),
-            "name: real\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
-        )
-        .unwrap();
-
-        let mut datasets = Vec::new();
-        walk_for_datasets(tmp.path(), &mut datasets, tmp.path());
-        assert_eq!(datasets.len(), 1);
-        assert_eq!(datasets[0].config.name, "real");
-    }
-}

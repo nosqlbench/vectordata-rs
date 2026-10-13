@@ -40,6 +40,7 @@
 //! | Open a dataset described in code | [`TestDataGroup::from_config`] | — |
 //! | Build a catalog entry in code | [`CatalogEntry::builder`](dataset::CatalogEntry::builder) → [`Catalog::open_entry`](catalog::Catalog::open_entry) | — |
 //! | Register a catalog at runtime | [`CatalogBuilder`](catalog::CatalogBuilder) → [`CatalogSources::with`](catalog::CatalogSources::with) | — |
+//! | Write a tree's catalog files | [`CatalogTree`](catalog::generate::CatalogTree) | — |
 //! | Resolve a path against a dataset or catalog location | [`Location::resolve`] | — |
 //! | Locate the cache | [`settings::cache_dir`] | — |
 //! | Inspect what is cached | [`FacetStorage::cache_stats`] via [`TestDataView::open_facet_storage`] | — |

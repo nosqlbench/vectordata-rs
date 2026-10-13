@@ -113,7 +113,7 @@ pub fn run(args: CheckArgs) {
     // Detect context: dataset directory, publish path, or unrecognized.
     let has_dataset_yaml = directory.join("dataset.yaml").exists();
     let has_publish_url = publish_url::find_publish_file(&directory).is_some();
-    let has_catalog_root = find_catalog_root_file(&directory).is_some();
+    let has_catalog_root = vectordata::catalog::generate::find_catalog_root(&directory).is_some();
     let is_publish_path = has_publish_url || has_catalog_root;
 
     if !has_dataset_yaml && !is_publish_path {
@@ -595,27 +595,6 @@ fn enumerate_workspace_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-/// Walk up from `dir` looking for `.catalog_root`.
-/// Returns a relative path from `dir` to the directory containing `.catalog_root`.
-fn find_catalog_root_file(dir: &Path) -> Option<PathBuf> {
-    let abs = std::fs::canonicalize(dir).unwrap_or(dir.to_path_buf());
-    let mut current = abs.clone();
-    let mut levels_up: usize = 0;
-
-    loop {
-        if current.join(".catalog_root").is_file() {
-            let mut rel = dir.to_path_buf();
-            for _ in 0..levels_up {
-                rel = rel.join("..");
-            }
-            return Some(rel);
-        }
-        if !current.pop() {
-            return None;
-        }
-        levels_up += 1;
-    }
-}
 
 /// Parse a human-readable size string like "100M", "50MiB", "1G" into bytes.
 pub fn parse_size(s: &str) -> Option<u64> {

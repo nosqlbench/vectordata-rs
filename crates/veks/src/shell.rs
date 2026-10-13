@@ -290,14 +290,23 @@ fn dispatch_help_version(spec: &veks_completion::CommandSpec, argv: &[String]) -
 /// Map each `datasets`/`prepare` leaf subcommand name (and its aliases) to its
 /// owning group, so shorthands like `veks ping` / `veks bootstrap` re-dispatch
 /// to `datasets ping` / `prepare bootstrap`. Built from the spec — no clap.
+///
+/// A name that is also a top-level pipeline group is not a shorthand:
+/// [`build_veks_spec`] grafts the pipeline groups first, so the root's
+/// `catalog` is the pipeline group its help shows, and dispatch must agree.
+/// (`veks catalog generate` once showed the pipeline step's options but ran
+/// `prepare catalog generate`, which refused them.)
 fn build_shorthand_map_spec(spec: &veks_completion::CommandSpec) -> Vec<(String, String)> {
+    let pipeline_groups: Vec<String> =
+        pipeline::cli::pipeline_command_spec().subcommands.into_iter().map(|g| g.name).collect();
     let mut map = Vec::new();
     for group in ["datasets", "prepare"] {
         if let Some(g) = spec.subcommands.iter().find(|c| c.name == group) {
             for child in &g.subcommands {
-                map.push((child.name.clone(), group.to_string()));
-                for alias in &child.aliases {
-                    map.push((alias.clone(), group.to_string()));
+                for name in std::iter::once(&child.name).chain(&child.aliases) {
+                    if !pipeline_groups.contains(name) {
+                        map.push((name.clone(), group.to_string()));
+                    }
                 }
             }
         }
@@ -653,6 +662,27 @@ mod tests {
 
     // The "one parse-definition per option name" gate now runs off the spec —
     // see `veks_spec_parse_consistency_holds` below.
+
+    /// **A root-level word runs the command its help describes.** The
+    /// help tree takes a top-level pipeline group over a `prepare` or
+    /// `datasets` leaf of the same name, so dispatch must too: `veks
+    /// catalog generate` showed the pipeline step's options and then ran
+    /// `prepare catalog generate`, which refused them.
+    #[test]
+    fn a_shorthand_never_shadows_a_pipeline_group() {
+        let spec = build_veks_spec();
+        let shorthands = build_shorthand_map_spec(&spec);
+        let pipeline = pipeline::cli::pipeline_command_spec();
+        for group in &pipeline.subcommands {
+            assert!(
+                shorthands.iter().all(|(name, _)| name != &group.name),
+                "'{}' is a pipeline group and a shorthand",
+                group.name,
+            );
+        }
+        assert!(pipeline.subcommands.iter().any(|g| g.name == "catalog"));
+        assert!(shorthands.iter().any(|(name, group)| name == "bootstrap" && group == "prepare"));
+    }
 
     /// Validates the additive `#[derive(VeksCli)]` pass on the nested datasets
     /// command tree: the derived spec must reproduce the subcommands and their

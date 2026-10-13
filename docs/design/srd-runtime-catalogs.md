@@ -1150,3 +1150,72 @@ established or what catalogs hold:
   - `the_source_view_shows_a_referenced_entrys_dataset_yaml`.
 - B-2 (`s3://` knn_entries) was fixed in step 1, and
   `s3_locations_open_from_their_kept_copies_offline` guards it.
+
+### 12.7 Step 7: one catalog generator (2026-10-13)
+
+**Found first.**
+- **The help mix-up was in dispatch, not the generators.** `prepare` has
+  a `catalog` subcommand and the pipeline has a top-level `catalog`
+  group. The help tree took the pipeline group, but dispatch looked up
+  `prepare`/`datasets` shorthands first. So `veks catalog generate
+  --source .` showed the pipeline step's options, then ran the manual
+  command, which refused them.
+- **`veks check catalogs` kept the manual command's `.do_not_catalog`
+  rule.** It asked for catalogs down to a dataset under a marked
+  directory. Under the accepted rule the generator writes none, so a
+  freshly generated tree would fail the check.
+- **The manual command's comment calls its publish root "outermost".**
+  Its code, like the pipeline's, takes the closest `.publish_url`. The
+  code is kept.
+
+**Built** (`vectordata::catalog::generate`, `Library API`):
+- **The shared pieces:**
+  - `CatalogTree::scan` discovers datasets: `load_and_resolve`, plus
+    template-derived views, `.publish` datasets only, no descent below
+    `.do_not_catalog`, and excluded directories skipped;
+  - `catalog_dirs` and `entries_in` decide which catalogs list which
+    datasets;
+  - `write` writes `knn_entries.yaml` first, then `<basename>.json` and
+    `.yaml`, deepest directory first, skipping marked directories;
+  - `knn_entries_in` produces the jvector file, with the publish URL read
+    through `push::binding::read_binding`;
+  - `find_catalog_boundary`, `find_catalog_root`, `is_withheld` and
+    `logical_path` (absolute, `.`/`..` resolved by name, symlinks kept).
+- **Progress is `GenerateEvent` values.** The library prints nothing;
+  each command renders the events in its own form.
+- **The pipeline command** keeps its policy: boundary as the scan root,
+  and creating its input's `.publish`. Its private walk, finders and
+  `knn_entries` writer are gone. It no longer canonicalizes.
+- **The manual command** keeps its policy: the closest publish root or
+  the child publish roots, the `.catalog_root` limit, and `--update`.
+  Its private walk, `normalize_path` and finder are gone.
+- **`veks check catalogs`** uses the shared finder and `is_withheld`, so
+  it expects exactly the catalogs the generator writes. `veks check`'s
+  separate `.catalog_root` finder is gone too.
+- **Shorthand dispatch skips a name that is a top-level pipeline
+  group,** as the help tree does. `veks catalog …` is the pipeline
+  group; `veks prepare catalog …` is the manual command.
+
+**Measured.** Both generators, old (step 6 build) and new, were run on
+the same tree: the eight comparison datasets from §11 item 3, plus a
+nested group of two.
+- The pipeline's output is **byte-identical** to before.
+- The manual command now writes **exactly the pipeline's files**. The
+  differences from its old output are the accepted ones: a
+  `knn_entries.yaml` at every level, and three template-derived facet
+  keys in one dataset's profile.
+- The new pipeline output has a `.publish` sentinel in its input
+  directory, which the manual run lacks. That is the pipeline step's
+  existing behaviour, not a catalog difference.
+
+**Guards:**
+- The `.do_not_catalog` rule: `nothing_below_a_do_not_catalog_marker_is_listed`.
+- `check_catalogs_accepts_what_the_generator_writes` fails on the
+  previous code ("private/inner: no catalog.json").
+- `a_shorthand_never_shadows_a_pipeline_group`. Before the fix, the old
+  binary refused `veks catalog generate --source .` ("unexpected option
+  '--source'").
+- Also: `the_scan_finds_publishable_datasets_only`,
+  `each_level_lists_the_datasets_below_it`,
+  `knn_entries_name_the_files_under_the_publish_url` and
+  `a_tree_through_a_symlink_keeps_its_logical_path`.

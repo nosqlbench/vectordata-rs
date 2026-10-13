@@ -19,6 +19,7 @@
 //! }
 //! ```
 
+pub mod generate;
 pub mod knn_entries;
 pub mod resolver;
 pub mod source;

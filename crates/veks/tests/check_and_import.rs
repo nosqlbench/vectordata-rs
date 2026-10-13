@@ -686,6 +686,31 @@ fn check_catalogs_present() {
     assert!(result.passed, "present catalog should pass: {:?}", result.messages);
 }
 
+/// **The catalog check expects what the generator writes**: a dataset
+/// under a `.do_not_catalog` directory is in no catalog, so the check
+/// asks for none for it. It used to ask for catalogs down to that
+/// dataset, which the generator never writes.
+#[test]
+fn check_catalogs_accepts_what_the_generator_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".publish_url"), "s3://bucket/datasets/\n").unwrap();
+    let mut datasets = Vec::new();
+    for rel in ["shown", "private/inner"] {
+        let ds_dir = dir.path().join(rel);
+        std::fs::create_dir_all(&ds_dir).unwrap();
+        std::fs::write(ds_dir.join("dataset.yaml"), "name: x\nprofiles:\n  default:\n    maxk: 10\n").unwrap();
+        std::fs::write(ds_dir.join(".publish"), "").unwrap();
+        datasets.push(ds_dir.join("dataset.yaml"));
+    }
+    std::fs::write(dir.path().join("private/.do_not_catalog"), "").unwrap();
+
+    let tree = vectordata::catalog::generate::CatalogTree::scan(dir.path(), &mut |_| {});
+    tree.write(&tree.catalog_dirs(), "catalog", &mut |_| {}).unwrap();
+
+    let result = check::catalogs::check(dir.path(), &datasets);
+    assert!(result.passed, "the generated tree should pass: {:?}", result.messages);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Adversarial edge cases
 // ═══════════════════════════════════════════════════════════════════════════

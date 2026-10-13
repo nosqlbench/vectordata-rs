@@ -114,6 +114,12 @@ documentation's **Common tasks** table is the same index with examples.
   listing order). To serve entries from elsewhere, implement
   [`CatalogSource`](crate::catalog::CatalogSource). Do not merge entries
   into a catalog by hand: a name in two catalogs must stay ambiguous.
+- Write the catalog files for a dataset tree:
+  [`CatalogTree::scan`](crate::catalog::generate::CatalogTree::scan) then
+  [`write`](crate::catalog::generate::CatalogTree::write) over
+  [`catalog_dirs`](crate::catalog::generate::CatalogTree::catalog_dirs). It
+  is the generator both `veks` commands run; do not walk a tree for
+  `dataset.yaml` files and serialize entries yourself.
 
 ## Do not hand-roll
 
