@@ -105,6 +105,15 @@ documentation's **Common tasks** table is the same index with examples.
   entry through its accessors (`profiles()`, `attributes()`,
   `dataset_home_url()`); what it holds is
   [`EntryDescription`](crate::dataset::EntryDescription).
+- Register a catalog at runtime:
+  [`CatalogBuilder::named`](crate::catalog::CatalogBuilder::named) with
+  `entry`/`entries` you built, or `content` (catalog JSON/YAML or a
+  `knn_entries.yaml` document) and a `base` for its relative paths; add
+  it with [`CatalogSources::with`](crate::catalog::CatalogSources::with)
+  (or `with_optional`), before or after `configure_default()` (order is
+  listing order). To serve entries from elsewhere, implement
+  [`CatalogSource`](crate::catalog::CatalogSource). Do not merge entries
+  into a catalog by hand: a name in two catalogs must stay ambiguous.
 
 ## Do not hand-roll
 

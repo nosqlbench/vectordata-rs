@@ -21,9 +21,11 @@
 
 pub mod knn_entries;
 pub mod resolver;
+pub mod source;
 pub mod sources;
 
 pub use resolver::{Catalog, DatasetSelection};
+pub use source::{BuiltCatalog, CatalogBuilder, CatalogOrigin, CatalogSource, LocatedCatalog, Requirement};
 pub use sources::CatalogSources;
 
 /// Something that went wrong while catalog sources were read or
@@ -51,12 +53,14 @@ pub enum Severity {
 }
 
 impl CatalogDiagnostic {
-    pub(crate) fn warning(message: String) -> Self {
-        CatalogDiagnostic { severity: Severity::Warning, message }
+    /// Something was skipped; what loaded is still usable.
+    pub fn warning(message: impl Into<String>) -> Self {
+        CatalogDiagnostic { severity: Severity::Warning, message: message.into() }
     }
 
-    pub(crate) fn error(message: String) -> Self {
-        CatalogDiagnostic { severity: Severity::Error, message }
+    /// A catalog, or part of one, could not be loaded.
+    pub fn error(message: impl Into<String>) -> Self {
+        CatalogDiagnostic { severity: Severity::Error, message: message.into() }
     }
 }
 

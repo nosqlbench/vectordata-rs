@@ -10,26 +10,49 @@
 //!    `catalogs.yaml` file listing catalog locations.
 //! 2. Each location is a directory path, file path, or HTTP(S) URL.
 //! 3. Directory paths are resolved to `catalog.json` within that directory.
-//! 4. All locations are collected into required and optional lists.
+//! 4. Each location becomes a [`LocatedCatalog`], required or optional,
+//!    in a [`CatalogSources`] set, beside any catalog a program adds with
+//!    [`CatalogSources::with`].
 
 use std::path::Path;
+use std::sync::Arc;
+
+use super::source::{CatalogSource, LocatedCatalog, Requirement};
 
 /// Default configuration directory for catalog discovery.
 pub const DEFAULT_CONFIG_DIR: &str = "~/.config/vectordata";
 
-/// A collection of catalog source locations.
+/// The catalogs a [`Catalog`](super::Catalog) is made of, in priority
+/// order: any [`CatalogSource`], each required or optional.
 ///
-/// Catalog sources are URLs or file paths pointing to directories or files
-/// that contain `catalog.json` or `catalog.yaml`. Sources are divided into
-/// required (failure is fatal) and optional (failure is silently ignored).
-#[derive(Debug, Clone, Default)]
+/// [`with`](Self::with) adds one a program supplies, such as a
+/// [`CatalogBuilder`](super::CatalogBuilder)'s catalog. The `configure*`
+/// and `add_*catalogs` methods add [`LocatedCatalog`]s, from a
+/// `catalogs.yaml` or from locations given. A required catalog that
+/// gives nothing is an error; an optional one is not. Registered and
+/// located catalogs are alike in every other way: a dataset name in two
+/// of them is ambiguous, whichever kinds they are.
+#[derive(Clone, Default)]
 pub struct CatalogSources {
-    /// Required catalog sources — loading failures are fatal.
-    required: Vec<NamedCatalogSource>,
-    /// Optional catalog sources — loading failures are silently ignored.
-    optional: Vec<NamedCatalogSource>,
+    sources: Vec<(Arc<dyn CatalogSource>, Requirement)>,
     /// Problems met while reading configuration and locations.
     diagnostics: Vec<super::CatalogDiagnostic>,
+}
+
+impl std::fmt::Debug for CatalogSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogSources")
+            .field(
+                "sources",
+                &self
+                    .sources
+                    .iter()
+                    .map(|(s, r)| (s.name().to_string(), s.origin().to_string(), *r))
+                    .collect::<Vec<_>>(),
+            )
+            .field("diagnostics", &self.diagnostics)
+            .finish()
+    }
 }
 
 impl CatalogSources {
@@ -59,7 +82,7 @@ impl CatalogSources {
             return self;
         }
         match load_config(&config_dir, &mut self.diagnostics) {
-            Ok(locations) => self.optional.extend(locations),
+            Ok(located) => self.extend_located(located, Requirement::Optional),
             Err(e) => self.diagnostics.push(super::CatalogDiagnostic::warning(e)),
         }
         self
@@ -73,10 +96,36 @@ impl CatalogSources {
     pub fn configure(mut self, config_dir: &str) -> Self {
         let config_dir = expand_tilde(config_dir);
         match load_config(&config_dir, &mut self.diagnostics) {
-            Ok(locations) => self.required.extend(locations),
+            Ok(located) => self.extend_located(located, Requirement::Required),
             Err(e) => self.diagnostics.push(super::CatalogDiagnostic::warning(e)),
         }
         self
+    }
+
+    /// A catalog the program supplies, required: one built with
+    /// [`CatalogBuilder`](super::CatalogBuilder), a [`LocatedCatalog`],
+    /// or the program's own [`CatalogSource`]. It takes its place in
+    /// order after the catalogs already added.
+    pub fn with(mut self, source: impl CatalogSource + 'static) -> Self {
+        self.sources.push((Arc::new(source), Requirement::Required));
+        self
+    }
+
+    /// A catalog the program supplies, optional: one that gives no
+    /// catalog at all is not an error.
+    pub fn with_optional(mut self, source: impl CatalogSource + 'static) -> Self {
+        self.sources.push((Arc::new(source), Requirement::Optional));
+        self
+    }
+
+    /// The catalogs, in order, each with whether it must load.
+    pub fn iter(&self) -> impl Iterator<Item = (&dyn CatalogSource, Requirement)> + '_ {
+        self.sources.iter().map(|(s, r)| (s.as_ref(), *r))
+    }
+
+    fn extend_located(&mut self, located: Vec<LocatedCatalog>, requirement: Requirement) {
+        self.sources
+            .extend(located.into_iter().map(|l| (Arc::new(l) as Arc<dyn CatalogSource>, requirement)));
     }
 
     /// Problems met while reading configuration and resolving
@@ -93,12 +142,19 @@ impl CatalogSources {
     /// `catalogs.yaml`), a file path, or an HTTP(S) URL. Sources from
     /// a directory's `catalogs.yaml` keep the names that file gives
     /// them; any other path gets the next free stringified index.
-    pub fn add_catalogs(mut self, paths: &[String]) -> Self {
+    pub fn add_catalogs(self, paths: &[String]) -> Self {
+        self.add_paths(paths, Requirement::Required)
+    }
+
+    fn add_paths(mut self, paths: &[String], requirement: Requirement) -> Self {
         for path in paths {
             let expanded = expand_tilde(path);
-            for (named, location) in resolve_catalog_path(&expanded, &mut self.diagnostics) {
-                let name = named.unwrap_or_else(|| self.synthesize_name());
-                self.required.push(NamedCatalogSource { name, location });
+            for found in resolve_catalog_path(&expanded, &mut self.diagnostics) {
+                let located = match found {
+                    Found::Configured(located) => located,
+                    Found::Bare(location) => LocatedCatalog::as_written(self.synthesize_name(), location, None),
+                };
+                self.extend_located(vec![located], requirement);
             }
         }
         self
@@ -108,11 +164,8 @@ impl CatalogSources {
     /// (ad-hoc CLI locations): the next free stringified index,
     /// matching the promotion rule for legacy list files.
     fn synthesize_name(&self) -> String {
-        let taken: std::collections::HashSet<&str> = self.required.iter()
-            .chain(self.optional.iter())
-            .map(|s| s.name.as_str())
-            .collect();
-        let mut n = self.required.len() + self.optional.len();
+        let taken: std::collections::HashSet<&str> = self.sources.iter().map(|(s, _)| s.name()).collect();
+        let mut n = self.sources.len();
         loop {
             let candidate = n.to_string();
             if !taken.contains(candidate.as_str()) {
@@ -123,30 +176,13 @@ impl CatalogSources {
     }
 
     /// Add optional catalog locations (failures are silently ignored).
-    pub fn add_optional_catalogs(mut self, paths: &[String]) -> Self {
-        for path in paths {
-            let expanded = expand_tilde(path);
-            for (named, location) in resolve_catalog_path(&expanded, &mut self.diagnostics) {
-                let name = named.unwrap_or_else(|| self.synthesize_name());
-                self.optional.push(NamedCatalogSource { name, location });
-            }
-        }
-        self
-    }
-
-    /// Returns required catalog locations.
-    pub fn required(&self) -> &[NamedCatalogSource] {
-        &self.required
-    }
-
-    /// Returns optional catalog sources.
-    pub fn optional(&self) -> &[NamedCatalogSource] {
-        &self.optional
+    pub fn add_optional_catalogs(self, paths: &[String]) -> Self {
+        self.add_paths(paths, Requirement::Optional)
     }
 
     /// Returns true if no catalog sources are configured.
     pub fn is_empty(&self) -> bool {
-        self.required.is_empty() && self.optional.is_empty()
+        self.sources.is_empty()
     }
 }
 
@@ -279,7 +315,7 @@ pub fn parse_named_catalogs(content: &str) -> Result<Vec<NamedCatalogSource>, St
 fn load_config(
     config_dir: &str,
     diags: &mut Vec<super::CatalogDiagnostic>,
-) -> Result<Vec<NamedCatalogSource>, String> {
+) -> Result<Vec<LocatedCatalog>, String> {
     let dir = Path::new(config_dir);
     let catalogs_yaml = dir.join("catalogs.yaml");
 
@@ -299,16 +335,21 @@ fn load_config(
     // Resolve each entry relative to the config directory. An entry
     // naming a directory with its own catalogs.yaml yields that file's
     // sources under that file's names.
-    let mut locations = Vec::new();
+    let configured_in = catalogs_yaml.to_string_lossy().into_owned();
+    let mut located = Vec::new();
     for entry in entries {
         let expanded = relative_to(dir, &expand_tilde(&entry.location));
-        for (named, location) in resolve_catalog_path(&expanded, diags) {
-            let name = named.unwrap_or_else(|| entry.name.clone());
-            locations.push(NamedCatalogSource { name, location });
+        for found in resolve_catalog_path(&expanded, diags) {
+            located.push(match found {
+                Found::Configured(nested) => nested,
+                Found::Bare(location) => {
+                    LocatedCatalog::as_written(entry.name.clone(), location, Some(configured_in.clone()))
+                }
+            });
         }
     }
 
-    Ok(locations)
+    Ok(located)
 }
 
 /// `location` as written in a `catalogs.yaml` in `dir`: a relative
@@ -320,9 +361,17 @@ fn relative_to(dir: &Path, location: &str) -> String {
     dir.join(location).to_string_lossy().into_owned()
 }
 
-/// Resolve a catalog path to concrete URLs or file paths, each with
-/// the name a nested `catalogs.yaml` gave it (`None` when the path
-/// names a catalog directly and the caller must name it).
+/// What a catalog path resolves to.
+enum Found {
+    /// A catalog a nested `catalogs.yaml` names, with that file's name
+    /// for it.
+    Configured(LocatedCatalog),
+    /// A location that is itself a catalog; the caller names it.
+    Bare(String),
+}
+
+/// Resolve a catalog path to concrete URLs or file paths: catalogs a
+/// nested `catalogs.yaml` names, under its names, or the path itself.
 ///
 /// Smart detection:
 /// - Remote URLs (`http(s)://`, `s3://`) are kept as-is — the
@@ -334,12 +383,12 @@ fn relative_to(dir: &Path, location: &str) -> String {
 fn resolve_catalog_path(
     path: &str,
     diags: &mut Vec<super::CatalogDiagnostic>,
-) -> Vec<(Option<String>, String)> {
+) -> Vec<Found> {
     // Any URL the shared transport speaks (currently `http://`,
     // `https://`, `s3://`) passes through verbatim — the catalog
     // fetcher normalises on the way to the wire.
     if crate::transport::is_remote_url(path) {
-        return vec![(None, path.to_string())];
+        return vec![Found::Bare(path.to_string())];
     }
 
     let p = Path::new(path);
@@ -349,17 +398,17 @@ fn resolve_catalog_path(
         let catalogs_yaml = p.join("catalogs.yaml");
         if catalogs_yaml.is_file()
             && let Ok(sources) = load_config(path, diags) {
-            return sources.into_iter().map(|s| (Some(s.name), s.location)).collect();
+            return sources.into_iter().map(Found::Configured).collect();
         }
 
         // Directory with catalog.json or catalog.yaml → use it
         let catalog_json = p.join("catalog.json");
         if catalog_json.is_file() {
-            return vec![(None, path.to_string())];
+            return vec![Found::Bare(path.to_string())];
         }
         let catalog_yaml = p.join("catalog.yaml");
         if catalog_yaml.is_file() {
-            return vec![(None, path.to_string())];
+            return vec![Found::Bare(path.to_string())];
         }
 
         // Fallback: `knn_entries.yaml` (legacy simplified format).
@@ -367,7 +416,7 @@ fn resolve_catalog_path(
         // `super::knn_entries`.
         let knn_entries = p.join("knn_entries.yaml");
         if knn_entries.is_file() {
-            return vec![(None, path.to_string())];
+            return vec![Found::Bare(path.to_string())];
         }
 
         // Directory without any catalog file
@@ -378,11 +427,11 @@ fn resolve_catalog_path(
     }
 
     if p.is_file() {
-        return vec![(None, path.to_string())];
+        return vec![Found::Bare(path.to_string())];
     }
 
     // Path doesn't exist — might be a remote URL without scheme
-    vec![(None, path.to_string())]
+    vec![Found::Bare(path.to_string())]
 }
 
 /// Expand `~` prefix to the user's home directory.
@@ -423,34 +472,6 @@ fn home_dir() -> Option<String> {
     std::env::var("HOME").ok()
 }
 
-/// Resolve a catalog location to the actual catalog file URL/path.
-///
-/// If `location` already names a YAML or JSON file (any filename ending
-/// in `.yaml`, `.yml`, or `.json`), it is returned verbatim. This is
-/// what lets back-ends point at non-standard filenames like
-/// `protected-catalog.yaml` — the file *is* the catalog regardless of
-/// its name, and the resolver's content-shape dispatch decides how to
-/// parse it.
-///
-/// Otherwise — when `location` names a directory — the canonical
-/// `catalog.json` is appended. The directory cascade in
-/// `resolver::load_catalog_entries` walks the documented filename set
-/// (`catalog.json` → `catalog.yaml` → `knn_entries.yaml`).
-pub fn catalog_file_for(location: &str) -> String {
-    if looks_like_catalog_file(location) {
-        return location.to_string();
-    }
-
-    // Local file paths may exist with non-standard names; honour the
-    // filesystem if it's actually there.
-    let p = Path::new(location);
-    if p.is_file() {
-        return location.to_string();
-    }
-
-    format!("{}catalog.json", crate::location::dir_form(location))
-}
-
 /// Returns true when `location` ends in `.yaml`, `.yml`, or `.json`
 /// — the strong signal that it names a catalog file directly rather
 /// than a directory to probe. Matches `DataSetLoaderSimpleMFD`'s
@@ -463,6 +484,15 @@ pub fn looks_like_catalog_file(location: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// `(name, location)` of each located catalog in `s` that has
+    /// `requirement`, in order.
+    fn listed(s: &CatalogSources, requirement: Requirement) -> Vec<(String, String)> {
+        s.iter()
+            .filter(|(_, r)| *r == requirement)
+            .map(|(c, _)| (c.name().to_string(), c.origin().to_string()))
+            .collect()
+    }
+
     /// catalogs.yaml accepts both shapes: a map of name → location
     /// (the default going forward) and the legacy list, whose entries
     /// promote to stringified 0-based indexes as names.
@@ -529,7 +559,7 @@ mod tests {
         // loader reads the dir it is handed and never a real config elsewhere.
         let empty = tempfile::tempdir().unwrap();
         let s = CatalogSources::new().configure_optional(&empty.path().to_string_lossy());
-        assert!(s.optional().is_empty() && s.required().is_empty());
+        assert!(s.is_empty());
 
         // With a catalogs.yaml in that dir, its entries are loaded.
         std::fs::write(
@@ -539,9 +569,8 @@ mod tests {
         .unwrap();
         let s = CatalogSources::new().configure_optional(&empty.path().to_string_lossy());
         assert!(
-            s.optional().iter().any(|e| e.location.contains("example.invalid")),
-            "expected the dir's catalogs.yaml entry, got {:?}",
-            s.optional()
+            listed(&s, Requirement::Optional).iter().any(|(_, l)| l.contains("example.invalid")),
+            "expected the dir's catalogs.yaml entry, got {s:?}",
         );
     }
 
@@ -567,43 +596,27 @@ mod tests {
         let bare = dir.path().join("bare");
         std::fs::create_dir_all(&bare).unwrap();
         let s = CatalogSources::new().add_catalogs(&[bare.to_string_lossy().to_string()]);
-        assert!(s.required().is_empty());
+        assert!(s.is_empty());
         assert_eq!(s.diagnostics().len(), 1, "{:?}", s.diagnostics());
         assert!(s.diagnostics()[0].message.contains("has no catalogs.yaml / catalog.json"), "{}", s.diagnostics()[0]);
 
         std::fs::write(dir.path().join("catalogs.yaml"), format!("lab: {}\n", bare.display())).unwrap();
         let s = CatalogSources::new().configure_optional(&path);
-        assert!(s.optional().is_empty());
+        assert!(s.is_empty());
         assert_eq!(s.diagnostics().len(), 1, "a listed bare directory: {:?}", s.diagnostics());
 
         std::fs::write(dir.path().join("catalogs.yaml"), "lab: [unclosed\n").unwrap();
         for s in [CatalogSources::new().configure(&path), CatalogSources::new().configure_optional(&path)] {
             assert_eq!(s.diagnostics().len(), 1, "a malformed catalogs.yaml: {:?}", s.diagnostics());
             assert!(s.diagnostics()[0].message.contains("failed to parse"), "{}", s.diagnostics()[0]);
-            assert!(s.required().is_empty() && s.optional().is_empty());
+            assert!(s.is_empty());
         }
-    }
-
-    #[test]
-    fn test_catalog_file_for() {
-        assert_eq!(
-            catalog_file_for("http://example.com/data"),
-            "http://example.com/data/catalog.json"
-        );
-        assert_eq!(
-            catalog_file_for("http://example.com/data/"),
-            "http://example.com/data/catalog.json"
-        );
-        assert_eq!(
-            catalog_file_for("http://example.com/data/catalog.json"),
-            "http://example.com/data/catalog.json"
-        );
     }
 
     #[test]
     fn test_resolve_http_url() {
         let locations = resolve_catalog_path("https://example.com/catalogs", &mut Vec::new());
-        assert_eq!(locations, vec![(None, "https://example.com/catalogs".to_string())]);
+        assert!(matches!(&locations[..], [Found::Bare(l)] if l == "https://example.com/catalogs"));
     }
 
     #[test]
@@ -620,11 +633,17 @@ mod tests {
 
         let sources = load_config(tmp.path().to_str().unwrap(), &mut Vec::new()).unwrap();
         // /some/catalog doesn't exist so it still gets returned as-is
-        assert!(sources.iter().any(|s| s.location == "/some/catalog"));
-        assert!(sources.iter().any(|s| s.location == "https://example.com/data"));
+        assert!(sources.iter().any(|s| s.location() == "/some/catalog"));
+        assert!(sources.iter().any(|s| s.location() == "https://example.com/data"));
         // Legacy list entries promote to stringified 0-based indexes.
-        assert!(sources.iter().any(|s| s.name == "0"));
-        assert!(sources.iter().any(|s| s.name == "1"));
+        assert!(sources.iter().any(|s| s.name() == "0"));
+        assert!(sources.iter().any(|s| s.name() == "1"));
+        // Each is bound to the catalogs.yaml that names it.
+        let file = tmp.path().join("catalogs.yaml").to_string_lossy().into_owned();
+        assert!(sources.iter().all(|s| matches!(
+            s.origin(),
+            super::super::CatalogOrigin::Located { configured_in: Some(c), .. } if c == file
+        )));
     }
 
     #[test]
@@ -640,8 +659,7 @@ mod tests {
         std::fs::write(tmp.path().join("catalog.json"), "[]").unwrap();
 
         let locations = resolve_catalog_path(tmp.path().to_str().unwrap(), &mut Vec::new());
-        assert_eq!(locations.len(), 1);
-        assert_eq!(locations[0], (None, tmp.path().to_str().unwrap().to_string()));
+        assert!(matches!(&locations[..], [Found::Bare(l)] if l == tmp.path().to_str().unwrap()));
     }
 
     /// A relative entry in catalogs.yaml names a file beside that
@@ -654,9 +672,10 @@ mod tests {
 
         let sources = CatalogSources::new().configure(tmp.path().to_str().unwrap());
         let expected = tmp.path().join("shipped-catalog.yaml");
-        assert_eq!(sources.required().len(), 1);
-        assert_eq!(sources.required()[0].name, "shipped");
-        assert_eq!(sources.required()[0].location, expected.to_string_lossy());
+        assert_eq!(
+            listed(&sources, Requirement::Required),
+            vec![("shipped".to_string(), expected.to_string_lossy().into_owned())],
+        );
     }
 
     /// A directory added ad hoc keeps the names its own catalogs.yaml
@@ -675,13 +694,10 @@ mod tests {
 
         let sources = CatalogSources::new()
             .add_catalogs(&[tmp.path().to_string_lossy().to_string()]);
-        let got: Vec<(&str, &str)> = sources.required().iter()
-            .map(|s| (s.name.as_str(), s.location.as_str()))
-            .collect();
         let deep = inner.join("deep-catalog.yaml");
-        assert_eq!(got, vec![
-            ("near", "https://example.com/near/"),
-            ("deep", deep.to_str().unwrap()),
+        assert_eq!(listed(&sources, Requirement::Required), vec![
+            ("near".to_string(), "https://example.com/near/".to_string()),
+            ("deep".to_string(), deep.to_str().unwrap().to_string()),
         ]);
     }
 
@@ -692,6 +708,6 @@ mod tests {
 
         let sources = CatalogSources::new()
             .add_catalogs(&[tmp.path().to_string_lossy().to_string()]);
-        assert_eq!(sources.required().len(), 1);
+        assert_eq!(listed(&sources, Requirement::Required).len(), 1);
     }
 }

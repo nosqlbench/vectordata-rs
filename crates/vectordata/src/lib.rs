@@ -39,6 +39,7 @@
 //! | Build a dataset description in code | [`DatasetConfig::builder`](dataset::DatasetConfig::builder) → [`save`](dataset::DatasetConfig::save) | — |
 //! | Open a dataset described in code | [`TestDataGroup::from_config`] | — |
 //! | Build a catalog entry in code | [`CatalogEntry::builder`](dataset::CatalogEntry::builder) → [`Catalog::open_entry`](catalog::Catalog::open_entry) | — |
+//! | Register a catalog at runtime | [`CatalogBuilder`](catalog::CatalogBuilder) → [`CatalogSources::with`](catalog::CatalogSources::with) | — |
 //! | Resolve a path against a dataset or catalog location | [`Location::resolve`] | — |
 //! | Locate the cache | [`settings::cache_dir`] | — |
 //! | Inspect what is cached | [`FacetStorage::cache_stats`] via [`TestDataView::open_facet_storage`] | — |
@@ -382,7 +383,7 @@ pub enum Error {
         name: String,
         /// Every dataset it matches, each with the catalog it came from
         /// and that catalog's location when known:
-        /// `ds (catalog 'lab': /data/lab/)`.
+        /// `ds (catalog 'lab': /data/lab/catalog.json)`.
         matches: Vec<String>,
     },
     /// A dataset spec or profile selector is malformed, or matches no

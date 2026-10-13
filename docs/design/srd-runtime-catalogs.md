@@ -1076,3 +1076,77 @@ established or what catalogs hold:
 - Also: `an_entry_is_embedded_or_referenced_by_its_listing`,
   `an_embedded_entry_without_a_home_is_refused` and
   `a_built_entry_opens_at_its_home`.
+
+### 12.6 Step 6: catalog sources, the catalog builder, provenance (2026-10-13)
+
+**Found first.**
+- **Severity cannot live in the source if the set decides it.** RC-13's
+  `entries` returned a plain list, so "this location has no catalog"
+  could not be told apart from "an empty catalog". Today's required and
+  optional loads differ only there. `entries` returns `Option`: `None`
+  is nothing there, and the set's `Requirement` decides whether that is
+  an error.
+- **`CatalogOrigin::Located` keeps the location as written,** as
+  entries keep theirs (§12.5). A catalog location names its kept copy.
+- **RC-17's "`catalog_file` becomes the origin" would lose the file.**
+  A directory's origin is the directory, but the document read is
+  `catalog.json`, `catalog.yaml` or `knn_entries.yaml`. A located
+  catalog records the document on each entry it reads. `Catalog::of`
+  records the catalog's name, and keeps each origin for provenance.
+
+**Built** (`catalog/source.rs`):
+- **`CatalogSource`** (`name`, `origin`, `entries`) and
+  **`CatalogOrigin`**: `Located { location, configured_in }` or
+  `Registered { label }`.
+- **`LocatedCatalog`** replaces `load_from_explicit_catalog_file`,
+  `try_load_canonical_catalog` and `try_load_knn_entries`:
+  - a location naming a file is that file;
+  - otherwise `catalog.json`, `catalog.yaml` and `knn_entries.yaml` are
+    probed under it;
+  - the first found is read by shape.
+- **`CatalogBuilder::named`** has `base`, `entry`, `entries`, `content`
+  and `label`. `build()` gives a `BuiltCatalog` whose content is already
+  parsed. Content with a relative path and no base is a diagnostic, and
+  its entry is skipped. A `knn_entries` document needs a base or a
+  `_defaults.base_url`.
+- **`parse_catalog_content`** is the one content parser. Located and
+  built catalogs both use it, so the same content gives the same
+  entries.
+- **`CatalogSources`** holds `(Arc<dyn CatalogSource>, Requirement)` in
+  order:
+  - `with` and `with_optional` add any source, and `iter` lists them;
+  - `configure*` and `add_*catalogs` add `LocatedCatalog`s, each bound
+    to the `catalogs.yaml` that names it;
+  - `required()`, `optional()` and the unused `catalog_file_for` are
+    gone.
+- **`Catalog::of`** asks each source in order and records its name on
+  every entry; ambiguity provenance reads the kept origins. A required
+  source that gives nothing is an error, and an optional one is a debug
+  log.
+- **`CatalogDiagnostic::error` and `warning` are public,** for a
+  program's own sources.
+- **The explorer's source view chooses by description:** a referenced
+  entry shows its `dataset.yaml`, and an embedded one its catalog
+  document.
+
+**Behaviour changes:**
+- **Catalogs list in the order they were added.** Required catalogs no
+  longer list ahead of optional ones (RC-16).
+- **A remote catalog directory is probed for `catalog.yaml` too**, as a
+  local one was. A knn-only remote catalog costs one more request.
+- **Canonical entries record their catalog document (B-8),** so
+  ambiguity provenance names the file:
+  `ds (catalog 'lab': /data/lab/catalog.json)`.
+
+**Guards:**
+- `a_located_catalogs_entries_record_their_document` (B-8) fails on the
+  previous code.
+- `a_built_catalog_equals_the_located_one_with_its_content` covers both
+  shapes.
+- Also:
+  - `built_content_with_relative_paths_and_no_base_is_a_diagnostic`;
+  - `a_registered_catalog_collides_like_a_located_one`;
+  - `only_a_required_catalog_that_gives_nothing_is_an_error`;
+  - `the_source_view_shows_a_referenced_entrys_dataset_yaml`.
+- B-2 (`s3://` knn_entries) was fixed in step 1, and
+  `s3_locations_open_from_their_kept_copies_offline` guards it.

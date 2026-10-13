@@ -10,11 +10,9 @@
 
 use crate::dataset::{CatalogEntry, CatalogLayout};
 
+use super::source::{CatalogOrigin, Requirement};
+use super::sources::CatalogSources;
 use super::CatalogDiagnostic;
-use super::knn_entries::parse_knn_entries_yaml;
-use super::sources::{
-    catalog_file_for, looks_like_catalog_file, CatalogSources,
-};
 
 /// A resolved catalog containing dataset entries from all configured sources.
 ///
@@ -28,10 +26,10 @@ use super::sources::{
 pub struct Catalog {
     entries: Vec<CatalogEntry>,
     diagnostics: Vec<CatalogDiagnostic>,
-    /// Each source's location by its symbolic name, so an entry's
+    /// Each source's origin by its symbolic name, so an entry's
     /// [`catalog_name`](CatalogEntry::catalog_name) can say where it
     /// came from.
-    locations: Vec<(String, String)>,
+    origins: Vec<(String, CatalogOrigin)>,
 }
 
 impl Catalog {
@@ -46,37 +44,29 @@ impl Catalog {
     pub fn of(sources: &CatalogSources) -> Self {
         let mut entries = Vec::new();
         let mut diagnostics = sources.diagnostics().to_vec();
-        let locations = sources
-            .required()
-            .iter()
-            .chain(sources.optional())
-            .map(|s| (s.name.clone(), s.location.clone()))
-            .collect();
-
-        let mut load_named = |src: &super::sources::NamedCatalogSource, required: bool| {
-            let before = entries.len();
-            load_catalog_entries(&src.location, &mut entries, required, &mut diagnostics);
-            // Stamp every entry this source contributed with the
-            // catalog's symbolic name so downstream surfaces (the
-            // picker's catalog toggle screen, listings) can group
-            // and filter by catalog.
-            for e in entries[before..].iter_mut() {
-                e.set_catalog_name(src.name.clone());
+        let mut origins = Vec::new();
+        for (source, requirement) in sources.iter() {
+            let origin = source.origin();
+            match source.entries(&mut diagnostics) {
+                // The one place an entry learns which configured catalog
+                // it came from, so the picker's catalog screen and
+                // listings can group and filter by catalog.
+                Some(found) => entries.extend(found.into_iter().map(|mut e| {
+                    e.set_catalog_name(source.name());
+                    e
+                })),
+                None if requirement == Requirement::Required => {
+                    diagnostics.push(CatalogDiagnostic::error(nothing_at(&origin)));
+                }
+                None => log::debug!("optional catalog '{}': {}", source.name(), nothing_at(&origin)),
             }
-        };
-
-        for src in sources.required() {
-            load_named(src, true);
-        }
-
-        for src in sources.optional() {
-            load_named(src, false);
+            origins.push((source.name().to_string(), origin));
         }
 
         for d in &diagnostics {
             log::warn!("{d}");
         }
-        Catalog { entries, diagnostics, locations }
+        Catalog { entries, diagnostics, origins }
     }
 
     /// Returns all dataset entries in the catalog.
@@ -129,13 +119,13 @@ impl Catalog {
     }
 
     /// An entry's name and the catalog it came from, for telling apart
-    /// datasets that share a name: `ds (catalog 'lab': /data/lab/)`.
+    /// datasets that share a name: `ds (catalog 'lab': /data/lab/catalog.json)`.
     fn provenance(&self, entry: &CatalogEntry) -> String {
         let Some(catalog) = entry.catalog_name() else {
             return entry.name().to_string();
         };
-        let location = entry.catalog_file().or_else(|| {
-            self.locations.iter().find(|(n, _)| n == catalog).map(|(_, l)| l.as_str())
+        let location = entry.catalog_file().map(str::to_string).or_else(|| {
+            self.origins.iter().find(|(n, _)| n == catalog).map(|(_, o)| o.to_string())
         });
         match location {
             Some(location) => format!("{} (catalog '{catalog}': {location})", entry.name()),
@@ -425,277 +415,15 @@ impl DatasetSelection {
     }
 }
 
-/// Load catalog entries from a single location string.
-///
-/// The location may be an HTTP URL or a local file/directory path.
-/// For layout-embedded entries, the `path` field is resolved relative
-/// to the base location to construct full URLs.
-///
-/// Resolution strategy:
-///
-/// 1. **Explicit catalog file** — when `location` ends in `.yaml`,
-///    `.yml`, or `.json`, the file is fetched once and dispatched by
-///    content shape: a YAML/JSON sequence is treated as a canonical
-///    catalog array; a YAML mapping is treated as a `knn_entries`-
-///    style document (jvector `DataSetLoaderSimpleMFD` parity). No
-///    sibling probing — the file *is* the catalog regardless of name.
-///
-/// 2. **Directory cascade** — when `location` is a directory or URL
-///    prefix, the canonical filename set is walked in order:
-///    `catalog.json`, `catalog.yaml`, `knn_entries.yaml`.
-fn load_catalog_entries(
-    location: &str,
-    entries: &mut Vec<CatalogEntry>,
-    required: bool,
-    diags: &mut Vec<CatalogDiagnostic>,
-) {
-    if looks_like_catalog_file(location) {
-        if !load_from_explicit_catalog_file(location, entries, diags) && required {
-            diags.push(CatalogDiagnostic::error(format!("could not load catalog from {location}")));
-        }
-        return;
-    }
-
-    // Directory cascade.
-    if try_load_canonical_catalog(location, entries, diags) { return; }
-    if try_load_knn_entries(location, entries, diags) { return; }
-
-    if required {
-        diags.push(CatalogDiagnostic::error(format!(
-            "no catalog file found at {location} \
-             (tried catalog.json, catalog.yaml, knn_entries.yaml)"
-        )));
-    } else {
-        log::debug!(
-            "optional catalog {} has no catalog.json / catalog.yaml / knn_entries.yaml",
-            location,
-        );
-    }
-}
-
-/// Fetch the content of an explicit-filename catalog (one whose URL
-/// or path ends in `.yaml`/`.yml`/`.json`) and dispatch by content
-/// shape: top-level sequence → canonical catalog array; top-level
-/// mapping → `knn_entries`-style. Returns `true` when the file was
-/// fetched and parsed successfully into at least one entry, or when
-/// the file was parsed but contained no entries (still a success —
-/// the file exists). Returns `false` when the file could not be
-/// fetched at all.
-fn load_from_explicit_catalog_file(
-    location: &str,
-    entries: &mut Vec<CatalogEntry>,
-    diags: &mut Vec<CatalogDiagnostic>,
-) -> bool {
-    let content = match fetch_location_content(location) {
-        Some(c) => c,
-        None => return false,
-    };
-
-    // Generic YAML parse: subsumes JSON (every JSON document is also
-    // valid YAML). This gives us a single value we can shape-match on
-    // without paying for two separate parse passes.
-    let value: serde_yaml::Value = match serde_yaml::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            diags.push(CatalogDiagnostic::error(format!("failed to parse catalog {location}: {e}")));
-            return true;
-        }
-    };
-
-    let base_url = crate::location::parent_form(location);
-
-    match value {
-        serde_yaml::Value::Sequence(seq) => {
-            for item in seq {
-                let as_json: serde_json::Value = match serde_json::to_value(&item) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        diags.push(CatalogDiagnostic::warning(format!("skipping catalog entry: {e}")));
-                        continue;
-                    }
-                };
-                match remap_entry(&as_json, &base_url) {
-                    Ok(entry) => entries.push(entry),
-                    Err(e) => diags.push(CatalogDiagnostic::warning(format!("skipping catalog entry: {e}"))),
-                }
-            }
-            true
-        }
-        serde_yaml::Value::Mapping(_) => {
-            // knn_entries-style: parser resolves facet paths relative
-            // to the catalog file's parent directory (matching
-            // jvector's per-entry resolution against the entry's
-            // cache directory, with `_defaults.base_url` overriding).
-            match parse_knn_entries_yaml(&content, &base_url) {
-                Ok(mut parsed) => {
-                    // The parser only sees the parent directory; the
-                    // resolver knows which document these entries came
-                    // from. Without this, "show me the catalog source"
-                    // surfaces a fabricated `<base_url>/knn_entries.yaml`
-                    // that may name the wrong host AND the wrong file.
-                    for e in &mut parsed {
-                        e.set_catalog_file(location);
-                    }
-                    entries.extend(parsed);
-                    true
-                }
-                Err(e) => {
-                    diags.push(CatalogDiagnostic::error(format!("failed to parse {location}: {e}")));
-                    true
-                }
-            }
-        }
-        _ => {
-            diags.push(CatalogDiagnostic::error(format!(
-                "catalog {location} is neither a sequence nor a mapping"
-            )));
-            true
-        }
-    }
-}
-
-/// Fetch the raw content of any catalog location (HTTP URL or local
-/// path). Returns `None` if the file/URL is unreachable so callers
-/// can fall through to alternative probes.
-fn fetch_location_content(location: &str) -> Option<String> {
-    // Anything the shared transport speaks goes through the HTTP
-    // fetcher (which normalises `s3://` → virtual-hosted-style HTTPS
-    // before the wire). Everything else is treated as a local path.
-    if crate::transport::is_remote_url(location) {
-        fetch_http(location).ok()
-    } else {
-        std::fs::read_to_string(location).ok()
-    }
-}
-
-/// Try the canonical `catalog.{json,yaml}` path at `location`.
-/// Returns `true` when the file was read and successfully parsed
-/// (entries appended); `false` when no canonical catalog file was
-/// found OR the file exists but parsing failed (the caller falls
-/// through to the next probe; the parse failure is logged here).
-fn try_load_canonical_catalog(
-    location: &str,
-    entries: &mut Vec<CatalogEntry>,
-    diags: &mut Vec<CatalogDiagnostic>,
-) -> bool {
-    let catalog_url = catalog_file_for(location);
-
-    let content = if crate::transport::is_remote_url(&catalog_url) {
-        match fetch_http(&catalog_url) {
-            Ok(c) => c,
-            Err(_) => return false, // missing — let the caller try the next probe
-        }
-    } else {
-        let path = std::path::Path::new(&catalog_url);
-        let file_path = if path.is_dir() {
-            let json = path.join("catalog.json");
-            if json.is_file() {
-                json
-            } else {
-                let yaml = path.join("catalog.yaml");
-                if yaml.is_file() {
-                    yaml
-                } else {
-                    return false;
-                }
-            }
-        } else if path.is_file() {
-            path.to_path_buf()
-        } else {
-            return false;
-        };
-
-        match std::fs::read_to_string(&file_path) {
-            Ok(c) => c,
-            Err(_) => return false,
-        }
-    };
-
-    let parsed: Vec<serde_json::Value> = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => match serde_yaml::from_str(&content) {
-            Ok(v) => v,
-            Err(e) => {
-                diags.push(CatalogDiagnostic::error(format!("failed to parse catalog {catalog_url}: {e}")));
-                return true; // file exists, but couldn't parse — don't fall through
-            }
-        },
-    };
-
-    let base_url = crate::location::dir_form(location);
-    for value in parsed {
-        match remap_entry(&value, &base_url) {
-            Ok(entry) => entries.push(entry),
-            Err(e) => {
-                diags.push(CatalogDiagnostic::warning(format!("skipping catalog entry: {e}")));
-            }
-        }
-    }
-    true
-}
-
-/// Try the legacy `knn_entries.yaml` format at `location` as a
-/// fallback when no canonical catalog file was found. See
-/// [`super::knn_entries`] for the format spec.
-///
-/// Returns `true` if a `knn_entries.yaml` was located and parsed
-/// (whether or not any entries were produced); `false` when no
-/// such file exists at the location.
-fn try_load_knn_entries(
-    location: &str,
-    entries: &mut Vec<CatalogEntry>,
-    diags: &mut Vec<CatalogDiagnostic>,
-) -> bool {
-    let url = knn_entries_url_for(location);
-    let content = if crate::transport::is_remote_url(&url) {
-        match fetch_http(&url) {
-            Ok(c) => c,
-            Err(_) => return false,
-        }
-    } else {
-        let p = std::path::Path::new(&url);
-        if !p.is_file() { return false; }
-        match std::fs::read_to_string(p) {
-            Ok(c) => c,
-            Err(_) => return false,
-        }
-    };
-
-    match parse_knn_entries_yaml(&content, location) {
-        Ok(mut parsed) => {
-            for e in &mut parsed {
-                e.set_catalog_file(url.clone());
-            }
-            entries.extend(parsed);
-            true
-        }
-        Err(e) => {
-            diags.push(CatalogDiagnostic::error(format!("failed to parse {url}: {e}")));
-            true
-        }
-    }
-}
-
-/// Resolve a catalog location to the implied `knn_entries.yaml`
-/// URL/path. Mirrors [`super::sources::catalog_file_for`] but for
-/// the legacy filename.
-pub(crate) fn knn_entries_url_for(location: &str) -> String {
-    if location.ends_with("/knn_entries.yaml") { return location.to_string(); }
-    let p = std::path::Path::new(location);
-    if p.is_file()
-        && p.file_name().and_then(|n| n.to_str()) == Some("knn_entries.yaml")
-    {
-        return location.to_string();
-    }
-    format!("{}knn_entries.yaml", crate::location::dir_form(location))
-}
-
 /// Remap a raw JSON/YAML catalog entry into a `CatalogEntry`.
 ///
 /// Layout-embedded entries have `layout.attributes` and `layout.profiles`
 /// and a relative `path`. The name is derived from the directory component
 /// of the path (matching Java's `dirNameOfPath`).
-fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry, String> {
+/// Without a `base_url` (content a program supplied with no base), a
+/// relative path is refused rather than resolved against the working
+/// directory.
+pub(super) fn remap_entry(value: &serde_json::Value, base_url: Option<&str>) -> Result<CatalogEntry, String> {
     if value.get("layout").is_some() {
         // Layout-embedded entry — remap to normalized form
         let path = value
@@ -769,7 +497,13 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
 /// the same rule [`TestDataGroup::load`](crate::TestDataGroup::load)
 /// applies when the entry is opened, so the listing, the picker and the
 /// open agree on the dataset's home.
-fn resolve_entry_path(base_url: &str, path: &str) -> Result<String, String> {
+fn resolve_entry_path(base_url: Option<&str>, path: &str) -> Result<String, String> {
+    let absolute = crate::location::has_scheme(path) || path.starts_with('/');
+    let base_url = match base_url {
+        Some(base) => base,
+        None if absolute => "/",
+        None => return Err(format!("path '{path}' is relative and the catalog has no base")),
+    };
     crate::Location::parse(base_url)
         .and_then(|base| base.resolve(path))
         .map_err(|e| e.to_string())
@@ -803,7 +537,7 @@ fn dir_name_of_path(path: &str) -> String {
 /// only from it in offline mode. A server that answers with an error
 /// status is an error, so a missing catalog file is never papered over
 /// by an old copy.
-fn fetch_http(url: &str) -> Result<String, String> {
+pub(super) fn fetch_http(url: &str) -> Result<String, String> {
     let kept = crate::settings::cache_dir().ok().map(|root| {
         root.join(crate::cache::layout::CATALOG_COPIES_DIR)
             .join(crate::cache::layout::kept_catalog_name(url))
@@ -868,6 +602,19 @@ fn fetch_http_online(url: &str) -> Result<String, Fetch> {
 
     response.text()
         .map_err(|e| Fetch::Failed(format!("failed to read response from {}: {}", url, e)))
+}
+
+/// Why a source gave no catalog at all, from where it is.
+fn nothing_at(origin: &CatalogOrigin) -> String {
+    match origin {
+        CatalogOrigin::Located { location, .. } if super::sources::looks_like_catalog_file(location) => {
+            format!("could not load catalog from {location}")
+        }
+        CatalogOrigin::Located { location, .. } => format!(
+            "no catalog file found at {location} (tried catalog.json, catalog.yaml, knn_entries.yaml)"
+        ),
+        CatalogOrigin::Registered { label } => format!("{label} gave no catalog"),
+    }
 }
 
 /// Convert a simple glob pattern to a regex-style matcher.
@@ -1023,7 +770,7 @@ mod tests {
             }
         });
 
-        let entry = remap_entry(&json, "https://example.com/data/").unwrap();
+        let entry = remap_entry(&json, Some("https://example.com/data/")).unwrap();
         assert_eq!(entry.name(), "test-ds");
         assert_eq!(entry.location(), "https://example.com/data/test-ds/dataset.yaml");
         assert!(entry.attributes().is_some());
@@ -1044,7 +791,7 @@ mod tests {
             }
         });
 
-        let entry = remap_entry(&json, "https://example.com/").unwrap();
+        let entry = remap_entry(&json, Some("https://example.com/")).unwrap();
         assert_eq!(entry.name(), "myds");
     }
 
@@ -1108,9 +855,10 @@ mod tests {
         let err = catalog.lookup("TWIN").unwrap_err();
         let crate::Error::AmbiguousDataset { matches, .. } = &err else { panic!("{err}") };
         assert_eq!(matches.len(), 2, "{err}");
-        for (src, m) in sources.required().iter().zip(matches) {
+        for ((src, _), m) in sources.iter().zip(matches) {
             assert!(m.starts_with("twin (catalog '"), "{m}");
-            assert!(m.contains(&format!("'{}'", src.name)) && m.contains(&src.location), "{m} / {src:?}");
+            let location = src.origin().to_string();
+            assert!(m.contains(&format!("'{}'", src.name())) && m.contains(&location), "{m} / {location}");
         }
         assert_ne!(matches[0], matches[1], "the two matches can be told apart");
         let text = err.to_string();

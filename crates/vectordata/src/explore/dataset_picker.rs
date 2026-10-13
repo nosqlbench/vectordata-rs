@@ -650,27 +650,29 @@ fn build_source_lines(
     let body_style = tint(theme().text_primary);
     let error_style = tint(theme().error);
 
-    // Source location. `entry.catalog_file` is the document the
-    // resolver actually parsed this entry from — authoritative when
-    // present. For knn_entries-shape catalogs it is the ONLY correct
-    // answer: the entry's base is `_defaults.base_url` (where the DATA
-    // lives, possibly another host and scheme), so a
-    // `<base>/knn_entries.yaml` reconstruction points at a file that
-    // may never have existed. Referenced entries fall back to their
-    // descriptor, which IS their dataset.yaml location.
-    let (source_url, title_suffix) = match entry.catalog_file() {
-        Some(file) => {
+    // Source location: where the entry's description is. A referenced
+    // entry's is its descriptor (its dataset.yaml). An embedded entry's
+    // is the catalog document it was read from, which the catalog
+    // records on every entry it loads; for a `knn_entries.yaml` catalog
+    // that is the only correct answer, since the entry's base is
+    // `_defaults.base_url` (where the DATA lives, possibly another host)
+    // and a `<base>/knn_entries.yaml` reconstruction may name a file
+    // that never existed.
+    let (source_url, title_suffix) = match (entry.description(), entry.catalog_file()) {
+        (crate::dataset::EntryDescription::Referenced { descriptor, .. }, _) => {
+            (descriptor.clone(), "dataset.yaml".to_string())
+        }
+        (crate::dataset::EntryDescription::Embedded(_), Some(file)) => {
             let basename = file.rsplit('/').next().unwrap_or("catalog").to_string();
             (file.to_string(), basename)
         }
-        None if entry.dataset_type() == "knn_entries.yaml" => (
+        (crate::dataset::EntryDescription::Embedded(_), None) => (
             format!(
                 "{}knn_entries.yaml",
                 crate::location::parent_form(entry.dataset_home_url().trim_end_matches('/')),
             ),
             "knn_entries.yaml".to_string(),
         ),
-        None => (entry.location().to_string(), "dataset.yaml".to_string()),
     };
 
     let raw = match fetch_yaml_text(&source_url) {
@@ -4568,6 +4570,31 @@ mod tests {
         );
         assert!(all.kept.is_empty());
         assert!(!ds.exists(), "every profile selected is the whole-dataset purge");
+    }
+
+    /// **The source view shows where an entry's description is**: a
+    /// referenced entry's `dataset.yaml`, though its catalog now records
+    /// the `catalog.json` it was listed in.
+    #[test]
+    fn the_source_view_shows_a_referenced_entrys_dataset_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ds")).unwrap();
+        std::fs::write(dir.path().join("ds/dataset.yaml"), "name: ds\nprofiles: {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("catalog.json"),
+            r#"[{"name":"ds","path":"ds/dataset.yaml","layout":{"profiles":{}}}]"#,
+        )
+        .unwrap();
+        let catalog = crate::catalog::Catalog::of(
+            &crate::catalog::CatalogSources::new().add_catalogs(&[dir.path().to_string_lossy().into_owned()]),
+        );
+        let entry = catalog.lookup("ds").unwrap();
+        assert!(entry.catalog_file().is_some_and(|f| f.ends_with("catalog.json")));
+        let (title, lines) = super::build_source_lines(entry, false);
+        assert_eq!(title, "Source — dataset.yaml");
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert!(text[0].ends_with("ds/dataset.yaml"), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("name: ds")), "{text:?}");
     }
 
     /// **The filter box takes a selector expression, and a bare word
