@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use crate::catalog::resolver::Catalog;
-use crate::catalog::sources::{self, CatalogSources};
+use crate::catalog::sources;
 use veks_completion::{ValueProvider, fn_provider};
 use crate::dataset::selector::{DatasetSpec, ProfileFacts};
 
@@ -121,21 +121,21 @@ fn option_values(context: &[&str], option: &str) -> Vec<String> {
 // Catalog access (IO) + the (name, profiles) view the pure cores use
 // ---------------------------------------------------------------------------
 
-/// Build a catalog resolver honoring any `--at` values already typed
-/// on the line; falls back to the configured catalogs.
+/// Build a catalog resolver honoring any `--at` / `--catalog` values
+/// already typed on the line, by the assembly every command uses
+/// ([`build_sources`](super::build_sources)). Opened silently: whatever
+/// completion prints lands in the shell's completion list, so a broken
+/// catalog's problems are left for the command itself to report.
 fn resolve_catalog(context: &[&str]) -> Catalog {
     let configured = sources::raw_catalog_entries(&sources::config_dir());
-    let at_values: Vec<String> = option_values(context, "--at")
-        .iter()
-        .filter_map(|v| resolve_catalog_value_opt(v, &configured))
-        .collect();
-
-    let catalog_sources = if at_values.is_empty() {
-        CatalogSources::new().configure_default()
-    } else {
-        CatalogSources::new().add_catalogs(&at_values)
+    let typed = |flag: &str| -> Vec<String> {
+        option_values(context, flag)
+            .iter()
+            .filter_map(|v| resolve_catalog_value_opt(v, &configured))
+            .collect()
     };
-    Catalog::of(&catalog_sources)
+    let run = super::build_sources(&sources::config_dir(), &typed("--catalog"), &typed("--at"));
+    Catalog::of(run.sources())
 }
 
 /// Flatten a catalog into `(dataset, profile facts)` pairs: what a

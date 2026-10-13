@@ -32,6 +32,16 @@ the datasets under it, or be a catalog file itself.
   (`CatalogSources::add_catalogs`, `--catalogs <dir>`). Any other ad-hoc
   location is named by the next free index.
 
+### When a catalog fails to load
+
+A catalog that cannot be read (the URL does not answer, the file is
+gone, it does not parse) never stops a command; the others still load.
+Every command says what went wrong on stderr, except shell completion,
+whose output would land in the completion list. The explorer shows it
+on its status line and marks the catalog with `✗` on the catalogs screen
+(Ctrl-G). A catalog named for the run (`--at`, `--catalog`) that fails
+is an error: the command exits with status 1.
+
 ### CLI management
 
 ```bash

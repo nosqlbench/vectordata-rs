@@ -15,7 +15,6 @@ use crate::catalog::resolver::Catalog;
 #[cfg(feature = "cli")]
 use crate::dataset::selector::DatasetSpec;
 #[cfg(feature = "cli")]
-use crate::catalog::sources::CatalogSources;
 use crate::dataset::CatalogEntry;
 
 /// Shared clap-derived argument struct for `vectordata datasets
@@ -38,17 +37,14 @@ pub struct DescribeArgs {
 
 /// Drive `describe` from parsed [`DescribeArgs`].
 #[cfg(feature = "cli")]
-pub fn run_args(args: DescribeArgs, configdir: &str, catalog: &[String], at_extra: &[String]) -> i32 {
+pub fn run_args(args: DescribeArgs, configdir: &str, catalog: &[String]) -> i32 {
     // `--at` pins describe to a single catalog source; numbered
     // shortcuts (`--at 2`) resolve against the configured list.
-    let sources = if let Some(at) = args.at {
-        CatalogSources::new().add_catalogs(&super::catalog_args(std::slice::from_ref(&at)))
-    } else {
-        CatalogSources::new()
-            .configure(configdir)
-            .add_catalogs(&super::catalog_args(catalog))
-            .add_catalogs(&super::catalog_args(at_extra))
-    };
+    // `--at` pins the command to the catalogs it names, numbered
+    // shortcuts (`--at 2`) included, by the one assembly every
+    // command uses.
+    let at: Vec<String> = args.at.iter().cloned().collect();
+    let sources = super::build_sources(configdir, catalog, &at);
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
         eprintln!();
@@ -63,7 +59,10 @@ pub fn run_args(args: DescribeArgs, configdir: &str, catalog: &[String], at_extr
             return 2;
         }
     };
-    let cat = super::open_catalog(&sources);
+    let cat = match sources.open() {
+        Ok(cat) => cat,
+        Err(code) => return code,
+    };
     run_via_catalog(&cat, &spec.head, spec.selector.as_ref().map(|s| s.text()))
 }
 

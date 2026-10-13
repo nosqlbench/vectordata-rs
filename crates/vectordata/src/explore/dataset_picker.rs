@@ -2307,7 +2307,7 @@ fn revalidate_catalog(
 ) {
     with_console(terminal, || {
         println!("Re-checking catalog '{name}' — {url}");
-        match crate::config::verify_catalog_source(url) {
+        match crate::config::verify_catalog_source(name, url) {
             Ok(count) => {
                 if unvalidated.remove(name) {
                     let _ = crate::settings::write_unvalidated_catalogs(unvalidated);
@@ -2325,6 +2325,91 @@ fn revalidate_catalog(
     });
 }
 
+/// What the catalogs screen (Ctrl-G) shows: the program's catalog set,
+/// in order (SRD RC-20).
+struct CatalogScreen {
+    /// Each catalog's name and dataset count. A configured catalog that
+    /// resolved to nothing still shows, so it can be fixed or re-enabled.
+    catalog_list: Vec<(String, usize)>,
+    /// name → where it is, for every catalog in the set: what the screen
+    /// shows under the highlighted one, and the URL a credential is for.
+    catalog_origins: std::collections::HashMap<String, crate::catalog::CatalogOrigin>,
+    /// name → its line in the user's `catalogs.yaml`, for the catalogs
+    /// that file configured: only these can be edited or removed here. A
+    /// catalog the program supplied, or one a nested `catalogs.yaml`
+    /// names, is shown read-only.
+    catalog_locations: std::collections::HashMap<String, String>,
+}
+
+impl CatalogScreen {
+    /// The screen for `sources`, whose `entries` the catalog loaded.
+    /// `config_file` is the user's `catalogs.yaml`, and `lines` what it
+    /// names.
+    fn of(
+        sources: &CatalogSources,
+        entries: &[CatalogEntry],
+        config_file: &str,
+        lines: Vec<crate::catalog::sources::NamedCatalogSource>,
+    ) -> Self {
+        let catalog_list = sources
+            .iter()
+            .map(|(source, _)| {
+                let count = entries.iter().filter(|e| e.catalog_name() == Some(source.name())).count();
+                (source.name().to_string(), count)
+            })
+            .collect();
+        let catalog_origins: std::collections::HashMap<String, crate::catalog::CatalogOrigin> =
+            sources.iter().map(|(s, _)| (s.name().to_string(), s.origin())).collect();
+        let catalog_locations = lines
+            .into_iter()
+            .filter(|line| {
+                matches!(
+                    catalog_origins.get(&line.name),
+                    Some(crate::catalog::CatalogOrigin::Located { configured_in: Some(f), .. }) if f == config_file
+                )
+            })
+            .map(|line| (line.name, line.location))
+            .collect();
+        CatalogScreen { catalog_list, catalog_origins, catalog_locations }
+    }
+}
+
+/// The status-line summary of catalog problems: how many there are and
+/// the first, pointing at the catalogs screen for the rest. `None` when
+/// every catalog loaded cleanly.
+fn status_for_problems(diagnostics: &[crate::catalog::CatalogDiagnostic]) -> Option<String> {
+    let first = diagnostics.first()?;
+    let more = match diagnostics.len() {
+        1 => String::new(),
+        n => format!(" (+{} more — Ctrl-G)", n - 1),
+    };
+    let which = first.catalog.as_deref().map(|c| format!("catalog '{c}': ")).unwrap_or_default();
+    Some(format!("{which}{}{more}", first.message))
+}
+
+/// The URL or path a located catalog is at.
+fn located_url(origin: Option<&crate::catalog::CatalogOrigin>) -> Option<&str> {
+    match origin? {
+        crate::catalog::CatalogOrigin::Located { location, .. } => Some(location),
+        crate::catalog::CatalogOrigin::Registered { .. } => None,
+    }
+}
+
+/// Why a catalog cannot be edited on the catalogs screen: the program
+/// supplied it, or a `catalogs.yaml` other than the user's names it.
+fn read_only_note(origin: Option<&crate::catalog::CatalogOrigin>, config_file: &str) -> Option<String> {
+    match origin? {
+        crate::catalog::CatalogOrigin::Registered { .. }
+        | crate::catalog::CatalogOrigin::Located { configured_in: None, .. } => {
+            Some("provided by the program — read-only".to_string())
+        }
+        crate::catalog::CatalogOrigin::Located { configured_in: Some(file), .. } if file != config_file => {
+            Some(format!("named in {file} — edit it there"))
+        }
+        crate::catalog::CatalogOrigin::Located { .. } => None,
+    }
+}
+
 /// Run the dataset picker. The caller provides a `dispatch` closure
 /// invoked when the user confirms an action from the per-row menu.
 ///
@@ -2334,7 +2419,12 @@ fn revalidate_catalog(
 /// restores its own chrome immediately after. Picker state (cursor,
 /// expanded set, filter, scroll, menu cursor) is preserved across
 /// dispatches because the function never exits between them.
-pub fn run_picker<F>(mut dispatch: F, start_in_settings: bool) -> PickerOutcome
+pub fn run_picker<F>(
+    sources: &CatalogSources,
+    catalog: &crate::catalog::Catalog,
+    mut dispatch: F,
+    start_in_settings: bool,
+) -> PickerOutcome
 where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
 {
     // Third dispatch argument is `pause_after`: when true, the runner
@@ -2343,15 +2433,13 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     // picker passes `true` for single-row dispatches and for the
     // *last* item in a batch loop only, so a 10-row batch precache
     // pauses once at the end instead of 10 times in a row.
-    // Load catalog
-    let sources = CatalogSources::new().configure_default();
+    // The catalogs the program assembled, already opened by the caller.
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
         eprintln!();
         eprintln!("Add one with `vectordata config catalog add <URL-or-path>`.");
         return PickerOutcome::Failed;
     }
-    let catalog = crate::datasets::open_catalog(&sources);
     let entries = catalog.datasets();
     if entries.is_empty() {
         eprintln!("error: no datasets found in any configured catalog");
@@ -2421,50 +2509,40 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     let mut filter = String::new();
     // Last theme-knob outcome, shown on the footer's summary line
     // until any other key clears it.
-    let mut flash: Option<String> = None;
+    let mut flash: Option<String> = status_for_problems(catalog.diagnostics());
     // Catalog toggle screen (Ctrl-G): the ordered catalog names with
     // dataset counts, the disabled set (session-scoped — comment the
     // entry out in catalogs.yaml to disable persistently), and the
     // screen's open/cursor state.
-    // name → configured location, from catalogs.yaml (the authoritative
-    // name↔location binding) — EVERY configured catalog, including disabled
-    // and unvalidated ones that resolve to no datasets. Drives the config
-    // pane's catalog list, the URL shown under the highlighted catalog, and
-    // removal by exact source line.
-    let catalog_locations: std::collections::HashMap<String, String> =
-        crate::catalog::sources::named_catalog_entries(
-            &crate::catalog::sources::config_dir())
-            .into_iter()
-            .map(|s| (s.name, s.location))
-            .collect();
-    // Every configured catalog with its dataset count: resolved catalogs
-    // (from `entries`) first, then any configured catalog that resolved to
-    // 0 datasets (disabled / unvalidated / unreachable) so it still shows
-    // in the config pane and can be fixed or re-enabled.
-    let catalog_list: Vec<(String, usize)> = {
-        let mut ordered: Vec<(String, usize)> = Vec::new();
-        for e in entries {
-            let name = e.catalog_name().unwrap_or("?").to_string();
-            match ordered.iter_mut().find(|(n, _)| *n == name) {
-                Some((_, count)) => *count += 1,
-                None => ordered.push((name, 1)),
-            }
+    let config_file = std::path::Path::new(&crate::catalog::sources::config_dir())
+        .join("catalogs.yaml")
+        .to_string_lossy()
+        .into_owned();
+    let CatalogScreen { catalog_list, catalog_origins, catalog_locations } = CatalogScreen::of(
+        sources,
+        entries,
+        &config_file,
+        crate::catalog::sources::named_catalog_entries(&crate::catalog::sources::config_dir()),
+    );
+    // What went wrong loading each catalog, shown on the catalogs screen
+    // and summarised on the status line (SRD §11, item 4).
+    let mut catalog_problems: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for d in catalog.diagnostics() {
+        if let Some(name) = &d.catalog {
+            catalog_problems.entry(name.clone()).or_default().push(d.message.clone());
         }
-        let mut extra: Vec<&String> = catalog_locations.keys()
-            .filter(|n| !ordered.iter().any(|(x, _)| x == *n))
-            .collect();
-        extra.sort();
-        for name in extra {
-            ordered.push((name.clone(), 0));
-        }
-        ordered
-    };
+    }
     // Catalog names that have a credential recorded for their URL (the
     // auth indicator). Joined pairwise by name: catalogs.yaml gives
     // name→url, credentials.toml is keyed by url. Rebuilt on reload (the
     // whole picker re-runs), so it always reflects what's on disk.
-    let authed_catalogs: std::collections::HashSet<String> = catalog_locations.iter()
-        .filter(|(_, url)| crate::credentials::credential_for_url(url).is_some())
+    let authed_catalogs: std::collections::HashSet<String> = catalog_origins.iter()
+        .filter(|(_, origin)| match origin {
+            crate::catalog::CatalogOrigin::Located { location, .. } =>
+                crate::credentials::credential_for_url(location).is_some(),
+            crate::catalog::CatalogOrigin::Registered { .. } => false,
+        })
         .map(|(name, _)| name.clone())
         .collect();
     // Seed from the persisted `disabled_catalogs` setting; only
@@ -3259,7 +3337,8 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                             let enabled = !disabled_catalogs.contains(name);
                             let lock = if authed_catalogs.contains(name) { "  🔒" } else { "" };
                             let warn = if unvalidated_catalogs.contains(name) { "  ⚠" } else { "" };
-                            (format!("[{}] {name}{lock}{warn}",
+                            let broken = if catalog_problems.contains_key(name) { "  ✗" } else { "" };
+                            (format!("[{}] {name}{lock}{warn}{broken}",
                                 if enabled { "x" } else { " " }), enabled)
                         }
                         SettingsItem::AddCatalog =>
@@ -3289,7 +3368,9 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                     // glance; the cursor row keeps that colour but reversed.
                     let style = match item {
                         SettingsItem::CatalogToggle(name) => {
-                            let sc = if unvalidated_catalogs.contains(name) {
+                            let sc = if catalog_problems.contains_key(name) {
+                                theme().error
+                            } else if unvalidated_catalogs.contains(name) {
                                 theme().warning
                             } else if disabled_catalogs.contains(name) {
                                 theme().text_dim
@@ -3317,10 +3398,19 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                 // Detail for the highlighted catalog: source URL, then either
                 // the count + auth (validated) or the ⚠ fix line (unvalidated).
                 if let Some(SettingsItem::CatalogToggle(name)) = items.get(catalog_cursor) {
-                    let loc = catalog_locations.get(name).map(String::as_str)
-                        .unwrap_or("(not a catalogs.yaml entry — not removable here)");
+                    let loc = catalog_origins.get(name).map(|o| o.to_string()).unwrap_or_default();
                     lines.push(Line::from(Span::styled(
                         format!("      {loc}"), tinted(theme().text_muted))));
+                    if let Some(note) = read_only_note(catalog_origins.get(name), &config_file)
+                        .filter(|_| !catalog_locations.contains_key(name))
+                    {
+                        lines.push(Line::from(Span::styled(
+                            format!("      {note}"), tinted(theme().text_dim))));
+                    }
+                    for problem in catalog_problems.get(name).into_iter().flatten() {
+                        lines.push(Line::from(Span::styled(
+                            format!("      ✗ {problem}"), tinted(theme().error))));
+                    }
                     if unvalidated_catalogs.contains(name) {
                         lines.push(Line::from(Span::styled(
                             "      ⚠ not validated — e: edit & re-check · Space: re-check",
@@ -3333,8 +3423,8 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                             tinted(theme().text_dim))));
                         // Auth line: who when a credential is stored, else a
                         // hint that `c` provides one.
-                        let auth_line = match catalog_locations.get(name)
-                            .and_then(|u| crate::credentials::credential_for_url(u))
+                        let auth_line = match located_url(catalog_origins.get(name))
+                            .and_then(crate::credentials::credential_for_url)
                         {
                             Some(e) => {
                                 let who = e.user.as_deref().unwrap_or("token");
@@ -3735,10 +3825,10 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                             if let Some(SettingsItem::CatalogToggle(name)) =
                                 items.get(catalog_cursor)
                             {
-                                match catalog_locations.get(name) {
+                                match located_url(catalog_origins.get(name)) {
                                     Some(url) => auth_input = Some(AuthInput {
                                         name: name.clone(),
-                                        url: url.clone(),
+                                        url: url.to_string(),
                                         token: String::new(),
                                     }),
                                     None => flash = Some(format!(
@@ -3760,7 +3850,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                             name.clone(), url.clone(), token));
                                     }
                                     None => flash = Some(format!(
-                                        "'{name}' isn't a catalogs.yaml entry — can't edit here")),
+                                        "'{name}' isn't an entry of your catalogs.yaml — can't edit it here")),
                                 }
                             }
                         }
@@ -3776,7 +3866,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                     confirm_remove = Some(name.clone());
                                 } else {
                                     flash = Some(format!(
-                                        "'{name}' isn't a removable catalogs.yaml entry"));
+                                        "'{name}' isn't an entry of your catalogs.yaml — can't remove it here"));
                                 }
                             }
                         }
@@ -4570,6 +4660,50 @@ mod tests {
         );
         assert!(all.kept.is_empty());
         assert!(!ds.exists(), "every profile selected is the whole-dataset purge");
+    }
+
+    /// **The catalogs screen lists the program's catalog set**: every
+    /// catalog in order with its location and count, a nested
+    /// `catalogs.yaml`'s catalogs included, and only the user's own
+    /// `catalogs.yaml` entries editable. The screen used to read
+    /// `catalogs.yaml` itself, so a nested name had no location (B-6) and
+    /// a program's catalog could not appear (RC-20).
+    #[test]
+    fn the_catalogs_screen_lists_the_whole_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let near = tmp.path().join("near");
+        let inner = tmp.path().join("inner");
+        for d in [&near, &inner] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(near.join("catalog.json"), "[]").unwrap();
+        std::fs::write(inner.join("deep.json"), "[]").unwrap();
+        std::fs::write(inner.join("catalogs.yaml"), "deep: deep.json\n").unwrap();
+        std::fs::write(tmp.path().join("catalogs.yaml"), "near: near\nouter: inner\n").unwrap();
+        let config = tmp.path().to_string_lossy().into_owned();
+        let sources = crate::catalog::CatalogSources::new()
+            .with(crate::catalog::CatalogBuilder::named("mine").build())
+            .configure(&config);
+        let config_file = tmp.path().join("catalogs.yaml").to_string_lossy().into_owned();
+        let screen = super::CatalogScreen::of(
+            &sources,
+            &[],
+            &config_file,
+            crate::catalog::sources::named_catalog_entries(&config),
+        );
+        let names: Vec<&str> = screen.catalog_list.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["mine", "near", "deep"]);
+        assert!(screen.catalog_list.iter().all(|(_, count)| *count == 0));
+        let deep = screen.catalog_origins["deep"].to_string();
+        assert!(deep.ends_with("deep.json"), "B-6: the nested catalog has its location: {deep}");
+        assert_eq!(screen.catalog_locations.keys().collect::<Vec<_>>(), ["near"]);
+        assert_eq!(
+            super::read_only_note(screen.catalog_origins.get("mine"), &config_file).as_deref(),
+            Some("provided by the program — read-only"),
+        );
+        let nested = super::read_only_note(screen.catalog_origins.get("deep"), &config_file).unwrap();
+        assert!(nested.starts_with("named in ") && nested.ends_with("inner/catalogs.yaml — edit it there"), "{nested}");
+        assert_eq!(super::read_only_note(screen.catalog_origins.get("near"), &config_file), None);
     }
 
     /// **The source view shows where an entry's description is**: a

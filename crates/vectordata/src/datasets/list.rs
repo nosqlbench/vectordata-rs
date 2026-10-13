@@ -260,7 +260,10 @@ pub fn run(
         return 1;
     }
 
-    let catalog = super::open_catalog(&sources);
+    let catalog = match sources.open() {
+        Ok(catalog) => catalog,
+        Err(code) => return code,
+    };
 
     if catalog.is_empty() {
         eprintln!("error: no datasets found in any configured catalog");
@@ -785,7 +788,7 @@ mod tests {
             &["https://example.com/catalog".to_string()],
         );
         // --at should take precedence, required should contain the at URL
-        assert!(sources.iter().any(|(s, r)| {
+        assert!(sources.sources().iter().any(|(s, r)| {
             r == crate::catalog::Requirement::Required && s.origin().to_string().contains("example.com")
         }));
     }

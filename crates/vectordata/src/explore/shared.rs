@@ -45,7 +45,10 @@ impl std::str::FromStr for SampleMode {
 /// selector after its path — and return the canonical
 /// [`TestDataView`]. The explorer shows one profile, so the selector
 /// must name exactly one (PS-9); none means `default`.
-pub(super) fn open_dataset_view(source: &str) -> std::sync::Arc<dyn crate::TestDataView> {
+pub(super) fn open_dataset_view(
+    source: &str,
+    catalog: &crate::catalog::Catalog,
+) -> std::sync::Arc<dyn crate::TestDataView> {
     let spec = crate::dataset::selector::DatasetSpec::parse(source).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -57,8 +60,6 @@ pub(super) fn open_dataset_view(source: &str) -> std::sync::Arc<dyn crate::TestD
             std::process::exit(1);
         })
     } else {
-        let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-        let catalog = crate::datasets::open_catalog(&sources);
         catalog.open(&spec.head).unwrap_or_else(|e| {
             eprintln!("error: {e}");
             std::process::exit(1);
@@ -83,6 +84,12 @@ pub(super) fn is_local_source(source: &str) -> bool {
     std::path::Path::new(source).exists()
 }
 
+/// Whether `source` names a dataset to look up in a catalog: neither a
+/// local path nor a URL, which open without one.
+pub(super) fn names_catalog_dataset(source: &str) -> bool {
+    !is_local_source(source) && !crate::transport::is_remote_url(source)
+}
+
 /// Unified data reader that wraps both local (AnyVectorReader) and
 /// remote (AnyDatasetReader) access behind the same interface.
 pub(super) enum UnifiedReader {
@@ -91,12 +98,14 @@ pub(super) enum UnifiedReader {
 }
 
 impl UnifiedReader {
-    pub(super) fn open(source: &str) -> Self {
+    /// Open `source`: a local file, or a dataset found by URL or in
+    /// `catalog`.
+    pub(super) fn open(source: &str, catalog: &crate::catalog::Catalog) -> Self {
         if is_local_source(source) {
             let path = resolve_source(source);
             UnifiedReader::Local(AnyVectorReader::open(&path))
         } else {
-            UnifiedReader::Remote(AnyDatasetReader::from_source(source))
+            UnifiedReader::Remote(AnyDatasetReader::from_source(source, catalog))
         }
     }
     pub(super) fn count(&self) -> usize {
@@ -281,8 +290,8 @@ pub(super) struct AnyDatasetReader {
 }
 
 impl AnyDatasetReader {
-    pub(super) fn from_source(source: &str) -> Self {
-        let view = open_dataset_view(source);
+    pub(super) fn from_source(source: &str, catalog: &crate::catalog::Catalog) -> Self {
+        let view = open_dataset_view(source, catalog);
         // Sparse access mode: don't prebuffer base_vectors at open
         // time. Reads route through the chunked-HTTP storage layer
         // (Storage::Cached or Storage::Http) which fetches 8 MiB

@@ -114,6 +114,16 @@ documentation's **Common tasks** table is the same index with examples.
   listing order). To serve entries from elsewhere, implement
   [`CatalogSource`](crate::catalog::CatalogSource). Do not merge entries
   into a catalog by hand: a name in two catalogs must stay ambiguous.
+- Open the explorer over a program's catalogs:
+  [`explore::run_with_sources`](crate::explore::run_with_sources) with the
+  `CatalogSources` you assembled. It lists and opens exactly those, and
+  an edit on its catalogs screen re-reads only the configured part
+  ([`reload_configured`](crate::catalog::CatalogSources::reload_configured)).
+- Build the catalogs a `datasets` command runs against:
+  [`datasets::build_sources`](crate::datasets::build_sources), then
+  [`RunSources::open`](crate::datasets::RunSources::open), which reports
+  every problem and fails only for a catalog named for the run. Do not
+  assemble `CatalogSources` per command.
 - Write the catalog files for a dataset tree:
   [`CatalogTree::scan`](crate::catalog::generate::CatalogTree::scan) then
   [`write`](crate::catalog::generate::CatalogTree::write) over

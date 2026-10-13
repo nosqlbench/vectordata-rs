@@ -238,11 +238,10 @@ fn catalogs_path() -> PathBuf {
     PathBuf::from(crate::catalog::sources::config_dir()).join("catalogs.yaml")
 }
 
+/// The configured catalogs, by name, as `catalogs.yaml` writes them:
+/// the one reading the config commands share with the catalog loader.
 fn load_catalog_entries() -> Vec<crate::catalog::sources::NamedCatalogSource> {
-    let path = catalogs_path();
-    if !path.is_file() { return Vec::new(); }
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    crate::catalog::sources::parse_named_catalogs(&content).unwrap_or_default()
+    crate::catalog::sources::named_catalog_entries(&crate::catalog::sources::config_dir())
 }
 
 // ── Comment-preserving textual edits ────────────────────────────────
@@ -649,8 +648,8 @@ pub fn set_update_check(value: &str) -> i32 {
 /// otherwise. Pure with respect to configuration — nothing is read
 /// from or written to `catalogs.yaml` — so it is directly testable
 /// against a fixture server.
-pub fn verify_catalog_source(source: &str) -> Result<usize, String> {
-    let sources = CatalogSources::new().add_catalogs(&[source.to_string()]);
+pub fn verify_catalog_source(name: &str, source: &str) -> Result<usize, String> {
+    let sources = CatalogSources::new().add_named_catalog(name, source);
     let catalog = crate::datasets::open_catalog(&sources);
     let count = catalog.datasets().len();
     if count == 0 {
@@ -713,7 +712,7 @@ pub fn try_add_catalog(source: &str, name: Option<&str>) -> Result<AddCatalogOut
         }
         None => derive_catalog_name(source, &taken),
     };
-    let count = verify_catalog_source(source).map_err(|e| format!("{source} — {e}"))?;
+    let count = verify_catalog_source(&name, source).map_err(|e| format!("{source} — {e}"))?;
     append_catalog_entry(&name, source)?;
     Ok(AddCatalogOutcome::Added { name, count })
 }

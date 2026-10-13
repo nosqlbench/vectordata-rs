@@ -1878,7 +1878,7 @@ fn resolve_spec(
         eprintln!("Add a catalog with: vectordata config catalog add <URL-or-path>");
         return None;
     }
-    let catalog = super::open_catalog(&sources);
+    let catalog = sources.open().ok()?;
     let entry = match catalog.lookup(head) {
         Ok(e) => e,
         Err(e) => {

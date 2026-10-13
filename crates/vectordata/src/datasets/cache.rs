@@ -164,22 +164,14 @@ pub fn run_cache_status(
     at: &[String],
 ) {
     use crate::merkle::MerkleState;
-    use crate::catalog::sources::CatalogSources;
 
     let cache_dir = configured_cache_dir_or_exit();
     let ds_cache = cache_dir.join(dataset_name);
 
     // Load catalog to get profile info
-    let mut sources = CatalogSources::new();
-    if !at.is_empty() {
-        sources = sources.add_catalogs(at);
-    } else {
-        sources = sources.configure(configdir);
-        if !extra_catalogs.is_empty() {
-            sources = sources.add_catalogs(extra_catalogs);
-        }
-    }
-    let catalog = super::open_catalog(&sources);
+    let catalog = super::build_sources(configdir, extra_catalogs, at)
+        .open()
+        .unwrap_or_else(|code| std::process::exit(code));
     let entry = catalog.find_exact(dataset_name);
 
     println!("Cache status: {}", dataset_name);

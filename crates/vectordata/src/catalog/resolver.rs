@@ -43,10 +43,11 @@ impl Catalog {
     /// `warn` level.
     pub fn of(sources: &CatalogSources) -> Self {
         let mut entries = Vec::new();
-        let mut diagnostics = sources.diagnostics().to_vec();
+        let mut diagnostics = sources.diagnostics();
         let mut origins = Vec::new();
         for (source, requirement) in sources.iter() {
             let origin = source.origin();
+            let first_own = diagnostics.len();
             match source.entries(&mut diagnostics) {
                 // The one place an entry learns which configured catalog
                 // it came from, so the picker's catalog screen and
@@ -59,6 +60,9 @@ impl Catalog {
                     diagnostics.push(CatalogDiagnostic::error(nothing_at(&origin)));
                 }
                 None => log::debug!("optional catalog '{}': {}", source.name(), nothing_at(&origin)),
+            }
+            for d in &mut diagnostics[first_own..] {
+                d.catalog.get_or_insert_with(|| source.name().to_string());
             }
             origins.push((source.name().to_string(), origin));
         }

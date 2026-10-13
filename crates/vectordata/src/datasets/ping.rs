@@ -21,7 +21,6 @@
 
 use crate::catalog::resolver::Catalog;
 #[cfg(feature = "cli")]
-use crate::catalog::sources::CatalogSources;
 #[cfg(feature = "cli")]
 use crate::dataset::selector::DatasetSpec;
 
@@ -47,19 +46,12 @@ pub struct PingArgs {
 
 /// Drive `ping` from a parsed [`PingArgs`].
 #[cfg(feature = "cli")]
-pub fn run_args(args: PingArgs, configdir: &str, catalog: &[String], at_extra: &[String]) -> i32 {
-    let sources = if let Some(at) = args.at {
-        // --at pins ping to a single catalog source. The user is
-        // saying "verify the dataset *here*", so don't expand back
-        // out to every configured catalog. Numbered shortcuts
-        // (`--at 2`) resolve against the configured list.
-        CatalogSources::new().add_catalogs(&super::catalog_args(std::slice::from_ref(&at)))
-    } else {
-        CatalogSources::new()
-            .configure(configdir)
-            .add_catalogs(&super::catalog_args(catalog))
-            .add_catalogs(&super::catalog_args(at_extra))
-    };
+pub fn run_args(args: PingArgs, configdir: &str, catalog: &[String]) -> i32 {
+    // `--at` pins the command to the catalogs it names, numbered
+    // shortcuts (`--at 2`) included, by the one assembly every
+    // command uses.
+    let at: Vec<String> = args.at.iter().cloned().collect();
+    let sources = super::build_sources(configdir, catalog, &at);
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
         eprintln!();
@@ -77,7 +69,10 @@ pub fn run_args(args: PingArgs, configdir: &str, catalog: &[String], at_extra: &
     let selector = args
         .profile
         .or_else(|| spec.selector.as_ref().map(|s| s.text().to_string()));
-    let cat = super::open_catalog(&sources);
+    let cat = match sources.open() {
+        Ok(cat) => cat,
+        Err(code) => return code,
+    };
     run_via_catalog(&cat, &spec.head, selector.as_deref())
 }
 

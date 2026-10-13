@@ -879,7 +879,7 @@ good-ds:
   gt: ds/gt.ivecs
 "#
     )).unwrap();
-    let n = vectordata::config::verify_catalog_source(&format!("{base}/live/knn_entries.yaml"))
+    let n = vectordata::config::verify_catalog_source("lab", &format!("{base}/live/knn_entries.yaml"))
         .expect("live endpoint must verify");
     assert_eq!(n, 1);
 
@@ -897,12 +897,12 @@ ghost-ds:
   gt: ds/gt.ivecs
 "#
     )).unwrap();
-    let err = vectordata::config::verify_catalog_source(&format!("{base}/dead/knn_entries.yaml"))
+    let err = vectordata::config::verify_catalog_source("lab", &format!("{base}/dead/knn_entries.yaml"))
         .expect_err("dead data endpoint must be refused");
     assert!(err.contains("catalog ping failed"), "unexpected refusal: {err}");
 
     // Unreachable / empty location: refused at the parse stage.
-    let err = vectordata::config::verify_catalog_source(&format!("{base}/absent/"))
+    let err = vectordata::config::verify_catalog_source("lab", &format!("{base}/absent/"))
         .expect_err("missing catalog must be refused");
     assert!(err.contains("no datasets"), "unexpected refusal: {err}");
 }

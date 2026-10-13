@@ -34,8 +34,31 @@ pub const DEFAULT_CONFIG_DIR: &str = "~/.config/vectordata";
 /// of them is ambiguous, whichever kinds they are.
 #[derive(Clone, Default)]
 pub struct CatalogSources {
-    sources: Vec<(Arc<dyn CatalogSource>, Requirement)>,
-    /// Problems met while reading configuration and locations.
+    sources: Vec<Slot>,
+    /// Each `configure*` call, so [`reload_configured`](Self::reload_configured)
+    /// can read its `catalogs.yaml` again.
+    configured: Vec<Configured>,
+    /// Problems met resolving locations given directly.
+    diagnostics: Vec<super::CatalogDiagnostic>,
+}
+
+/// One catalog in the set.
+#[derive(Clone)]
+struct Slot {
+    source: Arc<dyn CatalogSource>,
+    requirement: Requirement,
+    /// The `configure*` call it came from, by index into `configured`.
+    from_config: Option<usize>,
+}
+
+/// One `configure*` call: which directory's `catalogs.yaml`, how its
+/// catalogs are required, and what reading it reported.
+#[derive(Clone)]
+struct Configured {
+    dir: String,
+    requirement: Requirement,
+    /// `configure_optional`: a directory with no `catalogs.yaml` says nothing.
+    quiet_if_absent: bool,
     diagnostics: Vec<super::CatalogDiagnostic>,
 }
 
@@ -45,12 +68,11 @@ impl std::fmt::Debug for CatalogSources {
             .field(
                 "sources",
                 &self
-                    .sources
                     .iter()
-                    .map(|(s, r)| (s.name().to_string(), s.origin().to_string(), *r))
+                    .map(|(s, r)| (s.name().to_string(), s.origin().to_string(), r))
                     .collect::<Vec<_>>(),
             )
-            .field("diagnostics", &self.diagnostics)
+            .field("diagnostics", &self.diagnostics())
             .finish()
     }
 }
@@ -77,14 +99,12 @@ impl CatalogSources {
     /// [`diagnostics`](Self::diagnostics). The env-free seam behind
     /// [`Self::configure_default`].
     pub fn configure_optional(mut self, config_dir: &str) -> Self {
-        let config_dir = expand_tilde(config_dir);
-        if !Path::new(&config_dir).join("catalogs.yaml").is_file() {
-            return self;
-        }
-        match load_config(&config_dir, &mut self.diagnostics) {
-            Ok(located) => self.extend_located(located, Requirement::Optional),
-            Err(e) => self.diagnostics.push(super::CatalogDiagnostic::warning(e)),
-        }
+        self.add_configured(Configured {
+            dir: expand_tilde(config_dir),
+            requirement: Requirement::Optional,
+            quiet_if_absent: true,
+            diagnostics: Vec::new(),
+        });
         self
     }
 
@@ -94,12 +114,52 @@ impl CatalogSources {
     /// read, records a warning in [`diagnostics`](Self::diagnostics) and
     /// continues.
     pub fn configure(mut self, config_dir: &str) -> Self {
-        let config_dir = expand_tilde(config_dir);
-        match load_config(&config_dir, &mut self.diagnostics) {
-            Ok(located) => self.extend_located(located, Requirement::Required),
-            Err(e) => self.diagnostics.push(super::CatalogDiagnostic::warning(e)),
-        }
+        self.add_configured(Configured {
+            dir: expand_tilde(config_dir),
+            requirement: Requirement::Required,
+            quiet_if_absent: false,
+            diagnostics: Vec::new(),
+        });
         self
+    }
+
+    /// Read a `configure*` call's `catalogs.yaml` and add its catalogs.
+    fn add_configured(&mut self, mut configured: Configured) {
+        let index = self.configured.len();
+        let absent = !Path::new(&configured.dir).join("catalogs.yaml").is_file();
+        if !(absent && configured.quiet_if_absent) {
+            match load_config(&configured.dir, &mut configured.diagnostics) {
+                Ok(located) => self.extend_located(located, configured.requirement, Some(index)),
+                Err(e) => configured.diagnostics.push(super::CatalogDiagnostic::warning(e)),
+            }
+        }
+        self.configured.push(configured);
+    }
+
+    /// The same set with every `catalogs.yaml` it was configured from read
+    /// again, as after an edit to one: configured catalogs are replaced
+    /// where they stood, and every other catalog (a program's, or one
+    /// given by location) is kept as it is.
+    pub fn reload_configured(&self) -> Self {
+        let mut out = CatalogSources { diagnostics: self.diagnostics.clone(), ..CatalogSources::default() };
+        let mut reread = vec![false; self.configured.len()];
+        for slot in &self.sources {
+            match slot.from_config {
+                None => out.sources.push(Slot { from_config: None, ..slot.clone() }),
+                Some(k) if !reread[k] => {
+                    reread[k] = true;
+                    out.add_configured(Configured { diagnostics: Vec::new(), ..self.configured[k].clone() });
+                }
+                Some(_) => {}
+            }
+        }
+        // A configuration that gave no catalogs before may give some now.
+        for (k, configured) in self.configured.iter().enumerate() {
+            if !reread[k] {
+                out.add_configured(Configured { diagnostics: Vec::new(), ..configured.clone() });
+            }
+        }
+        out
     }
 
     /// A catalog the program supplies, required: one built with
@@ -107,33 +167,40 @@ impl CatalogSources {
     /// or the program's own [`CatalogSource`]. It takes its place in
     /// order after the catalogs already added.
     pub fn with(mut self, source: impl CatalogSource + 'static) -> Self {
-        self.sources.push((Arc::new(source), Requirement::Required));
+        self.sources.push(Slot { source: Arc::new(source), requirement: Requirement::Required, from_config: None });
         self
     }
 
     /// A catalog the program supplies, optional: one that gives no
     /// catalog at all is not an error.
     pub fn with_optional(mut self, source: impl CatalogSource + 'static) -> Self {
-        self.sources.push((Arc::new(source), Requirement::Optional));
+        self.sources.push(Slot { source: Arc::new(source), requirement: Requirement::Optional, from_config: None });
         self
     }
 
     /// The catalogs, in order, each with whether it must load.
     pub fn iter(&self) -> impl Iterator<Item = (&dyn CatalogSource, Requirement)> + '_ {
-        self.sources.iter().map(|(s, r)| (s.as_ref(), *r))
+        self.sources.iter().map(|slot| (slot.source.as_ref(), slot.requirement))
     }
 
-    fn extend_located(&mut self, located: Vec<LocatedCatalog>, requirement: Requirement) {
-        self.sources
-            .extend(located.into_iter().map(|l| (Arc::new(l) as Arc<dyn CatalogSource>, requirement)));
+    fn extend_located(&mut self, located: Vec<LocatedCatalog>, requirement: Requirement, from_config: Option<usize>) {
+        self.sources.extend(located.into_iter().map(|l| Slot {
+            source: Arc::new(l) as Arc<dyn CatalogSource>,
+            requirement,
+            from_config,
+        }));
     }
 
     /// Problems met while reading configuration and resolving
     /// locations, such as a directory with no catalog file in it.
     /// [`Catalog::of`](super::Catalog::of) carries these forward into
     /// its own [`diagnostics`](super::Catalog::diagnostics).
-    pub fn diagnostics(&self) -> &[super::CatalogDiagnostic] {
-        &self.diagnostics
+    pub fn diagnostics(&self) -> Vec<super::CatalogDiagnostic> {
+        self.configured
+            .iter()
+            .flat_map(|c| c.diagnostics.iter().cloned())
+            .chain(self.diagnostics.iter().cloned())
+            .collect()
     }
 
     /// Add required catalog locations.
@@ -154,8 +221,22 @@ impl CatalogSources {
                     Found::Configured(located) => located,
                     Found::Bare(location) => LocatedCatalog::as_written(self.synthesize_name(), location, None),
                 };
-                self.extend_located(vec![located], requirement);
+                self.extend_located(vec![located], requirement, None);
             }
+        }
+        self
+    }
+
+    /// Add the catalog at `path` under `name`, required. A directory
+    /// holding its own `catalogs.yaml` adds the catalogs that file names,
+    /// under its names, as [`add_catalogs`](Self::add_catalogs) does.
+    pub fn add_named_catalog(mut self, name: &str, path: &str) -> Self {
+        for found in resolve_catalog_path(&expand_tilde(path), &mut self.diagnostics) {
+            let located = match found {
+                Found::Configured(located) => located,
+                Found::Bare(location) => LocatedCatalog::as_written(name, location, None),
+            };
+            self.extend_located(vec![located], Requirement::Required, None);
         }
         self
     }
@@ -164,7 +245,7 @@ impl CatalogSources {
     /// (ad-hoc CLI locations): the next free stringified index,
     /// matching the promotion rule for legacy list files.
     fn synthesize_name(&self) -> String {
-        let taken: std::collections::HashSet<&str> = self.sources.iter().map(|(s, _)| s.name()).collect();
+        let taken: std::collections::HashSet<&str> = self.iter().map(|(s, _)| s.name()).collect();
         let mut n = self.sources.len();
         loop {
             let candidate = n.to_string();
@@ -699,6 +780,40 @@ mod tests {
             ("near".to_string(), "https://example.com/near/".to_string()),
             ("deep".to_string(), deep.to_str().unwrap().to_string()),
         ]);
+    }
+
+    /// **A reload re-reads the configured catalogs and keeps the rest**:
+    /// after an edit to `catalogs.yaml`, the explorer's set has the new
+    /// configured catalogs where the old ones stood, and the program's
+    /// catalog is still there (SRD RC-21).
+    #[test]
+    fn a_reload_rereads_the_configuration_and_keeps_the_programs_catalogs() {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["one", "two"] {
+            std::fs::create_dir_all(tmp.path().join(d)).unwrap();
+            std::fs::write(tmp.path().join(d).join("catalog.json"), "[]").unwrap();
+        }
+        let config = tmp.path().to_string_lossy().into_owned();
+        std::fs::write(tmp.path().join("catalogs.yaml"), "one: one\n").unwrap();
+        let program = super::super::CatalogBuilder::named("mine").build();
+        let sources = CatalogSources::new().with(program).configure(&config);
+        let names = |s: &CatalogSources| s.iter().map(|(c, _)| c.name().to_string()).collect::<Vec<_>>();
+        assert_eq!(names(&sources), ["mine", "one"]);
+
+        std::fs::write(tmp.path().join("catalogs.yaml"), "one: one\ntwo: two\n").unwrap();
+        let reloaded = sources.reload_configured();
+        assert_eq!(names(&reloaded), ["mine", "one", "two"]);
+        assert_eq!(names(&sources), ["mine", "one"], "the old set is unchanged");
+    }
+
+    /// **A catalog added under a name keeps it**, so what verifies it
+    /// and what it reports say the name the user chose, not a number.
+    #[test]
+    fn a_catalog_added_under_a_name_keeps_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("catalog.json"), "[]").unwrap();
+        let sources = CatalogSources::new().add_named_catalog("lab", &tmp.path().to_string_lossy());
+        assert_eq!(listed(&sources, Requirement::Required)[0].0, "lab");
     }
 
     #[test]

@@ -1219,3 +1219,75 @@ nested group of two.
   `each_level_lists_the_datasets_below_it`,
   `knn_entries_name_the_files_under_the_publish_url` and
   `a_tree_through_a_symlink_keeps_its_logical_path`.
+
+### 12.8 Step 8: one source assembly, the explorer over the program's catalogs (2026-10-13)
+
+**Found first.**
+- **No assembly knew which catalogs the user named for the run,** and
+  no diagnostic knew which catalog it concerned. So "fail for a catalog
+  named with `--at`, report the rest" (§11 item 4) had nothing to act
+  on.
+- **`describe` and `ping` read `--at` two ways.** The subcommand's
+  `--at` pinned the catalogs, and an `at_extra` argument added to the
+  configured ones. Every caller passed `at_extra` empty.
+- **Every explorer action fetched the catalogs again.** Visualize,
+  download, purge and ping each built their own
+  `configure_default()` set, so an embedder's catalogs could not reach
+  them.
+
+**Built:**
+- **`CatalogDiagnostic::catalog`** names the catalog a problem concerns.
+  `Catalog::of` fills it in for what each source reports.
+- **`datasets::build_sources` returns `RunSources`** (RC-18): the
+  sources, plus which ones `--at`/`--catalog` named.
+  - `RunSources::open` prints every problem, and returns `Err(1)` only
+    when a catalog named for the run reported an error.
+  - `list`, `precache`, `derive`, `cache`, `describe`, `ping`,
+    `veks datasets ping` and shell completion all use it. Completion
+    opens it silently.
+  - The inline copies in `cache.rs`, `describe.rs`, `ping.rs`,
+    `dyncomp.rs` and `veks/src/datasets` are gone, and so is `at_extra`.
+- **`CatalogSources::reload_configured`** (RC-21) re-reads every
+  `catalogs.yaml` the set was configured from, replacing those catalogs
+  where they stood and keeping every other one. `diagnostics()` now
+  returns a `Vec`, because configuration problems are kept per
+  `configure*` call so a reload can replace them.
+- **`CatalogSources::add_named_catalog`.** `verify_catalog_source(name,
+  source)` checks a new catalog under the name the user chose (B-7).
+  `config.rs` reads `catalogs.yaml` through `named_catalog_entries`, as
+  the loader does (RC-22).
+- **The explorer takes the program's catalogs** (RC-19):
+  - `explore::run` assembles them as the CLI does and calls
+    `run_with_sources`, which an embedder calls with its own set;
+  - each pass opens the catalog once, and the picker, visualize,
+    download (`PrecacheRequest::catalog`), purge and ping all use it;
+  - after an edit, the loop reloads only the configured part.
+- **The catalogs screen is the set** (RC-20, `CatalogScreen::of`):
+  - every catalog in order, with its location and count, a nested
+    `catalogs.yaml`'s catalogs included (B-6);
+  - a catalog with load problems is marked `✗`, with its messages under
+    it, and the status line opens on the first problem;
+  - only the user's own `catalogs.yaml` entries can be edited or
+    removed. A program's catalog shows "provided by the program —
+    read-only", and a nested one says which file names it.
+- **Purge looks its dataset up through `Catalog::lookup`** (B-5),
+  case-insensitively, refusing an ambiguous name.
+
+**Behaviour changes:**
+- **A failed `--at`/`--catalog` catalog exits with status 1**, for every
+  `datasets` command.
+- **The explorer reports configured catalogs that fail to load.** It no
+  longer re-fetches catalogs for each action.
+- **Order:** the catalogs screen lists catalogs in the set's order,
+  rather than "with datasets first, the rest sorted".
+
+**Guards:**
+- B-6 and B-5 were each run against the previous code's own data
+  source and comparison, in a split-check worktree; both failed there.
+  - B-6: `the_catalogs_screen_lists_the_whole_set`. The old screen's
+    `named_catalog_entries` map had no `deep`.
+  - B-5: `a_purge_finds_its_dataset_whatever_its_case`. The old `name ==`
+    comparison missed `mixedcase`.
+- Also: `only_a_catalog_named_for_the_run_fails_the_command`,
+  `a_reload_rereads_the_configuration_and_keeps_the_programs_catalogs`
+  and `a_catalog_added_under_a_name_keeps_it` (B-7).

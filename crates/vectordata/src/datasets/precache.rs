@@ -77,6 +77,10 @@ pub struct PrecacheRequest {
     /// the fallback is something the caller says yes to rather than
     /// something they discover afterwards.
     pub allow_whole_facet: bool,
+    /// A catalog already opened to look the dataset up in, in place of
+    /// the one `configdir` / `extra_catalogs` / `at` describe: the
+    /// explorer's, so a download from it sees the catalogs it lists.
+    pub catalog: Option<Catalog>,
 }
 
 impl PrecacheRequest {
@@ -170,6 +174,8 @@ pub fn run(req: PrecacheRequest) -> i32 {
     // use them would be wasted round trips.
     let catalog = if crate::transport::is_remote_url(&head) || Path::new(&head).exists() {
         Catalog::default()
+    } else if let Some(catalog) = req.catalog.clone() {
+        catalog
     } else {
         let sources = build_sources(&req.configdir, &req.extra_catalogs, &req.at);
         if sources.is_empty() {
@@ -179,7 +185,10 @@ pub fn run(req: PrecacheRequest) -> i32 {
             eprintln!("Or use --catalog/--at for one-off access.");
             return 1;
         }
-        super::open_catalog(&sources)
+        match sources.open() {
+            Ok(catalog) => catalog,
+            Err(code) => return code,
+        }
     };
     let selection = match catalog.open_selection(&head, Some(&selector)) {
         Ok(s) => s,

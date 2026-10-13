@@ -228,13 +228,27 @@ fn resolve_input(
     })
 }
 
-/// Launch the unified explore TUI. When no source is supplied, the
-/// catalog picker pops first; each picker selection routes through a
-/// per-row action menu (visualize / precache / purge / ping). Actions
-/// run in-place with the picker's chrome temporarily suspended so the
-/// picker's UI state — cursor, expanded set, filter, scroll, last
-/// menu cursor — is preserved across every action.
+/// Launch the unified explore TUI over the configured catalogs: the
+/// `vectordata explore` command. See [`run_with_sources`].
 pub fn run(args: ExploreArgs) -> i32 {
+    let run = crate::datasets::build_sources(&crate::catalog::sources::config_dir(), &[], &[]);
+    run_with_sources(args, run.sources().clone())
+}
+
+/// Launch the unified explore TUI over `sources`: the catalogs a
+/// program assembled, which may include its own
+/// ([`CatalogSources::with`](crate::catalog::CatalogSources::with)).
+/// The explorer lists and opens exactly these; it never reads the
+/// configured catalogs on its own.
+///
+/// When no source is supplied, the catalog picker pops first; each
+/// picker selection routes through a per-row action menu (visualize /
+/// precache / purge / ping). Actions run in-place with the picker's
+/// chrome temporarily suspended so the picker's UI state — cursor,
+/// expanded set, filter, scroll, last menu cursor — is preserved across
+/// every action. An edit to `catalogs.yaml` on the catalogs screen
+/// re-reads the configured catalogs and keeps the program's.
+pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogSources) -> i32 {
     use dataset_picker::{ActionFlow, PickerAction, PickerOutcome};
 
     let original_hook = std::panic::take_hook();
@@ -270,8 +284,15 @@ pub fn run(args: ExploreArgs) -> i32 {
     if dataset.is_some() || source.is_some() {
         let src = resolve_input(dataset, source, profile)
             .expect("guarded above: at least one of --dataset/--source is set here");
+        // Catalogs are read only for a source that names a dataset in one.
+        let catalog = if shared::names_catalog_dataset(&src) {
+            crate::datasets::open_catalog(&sources)
+        } else {
+            crate::catalog::Catalog::default()
+        };
         return match unified::run_interactive_explore(
             &src,
+            &catalog,
             sample,
             seed,
             sample_mode,
@@ -297,6 +318,10 @@ pub fn run(args: ExploreArgs) -> i32 {
     // result. The first run starts on the dataset list.
     let mut start_in_settings = false;
     loop {
+        // One catalog per pass, its problems printed before the picker
+        // takes the screen; the picker shows them on its status line, and
+        // every action looks datasets up in this same catalog.
+        let catalog = crate::datasets::open_catalog(&sources);
         let dispatch = |specifier: &str, action: PickerAction, pause: bool| -> ActionFlow {
             match action {
                 PickerAction::Visualize => {
@@ -305,6 +330,7 @@ pub fn run(args: ExploreArgs) -> i32 {
                     let _ = pause;
                     match unified::run_interactive_explore(
                         specifier,
+                        &catalog,
                         sample,
                         seed,
                         sample_mode,
@@ -320,15 +346,15 @@ pub fn run(args: ExploreArgs) -> i32 {
                     ActionFlow::Stay
                 }
                 PickerAction::Download => {
-                    run_precache(specifier, pause);
+                    run_precache(specifier, &catalog, pause);
                     ActionFlow::Stay
                 }
                 PickerAction::Purge => {
-                    run_purge(specifier, pause);
+                    run_purge(specifier, &catalog, pause);
                     ActionFlow::Stay
                 }
                 PickerAction::Ping => {
-                    run_ping(specifier, pause);
+                    run_ping(specifier, &catalog, pause);
                     ActionFlow::Stay
                 }
                 PickerAction::Describe | PickerAction::Source => {
@@ -341,11 +367,12 @@ pub fn run(args: ExploreArgs) -> i32 {
                 }
             }
         };
-        match dataset_picker::run_picker(dispatch, start_in_settings) {
+        match dataset_picker::run_picker(&sources, &catalog, dispatch, start_in_settings) {
             PickerOutcome::Done => return 0,
             PickerOutcome::Failed => return 1,
             PickerOutcome::Reload => {
                 start_in_settings = true;
+                sources = sources.reload_configured();
             }
         }
     }
@@ -409,7 +436,7 @@ fn pause_for_keypress() {
     let _ = std::io::stdin().read_line(&mut buf);
 }
 
-fn run_precache(specifier: &str, pause: bool) {
+fn run_precache(specifier: &str, catalog: &crate::catalog::Catalog, pause: bool) {
     // Picker-initiated precache drives the *highlighted profile only*.
     // Earlier this stripped the `:profile` suffix and walked every
     // profile via `ProfileSelection::AllProfiles`, but for datasets
@@ -429,10 +456,10 @@ fn run_precache(specifier: &str, pause: bool) {
     // own bytes and need to be precached explicitly — but that's
     // what the picker rows are for: the user highlights the partition
     // profile and runs precache against it directly.
-    let code = crate::datasets::precache::run(crate::datasets::precache::PrecacheRequest::all(
-        specifier,
-        &crate::catalog::sources::config_dir(),
-    ));
+    let code = crate::datasets::precache::run(crate::datasets::precache::PrecacheRequest {
+        catalog: Some(catalog.clone()),
+        ..crate::datasets::precache::PrecacheRequest::all(specifier, &crate::catalog::sources::config_dir())
+    });
     if code != 0 {
         eprintln!("(precache exited with status {code})");
     }
@@ -441,7 +468,20 @@ fn run_precache(specifier: &str, pause: bool) {
     }
 }
 
-fn run_purge(specifier: &str, pause: bool) {
+/// The dataset a purge acts on and the profiles its selector names,
+/// looked up as every surface looks a name up: case-insensitively, and
+/// an ambiguous name is refused with the catalogs it is in.
+fn purge_target(
+    catalog: &crate::catalog::Catalog,
+    dataset: &str,
+    selector: Option<&str>,
+) -> Result<(crate::dataset::CatalogEntry, Vec<String>), String> {
+    let entry = catalog.lookup(dataset).map_err(|e| e.to_string())?;
+    let selected = entry.select(selector).map_err(|e| format!("dataset '{dataset}': {e}"))?;
+    Ok((entry.clone(), selected))
+}
+
+fn run_purge(specifier: &str, catalog: &crate::catalog::Catalog, pause: bool) {
     // Purge acts on the profiles the selector names (PS-9): a file is
     // removed only when no unmatched profile references it, so the
     // base every profile shares survives a purge of one, and
@@ -458,22 +498,10 @@ fn run_purge(specifier: &str, pause: bool) {
             return;
         }
     };
-    let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-    let catalog = crate::datasets::open_catalog(&sources);
-    let entry = match catalog.datasets().iter().find(|e| e.name() == dataset) {
-        Some(e) => e.clone(),
-        None => {
-            eprintln!("error: dataset '{dataset}' not found in any configured catalog");
-            if pause {
-                pause_for_keypress();
-            }
-            return;
-        }
-    };
-    let selected = match entry.select(selector.as_deref()) {
-        Ok(names) => names,
+    let (entry, selected) = match purge_target(catalog, &dataset, selector.as_deref()) {
+        Ok(target) => target,
         Err(e) => {
-            eprintln!("error: dataset '{dataset}': {e}");
+            eprintln!("error: {e}");
             if pause {
                 pause_for_keypress();
             }
@@ -525,7 +553,7 @@ pub(crate) fn format_bytes_short(n: u64) -> String {
     }
 }
 
-fn run_ping(specifier: &str, pause: bool) {
+fn run_ping(specifier: &str, catalog: &crate::catalog::Catalog, pause: bool) {
     let (dataset, selector) = match split_specifier(specifier) {
         Ok(split) => split,
         Err(e) => {
@@ -536,12 +564,9 @@ fn run_ping(specifier: &str, pause: bool) {
             return;
         }
     };
-    // Use the same union catalog the picker built its row list from
-    // so a ping from inside the picker hits exactly the catalogs the
-    // user can see.
-    let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-    let catalog = crate::datasets::open_catalog(&sources);
-    let code = crate::datasets::ping::run_via_catalog(&catalog, &dataset, selector.as_deref());
+    // The catalog the picker built its row list from, so a ping from
+    // inside the picker hits exactly the catalogs the user can see.
+    let code = crate::datasets::ping::run_via_catalog(catalog, &dataset, selector.as_deref());
     if code != 0 {
         eprintln!("(ping exited with status {code})");
     }
@@ -563,6 +588,29 @@ fn run_ping(specifier: &str, pause: bool) {
 #[cfg(test)]
 mod tests {
     use super::locate_lines;
+
+    /// **A purge finds its dataset as every surface does**,
+    /// case-insensitively. The explorer compared names exactly, so a
+    /// dataset `catalog.lookup` found was "not found" here.
+    #[test]
+    fn a_purge_finds_its_dataset_whatever_its_case() {
+        let entry = crate::dataset::CatalogEntry::builder("MixedCase")
+            .home(&crate::Location::parse("https://h/MixedCase/").unwrap())
+            .dataset(
+                crate::dataset::DatasetConfig::builder("MixedCase")
+                    .profile("default", |p| p)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let sources = crate::catalog::CatalogSources::new()
+            .with(crate::catalog::CatalogBuilder::named("c").entry(entry).build());
+        let catalog = crate::catalog::Catalog::of(&sources);
+        let (entry, selected) = super::purge_target(&catalog, "mixedcase", None).unwrap();
+        assert_eq!(entry.name(), "MixedCase");
+        assert_eq!(selected, ["default"]);
+    }
 
     /// Locate prints a commented per-dataset header, then the cache
     /// directory when present or a `#`-commented note when not — so

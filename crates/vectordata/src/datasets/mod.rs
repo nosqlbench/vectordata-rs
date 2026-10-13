@@ -39,28 +39,77 @@ pub mod ping;
 
 use crate::catalog::sources::{self, CatalogSources};
 
-/// Build [`CatalogSources`] from the `--configdir` / `--catalog` /
-/// `--at` trio shared by the datasets subcommands. `--at` locations
-/// override the configured catalogs entirely; otherwise `configdir`'s
-/// `catalogs.yaml` is loaded and any `--catalog` extras appended.
+/// The catalogs a command runs against: what [`build_sources`] gives,
+/// remembering which catalogs the user named for this run.
+#[derive(Debug, Clone)]
+pub struct RunSources {
+    sources: CatalogSources,
+    named: Vec<String>,
+}
+
+impl RunSources {
+    /// The sources, for a caller that opens the catalog itself (shell
+    /// completion, which must print nothing).
+    pub fn sources(&self) -> &CatalogSources {
+        &self.sources
+    }
+
+    /// Whether there is no catalog at all to read.
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
+    /// Open the catalogs, printing every problem to stderr (SRD §11,
+    /// item 4): a configured catalog that fails to load is reported and
+    /// the command carries on with the others. A catalog the user named
+    /// for this run (`--at`, `--catalog`) that fails to load is an
+    /// error: `Err` carries the exit status.
+    pub fn open(&self) -> Result<crate::catalog::Catalog, i32> {
+        let catalog = open_catalog(&self.sources);
+        let failed: Vec<&str> = catalog
+            .diagnostics()
+            .iter()
+            .filter(|d| d.severity == crate::catalog::Severity::Error)
+            .filter_map(|d| d.catalog.as_deref())
+            .filter(|name| self.named.iter().any(|n| n == name))
+            .collect();
+        match failed.first() {
+            None => Ok(catalog),
+            Some(name) => {
+                eprintln!("error: catalog '{name}', named for this run, could not be loaded");
+                Err(1)
+            }
+        }
+    }
+}
+
+/// Build the catalogs a `datasets` command runs against, from the
+/// `--configdir` / `--catalog` / `--at` trio: the one assembly every
+/// command uses. `--at` locations replace the configured catalogs;
+/// otherwise `configdir`'s `catalogs.yaml` is read and any `--catalog`
+/// locations follow it. Catalogs given by `--at` or `--catalog` are
+/// [named for the run](RunSources::open).
 ///
 /// Numbered catalog shortcuts (`--at 2`, `--catalog 1`) resolve
 /// against the configured list in every position — this seam is what
 /// makes the shortcuts work identically from every binary that
 /// dispatches into this module.
-pub fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> CatalogSources {
+pub fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> RunSources {
     let at = catalog_args(at);
     let extra_catalogs = catalog_args(extra_catalogs);
-    let mut built = CatalogSources::new();
-    if !at.is_empty() {
-        built = built.add_catalogs(&at);
+    let (configured, named) = if at.is_empty() {
+        (CatalogSources::new().configure(configdir), extra_catalogs)
     } else {
-        built = built.configure(configdir);
-        if !extra_catalogs.is_empty() {
-            built = built.add_catalogs(&extra_catalogs);
-        }
-    }
-    built
+        (CatalogSources::new(), at)
+    };
+    let before: Vec<String> = configured.iter().map(|(s, _)| s.name().to_string()).collect();
+    let sources = configured.add_catalogs(&named);
+    let named = sources
+        .iter()
+        .map(|(s, _)| s.name().to_string())
+        .filter(|name| !before.contains(name))
+        .collect();
+    RunSources { sources, named }
 }
 
 /// Resolve `--at`/`--catalog` values, numbered shortcuts included,
@@ -126,3 +175,33 @@ fn print_dataset_with_profiles(entry: &crate::dataset::CatalogEntry) {
         eprintln!("  - {} (profiles: {})", entry.name(), profiles.join(", "));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config directory whose `catalogs.yaml` names `lab`, a location
+    /// with no catalog there.
+    fn config_naming_a_missing_catalog(dir: &std::path::Path) -> String {
+        let missing = dir.join("missing");
+        std::fs::write(dir.join("catalogs.yaml"), format!("lab: {}\n", missing.display())).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// **A configured catalog that fails to load is reported, and the
+    /// command goes on; one named for the run is an error** (SRD §11,
+    /// item 4). Each problem names the catalog it concerns.
+    #[test]
+    fn only_a_catalog_named_for_the_run_fails_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_naming_a_missing_catalog(dir.path());
+        let configured = build_sources(&config, &[], &[]).open().expect("a broken configured catalog is reported only");
+        let problem = configured.diagnostics().iter().find(|d| d.catalog.as_deref() == Some("lab"));
+        assert!(problem.is_some(), "{:?}", configured.diagnostics());
+
+        let missing = dir.path().join("also-missing").to_string_lossy().into_owned();
+        assert_eq!(build_sources(&config, &[], std::slice::from_ref(&missing)).open().err(), Some(1), "--at");
+        assert_eq!(build_sources(&config, std::slice::from_ref(&missing), &[]).open().err(), Some(1), "--catalog");
+    }
+}
+

@@ -563,13 +563,13 @@ pub fn run(args: DatasetsArgs) {
             // Ping now goes through the unified resolver; --at pins the
             // search to that catalog, otherwise every configured one is
             // in play and the dataset is looked up against the union.
-            let sources = if at.is_empty() {
-                crate::catalog::sources::CatalogSources::new().configure_default()
-            } else {
-                let resolved: Vec<String> = vectordata::datasets::catalog_args(&at);
-                crate::catalog::sources::CatalogSources::new().add_catalogs(&resolved)
-            };
-            let catalog = crate::catalog::resolver::Catalog::of(&sources);
+            let catalog = vectordata::datasets::build_sources(
+                &crate::catalog::sources::config_dir(),
+                &[],
+                &at,
+            )
+            .open()
+            .unwrap_or_else(|code| std::process::exit(code));
             let spec = match vectordata::dataset::selector::DatasetSpec::parse(&dataset) {
                 Ok(s) => s,
                 Err(e) => {
@@ -707,6 +707,7 @@ pub fn run(args: DatasetsArgs) {
                 window,
                 plan_only: plan,
                 allow_whole_facet,
+                catalog: None,
             });
         }
     }

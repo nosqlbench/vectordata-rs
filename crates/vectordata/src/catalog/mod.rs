@@ -42,6 +42,11 @@ pub struct CatalogDiagnostic {
     pub severity: Severity,
     /// What happened, naming the location involved.
     pub message: String,
+    /// The catalog it concerns, by its name in the
+    /// [`CatalogSources`] set; `None` for a problem with the
+    /// configuration itself, such as an unreadable `catalogs.yaml`.
+    /// [`Catalog::of`] records it.
+    pub catalog: Option<String>,
 }
 
 /// How serious a [`CatalogDiagnostic`] is.
@@ -56,12 +61,12 @@ pub enum Severity {
 impl CatalogDiagnostic {
     /// Something was skipped; what loaded is still usable.
     pub fn warning(message: impl Into<String>) -> Self {
-        CatalogDiagnostic { severity: Severity::Warning, message: message.into() }
+        CatalogDiagnostic { severity: Severity::Warning, message: message.into(), catalog: None }
     }
 
     /// A catalog, or part of one, could not be loaded.
     pub fn error(message: impl Into<String>) -> Self {
-        CatalogDiagnostic { severity: Severity::Error, message: message.into() }
+        CatalogDiagnostic { severity: Severity::Error, message: message.into(), catalog: None }
     }
 }
 

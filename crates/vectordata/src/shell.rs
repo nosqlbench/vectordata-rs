@@ -714,12 +714,12 @@ pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
                     args,
                     configdir,
                     catalog,
-                } => crate::datasets::ping::run_args(args, &configdir, &catalog, &[]),
+                } => crate::datasets::ping::run_args(args, &configdir, &catalog),
                 DatasetsCmd::Describe {
                     args,
                     configdir,
                     catalog,
-                } => crate::datasets::describe::run_args(args, &configdir, &catalog, &[]),
+                } => crate::datasets::describe::run_args(args, &configdir, &catalog),
                 DatasetsCmd::Curlify(args) => crate::datasets::curlify::run_args(args),
                 DatasetsCmd::Push(args) => crate::push::run(args),
                 DatasetsCmd::Derive {
@@ -775,6 +775,7 @@ pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
                     window,
                     plan_only: plan,
                     allow_whole_facet,
+                    catalog: None,
                 }),
             };
             if code != 0 {

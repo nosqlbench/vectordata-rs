@@ -340,11 +340,11 @@ pub(super) enum ExploreExit {
 }
 
 pub(super) fn run_interactive_explore(
-    source: &str, sample_size: usize, seed: u64, sample_mode: SampleMode,
+    source: &str, catalog: &crate::catalog::Catalog, sample_size: usize, seed: u64, sample_mode: SampleMode,
     start_palette: super::palette::Palette, start_curve: super::palette::Curve,
 ) -> ExploreExit {
     eprintln!("Opening {}...", source);
-    let reader = UnifiedReader::open(source);
+    let reader = UnifiedReader::open(source, catalog);
     let total = reader.count();
     let dim = reader.dim();
 
@@ -465,11 +465,12 @@ pub(super) fn run_interactive_explore(
     read_rx = new_read_rx;
     {
         let source_owned = source.to_string();
+        let catalog_owned = catalog.clone();
         let indices_clone = indices.clone();
         let dim_copy = dim;
         let cancel = cancel.clone();
         std::thread::spawn(move || {
-            let bg_reader = std::sync::Arc::new(UnifiedReader::open(&source_owned));
+            let bg_reader = std::sync::Arc::new(UnifiedReader::open(&source_owned, &catalog_owned));
             // Parallel readahead: warm the chunks covering this
             // sample with the download worker pool while the serial
             // loop below consumes them in order. In-flight dedup in
