@@ -114,6 +114,7 @@ documentation's **Common tasks** table is the same index with examples.
   listing order). To serve entries from elsewhere, implement
   [`CatalogSource`](crate::catalog::CatalogSource). Do not merge entries
   into a catalog by hand: a name in two catalogs must stay ambiguous.
+  `examples/register_catalog.rs` runs end to end, offline.
 - Open the explorer over a program's catalogs:
   [`explore::run_with_sources`](crate::explore::run_with_sources) with the
   `CatalogSources` you assembled. It lists and opens exactly those, and

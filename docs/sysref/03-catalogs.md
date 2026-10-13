@@ -32,6 +32,10 @@ the datasets under it, or be a catalog file itself.
   (`CatalogSources::add_catalogs`, `--catalogs <dir>`). Any other ad-hoc
   location is named by the next free index.
 
+- **Catalogs a program supplies** join the same set as the configured
+  ones, built from entries or content it holds, and behave the same:
+  see [§2.2, Registering catalogs at runtime](02-api.md#registering-catalogs-at-runtime).
+
 ### When a catalog fails to load
 
 A catalog that cannot be read (the URL does not answer, the file is
@@ -58,6 +62,10 @@ use vectordata::catalog::resolver::Catalog;
 
 let sources = CatalogSources::new().configure_default();
 let catalog = Catalog::of(&sources);
+// Each problem met loading is a value naming its catalog; print or log it.
+for problem in catalog.diagnostics() {
+    eprintln!("{problem}");
+}
 
 for entry in catalog.datasets() {
     println!("{} (profiles: {})", entry.name(), entry.profile_names().join(", "));

@@ -1291,3 +1291,42 @@ nested group of two.
 - Also: `only_a_catalog_named_for_the_run_fails_the_command`,
   `a_reload_rereads_the_configuration_and_keeps_the_programs_catalogs`
   and `a_catalog_added_under_a_name_keeps_it` (B-7).
+
+### 12.9 Step 9: docs (2026-10-13)
+
+Most `AGENTS.md` and common-tasks rows were written with the step that
+added their call (steps 3 to 8). This step adds:
+- **`examples/register_catalog.rs`.** It writes a four-vector dataset to
+  a temporary directory, builds one catalog from a description and an
+  entry made in code and one from `knn_entries` content with a base,
+  registers both with `with`, then looks each dataset up and reads its
+  vectors and ground truth. Offline, it prints what it read.
+- **Crate rustdoc:**
+  - a "Catalogs a program supplies" section with a doctest that runs;
+  - the common-tasks rows for building descriptions and entries and
+    registering catalogs point at the example;
+  - new rows: implementing `CatalogSource`, and
+    `explore::run_with_sources` (feature `explore`).
+- **sysref 02 §2.2:**
+  - "Registering catalogs at runtime": content and base, order,
+    collisions, provenance, and the explorer;
+  - "Datasets and entries built in code": the builders, `from_config`,
+    and what `build()` checks;
+  - "When a catalog fails to load", pointing to §3.1;
+  - `add_named_catalog`.
+- **sysref 03 §3.1:** a pointer to registration, and diagnostics in the
+  programmatic example. The failure-reporting rules went in with step 8.
+- **Not needed:** no new `FETCH_BUDGET` or discoverability entries. No
+  new fetch-like call was added, and the guards pass.
+
+**Status.** The SRD's nine steps are implemented: RC-1 to RC-22, and
+B-1 to B-8, each with a guard test. Two things remain for the user:
+- Tessera's published catalog still lists the default ground truth
+  under its unfiltered profiles until it is regenerated and republished
+  (§12.2).
+- The release notes need the behaviour changes recorded in §12.1 to
+  §12.8 and the semver-breaking API changes. The breaking changes:
+  `CatalogEntry`'s fields became accessors, `vectordata::knn_entries`
+  is gone, `CatalogSources::required`/`optional`/`catalog_file_for` are
+  gone, `build_sources` returns `RunSources`, and
+  `CatalogSources::diagnostics` returns a `Vec`.

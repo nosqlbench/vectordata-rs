@@ -201,6 +201,90 @@ let sources = CatalogSources::new()
 let catalog = Catalog::of(&sources);
 ```
 
+A directory with its own `catalogs.yaml` adds the catalogs that file
+names, under its names. `add_named_catalog(name, path)` adds one
+location under a name of the caller's choosing.
+
+### Registering catalogs at runtime
+
+A program can supply catalogs of its own: a `CatalogBuilder` catalog
+from entries it built or catalog content it holds, or any type that
+implements `CatalogSource`. They join the same ordered set as the
+configured catalogs, through `with` (a catalog that gives nothing is
+reported) or `with_optional` (it is not):
+
+```rust
+use vectordata::catalog::{Catalog, CatalogBuilder, CatalogSources};
+use vectordata::Location;
+
+let shipped = CatalogBuilder::named("shipped")
+    .base(Location::parse("https://bucket.example/datasets/")?)
+    .content(include_str!("catalog.yaml"))
+    .build();
+let sources = CatalogSources::new().with(shipped).configure_default();
+let catalog = Catalog::of(&sources);
+```
+
+- **Content** is a canonical catalog list or a `knn_entries.yaml`
+  document, in JSON or YAML, read by the same parser as a catalog file.
+  Relative paths resolve against `base`; content with a relative path
+  and no base is a diagnostic, and that entry is skipped.
+- **Order** is the order catalogs were added, and is the listing order.
+- **Collisions:** a dataset name in two catalogs is
+  `Error::AmbiguousDataset`, whichever kinds the catalogs are. Its
+  message names each catalog and where it is.
+- **Provenance:** every entry carries its catalog's name
+  (`catalog_name()`), and an entry read from a file carries that file
+  (`catalog_file()`).
+- **The explorer:** `vectordata::explore::run_with_sources(args,
+  sources)` opens it over the same set. A program's catalogs are shown
+  read-only on its catalogs screen, and survive an edit to
+  `catalogs.yaml` there (`CatalogSources::reload_configured`).
+
+`examples/register_catalog.rs` builds both kinds of catalog over a
+dataset it writes, and opens and reads from each.
+
+### Datasets and entries built in code
+
+A dataset described in code needs no `dataset.yaml`:
+
+```rust
+use vectordata::dataset::{CatalogEntry, DatasetConfig, StandardFacet};
+use vectordata::{Location, TestDataGroup};
+
+let description = DatasetConfig::builder("demo-10k")
+    .distance_function("COSINE")
+    .profile("default", |p| p
+        .facet(StandardFacet::BaseVectors, "base.fvec")
+        .facet(StandardFacet::QueryVectors, "query.fvec")
+        .facet(StandardFacet::NeighborIndices, "gt.ivec"))
+    .build()?;
+let home = Location::parse("/data/demo-10k/")?;
+
+// Open it directly…
+let group = TestDataGroup::from_config("demo-10k", home.clone(), description.clone());
+// …or list it in a catalog.
+let entry = CatalogEntry::builder("demo-10k").home(&home).dataset(description).build()?;
+```
+
+- **`build()` checks what a parse checks:** the version gate, stated
+  parents, shard declarations and inheritance. Without
+  `format_version` the description states the lowest version its
+  content needs. `save(path)` writes it as `dataset.yaml`, and a parse
+  of that file equals the built description.
+- **The home** is where relative facet paths resolve, and what the
+  cache mirrors under `<cache_root>/<name>/`.
+- **An entry** holds either the whole description (`dataset`), so it
+  opens with no fetch, or a summary and the `dataset.yaml` it points to
+  (`descriptor`). Its `EntryDescription` says which.
+
+### When a catalog fails to load
+
+See [§3.1](03-catalogs.md#when-a-catalog-fails-to-load): a broken
+catalog is reported and never stops a command, except one named for the
+run with `--at` or `--catalog`. In the library, problems are values on
+`Catalog::diagnostics`, each naming its catalog.
+
 ---
 
 ## 2.3 File Extension Scheme

@@ -36,10 +36,12 @@
 //! | Read a record (slab) facet | [`TestDataView::open_facet_records`] | — |
 //! | List profiles and facets | [`TestDataGroup::profile_names`], [`TestDataView::facet_manifest`] | below |
 //! | Find datasets by pattern | [`Catalog::match_glob`](catalog::Catalog::match_glob), [`Catalog::datasets`](catalog::Catalog::datasets) | — |
-//! | Build a dataset description in code | [`DatasetConfig::builder`](dataset::DatasetConfig::builder) → [`save`](dataset::DatasetConfig::save) | — |
+//! | Build a dataset description in code | [`DatasetConfig::builder`](dataset::DatasetConfig::builder) → [`save`](dataset::DatasetConfig::save) | `examples/register_catalog.rs` |
 //! | Open a dataset described in code | [`TestDataGroup::from_config`] | — |
-//! | Build a catalog entry in code | [`CatalogEntry::builder`](dataset::CatalogEntry::builder) → [`Catalog::open_entry`](catalog::Catalog::open_entry) | — |
-//! | Register a catalog at runtime | [`CatalogBuilder`](catalog::CatalogBuilder) → [`CatalogSources::with`](catalog::CatalogSources::with) | — |
+//! | Build a catalog entry in code | [`CatalogEntry::builder`](dataset::CatalogEntry::builder) → [`Catalog::open_entry`](catalog::Catalog::open_entry) | `examples/register_catalog.rs` |
+//! | Register a catalog at runtime | [`CatalogBuilder`](catalog::CatalogBuilder) → [`CatalogSources::with`](catalog::CatalogSources::with) | below, `examples/register_catalog.rs` |
+//! | Serve catalog entries from elsewhere | implement [`CatalogSource`](catalog::CatalogSource) | — |
+//! | Explore a program's catalogs (feature `explore`) | [`explore::run_with_sources`] | — |
 //! | Write a tree's catalog files | [`CatalogTree`](catalog::generate::CatalogTree) | — |
 //! | Resolve a path against a dataset or catalog location | [`Location::resolve`] | — |
 //! | Locate the cache | [`settings::cache_dir`] | — |
@@ -97,6 +99,38 @@
 //! let labels: TypedReader<i32> = open_facet_typed(&*view, "metadata_content")?;
 //! let label = labels.get_value(42)?;
 //! # let _ = label; Ok(()) }
+//! ```
+//!
+//! ### Catalogs a program supplies
+//!
+//! A program can register catalogs of its own, built from entries it
+//! made or content it holds, beside or instead of the configured ones.
+//! They list, open and collide exactly as configured catalogs do.
+//!
+//! ```
+//! use vectordata::catalog::{Catalog, CatalogBuilder, CatalogSources};
+//! use vectordata::dataset::{CatalogEntry, DatasetConfig, StandardFacet};
+//! use vectordata::Location;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let description = DatasetConfig::builder("demo")
+//!     .profile("default", |p| p.facet(StandardFacet::BaseVectors, "base.fvec"))
+//!     .build()?;
+//! let entry = CatalogEntry::builder("demo")
+//!     .home(&Location::parse("https://example.com/datasets/demo/")?)
+//!     .dataset(description)
+//!     .build()?;
+//! let shipped = CatalogBuilder::named("shipped")
+//!     .base(Location::parse("https://example.com/datasets/")?)
+//!     .content("listed:default:\n  base: listed/base.fvec\n  query: listed/query.fvec\n  gt: listed/gt.ivec\n")
+//!     .build();
+//! let sources = CatalogSources::new()
+//!     .with(CatalogBuilder::named("in-code").entry(entry).build())
+//!     .with(shipped); // add .configure_default() for the user's own
+//! let catalog = Catalog::of(&sources);
+//! assert_eq!(catalog.lookup("demo")?.catalog_name(), Some("in-code"));
+//! assert_eq!(catalog.lookup("listed")?.catalog_name(), Some("shipped"));
+//! # Ok(()) }
 //! ```
 //!
 //! ## Layers
