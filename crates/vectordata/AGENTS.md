@@ -93,6 +93,10 @@ documentation's **Common tasks** table is the same index with examples.
   checks a parsed file passes and equals the parse of what it saves.
   Parse text you hold with
   [`DatasetConfig::parse`](crate::dataset::DatasetConfig::parse).
+- Open a dataset you described in code, with no catalog:
+  [`TestDataGroup::from_config`](crate::TestDataGroup::from_config)`(name, home, description)`.
+  Relative facets resolve against `home`, and a remote home caches under
+  `<cache_root>/<name>/`.
 
 ## Do not hand-roll
 

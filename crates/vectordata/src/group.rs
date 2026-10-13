@@ -20,24 +20,75 @@ use url::Url;
 #[derive(Debug)]
 pub struct TestDataGroup {
     /// Where the dataset lives; relative facet paths resolve against it.
-    source: Location,
+    home: Location,
+    /// The home as written, recorded in the dataset's
+    /// `<cache_root>/<dataset>/origin.json`, so a catalog that moves can
+    /// be migrated by editing one file. Never re-spelled by URL parsing.
+    origin: String,
+    /// The per-dataset cache directory name (`<cache_root>/<name>/`).
+    /// `None` for a home with no name to give, a server's root: its
+    /// facets cache by URL instead, as no directory can be named.
+    name: Option<String>,
     config: DatasetConfig,
-    /// URL the dataset description was loaded from — the
-    /// `dataset.yaml` URL for canonical-shape catalogs, the
-    /// `knn_entries.yaml` (or wherever the synthesised layout
-    /// originated) for the legacy shape. Recorded in the
-    /// per-dataset `<cache_root>/<dataset>/origin.json` so a
-    /// catalog that moves can be migrated by editing one file.
-    /// `None` only when the group was built via a constructor that
-    /// doesn't have URL provenance (test fixtures); the cache
-    /// then falls back to URL-derived layout.
-    catalog_source: Option<String>,
-    /// Dataset identifier used as the per-dataset cache directory
-    /// name (`<cache_root>/<dataset_name>/`). Derived from the
-    /// catalog entry name when opened through `Catalog::open_entry`,
-    /// or from the last path/URL segment otherwise. `None` skips
-    /// catalog-anchored layout (URL-derived fallback wins).
-    dataset_name: Option<String>,
+}
+
+/// A dataset resolved for opening: what every route to a
+/// [`TestDataGroup`] arrives at before the one constructor
+/// ([`TestDataGroup::from_handle`]) builds it.
+///
+/// The name and origin are the dataset's cache identity. A directory or
+/// URL open names the dataset after its last segment and records the
+/// directory; a catalog entry gives its own name and
+/// [`dataset_home_url`](crate::dataset::CatalogEntry::dataset_home_url).
+/// Those are today's cache directory names, kept (SRD §11, item 1).
+struct DatasetHandle {
+    name: Option<String>,
+    home: Location,
+    origin: String,
+    config: DatasetConfig,
+}
+
+impl DatasetHandle {
+    /// A dataset at `home`, named after its last segment, whose origin
+    /// is `home` as a directory.
+    fn at(home: Location, config: DatasetConfig) -> Self {
+        DatasetHandle {
+            name: home.last_segment().map(str::to_string),
+            origin: dir_form(&home.to_string()),
+            home,
+            config,
+        }
+    }
+
+    /// A dataset at `home` described by `content`, a descriptor file of
+    /// either shape: `dataset.yaml` (it has `profiles:`) or
+    /// `knn_entries.yaml`. The shape decides, not the file's name, as in
+    /// jvector's `DataSetLoaderSimpleMFD`.
+    fn of_content(home: Location, content: &str) -> Result<Self> {
+        let value: serde_yaml::Value = serde_yaml::from_str(content)?;
+        let is_dataset_yaml = value.as_mapping().is_some_and(|m| m.contains_key("profiles"));
+        if is_dataset_yaml {
+            Self::of_dataset_yaml(home, content)
+        } else {
+            Self::of_knn_entries(home, content)
+        }
+    }
+
+    /// A dataset at `home` described by `dataset.yaml` content.
+    fn of_dataset_yaml(home: Location, content: &str) -> Result<Self> {
+        let description = crate::dataset::DatasetConfig::parse(content)?;
+        Ok(Self::at(home, DatasetConfig::opened(description)))
+    }
+
+    /// A dataset at `home` described by `knn_entries.yaml` content: the
+    /// entry named after the directory, or the file's first.
+    fn of_knn_entries(home: Location, content: &str) -> Result<Self> {
+        let entries = crate::knn_entries::KnnEntries::parse(content).map_err(Error::Other)?;
+        let description = entries
+            .description_for(home.last_segment().unwrap_or_default())
+            .map_err(Error::Other)?;
+        Ok(Self::at(home, DatasetConfig::opened(description)))
+    }
 }
 
 impl TestDataGroup {
@@ -77,80 +128,27 @@ impl TestDataGroup {
     /// canonical cascade applies: `dataset.yaml` → `knn_entries.yaml`.
     pub fn load_from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
+        let read = |file: &Path| fs::read_to_string(file).map_err(Error::ConfigIo);
 
         // Explicit catalog file: dispatch by content shape, no
         // sibling probing.
-        if path.is_file()
-            && path.extension().is_some_and(|ext| ext == "yaml" || ext == "yml")
-        {
-            let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-            let yaml_content = fs::read_to_string(path).map_err(Error::ConfigIo)?;
-            let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let config = parse_catalog_content_for(&yaml_content, dir_name)?;
-            let dataset_name = dir.file_name()
-                .and_then(|n| n.to_str()).map(|s| s.to_string());
-            return Ok(Self {
-                source: Location::Path(dir.clone()),
-                config,
-                catalog_source: dir.to_str().map(dir_form),
-                dataset_name,
-            });
+        if path.is_file() && is_yaml_name(&path.to_string_lossy()) {
+            let dir = path.parent().unwrap_or(Path::new("."));
+            let handle = DatasetHandle::of_content(Location::from_path(dir), &read(path)?)?;
+            return Ok(Self::from_handle(handle));
         }
 
-        // Directory cascade.
-        let dir = path.to_path_buf();
-        let yaml_path = dir.join("dataset.yaml");
-        if yaml_path.exists() {
-            let yaml_content = fs::read_to_string(&yaml_path).map_err(Error::ConfigIo)?;
-            let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
-            let dataset_name = dir.file_name()
-                .and_then(|n| n.to_str()).map(|s| s.to_string());
-            return Ok(Self {
-                source: Location::Path(dir.clone()),
-                config,
-                catalog_source: dir.to_str().map(dir_form),
-                dataset_name,
-            });
-        }
-
-        // Fall back to knn_entries.yaml. When the file describes
-        // multiple datasets, prefer the one whose name matches the
-        // containing directory; otherwise return the first
-        // dataset's config (preserves the prior behavior for
-        // single-dataset files).
-        let knn_path = dir.join("knn_entries.yaml");
-        if knn_path.exists() {
-            let entries = crate::knn_entries::KnnEntries::load(&knn_path)
-                .map_err(Error::Other)?;
-            let dir_name = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            let config = entries
-                .to_config_for(dir_name)
-                .unwrap_or_else(|| entries.to_config());
-            let dataset_name = dir.file_name()
-                .and_then(|n| n.to_str()).map(|s| s.to_string());
-            return Ok(Self {
-                source: Location::Path(dir.clone()),
-                config,
-                catalog_source: dir.to_str().map(dir_form),
-                dataset_name,
-            });
-        }
-
-        // Neither found — return the original error
-        let yaml_content = fs::read_to_string(&yaml_path)
-            .map_err(Error::ConfigIo)?;
-        let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
-        let dataset_name = dir.file_name()
-            .and_then(|n| n.to_str()).map(|s| s.to_string());
-        Ok(Self {
-            source: Location::Path(dir.clone()),
-            config,
-            catalog_source: dir.to_str().map(dir_form),
-            dataset_name,
-        })
+        // Directory cascade. With neither file present, the error is
+        // the missing dataset.yaml.
+        let home = Location::from_path(path);
+        let knn_path = path.join("knn_entries.yaml");
+        let dataset_path = path.join("dataset.yaml");
+        let handle = if !dataset_path.exists() && knn_path.exists() {
+            DatasetHandle::of_knn_entries(home, &read(&knn_path)?)?
+        } else {
+            DatasetHandle::of_dataset_yaml(home, &read(&dataset_path)?)?
+        };
+        Ok(Self::from_handle(handle))
     }
 
     /// Loads a TestDataGroup from a URL.
@@ -166,28 +164,21 @@ impl TestDataGroup {
         let client = crate::transport::shared_client_for(url_str);
 
         // Explicit catalog file: dispatch by content shape, no
-        // sibling probing. The base_url for resolving facet paths is
-        // the URL's parent directory.
-        if url.path().ends_with(".yaml") || url.path().ends_with(".yml") {
+        // sibling probing. Facet paths resolve against the URL's
+        // parent directory.
+        if is_yaml_name(url.path()) {
             let base_url = url.join(".")?;
-            let yaml_content = fetch_descriptor(&client, &url, &base_url)?.required(&url)?;
-            let dir_name = last_segment(&base_url).unwrap_or_default();
-            let config = parse_catalog_content_for(&yaml_content, &dir_name)?;
-            let dataset_name = last_segment(&base_url);
-            return Ok(Self {
-                source: Location::Url(base_url.clone()),
-                config,
-                catalog_source: Some(dir_form(base_url.as_str())),
-                dataset_name,
-            });
+            let content = fetch_descriptor(&client, &url, &base_url)?.required(&url)?;
+            let handle = DatasetHandle::of_content(Location::Url(base_url), &content)?;
+            return Ok(Self::from_handle(handle));
         }
 
         // Directory cascade.
-        let mut url = url;
-        if !url.path().ends_with('/') {
-            url.set_path(&(url.path().to_owned() + "/"));
+        let mut base_url = url;
+        if !base_url.path().ends_with('/') {
+            base_url.set_path(&(base_url.path().to_owned() + "/"));
         }
-        let base_url = url.clone();
+        let home = Location::Url(base_url.clone());
 
         // Try dataset.yaml first. When the server cannot be asked and no
         // copy of it was kept, the dataset may still be a kept
@@ -195,25 +186,15 @@ impl TestDataGroup {
         let dataset_url = base_url.join("dataset.yaml")?;
         let mut unavailable = None;
         match fetch_descriptor(&client, &dataset_url, &base_url)? {
-            Descriptor::Text(yaml_content) => {
-                let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
-                let dataset_name = last_segment(&base_url);
-                return Ok(Self {
-                    source: Location::Url(base_url.clone()),
-                    config,
-                    catalog_source: Some(dir_form(base_url.as_str())),
-                    dataset_name,
-                });
+            Descriptor::Text(content) => {
+                return Ok(Self::from_handle(DatasetHandle::of_dataset_yaml(home, &content)?));
             }
             Descriptor::Absent => {}
             Descriptor::Unavailable(e) => unavailable = Some(e),
         }
 
-        // Fall back to knn_entries.yaml. When the file describes
-        // multiple datasets, prefer the one whose name matches the
-        // last path segment of the URL; otherwise return the first.
         let knn_url = base_url.join("knn_entries.yaml")?;
-        let yaml_content = match (fetch_descriptor(&client, &knn_url, &base_url)?, unavailable) {
+        let content = match (fetch_descriptor(&client, &knn_url, &base_url)?, unavailable) {
             (Descriptor::Text(text), _) => text,
             // dataset.yaml went unasked: that is the reason, whatever
             // came of knn_entries.yaml.
@@ -222,19 +203,62 @@ impl TestDataGroup {
                 return Err(Error::Other(format!("{base_url}: no dataset.yaml or knn_entries.yaml")));
             }
         };
-        let entries = crate::knn_entries::KnnEntries::parse(&yaml_content)
-            .map_err(Error::Other)?;
-        let url_dir_name = last_segment(&base_url).unwrap_or_default();
-        let config = entries
-            .to_config_for(&url_dir_name)
-            .unwrap_or_else(|| entries.to_config());
+        Ok(Self::from_handle(DatasetHandle::of_knn_entries(home, &content)?))
+    }
 
-        let dataset_name = last_segment(&base_url);
-        Ok(Self {
-            source: Location::Url(base_url.clone()),
-            config,
-            catalog_source: Some(dir_form(base_url.as_str())),
-            dataset_name,
+    /// Open a dataset a program described itself: a description built
+    /// with [`DatasetConfig::builder`](crate::dataset::DatasetConfig::builder)
+    /// or parsed from text it holds, named `name`, living at `home`.
+    ///
+    /// Relative facet paths resolve against `home`, and a remote home is
+    /// what the cache mirrors, under `<cache_root>/<name>/`.
+    ///
+    /// ```
+    /// use vectordata::dataset::{DatasetConfig, StandardFacet};
+    /// use vectordata::{Location, TestDataGroup};
+    ///
+    /// let description = DatasetConfig::builder("demo")
+    ///     .profile("default", |p| p
+    ///         .facet(StandardFacet::BaseVectors, "base.fvec")
+    ///         .facet(StandardFacet::QueryVectors, "query.fvec"))
+    ///     .build()
+    ///     .map_err(vectordata::Error::Other)?;
+    /// let home = Location::parse("https://example.com/datasets/demo/")?;
+    /// let group = TestDataGroup::from_config("demo", home, description);
+    /// assert_eq!(group.profile_names(), ["default"]);
+    /// # Ok::<(), vectordata::Error>(())
+    /// ```
+    pub fn from_config(
+        name: impl Into<String>,
+        home: Location,
+        description: crate::dataset::DatasetConfig,
+    ) -> Self {
+        let handle = DatasetHandle {
+            name: Some(name.into()),
+            ..DatasetHandle::at(home.as_dir(), DatasetConfig::opened(description))
+        };
+        Self::from_handle(handle)
+    }
+
+    /// The one constructor every open ends in (RC-7).
+    fn from_handle(handle: DatasetHandle) -> Self {
+        let DatasetHandle { name, home, origin, config } = handle;
+        TestDataGroup { home, origin, name, config }
+    }
+
+    /// The view of one profile, anchored to this dataset's cache
+    /// identity: what [`profile`](Self::profile) and
+    /// [`generic_view`](Self::generic_view) both return.
+    fn view_of(&self, name: &str) -> Option<GenericTestDataView> {
+        let profile_config = self.config.profiles.get(name)?;
+        let view = GenericTestDataView::with_attributes(
+            self.home.clone(),
+            profile_config.clone(),
+            self.config.attributes.clone(),
+        );
+        Some(match &self.name {
+            Some(dataset) => view.with_catalog_identity(dataset.clone(), self.origin.clone()),
+            None => view,
         })
     }
 
@@ -242,16 +266,7 @@ impl TestDataGroup {
     ///
     /// Returns `None` if the profile name does not exist in the configuration.
     pub fn profile(&self, name: &str) -> Option<Arc<dyn TestDataView>> {
-        let profile_config = self.config.profiles.get(name)?;
-        let mut view = GenericTestDataView::with_attributes(
-            self.source.clone(),
-            profile_config.clone(),
-            self.config.attributes.clone(),
-        );
-        if let (Some(name), Some(src)) = (&self.dataset_name, &self.catalog_source) {
-            view = view.with_catalog_identity(name.clone(), src.clone());
-        }
-        Some(Arc::new(view))
+        self.view_of(name).map(|view| Arc::new(view) as Arc<dyn TestDataView>)
     }
 
     /// Returns the concrete `GenericTestDataView` for typed facet access.
@@ -259,16 +274,7 @@ impl TestDataGroup {
     /// Unlike `profile()` which returns a trait object, this returns the
     /// concrete type so clients can call `open_facet_typed::<T>()`.
     pub fn generic_view(&self, name: &str) -> Option<GenericTestDataView> {
-        let profile_config = self.config.profiles.get(name)?;
-        let mut view = GenericTestDataView::with_attributes(
-            self.source.clone(),
-            profile_config.clone(),
-            self.config.attributes.clone(),
-        );
-        if let (Some(name), Some(src)) = (&self.dataset_name, &self.catalog_source) {
-            view = view.with_catalog_identity(name.clone(), src.clone());
-        }
-        Some(view)
+        self.view_of(name)
     }
 
     /// Returns the names of all available profiles.
@@ -350,7 +356,7 @@ impl TestDataGroup {
         let mut facets = Vec::new();
         for name in profiles.iter().filter(|p| seen.insert(p.as_str())) {
             let view = self.profile(name).ok_or_else(|| crate::Error::Selection {
-                dataset: self.dataset_name.clone().unwrap_or_default(),
+                dataset: self.name.clone().unwrap_or_default(),
                 message: format!("profile '{name}' not found"),
             })?;
             crate::fetch::plan_view(&*view, Some(name), request, progress, &mut facets)?;
@@ -546,14 +552,15 @@ impl TestDataGroup {
     ///
     /// For `knn_entries.yaml`-shape entries the catalog file *is*
     /// the dataset description — there is no separate
-    /// `dataset.yaml` to fetch. The entry's `path` is a base
-    /// location (potentially an `s3://` or `file://` URL the
-    /// catalog publishes) and every facet path inside the layout
-    /// has already been absolutised by the parser, so the
-    /// data-source field is only used as a fallback when a
-    /// downstream caller hands in a relative path. For canonical
+    /// `dataset.yaml` to fetch, and every facet path inside the layout
+    /// has already been absolutised by the parser. For canonical
     /// (`catalog.json`-shape) entries the layout is a summary,
     /// not the full config — use [`Self::load`] instead.
+    ///
+    /// The dataset is named `entry.name`, and its home is
+    /// [`dataset_home_url`](crate::dataset::CatalogEntry::dataset_home_url),
+    /// the URL the cache mirrors under `<cache>/<name>/`, which
+    /// relative facet paths resolve against as the catalog resolves them.
     pub fn from_catalog_entry(entry: &crate::dataset::CatalogEntry) -> Result<Self> {
         // The reader's view of the layout, by the one projection every
         // load uses: the layout's profiles were resolved when it was
@@ -565,59 +572,26 @@ impl TestDataGroup {
             &layout.profile_tags,
             &layout.profiles,
         );
-        let source = Location::parse(&entry.path)?;
-        // The dataset's *home URL* is the URL the cache should
-        // mirror under `<cache>/<dataset_name>/`. For
-        // knn_entries-shape catalogs `entry.path` is the catalog
-        // base (no dataset segment) so we have to append the
-        // dataset name. For canonical catalogs `entry.path` is the
-        // `dataset.yaml` URL whose parent directory IS the home
-        // URL. View facet URLs strip this prefix to derive the
-        // relative path that the cache mirrors under the dataset
-        // directory.
-        let dataset_home_url = entry.dataset_home_url();
-        Ok(Self {
-            source,
+        let origin = entry.dataset_home_url();
+        Ok(Self::from_handle(DatasetHandle {
+            name: Some(entry.name.clone()),
+            home: Location::parse(&origin)?,
+            origin,
             config,
-            catalog_source: Some(dataset_home_url),
-            dataset_name: Some(entry.name.clone()),
-        })
+        }))
     }
+}
+
+/// True for a name ending in `.yaml` or `.yml`: an explicitly named
+/// descriptor file rather than a dataset directory.
+fn is_yaml_name(name: &str) -> bool {
+    name.ends_with(".yaml") || name.ends_with(".yml")
 }
 
 /// The last non-empty path segment of a dataset's base URL: its
 /// directory name, which names the dataset when nothing else does.
 fn last_segment(base_url: &Url) -> Option<String> {
     Location::Url(base_url.clone()).last_segment().map(str::to_string)
-}
-
-/// Parse a catalog YAML by content shape and return the resulting
-/// [`DatasetConfig`] for the dataset matching `prefer_name` (or the
-/// first dataset if no match). Used by both the URL and filesystem
-/// load paths when the location targets an explicit YAML file
-/// regardless of its basename — the shape, not the name, decides
-/// which parser handles it.
-fn parse_catalog_content_for(content: &str, prefer_name: &str) -> Result<DatasetConfig> {
-    // Try the canonical `dataset.yaml` shape first. We probe with a
-    // generic YAML value so we can distinguish "wrong shape — try
-    // the alternative" from "right shape but malformed — surface
-    // the error".
-    let value: serde_yaml::Value = serde_yaml::from_str(content)?;
-    if let serde_yaml::Value::Mapping(ref m) = value {
-        // dataset.yaml is identified by the presence of a top-level
-        // `profiles:` key. knn_entries.yaml's top level is a flat
-        // map of `name:profile` keys plus an optional `_defaults`.
-        if m.contains_key(serde_yaml::Value::String("profiles".into())) {
-            return serde_yaml::from_value(value).map_err(Error::from);
-        }
-    }
-
-    // Fall through to the knn_entries shape.
-    let entries = crate::knn_entries::KnnEntries::parse(content)
-        .map_err(Error::Other)?;
-    Ok(entries
-        .to_config_for(prefer_name)
-        .unwrap_or_else(|| entries.to_config()))
 }
 
 #[cfg(test)]
@@ -640,6 +614,102 @@ mod tests {
         let uri = url::Url::from_directory_path(dir.path()).unwrap().to_string();
         let group = TestDataGroup::load(&uri).expect("a file:// URI opens");
         assert_eq!(group.profile_names(), vec!["default".to_string()]);
+    }
+
+    /// Three two-dimensional f32 vectors in `.fvec` form.
+    fn write_fvec(path: &Path) {
+        let mut buf = Vec::new();
+        for i in 0..3 {
+            buf.extend(&2i32.to_le_bytes());
+            buf.extend(&(i as f32).to_le_bytes());
+            buf.extend(&(i as f32 + 0.5).to_le_bytes());
+        }
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, buf).unwrap();
+    }
+
+    /// **A catalog entry's dataset reads a relative facet from where the
+    /// catalog lists it**: under the dataset's home, not the catalog's
+    /// base. The open once resolved against `entry.path`, which for a
+    /// `knn_entries` entry is the catalog directory, so a listed file
+    /// was not the one the open looked for.
+    #[test]
+    fn a_catalog_entry_reads_its_facets_where_the_catalog_lists_them() {
+        let dir = tempdir().unwrap();
+        let catalog_dir = dir.path().join("catalog");
+        write_fvec(&catalog_dir.join("ds").join("b.fvec"));
+        let entry: crate::dataset::CatalogEntry = serde_json::from_value(serde_json::json!({
+            "name": "ds",
+            "path": catalog_dir.to_str().unwrap(),
+            "dataset_type": "knn_entries.yaml",
+            "layout": {"profiles": {"default": {"base_vectors": "b.fvec"}}},
+        }))
+        .unwrap();
+        assert_eq!(
+            entry.resolve_facet_url("b.fvec").unwrap(),
+            catalog_dir.join("ds").join("b.fvec").to_str().unwrap(),
+        );
+        let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
+        let base = group.profile("default").unwrap().base_vectors().expect("the listed file opens");
+        assert_eq!(base.count(), 3);
+    }
+
+    /// **A description built in code opens as a dataset**, its relative
+    /// facets read from the home it is given.
+    #[test]
+    fn a_built_description_opens_at_its_home() {
+        let dir = tempdir().unwrap();
+        write_fvec(&dir.path().join("profiles/base/b.fvec"));
+        let description = crate::dataset::DatasetConfig::builder("built")
+            .profile("default", |p| p.facet(crate::dataset::StandardFacet::BaseVectors, "profiles/base/b.fvec"))
+            .build()
+            .unwrap();
+        let group = TestDataGroup::from_config("built", Location::from_path(dir.path()), description);
+        assert_eq!(group.name.as_deref(), Some("built"));
+        let base = group.profile("default").unwrap().base_vectors().unwrap();
+        assert_eq!(base.count(), 3);
+    }
+
+    /// **A directory holding only `knn_entries.yaml` opens the entry
+    /// named after the directory**, and the first entry when none is.
+    #[test]
+    fn a_knn_entries_directory_opens_the_entry_named_after_it() {
+        let dir = tempdir().unwrap();
+        let ds = dir.path().join("second");
+        fs::create_dir_all(&ds).unwrap();
+        let content = "first:\n  base: a.fvec\n  query: q.fvec\n  gt: g.ivec\n\
+                       second:\n  base: b.fvec\n  query: q.fvec\n  gt: g.ivec\n";
+        fs::write(ds.join("knn_entries.yaml"), content).unwrap();
+        let group = TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+        let base = group.config().profiles["default"].base_vectors.as_ref().unwrap();
+        assert_eq!(base.source(), Some("b.fvec"));
+        assert_eq!(group.name.as_deref(), Some("second"));
+
+        let other = dir.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("knn_entries.yaml"), content).unwrap();
+        let group = TestDataGroup::load(other.to_str().unwrap()).unwrap();
+        let base = group.config().profiles["default"].base_vectors.as_ref().unwrap();
+        assert_eq!(base.source(), Some("a.fvec"));
+    }
+
+    /// **A dataset at a server's root has no cache directory name**, so
+    /// its facets cache by URL. Naming it with the empty string put every
+    /// such dataset in the cache root, where the second server's origin
+    /// was refused as a mismatch.
+    #[test]
+    fn a_dataset_at_a_server_root_is_not_given_an_empty_name() {
+        let empty = crate::dataset::DatasetConfig::builder("").build().unwrap();
+        for root in ["http://127.0.0.1:9/", "http://127.0.0.1:10/"] {
+            let handle = DatasetHandle::at(Location::parse(root).unwrap(), DatasetConfig::opened(empty.clone()));
+            assert_eq!(handle.name, None, "{root}");
+            assert_eq!(handle.origin, root);
+        }
+        let handle = DatasetHandle::at(
+            Location::parse("http://127.0.0.1:9/ds/").unwrap(),
+            DatasetConfig::opened(empty),
+        );
+        assert_eq!(handle.name.as_deref(), Some("ds"));
     }
 
     /// **A scheme vectordata does not read is named as such**, not
@@ -672,11 +742,8 @@ mod tests {
             layout,
         };
         let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
-        assert_eq!(
-            group.catalog_source.as_deref(),
-            Some("https://example.com/datasets/vecs1m/"),
-        );
-        assert_eq!(group.dataset_name.as_deref(), Some("vecs1m"));
+        assert_eq!(group.origin, "https://example.com/datasets/vecs1m/");
+        assert_eq!(group.name.as_deref(), Some("vecs1m"));
     }
 
     #[test]
@@ -701,11 +768,8 @@ mod tests {
             layout,
         };
         let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
-        assert_eq!(
-            group.catalog_source.as_deref(),
-            Some("s3://vector-datasets-public/datasets-clean/emb-002-100k/"),
-        );
-        assert_eq!(group.dataset_name.as_deref(), Some("emb-002-100k"));
+        assert_eq!(group.origin, "s3://vector-datasets-public/datasets-clean/emb-002-100k/");
+        assert_eq!(group.name.as_deref(), Some("emb-002-100k"));
     }
 
     #[test]

@@ -382,8 +382,8 @@ impl DatasetConfig {
     /// loader takes once it has the text. A file that states no `name`
     /// comes back with an empty one; [`load`](Self::load) and
     /// [`load_from`](Self::load_from) name it after its directory.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let mut config: Self = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    pub fn parse(text: &str) -> Result<Self, serde_yaml::Error> {
+        let mut config: Self = serde_yaml::from_str(text)?;
         config.unify_strata();
         Ok(config)
     }

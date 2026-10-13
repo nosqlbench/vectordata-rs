@@ -191,17 +191,26 @@ impl<'de> Deserialize<'de> for DatasetConfig {
     where
         D: serde::Deserializer<'de>,
     {
-        let mut description = crate::dataset::DatasetConfig::deserialize(deserializer)?;
+        let description = crate::dataset::DatasetConfig::deserialize(deserializer)?;
+        Ok(DatasetConfig::opened(description))
+    }
+}
+
+impl DatasetConfig {
+    /// The reader's view of a description it opens: sized profiles
+    /// written compactly are expanded from the description's own
+    /// `variables:` block, then the description is projected. Every
+    /// open goes through this, from a file, a URL, a catalog entry or a
+    /// description built in code.
+    pub(crate) fn opened(mut description: crate::dataset::DatasetConfig) -> Self {
         description.unify_strata();
         if description.profiles.has_deferred() {
             let vars = description.variables.clone();
             description.expand_sized_profiles(&vars);
         }
-        Ok(DatasetConfig::from_description(&description))
+        DatasetConfig::from_description(&description)
     }
-}
 
-impl DatasetConfig {
     /// The reader's view of a dataset description.
     pub fn from_description(description: &crate::dataset::DatasetConfig) -> Self {
         Self::from_parts(

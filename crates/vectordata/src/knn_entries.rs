@@ -19,13 +19,12 @@
 //!   gt: path/to/groundtruth.ivec
 //! ```
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::model::{DatasetConfig, FacetConfig, ProfileConfig};
+use crate::dataset::StandardFacet;
 
 /// A single knn_entries.yaml entry.
 #[derive(Debug, Clone, Deserialize)]
@@ -79,48 +78,28 @@ impl KnnEntries {
         Self::parse(&content)
     }
 
-    /// Convert to a `DatasetConfig` for use with `TestDataGroup`.
-    ///
-    /// Returns the first dataset's config — see [`Self::to_config_for`]
-    /// when the file carries multiple datasets and the caller knows
-    /// which one to load, and [`Self::to_configs`] for the full map.
-    pub fn to_config(&self) -> DatasetConfig {
-        let by_dataset = self.group_by_dataset();
-        match by_dataset.into_iter().next() {
-            Some((_, profiles)) => build_dataset_config(profiles),
-            None => DatasetConfig {
-                // Synthesized in memory: version 1 by construction (V-2).
-                format_version: crate::model::FORMAT_VERSION_BASE,
-                attributes: HashMap::new(),
-                profile_tags: Default::default(),
-                profiles: HashMap::new(),
-            },
-        }
-    }
-
-    /// Convert to a `DatasetConfig` for the specifically named
-    /// dataset. Returns `None` when the file has no entries for
-    /// that dataset name. Use this from any caller that knows
-    /// which dataset it's loading (e.g. `TestDataGroup::load_from_path`
-    /// can match against the directory name).
-    pub fn to_config_for(&self, dataset_name: &str) -> Option<DatasetConfig> {
-        let by_dataset = self.group_by_dataset();
-        for (name, profiles) in by_dataset {
-            if name == dataset_name {
-                return Some(build_dataset_config(profiles));
-            }
-        }
-        None
-    }
-
-    /// Convert every dataset in the file to a `DatasetConfig`,
-    /// keyed by dataset name. Use this when the caller wants to
-    /// surface the full multi-dataset view.
-    pub fn to_configs(&self) -> IndexMap<String, DatasetConfig> {
-        self.group_by_dataset()
+    /// The description of the dataset named `dataset_name`, or of the
+    /// file's first dataset when none has that name: the preference a
+    /// directory open makes, matching the directory's name. A file with
+    /// no entries describes a dataset with no profiles.
+    pub fn description_for(&self, dataset_name: &str) -> Result<crate::dataset::DatasetConfig, String> {
+        let mut by_dataset = self.group_by_dataset();
+        let chosen = match by_dataset.shift_remove_entry(dataset_name) {
+            Some(found) => Some(found),
+            None => by_dataset.shift_remove_index(0),
+        };
+        let Some((name, profiles)) = chosen else {
+            return crate::dataset::DatasetConfig::builder(dataset_name).build();
+        };
+        profiles
             .into_iter()
-            .map(|(name, profiles)| (name, build_dataset_config(profiles)))
-            .collect()
+            .fold(crate::dataset::DatasetConfig::builder(name), |dataset, (profile, entry)| {
+                dataset.profile(&profile, |p| p
+                    .facet(StandardFacet::BaseVectors, &entry.base)
+                    .facet(StandardFacet::QueryVectors, &entry.query)
+                    .facet(StandardFacet::NeighborIndices, &entry.gt))
+            })
+            .build()
     }
 
     fn group_by_dataset(&self) -> IndexMap<String, IndexMap<String, &KnnEntry>> {
@@ -143,44 +122,6 @@ impl KnnEntries {
             .collect();
         names.dedup();
         names
-    }
-}
-
-/// Build a [`DatasetConfig`] from the per-profile mapping produced
-/// by `group_by_dataset`. Shared by `to_config`, `to_config_for`,
-/// and `to_configs` so the facet wiring lives in exactly one place.
-fn build_dataset_config(profiles_map: IndexMap<String, &KnnEntry>) -> DatasetConfig {
-    let mut profiles = HashMap::new();
-    for (profile_name, entry) in profiles_map {
-        profiles.insert(profile_name, ProfileConfig {
-            attributes: Default::default(),
-            inherits: None,
-            maxk: None,
-            base_count: None,
-            partition: false,
-            base_vectors: Some(FacetConfig::Simple(entry.base.clone())),
-            base_content: None,
-            query_vectors: Some(FacetConfig::Simple(entry.query.clone())),
-            query_terms: None,
-            query_filters: None,
-            neighbor_indices: Some(FacetConfig::Simple(entry.gt.clone())),
-            neighbor_distances: None,
-            prefiltered_neighbor_indices: None,
-            prefiltered_neighbor_distances: None,
-            postfiltered_neighbor_indices: None,
-            postfiltered_neighbor_distances: None,
-            metadata_content: None,
-            metadata_predicates: None,
-            predicate_results: None,
-            metadata_layout: None,
-        });
-    }
-    DatasetConfig {
-        // Synthesized in memory: version 1 by construction (V-2).
-        format_version: crate::model::FORMAT_VERSION_BASE,
-        attributes: HashMap::new(),
-        profile_tags: Default::default(),
-        profiles,
     }
 }
 
@@ -220,7 +161,7 @@ _defaults:
   gt: profiles/base/neighbor_indices.ivec
 "#;
         let entries = KnnEntries::parse(yaml).unwrap();
-        let config = entries.to_config();
+        let config = crate::model::DatasetConfig::opened(entries.description_for("elsewhere").unwrap());
         assert!(config.profiles.contains_key("default"));
         let default = &config.profiles["default"];
         assert_eq!(default.base_vectors.as_ref().unwrap().source(), Some("profiles/base/base_vectors.fvec"));

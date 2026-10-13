@@ -943,3 +943,51 @@ bootstrapped file already rewrote it that way and dropped its comments.
   that a second save changes nothing. It fails on the previous code.
 - `a_built_description_equals_the_parse_of_its_save` and
   `a_builder_refuses_what_a_parse_refuses` cover the builder.
+
+### 12.4 Step 4: one `TestDataGroup` constructor (2026-10-12)
+
+**Found first.** A catalog entry's dataset resolved relative facets
+against `entry.path`, while the catalog resolved them against
+`dataset_home_url`. For a `knn_entries` entry `entry.path` is the
+catalog's directory, so the open looked for a listed file one directory
+too high. The parser absolutises the facets it reads, which hid this;
+entries built in code (step 5) would not have been.
+
+**Built:**
+- **`DatasetHandle { name, home, origin, config }`** (crate-private,
+  `group.rs`) is what every route resolves to, and
+  `TestDataGroup::from_handle` is the one constructor:
+  - a directory, a URL or an explicitly named descriptor file is named
+    after its last segment, and its origin is the directory as written;
+  - a catalog entry is named `entry.name`, and its home and origin are
+    `dataset_home_url`, the home it is listed under;
+  - a home with no last segment (a server's root) has no name, and its
+    facets cache by URL, as before.
+
+  These are today's cache names (§11, item 1).
+- **The eight struct literals are gone.** `of_content` (dispatch by
+  shape), `of_dataset_yaml` and `of_knn_entries` read a descriptor, and
+  `profile()` and `generic_view()` share one view constructor.
+- **`TestDataGroup::from_config(name, home, description)`** opens a
+  description a program built or parsed (RC-8).
+- **One reader view.** `model::DatasetConfig::opened` expands sized
+  profiles from the description's own variables, then projects. The
+  model's deserializer, every load route and `from_config` all go
+  through it.
+- **The handle holds the reader view, not the description.** A catalog
+  entry's layout is not a description until `EntryDescription` (step 5).
+  Step 5 changes that route, not the handle.
+- **The old `knn_entries` parser builds through the builder.** Its
+  `to_config`, `to_config_for` and `to_configs` literals became
+  `description_for(name)`. Step 5 removes the parser itself (RC-11).
+- **`DatasetConfig::parse` returns `serde_yaml::Error`,** so a malformed
+  `dataset.yaml` stays `Error::ConfigParse` through the group.
+
+**Guards:**
+- `a_catalog_entry_reads_its_facets_where_the_catalog_lists_them` fails
+  on the previous code.
+- `a_dataset_at_a_server_root_is_not_given_an_empty_name`: the first
+  draft named such datasets `""`, putting each in the cache root, where
+  the HTTP suites' servers refused one another's origins.
+- `a_built_description_opens_at_its_home` and
+  `a_knn_entries_directory_opens_the_entry_named_after_it`.
