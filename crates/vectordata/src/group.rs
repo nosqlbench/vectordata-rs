@@ -81,13 +81,25 @@ impl DatasetHandle {
     }
 
     /// A dataset at `home` described by `knn_entries.yaml` content: the
-    /// entry named after the directory, or the file's first.
+    /// entry named after the directory, or the file's first. The file is
+    /// read by the parser its catalog is read by, so `_defaults`
+    /// (`base_url`, `cache_dir`) and `${VAR}` apply as they do there.
+    /// The dataset keeps the directory's name and origin, the cache
+    /// identity a directory open has always had.
     fn of_knn_entries(home: Location, content: &str) -> Result<Self> {
-        let entries = crate::knn_entries::KnnEntries::parse(content).map_err(Error::Other)?;
-        let description = entries
-            .description_for(home.last_segment().unwrap_or_default())
+        let entries = crate::catalog::knn_entries::parse_knn_entries_yaml(content, &home.to_string())
             .map_err(Error::Other)?;
-        Ok(Self::at(home, DatasetConfig::opened(description)))
+        let dir_name = home.last_segment().unwrap_or_default();
+        let chosen = entries.iter().position(|e| e.name() == dir_name).unwrap_or(0);
+        let config = match entries.get(chosen).map(|e| e.description()) {
+            Some(crate::dataset::EntryDescription::Embedded(description)) => {
+                DatasetConfig::opened((**description).clone())
+            }
+            _ => DatasetConfig::opened(
+                crate::dataset::DatasetConfig::builder(dir_name).build().map_err(Error::Other)?,
+            ),
+        };
+        Ok(Self::at(home, config))
     }
 }
 
@@ -546,39 +558,33 @@ fn kept_descriptor_path(url: &Url, base_url: &Url) -> Option<std::path::PathBuf>
 pub const PREBUFFER_LARGE_WARNING_BYTES: u64 = 250 * 1024 * 1024;
 
 impl TestDataGroup {
-    /// Construct a `TestDataGroup` directly from a [`CatalogEntry`](crate::dataset::CatalogEntry)
-    /// whose layout already carries the full profile/facet
-    /// description.
+    /// Open the dataset a [`CatalogEntry`](crate::dataset::CatalogEntry)
+    /// names: what [`Catalog::open_entry`](crate::catalog::Catalog::open_entry) does.
     ///
-    /// For `knn_entries.yaml`-shape entries the catalog file *is*
-    /// the dataset description — there is no separate
-    /// `dataset.yaml` to fetch, and every facet path inside the layout
-    /// has already been absolutised by the parser. For canonical
-    /// (`catalog.json`-shape) entries the layout is a summary,
-    /// not the full config — use [`Self::load`] instead.
-    ///
-    /// The dataset is named `entry.name`, and its home is
+    /// An [embedded](crate::dataset::EntryDescription::Embedded) entry
+    /// holds its whole description, so nothing more is fetched. It is
+    /// named `entry.name`, and its home is
     /// [`dataset_home_url`](crate::dataset::CatalogEntry::dataset_home_url),
-    /// the URL the cache mirrors under `<cache>/<name>/`, which
-    /// relative facet paths resolve against as the catalog resolves them.
+    /// which relative facet paths resolve against, as the catalog
+    /// resolves them, and which the cache mirrors under `<cache>/<name>/`.
+    ///
+    /// A [referenced](crate::dataset::EntryDescription::Referenced)
+    /// entry's description is read from its descriptor, as
+    /// [`load`](Self::load) reads it, which names the dataset after the
+    /// descriptor's directory: today's cache names (SRD §11, item 1).
     pub fn from_catalog_entry(entry: &crate::dataset::CatalogEntry) -> Result<Self> {
-        // The reader's view of the layout, by the one projection every
-        // load uses: the layout's profiles were resolved when it was
-        // parsed (or built complete by the knn_entries parser).
-        let layout = &entry.layout;
-        let config = DatasetConfig::from_parts(
-            layout.format_version,
-            layout.attributes.as_ref(),
-            &layout.profile_tags,
-            &layout.profiles,
-        );
-        let origin = entry.dataset_home_url();
-        Ok(Self::from_handle(DatasetHandle {
-            name: Some(entry.name.clone()),
-            home: Location::parse(&origin)?,
-            origin,
-            config,
-        }))
+        match entry.description() {
+            crate::dataset::EntryDescription::Embedded(description) => {
+                let origin = entry.dataset_home_url().to_string();
+                Ok(Self::from_handle(DatasetHandle {
+                    name: Some(entry.name().to_string()),
+                    home: Location::parse(&origin)?,
+                    origin,
+                    config: DatasetConfig::opened((**description).clone()),
+                }))
+            }
+            crate::dataset::EntryDescription::Referenced { descriptor, .. } => Self::load(descriptor),
+        }
     }
 }
 
@@ -654,6 +660,26 @@ mod tests {
         assert_eq!(base.count(), 3);
     }
 
+    /// **An entry built in code opens through the catalog's open**, its
+    /// relative facets read from the home it was given.
+    #[test]
+    fn a_built_entry_opens_at_its_home() {
+        let dir = tempdir().unwrap();
+        write_fvec(&dir.path().join("b.fvec"));
+        let description = crate::dataset::DatasetConfig::builder("built")
+            .profile("default", |p| p.facet(crate::dataset::StandardFacet::BaseVectors, "b.fvec"))
+            .build()
+            .unwrap();
+        let entry = crate::dataset::CatalogEntry::builder("built")
+            .home(&Location::from_path(dir.path()))
+            .dataset(description)
+            .build()
+            .unwrap();
+        let group = crate::catalog::Catalog::open_entry(&entry).unwrap();
+        assert_eq!(group.name.as_deref(), Some("built"));
+        assert_eq!(group.profile("default").unwrap().base_vectors().unwrap().count(), 3);
+    }
+
     /// **A description built in code opens as a dataset**, its relative
     /// facets read from the home it is given.
     #[test]
@@ -682,7 +708,7 @@ mod tests {
         fs::write(ds.join("knn_entries.yaml"), content).unwrap();
         let group = TestDataGroup::load(ds.to_str().unwrap()).unwrap();
         let base = group.config().profiles["default"].base_vectors.as_ref().unwrap();
-        assert_eq!(base.source(), Some("b.fvec"));
+        assert_eq!(base.source(), ds.join("b.fvec").to_str());
         assert_eq!(group.name.as_deref(), Some("second"));
 
         let other = dir.path().join("other");
@@ -690,7 +716,29 @@ mod tests {
         fs::write(other.join("knn_entries.yaml"), content).unwrap();
         let group = TestDataGroup::load(other.to_str().unwrap()).unwrap();
         let base = group.config().profiles["default"].base_vectors.as_ref().unwrap();
-        assert_eq!(base.source(), Some("a.fvec"));
+        assert_eq!(base.source(), other.join("a.fvec").to_str());
+    }
+
+    /// **A directory's `knn_entries.yaml` reads its facets where its
+    /// `_defaults.base_url` says**, as the same file does when a catalog
+    /// lists it. The directory open had its own parser, which ignored
+    /// `_defaults` and looked for the files beside the catalog.
+    #[test]
+    fn a_knn_entries_directory_honours_its_defaults_base_url() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().join("data");
+        write_fvec(&data.join("b.fvec"));
+        let ds = dir.path().join("ds");
+        fs::create_dir_all(&ds).unwrap();
+        let content = format!(
+            "_defaults:\n  base_url: {}\nds:\n  base: b.fvec\n  query: b.fvec\n  gt: g.ivec\n",
+            data.to_str().unwrap(),
+        );
+        fs::write(ds.join("knn_entries.yaml"), content).unwrap();
+        let group = TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+        let base = group.profile("default").unwrap().base_vectors().expect("the file under base_url opens");
+        assert_eq!(base.count(), 3);
+        assert_eq!(group.name.as_deref(), Some("ds"), "the directory keeps its cache name");
     }
 
     /// **A dataset at a server's root has no cache directory name**, so
@@ -733,17 +781,14 @@ mod tests {
             attributes: None,
             profiles: Default::default(),
         };
-        let entry = crate::dataset::CatalogEntry {
-            name: "vecs1m".to_string(),
-            path: "https://example.com/datasets/vecs1m/dataset.yaml".to_string(),
-            dataset_type: "dataset.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
+        let entry = crate::dataset::CatalogEntry::from_listing(
+            "vecs1m".to_string(),
+            "https://example.com/datasets/vecs1m/dataset.yaml".to_string(),
+            "dataset.yaml".to_string(),
             layout,
-        };
-        let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
-        assert_eq!(group.origin, "https://example.com/datasets/vecs1m/");
-        assert_eq!(group.name.as_deref(), Some("vecs1m"));
+        )
+        .unwrap();
+        assert_eq!(entry.dataset_home_url(), "https://example.com/datasets/vecs1m/");
     }
 
     #[test]
@@ -759,14 +804,13 @@ mod tests {
             attributes: None,
             profiles: Default::default(),
         };
-        let entry = crate::dataset::CatalogEntry {
-            name: "emb-002-100k".to_string(),
-            path: "s3://vector-datasets-public/datasets-clean".to_string(),
-            dataset_type: "knn_entries.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
+        let entry = crate::dataset::CatalogEntry::from_listing(
+            "emb-002-100k".to_string(),
+            "s3://vector-datasets-public/datasets-clean".to_string(),
+            "knn_entries.yaml".to_string(),
             layout,
-        };
+        )
+        .unwrap();
         let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
         assert_eq!(group.origin, "s3://vector-datasets-public/datasets-clean/emb-002-100k/");
         assert_eq!(group.name.as_deref(), Some("emb-002-100k"));

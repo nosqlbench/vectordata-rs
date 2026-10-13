@@ -991,3 +991,88 @@ entries built in code (step 5) would not have been.
   the HTTP suites' servers refused one another's origins.
 - `a_built_description_opens_at_its_home` and
   `a_knn_entries_directory_opens_the_entry_named_after_it`.
+
+### 12.5 Step 5: entry descriptions, the entry builder, one `knn_entries` parser (2026-10-13)
+
+**Found first.** Three points of RC-9 and RC-10 did not fit what step 1
+established or what catalogs hold:
+- **RC-9's `descriptor: Location` would re-spell identities.** The
+  descriptor and the home are cache identities, and §12.1's rule keeps
+  them as written. The entry holds them as strings.
+  `EntryBuilder::home` and `descriptor` take a `Location` for a program.
+  The parsers use crate-private `home_as_written` and
+  `descriptor_as_written`.
+- **`dataset_type` cannot be derived from the variant alone.** Catalogs
+  list `hdf5` entries, and "direct" entries default to `unknown`;
+  `infer_vtype` reads the type. A referenced entry keeps its type, and
+  an embedded one is `knn_entries.yaml`.
+- **The old parser could not simply be swapped in for directory
+  opens.** Going through `from_catalog_entry` would give a directory's
+  dataset the catalog's home (`<base>/<name>/`). That moves its cache
+  identity, and a facet relative to the directory would then cache flat
+  by basename. A directory open uses the catalog parser for the
+  description, and keeps the directory's name and origin.
+
+**Built:**
+- **`EntryDescription`:** `Embedded(Box<DatasetConfig>)`, or
+  `Referenced { descriptor, dataset_type, summary }`.
+- **`CatalogEntry` is private fields behind accessors.**
+  - The fields are `name`, `home`, `description` and the provenance
+    pair.
+  - The accessors are `name`, `description`, `dataset_type`, `location`,
+    `format_version`, `attributes`, `profile_tags`, `profiles`,
+    `layout`, `catalog_file`, `catalog_name` and `dataset_home_url`.
+  - Provenance is set only by the crate's loaders, through
+    `set_catalog_file` and `set_catalog_name` (RC-14 moves this into the
+    catalog in step 6).
+- **`CatalogEntry::builder(name)`** (RC-10) takes `home` with `dataset`,
+  or `descriptor` with a summary. It refuses an entry with no
+  description, and an embedded one with no home.
+- **One listing constructor.** `CatalogEntry::from_listing` is the one
+  rule for a listed entry: a `knn_entries.yaml` entry is embedded and
+  homed at its base and name, and any other is referenced and homed at
+  its descriptor's directory. The resolver's `remap_entry` (both shapes)
+  and the entry's `Deserialize` use it.
+- **The file form is unchanged.** `Serialize` and `Deserialize` go
+  through the wire form `{name, path, dataset_type, layout}`, in the old
+  field order.
+- **The builders are the only construction paths.**
+  - The `knn_entries` catalog parser builds each dataset through
+    `DatasetConfig::builder` and each entry through
+    `CatalogEntry::builder`.
+  - Both catalog generators build entries through the builder.
+  - An embedded layout read from a file becomes a description through
+    `DatasetConfig::from_layout`, which runs `build`'s checks.
+- **`Catalog::open_entry` is `TestDataGroup::from_catalog_entry`,**
+  matching on the description. An embedded entry opens with no fetch.
+  A referenced one loads its descriptor, with today's cache names.
+- **`crate::knn_entries` is removed** (RC-11):
+  - a directory open of `knn_entries.yaml` uses the catalog parser;
+  - the publish check reads raw declared paths through
+    `catalog::knn_entries::declared_facet_paths`.
+- **Test fixtures that built entries as struct literals now use the
+  builders.** Two `filter.rs` tests had been rewritten to mutate a copy
+  of the layout, which would have tested nothing. They now change the
+  layout before building the entry.
+
+**Behaviour changes:**
+- A directory's `knn_entries.yaml` honours `_defaults.base_url`,
+  `cache_dir` and `${VAR}` (B-3).
+- Its facets are now resolved strings: the catalog's concatenation rule
+  rather than the view's URL join. For a URL directory the two differ
+  only for names with `..`, spaces or characters that need encoding;
+  such files cache under the concatenated spelling.
+- knn descriptions go through the one inheritance rule, as readers
+  already did through `effective_view`. A profile lacking a facet the
+  `default` profile has now carries it explicitly.
+- A listing shows an embedded entry's location as its home (base and
+  name) rather than its base.
+
+**Guards:**
+- `a_knn_entries_directory_honours_its_defaults_base_url` (B-3) fails on
+  the previous code.
+- `an_entry_writes_the_form_it_was_read_from` covers the catalog file
+  text, for each kind of entry.
+- Also: `an_entry_is_embedded_or_referenced_by_its_listing`,
+  `an_embedded_entry_without_a_home_is_refused` and
+  `a_built_entry_opens_at_its_home`.

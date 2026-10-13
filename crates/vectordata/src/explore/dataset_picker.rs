@@ -319,18 +319,17 @@ fn build_rows(
         // SimpleMFD ecosystem encodes the metric in ground-truth
         // filenames (`..._gt_..._ip_k100.ivecs`) — recover it from
         // there rather than showing an empty column.
-        let metric = entry.layout.attributes.as_ref()
+        let metric = entry.attributes()
             .and_then(|a| a.distance_function.as_deref())
             .map(|s| s.to_string())
             .or_else(|| infer_metric_from_entry(entry))
             .unwrap_or_default();
 
-        let ds_cache = cache_dir.join(&entry.name);
+        let ds_cache = cache_dir.join(entry.name());
 
-        let catalog_name = entry.catalog_name.clone()
-            .unwrap_or_else(|| "?".to_string());
+        let catalog_name = entry.catalog_name().unwrap_or("?").to_string();
         for profile_name in entry.profile_names() {
-            let profile = entry.layout.profiles.profile(profile_name);
+            let profile = entry.profiles().profile(profile_name);
             let bc = crate::dataset::profile::profile_sort_key(
                 profile_name, profile.and_then(|p| p.base_count));
 
@@ -360,7 +359,7 @@ fn build_rows(
             let access = profile_access_mode(entry, &ds_cache, profile, cache_survey);
 
             rows.push(PickerRow {
-                dataset: entry.name.clone(),
+                dataset: entry.name().to_string(),
                 catalog: catalog_name.clone(),
                 profile: profile_name.to_string(),
                 base_count: bc,
@@ -372,7 +371,7 @@ fn build_rows(
                 access,
                 facts: crate::dataset::selector::ProfileFacts::of_declared(
                     profile_name,
-                    &entry.layout.profiles,
+                    entry.profiles(),
                 )
                 .unwrap_or_default(),
             });
@@ -433,7 +432,7 @@ fn profile_cache_coverage(
     // Same home URL the storage open anchors the cache layout on —
     // single authority, so the picker's expectation of where a facet
     // caches cannot drift from where the runtime actually puts it.
-    let home = crate::location::dir_form(&entry.dataset_home_url());
+    let home = crate::location::dir_form(entry.dataset_home_url());
     let mut valid = 0u32;
     let mut total = 0u32;
     for (_facet, view) in &profile.views {
@@ -538,12 +537,12 @@ fn build_descriptor_lines(
     ]));
 
     if let Some(entry) = entry {
-        lines.push(kv("path", &entry.path, dim_gray, val_white));
-        lines.push(kv("type", &entry.dataset_type, dim_gray, val_white));
+        lines.push(kv("path", entry.location(), dim_gray, val_white));
+        lines.push(kv("type", entry.dataset_type(), dim_gray, val_white));
     }
 
     if let Some(entry) = entry
-        && let Some(attrs) = entry.layout.attributes.as_ref()
+        && let Some(attrs) = entry.attributes()
     {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(" Attributes ", head_cyan)));
@@ -564,7 +563,7 @@ fn build_descriptor_lines(
     }
 
     if let Some(entry) = entry
-        && let Some(profile) = entry.layout.profiles.profile(&row.profile)
+        && let Some(profile) = entry.profiles().profile(&row.profile)
     {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(" Profile ", head_cyan)));
@@ -654,21 +653,24 @@ fn build_source_lines(
     // Source location. `entry.catalog_file` is the document the
     // resolver actually parsed this entry from — authoritative when
     // present. For knn_entries-shape catalogs it is the ONLY correct
-    // answer: `entry.path` holds `_defaults.base_url` (where the DATA
-    // lives, possibly another host and scheme), so the old
-    // `<path>/knn_entries.yaml` reconstruction pointed at a file that
-    // never existed. Canonical entries fall back to `entry.path`,
-    // which IS their dataset.yaml location.
-    let (source_url, title_suffix) = match &entry.catalog_file {
+    // answer: the entry's base is `_defaults.base_url` (where the DATA
+    // lives, possibly another host and scheme), so a
+    // `<base>/knn_entries.yaml` reconstruction points at a file that
+    // may never have existed. Referenced entries fall back to their
+    // descriptor, which IS their dataset.yaml location.
+    let (source_url, title_suffix) = match entry.catalog_file() {
         Some(file) => {
             let basename = file.rsplit('/').next().unwrap_or("catalog").to_string();
-            (file.clone(), basename)
+            (file.to_string(), basename)
         }
-        None if entry.dataset_type == "knn_entries.yaml" => (
-            format!("{}/knn_entries.yaml", entry.path.trim_end_matches('/')),
+        None if entry.dataset_type() == "knn_entries.yaml" => (
+            format!(
+                "{}knn_entries.yaml",
+                crate::location::parent_form(entry.dataset_home_url().trim_end_matches('/')),
+            ),
             "knn_entries.yaml".to_string(),
         ),
-        None => (entry.path.clone(), "dataset.yaml".to_string()),
+        None => (entry.location().to_string(), "dataset.yaml".to_string()),
     };
 
     let raw = match fetch_yaml_text(&source_url) {
@@ -685,8 +687,8 @@ fn build_source_lines(
         }
     };
 
-    let filtered = if entry.dataset_type == "knn_entries.yaml" {
-        filter_knn_entries_for(&raw, &entry.name)
+    let filtered = if entry.dataset_type() == "knn_entries.yaml" {
+        filter_knn_entries_for(&raw, entry.name())
     } else {
         raw
     };
@@ -1150,7 +1152,7 @@ fn canonicalize_cache_url(url: &str) -> String {
 /// `resolve_facet_url` per row, but conceptually the same set).
 fn entry_facet_urls(entry: &CatalogEntry) -> std::collections::HashSet<String> {
     let mut urls = std::collections::HashSet::new();
-    for (_pname, profile) in &entry.layout.profiles.profiles {
+    for (_pname, profile) in &entry.profiles().profiles {
         for (_facet, view) in &profile.views {
             if let Some(url) = resolve_facet_url(entry, view) {
                 urls.insert(canonicalize_cache_url(&url));
@@ -1194,9 +1196,9 @@ pub(super) fn purge_cache_for_entry(
     };
 
     // Sweep 1: the dataset-keyed directory.
-    let name_dir = cache_dir.join(&entry.name);
+    let name_dir = cache_dir.join(entry.name());
     if name_dir.is_dir() {
-        let home = canonicalize_cache_url(&entry.dataset_home_url());
+        let home = canonicalize_cache_url(entry.dataset_home_url());
         match crate::cache::layout::read_dataset_origin(&name_dir) {
             Some(origin) if canonicalize_cache_url(&origin.source) != home => {
                 skipped.push(format!(
@@ -1257,11 +1259,11 @@ pub(super) fn purge_cache_for_profiles(
         return ProfilePurge { removed, freed, skipped, kept: Vec::new() };
     }
     let mut out = ProfilePurge { removed: Vec::new(), freed: 0, skipped: Vec::new(), kept: Vec::new() };
-    let name_dir = cache_dir.join(&entry.name);
+    let name_dir = cache_dir.join(entry.name());
     if !name_dir.is_dir() {
         return out;
     }
-    let home = canonicalize_cache_url(&entry.dataset_home_url());
+    let home = canonicalize_cache_url(entry.dataset_home_url());
     if let Some(origin) = crate::cache::layout::read_dataset_origin(&name_dir)
         && canonicalize_cache_url(&origin.source) != home
     {
@@ -1274,7 +1276,7 @@ pub(super) fn purge_cache_for_profiles(
         ));
         return out;
     }
-    let home_slash = crate::location::dir_form(&entry.dataset_home_url());
+    let home_slash = crate::location::dir_form(entry.dataset_home_url());
     // The cache leaves each profile's facets live in, by the same
     // forward derivation the storage open uses.
     let leaves_of = |profile: &crate::dataset::profile::DSProfile| -> Vec<String> {
@@ -1291,7 +1293,7 @@ pub(super) fn purge_cache_for_profiles(
     };
     let mut targets: Vec<String> = Vec::new();
     let mut keepers: Vec<(String, Vec<String>)> = Vec::new();
-    for (pname, profile) in &entry.layout.profiles.profiles {
+    for (pname, profile) in &entry.profiles().profiles {
         let leaves = leaves_of(profile);
         if selected.iter().any(|s| s == pname) {
             targets.extend(leaves);
@@ -1461,7 +1463,7 @@ fn profile_access_mode(
     let clean = strip_window_suffix(&view.source.path);
 
     if let Some(url) = resolve_facet_url(entry, view) {
-        let home = crate::location::dir_form(&entry.dataset_home_url());
+        let home = crate::location::dir_form(entry.dataset_home_url());
         let expected = ds_cache.join(crate::view::facet_cache_relpath(&url, &home));
         match survey.get(&expected) {
             // Chunk-store file: fully valid bitmap means every read
@@ -1500,7 +1502,7 @@ fn profile_access_mode(
 /// base) filename: `_ip_`, `_l2_`, `_cos`/`_cosine`, `_angular`,
 /// `_dot`. Returns the canonical lowercase token.
 fn infer_metric_from_entry(entry: &CatalogEntry) -> Option<String> {
-    for (_pname, profile) in &entry.layout.profiles.profiles {
+    for (_pname, profile) in &entry.profiles().profiles {
         for (_facet, view) in &profile.views {
             if let Some(m) = infer_metric_from_filename(&view.source.path) {
                 return Some(m);
@@ -1600,10 +1602,10 @@ fn collect_local_knowledge(
     knowledge: &mut std::collections::HashMap<String, FacetKnowledge>,
 ) {
     for entry in entries {
-        let ds_workspace = cache_dir.join(&entry.name);
-        let home = crate::location::dir_form(&entry.dataset_home_url());
+        let ds_workspace = cache_dir.join(entry.name());
+        let home = crate::location::dir_form(entry.dataset_home_url());
         for pname in entry.profile_names() {
-            let Some(profile) = entry.layout.profiles.profile(pname) else { continue };
+            let Some(profile) = entry.profiles().profile(pname) else { continue };
             for (_facet, view) in &profile.views {
                 let Some(shape) = facet_shape(entry, view) else { continue };
                 let known = knowledge.get(&shape.url).copied().unwrap_or_default();
@@ -1658,7 +1660,7 @@ fn collect_size_probe_jobs(
     let mut jobs: Vec<SizeProbeJob> = Vec::new();
     for entry in entries {
         for pname in entry.profile_names() {
-            let Some(profile) = entry.layout.profiles.profile(pname) else { continue };
+            let Some(profile) = entry.profiles().profile(pname) else { continue };
             for (_facet, view) in &profile.views {
                 let Some(shape) = facet_shape(entry, view) else { continue };
                 if !crate::transport::is_remote_url(&shape.url) { continue; }
@@ -1814,10 +1816,10 @@ fn apply_size_cells(
 ) {
     use crate::dataset::StandardFacet;
     for row in rows.iter_mut() {
-        let Some(entry) = entries.iter().find(|e| e.name == row.dataset) else { continue };
-        let Some(profile) = entry.layout.profiles.profile(&row.profile) else { continue };
+        let Some(entry) = entries.iter().find(|e| e.name() == row.dataset) else { continue };
+        let Some(profile) = entry.profiles().profile(&row.profile) else { continue };
 
-        let default_base_path: Option<String> = entry.layout.profiles
+        let default_base_path: Option<String> = entry.profiles()
             .profile("default")
             .and_then(|p| p.views.get(StandardFacet::BaseVectors.key()))
             .map(|v| strip_window_suffix(&v.source.path).to_string());
@@ -2440,7 +2442,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     let catalog_list: Vec<(String, usize)> = {
         let mut ordered: Vec<(String, usize)> = Vec::new();
         for e in entries {
-            let name = e.catalog_name.clone().unwrap_or_else(|| "?".to_string());
+            let name = e.catalog_name().unwrap_or("?").to_string();
             match ordered.iter_mut().find(|(n, _)| *n == name) {
                 Some((_, count)) => *count += 1,
                 None => ordered.push((name, 1)),
@@ -4025,7 +4027,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                 if action.is_picker_local() {
                                     match action {
                                         PickerAction::Describe => {
-                                            let entry = entries.iter().find(|e| e.name == row.dataset);
+                                            let entry = entries.iter().find(|e| e.name() == row.dataset);
                                             descriptor_lines = build_descriptor_lines(row, entry, &facet_knowledge, theme_on);
                                             descriptor_title = format!(
                                                 "Descriptor — {}:{}", row.dataset, row.profile);
@@ -4033,7 +4035,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                             descriptor_open = true;
                                         }
                                         PickerAction::Source => {
-                                            let entry = entries.iter().find(|e| e.name == row.dataset);
+                                            let entry = entries.iter().find(|e| e.name() == row.dataset);
                                             let (title, lines) = match entry {
                                                 Some(e) => build_source_lines(e, theme_on),
                                                 None => (
@@ -4370,20 +4372,32 @@ mod tests {
         assert_eq!(infer("ship.fvecs"), None);
     }
 
+    /// A `knn_entries.yaml` catalog's entry for `name` under `base`,
+    /// with `profiles`.
+    fn knn_entry_with(
+        name: &str,
+        base: &str,
+        profiles: Vec<(&str, crate::dataset::DSProfile)>,
+    ) -> crate::dataset::CatalogEntry {
+        let layout = crate::dataset::CatalogLayout {
+            format_version: crate::model::FORMAT_VERSION_BASE,
+            profile_tags: Default::default(),
+            attributes: None,
+            profiles: crate::dataset::DSProfileGroup::from_profiles(
+                profiles.into_iter().map(|(n, p)| (n.to_string(), p)).collect(),
+            ),
+        };
+        crate::dataset::CatalogEntry::from_listing(
+            name.to_string(),
+            base.to_string(),
+            "knn_entries.yaml".to_string(),
+            layout,
+        )
+        .unwrap()
+    }
+
     fn knn_entry(name: &str, base: &str) -> crate::dataset::CatalogEntry {
-        crate::dataset::CatalogEntry {
-            name: name.to_string(),
-            path: base.to_string(),
-            dataset_type: "knn_entries.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
-            layout: crate::dataset::CatalogLayout {
-                format_version: crate::model::FORMAT_VERSION_BASE,
-                profile_tags: Default::default(),
-                attributes: None,
-                profiles: Default::default(),
-            },
-        }
+        knn_entry_with(name, base, Vec::new())
     }
 
     /// Purge must remove the dataset-keyed directory even when every
@@ -4453,19 +4467,7 @@ mod tests {
         std::fs::write(ds.join("query.fvecs"), b"data").unwrap();
         std::fs::write(ds.join("query.fvecs.chunks"), [1u8]).unwrap();
 
-        let entry = crate::dataset::CatalogEntry {
-            name: "ds-a".to_string(),
-            path: "https://h/cat".to_string(),
-            dataset_type: "knn_entries.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
-            layout: crate::dataset::CatalogLayout {
-                format_version: crate::model::FORMAT_VERSION_BASE,
-                profile_tags: Default::default(),
-                attributes: None,
-                profiles: Default::default(),
-            },
-        };
+        let entry = knn_entry("ds-a", "https://h/cat");
         let view_for = |path: &str| DSView {
             source: DSSource {
                 path: path.to_string(),
@@ -4535,19 +4537,15 @@ mod tests {
              base_vectors: base.fvecs[0..10)\n  neighbor_indices: profiles/10m/gt.ivecs\n",
         )
         .unwrap();
-        let entry = crate::dataset::CatalogEntry {
-            name: "ds-p".to_string(),
-            path: "https://h/data/ds-p/dataset.yaml".to_string(),
-            dataset_type: "dataset.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
-            layout: crate::dataset::CatalogLayout {
+        let entry = crate::dataset::CatalogEntry::builder("ds-p")
+            .descriptor(&crate::Location::parse("https://h/data/ds-p/dataset.yaml").unwrap(), crate::dataset::CatalogLayout {
                 format_version: crate::model::FORMAT_VERSION_BASE,
                 profile_tags: Default::default(),
                 attributes: None,
                 profiles,
-            },
-        };
+            })
+            .build()
+            .unwrap();
 
         let one = super::purge_cache_for_profiles(&entry, &["10m".to_string()], &cache);
         // `Path::ends_with` compares components, so the expected suffix
@@ -4653,13 +4651,11 @@ mod tests {
         std::fs::write(ds.join("base.fvecs"), &bytes).unwrap();
         std::fs::write(ds.join("base.ivvecs"), [0u8; 64]).unwrap();
 
-        let mut entry = knn_entry("ds-a", "https://h/cat");
-        entry.layout.profiles.profiles.insert(
-            "default".into(), profile_with_base("https://h/cat/ds-a/base.fvecs"));
-        entry.layout.profiles.profiles.insert(
-            "win".into(), profile_with_base("https://h/cat/ds-a/base.fvecs[0..1)"));
-        entry.layout.profiles.profiles.insert(
-            "vv".into(), profile_with_base("https://h/cat/ds-a/base.ivvecs"));
+        let entry = knn_entry_with("ds-a", "https://h/cat", vec![
+            ("default", profile_with_base("https://h/cat/ds-a/base.fvecs")),
+            ("win", profile_with_base("https://h/cat/ds-a/base.fvecs[0..1)")),
+            ("vv", profile_with_base("https://h/cat/ds-a/base.ivvecs")),
+        ]);
         let entries = vec![entry];
 
         let survey = std::collections::HashMap::new();
@@ -4688,7 +4684,7 @@ mod tests {
         // and bytes for the uniform facet.
         let stat = super::facet_stat_string(
             &entries[0],
-            entries[0].layout.profiles.profile("default").unwrap()
+            entries[0].profiles().profile("default").unwrap()
                 .views.get("base_vectors").unwrap(),
             &knowledge);
         assert_eq!(stat.as_deref(), Some(format!(
@@ -4701,17 +4697,16 @@ mod tests {
     /// facets surface as `…` cells until their answer merges in.
     #[test]
     fn size_probe_jobs_dedupe_and_mark_pending() {
-        let mut a = knn_entry("ds-a", "https://h/cat");
-        a.layout.profiles.profiles.insert(
-            "default".into(), profile_with_base("https://h/cat/ds-a/base.fvecs"));
-        a.layout.profiles.profiles.insert(
-            "alt".into(), profile_with_base("https://h/cat/ds-a/base.fvecs"));
-        let mut b = knn_entry("ds-b", "https://h/cat");
-        b.layout.profiles.profiles.insert(
-            "default".into(), profile_with_base("/local/base.fvecs"));
-        let mut c = knn_entry("ds-c", "https://h/cat");
-        c.layout.profiles.profiles.insert(
-            "default".into(), profile_with_base("https://h/cat/ds-c/base.fvecs"));
+        let a = knn_entry_with("ds-a", "https://h/cat", vec![
+            ("default", profile_with_base("https://h/cat/ds-a/base.fvecs")),
+            ("alt", profile_with_base("https://h/cat/ds-a/base.fvecs")),
+        ]);
+        let b = knn_entry_with("ds-b", "https://h/cat", vec![
+            ("default", profile_with_base("/local/base.fvecs")),
+        ]);
+        let c = knn_entry_with("ds-c", "https://h/cat", vec![
+            ("default", profile_with_base("https://h/cat/ds-c/base.fvecs")),
+        ]);
         let entries = vec![a, b, c];
 
         // ds-c is already fully answered locally.
@@ -4809,9 +4804,9 @@ mod tests {
     /// the cells go blank instead of showing `…` forever.
     #[test]
     fn failed_probe_clears_pending_cells() {
-        let mut a = knn_entry("ds-a", "https://h/cat");
-        a.layout.profiles.profiles.insert(
-            "default".into(), profile_with_base("https://h/cat/ds-a/base.fvecs"));
+        let a = knn_entry_with("ds-a", "https://h/cat", vec![
+            ("default", profile_with_base("https://h/cat/ds-a/base.fvecs")),
+        ]);
         let entries = vec![a];
         let mut knowledge = std::collections::HashMap::new();
         knowledge.insert("https://h/cat/ds-a/base.fvecs".to_string(),

@@ -58,6 +58,19 @@ impl DatasetConfig {
     }
 }
 
+impl DatasetConfig {
+    /// The description a catalog layout carries whole (an embedded
+    /// entry's), named `name`, through the checks [`build`](DatasetBuilder::build)
+    /// runs.
+    pub(crate) fn from_layout(name: &str, layout: super::catalog::CatalogLayout) -> Result<Self, String> {
+        let mut builder = Self::builder(name).format_version(layout.format_version);
+        builder.attributes = layout.attributes;
+        builder.profile_tags = layout.profile_tags;
+        builder.profiles = layout.profiles.profiles;
+        builder.build()
+    }
+}
+
 /// A dataset description being built. See the [module docs](self).
 ///
 /// Problems (a source string that does not parse, a duplicate profile)

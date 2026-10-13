@@ -63,7 +63,7 @@ fn catalog_resolver_discovers_knn_entries_yaml() {
     let sources = CatalogSources::new().add_catalogs(&[tmp.path().to_string_lossy().to_string()]);
     let catalog = Catalog::of(&sources);
 
-    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name()).collect();
     assert!(names.contains(&"alpha"), "got names: {names:?}");
     assert!(names.contains(&"beta"), "got names: {names:?}");
 
@@ -76,7 +76,7 @@ fn catalog_resolver_discovers_knn_entries_yaml() {
     assert_eq!(beta.profile_names(), vec!["default"]);
 
     // Facet alias mapping: base→base_vectors, gt→neighbor_indices.
-    let default_profile = alpha.layout.profiles.profile("default").unwrap();
+    let default_profile = alpha.profiles().profile("default").unwrap();
     let view_names: Vec<&str> = default_profile.views.keys().map(|s| s.as_str()).collect();
     assert!(view_names.contains(&"base_vectors"));
     assert!(view_names.contains(&"query_vectors"));
@@ -110,8 +110,7 @@ fn no_defaults_uses_catalog_directory_as_base() {
     let catalog = Catalog::of(&sources);
     let d = catalog.find_exact("d").unwrap();
     let path = &d
-        .layout
-        .profiles
+        .profiles()
         .profile("default")
         .unwrap()
         .views
@@ -152,7 +151,7 @@ fn canonical_catalog_takes_precedence_over_knn_entries() {
 
     let sources = CatalogSources::new().add_catalogs(&[tmp.path().to_string_lossy().to_string()]);
     let catalog = Catalog::of(&sources);
-    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name()).collect();
     assert_eq!(
         names,
         vec!["canonical"],
@@ -218,17 +217,17 @@ _defaults:
     let sources = CatalogSources::new().add_catalogs(std::slice::from_ref(&dataset_url));
     let catalog = Catalog::of(&sources);
 
-    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name()).collect();
     assert_eq!(names, vec!["example-1b"], "got names: {names:?}");
 
     let entry = catalog.find_exact("example-1b").expect("dataset resolves");
-    assert_eq!(entry.dataset_type, "knn_entries.yaml");
+    assert_eq!(entry.dataset_type(), "knn_entries.yaml");
     let profiles: Vec<&str> = entry.profile_names();
     assert!(profiles.contains(&"default"));
     assert!(profiles.contains(&"100k"));
 
     // Facet alias mapping survives the HTTP round-trip.
-    let default = entry.layout.profiles.profile("default").unwrap();
+    let default = entry.profiles().profile("default").unwrap();
     let view_names: Vec<&str> = default.views.keys().map(|s| s.as_str()).collect();
     assert!(view_names.contains(&"base_vectors"));
     assert!(view_names.contains(&"query_vectors"));
@@ -294,7 +293,7 @@ fn http_404_on_canonical_falls_through_to_knn_entries() {
     let server = TestServer::start(tmp.path()).unwrap();
     let sources = CatalogSources::new().add_catalogs(&[server.base_url()]);
     let catalog = Catalog::of(&sources);
-    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name()).collect();
     assert_eq!(names, vec!["only"]);
 }
 
@@ -375,14 +374,14 @@ ds-c-1m:
     let sources = CatalogSources::new().add_catalogs(&[catalog_url]);
     let catalog = Catalog::of(&sources);
 
-    let mut names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
+    let mut names: Vec<&str> = catalog.datasets().iter().map(|e| e.name()).collect();
     names.sort();
     assert_eq!(names, vec!["ds-a-1m", "ds-b-10m", "ds-c-1m"], "got names: {names:?}");
 
     // Each SimpleMFD entry is a single-default-profile dataset.
     let ds_a = catalog.find_exact("ds-a-1m").expect("ds-a-1m resolves");
     assert_eq!(ds_a.profile_names(), vec!["default"]);
-    let default = ds_a.layout.profiles.profile("default").unwrap();
+    let default = ds_a.profiles().profile("default").unwrap();
     let bv = &default.views.get("base_vectors").unwrap().source.path;
     assert!(
         bv.starts_with(&format!("{base}/private-root/")) && bv.ends_with("ds-a/base.fvecs"),
@@ -419,11 +418,11 @@ _defaults:
     let sources = CatalogSources::new().add_catalogs(std::slice::from_ref(&catalog_url));
     let catalog = Catalog::of(&sources);
 
-    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name()).collect();
     assert_eq!(names, vec!["private-ds"], "got names: {names:?}");
 
     let entry = catalog.find_exact("private-ds").expect("dataset resolves");
-    let default = entry.layout.profiles.profile("default").unwrap();
+    let default = entry.profiles().profile("default").unwrap();
     let bv = &default.views.get("base_vectors").unwrap().source.path;
     assert!(
         bv.starts_with(&format!("{base}/protected/")) && bv.ends_with("profiles/base/base_vectors.fvecs"),
@@ -455,7 +454,7 @@ fn http_catalog_resolver_accepts_arbitrary_canonical_yaml() {
     let sources = CatalogSources::new().add_catalogs(&[catalog_url]);
     let catalog = Catalog::of(&sources);
 
-    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name()).collect();
     assert_eq!(names, vec!["alpha"], "got names: {names:?}");
 }
 
@@ -758,9 +757,9 @@ ds-a-6m:
     // this is what the picker's Source action displays. It must be
     // the actual catalog file, not a name fabricated from base_url.
     for e in catalog.datasets() {
-        assert_eq!(e.catalog_file.as_deref(),
+        assert_eq!(e.catalog_file(),
             Some(format!("{base}/root/knn_entries.yaml").as_str()),
-            "entry '{}' must record its source document", e.name);
+            "entry '{}' must record its source document", e.name());
     }
 
     let q_1m = open_query_path("ds-a-1m");

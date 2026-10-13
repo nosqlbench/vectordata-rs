@@ -15,7 +15,7 @@
 //! let catalog = Catalog::of(&sources);
 //!
 //! for entry in catalog.datasets() {
-//!     println!("{} ({} profiles)", entry.name, entry.profile_count());
+//!     println!("{} ({} profiles)", entry.name(), entry.profile_count());
 //! }
 //! ```
 

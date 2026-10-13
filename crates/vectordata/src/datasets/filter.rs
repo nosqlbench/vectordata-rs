@@ -174,7 +174,7 @@ impl DatasetFilter {
     /// (same as offline), never a live fetch.
     pub fn matches_with(&self, entry: &CatalogEntry, mode: ProbeMode) -> bool {
         if let Some(ref name) = self.name
-            && !smart_match(name, &entry.name) {
+            && !smart_match(name, entry.name()) {
                 return false;
             }
 
@@ -334,7 +334,7 @@ impl ProfileView {
 /// Collect all view (facet) names from all profiles in an entry.
 fn collect_all_view_names(entry: &CatalogEntry) -> Vec<String> {
     let mut names = Vec::new();
-    for (_, profile) in &entry.layout.profiles.profiles {
+    for (_, profile) in &entry.profiles().profiles {
         for key in profile.views.keys() {
             if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(key)) {
                 names.push(key.clone());
@@ -364,7 +364,7 @@ fn resolve_facet_name(name: &str) -> String {
 /// default profile's base_vectors window size.
 pub fn max_base_count(entry: &CatalogEntry) -> Option<u64> {
     let mut max: Option<u64> = None;
-    for (_, profile) in &entry.layout.profiles.profiles {
+    for (_, profile) in &entry.profiles().profiles {
         if let Some(bc) = profile.base_count {
             max = Some(max.map_or(bc, |m: u64| m.max(bc)));
         }
@@ -418,7 +418,7 @@ fn metric_synonym(token: &str) -> Option<&'static str> {
 /// 3. the dataset-name convention used by the ann-benchmarks corpus
 ///    (`glove-25-angular`, `sift-128-euclidean`, `lastfm-64-dot`).
 pub fn infer_metric(entry: &CatalogEntry) -> Option<String> {
-    if let Some(ref attrs) = entry.layout.attributes {
+    if let Some(attrs) = entry.attributes() {
         if let Some(ref df) = attrs.distance_function {
             return Some(canonicalize_metric(df));
         }
@@ -432,7 +432,7 @@ pub fn infer_metric(entry: &CatalogEntry) -> Option<String> {
         }
     }
     entry
-        .name
+        .name()
         .split(['-', '_'])
         .find_map(metric_synonym)
         .map(str::to_string)
@@ -536,7 +536,7 @@ fn probe_facet_dim_header(path: &str) -> Option<u32> {
 /// Infer dimensionality from attributes/tags or the dataset name.
 /// Offline-only — see [`resolve_dimension`] for the probing variant.
 pub fn infer_dimension(entry: &CatalogEntry) -> Option<u32> {
-    if let Some(ref attrs) = entry.layout.attributes {
+    if let Some(attrs) = entry.attributes() {
         for (k, v) in &attrs.tags {
             if (k.eq_ignore_ascii_case("dimension")
                 || k.eq_ignore_ascii_case("dim")
@@ -546,7 +546,7 @@ pub fn infer_dimension(entry: &CatalogEntry) -> Option<u32> {
                 }
         }
     }
-    extract_dim_from_name(&entry.name)
+    extract_dim_from_name(entry.name())
 }
 
 /// Dimensionality with a last-resort header probe: [`infer_dimension`]
@@ -609,7 +609,7 @@ pub(crate) fn base_vectors_path(entry: &CatalogEntry) -> Option<String> {
 /// and a catalog listing would report a fifth of the dataset's records
 /// as its size (SH-74).
 pub(crate) fn base_vectors_files(entry: &CatalogEntry) -> Vec<String> {
-    for (_, profile) in &entry.layout.profiles.profiles {
+    for (_, profile) in &entry.profiles().profiles {
         if let Some(view) = profile
             .views
             .get("base_vectors")
@@ -631,7 +631,7 @@ pub(crate) fn base_vectors_files(entry: &CatalogEntry) -> Vec<String> {
 /// this without touching a file — and answers it correctly, which a
 /// byte probe over one shard cannot.
 fn declared_base_records(entry: &CatalogEntry) -> Option<u64> {
-    for (_, profile) in &entry.layout.profiles.profiles {
+    for (_, profile) in &entry.profiles().profiles {
         if let Some(view) = profile
             .views
             .get("base_vectors")
@@ -645,10 +645,10 @@ fn declared_base_records(entry: &CatalogEntry) -> Option<u64> {
 
 /// Infer vector data type from base_vectors file extension.
 pub fn infer_vtype(entry: &CatalogEntry) -> Option<String> {
-    if entry.dataset_type.eq_ignore_ascii_case("hdf5") {
+    if entry.dataset_type().eq_ignore_ascii_case("hdf5") {
         return Some("hdf5".to_string());
     }
-    for (_, profile) in &entry.layout.profiles.profiles {
+    for (_, profile) in &entry.profiles().profiles {
         if let Some(view) = profile.views.get("base_vectors") {
             return vtype_from_extension(view.path());
         }
@@ -777,7 +777,7 @@ fn probed_base_records(entry: &CatalogEntry, mode: ProbeMode) -> Option<u64> {
 pub(crate) fn entry_facet_paths(entry: &CatalogEntry) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    for (_, profile) in &entry.layout.profiles.profiles {
+    for (_, profile) in &entry.profiles().profiles {
         for view in profile.views.values() {
             if let Some(path) = entry.resolve_facet_url(view.path())
                 && seen.insert(path.clone())
@@ -847,8 +847,8 @@ fn smart_match(pattern: &str, text: &str) -> bool {
 
 /// Smart match against description-like fields (name, notes, model, tags).
 fn matches_description_smart(entry: &CatalogEntry, pattern: &str) -> bool {
-    let mut texts = vec![entry.name.clone()];
-    if let Some(ref attrs) = entry.layout.attributes {
+    let mut texts = vec![entry.name().to_string()];
+    if let Some(attrs) = entry.attributes() {
         if let Some(ref notes) = attrs.notes {
             texts.push(notes.clone());
         }
@@ -1045,7 +1045,8 @@ mod tests {
     use crate::dataset::{CatalogLayout, DSProfile, DSProfileGroup};
     use indexmap::IndexMap;
 
-    fn entry_with_views(name: &str, views: &[&str]) -> CatalogEntry {
+    /// A `default` profile with maxk 100 and one `<view>.fvec` per view.
+    fn layout_with_views(views: &[&str]) -> CatalogLayout {
         let mut view_map = IndexMap::new();
         for v in views {
             view_map.insert(
@@ -1073,28 +1074,44 @@ mod tests {
                 ..Default::default()
             },
         );
-        CatalogEntry {
-            name: name.to_string(),
-            path: format!("{}/dataset.yaml", name),
-            dataset_type: "dataset.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
-            layout: CatalogLayout {
-                format_version: crate::model::FORMAT_VERSION_BASE,
-                profile_tags: Default::default(),
-                attributes: None,
-                profiles: DSProfileGroup::from_profiles(profiles),
-            },
+        layout_of(profiles)
+    }
+
+    fn layout_of(profiles: IndexMap<String, DSProfile>) -> CatalogLayout {
+        CatalogLayout {
+            format_version: crate::model::FORMAT_VERSION_BASE,
+            profile_tags: Default::default(),
+            attributes: None,
+            profiles: DSProfileGroup::from_profiles(profiles),
         }
     }
 
+    /// The entry a catalog lists for `<name>/dataset.yaml` with `layout`.
+    fn referenced(name: &str, layout: CatalogLayout) -> CatalogEntry {
+        let descriptor = crate::Location::parse(&format!("{name}/dataset.yaml")).unwrap();
+        CatalogEntry::builder(name).descriptor(&descriptor, layout).build().unwrap()
+    }
+
+    fn entry_with_views(name: &str, views: &[&str]) -> CatalogEntry {
+        referenced(name, layout_with_views(views))
+    }
+
+    /// `layout_with_views` with its default profile's `base_count` set.
+    fn entry_of_count(name: &str, views: &[&str], base_count: u64) -> CatalogEntry {
+        let mut layout = layout_with_views(views);
+        if let Some(p) = layout.profiles.profiles.get_mut("default") {
+            p.base_count = Some(base_count);
+        }
+        referenced(name, layout)
+    }
+
     fn entry_with_attrs(name: &str, metric: &str) -> CatalogEntry {
-        let mut e = entry_with_views(name, &["base_vectors", "query_vectors"]);
-        e.layout.attributes = Some(crate::dataset::DatasetAttributes {
+        let mut layout = layout_with_views(&["base_vectors", "query_vectors"]);
+        layout.attributes = Some(crate::dataset::DatasetAttributes {
             distance_function: Some(metric.to_string()),
             ..Default::default()
         });
-        e
+        referenced(name, layout)
     }
 
     #[test]
@@ -1279,10 +1296,7 @@ mod tests {
 
     #[test]
     fn distinct_size_and_data_extractors() {
-        let mut a = entry_with_views("glove-25-angular", &["base_vectors"]);
-        if let Some(p) = a.layout.profiles.profiles.get_mut("default") {
-            p.base_count = Some(100_000);
-        }
+        let a = entry_of_count("glove-25-angular", &["base_vectors"], 100_000);
         let entries: Vec<&CatalogEntry> = vec![&a];
         assert_eq!(distinct_base_counts(&entries, ProbeMode::Off), vec!["100k".to_string()]);
         // Offline (no probe): the base-only estimate is the fallback —
@@ -1298,10 +1312,7 @@ mod tests {
         // elem estimate which covers base vectors only and badly
         // under-reports a dataset with large query / GT / metadata
         // facets (e.g. a 43MB estimate for a multi-GB dataset).
-        let mut e = entry_with_views("ds", &["base_vectors", "neighbor_indices"]);
-        if let Some(p) = e.layout.profiles.profiles.get_mut("default") {
-            p.base_count = Some(1_000); // estimate would be tiny
-        }
+        let e = entry_of_count("ds", &["base_vectors", "neighbor_indices"], 1_000); // estimate would be tiny
         // Cache real (large) facet sizes keyed by resolved URL.
         let paths = entry_facet_paths(&e);
         let cache: FacetProbeCache = paths
@@ -1341,10 +1352,7 @@ mod tests {
         // A dataset estimated at ~118.4 MB must match the candidate
         // displayed as `118MB` (target 118_000_000, unit 1_000_000:
         // tolerance ±500_000).
-        let mut a = entry_with_views("emb_d2960_b10000", &["base_vectors"]);
-        if let Some(p) = a.layout.profiles.profiles.get_mut("default") {
-            p.base_count = Some(10_000);
-        }
+        let a = entry_of_count("emb_d2960_b10000", &["base_vectors"], 10_000);
         // 10_000 × 2960 × 4 = 118_400_000 bytes.
         assert_eq!(distinct_data_sizes(&[&a], ProbeMode::Off), vec![118_400_000]);
         let displayed = format_bytes_approx(118_400_000);
@@ -1396,8 +1404,8 @@ mod tests {
     /// the list, or a five-shard dataset reports a fifth of its size.
     #[test]
     fn a_sharded_base_names_every_shard_but_probes_the_first() {
-        let mut e = entry_with_views("ds", &["base_vectors"]);
-        let view = e.layout.profiles.profiles["default"]
+        let mut layout = layout_with_views(&["base_vectors"]);
+        let view = layout.profiles.profiles["default"]
             .views
             .get("base_vectors")
             .unwrap()
@@ -1412,13 +1420,14 @@ mod tests {
             record_count: Some(400),
             ..view
         };
-        e.layout
+        layout
             .profiles
             .profiles
             .get_mut("default")
             .unwrap()
             .views
             .insert("base_vectors".to_string(), sharded);
+        let e = referenced("ds", layout);
 
         let files = base_vectors_files(&e);
         assert_eq!(files.len(), 4, "{files:?}");
@@ -1437,8 +1446,8 @@ mod tests {
     /// probe over one shard is not.
     #[test]
     fn a_declared_record_count_is_used_instead_of_probing_one_shard() {
-        let mut e = entry_with_views("ds", &["base_vectors"]);
-        let view = e.layout.profiles.profiles["default"]
+        let mut layout = layout_with_views(&["base_vectors"]);
+        let view = layout.profiles.profiles["default"]
             .views
             .get("base_vectors")
             .unwrap()
@@ -1451,13 +1460,14 @@ mod tests {
             record_count: Some(1_000),
             ..view
         };
-        e.layout
+        layout
             .profiles
             .profiles
             .get_mut("default")
             .unwrap()
             .views
             .insert("base_vectors".to_string(), sharded);
+        let e = referenced("ds", layout);
 
         // No files exist and no probe is configured; the declaration
         // still answers, and answers the series total.
@@ -1550,19 +1560,7 @@ mod tests {
             maxk: None, base_count: Some(100_000_000), partition: false, views: IndexMap::new(),
             ..Default::default()
         });
-        let entry = CatalogEntry {
-            name: "test".to_string(),
-            path: "test/dataset.yaml".to_string(),
-            dataset_type: "dataset.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
-            layout: CatalogLayout {
-                format_version: crate::model::FORMAT_VERSION_BASE,
-                profile_tags: Default::default(),
-                attributes: None,
-                profiles: DSProfileGroup::from_profiles(profiles),
-            },
-        };
+        let entry = referenced("test", layout_of(profiles));
 
         let pv = ProfileView::new(Some(".*m".to_string()));
         let matched = pv.matching_profiles(&entry);
@@ -1591,19 +1589,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let entry = CatalogEntry {
-            name: "test".to_string(),
-            path: "test/dataset.yaml".to_string(),
-            dataset_type: "dataset.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
-            layout: CatalogLayout {
-                format_version: crate::model::FORMAT_VERSION_BASE,
-                profile_tags: Default::default(),
-                attributes: None,
-                profiles: DSProfileGroup::from_profiles(profiles),
-            },
-        };
+        let entry = referenced("test", layout_of(profiles));
 
         let f = DatasetFilter {
             min_count: Some(500_000),

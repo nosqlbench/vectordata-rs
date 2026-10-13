@@ -97,6 +97,14 @@ documentation's **Common tasks** table is the same index with examples.
   [`TestDataGroup::from_config`](crate::TestDataGroup::from_config)`(name, home, description)`.
   Relative facets resolve against `home`, and a remote home caches under
   `<cache_root>/<name>/`.
+- Build a catalog entry in code:
+  [`CatalogEntry::builder`](crate::dataset::CatalogEntry::builder), with
+  `home` and `dataset` for a whole description, or `descriptor` and a
+  summary for a `dataset.yaml` read when opened. Open it with
+  [`Catalog::open_entry`](crate::catalog::Catalog::open_entry). Read an
+  entry through its accessors (`profiles()`, `attributes()`,
+  `dataset_home_url()`); what it holds is
+  [`EntryDescription`](crate::dataset::EntryDescription).
 
 ## Do not hand-roll
 

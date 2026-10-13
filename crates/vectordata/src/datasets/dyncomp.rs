@@ -144,7 +144,7 @@ fn dataset_profile_facts(catalog: &Catalog) -> Vec<(String, Vec<ProfileFacts>)> 
     catalog
         .datasets()
         .iter()
-        .map(|e| (e.name.clone(), e.layout.profiles.profile_facts()))
+        .map(|e| (e.name().to_string(), e.profiles().profile_facts()))
         .collect()
 }
 
@@ -156,7 +156,7 @@ fn dataset_profile_pairs(catalog: &Catalog) -> Vec<(String, Vec<String>)> {
         .iter()
         .map(|e| {
             (
-                e.name.clone(),
+                e.name().to_string(),
                 e.profile_names().into_iter().map(|s| s.to_string()).collect(),
             )
         })
@@ -717,7 +717,7 @@ pub fn complete_select_specs(partial: &str, context: &[&str]) -> Vec<String> {
     let facts = with_filtered_entries(context, false, |entries, _| {
         entries
             .iter()
-            .map(|e| (e.name.clone(), e.layout.profiles.profile_facts()))
+            .map(|e| (e.name().to_string(), e.profiles().profile_facts()))
             .collect::<Vec<(String, Vec<ProfileFacts>)>>()
     });
     filter_spec_candidates(&facts, partial)

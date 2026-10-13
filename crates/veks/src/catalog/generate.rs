@@ -72,22 +72,19 @@ impl DiscoveredDataset {
             .filter(|c| !matches!(c, std::path::Component::CurDir))
             .collect();
 
-        CatalogEntry {
-            name: self.config.name.clone(),
-            path: cleaned.to_string_lossy().to_string(),
-            dataset_type: "dataset.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
-            layout: CatalogLayout {
-                // The dataset's own version travels into the catalog,
-                // so a consumer too old for it can say so from the
-                // listing rather than after fetching (V-13).
-                format_version: self.config.format_version,
-                profile_tags: self.config.profile_tags.clone(),
-                attributes: self.config.attributes.clone(),
-                profiles: self.config.profiles.clone(),
-            },
-        }
+        let layout = CatalogLayout {
+            // The dataset's own version travels into the catalog,
+            // so a consumer too old for it can say so from the
+            // listing rather than after fetching (V-13).
+            format_version: self.config.format_version,
+            profile_tags: self.config.profile_tags.clone(),
+            attributes: self.config.attributes.clone(),
+            profiles: self.config.profiles.clone(),
+        };
+        CatalogEntry::builder(self.config.name.clone())
+            .descriptor(&vectordata::Location::from_path(cleaned), layout)
+            .build()
+            .expect("an entry with a descriptor always builds")
     }
 }
 
@@ -465,15 +462,15 @@ profiles:
         let root = tmp.path().canonicalize().unwrap();
         let entry = datasets[0].to_entry(&root);
 
-        assert_eq!(entry.name, "glove-100");
-        assert_eq!(entry.dataset_type, "dataset.yaml");
-        assert!(entry.path.contains("dataset.yaml"));
+        assert_eq!(entry.name(), "glove-100");
+        assert_eq!(entry.dataset_type(), "dataset.yaml");
+        assert!(entry.location().contains("dataset.yaml"));
 
         // Verify layout has attributes and profiles
-        let attrs = entry.layout.attributes.as_ref().unwrap();
+        let attrs = entry.attributes().unwrap();
         assert_eq!(attrs.distance_function.as_deref(), Some("L2"));
         assert_eq!(attrs.license.as_deref(), Some("MIT"));
-        assert!(!entry.layout.profiles.is_empty());
+        assert!(!entry.profiles().is_empty());
 
         // Verify JSON serialization is layout-embedded
         let json = serde_json::to_value(&entry).unwrap();

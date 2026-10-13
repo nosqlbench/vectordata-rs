@@ -121,8 +121,8 @@ pub fn report_lookup_failure(catalog: &crate::catalog::Catalog, error: &crate::E
 fn print_dataset_with_profiles(entry: &crate::dataset::CatalogEntry) {
     let profiles: Vec<String> = entry.profile_names().into_iter().map(|s| s.to_string()).collect();
     if profiles.is_empty() {
-        eprintln!("  - {} (no profiles)", entry.name);
+        eprintln!("  - {} (no profiles)", entry.name());
     } else {
-        eprintln!("  - {} (profiles: {})", entry.name, profiles.join(", "));
+        eprintln!("  - {} (profiles: {})", entry.name(), profiles.join(", "));
     }
 }

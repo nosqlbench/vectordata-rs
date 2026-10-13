@@ -460,7 +460,7 @@ fn run_purge(specifier: &str, pause: bool) {
     };
     let sources = crate::catalog::sources::CatalogSources::new().configure_default();
     let catalog = crate::datasets::open_catalog(&sources);
-    let entry = match catalog.datasets().iter().find(|e| e.name == dataset) {
+    let entry = match catalog.datasets().iter().find(|e| e.name() == dataset) {
         Some(e) => e.clone(),
         None => {
             eprintln!("error: dataset '{dataset}' not found in any configured catalog");

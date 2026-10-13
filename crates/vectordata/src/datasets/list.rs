@@ -330,10 +330,10 @@ fn output_select(entries: &[&CatalogEntry], pv: &ProfileView, select_value: &str
     for entry in entries {
         let profiles = pv.matching_profiles(entry);
         if profiles.is_empty() && !pv.is_active() {
-            matches.push(entry.name.clone());
+            matches.push(entry.name().to_string());
         } else {
             for p in profiles {
-                matches.push(format!("{}:{}", entry.name, p));
+                matches.push(format!("{}:{}", entry.name(), p));
             }
         }
     }
@@ -345,13 +345,13 @@ fn output_select(entries: &[&CatalogEntry], pv: &ProfileView, select_value: &str
         && let Some(sel) = &spec.selector
         && sel.bare_name().is_none()
     {
-        let Some(entry) = entries.iter().find(|e| e.name.eq_ignore_ascii_case(&spec.head)) else {
+        let Some(entry) = entries.iter().find(|e| e.name().eq_ignore_ascii_case(&spec.head)) else {
             eprintln!("--select '{select_value}': dataset '{}' does not match any dataset.", spec.head);
             std::process::exit(1);
         };
         match entry.select_one(Some(sel.text())) {
             Ok(profile) => {
-                println!("{}:{profile}", entry.name);
+                println!("{}:{profile}", entry.name());
                 return;
             }
             Err(e) => {
@@ -444,7 +444,7 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
 
     // Find the longest dataset name for column alignment
     let max_name_len = entries.iter()
-        .map(|e| e.name.len())
+        .map(|e| e.name().len())
         .max()
         .unwrap_or(0)
         .min(width / 3); // don't let names take more than 1/3 of the line
@@ -461,7 +461,7 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
         let profile_names = pv.matching_profiles(entry);
         if profile_names.is_empty() {
             if !pv.is_active() {
-                println!("{}", entry.name);
+                println!("{}", entry.name());
             }
             continue;
         }
@@ -474,12 +474,12 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
         };
 
         // Attribute summary (distance function, dimension if available)
-        let attr_summary = entry.layout.attributes.as_ref()
+        let attr_summary = entry.attributes()
             .and_then(|a| a.distance_function.as_deref())
             .unwrap_or("");
 
         // Truncate profiles if they'd overflow the line
-        let name_part = &entry.name;
+        let name_part = &entry.name();
         let available = width.saturating_sub(name_col + attr_summary.len() + 2);
         let profiles_display = if profiles_str.len() > available && available > 10 {
             // Truncate with count
@@ -506,8 +506,8 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
 
         if verbose {
             // Indented detail lines
-            println!("  url: {}", entry.path);
-            if let Some(ref attrs) = entry.layout.attributes {
+            println!("  url: {}", entry.location());
+            if let Some(attrs) = entry.attributes() {
                 if let Some(ref model) = attrs.model {
                     println!("  model: {}", model);
                 }
@@ -522,7 +522,7 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
                 }
             }
             // Show views for default profile
-            if let Some(profile) = entry.layout.profiles.profiles.get("default") {
+            if let Some(profile) = entry.profiles().profiles.get("default") {
                 let views: Vec<&str> = profile.view_names();
                 if !views.is_empty() {
                     println!("  views: {}", views.join(", "));
@@ -542,7 +542,7 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
 /// invent measurements nobody took (P-7).
 fn print_profile_parameters(entry: &CatalogEntry) {
     let mut any = false;
-    for (name, profile) in &entry.layout.profiles.profiles {
+    for (name, profile) in &entry.profiles().profiles {
         if profile.attributes.is_empty() {
             continue;
         }
@@ -560,7 +560,7 @@ fn print_profile_parameters(entry: &CatalogEntry) {
     // Families are what make those numbers comparable: two profiles
     // that are one corpus at two parameter values, rather than two
     // unrelated profiles that happen to be listed together (P-8).
-    for (spec, members) in entry.layout.profiles.families() {
+    for (spec, members) in entry.profiles().families() {
         if members.len() > 1 {
             println!("  family[{spec}]: {}", members.join(", "));
         }
@@ -599,7 +599,7 @@ fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: 
         }
 
         let group_key = match key {
-            "source" => entry.path.clone(),
+            "source" => entry.location().to_string(),
             "metric" => filter::infer_metric(entry)
                 .unwrap_or_else(|| "(no metric in attributes or name)".into()),
             "profile" => {
@@ -607,7 +607,7 @@ fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: 
                 for pname in &profile_names {
                     groups.entry(pname.to_string())
                         .or_default()
-                        .push((&entry.name, vec![*pname]));
+                        .push((entry.name(), vec![*pname]));
                 }
                 continue;
             }
@@ -619,7 +619,7 @@ fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: 
 
         groups.entry(group_key)
             .or_default()
-            .push((&entry.name, profile_names));
+            .push((entry.name(), profile_names));
     }
 
     // Find longest dataset name across all groups for alignment
@@ -647,9 +647,9 @@ fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: 
 
             if verbose {
                 // Find the entry to show details
-                if let Some(entry) = entries.iter().find(|e| e.name == **name) {
-                    println!("    url: {}", entry.path);
-                    if let Some(ref attrs) = entry.layout.attributes
+                if let Some(entry) = entries.iter().find(|e| e.name() == *name) {
+                    println!("    url: {}", entry.location());
+                    if let Some(attrs) = entry.attributes()
                         && let Some(ref df) = attrs.distance_function {
                             println!("    metric: {}", df);
                         }
@@ -671,19 +671,19 @@ fn output_csv(entries: &[&CatalogEntry], verbose: bool, pv: &ProfileView) {
     for entry in entries {
         for profile_name in pv.matching_profiles(entry) {
             if verbose {
-                let attrs = entry.layout.attributes.as_ref();
+                let attrs = entry.attributes();
                 let df = attrs.and_then(|a| a.distance_function.as_deref()).unwrap_or("");
                 let model = attrs.and_then(|a| a.model.as_deref()).unwrap_or("");
                 let vendor = attrs.and_then(|a| a.vendor.as_deref()).unwrap_or("");
                 let license = attrs.and_then(|a| a.license.as_deref()).unwrap_or("");
 
-                let views = entry.layout.profiles.profiles.get(profile_name)
+                let views = entry.profiles().profiles.get(profile_name)
                     .map(|p| p.view_names().join(";"))
                     .unwrap_or_default();
 
                 println!(
                     "{},{},{},{},{},{},{}",
-                    escape_csv(&entry.name),
+                    escape_csv(entry.name()),
                     escape_csv(profile_name),
                     escape_csv(df),
                     escape_csv(model),
@@ -692,7 +692,7 @@ fn output_csv(entries: &[&CatalogEntry], verbose: bool, pv: &ProfileView) {
                     escape_csv(&views),
                 );
             } else {
-                println!("{},{}", escape_csv(&entry.name), escape_csv(profile_name));
+                println!("{},{}", escape_csv(entry.name()), escape_csv(profile_name));
             }
         }
     }
@@ -719,7 +719,7 @@ fn build_structured(entries: &[&CatalogEntry], verbose: bool, pv: &ProfileView) 
     for entry in entries {
         for profile_name in pv.matching_profiles(entry) {
             let mut summary = DatasetProfileSummary {
-                dataset: entry.name.clone(),
+                dataset: entry.name().to_string(),
                 profile: profile_name.to_string(),
                 url: None,
                 attributes: None,
@@ -729,11 +729,11 @@ fn build_structured(entries: &[&CatalogEntry], verbose: bool, pv: &ProfileView) 
             };
 
             if verbose {
-                summary.url = Some(entry.path.clone());
-                if let Some(ref attrs) = entry.layout.attributes {
+                summary.url = Some(entry.location().to_string());
+                if let Some(attrs) = entry.attributes() {
                     summary.attributes = serde_json::to_value(attrs).ok();
                 }
-                if let Some(profile) = entry.layout.profiles.profiles.get(profile_name) {
+                if let Some(profile) = entry.profiles().profiles.get(profile_name) {
                     let view_names = profile.view_names();
                     if !view_names.is_empty() {
                         summary.views = Some(serde_json::json!(view_names));
@@ -745,7 +745,7 @@ fn build_structured(entries: &[&CatalogEntry], verbose: bool, pv: &ProfileView) 
                             serde_json::to_value(&profile.attributes).ok();
                     }
                 }
-                if let Some((spec, members)) = entry.layout.profiles.family_of(profile_name) {
+                if let Some((spec, members)) = entry.profiles().family_of(profile_name) {
                     summary.family = Some(serde_json::json!({
                         "spec": spec,
                         "members": members,

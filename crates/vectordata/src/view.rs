@@ -3700,7 +3700,7 @@ mod tests {
                 "dataset_type":"dataset.yaml","layout":{"profiles":{}}}"#,
         )
         .unwrap();
-        let home = crate::location::dir_form(&entry.dataset_home_url());
+        let home = crate::location::dir_form(entry.dataset_home_url());
         let config: crate::model::DatasetConfig =
             serde_yaml::from_str("name: ds\nprofiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
         let view = GenericTestDataView::new(

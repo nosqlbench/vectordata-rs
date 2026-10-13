@@ -94,15 +94,13 @@ pub fn validate(mode: SourceMode, root: &Path) -> Result<(), String> {
         }
         SourceMode::Catalog => {
             let path = root.join("knn_entries.yaml");
-            let entries = crate::knn_entries::KnnEntries::load(&path)?;
-            // Best-effort: every referenced facet path must exist on disk.
-            for (key, e) in &entries.entries {
-                for (facet, rel) in [("base", &e.base), ("query", &e.query), ("gt", &e.gt)] {
-                    if !root.join(rel).is_file() {
-                        return Err(format!(
-                            "knn_entries entry '{key}' {facet} file is missing: {rel}"
-                        ));
-                    }
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            // Best-effort: every relative facet path must exist on disk.
+            for (key, facet, rel) in crate::catalog::knn_entries::declared_facet_paths(&content)? {
+                let absolute = crate::location::has_scheme(&rel) || rel.starts_with('/');
+                if !absolute && !root.join(&rel).is_file() {
+                    return Err(format!("knn_entries entry '{key}' {facet} file is missing: {rel}"));
                 }
             }
             Ok(())

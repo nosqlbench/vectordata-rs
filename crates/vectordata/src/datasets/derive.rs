@@ -1886,7 +1886,7 @@ fn resolve_spec(
             return None;
         }
     };
-    if entry.dataset_type == "knn_entries.yaml" {
+    if entry.dataset_type() == "knn_entries.yaml" {
         // derive needs the per-dataset `dataset.yaml` to extract
         // window metadata (see [`RichDatasetConfig::load_from`]). knn_entries-
         // shape catalogs don't publish one — the catalog's embedded
@@ -1897,11 +1897,11 @@ fn resolve_spec(
         eprintln!("       (those catalogs have no per-dataset dataset.yaml with window metadata)");
         return None;
     }
-    let name = entry.name.clone();
-    let yaml_url = entry.path.clone();
+    let name = entry.name().to_string();
+    let yaml_url = entry.location().to_string();
     Some((
         Resolved::CatalogEntry { catalog, name: name.clone(), yaml_url },
-        name,
+        name.to_string(),
     ))
 }
 

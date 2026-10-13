@@ -33,11 +33,7 @@
 
 use indexmap::IndexMap;
 
-use crate::dataset::{
-    profile::{DSProfile, DSProfileGroup, DSView},
-    source::DSSource,
-    CatalogEntry, CatalogLayout,
-};
+use crate::dataset::{profile::DSView, source::DSSource, CatalogEntry, DatasetConfig};
 
 /// Facet aliases used in `knn_entries.yaml`, mapped to the
 /// canonical facet keys the rest of the codebase expects.
@@ -156,54 +152,51 @@ pub fn parse_knn_entries_yaml(
             .insert(profile_name.to_string(), view_map);
     }
 
-    // Materialize CatalogEntries.
+    // Each dataset is an embedded entry: its home is the base and its
+    // name, and every facet keeps the path resolved above, as written.
     let mut out: Vec<CatalogEntry> = Vec::with_capacity(grouped.len());
     for (name, profiles) in grouped {
-        let mut profile_group = DSProfileGroup::default();
-        for (profile_name, views) in profiles {
-            let mut profile = DSProfile {
-                maxk: None,
-                base_count: None,
-                partition: false,
-                views: IndexMap::new(),
-                ..Default::default()
-            };
-            for (facet, path) in views {
-                let view = DSView {
-                    source: DSSource {
-                        path,
-                        namespace: None,
-                        window: Default::default(),
-                        declared_count: None,
-                    },
-                    window: None,
-                    ..Default::default()
-                };
-                profile.views.insert(facet, view);
-            }
-            profile_group.profiles.insert(profile_name, profile);
+        let description = profiles
+            .into_iter()
+            .fold(DatasetConfig::builder(name.clone()), |dataset, (profile_name, views)| {
+                dataset.profile(&profile_name, |profile| {
+                    views.into_iter().fold(profile, |profile, (facet, path)| {
+                        let source = DSSource { path, ..Default::default() };
+                        profile.view(&facet, DSView { source, ..Default::default() })
+                    })
+                })
+            })
+            .build()
+            .map_err(|e| format!("dataset '{name}': {e}"))?;
+        out.push(
+            CatalogEntry::builder(name.clone())
+                .home_as_written(format!("{}/{name}/", default_base_url.trim_end_matches('/')))
+                .dataset(description)
+                .build()?,
+        );
+    }
+    Ok(out)
+}
+
+/// Every facet path a `knn_entries.yaml` declares, as written and
+/// before `_defaults` resolve it: `(entry key, facet alias, path)`, in
+/// file order. What a publish checks against the files beside the
+/// catalog, which is where they will be published from.
+pub(crate) fn declared_facet_paths(content: &str) -> Result<Vec<(String, String, String)>, String> {
+    let top: serde_yaml::Mapping = serde_yaml::from_str(content)
+        .map_err(|e| format!("parse knn_entries.yaml: {e}"))?;
+    let mut out = Vec::new();
+    for (key, value) in &top {
+        let (Some(key), Some(facets)) = (key.as_str(), value.as_mapping()) else { continue };
+        if key.starts_with('_') || parse_dataset_profile_key(key).is_none() {
+            continue;
         }
-        out.push(CatalogEntry {
-            name: name.clone(),
-            // Set by the resolver, which knows which document this
-            // catalog came from; the parser only sees its content.
-            catalog_file: None,
-            catalog_name: None,
-            // For knn_entries-shaped catalogs there's no per-dataset
-            // dataset.yaml — the synthesized layout *is* the
-            // dataset description. Point the path at the catalog
-            // location so downstream consumers can resolve a URL
-            // for the dataset's "home directory" when they need
-            // one (e.g. for precache status display).
-            path: default_base_url.trim_end_matches('/').to_string(),
-            dataset_type: "knn_entries.yaml".to_string(),
-            layout: CatalogLayout {
-                format_version: crate::model::FORMAT_VERSION_BASE,
-                profile_tags: Default::default(),
-                attributes: None,
-                profiles: profile_group,
-            },
-        });
+        for (alias, path) in facets {
+            let (Some(alias), Some(path)) = (alias.as_str(), path.as_str()) else { continue };
+            if alias != "base_url" && alias != "cache_dir" {
+                out.push((key.to_string(), alias.to_string(), path.to_string()));
+            }
+        }
     }
     Ok(out)
 }
@@ -369,13 +362,13 @@ _defaults:
         // Single dataset, three profiles.
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
-        assert_eq!(entry.name, "sample-dataset");
-        assert_eq!(entry.dataset_type, "knn_entries.yaml");
-        let profile_names: Vec<&str> = entry.layout.profiles.profile_names();
+        assert_eq!(entry.name(), "sample-dataset");
+        assert_eq!(entry.dataset_type(), "knn_entries.yaml");
+        let profile_names: Vec<&str> = entry.profiles().profile_names();
         assert_eq!(profile_names, vec!["default", "100k", "200k"]);
 
         // Facet alias mapping: base→base_vectors, query→query_vectors, gt→neighbor_indices.
-        let default = entry.layout.profiles.profile("default").unwrap();
+        let default = entry.profiles().profile("default").unwrap();
         let view_names: Vec<&str> = default.views.keys().map(|s| s.as_str()).collect();
         assert!(view_names.contains(&"base_vectors"));
         assert!(view_names.contains(&"query_vectors"));
@@ -420,7 +413,7 @@ sample-ds:
         );
         let entries = parse_knn_entries_yaml(&yaml, "https://host/").unwrap();
         assert_eq!(entries.len(), 1);
-        let default = entries[0].layout.profiles.profile("default").unwrap();
+        let default = entries[0].profiles().profile("default").unwrap();
         let bv = &default.views.get("base_vectors").unwrap().source.path;
         // Cached → absolute local path.
         let expected = std::fs::canonicalize(&cached_file).unwrap();
@@ -444,7 +437,7 @@ sample-ds:
   base: a/b/c.fvecs
 "#;
         let entries = parse_knn_entries_yaml(yaml, "https://host/").unwrap();
-        let default = entries[0].layout.profiles.profile("default").unwrap();
+        let default = entries[0].profiles().profile("default").unwrap();
         // cache_dir's default value points at a path that doesn't
         // exist → falls through to remote URL with expanded
         // base_url default.
@@ -466,7 +459,7 @@ sample-ds:
   base: a/b/c.fvecs
 "#;
         let entries = parse_knn_entries_yaml(yaml, "https://host/").unwrap();
-        let default = entries[0].layout.profiles.profile("default").unwrap();
+        let default = entries[0].profiles().profile("default").unwrap();
         // Both override cache_dir candidates are missing → falls
         // back to the per-entry base_url override.
         let bv = &default.views.get("base_vectors").unwrap().source.path;
@@ -483,8 +476,7 @@ sample-ds:
 "#;
         let entries = parse_knn_entries_yaml(yaml, "https://host/d").unwrap();
         let path = &entries[0]
-            .layout
-            .profiles
+            .profiles()
             .profile("default")
             .unwrap()
             .views
@@ -508,13 +500,13 @@ sample-ds:
   base: b/base.fvecs
 "#;
         let entries = parse_knn_entries_yaml(yaml, "https://host/").unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let names: Vec<&str> = entries.iter().map(|e| e.name()).collect();
         assert!(names.contains(&"alpha"));
         assert!(names.contains(&"beta"));
-        let alpha = entries.iter().find(|e| e.name == "alpha").unwrap();
-        assert_eq!(alpha.layout.profiles.profile_names(), vec!["default", "large"]);
-        let beta = entries.iter().find(|e| e.name == "beta").unwrap();
-        assert_eq!(beta.layout.profiles.profile_names(), vec!["default"]);
+        let alpha = entries.iter().find(|e| e.name() == "alpha").unwrap();
+        assert_eq!(alpha.profiles().profile_names(), vec!["default", "large"]);
+        let beta = entries.iter().find(|e| e.name() == "beta").unwrap();
+        assert_eq!(beta.profiles().profile_names(), vec!["default"]);
     }
 
     /// A facet alias not in the mapping table passes through with
@@ -529,7 +521,7 @@ sample-ds:
   custom_facet: cf.bin
 "#;
         let entries = parse_knn_entries_yaml(yaml, "https://host/").unwrap();
-        let views = &entries[0].layout.profiles.profile("default").unwrap().views;
+        let views = &entries[0].profiles().profile("default").unwrap().views;
         assert!(views.contains_key("base_vectors"));
         assert!(views.contains_key("metadata_content"));
         assert!(views.contains_key("custom_facet"));
@@ -552,10 +544,10 @@ sample-ds:
   base: a.fvecs
 "#;
         let entries = parse_knn_entries_yaml(yaml, "https://host/").unwrap();
-        let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let mut names: Vec<&str> = entries.iter().map(|e| e.name()).collect();
         names.sort();
         assert_eq!(names, vec!["no-colon-here", "ok"]);
-        let no_colon = entries.iter().find(|e| e.name == "no-colon-here").unwrap();
+        let no_colon = entries.iter().find(|e| e.name() == "no-colon-here").unwrap();
         assert_eq!(no_colon.profile_names(), vec!["default"]);
     }
 
@@ -571,7 +563,7 @@ _defaults:
   query: profiles/q.fvecs
 "#;
         let entries = parse_knn_entries_yaml(yaml, "https://host/d/").unwrap();
-        let views = &entries[0].layout.profiles.profile("default").unwrap().views;
+        let views = &entries[0].profiles().profile("default").unwrap().views;
         assert_eq!(views.get("base_vectors").unwrap().source.path, "https://other-host/base.fvecs");
         assert_eq!(views.get("query_vectors").unwrap().source.path, "s3://my-bucket/parent/profiles/q.fvecs");
     }

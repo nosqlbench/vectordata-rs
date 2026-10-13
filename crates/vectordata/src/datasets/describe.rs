@@ -83,7 +83,7 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&
     let profile_name = match entry.select_one(selector) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("error: dataset '{}': {e}", entry.name);
+            eprintln!("error: dataset '{}': {e}", entry.name());
             return 1;
         }
     };
@@ -138,12 +138,12 @@ fn varying_attributes(
 }
 
 fn render(entry: &CatalogEntry, profile_name: &str) {
-    println!("Dataset: {}", entry.name);
+    println!("Dataset: {}", entry.name());
     println!("Profile: {profile_name}");
-    println!("Path:    {}", entry.path);
-    println!("Type:    {}", entry.dataset_type);
+    println!("Path:    {}", entry.location());
+    println!("Type:    {}", entry.dataset_type());
 
-    if let Some(attrs) = entry.layout.attributes.as_ref() {
+    if let Some(attrs) = entry.attributes() {
         let mut have_any = false;
         let mut header = || {
             if !have_any { println!(); println!("Attributes:"); have_any = true; }
@@ -164,12 +164,12 @@ fn render(entry: &CatalogEntry, profile_name: &str) {
             { header(); kv("notes", v); }
     }
 
-    let Some(profile) = entry.layout.profiles.profile(profile_name) else {
+    let Some(profile) = entry.profiles().profile(profile_name) else {
         println!();
-        eprintln!("error: profile '{profile_name}' not found in dataset '{}'", entry.name);
+        eprintln!("error: profile '{profile_name}' not found in dataset '{}'", entry.name());
         eprintln!();
         eprintln!("Available profiles: {}",
-            entry.layout.profiles.profile_names().join(", "));
+            entry.profiles().profile_names().join(", "));
         // Soft-fail render — the dataset-level info above is still
         // useful to the user even when the profile is the typo.
         // Exit code is handled by the caller; we just stop here.
@@ -205,12 +205,12 @@ fn render(entry: &CatalogEntry, profile_name: &str) {
     // The family this profile belongs to, and what distinguishes it
     // from its siblings — which is what a reader actually needs when
     // deciding which profile to open (P-12).
-    if let Some((spec, members)) = entry.layout.profiles.family_of(profile_name) {
+    if let Some((spec, members)) = entry.profiles().family_of(profile_name) {
         println!();
         println!("Family:");
         kv("spec", spec);
         kv("members", &members.join(", "));
-        let varying = varying_attributes(&entry.layout.profiles, profile_name);
+        let varying = varying_attributes(entry.profiles(), profile_name);
         if varying.is_empty() {
             kv("varies by", "(nothing recorded — members are undescribed)");
         } else {

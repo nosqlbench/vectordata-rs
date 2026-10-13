@@ -270,22 +270,19 @@ impl DiscoveredDataset {
         let rel_path = self.yaml_path.strip_prefix(catalog_dir)
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| self.yaml_path.clone());
-        CatalogEntry {
-            name: self.config.name.clone(),
-            path: rel_path.to_string_lossy().to_string(),
-            dataset_type: "dataset.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
-            layout: CatalogLayout {
-                // The dataset's own version travels into the catalog,
-                // so a consumer too old for it can say so from the
-                // listing rather than after fetching (V-13).
-                format_version: self.config.format_version,
-                profile_tags: self.config.profile_tags.clone(),
-                attributes: self.config.attributes.clone(),
-                profiles: self.config.profiles.clone(),
-            },
-        }
+        let layout = CatalogLayout {
+            // The dataset's own version travels into the catalog,
+            // so a consumer too old for it can say so from the
+            // listing rather than after fetching (V-13).
+            format_version: self.config.format_version,
+            profile_tags: self.config.profile_tags.clone(),
+            attributes: self.config.attributes.clone(),
+            profiles: self.config.profiles.clone(),
+        };
+        CatalogEntry::builder(self.config.name.clone())
+            .descriptor(&vectordata::Location::from_path(rel_path), layout)
+            .build()
+            .expect("an entry with a descriptor always builds")
     }
 }
 

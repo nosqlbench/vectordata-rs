@@ -257,7 +257,7 @@ pub fn run_cache_status(
         let mut mrkl_cache: std::collections::HashMap<std::path::PathBuf, Option<MerkleState>> =
             std::collections::HashMap::new();
         for pname in entry.profile_names() {
-            if let Some(profile) = entry.layout.profiles.profile(pname) {
+            if let Some(profile) = entry.profiles().profile(pname) {
                 let mut pv = 0u32;
                 let mut pt = 0u32;
                 for (_facet, view) in &profile.views {

@@ -273,7 +273,7 @@ fn a_remote_catalog_loads_from_its_kept_copy_when_unreachable() {
     drop(server);
     let offline = vectordata::catalog::Catalog::of(&sources);
     assert!(offline.diagnostics().is_empty(), "{:?}", offline.diagnostics());
-    assert_eq!(offline.datasets()[0].name, "listed");
+    assert_eq!(offline.datasets()[0].name(), "listed");
 }
 
 /// **A changed upstream is caught for a file with no `.mref` too.** The
@@ -555,6 +555,6 @@ fn open_s3_offline_in_a_child() {
     let sources = vectordata::catalog::CatalogSources::new()
         .add_catalogs(&["s3://example-bucket/cat/".to_string()]);
     let catalog = vectordata::catalog::Catalog::of(&sources);
-    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name()).collect();
     assert_eq!(names, vec!["ds-one"], "diagnostics: {:?}", catalog.diagnostics());
 }

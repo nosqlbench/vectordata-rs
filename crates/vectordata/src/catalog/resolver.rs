@@ -61,7 +61,7 @@ impl Catalog {
             // picker's catalog toggle screen, listings) can group
             // and filter by catalog.
             for e in entries[before..].iter_mut() {
-                e.catalog_name = Some(src.name.clone());
+                e.set_catalog_name(src.name.clone());
             }
         };
 
@@ -113,13 +113,13 @@ impl Catalog {
         let matches: Vec<_> = self
             .entries
             .iter()
-            .filter(|e| e.name.eq_ignore_ascii_case(name))
+            .filter(|e| e.name().eq_ignore_ascii_case(name))
             .collect();
         match matches.as_slice() {
             [one] => Ok(one),
             [] => Err(crate::Error::UnknownDataset {
                 name: name.to_string(),
-                suggestions: self.suggestions(name).iter().map(|e| e.name.clone()).collect(),
+                suggestions: self.suggestions(name).iter().map(|e| e.name().to_string()).collect(),
             }),
             _ => Err(crate::Error::AmbiguousDataset {
                 name: name.to_string(),
@@ -131,15 +131,15 @@ impl Catalog {
     /// An entry's name and the catalog it came from, for telling apart
     /// datasets that share a name: `ds (catalog 'lab': /data/lab/)`.
     fn provenance(&self, entry: &CatalogEntry) -> String {
-        let Some(catalog) = &entry.catalog_name else {
-            return entry.name.clone();
+        let Some(catalog) = entry.catalog_name() else {
+            return entry.name().to_string();
         };
-        let location = entry.catalog_file.as_deref().or_else(|| {
+        let location = entry.catalog_file().or_else(|| {
             self.locations.iter().find(|(n, _)| n == catalog).map(|(_, l)| l.as_str())
         });
         match location {
-            Some(location) => format!("{} (catalog '{catalog}': {location})", entry.name),
-            None => format!("{} (catalog '{catalog}')", entry.name),
+            Some(location) => format!("{} (catalog '{catalog}': {location})", entry.name()),
+            None => format!("{} (catalog '{catalog}')", entry.name()),
         }
     }
 
@@ -152,7 +152,7 @@ impl Catalog {
         let lower = search.to_lowercase();
         self.entries
             .iter()
-            .filter(|e| e.name.to_lowercase().contains(&lower))
+            .filter(|e| e.name().to_lowercase().contains(&lower))
             .collect()
     }
 
@@ -171,13 +171,13 @@ impl Catalog {
     pub fn match_regex(&self, pattern: &str) -> Vec<&CatalogEntry> {
         // Use simple substring/pattern matching without pulling in regex crate
         match simple_regex_match(pattern) {
-            Some(matcher) => self.entries.iter().filter(|e| matcher(&e.name)).collect(),
+            Some(matcher) => self.entries.iter().filter(|e| matcher(e.name())).collect(),
             None => {
                 log::warn!("unsupported regex pattern '{pattern}', falling back to substring match");
                 let lower = pattern.to_lowercase();
                 self.entries
                     .iter()
-                    .filter(|e| e.name.to_lowercase().contains(&lower))
+                    .filter(|e| e.name().to_lowercase().contains(&lower))
                     .collect()
             }
         }
@@ -212,10 +212,7 @@ impl Catalog {
     /// hold a `CatalogEntry` (e.g. the picker iterating `datasets()`)
     /// use this to avoid the `find_exact` round-trip.
     pub fn open_entry(entry: &CatalogEntry) -> crate::Result<crate::TestDataGroup> {
-        if entry.dataset_type == "knn_entries.yaml" {
-            return crate::TestDataGroup::from_catalog_entry(entry);
-        }
-        crate::TestDataGroup::load(&entry.path)
+        crate::TestDataGroup::from_catalog_entry(entry)
     }
 
     /// Open what a dataset spec names: **the call for turning a string
@@ -267,11 +264,11 @@ impl Catalog {
             // selector that matches nothing fails before the dataset is
             // fetched (PS-9).
             entry.select(selector).map_err(|e| crate::Error::Selection {
-                dataset: entry.name.clone(),
+                dataset: entry.name().to_string(),
                 message: e.to_string(),
             })?;
-            let group = Self::open_entry(entry).map_err(|e| opened(&entry.name, e))?;
-            (entry.name.clone(), group)
+            let group = Self::open_entry(entry).map_err(|e| opened(entry.name(), e))?;
+            (entry.name().to_string(), group)
         };
         let profiles = group.select(selector).map_err(|e| crate::Error::Selection {
             dataset: dataset.clone(),
@@ -537,7 +534,7 @@ fn load_from_explicit_catalog_file(
                     // surfaces a fabricated `<base_url>/knn_entries.yaml`
                     // that may name the wrong host AND the wrong file.
                     for e in &mut parsed {
-                        e.catalog_file = Some(location.to_string());
+                        e.set_catalog_file(location);
                     }
                     entries.extend(parsed);
                     true
@@ -667,7 +664,7 @@ fn try_load_knn_entries(
     match parse_knn_entries_yaml(&content, location) {
         Ok(mut parsed) => {
             for e in &mut parsed {
-                e.catalog_file = Some(url.clone());
+                e.set_catalog_file(url.clone());
             }
             entries.extend(parsed);
             true
@@ -726,14 +723,7 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
             .unwrap_or("dataset.yaml")
             .to_string();
 
-        Ok(CatalogEntry {
-            name,
-            path: full_path,
-            dataset_type,
-            layout,
-            catalog_file: None,
-            catalog_name: None,
-        })
+        CatalogEntry::from_listing(name, full_path, dataset_type, layout)
     } else {
         // Direct entry — attributes and profiles at top level (e.g. HDF5 datasets)
         let name = value
@@ -764,19 +754,13 @@ fn remap_entry(value: &serde_json::Value, base_url: &str) -> Result<CatalogEntry
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
-        Ok(CatalogEntry {
-            name,
-            path: full_path,
-            dataset_type,
-            layout: CatalogLayout {
-                format_version: crate::model::FORMAT_VERSION_BASE,
-                profile_tags: Default::default(),
-                attributes,
-                profiles,
-            },
-            catalog_file: None,
-            catalog_name: None,
-        })
+        let layout = CatalogLayout {
+            format_version: crate::model::FORMAT_VERSION_BASE,
+            profile_tags: Default::default(),
+            attributes,
+            profiles,
+        };
+        CatalogEntry::from_listing(name, full_path, dataset_type, layout)
     }
 }
 
@@ -971,19 +955,16 @@ mod tests {
                 },
             );
         }
-        CatalogEntry {
-            name: name.to_string(),
-            path: format!("{}/dataset.yaml", name),
-            dataset_type: "dataset.yaml".to_string(),
-            catalog_file: None,
-            catalog_name: None,
-            layout: CatalogLayout {
-                format_version: crate::model::FORMAT_VERSION_BASE,
-                profile_tags: Default::default(),
-                attributes: None,
-                profiles: crate::dataset::DSProfileGroup::from_profiles(profile_group),
-            },
-        }
+        let layout = CatalogLayout {
+            format_version: crate::model::FORMAT_VERSION_BASE,
+            profile_tags: Default::default(),
+            attributes: None,
+            profiles: crate::dataset::DSProfileGroup::from_profiles(profile_group),
+        };
+        CatalogEntry::builder(name)
+            .descriptor(&crate::Location::parse(&format!("{name}/dataset.yaml")).unwrap(), layout)
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -1043,10 +1024,10 @@ mod tests {
         });
 
         let entry = remap_entry(&json, "https://example.com/data/").unwrap();
-        assert_eq!(entry.name, "test-ds");
-        assert_eq!(entry.path, "https://example.com/data/test-ds/dataset.yaml");
-        assert!(entry.layout.attributes.is_some());
-        assert!(!entry.layout.profiles.is_empty());
+        assert_eq!(entry.name(), "test-ds");
+        assert_eq!(entry.location(), "https://example.com/data/test-ds/dataset.yaml");
+        assert!(entry.attributes().is_some());
+        assert!(!entry.profiles().is_empty());
     }
 
     #[test]
@@ -1064,7 +1045,7 @@ mod tests {
         });
 
         let entry = remap_entry(&json, "https://example.com/").unwrap();
-        assert_eq!(entry.name, "myds");
+        assert_eq!(entry.name(), "myds");
     }
 
     #[test]
@@ -1095,7 +1076,7 @@ mod tests {
 
         let catalog = Catalog::of(&sources);
         assert_eq!(catalog.datasets().len(), 1);
-        assert_eq!(catalog.datasets()[0].name, "alpha");
+        assert_eq!(catalog.datasets()[0].name(), "alpha");
     }
 
     /// **A name two catalogs both declare is ambiguous, and the error

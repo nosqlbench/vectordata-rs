@@ -174,19 +174,19 @@ let catalog = Catalog::of(&sources);
 // List all available datasets
 for entry in catalog.datasets() {
     println!("{} (profiles: {})",
-        entry.name,
+        entry.name(),
         entry.profile_names().join(", "));
 }
 
 // Find by exact name (case-insensitive)
 if let Some(entry) = catalog.find_exact("my-dataset") {
-    println!("found: {}, path: {}", entry.name, entry.path);
+    println!("found: {}, at: {}", entry.name(), entry.location());
 }
 
 // Find by glob pattern
 let matches = catalog.match_glob("my-vectors*");
 for entry in matches {
-    println!("  {}", entry.name);
+    println!("  {}", entry.name());
 }
 ```
 
@@ -730,15 +730,10 @@ _defaults:
   gt:    profiles/base/neighbor_indices.ivecs
 ```
 
-The `knn_entries` module can also be used directly:
-
-```rust
-use vectordata::knn_entries::KnnEntries;
-
-let entries = KnnEntries::load("knn_entries.yaml")?;
-println!("datasets: {:?}", entries.dataset_names());
-let config = entries.to_config();  // → DatasetConfig
-```
+The file is read by the catalog's `knn_entries.yaml` parser, so a
+directory open honours `_defaults.base_url`, `cache_dir` and `${VAR}`
+exactly as a catalog listing of the same file does. The dataset opened
+is the entry named after the directory, or the file's first.
 
 ---
 

@@ -50,11 +50,11 @@ let sources = CatalogSources::new().configure_default();
 let catalog = Catalog::of(&sources);
 
 for entry in catalog.datasets() {
-    println!("{} (profiles: {})", entry.name, entry.profile_names().join(", "));
+    println!("{} (profiles: {})", entry.name(), entry.profile_names().join(", "));
 }
 
 if let Some(entry) = catalog.find_exact("my-dataset") {
-    println!("found at path: {}", entry.path);
+    println!("found at: {}", entry.location());
 }
 
 // Glob matching
