@@ -1326,15 +1326,16 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
         .collect();
     config.profiles.derive_views_from_templates(&templates);
 
-    // Compare-before-write so an idempotent second `veks run` doesn't
-    // touch dataset.yaml's mtime (or its progress-tracked size) when
-    // the content would be identical. Without this, every run
-    // invalidates downstream finalize steps (generate-dataset-json,
-    // generate-merkle, ...) for no reason.
+    // Write only when the description changes. A file that already
+    // says what this save would say is left byte-for-byte, whatever its
+    // layout, comments or spelling: rewriting it would change nothing a
+    // reader sees, yet would move its content key and send every
+    // finalize step (generate-dataset-json, generate-merkle, ...) round
+    // again, and it would replace a hand-kept file with the renderer's.
     match config.to_expanded_yaml_string(dataset_path) {
         Ok(new_content) => {
             let existing = std::fs::read_to_string(dataset_path).ok();
-            if existing.as_deref() == Some(new_content.as_str()) {
+            if existing.as_deref().is_some_and(|text| same_description(text, &new_content)) {
                 eprintln!("  dataset.yaml up-to-date ({} variable(s) already synced)", vars.len());
             } else if let Err(e) = std::fs::write(dataset_path, &new_content) {
                 eprintln!("  warning: failed to save dataset.yaml: {}", e);
@@ -1345,6 +1346,19 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
         Err(e) => {
             eprintln!("  warning: failed to serialize dataset.yaml: {}", e);
         }
+    }
+}
+
+/// Whether two `dataset.yaml` texts describe the same dataset: they
+/// parse to the same configuration, which is what `dataset.json`
+/// publishes. Layout, comments, key order and window spelling are not
+/// part of it. A text that does not parse describes nothing, so it is
+/// never the same as another.
+fn same_description(a: &str, b: &str) -> bool {
+    let described = |text: &str| DatasetConfig::parse(text).ok().and_then(|c| serde_json::to_value(&c).ok());
+    match (described(a), described(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -2573,6 +2587,60 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not defined"));
+    }
+
+    /// A hand-kept `dataset.yaml`: a comment, an inherited window stated
+    /// explicitly, and its variables already synced. The renderer would
+    /// write all of it differently.
+    const HAND_KEPT: &str = "\
+# kept by hand
+name: kept
+attributes:
+  distance_function: L2
+profiles:
+  default:
+    base_vectors: b.fvec
+    query_vectors: q.fvec
+    neighbor_indices: profiles/default/g.ivec
+  10k:
+    inherits: default
+    base_count: 10000
+    base_vectors: b.fvec[0..10000)
+    neighbor_indices: profiles/10k/g.ivec
+variables:
+  vector_count: '20000'
+";
+
+    /// **The closing save leaves a file that already says the same
+    /// thing byte-for-byte**, however it is laid out. Rewriting it would
+    /// change nothing a reader sees, but would move its content key and
+    /// re-run every finalize step; for a published dataset whose
+    /// `dataset.yaml` must not change, it would rewrite that file.
+    #[test]
+    fn the_closing_save_leaves_an_unchanged_description_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("dataset.yaml");
+        std::fs::write(&path, HAND_KEPT).unwrap();
+        std::fs::write(tmp.path().join("variables.yaml"), "vector_count: '20000'\n").unwrap();
+
+        update_dataset_attributes(&path, tmp.path());
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), HAND_KEPT);
+    }
+
+    /// **A save that changes the description still writes it**: a
+    /// variable the run changed reaches `dataset.yaml`.
+    #[test]
+    fn the_closing_save_writes_a_changed_description() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("dataset.yaml");
+        std::fs::write(&path, HAND_KEPT).unwrap();
+        std::fs::write(tmp.path().join("variables.yaml"), "vector_count: '30000'\n").unwrap();
+
+        update_dataset_attributes(&path, tmp.path());
+
+        let saved = DatasetConfig::load(&path).unwrap();
+        assert_eq!(saved.variable("vector_count"), Some("30000"));
     }
 
     #[test]
