@@ -434,9 +434,11 @@ fn load_config(
 }
 
 /// `location` as written in a `catalogs.yaml` in `dir`: a relative
-/// local path is joined onto `dir`; URLs and absolute paths are kept.
+/// local path is joined onto `dir`; URLs and rooted paths are kept. A
+/// rooted path (`/x`, or `\x` and `C:\x` on Windows) is not relative to
+/// the file, though on Windows only a drive path is absolute.
 fn relative_to(dir: &Path, location: &str) -> String {
-    if crate::location::has_scheme(location) || Path::new(location).is_absolute() {
+    if crate::location::has_scheme(location) || Path::new(location).has_root() {
         return location.to_string();
     }
     dir.join(location).to_string_lossy().into_owned()
