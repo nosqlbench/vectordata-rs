@@ -159,6 +159,12 @@ fn log_event(ui: &veks_core::ui::UiHandle, event: GenerateEvent) {
             ui.log(&format!("  warning: failed to load {}: {error}", path.display()))
         }
         GenerateEvent::Marked(dir) => ui.log(&format!("  skipping {} (.do_not_catalog)", dir.display())),
+        GenerateEvent::KnnOmitted { dataset, profile, reason } => {
+            ui.log(&format!("  knn_entries.yaml omits {dataset}:{profile}: {reason}"))
+        }
+        GenerateEvent::RemovedKnnEntries(dir) => {
+            ui.log(&format!("  removed {}/knn_entries.yaml: no profile below it can be listed", dir.display()))
+        }
         GenerateEvent::Wrote { dir, entries, files } => {
             let names: Vec<String> = files
                 .iter()

@@ -101,6 +101,12 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
         ),
         GenerateEvent::Unreadable { path, error } => eprintln!("WARNING: failed to load {}: {error}", rel(path)),
         GenerateEvent::Marked(dir) => eprintln!("  Skipping {} (.do_not_catalog)", rel(dir)),
+        GenerateEvent::KnnOmitted { dataset, profile, reason } => {
+            eprintln!("  knn_entries.yaml omits {dataset}:{profile}: {reason}")
+        }
+        GenerateEvent::RemovedKnnEntries(dir) => {
+            eprintln!("  Removed {}/knn_entries.yaml: no profile below it can be listed", rel(dir))
+        }
         GenerateEvent::Wrote { entries, files, .. } => {
             let names: Vec<String> = files.iter().map(|f| rel(f)).collect();
             eprintln!("Wrote {entries} entries to {}", names.join(", "));

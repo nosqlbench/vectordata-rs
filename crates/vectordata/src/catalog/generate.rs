@@ -104,6 +104,21 @@ pub enum GenerateEvent<'a> {
     },
     /// A directory marked `.do_not_catalog` gets no catalog file.
     Marked(&'a Path),
+    /// A profile with base vectors, query vectors and neighbor indices
+    /// is left out of `knn_entries.yaml`, which cannot state it exactly
+    /// ([`knn_listing`]). Reported once, at the dataset's own catalog.
+    KnnOmitted {
+        /// The dataset.
+        dataset: &'a str,
+        /// The profile left out.
+        profile: &'a str,
+        /// Why it cannot be listed.
+        reason: &'a str,
+    },
+    /// A directory's `knn_entries.yaml` was removed: nothing below it
+    /// can be stated in jvector's format any more, and the file is the
+    /// generator's to keep true ([`knn_listing`]).
+    RemovedKnnEntries(&'a Path),
     /// A directory's catalog files were written.
     Wrote {
         /// The directory.
@@ -200,12 +215,26 @@ impl CatalogTree {
             if entries.is_empty() {
                 continue;
             }
+            for dataset in self.datasets.iter().filter(|d| d.dir() == dir.as_path()) {
+                for (profile, p) in &dataset.config.profiles.profiles {
+                    if let Some(Err(reason)) = knn_listing(p) {
+                        progress(GenerateEvent::KnnOmitted { dataset: &dataset.config.name, profile, reason: &reason });
+                    }
+                }
+            }
             let mut files = Vec::new();
             // knn_entries.yaml first: the catalog files must be newer
             // for the publish pre-flight's mtime checks.
+            // The generator owns knn_entries.yaml in every directory it
+            // catalogs, as it owns catalog.json: one listing nothing is
+            // removed, not left to describe what is no longer listable.
             let knn = self.knn_entries_in(dir, base_url.as_deref());
+            let knn_path = dir.join("knn_entries.yaml");
             if !knn.is_empty() {
-                files.push(write_file(&dir.join("knn_entries.yaml"), &knn)?);
+                files.push(write_file(&knn_path, &knn)?);
+            } else if knn_path.exists() {
+                std::fs::remove_file(&knn_path).map_err(|e| format!("failed to remove {}: {e}", knn_path.display()))?;
+                progress(GenerateEvent::RemovedKnnEntries(dir));
             }
             let json = serde_json::to_string_pretty(&entries).map_err(|e| format!("JSON serialization failed: {e}"))?;
             files.push(write_file(&dir.join(format!("{basename}.json")), &json)?);
@@ -218,20 +247,17 @@ impl CatalogTree {
     }
 
     /// The `knn_entries.yaml` (jvector's format) for `dir`: one
-    /// `<dataset>:<profile>` entry for each profile below it that has
-    /// base vectors, query vectors and neighbor indices, with paths
-    /// relative to `dir`, and the publish URL as `_defaults.base_url`.
-    /// Empty when no profile qualifies.
+    /// `<dataset>:<profile>` entry for each profile below it that it
+    /// can state exactly ([`knn_listing`]), with paths relative to
+    /// `dir`, and the publish URL as `_defaults.base_url`. Empty when no
+    /// profile qualifies.
     pub fn knn_entries_in(&self, dir: &Path, base_url: Option<&str>) -> String {
         let mut out = String::new();
         for dataset in self.datasets.iter().filter(|d| d.yaml_path.starts_with(dir)) {
             let relative = dataset.dir().strip_prefix(dir).map(|r| r.to_string_lossy().into_owned()).unwrap_or_default();
             let prefix = if relative.is_empty() { String::new() } else { format!("{relative}/") };
             for (profile_name, profile) in &dataset.config.profiles.profiles {
-                let path = |facet: &str| profile.view(facet).map(|v| v.path().to_string());
-                let (Some(base), Some(query), Some(gt)) =
-                    (path("base_vectors"), path("query_vectors"), path("neighbor_indices"))
-                else {
+                let Some(Ok(KnnListing { base, query, gt })) = knn_listing(profile) else {
                     continue;
                 };
                 // The key holds a ':', so it is quoted.
@@ -246,6 +272,52 @@ impl CatalogTree {
             _ => out,
         }
     }
+}
+
+/// The three files a `knn_entries.yaml` entry names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnnListing {
+    /// Base vectors.
+    pub base: String,
+    /// Query vectors.
+    pub query: String,
+    /// Neighbor indices (ground truth).
+    pub gt: String,
+}
+
+/// How a profile appears in `knn_entries.yaml`.
+///
+/// jvector's format names three whole files and nothing else: no
+/// window, no series, no namespace inside a file. A profile is listed
+/// only when its base vectors, query vectors and neighbor indices are
+/// each exactly such a file, because an entry that dropped any of those
+/// would hand a reader different data than the profile holds (a sized
+/// profile listed against the whole base, scored by ground truth over
+/// its first rows).
+///
+/// - `None`: the profile lacks one of the three facets, so it is no
+///   candidate for the format.
+/// - `Some(Err(reason))`: it has all three, but one cannot be stated
+///   exactly; it is left out, and `reason` says why.
+/// - `Some(Ok(listing))`: it is listed with these files.
+pub fn knn_listing(profile: &crate::dataset::DSProfile) -> Option<Result<KnnListing, String>> {
+    let exact = |facet: &str| -> Option<Result<String, String>> {
+        let view = profile.view(facet)?;
+        Some(if view.is_series() {
+            Err(format!("{facet} is a multi-file series"))
+        } else if view.window.is_some() || !view.source.window.is_empty() {
+            Err(format!("{facet} reads a window of its file"))
+        } else if view.source.namespace.is_some() {
+            Err(format!("{facet} reads a namespace inside its file"))
+        } else {
+            Ok(view.path().to_string())
+        })
+    };
+    let (base, query, gt) = (exact("base_vectors")?, exact("query_vectors")?, exact("neighbor_indices")?);
+    Some(match (base, query, gt) {
+        (Ok(base), Ok(query), Ok(gt)) => Ok(KnnListing { base, query, gt }),
+        (base, query, gt) => Err([base, query, gt].into_iter().filter_map(Result::err).collect::<Vec<_>>().join("; ")),
+    })
 }
 
 fn write_file(path: &Path, content: &str) -> Result<PathBuf, String> {
@@ -385,6 +457,113 @@ mod tests {
         assert!(!tmp.path().join("private").join("inner").join("catalog.json").exists());
         let top = std::fs::read_to_string(tmp.path().join("catalog.json")).unwrap();
         assert!(!top.contains("inner"), "{top}");
+    }
+
+    /// **`knn_entries.yaml` lists only the profiles it can state
+    /// exactly, and reports the rest.** jvector's format names three
+    /// whole files, so a sized profile (a window of the base) or a
+    /// sharded base would be listed against other data than the profile
+    /// holds: the whole base, scored by ground truth over its first rows.
+    /// Each omission is reported once, at the dataset's own catalog,
+    /// though the dataset is listed at every level above it too.
+    #[test]
+    fn knn_entries_list_only_profiles_they_state_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("group").join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dataset.yaml"),
+            "format_version: 2\nname: d\nattributes:\n  distance_function: L2\nprofiles:\n  default:\n    \
+             base_vectors: base.fvec\n    query_vectors: query.fvec\n    neighbor_indices: gt.ivec\n  \
+             10:\n    inherits: default\n    base_count: 10\n    neighbor_indices: profiles/10/gt.ivec\n  \
+             sharded:\n    base_vectors:\n      source: profiles/base/b__NNNN.fvec\n      shard_stride: 5\n      \
+             shard_count: 2\n      record_count: 10\n    query_vectors: query.fvec\n    neighbor_indices: profiles/sharded/gt.ivec\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(PUBLISH_SENTINEL), "").unwrap();
+        let tree = CatalogTree::scan(tmp.path(), &mut |e| {
+            if let GenerateEvent::Unreadable { error, .. } = e {
+                panic!("the fixture does not load: {error}");
+            }
+        });
+        let mut omitted = Vec::new();
+        tree.write(&tree.catalog_dirs(), "catalog", &mut |e| {
+            if let GenerateEvent::KnnOmitted { dataset, profile, reason } = e {
+                omitted.push(format!("{dataset}:{profile}: {reason}"));
+            }
+        })
+        .unwrap();
+
+        for level in [dir.clone(), tmp.path().join("group"), tmp.path().to_path_buf()] {
+            let knn = std::fs::read_to_string(level.join("knn_entries.yaml")).unwrap();
+            assert!(knn.contains("\"d:default\":"), "{knn}");
+            for left_out in ["\"d:10\":", "\"d:sharded\":"] {
+                assert!(!knn.contains(left_out), "{left_out} listed at {}:\n{knn}", level.display());
+            }
+        }
+        assert_eq!(
+            omitted,
+            [
+                "d:10: base_vectors reads a window of its file",
+                "d:sharded: base_vectors is a multi-file series",
+            ],
+            "each omission once",
+        );
+    }
+
+    /// **A `knn_entries.yaml` that would list nothing is removed**, not
+    /// left behind: once a dataset's profiles can no longer be stated in
+    /// the format (here, its base became a series), the old file would
+    /// still hand jvector the entries it no longer has. The removal is
+    /// reported.
+    #[test]
+    fn a_knn_entries_file_listing_nothing_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        dataset(&dir, "d");
+        let tree = CatalogTree::scan(tmp.path(), &mut |_| {});
+        tree.write(&tree.catalog_dirs(), "catalog", &mut |_| {}).unwrap();
+        assert!(dir.join("knn_entries.yaml").exists(), "a whole-file profile is listed");
+
+        std::fs::write(
+            dir.join("dataset.yaml"),
+            "format_version: 2\nname: d\nprofiles:\n  default:\n    base_vectors:\n      \
+             source: b__NNNN.fvec\n      shard_stride: 5\n      shard_count: 2\n      record_count: 10\n    \
+             query_vectors: query.fvec\n    neighbor_indices: gt.ivec\n",
+        )
+        .unwrap();
+        let tree = CatalogTree::scan(tmp.path(), &mut |_| {});
+        let mut removed = Vec::new();
+        tree.write(&tree.catalog_dirs(), "catalog", &mut |e| {
+            if let GenerateEvent::RemovedKnnEntries(at) = e {
+                removed.push(at.to_path_buf());
+            }
+        })
+        .unwrap();
+        for level in [&dir, &tmp.path().to_path_buf()] {
+            assert!(!level.join("knn_entries.yaml").exists(), "stale knn_entries.yaml left at {}", level.display());
+            assert!(level.join("catalog.json").exists());
+        }
+        removed.sort();
+        let mut expected = vec![tmp.path().to_path_buf(), dir.clone()];
+        expected.sort();
+        assert_eq!(removed, expected, "each removal reported");
+    }
+
+    /// **A facet read from a namespace inside its file cannot be listed**:
+    /// the format has no way to name the namespace. **A profile without
+    /// ground truth is no candidate**, so it is not reported as omitted.
+    #[test]
+    fn a_namespaced_facet_is_not_listed_and_a_partial_profile_is_no_candidate() {
+        let profiles: crate::dataset::DSProfileGroup = serde_yaml::from_str(
+            "default:\n  base_vectors: base.fvec\n  query_vectors: q.slab:queries\n  neighbor_indices: gt.ivec\n",
+        )
+        .unwrap();
+        let listing = knn_listing(&profiles.profiles["default"]);
+        assert_eq!(listing, Some(Err("query_vectors reads a namespace inside its file".to_string())));
+        let partial: crate::dataset::DSProfileGroup =
+            serde_yaml::from_str("default:\n  base_vectors: base.fvec\n  query_vectors: query.fvec\n").unwrap();
+        assert_eq!(knn_listing(&partial.profiles["default"]), None);
     }
 
     /// **Every directory from a dataset up to the scan root gets a
