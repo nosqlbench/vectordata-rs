@@ -234,6 +234,11 @@ pub(crate) fn file_uri_path(text: &str) -> std::borrow::Cow<'_, str> {
     let Some(rest) = text.strip_prefix("file://") else {
         return std::borrow::Cow::Borrowed(text);
     };
+    // `file://name` with no path names `/name`, not a host, on every
+    // platform; read as a URL, Windows would make it the share `\\name\`.
+    if !rest.is_empty() && !rest.contains('/') {
+        return std::borrow::Cow::Owned(format!("/{rest}"));
+    }
     if let Some(path) = Url::parse(text).ok().and_then(|url| url.to_file_path().ok()) {
         return std::borrow::Cow::Owned(path.to_string_lossy().into_owned());
     }
@@ -260,6 +265,10 @@ mod tests {
         assert!(matches!(loc("s3://bucket/key"), Location::Url(_)));
         assert!(matches!(loc("gs://bucket/key"), Location::Url(_)));
         assert_eq!(loc("file:///abs/x"), Location::from_path("/abs/x"));
+        // A host is a UNC share on Windows; elsewhere it is not part of the path.
+        #[cfg(windows)]
+        assert_eq!(loc("file://host/abs/x"), Location::from_path(r"\\host\abs\x"));
+        #[cfg(not(windows))]
         assert_eq!(loc("file://host/abs/x"), Location::from_path("/abs/x"));
         assert_eq!(loc("file://abs"), Location::from_path("/abs"));
         assert_eq!(loc("/abs/x"), Location::from_path("/abs/x"));
