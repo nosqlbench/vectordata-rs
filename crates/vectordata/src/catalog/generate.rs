@@ -65,13 +65,7 @@ impl FoundDataset {
     /// The entry a catalog in `catalog_dir` lists for it: its
     /// `dataset.yaml` relative to that directory, and its layout.
     pub fn entry_in(&self, catalog_dir: &Path) -> CatalogEntry {
-        let relative: PathBuf = self
-            .yaml_path
-            .strip_prefix(catalog_dir)
-            .unwrap_or(&self.yaml_path)
-            .components()
-            .filter(|c| !matches!(c, Component::CurDir))
-            .collect();
+        let relative = PathBuf::from(slash_path(self.yaml_path.strip_prefix(catalog_dir).unwrap_or(&self.yaml_path)));
         let layout = CatalogLayout {
             // The dataset's own version travels into the catalog, so a
             // consumer too old for it can say so from the listing
@@ -254,7 +248,7 @@ impl CatalogTree {
     pub fn knn_entries_in(&self, dir: &Path, base_url: Option<&str>) -> String {
         let mut out = String::new();
         for dataset in self.datasets.iter().filter(|d| d.yaml_path.starts_with(dir)) {
-            let relative = dataset.dir().strip_prefix(dir).map(|r| r.to_string_lossy().into_owned()).unwrap_or_default();
+            let relative = dataset.dir().strip_prefix(dir).map(slash_path).unwrap_or_default();
             let prefix = if relative.is_empty() { String::new() } else { format!("{relative}/") };
             for (profile_name, profile) in &dataset.config.profiles.profiles {
                 let Some(Ok(KnnListing { base, query, gt })) = knn_listing(profile) else {
@@ -318,6 +312,19 @@ pub fn knn_listing(profile: &crate::dataset::DSProfile) -> Option<Result<KnnList
         (Ok(base), Ok(query), Ok(gt)) => Ok(KnnListing { base, query, gt }),
         (base, query, gt) => Err([base, query, gt].into_iter().filter_map(Result::err).collect::<Vec<_>>().join("; ")),
     })
+}
+
+/// A relative path as a catalog writes it: its components joined with
+/// `/`, whatever the platform. A catalog's paths are relative references
+/// that consumers resolve by URL rules, so a Windows separator in one
+/// would name a different file, or none.
+fn slash_path(relative: &Path) -> String {
+    relative
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn write_file(path: &Path, content: &str) -> Result<PathBuf, String> {
