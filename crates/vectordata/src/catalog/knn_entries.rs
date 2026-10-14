@@ -667,9 +667,12 @@ _defaults:
         assert_eq!(source(&with_cache, at, env_dir, "query_vectors"), "s3://b/ds/env.fvec");
         // A file kept as a symlink is named where the catalog names it,
         // not where the link points.
-        std::os::unix::fs::symlink(env.join("env.fvec"), catalog.join("linked.fvec")).unwrap();
-        let linked = "_defaults:\n  base_url: s3://b/ds\nds:\n  base: linked.fvec\n";
-        assert_eq!(source(linked, at, None, "base_vectors"), local(&catalog, "linked.fvec"));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(env.join("env.fvec"), catalog.join("linked.fvec")).unwrap();
+            let linked = "_defaults:\n  base_url: s3://b/ds\nds:\n  base: linked.fvec\n";
+            assert_eq!(source(linked, at, None, "base_vectors"), local(&catalog, "linked.fvec"));
+        }
         // A remote catalog looks in no local directory of its own.
         let remote = format!("ds:\n{facets}");
         assert_eq!(source(&remote, "https://host/ds/", None, "base_vectors"), "https://host/ds/beside.fvec");
