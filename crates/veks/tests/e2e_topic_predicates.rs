@@ -27,6 +27,9 @@ use veks_core::formats::anode::{self, ANode};
 use veks_core::formats::mnode::{MNode, MValue};
 use veks_core::formats::passage_table::{ParentRow, ParentTableWriter, PassageRow, PassageTableWriter};
 
+#[path = "support/catalog_mirror.rs"]
+mod catalog_mirror;
+
 const ROWS: usize = 200;
 const PER_PAPER: usize = 4;
 const DIM: usize = 8;
@@ -278,12 +281,18 @@ fn extend_definition(dataset_yaml: &Path, src_rel: &str) {
     std::fs::write(dataset_yaml, serde_yaml::to_string(&doc).unwrap()).unwrap();
 }
 
+/// The dataset is published, so its finalize pass writes catalogs; a run
+/// that succeeds must leave every projection mirroring `dataset.yaml`.
 fn run_pipeline(dataset_yaml: &Path) -> (bool, String) {
+    catalog_mirror::mark_publishable(dataset_yaml.parent().expect("dataset.yaml has a directory"));
     let output = Command::new(veks_bin())
         .arg("run").args(["--output", "batch", "--threads", "2"]).arg(dataset_yaml)
         .output()
         .expect("failed to execute veks");
     let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    if output.status.success() {
+        catalog_mirror::assert_projections_mirror_dataset_yaml(dataset_yaml.parent().unwrap());
+    }
     (output.status.success(), text)
 }
 

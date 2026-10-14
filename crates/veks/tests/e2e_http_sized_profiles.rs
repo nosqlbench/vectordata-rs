@@ -35,6 +35,9 @@ use veks::prepare::import::ImportArgs;
 mod support;
 use support::testserver::TestServer;
 
+#[path = "support/catalog_mirror.rs"]
+mod catalog_mirror;
+
 /// Process-wide cache override so the e2e test never writes into the
 /// user's real `cache_dir:`. Mirrors the pattern used in
 /// `vectordata/tests/http_storage.rs`. Lives in `target/tmp` and is
@@ -157,7 +160,10 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
     }
 }
 
+/// The dataset is published, so its finalize pass writes catalogs; a run
+/// that succeeds must leave every projection mirroring `dataset.yaml`.
 fn run_pipeline(dataset_yaml: &Path) -> (bool, String) {
+    catalog_mirror::mark_publishable(dataset_yaml.parent().expect("dataset.yaml has a directory"));
     let output = Command::new(veks_bin())
         .arg("run")
         .arg("--output").arg("batch")
@@ -170,6 +176,8 @@ fn run_pipeline(dataset_yaml: &Path) -> (bool, String) {
     if !output.status.success() {
         eprintln!("=== PIPELINE STDOUT ===\n{}", stdout);
         eprintln!("=== PIPELINE STDERR ===\n{}", stderr);
+    } else {
+        catalog_mirror::assert_projections_mirror_dataset_yaml(dataset_yaml.parent().unwrap());
     }
     (output.status.success(), format!("{}\n{}", stdout, stderr))
 }

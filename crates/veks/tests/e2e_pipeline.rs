@@ -17,6 +17,9 @@ use std::sync::{Arc, OnceLock};
 
 use veks::prepare::import::ImportArgs;
 
+#[path = "support/catalog_mirror.rs"]
+mod catalog_mirror;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Test infrastructure
 // ═══════════════════════════════════════════════════════════════════════════
@@ -348,7 +351,12 @@ fn run_pipeline(dataset_yaml: &Path) -> (bool, String) {
 
 /// `veks run` with an output mode and extra flags; `basic` output
 /// carries every per-step decision line.
+///
+/// The dataset is published, so its finalize pass writes catalogs; a run
+/// that succeeds must leave every projection mirroring `dataset.yaml`.
 fn run_pipeline_with(dataset_yaml: &Path, output_mode: &str, extra: &[&str]) -> (bool, String) {
+    let dataset_dir = dataset_yaml.parent().expect("dataset.yaml has a directory");
+    catalog_mirror::mark_publishable(dataset_dir);
     let output = Command::new(veks_bin())
         .arg("run")
         .arg("--output").arg(output_mode)
@@ -364,6 +372,8 @@ fn run_pipeline_with(dataset_yaml: &Path, output_mode: &str, extra: &[&str]) -> 
     if !output.status.success() {
         eprintln!("=== PIPELINE STDOUT ===\n{}", stdout);
         eprintln!("=== PIPELINE STDERR ===\n{}", stderr);
+    } else if !extra.contains(&"--dry-run") {
+        catalog_mirror::assert_projections_mirror_dataset_yaml(dataset_dir);
     }
     (output.status.success(), format!("{}\n{}", stdout, stderr))
 }

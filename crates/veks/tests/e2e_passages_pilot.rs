@@ -19,6 +19,9 @@ use std::process::Command;
 
 use veks_core::formats::passage_table::{read_parents, read_passages};
 
+#[path = "support/catalog_mirror.rs"]
+mod catalog_mirror;
+
 fn veks_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_veks"))
 }
@@ -256,6 +259,8 @@ fn passages_pilot_end_to_end() {
     assert_success(&out, "prepare bootstrap");
     let dataset_yaml = dataset.join("dataset.yaml");
     assert!(dataset_yaml.exists(), "bootstrap wrote dataset.yaml");
+    // Published, so the finalize pass writes catalogs to check.
+    catalog_mirror::mark_publishable(&dataset);
 
     let out = run_veks(
         &[
@@ -269,6 +274,7 @@ fn passages_pilot_end_to_end() {
         work,
     );
     assert_success(&out, "veks run");
+    catalog_mirror::assert_projections_mirror_dataset_yaml(&dataset);
 
     let out = run_veks(
         &["check", dataset.to_str().unwrap(), "--check-integrity"],

@@ -22,6 +22,9 @@ use std::process::Command;
 
 use veks::prepare::import::ImportArgs;
 
+#[path = "support/catalog_mirror.rs"]
+mod catalog_mirror;
+
 fn veks_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_veks"))
 }
@@ -104,7 +107,10 @@ fn base_args(name: &str, output: &Path) -> ImportArgs {
     }
 }
 
+/// The dataset is published, so its finalize pass writes catalogs; a run
+/// that succeeds must leave every projection mirroring `dataset.yaml`.
 fn run_pipeline(dataset_yaml: &Path) -> (bool, String) {
+    catalog_mirror::mark_publishable(dataset_yaml.parent().expect("dataset.yaml has a directory"));
     let out = Command::new(veks_bin())
         .arg("run")
         .arg("--output").arg("batch")
@@ -117,6 +123,9 @@ fn run_pipeline(dataset_yaml: &Path) -> (bool, String) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    if out.status.success() {
+        catalog_mirror::assert_projections_mirror_dataset_yaml(dataset_yaml.parent().unwrap());
+    }
     (out.status.success(), text)
 }
 
