@@ -46,3 +46,16 @@ pub fn write_mref(path: &Path) {
     p.push(".mref");
     mref.save(Path::new(&p)).unwrap();
 }
+
+/// Write the catalogs over the datasets under `root` the way a publish
+/// does: each named dataset directory is marked publishable and the
+/// catalog generator writes every level, so what a catalog lists is what
+/// each `dataset.yaml` says. A test never writes a catalog by hand.
+pub fn write_catalogs(root: &Path, datasets: &[&str]) {
+    use vectordata::catalog::generate::CatalogTree;
+    for name in datasets {
+        std::fs::write(root.join(name).join(".publish"), "").unwrap();
+    }
+    let tree = CatalogTree::scan(root, &mut |_| {});
+    tree.write(&tree.catalog_dirs(), "catalog", &mut |_| {}).unwrap();
+}

@@ -9,7 +9,7 @@ mod support;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use support::fixtures::{fvec_value, write_fvec, write_ivvec, write_mref};
+use support::fixtures::{fvec_value, write_catalogs, write_fvec, write_ivvec, write_mref};
 use support::testserver::TestServer;
 use vectordata::TestDataGroup;
 use vectordata::fetch::{FetchRequest, Silent};
@@ -173,13 +173,7 @@ const STRICT_CATALOG: &str = "VECTORDATA_TEST_STRICT_CATALOG";
 /// Serve `name` with a remote catalog file listing it.
 fn served_catalog(root: &Path, name: &str, seed: f32) {
     dataset(root, name, seed);
-    std::fs::write(
-        root.join("catalog.json"),
-        format!(
-            r#"[{{"name":"{name}","path":"{name}/dataset.yaml","dataset_type":"dataset.yaml","layout":{{"profiles":{{"default":{{}}}}}}}}]"#
-        ),
-    )
-    .unwrap();
+    write_catalogs(root, &[name]);
 }
 
 /// **Offline mode makes no request at all**, and still opens a fetched

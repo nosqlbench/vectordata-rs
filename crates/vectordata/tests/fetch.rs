@@ -477,11 +477,7 @@ fn anchored_dataset(root: &Path) {
          metadata_results: results.ivvec\n    metadata_content: labels.u8\n",
     )
     .unwrap();
-    std::fs::write(
-        root.join("catalog.json"),
-        r#"[{"name":"anchored","path":"anchored/dataset.yaml","dataset_type":"dataset.yaml","layout":{"profiles":{"default":{}}}}]"#,
-    )
-    .unwrap();
+    support::fixtures::write_catalogs(root, &["anchored"]);
 }
 
 const CHILD_CATALOG: &str = "VECTORDATA_TEST_CHILD_CATALOG";

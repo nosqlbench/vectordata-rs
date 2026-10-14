@@ -13,7 +13,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use support::fixtures::{fvec_value, write_fvec, write_mref};
+use support::fixtures::{fvec_value, write_catalogs, write_fvec, write_mref};
 use support::testserver::TestServer;
 use vectordata::fetch::{FetchRequest, Silent};
 use vectordata::settings::{self, CacheDirConflict};
@@ -48,13 +48,7 @@ fn serve(root: &Path, name: &str, seed: f32) -> TestServer {
         format!("name: {name}\nprofiles:\n  default:\n    base_vectors: base.fvec\n"),
     )
     .unwrap();
-    std::fs::write(
-        root.join("served/catalog.json"),
-        format!(
-            r#"[{{"name":"{name}","path":"{name}/dataset.yaml","dataset_type":"dataset.yaml","layout":{{"profiles":{{"default":{{}}}}}}}}]"#
-        ),
-    )
-    .unwrap();
+    write_catalogs(&root.join("served"), &[name]);
     TestServer::start(&root.join("served")).unwrap()
 }
 

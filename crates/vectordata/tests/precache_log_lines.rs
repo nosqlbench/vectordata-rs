@@ -10,7 +10,7 @@ mod support;
 use std::path::PathBuf;
 use std::process::Command;
 
-use support::fixtures::{write_fvec, write_mref};
+use support::fixtures::{write_catalogs, write_fvec, write_mref};
 use support::testserver::TestServer;
 
 fn make_tmp() -> tempfile::TempDir {
@@ -28,11 +28,7 @@ fn precache_into_a_pipe_writes_log_lines() {
     write_fvec(&ds.join("base.fvec"), 400, 8, 3.1e8);
     write_mref(&ds.join("base.fvec"));
     std::fs::write(ds.join("dataset.yaml"), "name: logged\nprofiles:\n  default:\n    base_vectors: base.fvec\n").unwrap();
-    std::fs::write(
-        served.join("catalog.json"),
-        r#"[{"name":"logged","path":"logged/dataset.yaml","dataset_type":"dataset.yaml","layout":{"profiles":{"default":{}}}}]"#,
-    )
-    .unwrap();
+    write_catalogs(&served, &["logged"]);
     let server = TestServer::start(&served).unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
