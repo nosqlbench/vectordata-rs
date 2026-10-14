@@ -84,8 +84,7 @@ pub(crate) fn parse_knn_entries_yaml_with(
     env_cache_dir: Option<&str>,
 ) -> Result<Vec<CatalogEntry>, String> {
     // Top-level shape: a map of String -> serde_yaml::Value.
-    let top: serde_yaml::Mapping = serde_yaml::from_str(content)
-        .map_err(|e| format!("parse knn_entries.yaml: {e}"))?;
+    let top = top_level(content)?;
 
     // `_defaults` carries per-catalog defaults that are folded into
     // each entry. The two fields we honour mirror jvector
@@ -205,13 +204,46 @@ pub(crate) fn parse_knn_entries_yaml_with(
     Ok(out)
 }
 
+/// The document's top-level map. A key given twice keeps its last
+/// entry, as jvector's YAML loader and earlier releases read it, and is
+/// warned about: hand-kept files repeat an entry when a newer copy of
+/// the data is appended below the old one.
+fn top_level(content: &str) -> Result<serde_yaml::Mapping, String> {
+    struct LastWins(serde_yaml::Mapping, Vec<String>);
+    impl<'de> serde::Deserialize<'de> for LastWins {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Visit;
+            impl<'de> serde::de::Visitor<'de> for Visit {
+                type Value = LastWins;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a map of catalog entries")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<LastWins, A::Error> {
+                    let mut out = LastWins(serde_yaml::Mapping::new(), Vec::new());
+                    while let Some((key, value)) = map.next_entry::<serde_yaml::Value, serde_yaml::Value>()? {
+                        if out.0.insert(key.clone(), value).is_some() {
+                            out.1.push(key.as_str().map(str::to_string).unwrap_or_else(|| format!("{key:?}")));
+                        }
+                    }
+                    Ok(out)
+                }
+            }
+            deserializer.deserialize_map(Visit)
+        }
+    }
+    let LastWins(top, repeated) = serde_yaml::from_str(content).map_err(|e| format!("parse knn_entries.yaml: {e}"))?;
+    for key in repeated {
+        log::warn!("knn_entries.yaml: entry '{key}' is given more than once; the last one is used");
+    }
+    Ok(top)
+}
+
 /// Every facet path a `knn_entries.yaml` declares, as written and
 /// before `_defaults` resolve it: `(entry key, facet alias, path)`, in
 /// file order. What a publish checks against the files beside the
 /// catalog, which is where they will be published from.
 pub(crate) fn declared_facet_paths(content: &str) -> Result<Vec<(String, String, String)>, String> {
-    let top: serde_yaml::Mapping = serde_yaml::from_str(content)
-        .map_err(|e| format!("parse knn_entries.yaml: {e}"))?;
+    let top = top_level(content)?;
     let mut out = Vec::new();
     for (key, value) in &top {
         let (Some(key), Some(facets)) = (key.as_str(), value.as_mapping()) else { continue };
@@ -641,6 +673,20 @@ _defaults:
         // A remote catalog looks in no local directory of its own.
         let remote = format!("ds:\n{facets}");
         assert_eq!(source(&remote, "https://host/ds/", None, "base_vectors"), "https://host/ds/beside.fvec");
+    }
+
+    /// **An entry given twice keeps its last copy**, as jvector's loader
+    /// and earlier releases read it, rather than failing the whole file:
+    /// hand-kept catalogs append a newer copy of an entry below the old.
+    #[test]
+    fn a_repeated_entry_keeps_its_last_copy() {
+        let yaml = "\"d:default\":\n  base: old/b.fvec\n\"d:other\":\n  base: o.fvec\n\"d:default\":\n  base: new/b.fvec\n";
+        let entries = parse_knn_entries_yaml_with(yaml, "https://host/", None).unwrap();
+        let profiles = entries[0].profiles();
+        assert_eq!(profiles.profile("default").unwrap().views["base_vectors"].source.path, "https://host/new/b.fvec");
+        assert!(profiles.profile("other").is_some());
+        let declared = declared_facet_paths(yaml).unwrap();
+        assert_eq!(declared.iter().filter(|(k, _, _)| k == "d:default").map(|(_, _, p)| p.as_str()).collect::<Vec<_>>(), ["new/b.fvec"]);
     }
 
     /// Garbage YAML errors cleanly.
