@@ -14,7 +14,6 @@
 use crate::catalog::resolver::Catalog;
 #[cfg(feature = "cli")]
 use crate::dataset::selector::DatasetSpec;
-#[cfg(feature = "cli")]
 use crate::dataset::CatalogEntry;
 
 /// Shared clap-derived argument struct for `vectordata datasets
