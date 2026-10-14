@@ -652,8 +652,8 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            entry.resolve_facet_url("b.fvec").unwrap(),
-            catalog_dir.join("ds").join("b.fvec").to_str().unwrap(),
+            Path::new(&entry.resolve_facet_url("b.fvec").unwrap()),
+            catalog_dir.join("ds").join("b.fvec"),
         );
         let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
         let base = group.profile("default").unwrap().base_vectors().expect("the listed file opens");
@@ -708,7 +708,7 @@ mod tests {
         fs::write(ds.join("knn_entries.yaml"), content).unwrap();
         let group = TestDataGroup::load(ds.to_str().unwrap()).unwrap();
         let base = group.config().profiles["default"].base_vectors.as_ref().unwrap();
-        assert_eq!(base.source(), ds.join("b.fvec").to_str());
+        assert_eq!(base.source().map(Path::new), Some(ds.join("b.fvec").as_path()));
         assert_eq!(group.name.as_deref(), Some("second"));
 
         let other = dir.path().join("other");

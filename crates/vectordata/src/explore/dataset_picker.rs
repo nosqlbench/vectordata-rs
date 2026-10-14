@@ -4702,7 +4702,8 @@ mod tests {
             Some("provided by the program — read-only"),
         );
         let nested = super::read_only_note(screen.catalog_origins.get("deep"), &config_file).unwrap();
-        assert!(nested.starts_with("named in ") && nested.ends_with("inner/catalogs.yaml — edit it there"), "{nested}");
+        let inner = std::path::Path::new("inner").join("catalogs.yaml");
+        assert!(nested.starts_with("named in ") && nested.ends_with(&format!("{} — edit it there", inner.display())), "{nested}");
         assert_eq!(super::read_only_note(screen.catalog_origins.get("near"), &config_file), None);
     }
 
