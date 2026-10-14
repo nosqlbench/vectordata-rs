@@ -612,15 +612,16 @@ byte ranges rather than requiring a full file re-download.
         let mut skipped_fresh = 0usize;
         let mut total_bytes: u64 = 0;
 
-        // A sidecar of a file the rule now exempts — a document's, from
-        // before documents were exempt — is removed: it describes
-        // nothing a reader ranges over, and the check would call it
-        // extraneous.
+        // A sidecar that describes nothing a reader ranges over is
+        // removed, and the check would call it extraneous: one of a file
+        // the rule now exempts (a document's, from before documents were
+        // exempt), or of a file that is gone (a `knn_entries.yaml` the
+        // catalog generator removed when nothing could be listed).
         if source_path.is_dir() {
-            for orphan in collect_exempt_sidecars(&source_path) {
+            for (orphan, why) in collect_orphan_sidecars(&source_path) {
                 match std::fs::remove_file(&orphan) {
                     Ok(()) => ctx.ui.log(&format!(
-                        "  removed {} — its file is not merkled",
+                        "  removed {} — {why}",
                         orphan.strip_prefix(&ctx.workspace).unwrap_or(&orphan).display()
                     )),
                     Err(e) => ctx.ui.log(&format!("  could not remove {}: {e}", orphan.display())),
@@ -1893,15 +1894,23 @@ fn collect_eligible_files(dir: &Path, min_size: u64) -> Vec<PathBuf> {
     files
 }
 
-/// The `.mref` files under `dir` whose base file is merkle-exempt — a
-/// document's, an infrastructure file's — left by an earlier rule.
-/// They say nothing a reader uses and the step removes them.
-fn collect_exempt_sidecars(dir: &Path) -> Vec<PathBuf> {
+/// The `.mref` sidecars under `dir` that describe nothing, each with
+/// why: its base file is merkle-exempt (a document's, an
+/// infrastructure file's, left by an earlier rule), or it is gone. They
+/// say nothing a reader uses and the step removes them.
+fn collect_orphan_sidecars(dir: &Path) -> Vec<(PathBuf, &'static str)> {
     let mut files = Vec::new();
     let mut orphans = Vec::new();
     collect_eligible_recursive(dir, 0, &mut files, &mut orphans);
-    orphans.sort();
-    orphans
+    let mut out: Vec<(PathBuf, &'static str)> = orphans
+        .into_iter()
+        .map(|p| {
+            let gone = !p.with_extension("").exists();
+            (p, if gone { "its file is gone" } else { "its file is not merkled" })
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 fn collect_eligible_recursive(dir: &Path, min_size: u64, files: &mut Vec<PathBuf>, orphans: &mut Vec<PathBuf>) {
@@ -1919,8 +1928,8 @@ fn collect_eligible_recursive(dir: &Path, min_size: u64, files: &mut Vec<PathBuf
             collect_eligible_recursive(&path, min_size, files, orphans);
         } else {
             if let Some(base) = name_str.strip_suffix(".mref")
-                && veks_core::filters::is_merkle_exempt(base)
-                && !veks_core::filters::is_derived_sidecar(base)
+                && ((veks_core::filters::is_merkle_exempt(base) && !veks_core::filters::is_derived_sidecar(base))
+                    || !path.with_extension("").exists())
             {
                 orphans.push(path);
                 continue;
@@ -2488,6 +2497,30 @@ mod tests {
         let tree2 = MerkleTree::from_data(data, 8);
         assert_eq!(tree1, tree2);
         assert!(tree1.find_mismatches(&tree2).is_empty());
+    }
+
+    /// **A sidecar whose file is gone is removed**, and one whose file is
+    /// there is kept: once the catalog generator removes a
+    /// `knn_entries.yaml` that could list nothing, its `.mref` describes
+    /// nothing and must not be published beside the absence.
+    #[test]
+    fn a_sidecar_of_a_file_that_is_gone_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        std::fs::write(ws.join("kept.dat"), b"data that stays, for its merkle tree").unwrap();
+        std::fs::write(ws.join("knn_entries.yaml"), b"\"d:default\":\n  base: b.fvec\n").unwrap();
+        let mut opts = Options::new();
+        opts.set("source", ws.to_string_lossy().to_string());
+        opts.set("min-size", "0");
+        assert_eq!(MerkleCreateOp.execute(&opts, &mut ctx).status, Status::Ok);
+        assert!(ws.join("kept.dat.mref").exists());
+        assert!(ws.join("knn_entries.yaml.mref").exists());
+
+        std::fs::remove_file(ws.join("knn_entries.yaml")).unwrap();
+        assert_eq!(MerkleCreateOp.execute(&opts, &mut ctx).status, Status::Ok);
+        assert!(!ws.join("knn_entries.yaml.mref").exists(), "the sidecar of a file that is gone stays");
+        assert!(ws.join("kept.dat.mref").exists(), "a sidecar of a file that is there is kept");
     }
 
     #[test]
