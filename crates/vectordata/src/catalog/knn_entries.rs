@@ -62,7 +62,7 @@ pub const DATASET_CACHE_DIR_ENV: &str = "DATASET_CACHE_DIR";
 /// optional `_defaults.base_url` overrides that when present.
 ///
 /// Each facet is read from a local copy when there is one, as jvector
-/// reads it ([`resolve_facet_path`]): the local directory is the
+/// reads it: the local directory is the
 /// entry's `cache_dir`, else `$DATASET_CACHE_DIR`, else the catalog's
 /// own directory when the catalog is local.
 ///
