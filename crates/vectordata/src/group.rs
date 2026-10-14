@@ -741,6 +741,26 @@ mod tests {
         assert_eq!(group.name.as_deref(), Some("ds"), "the directory keeps its cache name");
     }
 
+    /// **A directory's `knn_entries.yaml` reads the files beside it
+    /// before its `_defaults.base_url`**, as jvector does: with no
+    /// `cache_dir`, the catalog's own directory is where the local
+    /// copies are. A published dataset's directory carries its remote
+    /// home as `base_url` and its files on disk; reading them from the
+    /// remote fetched data that was already there, and failed offline.
+    #[test]
+    fn a_knn_entries_directory_reads_the_files_beside_it_before_its_base_url() {
+        let dir = tempdir().unwrap();
+        let ds = dir.path().join("ds");
+        write_fvec(&ds.join("b.fvec"));
+        let content = "_defaults:\n  base_url: s3://no-such-bucket/ds\nds:\n  base: b.fvec\n  query: b.fvec\n  gt: g.ivec\n";
+        fs::write(ds.join("knn_entries.yaml"), content).unwrap();
+        let group = TestDataGroup::load(ds.to_str().unwrap()).unwrap();
+        let profile = group.profile("default").unwrap();
+        assert_eq!(profile.base_vectors().expect("the local copy opens, with no request").count(), 3);
+        let gt = group.config().profiles["default"].neighbor_indices.as_ref().unwrap();
+        assert_eq!(gt.source(), Some("s3://no-such-bucket/ds/g.ivec"), "a file not beside it is still the remote's");
+    }
+
     /// **A dataset at a server's root has no cache directory name**, so
     /// its facets cache by URL. Naming it with the empty string put every
     /// such dataset in the cache root, where the second server's origin

@@ -51,17 +51,37 @@ fn canonical_facet_name(alias: &str) -> &str {
     }
 }
 
+/// The environment variable jvector reads for where local copies of a
+/// catalog's files live when the catalog does not say.
+pub const DATASET_CACHE_DIR_ENV: &str = "DATASET_CACHE_DIR";
+
 /// Parse a `knn_entries.yaml` document into one [`CatalogEntry`]
 /// per distinct dataset name. Profiles are aggregated under each
 /// entry; facet paths are resolved relative to the catalog
 /// location (the directory containing `knn_entries.yaml`) — the
 /// optional `_defaults.base_url` overrides that when present.
 ///
+/// Each facet is read from a local copy when there is one, as jvector
+/// reads it ([`resolve_facet_path`]): the local directory is the
+/// entry's `cache_dir`, else `$DATASET_CACHE_DIR`, else the catalog's
+/// own directory when the catalog is local.
+///
 /// `catalog_location` should be the directory URL or path that
 /// `knn_entries.yaml` lives in (with or without trailing `/`).
 pub fn parse_knn_entries_yaml(
     content: &str,
     catalog_location: &str,
+) -> Result<Vec<CatalogEntry>, String> {
+    let env_cache_dir = std::env::var(DATASET_CACHE_DIR_ENV).ok().filter(|v| !v.is_empty());
+    parse_knn_entries_yaml_with(content, catalog_location, env_cache_dir.as_deref())
+}
+
+/// [`parse_knn_entries_yaml`] with `$DATASET_CACHE_DIR`'s value given,
+/// so the lookup is a function of its inputs.
+pub(crate) fn parse_knn_entries_yaml_with(
+    content: &str,
+    catalog_location: &str,
+    env_cache_dir: Option<&str>,
 ) -> Result<Vec<CatalogEntry>, String> {
     // Top-level shape: a map of String -> serde_yaml::Value.
     let top: serde_yaml::Mapping = serde_yaml::from_str(content)
@@ -73,6 +93,11 @@ pub fn parse_knn_entries_yaml(
     // and `cache_dir` (where the local copies live, if any).
     let (default_base_url, default_cache_dir) =
         extract_defaults(&top, catalog_location);
+    // A local catalog's own directory is where its files are, unless the
+    // catalog or the environment names another; jvector's last resort.
+    let local_catalog_dir = crate::Location::parse(catalog_location)
+        .ok()
+        .and_then(|l| l.as_path().map(|p| p.to_string_lossy().into_owned()));
 
     // Accumulate by dataset name → (profile name → resolved views).
     // We resolve every facet path eagerly here so the synthesized
@@ -122,7 +147,9 @@ pub fn parse_knn_entries_yaml(
             .get(serde_yaml::Value::String("cache_dir".to_string()))
             .and_then(|v| v.as_str())
             .map(expand_env_vars)
-            .or_else(|| default_cache_dir.clone());
+            .or_else(|| default_cache_dir.clone())
+            .or_else(|| env_cache_dir.map(str::to_string))
+            .or_else(|| local_catalog_dir.clone());
 
         let mut view_map: IndexMap<String, String> = IndexMap::new();
         for (fk, fv) in raw {
@@ -233,7 +260,9 @@ fn extract_defaults(top: &serde_yaml::Mapping, catalog_location: &str) -> (Strin
 /// source. Matches jvector `DataSetLoaderSimpleMFD::loadDataSet`:
 /// if `<cache_dir>/<rel>` exists on disk, that local copy is
 /// used; otherwise the remote URL composed from `<base_url><rel>`
-/// is used. An absolute URL or absolute path in `rel` short-
+/// is used. `cache_dir` is the local directory as jvector chooses it:
+/// the entry's (or `_defaults`') `cache_dir`, else `$DATASET_CACHE_DIR`,
+/// else a local catalog's own directory. An absolute URL or absolute path in `rel` short-
 /// circuits both branches (the catalog entry is naming a specific
 /// location, not a layout-relative file).
 fn resolve_facet_path(rel: &str, cache_dir: Option<&str>, base_url: &str) -> String {
@@ -250,11 +279,14 @@ fn resolve_facet_path(rel: &str, cache_dir: Option<&str>, base_url: &str) -> Str
         if candidate.exists() {
             // Emit the absolute path so the view-layer
             // local-source short-circuit triggers without
-            // re-checking the filesystem.
-            return std::fs::canonicalize(&candidate)
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| candidate.to_string_lossy().to_string());
+            // re-checking the filesystem. Absolute, not canonical: a
+            // file kept as a symlink (a dataset's facet linked to its
+            // source) is named where the catalog names it, as jvector's
+            // `cacheDir.resolve(file)` does, not where the link points.
+            return std::path::absolute(&candidate)
+                .unwrap_or(candidate)
+                .to_string_lossy()
+                .into_owned();
         }
     }
     crate::location::concat_form(base_url, rel)
@@ -416,7 +448,7 @@ sample-ds:
         let default = entries[0].profiles().profile("default").unwrap();
         let bv = &default.views.get("base_vectors").unwrap().source.path;
         // Cached → absolute local path.
-        let expected = std::fs::canonicalize(&cached_file).unwrap();
+        let expected = std::path::absolute(&cached_file).unwrap();
         assert_eq!(bv, expected.to_str().unwrap());
         // Not cached → falls back to remote URL.
         let qv = &default.views.get("query_vectors").unwrap().source.path;
@@ -566,6 +598,49 @@ _defaults:
         let views = &entries[0].profiles().profile("default").unwrap().views;
         assert_eq!(views.get("base_vectors").unwrap().source.path, "https://other-host/base.fvecs");
         assert_eq!(views.get("query_vectors").unwrap().source.path, "s3://my-bucket/parent/profiles/q.fvecs");
+    }
+
+    /// **The local directory for an entry's files is chosen as jvector
+    /// chooses it**: the entry's `cache_dir`, else `$DATASET_CACHE_DIR`,
+    /// else a local catalog's own directory. A file found there is read
+    /// from there; any other comes from `base_url`. A remote catalog has
+    /// no directory on disk to look in.
+    #[test]
+    fn local_copies_are_found_where_jvector_looks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (catalog, env, named) = (tmp.path().join("catalog"), tmp.path().join("env"), tmp.path().join("named"));
+        for (dir, file) in [(&catalog, "beside.fvec"), (&env, "env.fvec"), (&named, "named.fvec")] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+        let local = |dir: &std::path::Path, file: &str| std::path::absolute(dir.join(file)).unwrap().to_string_lossy().into_owned();
+        let source = |yaml: &str, location: &str, env_dir: Option<&str>, facet: &str| {
+            let entries = parse_knn_entries_yaml_with(yaml, location, env_dir).unwrap();
+            entries[0].profiles().profile("default").unwrap().views[facet].source.path.clone()
+        };
+        let facets = "  base: beside.fvec\n  query: env.fvec\n  gt: named.fvec\n";
+        let plain = format!("_defaults:\n  base_url: s3://b/ds\nds:\n{facets}");
+        let at = catalog.to_str().unwrap();
+
+        // The catalog's directory, with nothing else named.
+        assert_eq!(source(&plain, at, None, "base_vectors"), local(&catalog, "beside.fvec"));
+        assert_eq!(source(&plain, at, None, "query_vectors"), "s3://b/ds/env.fvec");
+        // $DATASET_CACHE_DIR outranks the catalog's directory.
+        let env_dir = env.to_str();
+        assert_eq!(source(&plain, at, env_dir, "query_vectors"), local(&env, "env.fvec"));
+        assert_eq!(source(&plain, at, env_dir, "base_vectors"), "s3://b/ds/beside.fvec");
+        // A named cache_dir outranks both.
+        let with_cache = format!("_defaults:\n  base_url: s3://b/ds\n  cache_dir: {}\nds:\n{facets}", named.display());
+        assert_eq!(source(&with_cache, at, env_dir, "neighbor_indices"), local(&named, "named.fvec"));
+        assert_eq!(source(&with_cache, at, env_dir, "query_vectors"), "s3://b/ds/env.fvec");
+        // A file kept as a symlink is named where the catalog names it,
+        // not where the link points.
+        std::os::unix::fs::symlink(env.join("env.fvec"), catalog.join("linked.fvec")).unwrap();
+        let linked = "_defaults:\n  base_url: s3://b/ds\nds:\n  base: linked.fvec\n";
+        assert_eq!(source(linked, at, None, "base_vectors"), local(&catalog, "linked.fvec"));
+        // A remote catalog looks in no local directory of its own.
+        let remote = format!("ds:\n{facets}");
+        assert_eq!(source(&remote, "https://host/ds/", None, "base_vectors"), "https://host/ds/beside.fvec");
     }
 
     /// Garbage YAML errors cleanly.
