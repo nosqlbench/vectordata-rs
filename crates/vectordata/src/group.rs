@@ -716,7 +716,7 @@ mod tests {
         fs::write(other.join("knn_entries.yaml"), content).unwrap();
         let group = TestDataGroup::load(other.to_str().unwrap()).unwrap();
         let base = group.config().profiles["default"].base_vectors.as_ref().unwrap();
-        assert_eq!(base.source(), other.join("a.fvec").to_str());
+        assert_eq!(base.source().map(Path::new), Some(other.join("a.fvec").as_path()));
     }
 
     /// **A directory's `knn_entries.yaml` reads its facets where its
