@@ -1471,6 +1471,31 @@ fn crossing_view(
     }
 }
 
+/// A child's facets after inheritance, in the order every projection
+/// lists them:
+/// 1. the facets every profile shares with the default (its
+///    non-per-profile facets), in the default's order;
+/// 2. the child's own declarations, in its order;
+/// 3. what its parent adds, in the parent's order.
+///
+/// This is the order datasets have always been published in, so a
+/// regenerated projection only differs where its content does.
+fn inherited_order(
+    shared_with_default: &[String],
+    mut declared: IndexMap<String, DSView>,
+    mut inherited: IndexMap<String, DSView>,
+) -> IndexMap<String, DSView> {
+    let mut out = IndexMap::with_capacity(declared.len() + inherited.len());
+    for facet in shared_with_default {
+        if let Some(view) = declared.shift_remove(facet).or_else(|| inherited.shift_remove(facet)) {
+            out.insert(facet.clone(), view);
+        }
+    }
+    out.extend(declared);
+    out.extend(inherited);
+    out
+}
+
 /// `view` cut to its first `count` rows. A series is windowed in facet
 /// ordinals through its own field (SH-67); a single file through its
 /// source, replacing any window it had.
@@ -1503,6 +1528,12 @@ impl DSProfileGroup {
     /// members with what they declared, as naming no parent would, and
     /// `veks check` names it.
     ///
+    /// The child's facets come out in [`inherited_order`]: what every
+    /// profile shares with the default first, then its own, then what a
+    /// nearer parent adds. Every projection (`dataset.json`, catalogs,
+    /// docs) lists facets in this order, so it is part of what they
+    /// publish.
+    ///
     /// A profile naming a parent that is not here yet, while sized
     /// profiles are still waiting on variables to be expanded, waits
     /// too: its parent may be one of them, and falling back to
@@ -1519,16 +1550,23 @@ impl DSProfileGroup {
             }
             let Some(parent_name) = self.parent_name(&name) else { continue };
             let Some(parent) = self.profiles.get(&parent_name).cloned() else { continue };
+            let shared_with_default: Vec<String> = self
+                .profiles
+                .get("default")
+                .map(|d| d.views.keys().filter(|k| facet_role(k) != FacetRole::PerProfile).cloned().collect())
+                .unwrap_or_default();
             let Some(child) = self.profiles.get_mut(&name) else { continue };
             let size_axis = child.base_count.is_some() && child.base_count != parent.base_count;
+            let mut inherited = IndexMap::new();
             for (facet, parent_view) in &parent.views {
                 if child.views.contains_key(facet) {
                     continue;
                 }
                 if let Some(view) = crossing_view(facet, parent_view, child.base_count, size_axis) {
-                    child.views.insert(facet.clone(), view);
+                    inherited.insert(facet.clone(), view);
                 }
             }
+            child.views = inherited_order(&shared_with_default, std::mem::take(&mut child.views), inherited);
             if !size_axis && child.base_count.is_none() {
                 child.base_count = parent.base_count;
             }
@@ -2409,6 +2447,44 @@ mod tests {
         assert!(!g.is_layer("default"));
         assert_eq!(g.parent_name("10m-mixed").as_deref(), Some("10m"));
         assert_eq!(g.parent_name("part"), None);
+    }
+
+    /// **Inheritance lists facets in the order datasets are published
+    /// in**: what a profile shares with the default first, in the
+    /// default's order; then its own; then what a nearer parent adds.
+    /// Every projection (`dataset.json`, catalogs, docs) follows this
+    /// order, so a change to it rewrites every published dataset's
+    /// files without changing their content. The shape is a sized
+    /// unfiltered rung on the default, with a filtered set on the rung.
+    #[test]
+    fn inheritance_lists_facets_in_the_published_order() {
+        let g: DSProfileGroup = serde_yaml::from_str(
+            "default:\n  base_vectors: b.fvec\n  query_vectors: q.fvec\n  metadata_content: m.slab\n  metadata_predicates: p.slab\n  \
+             neighbor_indices: profiles/default/g.ivec\n  metadata_results: profiles/default/r.slab\n\
+             10-unfiltered:\n  inherits: default\n  base_count: 10\n  base_vectors: b.fvec[0..10)\n  metadata_content: m.slab[0..10)\n  \
+             neighbor_indices: profiles/10/g.ivec\n\
+             10-set:\n  inherits: 10-unfiltered\n  base_count: 10\n  metadata_predicates: profiles/10-set/p.slab\n  \
+             metadata_results: profiles/10-set/r.slab\n",
+        )
+        .unwrap();
+        let order = |name: &str| g.profiles[name].views.keys().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            order("10-unfiltered"),
+            ["base_vectors", "query_vectors", "metadata_content", "metadata_predicates", "neighbor_indices"],
+            "the default's shared facets in its order, then the rung's own; none of the default's per-profile outputs",
+        );
+        assert_eq!(
+            order("10-set"),
+            [
+                "base_vectors",
+                "query_vectors",
+                "metadata_content",
+                "metadata_predicates",
+                "metadata_results",
+                "neighbor_indices",
+            ],
+            "the set's own after the shared facets, then what its rung adds",
+        );
     }
 
     /// **A generated rung of a layered dataset splits into its layer
