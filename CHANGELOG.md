@@ -1,6 +1,9 @@
 # Changelog
 
-## 3.0.1 — unreleased
+## 3.0.1 — 2026-10-15
+
+`vectordata` and the `vectordata-rs` workspace move to 3.0.1. The API
+is unchanged.
 
 ### Fixes
 

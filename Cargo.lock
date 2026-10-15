@@ -6275,7 +6275,7 @@ dependencies = [
 
 [[package]]
 name = "vectordata"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -6320,7 +6320,7 @@ dependencies = [
 
 [[package]]
 name = "vectordata-rs"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "slabtastic",
  "vecd",
