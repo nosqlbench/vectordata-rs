@@ -15,37 +15,13 @@
 - **`veks run --explain-staleness`** now reports the finalize steps too,
   after the compute steps, each judged as a run would judge it.
 
-## 3.0.1 — 2026-10-15
+## 3.0.0 — 2026-10-15
 
-`vectordata` and the `vectordata-rs` workspace move to 3.0.1. The API
-is unchanged.
-
-### Fixes
-
-- **Configuration files are replaced whole, never rewritten in place.**
-  `catalogs.yaml`, `settings.yaml` and `credentials.toml` were written
-  by truncating the file and then writing it, so another process reading
-  one in between, such as a second `vectordata` command while the
-  explorer edits catalogs, could find it empty. Each is now written to a
-  temporary file beside it and renamed over it, so a reader sees the old
-  file or the new one.
-  - A symlinked configuration file stays a symlink; its target is
-    replaced, as before.
-  - A configuration file keeps its permissions.
-  - `credentials.toml` is owner-only (`0600`) from the moment it is
-    created, before any token is written to it. Before, it was made
-    owner-only after the tokens were written.
-- The writes that already used a temporary file and a rename (publish's
-  local files and objects, backup restores) now share one
-  implementation, which also removes its temporary file when the rename
-  fails.
-
-## 3.0.0 — 2026-10-14
-
-`vectordata`, `veks` and the `vectordata-rs` workspace move from 2.5.1
-to 3.0.0, and `veks-core` and `veks-pipeline`, which re-export
-`vectordata` types, from 2.5.0 to 3.0.0. `vecd` moves to 2.6.0 for its
-`vectordata` 3 dependency; its own API is unchanged.
+Every crate in the workspace moves to 3.0.0 and is released with the
+others at one version from now on. The library API changes are in
+`vectordata`, and in `veks-core` and `veks-pipeline`, which re-export
+its types; the other crates move for the lockstep version and their own
+APIs are unchanged.
 
 The release breaks the library API: code built against 2.x needs the
 changes under [Upgrading](#upgrading-from-25). A 2.x pin
@@ -69,6 +45,26 @@ changes under [Upgrading](#upgrading-from-25). A 2.x pin
   pipeline's `catalog generate` step now write the same files.
 - **`knn_entries.yaml` states only what it can state exactly** (see
   below).
+
+### Fixes
+
+- **Configuration files are replaced whole, never rewritten in place.**
+  `catalogs.yaml`, `settings.yaml` and `credentials.toml` were written
+  by truncating the file and then writing it, so another process reading
+  one in between, such as a second `vectordata` command while the
+  explorer edits catalogs, could find it empty. Each is now written to a
+  temporary file beside it and renamed over it, so a reader sees the old
+  file or the new one.
+  - A symlinked configuration file stays a symlink; its target is
+    replaced, as before.
+  - A configuration file keeps its permissions.
+  - `credentials.toml` is owner-only (`0600`) from the moment it is
+    created, before any token is written to it. Before, it was made
+    owner-only after the tokens were written.
+- The writes that already used a temporary file and a rename (publish's
+  local files and objects, backup restores) now share one
+  implementation, which also removes its temporary file when the rename
+  fails.
 
 ### Upgrading from 2.5
 
