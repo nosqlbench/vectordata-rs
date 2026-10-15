@@ -1933,3 +1933,79 @@ fn e2e_rerun_cascades_to_dependents() {
     assert!(!success, "an unknown step was accepted:\n{}", output);
     assert!(output.contains("names no step"), "{}", output);
 }
+
+/// **A new binary re-runs the finalize steps and nothing else.** Under
+/// the default `config-only` selector a compute step built by another
+/// version stays fresh, but a finalize step's outputs are projections
+/// a fix to the generators changes, so it runs again. Before this, a
+/// dataset kept the catalogs and docs of whatever veks first wrote
+/// them, through every later run.
+#[test]
+fn e2e_a_new_binary_reruns_the_finalize_steps_only() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
+    let out = tmp.path().join("dataset");
+    let mut args = default_args("e2e-new-binary", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    veks::prepare::import::run(args);
+    let dataset_yaml = out.join("dataset.yaml");
+    let (success, output) = run_pipeline(&dataset_yaml);
+    assert!(success, "pipeline failed:\n{}", output);
+    let knn = out.join("profiles/default/neighbor_indices.ivecs");
+    let catalog = out.join("catalog.json");
+    let mtime = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+    let (knn_built, catalog_built) = (mtime(&knn), mtime(&catalog));
+
+    // Every step as recorded by a veks of another major version. A node
+    // is stored under the hash of its content, so a node from another
+    // version sits under another address: each address is renamed
+    // throughout the log, or the current node would find its own
+    // address taken by the edited one and be compared with itself.
+    let log = out.join(".cache/.upstream.progress.yaml");
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let addresses: Vec<String> = parsed["provenance"]
+        .as_mapping()
+        .expect("the progress log holds a provenance graph")
+        .keys()
+        .map(|k| k.as_str().unwrap().to_string())
+        .collect();
+    for address in &addresses {
+        text = text.replace(address.as_str(), &format!("{address}-older"));
+    }
+    let mut rewritten = 0;
+    let older: String = text
+        .lines()
+        .map(|line| match line.split_once("binary_version_major:") {
+            Some((indent, _)) => {
+                rewritten += 1;
+                format!("{indent}binary_version_major: 0\n")
+            }
+            None => format!("{line}\n"),
+        })
+        .collect();
+    assert!(rewritten > 0, "the progress log records no binary version:\n{text}");
+    std::fs::write(&log, older).unwrap();
+
+    // The staleness report judges each step as a run would.
+    let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &["--explain-staleness"]);
+    assert!(success, "{}", output);
+    assert!(output.contains("compute-knn — fresh"), "{}", output);
+    assert!(output.contains("generate-catalog — STALE"), "{}", output);
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &[]);
+    assert!(success, "{}", output);
+    assert!(output.contains("compute-knn — fresh, skipping"), "{}", output);
+    assert!(output.contains("generate-catalog — stale: provenance changed"), "{}", output);
+    assert!(output.contains("generate-dataset-json — stale: provenance changed"), "{}", output);
+    assert_eq!(mtime(&knn), knn_built, "a compute step re-ran for a new binary");
+    assert!(mtime(&catalog) > catalog_built, "the catalog was not regenerated");
+
+    // Recorded by this binary now: everything is fresh again.
+    let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &[]);
+    assert!(success, "{}", output);
+    assert!(!output.contains("— stale:"), "{}", output);
+}

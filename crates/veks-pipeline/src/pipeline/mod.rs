@@ -299,6 +299,10 @@ pub struct RunArgs {
     /// Use `strict` when a build genuinely changes what a step
     /// produces — a kernel fix, a format change — and `version-aware`
     /// to re-run only across major versions.
+    ///
+    /// Finalize steps (dataset.json, the catalogs, the docs, the merkle
+    /// trees) also count the binary under every selector: they are
+    /// cheap, and a new build is how a fix to them reaches a dataset.
     #[arg(long, default_value = "config-only", value_name = "SELECTOR")]
     pub provenance: String,
 
@@ -994,9 +998,14 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
 
     // Explain-staleness mode: walk every step under the active
     // selector, print fresh/stale + diff lines, and exit without
-    // executing. Useful for "why is this re-running?" diagnosis.
+    // executing. Useful for "why is this re-running?" diagnosis. The
+    // finalize steps follow the compute steps, as they run.
     if args.explain_staleness {
-        explain_staleness(&pipeline_dag.steps, &registry, &ctx, provenance_selector_parsed);
+        let finalize_steps: Vec<_> = steps.iter().filter(|s| s.finalize).cloned().collect();
+        let finalize_dag = dag::build_dag_partial(&finalize_steps)
+            .map_err(|e| format!("DAG error for finalization steps: {}", e))?;
+        let walked: Vec<_> = pipeline_dag.steps.iter().chain(&finalize_dag.steps).cloned().collect();
+        explain_staleness(&walked, &registry, &ctx, provenance_selector_parsed);
         return Ok(());
     }
 
@@ -1472,6 +1481,7 @@ fn explain_staleness(
             }
             Some(stored) => {
                 let keys = graph.shared_upstream_keys(&current, stored);
+                let selector = selector.for_step(step.def.finalize);
                 let stored_hash = graph.hash_restricted(stored, selector, &keys);
                 if stored_hash.is_some() && stored_hash == graph.hash_restricted(&current, selector, &keys) {
                     println!("  {} {} — fresh", term::ok("✓"), step.id);

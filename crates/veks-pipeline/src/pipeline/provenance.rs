@@ -821,12 +821,20 @@ impl ProvenanceFlags {
             | Self::OPTIONS.0 | Self::UPSTREAM.0
     );
 
+    /// The components naming the binary: its version, the commit it
+    /// was built from, and whether that tree was dirty.
+    pub const BUILD: Self = Self(
+        Self::VERSION_MAJOR.0 | Self::VERSION_MINOR.0 | Self::VERSION_PATCH.0
+            | Self::GIT_HASH.0 | Self::DIRTY_FLAG.0
+    );
+
     /// What a run uses when nothing asks for anything else.
     ///
     /// `CONFIG_ONLY`: a step is stale when its own options or an
     /// upstream changed, not merely because the binary did. See the
     /// `--provenance` flag for why this is the default rather than
-    /// [`Self::STRICT`].
+    /// [`Self::STRICT`]. A finalize step also counts the binary, under
+    /// any selector: see [`Self::for_step`].
     pub const DEFAULT: Self = Self::CONFIG_ONLY;
 
     /// The name of [`Self::DEFAULT`], for the CLI and for the callers
@@ -842,6 +850,20 @@ impl ProvenanceFlags {
 
     /// The raw bitmask.
     pub fn bits(&self) -> u32 { self.0 }
+
+    /// The selector a step is judged by when the run uses this one.
+    ///
+    /// A finalize step also counts the binary ([`Self::BUILD`]). Its
+    /// outputs — `dataset.json`, the catalogs, the docs, the merkle
+    /// trees — are projections of the definition, so a fix to the code
+    /// that writes them changes them with no option or upstream
+    /// changing. Judged without the binary, a dataset would keep the
+    /// old projections through every later run. Finalize steps are
+    /// cheap, so re-running them on a new binary costs little; compute
+    /// steps keep the run's selector.
+    pub fn for_step(self, finalize: bool) -> Self {
+        if finalize { Self(self.0 | Self::BUILD.0) } else { self }
+    }
 
     /// Parse a comma-separated component list (case-insensitive,
     /// hyphens or underscores accepted) or one of the named presets.

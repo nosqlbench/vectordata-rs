@@ -225,7 +225,7 @@ pub fn run_steps(
             &inputs,
             &cmd_build_version,
         );
-        let selector = ctx.provenance_selector;
+        let selector = ctx.provenance_selector.for_step(step.def.finalize);
 
         // 4. Check freshness: progress log + provenance under selector.
         //    The provenance check subsumes the v4 fingerprint cascade —

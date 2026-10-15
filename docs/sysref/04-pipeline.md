@@ -162,6 +162,16 @@ Tab-completion suggests presets up front; once a comma is typed it
 switches to suggesting individual components and excludes any already
 chosen.
 
+**Finalize steps also count the binary**, under every selector: the
+selector a finalize step is judged by is the run's selector plus every
+binary component (`ProvenanceFlags::for_step`). Their outputs —
+`dataset.json`, the catalogs, the docs, the merkle trees — are
+projections of `dataset.yaml`, and a fix to the code that writes them
+changes them with no option or upstream changing. Judged by
+`config-only` alone, a dataset would keep the projections of whatever
+veks first wrote them. They are cheap to re-run, so a new binary
+re-runs the finalize pass and leaves every compute step as it was.
+
 #### Why the full node is stored
 
 Storing the full node (rather than a single opaque hash) means a later
@@ -236,8 +246,9 @@ starts from a known-correct state.
   changed what one step computes without changing any option: the
   config-only selector cannot see it, and `strict` would re-run the
   whole ladder, ground truth included.
-- **`veks run --explain-staleness`** — walk every step under the active
-  selector and print `fresh` / `STALE` plus per-component diff lines
+- **`veks run --explain-staleness`** — walk every step, the finalize
+  steps after the compute steps, under the selector each is judged by
+  and print `fresh` / `STALE` plus per-component diff lines
   (`binary_version_major: 1 → 2`, `option 'k': "100" → "200"`,
   `upstream 'extract' provenance changed`, …) without executing
   anything. Upstream maps in the walk use the in-flight currents so the

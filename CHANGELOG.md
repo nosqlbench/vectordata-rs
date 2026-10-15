@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **A new veks re-runs a dataset's finalize steps.** Under the default
+  `--provenance config-only`, a step built by another veks counted as
+  fresh. That is right for compute steps, and wrong for the finalize
+  steps (`dataset.json`, the catalogs, the docs, the merkle trees):
+  they project `dataset.yaml`, so a fix to the code that writes them
+  never reached a dataset whose projections an older veks had written.
+  Finalize steps now also count the binary under every selector; compute
+  steps keep the run's selector.
+- **`veks run --explain-staleness`** now reports the finalize steps too,
+  after the compute steps, each judged as a run would judge it.
+
 ## 3.0.1 — 2026-10-15
 
 `vectordata` and the `vectordata-rs` workspace move to 3.0.1. The API
