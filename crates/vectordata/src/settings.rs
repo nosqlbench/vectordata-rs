@@ -537,7 +537,7 @@ pub fn remove_setting(key: &str) -> Result<(), String> {
         .collect();
     let mut out = kept.join("\n");
     if !out.is_empty() { out.push('\n'); }
-    std::fs::write(&path, out).map_err(|e| e.to_string())
+    crate::atomic_file::replace_config(&path, out.as_bytes(), false).map_err(|e| e.to_string())
 }
 
 /// Write (or replace) one top-level scalar in `settings.yaml`,
@@ -550,7 +550,7 @@ pub fn write_setting(key: &str, value: &str) -> Result<PathBuf, String> {
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let new_content = rewrite_setting_line(&existing, key, value);
-    std::fs::write(&path, new_content).map_err(|e| e.to_string())?;
+    crate::atomic_file::replace_config(&path, new_content.as_bytes(), false).map_err(|e| e.to_string())?;
     Ok(path)
 }
 
@@ -803,7 +803,7 @@ pub fn write_cache_dir_at(
             cache_dir.display(),
         )
     };
-    std::fs::write(settings, content)?;
+    crate::atomic_file::replace_config(settings, content.as_bytes(), false)?;
     Ok(WriteCacheOutcome::Wrote)
 }
 
@@ -851,7 +851,7 @@ pub fn add_trust_self_signed_at(settings: &Path, origin: &str) -> Result<PathBuf
         if let Some(parent) = settings.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::write(settings, updated).map_err(|e| e.to_string())?;
+        crate::atomic_file::replace_config(settings, updated.as_bytes(), false).map_err(|e| e.to_string())?;
     }
     Ok(settings.to_path_buf())
 }
@@ -893,6 +893,29 @@ fn add_yaml_list_item(content: &str, key: &str, item: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// **Every `settings.yaml` edit replaces the file whole**: a reader
+    /// that already has it open keeps reading the old file, never a
+    /// truncated one.
+    #[cfg(unix)]
+    #[test]
+    fn settings_yaml_edits_replace_the_file_whole() {
+        use std::io::Read;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.yaml");
+        std::fs::write(&path, "cache_dir: /old\n").unwrap();
+        let reads_old = |edit: &dyn Fn(&std::path::Path)| {
+            let before = std::fs::read_to_string(&path).unwrap();
+            let mut reader = std::fs::File::open(&path).unwrap();
+            edit(&path);
+            let mut seen = String::new();
+            reader.read_to_string(&mut seen).unwrap();
+            assert_eq!(seen, before, "the open file was rewritten in place");
+            assert_ne!(std::fs::read_to_string(&path).unwrap(), before, "the edit took effect");
+        };
+        reads_old(&|p| { super::add_trust_self_signed_at(p, "https://h:8443").unwrap(); });
+        let new_cache = tmp.path().join("new-cache");
+        reads_old(&|p| { super::write_cache_dir_at(p, &new_cache, true).unwrap(); });
+    }
     /// A process's cache directory is chosen once: the first choice is
     /// installed, repeating it changes nothing, and any other choice —
     /// a different path, or one away from a configured cache that

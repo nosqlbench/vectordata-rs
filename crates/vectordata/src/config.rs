@@ -385,12 +385,16 @@ fn classify_catalogs(content: &str) -> CatalogsFormat {
 /// every comment / blank line. Returns the number of entries converted
 /// (0 if already map/empty). Refuses a mixed file.
 pub fn convert_catalogs_to_map() -> Result<usize, String> {
-    let path = catalogs_path();
-    let content = std::fs::read_to_string(&path)
+    convert_catalogs_to_map_at(&catalogs_path())
+}
+
+/// [`convert_catalogs_to_map`] on the `catalogs.yaml` at `path`.
+fn convert_catalogs_to_map_at(path: &Path) -> Result<usize, String> {
+    let content = std::fs::read_to_string(path)
         .map_err(|e| format!("reading {}: {e}", path.display()))?;
     let (new_content, converted) = list_to_map_text(&content)?;
     if converted > 0 {
-        std::fs::write(&path, new_content)
+        crate::atomic_file::replace_config(path, new_content.as_bytes(), false)
             .map_err(|e| format!("writing {}: {e}", path.display()))?;
     }
     Ok(converted)
@@ -467,31 +471,39 @@ fn derive_catalog_name(location: &str, taken: &[String]) -> String {
 }
 
 fn append_catalog_entry(name: &str, source: &str) -> Result<PathBuf, String> {
-    let path = catalogs_path();
+    append_catalog_entry_at(&catalogs_path(), name, source)
+}
+
+/// [`append_catalog_entry`] on the `catalogs.yaml` at `path`.
+fn append_catalog_entry_at(path: &Path, name: &str, source: &str) -> Result<PathBuf, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
     let content = if path.is_file() {
-        std::fs::read_to_string(&path)
+        std::fs::read_to_string(path)
             .map_err(|e| format!("reading {}: {e}", path.display()))?
     } else {
         String::new()
     };
     let new_content = append_entry_text(&content, name, source)?;
-    std::fs::write(&path, new_content)
+    crate::atomic_file::replace_config(path, new_content.as_bytes(), false)
         .map_err(|e| format!("writing {}: {e}", path.display()))?;
-    Ok(path)
+    Ok(path.to_path_buf())
 }
 
 fn remove_catalog_entry(source: &str) -> Result<bool, String> {
-    let path = catalogs_path();
+    remove_catalog_entry_at(&catalogs_path(), source)
+}
+
+/// [`remove_catalog_entry`] on the `catalogs.yaml` at `path`.
+fn remove_catalog_entry_at(path: &Path, source: &str) -> Result<bool, String> {
     if !path.is_file() { return Ok(false); }
-    let content = std::fs::read_to_string(&path)
+    let content = std::fs::read_to_string(path)
         .map_err(|e| format!("reading {}: {e}", path.display()))?;
     let (new_content, removed) = remove_entry_text(&content, source);
     if removed {
-        std::fs::write(&path, new_content)
+        crate::atomic_file::replace_config(path, new_content.as_bytes(), false)
             .map_err(|e| format!("writing {}: {e}", path.display()))?;
     }
     Ok(removed)
@@ -917,6 +929,31 @@ fn dir_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every `catalogs.yaml` edit replaces the file whole**: a reader
+    /// that already has it open keeps reading the old file, never a
+    /// truncated one. The explorer's convert-then-add wrote the file in
+    /// place twice, and a reader between the two found it empty.
+    #[cfg(unix)]
+    #[test]
+    fn catalogs_yaml_edits_replace_the_file_whole() {
+        use std::io::Read;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("catalogs.yaml");
+        let reads_old = |edit: &dyn Fn(&Path)| {
+            let before = std::fs::read_to_string(&path).unwrap();
+            let mut reader = std::fs::File::open(&path).unwrap();
+            edit(&path);
+            let mut seen = String::new();
+            reader.read_to_string(&mut seen).unwrap();
+            assert_eq!(seen, before, "the open file was rewritten in place");
+            assert_ne!(std::fs::read_to_string(&path).unwrap(), before, "the edit took effect");
+        };
+        std::fs::write(&path, "- /a/catalog\n").unwrap();
+        reads_old(&|p| assert_eq!(convert_catalogs_to_map_at(p).unwrap(), 1));
+        reads_old(&|p| { append_catalog_entry_at(p, "b", "/b/catalog").unwrap(); });
+        reads_old(&|p| assert!(remove_catalog_entry_at(p, "/b/catalog").unwrap()));
+    }
 
     /// `config get offline` names the environment variable only when it
     /// is what decided: a recognized value, either way; an empty or

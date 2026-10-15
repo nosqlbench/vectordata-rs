@@ -108,6 +108,8 @@ impl Store {
     }
 
     /// Persist the store (creating the config dir `0700`, the file `0600`).
+    /// The file is replaced whole, and is owner-only before any token is
+    /// written to it.
     pub fn save(&self) -> std::io::Result<()> {
         let dir = config_dir();
         std::fs::create_dir_all(&dir)?;
@@ -115,9 +117,7 @@ impl Store {
         let path = credentials_path();
         let text = toml::to_string_pretty(self)
             .map_err(std::io::Error::other)?;
-        std::fs::write(&path, text)?;
-        set_mode(&path, 0o600);
-        Ok(())
+        crate::atomic_file::replace_config(&path, text.as_bytes(), true)
     }
 
     /// The entry stored under exactly this key (a [`credential_key`]),

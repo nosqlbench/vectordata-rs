@@ -4,6 +4,19 @@
 
 ### Fixes
 
+- **Configuration files are replaced whole, never rewritten in place.**
+  `catalogs.yaml`, `settings.yaml` and `credentials.toml` were written
+  by truncating the file and then writing it, so another process reading
+  one in between, such as a second `vectordata` command while the
+  explorer edits catalogs, could find it empty. Each is now written to a
+  temporary file beside it and renamed over it, so a reader sees the old
+  file or the new one.
+  - A symlinked configuration file stays a symlink; its target is
+    replaced, as before.
+  - A configuration file keeps its permissions.
+  - `credentials.toml` is owner-only (`0600`) from the moment it is
+    created, before any token is written to it. Before, it was made
+    owner-only after the tokens were written.
 - The writes that already used a temporary file and a rename (publish's
   local files and objects, backup restores) now share one
   implementation, which also removes its temporary file when the rename
