@@ -5,6 +5,11 @@
 t = "test --release"
 b = "build --release"
 ta = "test --workspace --all-features"
+# Version every crate together and publish them: `cargo ws-release patch`
+# (or minor, major, `custom 3.1.0`); add `--dry-run` to rehearse it.
+# --force '*' versions crates with no changes, --all includes the private
+# ones, and --exact pins the internal dependencies with `=`.
+ws-release = ["ws", "publish", "--force", "*", "--all", "--exact", "--allow-branch", "main"]
 
 # Direct all test temp files to target/test-tmp/ instead of /tmp.
 [env]
