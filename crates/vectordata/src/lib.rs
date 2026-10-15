@@ -228,6 +228,9 @@ pub(crate) mod chunked_http;
 /// `storage::Storage` — they get reader handles whose transport is
 /// chosen for them.
 pub(crate) mod storage;
+/// Internal. Replace a file so a reader sees the old file or the new
+/// one, never a truncated one.
+pub(crate) mod atomic_file;
 pub mod settings;
 pub mod filters;
 pub mod mounts;

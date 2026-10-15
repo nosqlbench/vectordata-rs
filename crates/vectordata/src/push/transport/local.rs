@@ -135,22 +135,8 @@ fn io(e: std::io::Error) -> PushError {
     PushError::Other(e.to_string())
 }
 
-/// Write `data` to `dst` crash-atomically: stage in a sibling temp file,
-/// then `rename` over the target (atomic on the same filesystem). A crash
-/// mid-write leaves either the old file or the new one — never a torn
-/// half-written object.
+/// Write `data` to `dst` crash-atomically: a crash mid-write leaves
+/// either the old file or the new one, never a torn object.
 fn atomic_write(dst: &Path, data: &[u8]) -> Result<(), PushError> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(io)?;
-    }
-    let file_name = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dst.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, data).map_err(io)?;
-    match std::fs::rename(&tmp, dst) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(io(e))
-        }
-    }
+    crate::atomic_file::replace(dst, data).map_err(io)
 }

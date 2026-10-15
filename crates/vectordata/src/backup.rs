@@ -137,13 +137,13 @@ pub fn run_backup(
                     continue;
                 }
                 let bytes = endpoint::get_object(url, ns, tag, key, token)?;
-                atomic_write(&blob_path, &bytes).map_err(|e| e.to_string())?;
+                crate::atomic_file::replace(&blob_path, &bytes).map_err(|e| e.to_string())?;
                 stats.blobs_fetched += 1;
                 stats.bytes += bytes.len() as u64;
             }
             // The manifest is written LAST — its presence marks the version
             // complete, which is what makes an interrupted backup resumable.
-            atomic_write(&manifest_path, &serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?)
+            crate::atomic_file::replace(&manifest_path, &serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
             stats.versions += 1;
         }
@@ -252,16 +252,6 @@ fn find_versions_files(ns_root: &Path) -> Vec<PathBuf> {
     }
     walk(ns_root, &mut out);
     out
-}
-
-/// Atomic temp+rename write.
-fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
 }
 
 fn tempdir_under(root: &Path) -> Result<PathBuf, String> {

@@ -482,7 +482,7 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
             //       content — a genuine conflicting update. Refuse.
             if remote_committed.stable_sums() == Some(&sums_digests) {
                 if !opts.dry_run {
-                    atomic_write_local(
+                    crate::atomic_file::replace(
                         &root.join(pushlog::PUSHLOG_FILE),
                         remote_committed.render().as_bytes(),
                     )
@@ -811,10 +811,10 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     // 15. Mirror into the local pushlog; persist a staged binding. Both
     //     are written crash-atomically (temp + rename) so an interrupted
     //     mirror can't leave a torn local pushlog.
-    atomic_write_local(&root.join(pushlog::PUSHLOG_FILE), log.render().as_bytes())
+    crate::atomic_file::replace(&root.join(pushlog::PUSHLOG_FILE), log.render().as_bytes())
         .map_err(Failure::op)?;
     if matches!(bind, Binding::Staged(_)) {
-        atomic_write_local(
+        crate::atomic_file::replace(
             &root.join(binding::PUBLISH_FILE),
             format!("{}\n", endpoint.url).as_bytes(),
         )
@@ -1129,14 +1129,6 @@ fn changed_since(
         }
     }
     Ok(None)
-}
-
-/// Crash-atomic write of a local file (temp + rename on the same dir).
-fn atomic_write_local(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
 }
 
 fn dir_join(root: &Path, dir_rel: &str) -> PathBuf {

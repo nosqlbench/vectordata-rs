@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.0.1 — unreleased
+
+### Fixes
+
+- The writes that already used a temporary file and a rename (publish's
+  local files and objects, backup restores) now share one
+  implementation, which also removes its temporary file when the rename
+  fails.
+
 ## 3.0.0 — 2026-10-14
 
 `vectordata`, `veks` and the `vectordata-rs` workspace move from 2.5.1
