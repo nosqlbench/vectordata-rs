@@ -2008,4 +2008,20 @@ fn e2e_a_new_binary_reruns_the_finalize_steps_only() {
     let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &[]);
     assert!(success, "{}", output);
     assert!(!output.contains("— stale:"), "{}", output);
+
+    // The report agrees. The compute steps still hold the older
+    // version's records, which a run keeps, so a finalize step names
+    // them as upstreams by those records, not by the nodes this binary
+    // would record were they to re-run.
+    // It only reads: the run log and the variables are as the run left
+    // them, so asking changes nothing a publish would carry.
+    let runlog = out.join("runlog.jsonl");
+    let variables = out.join("variables.yaml");
+    let (runlog_len, variables_mtime) = (std::fs::metadata(&runlog).unwrap().len(), mtime(&variables));
+    let (success, output) = run_pipeline_with(&dataset_yaml, "basic", &["--explain-staleness"]);
+    assert!(success, "{}", output);
+    assert!(!output.contains("— STALE"), "{}", output);
+    assert!(output.contains(" 0 stale"), "{}", output);
+    assert_eq!(std::fs::metadata(&runlog).unwrap().len(), runlog_len, "the report appended to runlog.jsonl");
+    assert_eq!(mtime(&variables), variables_mtime, "the report rewrote variables.yaml");
 }

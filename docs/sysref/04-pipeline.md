@@ -251,8 +251,12 @@ starts from a known-correct state.
   and print `fresh` / `STALE` plus per-component diff lines
   (`binary_version_major: 1 → 2`, `option 'k': "100" → "200"`,
   `upstream 'extract' provenance changed`, …) without executing
-  anything. Upstream maps in the walk use the in-flight currents so the
-  cascade reflects the planned re-run order, not a misleading snapshot.
+  anything. Each step names its upstreams as a run would: a stale
+  upstream by the node it would record on re-running, a fresh one by the
+  record it keeps, so the report calls a step stale exactly when the run
+  would. The diff lines list every component that differs, including
+  ones the step's selector does not count. The report writes nothing:
+  no run log, no variables.
 - **`--clean`** removes all generated artifacts and forces
   re-execution from scratch.
 

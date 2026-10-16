@@ -846,7 +846,10 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
 
     governor.print_summary();
 
-    // Persistent run log: plain text in .cache/run.log, JSONL in workspace/runlog.jsonl
+    // Persistent run log: plain text in .cache/run.log, JSONL in workspace/runlog.jsonl.
+    // A staleness report only reads: it writes neither log nor variables,
+    // so asking why a step would run changes nothing a publish carries.
+    let read_only = args.explain_staleness;
     let run_log_path = cache_dir.join("run.log");
     let run_jsonl_path = workspace.join("runlog.jsonl");
 
@@ -904,7 +907,11 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
             };
             // Install global logger and attach log file to UiHandle for
             // lock-step file writes from ctx.ui.log().
-            let log_writers = veks_core::ui::install_logger(handle.sink_arc(), Some(&run_log_path), Some(&run_jsonl_path));
+            let log_writers = if read_only {
+                veks_core::ui::install_logger(handle.sink_arc(), None, None)
+            } else {
+                veks_core::ui::install_logger(handle.sink_arc(), Some(&run_log_path), Some(&run_jsonl_path))
+            };
             handle.set_log_writers(log_writers);
             handle
         },
@@ -918,10 +925,14 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         concat!(env!("CARGO_PKG_VERSION"), "+", env!("VEKS_BUILD_HASH"), ".", env!("VEKS_BUILD_NUMBER"))));
 
     // Persist dataset-level metadata as variables so stats.csv can use them
-    let _ = variables::set_and_save(&ctx.workspace, "dataset_name", &ctx.dataset_name);
+    if !read_only {
+        let _ = variables::set_and_save(&ctx.workspace, "dataset_name", &ctx.dataset_name);
+    }
     ctx.defaults.insert("dataset_name".into(), ctx.dataset_name.clone());
     if let Some(df) = config.distance_function() {
-        let _ = variables::set_and_save(&ctx.workspace, "distance_function", df);
+        if !read_only {
+            let _ = variables::set_and_save(&ctx.workspace, "distance_function", df);
+        }
         ctx.defaults.insert("distance_function".into(), df.to_string());
     }
 
@@ -1392,11 +1403,11 @@ fn explain_staleness(
     );
     println!();
 
-    // Current nodes are built into a copy of the log's graph, so an
-    // upstream's *current* node is in scope when computing a
-    // downstream's — letting the user see what would happen if every
-    // upstream re-ran exactly as currently configured — without the
-    // walk touching the log itself.
+    // Current nodes are built into a copy of the log's graph, so the
+    // walk never touches the log itself. Each step names its upstreams
+    // as the run would: a stale upstream by the node it would record on
+    // re-running, a fresh one by the node it already recorded, which a
+    // run keeps.
     let mut graph = ctx.progress.provenance.clone();
     let generated_docs = runner::step_outputs(steps, registry, ctx);
     let mut current_addresses: std::collections::HashMap<String, provenance::Address> =
@@ -1431,9 +1442,9 @@ fn explain_staleness(
         let cmd = factory();
         let cmd_build_version = cmd.build_version().to_string();
 
-        // Build the current node the same way runner.rs does, but take
-        // upstream addresses from the in-flight `current_addresses`
-        // when present so the diff reflects the planned re-run order.
+        // Build the current node the same way runner.rs does, taking
+        // each upstream walked before it from `current_addresses`: the
+        // node it would hold once the run reached this step.
         let upstream_ids: Vec<&str> = step.def.after.iter().map(|s| s.as_str()).collect();
         let mut upstream: std::collections::BTreeMap<String, provenance::Address> =
             std::collections::BTreeMap::new();
@@ -1472,11 +1483,11 @@ fn explain_staleness(
                 &step.id, &step.def.run, &binary, &resolved_map, upstream,
             ))
             .expect("every upstream address was just taken from or put into this graph");
-        current_addresses.insert(step.id.clone(), current.clone());
         let stored = ctx.progress.get_step(&step.id).and_then(|r| r.provenance.as_deref());
         match stored {
             None => {
                 println!("  {} {} — STALE (no prior record)", term::warn("●"), step.id);
+                current_addresses.insert(step.id.clone(), current.clone());
                 stale_count += 1;
             }
             Some(stored) => {
@@ -1485,6 +1496,7 @@ fn explain_staleness(
                 let stored_hash = graph.hash_restricted(stored, selector, &keys);
                 if stored_hash.is_some() && stored_hash == graph.hash_restricted(&current, selector, &keys) {
                     println!("  {} {} — fresh", term::ok("✓"), step.id);
+                    current_addresses.insert(step.id.clone(), stored.to_string());
                     fresh_count += 1;
                 } else {
                     println!("  {} {} — STALE", term::warn("●"), step.id);
@@ -1496,6 +1508,7 @@ fn explain_staleness(
                     if diffs.len() > 8 {
                         println!("      ... and {} more", diffs.len() - 8);
                     }
+                    current_addresses.insert(step.id.clone(), current.clone());
                     stale_count += 1;
                 }
             }

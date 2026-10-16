@@ -20,6 +20,19 @@
   steps keep the run's selector.
 - **`veks run --explain-staleness`** now reports the finalize steps too,
   after the compute steps, each judged as a run would judge it.
+- **`veks run --explain-staleness` agrees with the run.** It named each
+  upstream by the node a re-run would record, even for an upstream the
+  run keeps, so on a dataset whose compute steps an older veks recorded
+  it called their dependents and every finalize step stale while
+  `veks run` correctly skipped them. A fresh upstream is now named by the
+  record it keeps.
+- **`veks run --explain-staleness` writes nothing.** It appended to
+  `runlog.jsonl` and `.cache/run.log` and rewrote `variables.yaml`, so
+  asking why a step would run changed files a publish carries.
+- **Pipeline variables are saved only when one changes.** Every
+  `veks run` rewrote `variables.yaml` to set `dataset_name` and
+  `distance_function` to the values it already held, which gave an
+  unchanged file a new modification time.
 
 ## 3.0.0 — 2026-10-15
 

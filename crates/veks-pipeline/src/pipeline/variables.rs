@@ -71,9 +71,14 @@ pub fn save(dataset_dir: &Path, vars: &IndexMap<String, String>) -> Result<(), S
     Ok(())
 }
 
-/// Set a single variable and persist.
+/// Set a single variable and persist. A variable that already holds
+/// `value` leaves the file alone, so its modification time says when a
+/// value last changed, not when a run last started.
 pub fn set_and_save(dataset_dir: &Path, name: &str, value: &str) -> Result<(), String> {
     let mut vars = load(dataset_dir)?;
+    if vars.get(name).is_some_and(|v| v == value) {
+        return Ok(());
+    }
     vars.insert(name.to_string(), value.to_string());
     save(dataset_dir, &vars)
 }
@@ -334,6 +339,25 @@ mod tests {
         let loaded = load(tmp.path()).unwrap();
         assert_eq!(loaded.get("foo").unwrap(), "bar");
         assert_eq!(loaded.get("baz").unwrap(), "123");
+    }
+
+    /// **Setting a variable to the value it holds writes nothing**: every
+    /// `veks run` sets `dataset_name`, and rewriting `variables.yaml` each
+    /// time made a publish treat an unchanged file as changed.
+    #[test]
+    fn setting_a_variable_to_its_value_leaves_the_file_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_and_save(tmp.path(), "dataset_name", "t").unwrap();
+        let path = variables_path(tmp.path());
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(older).unwrap();
+
+        set_and_save(tmp.path(), "dataset_name", "t").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), older);
+
+        set_and_save(tmp.path(), "dataset_name", "u").unwrap();
+        assert_eq!(load(tmp.path()).unwrap().get("dataset_name").unwrap(), "u");
+        assert!(std::fs::metadata(&path).unwrap().modified().unwrap() > older);
     }
 
     #[test]
