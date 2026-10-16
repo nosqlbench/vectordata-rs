@@ -369,7 +369,6 @@ fn plan_segments(
     expected_provenance: Option<&str>,
     pred_count: usize,
     first_ordinal: i64,
-    compress_cache: bool,
 ) -> Vec<SegmentInfo> {
     if page_entries.is_empty() || end_ordinal == 0 {
         return Vec::new();
@@ -402,7 +401,7 @@ fn plan_segments(
                     cache_prefix, seg_start, seg_end,
                 ));
                 let valid = is_cache_valid(
-                    &path, pred_count, compress_cache, expected_provenance,
+                    &path, pred_count, expected_provenance,
                 );
                 (Some(path), valid)
             }
@@ -445,14 +444,15 @@ fn plan_segments(
 /// hypothetical pre-provenance audit/CLI path) pass `None` to skip
 /// the sidecar check.
 ///
-/// When `compress_cache` is true, also checks for the `.gz` compressed
-/// form. If the compressed form exists, it is decompressed to the
-/// original path so that subsequent `SlabReader::open` calls work
-/// normally.
+/// A segment found only in its `.gz` form, whatever wrote it (this
+/// step with `compress-cache`, or `veks prepare cache-compress`), is
+/// decompressed to the original path, streaming, so that subsequent
+/// `SlabReader::open` calls work normally. Reading does not depend on
+/// `compress-cache`: that option says how this step writes its caches,
+/// not which of them it may reuse.
 fn is_cache_valid(
     path: &Path,
     expected_records: usize,
-    compress_cache: bool,
     expected_provenance: Option<&str>,
 ) -> bool {
     let record_count_ok = |p: &Path| -> bool {
@@ -485,14 +485,11 @@ fn is_cache_valid(
         return record_count_ok(path) && provenance_matches(path);
     }
 
-    // If compress-cache is enabled, check for the .gz form.
-    if compress_cache && crate::pipeline::gz_cache::gz_exists(path) {
-        match crate::pipeline::gz_cache::load_gz(path) {
-            Ok(data) => {
-                // Write decompressed data to the original path for SlabReader.
-                if std::fs::write(path, &data).is_err() {
-                    return false;
-                }
+    // Otherwise the .gz form, decompressed beside it for SlabReader.
+    if crate::pipeline::gz_cache::gz_path(path).exists() {
+        let read = std::sync::atomic::AtomicU64::new(0);
+        match crate::pipeline::gz_cache::decompress_file(path, &read) {
+            Ok(_) => {
                 let valid = record_count_ok(path) && provenance_matches(path);
                 // Clean up decompressed file if invalid.
                 if !valid {
@@ -1336,7 +1333,6 @@ sweep.
             Some(run_root.as_str()),
             pred_len,
             effective_start,
-            compress_cache,
         );
 
         let cached_count = segments.iter().filter(|s| s.cached).count();
@@ -1782,21 +1778,15 @@ sweep.
                                 );
                             }
                             if compress_cache {
-                                // Read back the slab file, compress, and delete the original.
-                                match std::fs::read(cache_path) {
-                                    Ok(raw) => {
-                                        if let Err(e) = crate::pipeline::gz_cache::save_gz(cache_path, &raw) {
-                                            log::warn!(
-                                                "compute predicates: compress error for segment {}: {}",
-                                                seg_idx, e,
-                                            );
-                                        } else {
-                                            let _ = std::fs::remove_file(cache_path);
-                                        }
+                                // Compress the slab file, streaming, and delete the original.
+                                let read = std::sync::atomic::AtomicU64::new(0);
+                                match crate::pipeline::gz_cache::compress_file(cache_path, &read) {
+                                    Ok(_) => {
+                                        let _ = std::fs::remove_file(cache_path);
                                     }
                                     Err(e) => {
                                         log::warn!(
-                                            "compute predicates: failed to read cache for compress, segment {}: {}",
+                                            "compute predicates: compress error for segment {}: {}",
                                             seg_idx, e,
                                         );
                                     }
@@ -1893,19 +1883,12 @@ sweep.
             .enumerate()
             .map(|(seg_idx, seg)| {
                 seg.cache_path.as_ref().and_then(|cp| {
-                    // If compress-cache is enabled and the uncompressed file is
-                    // missing but the .gz form exists, decompress it first.
-                    if compress_cache && !cp.exists() && crate::pipeline::gz_cache::gz_exists(cp) {
-                        match crate::pipeline::gz_cache::load_gz(cp) {
-                            Ok(data) => {
-                                if let Err(e) = std::fs::write(cp, &data) {
-                                    ctx.ui.log(&format!(
-                                        "compute predicates: decompress write error for segment {}: {}",
-                                        seg_idx, e
-                                    ));
-                                    return None;
-                                }
-                            }
+                    // A segment held only in its .gz form, whatever wrote it,
+                    // is decompressed beside it first, streaming.
+                    if !cp.exists() && crate::pipeline::gz_cache::gz_path(cp).exists() {
+                        let read = std::sync::atomic::AtomicU64::new(0);
+                        match crate::pipeline::gz_cache::decompress_file(cp, &read) {
+                            Ok(_) => {}
                             Err(e) => {
                                 ctx.ui.log(&format!(
                                     "compute predicates: decompress error for segment {}: {}",
@@ -2727,22 +2710,54 @@ mod tests {
             .unwrap();
 
         // No sidecar yet → invalid under strict expectation.
-        assert!(!is_cache_valid(&cache_path, 2, false, Some(&prov_a)),
+        assert!(!is_cache_valid(&cache_path, 2, Some(&prov_a)),
             "sidecar absence must fail strict validation");
 
         // Write sidecar A → valid for A, invalid for B.
         graph.write_sidecar(&prov_a, &cache_path).unwrap();
-        assert!(is_cache_valid(&cache_path, 2, false, Some(&prov_a)),
+        assert!(is_cache_valid(&cache_path, 2, Some(&prov_a)),
             "matching sidecar must pass");
-        assert!(!is_cache_valid(&cache_path, 2, false, Some(&prov_b)),
+        assert!(!is_cache_valid(&cache_path, 2, Some(&prov_b)),
             "different binary → different hash → must fail");
 
         // Without an expected provenance (None), record-count
         // check is still enforced.
-        assert!(is_cache_valid(&cache_path, 2, false, None),
+        assert!(is_cache_valid(&cache_path, 2, None),
             "no provenance expected → record-count check is sufficient");
-        assert!(!is_cache_valid(&cache_path, 99, false, None),
+        assert!(!is_cache_valid(&cache_path, 99, None),
             "wrong record count must still fail even without provenance");
+    }
+
+    /// **A segment cache held only as `.gz` is reused whatever
+    /// `compress-cache` says.** `veks prepare cache-compress` compresses
+    /// these caches on a dataset whose steps never set the option, and
+    /// the reader looked for the `.gz` only when it was set: each
+    /// compressed segment was a cache miss, recomputed on the next run.
+    #[test]
+    fn a_compressed_segment_cache_is_reused_without_compress_cache() {
+        use crate::pipeline::provenance::{BinaryVersion, ProvenanceGraph, ProvenanceNode};
+        use std::collections::{BTreeMap, HashMap};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("seg.predkeys.slab");
+        let cfg = WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
+        let mut w = SlabWriter::new(&cache_path, cfg).unwrap();
+        w.add_record(&[]).unwrap();
+        w.add_record(&[]).unwrap();
+        w.finish().unwrap();
+        let mut graph = ProvenanceGraph::new();
+        let prov = graph
+            .insert(ProvenanceNode::build("step", "cmd", &BinaryVersion::parse("1.0.0+aaaa"), &HashMap::new(), BTreeMap::new()))
+            .unwrap();
+        graph.write_sidecar(&prov, &cache_path).unwrap();
+        let original = std::fs::read(&cache_path).unwrap();
+
+        let read = std::sync::atomic::AtomicU64::new(0);
+        crate::pipeline::gz_cache::compress_file(&cache_path, &read).unwrap();
+        std::fs::remove_file(&cache_path).unwrap();
+
+        assert!(is_cache_valid(&cache_path, 2, Some(&prov)), "the compressed segment was not reused");
+        assert_eq!(std::fs::read(&cache_path).unwrap(), original, "the segment was not restored byte for byte");
     }
 
     // Test helpers used by the cache-key regression tests above.

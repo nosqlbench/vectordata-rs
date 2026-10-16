@@ -40,6 +40,20 @@
   on one line for minutes. It now sends only the sums that differ from
   the remote's, on `--concurrency` streams, with a running count, and
   counts its deletions the same way.
+- **`veks prepare cache-compress` and `cache-uncompress` stream.**
+  Each read its files whole and compressed them in memory, on every
+  thread at once, so a cache of large segments ran the host out of
+  memory (killed at 765 GB on a 1 TB host). Each file is now compressed
+  through a fixed buffer to a temporary file renamed into place, with a
+  running count of files and bytes.
+- **A compressed predicate-key segment cache is reused.** The
+  predicate-key step looked for a `.gz` segment only when it set
+  `compress-cache`, so every segment `cache-compress` compressed on a
+  dataset without that option was recomputed on its next run. It now
+  reads either form, decompressing by streaming rather than in memory,
+  as the KNN and dedup caches already did.
+- **The `veks run` hint to run `cache-compress`** now recognises a
+  pipeline that sets `compress-cache`; it looked for `compress_cache`.
 
 ## 3.0.0 — 2026-10-15
 

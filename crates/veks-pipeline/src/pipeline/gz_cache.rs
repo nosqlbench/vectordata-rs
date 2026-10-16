@@ -134,6 +134,92 @@ pub fn gz_uncompressed_size_hint(path: &Path) -> Option<u32> {
     Some(u32::from_le_bytes([last4[0], last4[1], last4[2], last4[3]]))
 }
 
+/// Buffer size for the streaming copies: a few of these per thread is
+/// all the memory a file of any size costs.
+const STREAM_BUF: usize = 1 << 20;
+
+/// A reader that adds every byte it yields to `counter`, so a caller can
+/// report progress through a copy it does not drive itself.
+struct Counting<'a, R> {
+    inner: R,
+    counter: &'a std::sync::atomic::AtomicU64,
+}
+
+impl<R: Read> Read for Counting<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// Compress the file at `path` into its `.gz` beside it at the current
+/// level, streaming, so the memory it costs does not grow with the file.
+/// The `.gz` is written to a temporary file and renamed into place, so
+/// it is either whole or absent; `path` itself is left alone. Every byte
+/// read from `path` is added to `progress`. Returns the `.gz` size.
+pub fn compress_file(path: &Path, progress: &std::sync::atomic::AtomicU64) -> Result<u64, String> {
+    let gz = gz_path(path);
+    let tmp = gz.with_extension("gz.tmp");
+    let copy = || -> std::io::Result<u64> {
+        let src = std::fs::File::open(path)?;
+        let mut reader = Counting { inner: std::io::BufReader::with_capacity(STREAM_BUF, src), counter: progress };
+        let out = std::io::BufWriter::with_capacity(STREAM_BUF, std::fs::File::create(&tmp)?);
+        let mut encoder = GzEncoder::new(out, compression_level());
+        std::io::copy(&mut reader, &mut encoder)?;
+        let file = encoder.finish()?.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        Ok(file.metadata()?.len())
+    };
+    match copy() {
+        Ok(size) => {
+            std::fs::rename(&tmp, &gz).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("failed to rename {}: {e}", tmp.display())
+            })?;
+            Ok(size)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("failed to compress {}: {e}", path.display()))
+        }
+    }
+}
+
+/// Decompress the `.gz` of `path` into `path`, streaming, so the memory
+/// it costs does not grow with the file. `path` is written to a
+/// temporary file and renamed into place, so it is either whole or
+/// absent; the `.gz` is left alone. Every byte read from the `.gz` is
+/// added to `progress`. Returns the decompressed size.
+pub fn decompress_file(path: &Path, progress: &std::sync::atomic::AtomicU64) -> Result<u64, String> {
+    let gz = gz_path(path);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let copy = || -> std::io::Result<u64> {
+        let src = std::fs::File::open(&gz)?;
+        let counted = Counting { inner: std::io::BufReader::with_capacity(STREAM_BUF, src), counter: progress };
+        let mut decoder = GzDecoder::new(counted);
+        let mut out = std::io::BufWriter::with_capacity(STREAM_BUF, std::fs::File::create(&tmp)?);
+        let size = std::io::copy(&mut decoder, &mut out)?;
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        Ok(size)
+    };
+    match copy() {
+        Ok(size) => {
+            std::fs::rename(&tmp, path).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("failed to rename {}: {e}", tmp.display())
+            })?;
+            Ok(size)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("failed to decompress {}: {e}", gz.display()))
+        }
+    }
+}
+
 /// Compression statistics for logging.
 pub struct GzStats {
     /// Uncompressed size in bytes.
@@ -264,5 +350,80 @@ mod tests {
         assert_eq!(stats.compressed_size, on_disk);
         assert!(stats.compressed_size > 0, "compressed size must be measured, not zeroed");
         assert!(stats.ratio() > 1.0 && stats.savings_pct() > 0.0);
+    }
+
+    /// Bytes no generator would compress well, so the `.gz` grows as
+    /// fast as its input is read.
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect()
+    }
+
+    /// **A file compresses to its `.gz` and back byte for byte**, the
+    /// original left in place, nothing temporary left behind, and every
+    /// byte read counted.
+    #[test]
+    fn compress_and_decompress_file_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.predkeys.slab");
+        let data = noise(3 << 20, 7);
+        std::fs::write(&path, &data).unwrap();
+
+        let read = std::sync::atomic::AtomicU64::new(0);
+        let gz_size = compress_file(&path, &read).unwrap();
+        assert_eq!(read.load(std::sync::atomic::Ordering::Relaxed), data.len() as u64);
+        assert_eq!(std::fs::metadata(gz_path(&path)).unwrap().len(), gz_size);
+        assert_eq!(std::fs::read(&path).unwrap(), data, "compress_file touched the original");
+
+        std::fs::remove_file(&path).unwrap();
+        let read = std::sync::atomic::AtomicU64::new(0);
+        assert_eq!(decompress_file(&path, &read).unwrap(), data.len() as u64);
+        assert_eq!(read.load(std::sync::atomic::Ordering::Relaxed), gz_size);
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "a temporary file was left: {names:?}");
+    }
+
+    /// **Compression streams: output is written while input is still
+    /// arriving.** The input is a pipe its writer holds open until the
+    /// `.gz` has started to grow, which a compressor that reads its
+    /// whole input before writing never does — that is how
+    /// `veks prepare cache-compress` held every file it compressed in
+    /// memory at once and was killed at 765 GB.
+    #[cfg(unix)]
+    #[test]
+    fn compress_file_writes_before_its_input_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.predkeys.slab");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo failed");
+        let tmp = gz_path(&path).with_extension("gz.tmp");
+
+        let writer = {
+            let path = path.clone();
+            let tmp = tmp.clone();
+            std::thread::spawn(move || -> bool {
+                let mut pipe = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                let mut seed = 1;
+                // Keep feeding until the output shows up, then close.
+                while std::time::Instant::now() < deadline {
+                    if pipe.write_all(&noise(1 << 20, seed)).is_err() {
+                        return false;
+                    }
+                    seed += 1;
+                    if std::fs::metadata(&tmp).map(|m| m.len() > 0).unwrap_or(false) {
+                        return true;
+                    }
+                }
+                false
+            })
+        };
+        let read = std::sync::atomic::AtomicU64::new(0);
+        let compressed = compress_file(&path, &read);
+        let streamed = writer.join().unwrap();
+        assert!(streamed, "no output was written while the input was still open");
+        assert!(compressed.is_ok(), "{compressed:?}");
     }
 }

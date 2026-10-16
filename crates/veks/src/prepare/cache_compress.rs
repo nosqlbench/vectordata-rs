@@ -128,69 +128,113 @@ pub fn run(cache_dir: &Path, dry_run: bool) {
         return;
     }
 
-    // Parallel compression with rayon
-    use rayon::prelude::*;
-
-    let compressed_count = AtomicU64::new(0);
-    let a_total_original = AtomicU64::new(0);
-    let a_total_compressed = AtomicU64::new(0);
-    let a_errors = AtomicU64::new(0);
-    let done = AtomicU64::new(0);
-
-    eligible.par_iter().for_each(|path| {
-        let rel = path.strip_prefix(cache_dir).unwrap_or(path);
-        let original_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let original_mtime = std::fs::metadata(path.as_path()).ok().and_then(|m| m.modified().ok());
-
-        let data = match std::fs::read(path.as_path()) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("ERROR reading {}: {}", rel.display(), e);
-                a_errors.fetch_add(1, Ordering::Relaxed);
-                done.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
-
-        if let Err(e) = crate::pipeline::gz_cache::save_gz(path, &data) {
-            eprintln!("ERROR compressing {}: {}", rel.display(), e);
-            a_errors.fetch_add(1, Ordering::Relaxed);
-            done.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
+    let sizes: Vec<u64> = eligible.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).collect();
+    let outcome = for_each_streaming(&eligible, &sizes, "compress", |path, read| {
+        let original_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        let compressed_size = crate::pipeline::gz_cache::compress_file(path, read)?;
         let gz_path = crate::pipeline::gz_cache::gz_path(path);
-        let compressed_size = std::fs::metadata(&gz_path).map(|m| m.len()).unwrap_or(0);
-
         if let Some(mtime) = original_mtime {
             let _ = filetime::set_file_mtime(&gz_path, filetime::FileTime::from_system_time(mtime));
         }
+        let _ = std::fs::remove_file(path);
+        Ok(compressed_size)
+    }, cache_dir);
 
-        let _ = std::fs::remove_file(path.as_path());
-
-        a_total_original.fetch_add(original_size, Ordering::Relaxed);
-        a_total_compressed.fetch_add(compressed_size, Ordering::Relaxed);
-        compressed_count.fetch_add(1, Ordering::Relaxed);
-        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(10) || n as usize == total {
-            eprint!("\r[{}/{}] compressed...       ", n, total);
-        }
-    });
-
-    let cc = compressed_count.load(Ordering::Relaxed);
-    let to = a_total_original.load(Ordering::Relaxed);
-    let tc = a_total_compressed.load(Ordering::Relaxed);
-    let errs = a_errors.load(Ordering::Relaxed);
-
-    eprint!("\r{}\r", " ".repeat(60));
     println!("\n--- cache compress summary ---");
-    println!("Files compressed: {}", cc);
-    if errs > 0 { println!("Errors:           {}", errs); }
-    println!("Original size:    {}", format_size(to));
-    println!("Compressed size:  {}", format_size(tc));
-    if to > 0 {
-        let saved = to.saturating_sub(tc);
-        println!("Space saved:      {} ({:.1}%)", format_size(saved), (saved as f64 / to as f64) * 100.0);
+    println!("Files compressed: {}", outcome.done);
+    if outcome.errors > 0 { println!("Errors:           {}", outcome.errors); }
+    println!("Original size:    {}", format_size(outcome.read));
+    println!("Compressed size:  {}", format_size(outcome.written));
+    if outcome.read > 0 {
+        let saved = outcome.read.saturating_sub(outcome.written);
+        println!("Space saved:      {} ({:.1}%)", format_size(saved), (saved as f64 / outcome.read as f64) * 100.0);
+    }
+}
+
+/// What [`for_each_streaming`] did: files finished and failed, and the
+/// bytes read from and written to disk across them.
+struct StreamOutcome {
+    done: u64,
+    errors: u64,
+    read: u64,
+    written: u64,
+}
+
+/// Run `op` over `files` on the rayon pool, each one a streaming copy
+/// that adds the bytes it reads to the counter it is given and returns
+/// the size it wrote, so the memory a file costs does not grow with it.
+/// The files, bytes and the file last finished are reported on stderr as
+/// the work goes: redrawn in place on a terminal, a line every 30 seconds
+/// otherwise.
+fn for_each_streaming(
+    files: &[&PathBuf],
+    sizes: &[u64],
+    verb: &str,
+    op: impl Fn(&Path, &AtomicU64) -> Result<u64, String> + Sync,
+    root: &Path,
+) -> StreamOutcome {
+    use rayon::prelude::*;
+    use std::io::IsTerminal;
+
+    let total = files.len();
+    let total_bytes: u64 = sizes.iter().sum();
+    let read = AtomicU64::new(0);
+    let written = AtomicU64::new(0);
+    let done = AtomicU64::new(0);
+    let errors = AtomicU64::new(0);
+    let last = std::sync::Mutex::new(String::new());
+    let finished = std::sync::atomic::AtomicBool::new(false);
+    let tty = std::io::stderr().is_terminal();
+
+    let line = || {
+        format!(
+            "{verb}: {}/{} files, {}/{} — {}",
+            done.load(Ordering::Relaxed) + errors.load(Ordering::Relaxed),
+            total,
+            format_size(read.load(Ordering::Relaxed)),
+            format_size(total_bytes),
+            last.lock().expect("last file"),
+        )
+    };
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut since_line = std::time::Instant::now();
+            while !finished.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if tty {
+                    eprint!("\r  {}\x1b[K", line());
+                } else if since_line.elapsed() >= std::time::Duration::from_secs(30) {
+                    eprintln!("  {}", line());
+                    since_line = std::time::Instant::now();
+                }
+            }
+        });
+        files.par_iter().for_each(|path| {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            match op(path, &read) {
+                Ok(size) => {
+                    written.fetch_add(size, Ordering::Relaxed);
+                    done.fetch_add(1, Ordering::Relaxed);
+                    *last.lock().expect("last file") = rel.display().to_string();
+                }
+                Err(e) => {
+                    eprintln!("\nERROR {verb}ing {}: {e}", rel.display());
+                    errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        finished.store(true, Ordering::Relaxed);
+    });
+    if tty {
+        eprintln!("\r  {}\x1b[K", line());
+    } else {
+        eprintln!("  {}", line());
+    }
+    StreamOutcome {
+        done: done.into_inner(),
+        errors: errors.into_inner(),
+        read: read.into_inner(),
+        written: written.into_inner(),
     }
 }
 
@@ -245,72 +289,25 @@ pub fn run_uncompress(cache_dir: &Path, dry_run: bool) {
         return;
     }
 
-    // Parallel decompression with rayon
-    use rayon::prelude::*;
-
-    let uncompressed_count = AtomicU64::new(0);
-    let a_total_compressed = AtomicU64::new(0);
-    let a_total_uncompressed = AtomicU64::new(0);
-    let a_errors = AtomicU64::new(0);
-    let done = AtomicU64::new(0);
-
-    gz_files.par_iter().for_each(|gz_path| {
-        let rel = gz_path.strip_prefix(cache_dir).unwrap_or(gz_path);
-        let compressed_size = std::fs::metadata(gz_path.as_path()).map(|m| m.len()).unwrap_or(0);
-
-        // Capture mtime from .gz for preservation
-        let gz_mtime = std::fs::metadata(gz_path.as_path()).ok().and_then(|m| m.modified().ok());
-
-        // Derive the original path by stripping .gz
+    let sizes: Vec<u64> = gz_files.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).collect();
+    let outcome = for_each_streaming(&gz_files, &sizes, "uncompress", |gz_path, read| {
+        let gz_mtime = std::fs::metadata(gz_path).ok().and_then(|m| m.modified().ok());
         let original_path = gz_path.with_extension("");
-
-        let data = match crate::pipeline::gz_cache::load_gz(&original_path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("ERROR decompressing {}: {}", rel.display(), e);
-                a_errors.fetch_add(1, Ordering::Relaxed);
-                done.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
-
-        if let Err(e) = std::fs::write(&original_path, &data) {
-            eprintln!("ERROR writing {}: {}", original_path.display(), e);
-            a_errors.fetch_add(1, Ordering::Relaxed);
-            done.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
-        // Preserve mtime
+        let size = crate::pipeline::gz_cache::decompress_file(&original_path, read)?;
         if let Some(mtime) = gz_mtime {
             let _ = filetime::set_file_mtime(&original_path, filetime::FileTime::from_system_time(mtime));
         }
-
-        // Remove .gz
-        if let Err(e) = std::fs::remove_file(gz_path.as_path()) {
-            eprintln!("WARNING: uncompressed ok but failed to remove {}: {}", rel.display(), e);
+        if let Err(e) = std::fs::remove_file(gz_path) {
+            eprintln!("\nWARNING: uncompressed ok but failed to remove {}: {}", gz_path.display(), e);
         }
+        Ok(size)
+    }, cache_dir);
 
-        a_total_compressed.fetch_add(compressed_size, Ordering::Relaxed);
-        a_total_uncompressed.fetch_add(data.len() as u64, Ordering::Relaxed);
-        uncompressed_count.fetch_add(1, Ordering::Relaxed);
-        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(10) || n as usize == total {
-            eprint!("\r[{}/{}] uncompressed...       ", n, total);
-        }
-    });
-
-    let uc = uncompressed_count.load(Ordering::Relaxed);
-    let tc = a_total_compressed.load(Ordering::Relaxed);
-    let tu = a_total_uncompressed.load(Ordering::Relaxed);
-    let errs = a_errors.load(Ordering::Relaxed);
-
-    eprint!("\r{}\r", " ".repeat(60));
     println!("\n--- cache uncompress summary ---");
-    println!("Files uncompressed: {}", uc);
-    if errs > 0 { println!("Errors:             {}", errs); }
-    println!("Compressed size:    {}", format_size(tc));
-    println!("Uncompressed size:  {}", format_size(tu));
+    println!("Files uncompressed: {}", outcome.done);
+    if outcome.errors > 0 { println!("Errors:             {}", outcome.errors); }
+    println!("Compressed size:    {}", format_size(outcome.read));
+    println!("Uncompressed size:  {}", format_size(outcome.written));
 }
 
 /// Human-readable size formatting (matches `cache.rs` style).
@@ -387,5 +384,26 @@ mod tests {
         // Verify roundtrip.
         let loaded = crate::pipeline::gz_cache::load_gz(&f).unwrap();
         assert_eq!(loaded, data);
+    }
+
+    /// **Compress and uncompress give back each file byte for byte, with
+    /// its modification time**, which is how the pipeline judges a cache
+    /// file against the step that wrote it.
+    #[test]
+    fn uncompress_restores_what_compress_took() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("keys.ab.seg_0000000000_0000000010.predkeys.slab");
+        let data: Vec<u8> = (0..1u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        std::fs::write(&f, &data).unwrap();
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(older).unwrap();
+
+        run(tmp.path(), false);
+        assert!(!f.exists(), "the original was kept");
+        run_uncompress(tmp.path(), false);
+
+        assert_eq!(std::fs::read(&f).unwrap(), data);
+        assert_eq!(std::fs::metadata(&f).unwrap().modified().unwrap(), older);
+        assert!(!crate::pipeline::gz_cache::gz_path(&f).exists(), "the .gz was kept");
     }
 }

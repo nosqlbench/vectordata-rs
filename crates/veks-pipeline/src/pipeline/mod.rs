@@ -1572,13 +1572,13 @@ fn print_run_summary(summary: &runner::RunSummary) {
 ///
 /// Informs the user that `.cache/` contains intermediate artifacts that are
 /// expensive to recompute, and suggests `veks prepare cache-compress` if
-/// the pipeline was not already configured with `compress_cache: true`.
+/// the pipeline was not already configured with `compress-cache: true`.
 fn print_cache_guidance(cache_dir: &std::path::Path, steps: &[dag::ResolvedStep]) {
     use veks_core::term;
 
-    // Check if any step has compress_cache enabled
+    // Check if any step has compress-cache enabled
     let has_compress = steps.iter().any(|s| {
-        s.def.options.get("compress_cache")
+        s.def.options.get("compress-cache")
             .and_then(|v| v.as_str())
             .map(|v| v == "true")
             .unwrap_or(false)
