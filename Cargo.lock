@@ -5138,7 +5138,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slabtastic"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "criterion",
  "csv",
@@ -5882,7 +5882,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "3.0.1"
+version = "3.0.2"
 
 [[package]]
 name = "tower"
@@ -6246,7 +6246,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vecd"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -6275,7 +6275,7 @@ dependencies = [
 
 [[package]]
 name = "vectordata"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -6320,7 +6320,7 @@ dependencies = [
 
 [[package]]
 name = "vectordata-rs"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "slabtastic",
  "vecd",
@@ -6330,7 +6330,7 @@ dependencies = [
 
 [[package]]
 name = "veks"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "arrow",
  "atty",
@@ -6371,7 +6371,7 @@ dependencies = [
 
 [[package]]
 name = "veks-anode"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "byteorder",
  "indexmap",
@@ -6381,7 +6381,7 @@ dependencies = [
 
 [[package]]
 name = "veks-completion"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "tempfile",
  "veks-completion-derive",
@@ -6389,7 +6389,7 @@ dependencies = [
 
 [[package]]
 name = "veks-completion-derive"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6398,7 +6398,7 @@ dependencies = [
 
 [[package]]
 name = "veks-core"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "arrow",
  "atty",
@@ -6425,7 +6425,7 @@ dependencies = [
 
 [[package]]
 name = "veks-io"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "arrow",
  "byteorder",
@@ -6442,7 +6442,7 @@ dependencies = [
 
 [[package]]
 name = "veks-pipeline"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "arrow",
  "atty",
@@ -6497,7 +6497,7 @@ dependencies = [
 
 [[package]]
 name = "veks-simd"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "criterion",
  "fearless_simd",
@@ -6508,7 +6508,7 @@ dependencies = [
 
 [[package]]
 name = "veks-studies"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "rand 0.9.4",
  "rand_xoshiro",
