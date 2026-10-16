@@ -4,6 +4,12 @@
 
 ### Fixes
 
+- **`generate dataset-json` rewrites a `dataset.json` an older veks
+  rendered.** It skipped whenever `dataset.json` was newer than
+  `dataset.yaml`, so the 3.0.1 re-run of the finalize steps left an
+  older build's `dataset.json` in place. It now renders every time and
+  writes when the result differs from the file there; an identical file
+  keeps its modification time.
 - **A new veks re-runs a dataset's finalize steps.** Under the default
   `--provenance config-only`, a step built by another veks counted as
   fresh. That is right for compute steps, and wrong for the finalize

@@ -5,8 +5,9 @@
 //!
 //! Writes a JSON-format copy of the dataset configuration alongside
 //! the YAML source. This provides a JSON-accessible copy for clients
-//! that prefer JSON over YAML. The file is only written when missing
-//! or when `dataset.yaml` is newer.
+//! that prefer JSON over YAML. The file is rewritten whenever what
+//! this build renders differs from it, so a fix to the rendering
+//! reaches a dataset whose `dataset.yaml` has not changed.
 
 use std::time::Instant;
 
@@ -17,7 +18,7 @@ use crate::pipeline::command::{
     Status, StreamContext, render_options_table,
 };
 
-/// Pipeline command: write `dataset.json` as a JSON copy of `dataset.yaml` when it is missing or stale.
+/// Pipeline command: write `dataset.json` as a JSON copy of `dataset.yaml` when it differs from what is there.
 pub struct DatasetJsonOp;
 
 /// Creates a boxed [`DatasetJsonOp`]; registered as the `generate dataset-json` command.
@@ -45,8 +46,9 @@ impl CommandOp for DatasetJsonOp {
                  Generate a JSON copy of the dataset configuration.\n\n\
                  ## Description\n\n\
                  Reads `dataset.yaml` from the workspace and writes `dataset.json` \
-                 alongside it. The JSON file is only written when missing or when \
-                 `dataset.yaml` has a newer modification time. This provides a \
+                 alongside it. The JSON file is rendered every time and written when \
+                 it differs from the file there, so a new veks rewrites a \
+                 `dataset.json` an older one rendered. This provides a \
                  JSON-accessible copy for clients that prefer JSON over YAML.\n\n\
                  ## Options\n\n{}",
                 render_options_table(&options)
@@ -64,24 +66,6 @@ impl CommandOp for DatasetJsonOp {
             return CommandResult {
                 status: Status::Error,
                 message: format!("dataset.yaml not found in {}", ctx.workspace.display()),
-                produced: vec![],
-                elapsed: start.elapsed(),
-            };
-        }
-
-        let needs_update = if !json_path.exists() {
-            true
-        } else {
-            match (std::fs::metadata(&yaml_path), std::fs::metadata(&json_path)) {
-                (Ok(ym), Ok(jm)) => ym.modified().ok() > jm.modified().ok(),
-                _ => true,
-            }
-        };
-
-        if !needs_update {
-            return CommandResult {
-                status: Status::Ok,
-                message: "dataset.json is up to date".into(),
                 produced: vec![],
                 elapsed: start.elapsed(),
             };
@@ -155,6 +139,18 @@ impl CommandOp for DatasetJsonOp {
             },
         };
 
+        // Compared by content, not by modification time: a `dataset.json`
+        // newer than its `dataset.yaml` may still be an older build's
+        // rendering of it.
+        if std::fs::read(&json_path).is_ok_and(|current| current == json.as_bytes()) {
+            return CommandResult {
+                status: Status::Ok,
+                message: "dataset.json is up to date".into(),
+                produced: vec![json_path],
+                elapsed: start.elapsed(),
+            };
+        }
+
         if let Err(e) = std::fs::write(&json_path, &json) {
             return CommandResult {
                 status: Status::Error,
@@ -186,5 +182,79 @@ impl CommandOp for DatasetJsonOp {
             outputs: vec!["dataset.json".to_string()],
             intermediates: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::progress::ProgressLog;
+    use std::path::Path;
+
+    const YAML: &str = "name: t\nprofiles:\n  default:\n    maxk: 10\n    base_vectors: base.fvecs\n";
+
+    fn ctx_at(workspace: &Path) -> StreamContext {
+        StreamContext {
+            attributes: Vec::new(),
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            cache: workspace.join(".cache"),
+            defaults: indexmap::IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+            provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
+        }
+    }
+
+    /// **An older build's `dataset.json` is rewritten** even when it is
+    /// newer than `dataset.yaml`: a modification time says nothing about
+    /// which build rendered the file, so a rendering fix would otherwise
+    /// never reach a dataset whose `dataset.yaml` is unchanged.
+    #[test]
+    fn a_newer_but_different_dataset_json_is_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("dataset.yaml"), YAML).unwrap();
+        let json_path = tmp.path().join("dataset.json");
+        std::fs::write(&json_path, "{\"rendered_by\": \"an older veks\"}").unwrap();
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(tmp.path().join("dataset.yaml")).unwrap()
+            .set_modified(older).unwrap();
+
+        let result = DatasetJsonOp.execute(&Options::new(), &mut ctx_at(tmp.path()));
+
+        assert_eq!(result.status, Status::Ok, "{}", result.message);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(written["name"], "t", "dataset.json was not re-rendered: {written}");
+        assert_eq!(result.produced, vec![json_path]);
+    }
+
+    /// **A `dataset.json` this build would render is left alone**, so a
+    /// re-run does not touch its modification time and send the steps
+    /// that read it (its merkle tree, the catalogs) round again.
+    #[test]
+    fn an_identical_dataset_json_is_not_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("dataset.yaml"), YAML).unwrap();
+        let json_path = tmp.path().join("dataset.json");
+        let first = DatasetJsonOp.execute(&Options::new(), &mut ctx_at(tmp.path()));
+        assert_eq!(first.status, Status::Ok, "{}", first.message);
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&json_path).unwrap().set_modified(older).unwrap();
+
+        let second = DatasetJsonOp.execute(&Options::new(), &mut ctx_at(tmp.path()));
+
+        assert_eq!(second.status, Status::Ok, "{}", second.message);
+        assert_eq!(second.message, "dataset.json is up to date");
+        assert_eq!(std::fs::metadata(&json_path).unwrap().modified().unwrap(), older);
+        assert_eq!(second.produced, vec![json_path]);
     }
 }
