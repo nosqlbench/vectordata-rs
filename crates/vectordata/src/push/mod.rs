@@ -783,14 +783,30 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
         opts.concurrency.max(1)
     ));
     upload_files(tx.as_ref(), root, &to_upload, &pre_stats, opts.concurrency, &report)?;
-    // …then every directory's SHA256SUMS (sums last = the per-dir commit
-    // signal a strict reader keys on).
-    report.note(&format!("upload: checksum files of {} director{}", scan.content_dirs.len(), if scan.content_dirs.len() == 1 { "y" } else { "ies" }));
-    for dir_rel in &scan.content_dirs {
-        let key = plan::sums_key(dir_rel);
-        let bytes = local_sums.get(dir_rel).expect("sums computed").render().into_bytes();
-        tx.put_bytes(&key, &bytes, None).map_err(map_transport)?;
-    }
+    // …then the SHA256SUMS of every directory whose sums differ from the
+    // remote's (sums last = the per-dir commit signal a strict reader
+    // keys on). A directory whose remote sums already read as the local
+    // ones holds those files already, so its sums are not sent again:
+    // over S3 each one is an `aws` process.
+    let changed_sums: Vec<(String, Vec<u8>)> = scan
+        .content_dirs
+        .iter()
+        .filter_map(|dir_rel| {
+            let rendered = local_sums.get(dir_rel).expect("sums computed").render();
+            let remote = remote_sums_by_dir.get(dir_rel).and_then(|r| r.as_ref()).map(|r| r.render());
+            (remote.as_deref() != Some(rendered.as_str())).then(|| (plan::sums_key(dir_rel), rendered.into_bytes()))
+        })
+        .collect();
+    report.note(&format!(
+        "upload: checksum files of {} director{} ({} unchanged)",
+        changed_sums.len(),
+        if changed_sums.len() == 1 { "y" } else { "ies" },
+        scan.content_dirs.len() - changed_sums.len(),
+    ));
+    for_each_concurrent(changed_sums.len(), opts.concurrency, &report, "upload: checksum files", |i| {
+        let (key, bytes) = &changed_sums[i];
+        tx.put_bytes(key, bytes, None).map_err(map_transport).map(|()| key.clone())
+    })?;
 
     // Refresh the remote binding (self-describing).
     tx.put_bytes(binding::PUBLISH_FILE, endpoint.url.as_bytes(), None)
@@ -804,9 +820,12 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     // Delete orphans only after the new version is live, so a reader on
     // the prior version never sees its files vanish mid-update. The
     // removed keys are recorded on the begin event for audit.
-    for key in &deletes {
-        tx.delete(key).map_err(map_transport)?;
+    if !deletes.is_empty() {
+        report.note(&format!("delete: {} remote object(s) no longer published", deletes.len()));
     }
+    for_each_concurrent(deletes.len(), opts.concurrency, &report, "delete", |i| {
+        tx.delete(&deletes[i]).map_err(map_transport).map(|()| deletes[i].clone())
+    })?;
 
     // 15. Mirror into the local pushlog; persist a staged binding. Both
     //     are written crash-atomically (temp + rename) so an interrupted
@@ -928,6 +947,69 @@ fn fetch_dir_sums(
 /// bytes done and the file that just landed. The first failure ends
 /// the upload; what was put stays, since a resumed push re-puts only
 /// what is missing.
+/// Run `op` for every index below `n` on `concurrency` streams, saying
+/// how many are done and the last one finished (the name `op` returns)
+/// under `label`, and stopping at the first failure.
+fn for_each_concurrent(
+    n: usize,
+    concurrency: u32,
+    report: &Reporter,
+    label: &str,
+    op: impl Fn(usize) -> Result<String, Failure> + Sync,
+) -> Result<(), Failure> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if n == 0 {
+        return Ok(());
+    }
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let failed = std::sync::Mutex::new(None::<Failure>);
+    let last = std::sync::Mutex::new(String::new());
+    let workers = (concurrency.max(1) as usize).min(n);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if failed.lock().expect("failure slot").is_some() {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= n {
+                    break;
+                }
+                match op(i) {
+                    Ok(name) => {
+                        *last.lock().expect("last item") = name;
+                        done.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        let mut slot = failed.lock().expect("failure slot");
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+        let mut shown = 0usize;
+        loop {
+            let d = done.load(Ordering::SeqCst);
+            if d != shown {
+                report.progress(label, d, n, &format!("— {}", last.lock().expect("last item")));
+                shown = d;
+            }
+            if d >= n || failed.lock().expect("failure slot").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    match failed.into_inner().expect("failure slot") {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 fn upload_files(
     tx: &dyn PushTransport,
     root: &Path,

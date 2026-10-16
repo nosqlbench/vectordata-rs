@@ -98,6 +98,49 @@ fn a_push_reports_every_phase() {
     assert!(!lines.iter().any(|l| l.starts_with("upload")), "{lines:?}");
 }
 
+/// **A push sends the checksum files of only the directories that
+/// changed, and says how far along it is** — and so do its deletions.
+/// Every directory's `SHA256SUMS` used to be sent again, one at a time
+/// and without a word: over S3, a change to four directories of 186
+/// sat for minutes on one line.
+#[test]
+fn a_push_sends_only_the_changed_checksum_files_and_reports_them() {
+    let src = unique("sums-src");
+    let remote = unique("sums-remote");
+    make_dataset(&src);
+    std::fs::write(src.join("orphan.fvec"), b"ORPHAN").unwrap();
+    execute(&opts(&src, &remote)).expect("first push ok");
+    let unchanged_sums = remote.join(plan::sums_key("profiles/1m"));
+    let older = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options().write(true).open(&unchanged_sums).unwrap().set_modified(older).unwrap();
+
+    // One root file changes and another goes: only the root's sums move.
+    std::fs::write(src.join("base.fvec"), b"BASEDATA-2").unwrap();
+    std::fs::remove_file(src.join("orphan.fvec")).unwrap();
+    let (sink, lines) = ProgressSink::capture();
+    let mut o = opts(&src, &remote);
+    o.progress = sink;
+    o.delete = true;
+    o.message = Some("base rewritten, orphan dropped".to_string());
+    execute(&o).expect("second push ok");
+    let lines = lines.lock().unwrap().clone();
+    let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
+
+    assert_eq!(std::fs::read(remote.join("base.fvec")).unwrap(), b"BASEDATA-2");
+    assert!(!remote.join("orphan.fvec").exists(), "the orphan was not deleted");
+    assert_eq!(
+        std::fs::metadata(&unchanged_sums).unwrap().modified().unwrap(),
+        older,
+        "an unchanged directory's checksum file was sent again"
+    );
+    let root_sums = std::fs::read_to_string(remote.join(plan::sums_key(""))).unwrap();
+    assert!(!root_sums.contains("orphan.fvec"), "the root's sums were not sent: {root_sums}");
+    assert!(has("upload: checksum files of 1 directory (1 unchanged)"), "{lines:?}");
+    assert!(has("upload: checksum files: 1/1"), "{lines:?}");
+    assert!(has("delete: 1 remote object(s) no longer published"), "{lines:?}");
+    assert!(has("delete: 1/1 — orphan.fvec"), "{lines:?}");
+}
+
 fn remote_log(remote: &Path) -> Log {
     Log::parse(&std::fs::read_to_string(remote.join(pushlog::PUSHLOG_FILE)).unwrap()).unwrap()
 }

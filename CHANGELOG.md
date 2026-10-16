@@ -33,6 +33,13 @@
   `veks run` rewrote `variables.yaml` to set `dataset_name` and
   `distance_function` to the values it already held, which gave an
   unchanged file a new modification time.
+- **A publish sends only the checksum files that changed, and reports
+  them.** After the content uploads it sent every directory's
+  `SHA256SUMS` again, one at a time and silently, and then deleted
+  orphans silently: over S3, a change touching 4 directories of 186 sat
+  on one line for minutes. It now sends only the sums that differ from
+  the remote's, on `--concurrency` streams, with a running count, and
+  counts its deletions the same way.
 
 ## 3.0.0 — 2026-10-15
 
