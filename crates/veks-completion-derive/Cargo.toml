@@ -1,6 +1,6 @@
 [package]
 name = "veks-completion-derive"
-version = "3.0.2"
+version = "3.0.3"
 edition = "2024"
 license = "Apache-2.0"
 description = "Derive macro for the veks-completion CLI framework (the in-tree clap replacement)"
