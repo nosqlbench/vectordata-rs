@@ -1,6 +1,6 @@
 [package]
 name = "veks-pipeline"
-version = "3.0.3"
+version = "3.0.4"
 edition = "2024"
 description = "Pipeline execution engine for veks"
 license = "Apache-2.0"
@@ -80,17 +80,17 @@ hmac = "0.12"
 hex = "0.4"
 quick-xml = "0.36"
 signal-hook = "0.3"
-slabtastic = { path = "../slabtastic", version = "=3.0.3" }
-veks-simd = { path = "../veks-simd", version = "=3.0.3" }
+slabtastic = { path = "../slabtastic", version = "=3.0.4" }
+veks-simd = { path = "../veks-simd", version = "=3.0.4" }
 # Pure-Rust sgemm (the engine under faer) for the matrix-multiply KNN
 # scans; `x86-v4` turns on its AVX-512 kernels.
 gemm = { version = "0.19", default-features = false, features = ["std", "rayon", "x86-v4"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
-vectordata = { path = "../vectordata", version = "=3.0.3" }
-veks-core = { path = "../veks-core", version = "=3.0.3" }
-veks-completion = { path = "../veks-completion", version = "=3.0.3" }
-veks-completion-derive = { path = "../veks-completion-derive", version = "=3.0.3" }
+vectordata = { path = "../vectordata", version = "=3.0.4" }
+veks-core = { path = "../veks-core", version = "=3.0.4" }
+veks-completion = { path = "../veks-completion", version = "=3.0.4" }
+veks-completion-derive = { path = "../veks-completion-derive", version = "=3.0.4" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
