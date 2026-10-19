@@ -17,6 +17,28 @@ use crate::traits::{SourceMeta, VecSource};
 
 const READ_BUF_SIZE: usize = 4 << 20; // 4 MiB
 
+/// The shape of an xvec file from its first header and its size: the
+/// dimension, the record size, and the record count. The file must be
+/// a whole number of records of a positive dimension; a short file is
+/// refused here rather than read up to where it stops, because a tail
+/// that is silently dropped is a record a consumer never sees.
+fn shape(path: &Path, dim: i32, file_size: u64, elem_size: usize) -> Result<(u32, usize, u64), String> {
+    if dim <= 0 {
+        return Err(format!("{}: dimension {dim} is not positive", path.display()));
+    }
+    let record_bytes = (dim as usize)
+        .checked_mul(elem_size)
+        .and_then(|payload| payload.checked_add(4))
+        .ok_or_else(|| format!("{}: a record of dimension {dim} overflows", path.display()))?;
+    if !file_size.is_multiple_of(record_bytes as u64) {
+        return Err(format!(
+            "{}: file size {file_size} is not a whole number of {record_bytes}-byte records",
+            path.display()
+        ));
+    }
+    Ok((dim as u32, record_bytes, file_size / record_bytes as u64))
+}
+
 /// Open an xvec file as a streaming [`VecSource`].
 pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String> {
     let file = File::open(path)
@@ -33,13 +55,8 @@ pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String
 
     // Read dimension from first record header
     let dim = reader.read_i32::<LittleEndian>()
-        .map_err(|e| format!("read dim: {}", e))? as u32;
-    if dim == 0 {
-        return Err("zero dimension".into());
-    }
-
-    let record_bytes = 4 + (dim as usize) * elem_size;
-    let total_records = file_size / record_bytes as u64;
+        .map_err(|e| format!("read dim: {}", e))?;
+    let (dim, _, total_records) = shape(path, dim, file_size, elem_size)?;
 
     // Seek back to start
     use std::io::Seek;
@@ -69,9 +86,8 @@ pub fn probe(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
 
     let mut reader = BufReader::new(file);
     let dim = reader.read_i32::<LittleEndian>()
-        .map_err(|e| format!("read dim: {}", e))? as u32;
-    let record_bytes = 4 + (dim as usize) * elem_size;
-    let count = file_size / record_bytes as u64;
+        .map_err(|e| format!("read dim: {}", e))?;
+    let (dim, _, count) = shape(path, dim, file_size, elem_size)?;
 
     Ok(SourceMeta {
         dimension: dim,

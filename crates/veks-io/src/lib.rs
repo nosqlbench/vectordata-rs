@@ -3,8 +3,19 @@
 
 //! # veks-io — Standalone Vector Data I/O
 //!
-//! Read and write vector data in fvec, ivec, mvec, dvec, bvec, svec,
-//! and (optionally) npy, parquet, and slab formats.
+//! Read and write vector data in the xvec family (fvec, ivec, mvec,
+//! dvec, bvec, svec, and the typed spellings up to bf16vecs), the
+//! header-free scalar columns of every [`ElementType`], and
+//! (optionally) npy, parquet, and slab formats.
+//!
+//! The element model — which types a file may hold, what an extension
+//! says, and what a reader may do when asked for another type — is
+//! `veks-datatypes`, re-exported here ([`ElementType`], [`Element`],
+//! [`ElementConversion`], [`Container`], [`struct@bf16`],
+//! [`struct@f16`]). The readers
+//! in this crate read a file at its own type only; the
+//! [`ElementMismatch`](MmapError::ElementMismatch) error is what a
+//! wrong type gets.
 //!
 //! ## Quick Start
 //!
@@ -29,13 +40,25 @@
 //!
 //! ## Zero-Copy Mmap Access
 //!
-//! For random-access on xvec files, use the typed mmap readers:
+//! For random access on xvec files, use the typed mmap reader at the
+//! file's own type:
 //!
 //! ```rust,no_run
-//! use veks_io::xvec::mmap::MmapReader;
+//! use veks_io::MmapReader;
 //!
-//! let reader = MmapReader::<f32>::open_fvec("base.fvec".as_ref()).unwrap();
-//! let vec = reader.get_slice(42); // &[f32], zero-copy
+//! let reader = MmapReader::<f32>::open("base.fvecs".as_ref()).unwrap();
+//! let vec = reader.get_slice(42).unwrap(); // &[f32], zero-copy
+//! let mut rows = vec![0f32; reader.dim() * 1000];
+//! let read = reader.read_into(0, &mut rows).unwrap(); // the first 1000 records
+//! ```
+//!
+//! A header-free column is one slice:
+//!
+//! ```rust,no_run
+//! use veks_io::scalar::mmap::ScalarMmapReader;
+//!
+//! let scale = ScalarMmapReader::<f32>::open("quant_scale.f32".as_ref()).unwrap();
+//! let all: &[f32] = scale.as_slice().unwrap();
 //! ```
 //!
 //! ## Feature Flags
@@ -46,11 +69,13 @@
 
 #![warn(missing_docs)]
 
+pub mod element;
 pub mod format;
 pub mod scalar;
 pub mod traits;
 pub mod xvec;
 
+pub use element::{Container, Element, ElementConversion, ElementKind, ElementType, FloatFormat, MmapError, bf16, f16};
 pub use format::VecFormat;
 pub use traits::{SourceMeta, VecSink, VecSource};
 pub use traits::{VarlenRecord, VarlenSink, VarlenSource};
@@ -417,12 +442,12 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        let reader = MmapReader::<f32>::open_fvec(&path).unwrap();
+        let reader = MmapReader::<f32>::open(&path).unwrap();
         assert_eq!(reader.count(), 100);
         assert_eq!(reader.dim(), 3);
 
         for i in 0..100 {
-            let slice = reader.get_slice(i);
+            let slice = reader.get_slice(i).unwrap();
             assert_eq!(slice[0], i as f32);
             assert_eq!(slice[1], (i * 2) as f32);
             assert_eq!(slice[2], (i * 3) as f32);
@@ -507,8 +532,11 @@ mod tests {
 
     // ── truncated file ──────────────────────────────────────────────
 
+    /// A file that is not a whole number of records is refused at open,
+    /// by the streaming reader as by the mmap reader: a tail silently
+    /// dropped is a record a consumer never sees.
     #[test]
-    fn truncated_file_stops_gracefully() {
+    fn a_truncated_file_is_refused() {
         let tmp = make_tmp();
         let path = tmp.path().join("truncated.fvec");
 
@@ -524,13 +552,9 @@ mod tests {
             // Missing: the two f32 values
         }
 
-        let mut reader = open(&path).unwrap();
-        // First record should succeed
-        let r0 = reader.next_record();
-        assert!(r0.is_some(), "first record should be readable");
-        // Second record is truncated — should return None, not panic
-        let r1 = reader.next_record();
-        assert!(r1.is_none(), "truncated record should return None");
+        let err = open(&path).err().expect("a short file does not open");
+        assert!(err.contains("not a whole number"), "{err}");
+        assert!(probe(&path).is_err());
     }
 
     // ── corrupted dimension header ──────────────────────────────────
@@ -547,13 +571,13 @@ mod tests {
             f.write_all(&1.0f32.to_le_bytes()).unwrap();
             f.write_all(&2.0f32.to_le_bytes()).unwrap();
             f.write_all(&3.0f32.to_le_bytes()).unwrap();
-            // Record 1: dim=5 (mismatch!)
+            // Record 1: header says dim=5 (mismatch!) over a record-sized
+            // payload, so the file is still a whole number of records and
+            // only the header is wrong.
             f.write_all(&5i32.to_le_bytes()).unwrap();
             f.write_all(&4.0f32.to_le_bytes()).unwrap();
             f.write_all(&5.0f32.to_le_bytes()).unwrap();
             f.write_all(&6.0f32.to_le_bytes()).unwrap();
-            f.write_all(&7.0f32.to_le_bytes()).unwrap();
-            f.write_all(&8.0f32.to_le_bytes()).unwrap();
         }
 
         let mut reader = open(&path).unwrap();
@@ -579,7 +603,7 @@ mod tests {
             // Missing 2 more f32s — file size not a multiple of record size
         }
 
-        let result = MmapReader::<f32>::open_fvec(&path);
+        let result = MmapReader::<f32>::open(&path);
         assert!(result.is_err(), "truncated file should fail mmap open");
     }
 
@@ -613,10 +637,10 @@ mod tests {
         assert_eq!(v00, 0.0);
 
         // Also verify mmap
-        let mmap = MmapReader::<f32>::open_fvec(&path).unwrap();
+        let mmap = MmapReader::<f32>::open(&path).unwrap();
         assert_eq!(mmap.count(), 3);
-        assert_eq!(mmap.get_slice(0), &[0.0, 1.0, 2.0, 3.0]);
-        assert_eq!(mmap.get_slice(2), &[20.0, 21.0, 22.0, 23.0]);
+        assert_eq!(mmap.get_slice(0), Some(&[0.0f32, 1.0, 2.0, 3.0][..]));
+        assert_eq!(mmap.get_slice(2), Some(&[20.0f32, 21.0, 22.0, 23.0][..]));
     }
 
     // ── probe on all xvec formats ───────────────────────────────────
@@ -625,7 +649,7 @@ mod tests {
     fn probe_all_xvec_formats() {
         let tmp = make_tmp();
 
-        for (ext, elem_size) in [("fvec", 4), ("ivec", 4), ("dvec", 8), ("mvec", 2), ("svec", 2), ("bvec", 1)] {
+        for (ext, elem_size) in [("fvec", 4), ("ivec", 4), ("dvec", 8), ("mvec", 2), ("svec", 2), ("bvec", 1), ("bf16vecs", 2)] {
             let path = tmp.path().join(format!("test.{}", ext));
             let dim = 5u32;
             let mut writer = create(&path, dim).unwrap();
@@ -723,6 +747,7 @@ mod tests {
         for (ext, elem_size) in [
             ("u8", 1), ("i8", 1), ("u16", 2), ("i16", 2),
             ("u32", 4), ("i32", 4), ("u64", 8), ("i64", 8),
+            ("f16", 2), ("bf16", 2), ("f32", 4), ("f64", 8),
         ] {
             let path = tmp.path().join(format!("data.{}", ext));
             let data = vec![0u8; elem_size * 10]; // 10 records

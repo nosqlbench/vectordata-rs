@@ -1,0 +1,347 @@
+// Copyright (c) Jonathan Shook
+// SPDX-License-Identifier: Apache-2.0
+
+//! The element model in veks-io's readers (SRD element access, §14.3
+//! step 2): the guards that failed on the code before it, and the
+//! behaviour of the generic readers.
+
+use std::io::Write;
+use std::path::Path;
+
+use veks_io::scalar::mmap::ScalarMmapReader;
+use veks_io::{Container, Element, ElementType, MmapReader, bf16, f16};
+
+fn tmp() -> tempfile::TempDir {
+    tempfile::tempdir().unwrap()
+}
+
+/// The error the streaming reader gives for `path`.
+fn stream_error(path: &Path) -> String {
+    veks_io::open(path).err().expect("the streaming reader refuses the file")
+}
+
+fn write_records(path: &Path, dim: i32, records: &[Vec<u8>]) {
+    let mut f = std::fs::File::create(path).unwrap();
+    for r in records {
+        f.write_all(&dim.to_le_bytes()).unwrap();
+        f.write_all(r).unwrap();
+    }
+}
+
+fn bytes_of<T: Element>(values: &[T]) -> Vec<u8> {
+    let mut out = vec![0u8; values.len() * T::SIZE];
+    for (v, slot) in values.iter().zip(out.chunks_exact_mut(T::SIZE)) {
+        v.write_le_bytes(slot);
+    }
+    out
+}
+
+/// A sample of every type: the edges and one value in between.
+fn sample<T: Element>(i: usize) -> T {
+    let value = match i % 5 {
+        0 => veks_datatypes::Value::Int(0),
+        1 => veks_datatypes::Value::Int(1),
+        2 => veks_datatypes::Value::Int(100),
+        3 => veks_datatypes::Value::Int(if T::TYPE.is_integer() && T::TYPE.kind() != veks_datatypes::ElementKind::Unsigned { -7 } else { 7 }),
+        _ => veks_datatypes::Value::Int(127),
+    };
+    T::from_value(value).expect("fits every type")
+}
+
+// ── Guards (each failed on the code before this step) ──────────────────
+
+#[test]
+fn a_negative_dimension_is_rejected() {
+    let dir = tmp();
+    let path = dir.path().join("neg.fvec");
+    write_records(&path, -4, &[vec![0u8; 16]]);
+    let err = MmapReader::<f32>::open(&path).unwrap_err();
+    assert!(err.to_string().contains("dimension -4 is not positive"), "{err}");
+    assert!(stream_error(&path).contains("not positive"));
+}
+
+#[test]
+fn a_truncated_file_is_rejected_by_the_streaming_reader() {
+    let dir = tmp();
+    let path = dir.path().join("short.fvec");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(&2i32.to_le_bytes()).unwrap();
+    f.write_all(&1.0f32.to_le_bytes()).unwrap();
+    f.write_all(&2.0f32.to_le_bytes()).unwrap();
+    f.write_all(&2i32.to_le_bytes()).unwrap(); // a second header and nothing after it
+    drop(f);
+    let err = stream_error(&path);
+    assert!(err.contains("file size 16 is not a whole number of 12-byte records"), "{err}");
+    assert!(veks_io::probe(&path).is_err());
+}
+
+#[test]
+fn a_misaligned_f64_record_has_no_slice() {
+    let dir = tmp();
+    let path = dir.path().join("one.dvec");
+    write_records(&path, 1, &[1.5f64.to_le_bytes().to_vec(), 2.5f64.to_le_bytes().to_vec()]);
+    let reader = MmapReader::<f64>::open(&path).unwrap();
+    // Record 0's payload starts 4 bytes into a page-aligned mapping: not
+    // an f64 boundary, so there is no slice to borrow — but the values
+    // are still there to decode.
+    assert_eq!(reader.get_slice(0), None);
+    assert_eq!(reader.get(0), Some(vec![1.5]));
+    let mut out = [0f64; 2];
+    assert_eq!(reader.read_into(0, &mut out).unwrap(), 2);
+    assert_eq!(out, [1.5, 2.5]);
+}
+
+#[test]
+fn a_bvecs_file_does_not_open_as_f32() {
+    let dir = tmp();
+    let path = dir.path().join("codes.bvecs");
+    // 17 records of 16 bytes: 340 bytes, which also divides by the 68-byte
+    // stride an f32 reader derives from the same header, so nothing but
+    // the extension can tell the two apart.
+    let records: Vec<Vec<u8>> = (0..17).map(|i| vec![i as u8; 16]).collect();
+    write_records(&path, 16, &records);
+    assert!(matches!(
+        MmapReader::<f32>::open(&path),
+        Err(veks_io::MmapError::ElementMismatch { file: ElementType::U8, requested: ElementType::F32 })
+    ));
+    let reader = MmapReader::<u8>::open(&path).unwrap();
+    assert_eq!(reader.count(), 17);
+    assert_eq!(reader.get_slice(16), Some(&[16u8; 16][..]));
+}
+
+// ── The generic readers ────────────────────────────────────────────────
+
+fn mmap_round_trip<T: Element + PartialEq + std::fmt::Debug>(dir: &Path) {
+    let dim = 4;
+    let records: Vec<Vec<T>> = (0..3).map(|r| (0..dim).map(|d| sample::<T>(r * dim + d)).collect()).collect();
+    let path = dir.join(format!("vectors.{}", T::TYPE.extension(Container::Vec)));
+    write_records(&path, dim as i32, &records.iter().map(|r| bytes_of(r)).collect::<Vec<_>>());
+
+    let reader = MmapReader::<T>::open(&path).unwrap();
+    assert_eq!((reader.dim(), reader.count()), (dim, 3), "{}", T::TYPE);
+    for (i, want) in records.iter().enumerate() {
+        assert_eq!(reader.get(i).as_ref(), Some(want), "{} get({i})", T::TYPE);
+        // The payload sits 4 bytes after a multiple of the record size:
+        // on a boundary for types up to 4 bytes wide, never for 8.
+        match reader.get_slice(i) {
+            Some(slice) => assert_eq!(slice, &want[..], "{} get_slice({i})", T::TYPE),
+            None => assert_eq!(T::SIZE, 8, "{} get_slice({i}) should be borrowable", T::TYPE),
+        }
+    }
+    let mut out = vec![sample::<T>(0); dim * 3];
+    assert_eq!(reader.read_into(0, &mut out).unwrap(), 3);
+    assert_eq!(out, records.concat(), "{} read_into", T::TYPE);
+    assert_eq!(reader.read_into(2, &mut out).unwrap(), 1);
+    assert_eq!(&out[..dim], &records[2][..]);
+}
+
+#[test]
+fn every_type_round_trips_through_mmap() {
+    let dir = tmp();
+    mmap_round_trip::<u8>(dir.path());
+    mmap_round_trip::<i8>(dir.path());
+    mmap_round_trip::<u16>(dir.path());
+    mmap_round_trip::<i16>(dir.path());
+    mmap_round_trip::<u32>(dir.path());
+    mmap_round_trip::<i32>(dir.path());
+    mmap_round_trip::<u64>(dir.path());
+    mmap_round_trip::<i64>(dir.path());
+    mmap_round_trip::<f16>(dir.path());
+    mmap_round_trip::<bf16>(dir.path());
+    mmap_round_trip::<f32>(dir.path());
+    mmap_round_trip::<f64>(dir.path());
+}
+
+fn column_round_trip<T: Element + PartialEq + std::fmt::Debug>(dir: &Path) {
+    let values: Vec<T> = (0..9).map(sample::<T>).collect();
+    let path = dir.join(format!("column.{}", T::TYPE.extension(Container::Scalar)));
+    std::fs::write(&path, bytes_of(&values)).unwrap();
+
+    let reader = ScalarMmapReader::<T>::open(&path).unwrap();
+    assert_eq!(reader.count(), 9, "{}", T::TYPE);
+    assert_eq!(reader.as_slice(), Some(&values[..]), "{} as_slice", T::TYPE);
+    for (i, want) in values.iter().enumerate() {
+        assert_eq!(reader.get(i), Some(*want), "{} get({i})", T::TYPE);
+        assert_eq!(reader.get_slice(i), Some(std::slice::from_ref(want)), "{} get_slice({i})", T::TYPE);
+    }
+    let mut out = vec![sample::<T>(0); 4];
+    assert_eq!(reader.read_into(7, &mut out).unwrap(), 2);
+    assert_eq!(&out[..2], &values[7..]);
+}
+
+#[test]
+fn a_scalar_column_is_one_slice() {
+    let dir = tmp();
+    column_round_trip::<u8>(dir.path());
+    column_round_trip::<i8>(dir.path());
+    column_round_trip::<u16>(dir.path());
+    column_round_trip::<i16>(dir.path());
+    column_round_trip::<u32>(dir.path());
+    column_round_trip::<i32>(dir.path());
+    column_round_trip::<u64>(dir.path());
+    column_round_trip::<i64>(dir.path());
+    column_round_trip::<f16>(dir.path());
+    column_round_trip::<bf16>(dir.path());
+    column_round_trip::<f32>(dir.path());
+    column_round_trip::<f64>(dir.path());
+}
+
+#[test]
+fn bf16_vectors_round_trip_through_the_writer() {
+    let dir = tmp();
+    let path = dir.path().join("base.bf16vecs");
+    let rows: Vec<Vec<bf16>> = vec![
+        vec![bf16::from_f32(1.0), bf16::from_f32(-2.5), bf16::from_f32(3.0e30)],
+        vec![bf16::from_f32(0.0), bf16::from_f32(0.1), bf16::from_f32(-1.0)],
+    ];
+    let mut writer = veks_io::create(&path, 3).unwrap();
+    for (i, row) in rows.iter().enumerate() {
+        writer.write_record(i as i64, &bytes_of(row));
+    }
+    writer.finish().unwrap();
+
+    let meta = veks_io::probe(&path).unwrap();
+    assert_eq!((meta.dimension, meta.element_size, meta.record_count), (3, 2, Some(2)));
+    let mut stream = veks_io::open(&path).unwrap();
+    assert_eq!(stream.next_record().unwrap(), bytes_of(&rows[0]));
+
+    let reader = MmapReader::<bf16>::open(&path).unwrap();
+    assert_eq!(reader.get_slice(1), Some(&rows[1][..]));
+    assert_eq!(reader.get_slice(0).unwrap()[2].to_f32(), bf16::from_f32(3.0e30).to_f32());
+    // The same bytes are not f16: a different format, refused.
+    assert!(matches!(
+        MmapReader::<f16>::open(&path),
+        Err(veks_io::MmapError::ElementMismatch { file: ElementType::BF16, requested: ElementType::F16 })
+    ));
+    assert!(matches!(MmapReader::<u16>::open(&path), Err(veks_io::MmapError::ElementMismatch { .. })));
+}
+
+#[test]
+fn f32_columns_round_trip_through_the_scalar_writer() {
+    let dir = tmp();
+    let path = dir.path().join("quant_scale.f32");
+    let scales = [0.5f32, 0.25, 1.0e-3, 7.0];
+    let mut writer = veks_io::create(&path, 1).unwrap();
+    for (i, s) in scales.iter().enumerate() {
+        writer.write_record(i as i64, &s.to_le_bytes());
+    }
+    writer.finish().unwrap();
+
+    let meta = veks_io::probe(&path).unwrap();
+    assert_eq!((meta.dimension, meta.element_size, meta.record_count), (1, 4, Some(4)));
+    let reader = ScalarMmapReader::<f32>::open(&path).unwrap();
+    assert_eq!(reader.as_slice(), Some(&scales[..]));
+    assert!(matches!(ScalarMmapReader::<i32>::open(&path), Err(veks_io::MmapError::ElementMismatch { .. })));
+}
+
+#[test]
+#[allow(deprecated)]
+fn the_deprecated_constructors_open_the_same_file() {
+    let dir = tmp();
+    macro_rules! same_as_open {
+        ($t:ty, $ctor:ident, $ext:literal) => {{
+            let path = dir.path().join(concat!("base.", $ext));
+            let rows: Vec<Vec<$t>> = (0..2).map(|r| (0..2).map(|d| sample::<$t>(r * 2 + d)).collect()).collect();
+            write_records(&path, 2, &rows.iter().map(|r| bytes_of(r)).collect::<Vec<_>>());
+            let by_name = MmapReader::<$t>::$ctor(&path).unwrap();
+            let by_type = MmapReader::<$t>::open(&path).unwrap();
+            assert_eq!((by_name.count(), by_name.dim(), by_name.entry_bytes()), (by_type.count(), by_type.dim(), by_type.entry_bytes()));
+            assert_eq!(by_name.get(1), by_type.get(1));
+        }};
+    }
+    same_as_open!(f32, open_fvec, "fvec");
+    same_as_open!(i32, open_ivec, "ivec");
+    same_as_open!(f16, open_mvec, "mvec");
+    same_as_open!(f64, open_dvec, "dvec");
+    same_as_open!(u8, open_bvec, "bvec");
+    same_as_open!(i16, open_svec, "svec");
+
+    macro_rules! same_column {
+        ($t:ty, $ctor:ident, $ext:literal) => {{
+            let column = dir.path().join(concat!("ids.", $ext));
+            let values: Vec<$t> = (0..3).map(sample::<$t>).collect();
+            std::fs::write(&column, bytes_of(&values)).unwrap();
+            assert_eq!(ScalarMmapReader::<$t>::$ctor(&column).unwrap().as_slice(), Some(&values[..]));
+        }};
+    }
+    same_column!(u8, open_u8, "u8");
+    same_column!(i8, open_i8, "i8");
+    same_column!(u16, open_u16, "u16");
+    same_column!(i16, open_i16, "i16");
+    same_column!(u32, open_u32, "u32");
+    same_column!(i32, open_i32, "i32");
+    same_column!(u64, open_u64, "u64");
+    same_column!(i64, open_i64, "i64");
+}
+
+#[test]
+fn errors_say_what_happened() {
+    let dir = tmp();
+    let missing = MmapReader::<f32>::open(&dir.path().join("missing.fvec")).unwrap_err();
+    assert!(matches!(missing, veks_io::MmapError::Open(_)));
+    assert!(missing.to_string().starts_with("open: "), "{missing}");
+
+    let path = dir.path().join("two.fvec");
+    write_records(&path, 1, &[bytes_of(&[1.0f32]), bytes_of(&[2.0f32])]);
+    let reader = MmapReader::<f32>::open(&path).unwrap();
+    let past = reader.read_into(3, &mut [0f32; 1]).unwrap_err();
+    assert_eq!(past.to_string(), "record 3 is out of bounds (count 2)");
+    assert!(matches!(past, veks_io::MmapError::OutOfBounds { index: 3, count: 2 }));
+
+    let wrong = MmapReader::<i32>::open(&path).unwrap_err();
+    assert_eq!(wrong.to_string(), "the file holds f32 elements and cannot be read as i32");
+
+    let varlen = dir.path().join("rows.fvvecs");
+    write_records(&varlen, 1, &[bytes_of(&[1.0f32])]);
+    let err = MmapReader::<f32>::open(&varlen).unwrap_err();
+    assert!(err.to_string().contains("a variable-length vector file, not a vector file"), "{err}");
+
+    let unknown = dir.path().join("rows.xyz");
+    write_records(&unknown, 1, &[bytes_of(&[1.0f32])]);
+    let err = MmapReader::<f32>::open(&unknown).unwrap_err();
+    assert!(err.to_string().contains("unrecognised extension .xyz"), "{err}");
+}
+
+#[test]
+fn readers_describe_themselves() {
+    let dir = tmp();
+    let path = dir.path().join("two.bf16vecs");
+    write_records(&path, 3, &[bytes_of(&[bf16::from_f32(1.0); 3]), bytes_of(&[bf16::from_f32(2.0); 3])]);
+    let reader = MmapReader::<bf16>::open(&path).unwrap();
+    reader.advise_sequential();
+    let shown = format!("{reader:?}");
+    assert!(shown.contains("element: BF16") && shown.contains("dim: 3") && shown.contains("count: 2"), "{shown}");
+
+    let column = dir.path().join("ids.u64");
+    std::fs::write(&column, bytes_of(&[7u64; 4])).unwrap();
+    let shown = format!("{:?}", ScalarMmapReader::<u64>::open(&column).unwrap());
+    assert!(shown.contains("element: U64") && shown.contains("count: 4"), "{shown}");
+}
+
+#[test]
+fn the_streaming_readers_take_only_their_own_layout() {
+    let dir = tmp();
+    let vectors = dir.path().join("base.fvec");
+    write_records(&vectors, 1, &[bytes_of(&[1.0f32])]);
+    assert!(veks_io::xvec::reader::open(&vectors, veks_io::VecFormat::ScalarU8).is_err());
+    assert!(veks_io::xvec::reader::probe(&vectors, veks_io::VecFormat::Slab).is_err());
+    let column = dir.path().join("ids.u8");
+    std::fs::write(&column, [1u8, 2]).unwrap();
+    assert!(veks_io::scalar::reader::open(&column, veks_io::VecFormat::Slab).is_err());
+    assert!(veks_io::scalar::reader::probe(&column, veks_io::VecFormat::Npy).is_err());
+    assert!(veks_io::scalar::writer::open(&column, veks_io::VecFormat::Parquet).is_err());
+}
+
+#[test]
+fn a_column_does_not_open_as_vectors_and_vice_versa() {
+    let dir = tmp();
+    let column = dir.path().join("codes.u8");
+    std::fs::write(&column, [1u8, 2, 3, 4]).unwrap();
+    let err = MmapReader::<u8>::open(&column).unwrap_err();
+    assert!(err.to_string().contains("a column file, not a vector file"), "{err}");
+
+    let vectors = dir.path().join("codes.bvecs");
+    write_records(&vectors, 2, &[vec![1, 2]]);
+    let err = ScalarMmapReader::<u8>::open(&vectors).unwrap_err();
+    assert!(err.to_string().contains("a vector file, not a column file"), "{err}");
+}

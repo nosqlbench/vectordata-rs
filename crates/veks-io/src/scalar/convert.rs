@@ -1,186 +1,142 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Checked integer type conversions between scalar formats.
+//! Checked conversion of a packed column between element types.
 //!
-//! Widening conversions always succeed. Narrowing and signed↔unsigned
-//! conversions check every value and return an error with the offending
-//! ordinal and value on overflow.
+//! The conversion table ([`ElementType::conversion_to`]) says what a
+//! *reader* may do, and a reader never narrows. A converter is asked
+//! to: it writes a new column, so an integer column may be narrowed
+//! when every value fits, with the first value that does not named by
+//! ordinal. Everything the table refuses for a reason other than
+//! integer width — a float to an integer, a float to a narrower float,
+//! an integer to a float that would round it — is refused here too.
 
 use std::fmt;
 
-/// Element type for scalar conversion dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScalarType {
-    /// Unsigned 8-bit integer.
-    U8,
-    /// Signed 8-bit integer.
-    I8,
-    /// Unsigned 16-bit integer.
-    U16,
-    /// Signed 16-bit integer.
-    I16,
-    /// Unsigned 32-bit integer.
-    U32,
-    /// Signed 32-bit integer.
-    I32,
-    /// Unsigned 64-bit integer.
-    U64,
-    /// Signed 64-bit integer.
-    I64,
-}
+use veks_datatypes::{Element, ElementConversion, ElementType, Value, convert, dispatch_element};
 
-impl ScalarType {
-    /// Bytes per element.
-    pub fn size(self) -> usize {
-        match self {
-            Self::U8 | Self::I8 => 1,
-            Self::U16 | Self::I16 => 2,
-            Self::U32 | Self::I32 => 4,
-            Self::U64 | Self::I64 => 8,
-        }
-    }
+/// The element types a column may hold. The name predates the shared
+/// model; the type is [`ElementType`].
+#[deprecated(note = "use `ElementType`")]
+pub type ScalarType = ElementType;
 
-    /// Human-readable name.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::U8 => "u8", Self::I8 => "i8",
-            Self::U16 => "u16", Self::I16 => "i16",
-            Self::U32 => "u32", Self::I32 => "i32",
-            Self::U64 => "u64", Self::I64 => "i64",
-        }
-    }
-}
-
-impl fmt::Display for ScalarType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-/// Error from a narrowing or sign-mismatch conversion.
-#[derive(Debug)]
-pub struct ConvertError {
-    /// Ordinal of the element that did not fit.
-    pub ordinal: u64,
-    /// The offending source value, widened to `i128` so any source type fits.
-    pub value: i128,
-    /// Element type being converted from.
-    pub from_type: ScalarType,
-    /// Element type being converted to.
-    pub to_type: ScalarType,
+/// Why a conversion did not produce a column.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ConvertError {
+    /// A value of the source type does not fit the target type.
+    Overflow {
+        /// The ordinal of the value, counting from 0.
+        ordinal: u64,
+        /// The value as the source holds it.
+        value: Value,
+        /// The source element type.
+        from_type: ElementType,
+        /// The target element type.
+        to_type: ElementType,
+    },
+    /// No conversion between the two types is defined: a float to an
+    /// integer, a float to a narrower float, or an integer to a float
+    /// that cannot hold every value of it.
+    Refused {
+        /// The source element type.
+        from_type: ElementType,
+        /// The target element type.
+        to_type: ElementType,
+    },
+    /// The input is not a whole number of source elements.
+    Length {
+        /// The input's length in bytes.
+        bytes: usize,
+        /// The source element type.
+        from_type: ElementType,
+    },
 }
 
 impl fmt::Display for ConvertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "narrowing overflow at ordinal {}: value {} ({}) does not fit in {}",
-            self.ordinal, self.value, self.from_type, self.to_type)
+        match self {
+            Self::Overflow { ordinal, value, from_type, to_type } => write!(
+                f,
+                "narrowing overflow at ordinal {ordinal}: value {value} ({from_type}) does not fit in {to_type}"
+            ),
+            Self::Refused { from_type, to_type } => {
+                write!(f, "no conversion from {from_type} to {to_type}")
+            }
+            Self::Length { bytes, from_type } => write!(
+                f,
+                "{bytes} bytes is not a whole number of {}-byte {from_type} elements",
+                from_type.byte_width()
+            ),
+        }
     }
 }
 
 impl std::error::Error for ConvertError {}
 
-/// Read a single value from `data` at byte offset 0 as i128 for comparison.
-fn read_value(data: &[u8], ty: ScalarType) -> i128 {
-    match ty {
-        ScalarType::U8 => data[0] as i128,
-        ScalarType::I8 => data[0] as i8 as i128,
-        ScalarType::U16 => u16::from_le_bytes([data[0], data[1]]) as i128,
-        ScalarType::I16 => i16::from_le_bytes([data[0], data[1]]) as i128,
-        ScalarType::U32 => u32::from_le_bytes(data[..4].try_into().unwrap()) as i128,
-        ScalarType::I32 => i32::from_le_bytes(data[..4].try_into().unwrap()) as i128,
-        ScalarType::U64 => u64::from_le_bytes(data[..8].try_into().unwrap()) as i128,
-        ScalarType::I64 => i64::from_le_bytes(data[..8].try_into().unwrap()) as i128,
-    }
+/// Whether the converter takes the pair at all: anything the reader
+/// table allows, plus integer narrowing, which is checked per value.
+fn allowed(from: ElementType, to: ElementType) -> bool {
+    from.conversion_to(to) != ElementConversion::Refused || (from.is_integer() && to.is_integer())
 }
 
-/// Write a value as the target type's little-endian bytes.
-fn write_value(val: i128, ty: ScalarType) -> Vec<u8> {
-    match ty {
-        ScalarType::U8 => vec![val as u8],
-        ScalarType::I8 => vec![val as i8 as u8],
-        ScalarType::U16 => (val as u16).to_le_bytes().to_vec(),
-        ScalarType::I16 => (val as i16).to_le_bytes().to_vec(),
-        ScalarType::U32 => (val as u32).to_le_bytes().to_vec(),
-        ScalarType::I32 => (val as i32).to_le_bytes().to_vec(),
-        ScalarType::U64 => (val as u64).to_le_bytes().to_vec(),
-        ScalarType::I64 => (val as i64).to_le_bytes().to_vec(),
-    }
-}
-
-/// Check if a value fits in the target type's range.
-fn fits(val: i128, ty: ScalarType) -> bool {
-    match ty {
-        ScalarType::U8 => val >= 0 && val <= u8::MAX as i128,
-        ScalarType::I8 => val >= i8::MIN as i128 && val <= i8::MAX as i128,
-        ScalarType::U16 => val >= 0 && val <= u16::MAX as i128,
-        ScalarType::I16 => val >= i16::MIN as i128 && val <= i16::MAX as i128,
-        ScalarType::U32 => val >= 0 && val <= u32::MAX as i128,
-        ScalarType::I32 => val >= i32::MIN as i128 && val <= i32::MAX as i128,
-        ScalarType::U64 => val >= 0 && val <= u64::MAX as i128,
-        ScalarType::I64 => val >= i64::MIN as i128 && val <= i64::MAX as i128,
-    }
-}
-
-/// Convert a flat packed scalar array from one integer type to another.
-///
-/// Returns the converted bytes, or an error if any value overflows the
-/// target type (narrowing or signed↔unsigned mismatch).
-///
-/// Identity conversions (same type) are a no-op copy.
-pub fn convert_scalars(
-    data: &[u8],
-    from: ScalarType,
-    to: ScalarType,
-) -> Result<Vec<u8>, ConvertError> {
-    let from_size = from.size();
-    let to_size = to.size();
+/// Convert a packed column of `from` elements to a packed column of
+/// `to` elements, checking every value.
+pub fn convert_scalars(data: &[u8], from: ElementType, to: ElementType) -> Result<Vec<u8>, ConvertError> {
+    let from_size = from.byte_width();
+    let to_size = to.byte_width();
 
     if !data.len().is_multiple_of(from_size) {
-        return Err(ConvertError {
-            ordinal: 0, value: 0, from_type: from, to_type: to,
-        });
+        return Err(ConvertError::Length { bytes: data.len(), from_type: from });
+    }
+    if from == to {
+        return Ok(data.to_vec());
+    }
+    if !allowed(from, to) {
+        return Err(ConvertError::Refused { from_type: from, to_type: to });
     }
 
     let count = data.len() / from_size;
-    let mut out = Vec::with_capacity(count * to_size);
-
-    if from == to {
-        out.extend_from_slice(data);
-        return Ok(out);
-    }
-
-    for i in 0..count {
-        let offset = i * from_size;
-        let val = read_value(&data[offset..offset + from_size], from);
-        if !fits(val, to) {
-            return Err(ConvertError {
+    let mut out = vec![0u8; count * to_size];
+    dispatch_element!(from, F => dispatch_element!(to, T => {
+        for (i, (src, dst)) in data.chunks_exact(from_size).zip(out.chunks_exact_mut(to_size)).enumerate() {
+            // Qualified: inside a dispatch arm `F` is a type alias, and
+            // the primitives have an inherent `from_le_bytes` of their own.
+            let value = <F as Element>::from_le_bytes(src);
+            let converted: T = convert::<F, T>(value).map_err(|e| ConvertError::Overflow {
                 ordinal: i as u64,
-                value: val,
+                value: e.value,
                 from_type: from,
                 to_type: to,
-            });
+            })?;
+            converted.write_le_bytes(dst);
         }
-        out.extend_from_slice(&write_value(val, to));
-    }
-
+    }));
     Ok(out)
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
-    fn make_data<T: Copy>(vals: &[T]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for v in vals {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>())
-            };
-            out.extend_from_slice(bytes);
+    fn make_data<T: Element>(vals: &[T]) -> Vec<u8> {
+        let mut out = vec![0u8; vals.len() * T::SIZE];
+        for (v, slot) in vals.iter().zip(out.chunks_exact_mut(T::SIZE)) {
+            v.write_le_bytes(slot);
         }
         out
     }
+
+    /// One value of an integer type as its bytes.
+    fn write_value(val: i128, ty: ElementType) -> Vec<u8> {
+        dispatch_element!(ty, T => make_data(&[T::from_value(Value::Int(val)).expect("fits")]))
+    }
+
+    const INTEGERS: [ElementType; 8] = [
+        ElementType::U8, ElementType::I8, ElementType::U16, ElementType::I16,
+        ElementType::U32, ElementType::I32, ElementType::U64, ElementType::I64,
+    ];
 
     // ── Identity conversions ───────────────────────────────────────
 
@@ -198,338 +154,242 @@ mod tests {
         assert_eq!(data, out);
     }
 
-    // ── Widening conversions (always succeed) ──────────────────────
+    // ── Widening ───────────────────────────────────────────────────
 
-    #[test] fn u8_to_u16() {
-        let data = make_data(&[0u8, 255]);
-        let out = convert_scalars(&data, ScalarType::U8, ScalarType::U16).unwrap();
-        assert_eq!(out, make_data(&[0u16, 255]));
+    fn widens<F: Element, T: Element + PartialEq + std::fmt::Debug>(input: &[F], want: &[T]) {
+        let out = convert_scalars(&make_data(input), F::TYPE, T::TYPE).unwrap();
+        assert_eq!(out, make_data(want), "{} -> {}", F::TYPE, T::TYPE);
     }
 
-    #[test] fn u8_to_u32() {
-        let data = make_data(&[0u8, 255]);
-        let out = convert_scalars(&data, ScalarType::U8, ScalarType::U32).unwrap();
-        assert_eq!(out, make_data(&[0u32, 255]));
+    #[test]
+    fn u8_to_u16() { widens(&[0u8, 127, 255], &[0u16, 127, 255]); }
+    #[test]
+    fn u8_to_u32() { widens(&[0u8, 255], &[0u32, 255]); }
+    #[test]
+    fn u8_to_u64() { widens(&[255u8], &[255u64]); }
+    #[test]
+    fn u8_to_i16() { widens(&[0u8, 255], &[0i16, 255]); }
+    #[test]
+    fn u8_to_i32() { widens(&[255u8], &[255i32]); }
+    #[test]
+    fn u8_to_i64() { widens(&[255u8], &[255i64]); }
+    #[test]
+    fn i8_to_i16() { widens(&[-128i8, 127], &[-128i16, 127]); }
+    #[test]
+    fn i8_to_i32() { widens(&[-128i8], &[-128i32]); }
+    #[test]
+    fn i8_to_i64() { widens(&[-1i8], &[-1i64]); }
+    #[test]
+    fn u16_to_u32() { widens(&[u16::MAX], &[65535u32]); }
+    #[test]
+    fn u16_to_u64() { widens(&[u16::MAX], &[65535u64]); }
+    #[test]
+    fn i16_to_i32() { widens(&[i16::MIN, i16::MAX], &[-32768i32, 32767]); }
+    #[test]
+    fn u32_to_u64() { widens(&[u32::MAX], &[u32::MAX as u64]); }
+    #[test]
+    fn i32_to_i64() { widens(&[i32::MIN], &[i32::MIN as i64]); }
+    #[test]
+    fn u8_to_f32_and_bf16() {
+        widens(&[0u8, 1, 255], &[0.0f32, 1.0, 255.0]);
+        widens(&[0u8, 255], &[half::bf16::from_f32(0.0), half::bf16::from_f32(255.0)]);
+    }
+    #[test]
+    fn f16_and_bf16_to_f32() {
+        widens(&[half::f16::from_f32(1.5), half::f16::MAX], &[1.5f32, half::f16::MAX.to_f32()]);
+        widens(&[half::bf16::from_f32(-3.0e30)], &[half::bf16::from_f32(-3.0e30).to_f32()]);
     }
 
-    #[test] fn u8_to_u64() {
-        let data = make_data(&[255u8]);
-        let out = convert_scalars(&data, ScalarType::U8, ScalarType::U64).unwrap();
-        assert_eq!(out, make_data(&[255u64]));
+    // ── Narrowing that fits ────────────────────────────────────────
+
+    #[test]
+    fn u16_to_u8_ok() { widens(&[0u16, 255], &[0u8, 255]); }
+    #[test]
+    fn i16_to_i8_ok() { widens(&[-128i16, 127], &[-128i8, 127]); }
+    #[test]
+    fn u32_to_u16_ok() { widens(&[65535u32], &[65535u16]); }
+    #[test]
+    fn i32_to_i16_ok() { widens(&[-32768i32], &[-32768i16]); }
+    #[test]
+    fn u64_to_u32_ok() { widens(&[u32::MAX as u64], &[u32::MAX]); }
+    #[test]
+    fn i64_to_i32_ok() { widens(&[i32::MIN as i64], &[i32::MIN]); }
+
+    // ── Narrowing that overflows ───────────────────────────────────
+
+    fn overflows<F: Element>(input: &[F], to: ElementType, ordinal: u64) {
+        match convert_scalars(&make_data(input), F::TYPE, to) {
+            Err(ConvertError::Overflow { ordinal: o, from_type, to_type, .. }) => {
+                assert_eq!((o, from_type, to_type), (ordinal, F::TYPE, to));
+            }
+            other => panic!("{} -> {to}: expected an overflow, got {other:?}", F::TYPE),
+        }
     }
 
-    #[test] fn u8_to_i16() {
-        let data = make_data(&[0u8, 255]);
-        let out = convert_scalars(&data, ScalarType::U8, ScalarType::I16).unwrap();
-        assert_eq!(out, make_data(&[0i16, 255]));
+    #[test]
+    fn u16_to_u8_overflow() { overflows(&[1u16, 256], ElementType::U8, 1); }
+    #[test]
+    fn i16_to_i8_overflow_positive() { overflows(&[128i16], ElementType::I8, 0); }
+    #[test]
+    fn i16_to_i8_overflow_negative() { overflows(&[0i16, 0, -129], ElementType::I8, 2); }
+    #[test]
+    fn u32_to_u8_overflow() { overflows(&[256u32], ElementType::U8, 0); }
+    #[test]
+    fn i32_to_i8_overflow() { overflows(&[i32::MAX], ElementType::I8, 0); }
+    #[test]
+    fn u64_to_u8_overflow() { overflows(&[u64::MAX], ElementType::U8, 0); }
+    #[test]
+    fn i64_to_i16_overflow() { overflows(&[40_000i64], ElementType::I16, 0); }
+
+    // ── Sign changes ───────────────────────────────────────────────
+
+    #[test]
+    fn u8_to_i8_ok() { widens(&[0u8, 127], &[0i8, 127]); }
+    #[test]
+    fn u8_to_i8_overflow() { overflows(&[128u8], ElementType::I8, 0); }
+    #[test]
+    fn i8_to_u8_ok() { widens(&[0i8, 127], &[0u8, 127]); }
+    #[test]
+    fn i8_to_u8_negative_fails() { overflows(&[-1i8], ElementType::U8, 0); }
+    #[test]
+    fn u16_to_i16_ok() { widens(&[32767u16], &[32767i16]); }
+    #[test]
+    fn u16_to_i16_overflow() { overflows(&[32768u16], ElementType::I16, 0); }
+    #[test]
+    fn i16_to_u16_negative_fails() { overflows(&[-1i16], ElementType::U16, 0); }
+    #[test]
+    fn u32_to_i32_ok() { widens(&[i32::MAX as u32], &[i32::MAX]); }
+    #[test]
+    fn u32_to_i32_overflow() { overflows(&[u32::MAX], ElementType::I32, 0); }
+    #[test]
+    fn i32_to_u32_negative_fails() { overflows(&[-1i32], ElementType::U32, 0); }
+    #[test]
+    fn u64_to_i64_ok() { widens(&[i64::MAX as u64], &[i64::MAX]); }
+    #[test]
+    fn u64_to_i64_overflow() { overflows(&[u64::MAX], ElementType::I64, 0); }
+    #[test]
+    fn i64_to_u64_negative_fails() { overflows(&[-1i64], ElementType::U64, 0); }
+
+    // ── Refused pairs ──────────────────────────────────────────────
+
+    #[test]
+    fn floats_never_become_integers_and_never_narrow() {
+        for (from, to) in [
+            (ElementType::F32, ElementType::I32),
+            (ElementType::F64, ElementType::F32),
+            (ElementType::F16, ElementType::BF16),
+            (ElementType::BF16, ElementType::F16),
+            (ElementType::I32, ElementType::F32),
+            (ElementType::U16, ElementType::BF16),
+        ] {
+            let data = vec![0u8; from.byte_width()];
+            assert_eq!(
+                convert_scalars(&data, from, to),
+                Err(ConvertError::Refused { from_type: from, to_type: to }),
+                "{from} -> {to}"
+            );
+        }
     }
 
-    #[test] fn u8_to_i32() {
-        let data = make_data(&[255u8]);
-        let out = convert_scalars(&data, ScalarType::U8, ScalarType::I32).unwrap();
-        assert_eq!(out, make_data(&[255i32]));
-    }
+    // ── The whole integer matrix ───────────────────────────────────
 
-    #[test] fn u8_to_i64() {
-        let data = make_data(&[255u8]);
-        let out = convert_scalars(&data, ScalarType::U8, ScalarType::I64).unwrap();
-        assert_eq!(out, make_data(&[255i64]));
-    }
-
-    #[test] fn i8_to_i16() {
-        let data = make_data(&[-128i8, 0, 127]);
-        let out = convert_scalars(&data, ScalarType::I8, ScalarType::I16).unwrap();
-        assert_eq!(out, make_data(&[-128i16, 0, 127]));
-    }
-
-    #[test] fn i8_to_i32() {
-        let data = make_data(&[-1i8]);
-        let out = convert_scalars(&data, ScalarType::I8, ScalarType::I32).unwrap();
-        assert_eq!(out, make_data(&[-1i32]));
-    }
-
-    #[test] fn i8_to_i64() {
-        let data = make_data(&[i8::MIN]);
-        let out = convert_scalars(&data, ScalarType::I8, ScalarType::I64).unwrap();
-        assert_eq!(out, make_data(&[i8::MIN as i64]));
-    }
-
-    #[test] fn u16_to_u32() {
-        let data = make_data(&[0u16, 65535]);
-        let out = convert_scalars(&data, ScalarType::U16, ScalarType::U32).unwrap();
-        assert_eq!(out, make_data(&[0u32, 65535]));
-    }
-
-    #[test] fn u16_to_u64() {
-        let data = make_data(&[65535u16]);
-        let out = convert_scalars(&data, ScalarType::U16, ScalarType::U64).unwrap();
-        assert_eq!(out, make_data(&[65535u64]));
-    }
-
-    #[test] fn i16_to_i32() {
-        let data = make_data(&[i16::MIN, i16::MAX]);
-        let out = convert_scalars(&data, ScalarType::I16, ScalarType::I32).unwrap();
-        assert_eq!(out, make_data(&[i16::MIN as i32, i16::MAX as i32]));
-    }
-
-    #[test] fn u32_to_u64() {
-        let data = make_data(&[u32::MAX]);
-        let out = convert_scalars(&data, ScalarType::U32, ScalarType::U64).unwrap();
-        assert_eq!(out, make_data(&[u32::MAX as u64]));
-    }
-
-    #[test] fn i32_to_i64() {
-        let data = make_data(&[i32::MIN, i32::MAX]);
-        let out = convert_scalars(&data, ScalarType::I32, ScalarType::I64).unwrap();
-        assert_eq!(out, make_data(&[i32::MIN as i64, i32::MAX as i64]));
-    }
-
-    // ── Narrowing conversions that succeed ──────────────────────────
-
-    #[test] fn u16_to_u8_ok() {
-        let data = make_data(&[0u16, 255]);
-        let out = convert_scalars(&data, ScalarType::U16, ScalarType::U8).unwrap();
-        assert_eq!(out, make_data(&[0u8, 255]));
-    }
-
-    #[test] fn i16_to_i8_ok() {
-        let data = make_data(&[-128i16, 127]);
-        let out = convert_scalars(&data, ScalarType::I16, ScalarType::I8).unwrap();
-        assert_eq!(out, make_data(&[-128i8, 127]));
-    }
-
-    #[test] fn u32_to_u16_ok() {
-        let data = make_data(&[0u32, 65535]);
-        let out = convert_scalars(&data, ScalarType::U32, ScalarType::U16).unwrap();
-        assert_eq!(out, make_data(&[0u16, 65535]));
-    }
-
-    #[test] fn i32_to_i16_ok() {
-        let data = make_data(&[-32768i32, 32767]);
-        let out = convert_scalars(&data, ScalarType::I32, ScalarType::I16).unwrap();
-        assert_eq!(out, make_data(&[-32768i16, 32767]));
-    }
-
-    #[test] fn u64_to_u32_ok() {
-        let data = make_data(&[0u64, u32::MAX as u64]);
-        let out = convert_scalars(&data, ScalarType::U64, ScalarType::U32).unwrap();
-        assert_eq!(out, make_data(&[0u32, u32::MAX]));
-    }
-
-    #[test] fn i64_to_i32_ok() {
-        let data = make_data(&[i32::MIN as i64, i32::MAX as i64]);
-        let out = convert_scalars(&data, ScalarType::I64, ScalarType::I32).unwrap();
-        assert_eq!(out, make_data(&[i32::MIN, i32::MAX]));
-    }
-
-    // ── Narrowing conversions that fail ─────────────────────────────
-
-    #[test] fn u16_to_u8_overflow() {
-        let data = make_data(&[256u16]);
-        let err = convert_scalars(&data, ScalarType::U16, ScalarType::U8).unwrap_err();
-        assert_eq!(err.ordinal, 0);
-        assert_eq!(err.value, 256);
-    }
-
-    #[test] fn i16_to_i8_overflow_positive() {
-        let data = make_data(&[128i16]);
-        let err = convert_scalars(&data, ScalarType::I16, ScalarType::I8).unwrap_err();
-        assert_eq!(err.value, 128);
-    }
-
-    #[test] fn i16_to_i8_overflow_negative() {
-        let data = make_data(&[-129i16]);
-        let err = convert_scalars(&data, ScalarType::I16, ScalarType::I8).unwrap_err();
-        assert_eq!(err.value, -129);
-    }
-
-    #[test] fn u32_to_u8_overflow() {
-        let data = make_data(&[0u32, 256]);
-        let err = convert_scalars(&data, ScalarType::U32, ScalarType::U8).unwrap_err();
-        assert_eq!(err.ordinal, 1);
-        assert_eq!(err.value, 256);
-    }
-
-    #[test] fn i32_to_i8_overflow() {
-        let data = make_data(&[129i32]);
-        assert!(convert_scalars(&data, ScalarType::I32, ScalarType::I8).is_err());
-    }
-
-    #[test] fn u64_to_u8_overflow() {
-        let data = make_data(&[u64::MAX]);
-        assert!(convert_scalars(&data, ScalarType::U64, ScalarType::U8).is_err());
-    }
-
-    #[test] fn i64_to_i16_overflow() {
-        let data = make_data(&[i64::MAX]);
-        assert!(convert_scalars(&data, ScalarType::I64, ScalarType::I16).is_err());
-    }
-
-    // ── Signed ↔ unsigned crossings ────────────────────────────────
-
-    #[test] fn u8_to_i8_ok() {
-        let data = make_data(&[0u8, 127]);
-        let out = convert_scalars(&data, ScalarType::U8, ScalarType::I8).unwrap();
-        assert_eq!(out, make_data(&[0i8, 127]));
-    }
-
-    #[test] fn u8_to_i8_overflow() {
-        let data = make_data(&[128u8]);
-        assert!(convert_scalars(&data, ScalarType::U8, ScalarType::I8).is_err());
-    }
-
-    #[test] fn i8_to_u8_ok() {
-        let data = make_data(&[0i8, 127]);
-        let out = convert_scalars(&data, ScalarType::I8, ScalarType::U8).unwrap();
-        assert_eq!(out, make_data(&[0u8, 127]));
-    }
-
-    #[test] fn i8_to_u8_negative_fails() {
-        let data = make_data(&[-1i8]);
-        assert!(convert_scalars(&data, ScalarType::I8, ScalarType::U8).is_err());
-    }
-
-    #[test] fn u16_to_i16_ok() {
-        let data = make_data(&[0u16, 32767]);
-        convert_scalars(&data, ScalarType::U16, ScalarType::I16).unwrap();
-    }
-
-    #[test] fn u16_to_i16_overflow() {
-        let data = make_data(&[32768u16]);
-        assert!(convert_scalars(&data, ScalarType::U16, ScalarType::I16).is_err());
-    }
-
-    #[test] fn i16_to_u16_negative_fails() {
-        let data = make_data(&[-1i16]);
-        assert!(convert_scalars(&data, ScalarType::I16, ScalarType::U16).is_err());
-    }
-
-    #[test] fn u32_to_i32_ok() {
-        let data = make_data(&[0u32, i32::MAX as u32]);
-        convert_scalars(&data, ScalarType::U32, ScalarType::I32).unwrap();
-    }
-
-    #[test] fn u32_to_i32_overflow() {
-        let data = make_data(&[u32::MAX]);
-        assert!(convert_scalars(&data, ScalarType::U32, ScalarType::I32).is_err());
-    }
-
-    #[test] fn i32_to_u32_negative_fails() {
-        let data = make_data(&[-1i32]);
-        assert!(convert_scalars(&data, ScalarType::I32, ScalarType::U32).is_err());
-    }
-
-    #[test] fn u64_to_i64_ok() {
-        let data = make_data(&[0u64, i64::MAX as u64]);
-        convert_scalars(&data, ScalarType::U64, ScalarType::I64).unwrap();
-    }
-
-    #[test] fn u64_to_i64_overflow() {
-        let data = make_data(&[u64::MAX]);
-        assert!(convert_scalars(&data, ScalarType::U64, ScalarType::I64).is_err());
-    }
-
-    #[test] fn i64_to_u64_negative_fails() {
-        let data = make_data(&[-1i64]);
-        assert!(convert_scalars(&data, ScalarType::I64, ScalarType::U64).is_err());
-    }
-
-    // ── Full 8×8 matrix: boundary values ───────────────────────────
-
-    /// For every (from, to) pair, verify that the conversion of a zero
-    /// value always succeeds (zero is representable in all types).
     #[test]
     fn full_matrix_zero_succeeds() {
-        let types = [
-            ScalarType::U8, ScalarType::I8, ScalarType::U16, ScalarType::I16,
-            ScalarType::U32, ScalarType::I32, ScalarType::U64, ScalarType::I64,
-        ];
-        for &from in &types {
-            // Create a zero value of the source type
-            let data = vec![0u8; from.size()];
-            for &to in &types {
-                let result = convert_scalars(&data, from, to);
-                assert!(result.is_ok(), "zero {} -> {} should succeed", from, to);
-                // The output should also be all zeros
-                let out = result.unwrap();
-                assert_eq!(out.len(), to.size());
-                assert!(out.iter().all(|&b| b == 0), "zero {} -> {} not zero", from, to);
+        for &from in &INTEGERS {
+            let data = vec![0u8; from.byte_width()];
+            for &to in &INTEGERS {
+                let out = convert_scalars(&data, from, to).unwrap_or_else(|e| panic!("zero {from} -> {to}: {e}"));
+                assert_eq!(out.len(), to.byte_width());
+                assert!(out.iter().all(|&b| b == 0), "zero {from} -> {to} not zero");
             }
         }
     }
 
-    /// For every (from, to) pair where from.size() > to.size(),
-    /// verify that the max value of `from` fails conversion to `to`.
     #[test]
     fn full_matrix_max_narrowing_fails() {
-        let type_max: &[(ScalarType, i128)] = &[
-            (ScalarType::U8, u8::MAX as i128),
-            (ScalarType::I8, i8::MAX as i128),
-            (ScalarType::U16, u16::MAX as i128),
-            (ScalarType::I16, i16::MAX as i128),
-            (ScalarType::U32, u32::MAX as i128),
-            (ScalarType::I32, i32::MAX as i128),
-            (ScalarType::U64, u64::MAX as i128),
-            (ScalarType::I64, i64::MAX as i128),
+        let type_max: &[(ElementType, i128)] = &[
+            (ElementType::U8, u8::MAX as i128),
+            (ElementType::I8, i8::MAX as i128),
+            (ElementType::U16, u16::MAX as i128),
+            (ElementType::I16, i16::MAX as i128),
+            (ElementType::U32, u32::MAX as i128),
+            (ElementType::I32, i32::MAX as i128),
+            (ElementType::U64, u64::MAX as i128),
+            (ElementType::I64, i64::MAX as i128),
         ];
-
         for &(from, max_val) in type_max {
-            for &(to, _) in type_max {
-                if from == to { continue; }
+            for &(to, to_max) in type_max {
+                if from == to {
+                    continue;
+                }
                 let data = write_value(max_val, from);
                 let result = convert_scalars(&data, from, to);
-                let should_fit = fits(max_val, to);
-                if should_fit {
-                    assert!(result.is_ok(),
-                        "max({})={} -> {} should fit", from, max_val, to);
+                if max_val > to_max {
+                    assert!(matches!(result, Err(ConvertError::Overflow { ordinal: 0, .. })), "max({from}) -> {to}");
                 } else {
-                    assert!(result.is_err(),
-                        "max({})={} -> {} should NOT fit", from, max_val, to);
+                    assert!(result.is_ok(), "max({from})={max_val} -> {to} fits");
                 }
             }
         }
     }
 
-    /// Signed types: verify that min negative values fail unsigned targets.
     #[test]
     fn full_matrix_min_signed_fails_unsigned() {
-        let signed_mins: &[(ScalarType, i128)] = &[
-            (ScalarType::I8, i8::MIN as i128),
-            (ScalarType::I16, i16::MIN as i128),
-            (ScalarType::I32, i32::MIN as i128),
-            (ScalarType::I64, i64::MIN as i128),
+        let signed_mins: &[(ElementType, i128)] = &[
+            (ElementType::I8, i8::MIN as i128),
+            (ElementType::I16, i16::MIN as i128),
+            (ElementType::I32, i32::MIN as i128),
+            (ElementType::I64, i64::MIN as i128),
         ];
-        let unsigned = [ScalarType::U8, ScalarType::U16, ScalarType::U32, ScalarType::U64];
-
+        let unsigned = [ElementType::U8, ElementType::U16, ElementType::U32, ElementType::U64];
         for &(from, min_val) in signed_mins {
             let data = write_value(min_val, from);
             for &to in &unsigned {
                 let result = convert_scalars(&data, from, to);
-                assert!(result.is_err(),
-                    "min({})={} -> {} should fail (negative to unsigned)", from, min_val, to);
+                assert!(
+                    matches!(result, Err(ConvertError::Overflow { ordinal: 0, value: Value::Int(v), .. }) if v == min_val),
+                    "min({from})={min_val} -> {to} should fail (negative to unsigned)"
+                );
             }
         }
     }
 
-    // ── Empty input ────────────────────────────────────────────────
+    // ── Edge cases ─────────────────────────────────────────────────
 
     #[test]
     fn empty_input() {
-        let out = convert_scalars(&[], ScalarType::U8, ScalarType::U16).unwrap();
+        let out = convert_scalars(&[], ElementType::U8, ElementType::I64).unwrap();
         assert!(out.is_empty());
     }
 
-    // ── Error message formatting ───────────────────────────────────
+    #[test]
+    fn a_partial_element_is_a_length_error() {
+        assert_eq!(
+            convert_scalars(&[0u8; 5], ElementType::U32, ElementType::U64),
+            Err(ConvertError::Length { bytes: 5, from_type: ElementType::U32 })
+        );
+    }
 
     #[test]
     fn error_display() {
-        let err = ConvertError {
-            ordinal: 42, value: 256, from_type: ScalarType::U16, to_type: ScalarType::U8,
+        let err = ConvertError::Overflow {
+            ordinal: 42,
+            value: Value::Int(256),
+            from_type: ElementType::U16,
+            to_type: ElementType::U8,
         };
-        let msg = format!("{}", err);
+        let msg = err.to_string();
         assert!(msg.contains("42"));
         assert!(msg.contains("256"));
         assert!(msg.contains("u16"));
         assert!(msg.contains("u8"));
+        assert_eq!(
+            ConvertError::Refused { from_type: ElementType::F32, to_type: ElementType::I32 }.to_string(),
+            "no conversion from f32 to i32"
+        );
+        let length = ConvertError::Length { bytes: 5, from_type: ElementType::U32 };
+        assert_eq!(length.to_string(), "5 bytes is not a whole number of 4-byte u32 elements");
+        let boxed: Box<dyn std::error::Error> = Box::new(length);
+        assert!(boxed.to_string().contains("u32"));
     }
 }

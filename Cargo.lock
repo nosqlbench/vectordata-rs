@@ -6572,6 +6572,7 @@ dependencies = [
  "parquet",
  "slabtastic",
  "tempfile",
+ "veks-datatypes",
 ]
 
 [[package]]

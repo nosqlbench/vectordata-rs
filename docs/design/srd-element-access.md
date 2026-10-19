@@ -1121,6 +1121,49 @@ Per-file numbers come from the lcov file (`SF`/`LF`/`LH`/`FNF`/`FNH`
 records), since `cargo llvm-cov report` cannot take the `--exclude`
 list.
 
+**Baseline, 2026-10-19, after step 1** (the whole set: 75.6% of lines,
+74.0% of functions, 323 test binaries). Line coverage, then function
+coverage, from each file's own crate tests and the integration suites:
+
+| File | Lines | Functions |
+|---|---|---|
+| `veks-datatypes/src/conversion.rs` | 97.9% (138/141) | 100% (14/14) |
+| `veks-datatypes/src/element.rs` | 100% (107/107) | 100% (20/20) |
+| `veks-datatypes/src/element_type.rs` | 97.9% (142/145) | 96.0% (24/25) |
+| `vectordata/src/io.rs` | 82.9% (840/1013) | 81.6% (111/136) |
+| `vectordata/src/typed_access.rs` | 80.2% (308/384) | 64.1% (41/64) |
+| `vectordata/src/view.rs` | 84.7% (1992/2353) | 73.4% (246/335) |
+| `vectordata/src/explore/shared.rs` | 42.4% (209/493) | 36.6% (30/82) |
+| `vectordata/src/group.rs` | 93.2% (451/484) | 95.0% (57/60) |
+| `vectordata/src/catalog/source.rs` | 92.1% (197/214) | 94.3% (33/35) |
+| `vectordata/src/catalog/knn_entries.rs` | 94.9% (409/431) | 92.7% (51/55) |
+| `vectordata/src/dataset/facet.rs` | 93.3% (306/328) | 95.7% (45/47) |
+| `vectordata/src/dataset/conformance.rs` | 88.2% (202/229) | 100% (21/21) |
+| `vectordata/src/dataset/profile.rs` | 95.5% (2321/2431) | 90.0% (216/240) |
+| `vectordata/src/dataset/shards.rs` | 93.8% (1232/1313) | 82.4% (126/153) |
+| `veks-io/src/format.rs` | 89.2% (298/334) | 89.7% (35/39) |
+| `veks-io/src/lib.rs` | 94.6% (508/537) | 91.4% (53/58) |
+| `veks-io/src/xvec/mmap.rs` | 72.6% (77/106) | 61.1% (11/18) |
+| `veks-io/src/xvec/reader.rs` | 87.0% (67/77) | 61.5% (8/13) |
+| `veks-io/src/xvec/writer.rs` | 90.2% (46/51) | 71.4% (5/7) |
+| `veks-io/src/scalar/mmap.rs` | 90.1% (109/121) | 75.0% (15/20) |
+| `veks-io/src/scalar/reader.rs` | 90.0% (54/60) | 66.7% (6/9) |
+| `veks-io/src/scalar/writer.rs` | 85.2% (23/27) | 60.0% (3/5) |
+| `veks-io/src/scalar/convert.rs` | 98.6% (352/357) | 100% (57/57) |
+| `veks-core/src/formats/facet.rs` | 92.7% (178/192) | 88.0% (22/25) |
+| `veks-core/src/formats/mod.rs` | 65.3% (143/219) | 91.3% (21/23) |
+| `veks-pipeline/src/pipeline/element_type.rs` | 81.1% (137/169) | 46.3% (19/41) |
+| `veks/src/check/profiles.rs` | 86.6% (356/411) | 87.5% (35/40) |
+| `veks/src/check/integrity.rs` | 82.6% (76/92) | 50.0% (4/8) |
+
+What the numbers say that §14.2 did not: the explorer's reader path
+is the least exercised file this SRD touches (42%); the pipeline's
+`ElementType` has fewer than half its functions called (the
+`dispatch_reader!` arms); veks-io's xvec mmap reader is at 61% of
+functions (the per-type constructors other than f32/i32 are never
+called). Each step's record in §16 states the same files after it
+lands.
+
 Targets this SRD holds itself to, by file, line coverage from the
 crate's own tests:
 - `veks-datatypes`: every line of `conversion.rs` and
@@ -1194,3 +1237,100 @@ reads it first. The two are separate questions — what a file may be
 called, and what a new file is called — and the table answers both.
 
 **Tests:** 20 unit, 2 doc. `cargo doc` clean with warnings denied.
+
+### 16.2 Step 2: veks-io on the model (2026-10-19)
+
+**Guards, run against the code before the step** (`crates/veks-io/
+tests/element_model.rs`, first written in the old API's spellings):
+- `a_negative_dimension_is_rejected`: panicked at `xvec/mmap.rs:69:31`
+  — `4 + dim * elem_size` overflowed after `-4` was cast to `usize`.
+- `a_truncated_file_is_rejected_by_the_streaming_reader`: the 16-byte
+  file opened `Ok` and the tail was dropped.
+- `a_misaligned_f64_record_has_no_slice`: SIGABRT — "unsafe
+  precondition(s) violated: slice::from_raw_parts requires the pointer
+  to be aligned" at `xvec/mmap.rs:99`. The undefined behaviour was
+  real, not theoretical: the debug build aborts on it.
+- `a_bvecs_file_does_not_open_as_f32`: a 340-byte `.bvecs` opened `Ok`
+  as f32 with `count() == 5`.
+
+**Built:**
+- veks-io depends on `veks-datatypes` and re-exports the model
+  (`ElementType`, `Element`, `ElementConversion`, `Container`, `bf16`,
+  `f16`) at its root. New `src/element.rs` holds the one
+  `MmapError`, `require_native::<T>(path, Container)` (the check EA-11
+  names, applied here to both mmap readers), an alignment test, and the
+  little-endian decode used by every bulk read.
+- `MmapReader<T: Element>::open` (EA-28): dimension must be
+  `1..=i32::MAX`, record size by checked arithmetic, remainder
+  refused, extension must name `T` in the `Vec` layout. `get_slice ->
+  Option<&[T]>` (`None` past the end or misaligned), `get ->
+  Option<Vec<T>>`, `read_into(start, &mut [T]) -> Result<usize>`,
+  `Debug`. The six per-type constructors are deprecated wrappers.
+- `ScalarMmapReader<T: Element>::open` (EA-29): same check in the
+  `Scalar` layout; `get -> Option<T>`, `get_slice`, `as_slice` (the
+  whole column), `read_into`, `Debug`. The eight per-type constructors
+  are deprecated wrappers.
+- The streaming `xvec::reader::open` and `probe` share one `shape`
+  check: positive dimension, checked record size, whole-file
+  remainder.
+- `VecFormat` (EA-22): `Bf16vec`, `ScalarF16`, `ScalarBf16`,
+  `ScalarF32`, `ScalarF64`; `ALL`; `element_type`, `container`, `of`;
+  `is_xvec`, `is_scalar`, `is_integer`, `is_signed`, `element_size`,
+  `from_extension`, `data_type_name` derived from the element model;
+  `#[non_exhaustive]`. `preferred_extension` keeps every historical
+  spelling (§16.1's decision) through `legacy_extension`. The writers
+  take the new formats with no change of their own.
+- `scalar::convert` rebuilt on `Element`: `convert_scalars` dispatches
+  both types through `dispatch_element!` and converts with
+  `veks_datatypes::convert`; `ScalarType` is a deprecated alias of
+  `ElementType`; `ConvertError` is an enum (`Overflow`, `Refused`,
+  `Length`). It still narrows integers when every value fits — a
+  converter writes a new column, which is not what a reader does — and
+  refuses float-to-integer, float narrowing, and lossy integer-to-float.
+
+**Decided during the step:**
+- **One `MmapError`.** The two readers had two enums with different
+  variants (`Io`/`InvalidSize`/`EmptyFile` against
+  `Open`/`Mmap`/`InvalidFormat`). There is one now, with
+  `ElementMismatch` and `OutOfBounds` added; the scalar reader's old
+  variants fold into `InvalidFormat` with the size in the message.
+  Semver-breaking for a caller matching the scalar reader's errors.
+- **The streaming reader refuses a short file at open**, as the mmap
+  reader always did, instead of yielding the records before the cut.
+  Two lib tests flipped: `truncated_file_stops_gracefully` is now
+  `a_truncated_file_is_refused`, and `corrupted_dim_mid_file` keeps a
+  whole-record file size so it still tests a bad mid-file header. A
+  mid-file header that disagrees still ends iteration with `None`
+  (`VecSource::next_record` has no error channel; unchanged).
+- **A file without an extension, or with a variable-length one, is
+  refused by the mmap readers.** They read a file at the type its
+  extension names; a path that names none has nothing to check
+  against. vectordata's readers over storage (step 3) decide for
+  themselves.
+
+**Flips:** `test_scalar_extensions` admits the float columns (§14.2).
+
+**Tests:** 123 unit, 13 in `tests/element_model.rs` (the four guards
+and nine behaviour tests, among them `every_type_round_trips_through_
+mmap` and `a_scalar_column_is_one_slice` over all twelve types), 7
+doc; veks-core's 131 pass unchanged; the workspace compiles with no
+new warnings. `cargo doc` clean with warnings denied. The example
+`examples/mmap_access.rs` moved to the generic open and shows
+`read_into`.
+
+**Coverage after the step** (the §14.5 command, whole workspace;
+baseline → after, lines, then functions after):
+
+| File | Baseline | After | Functions |
+|---|---|---|---|
+| `veks-io/src/element.rs` | — | 97.9% (46/47) | 100% (8/8) |
+| `veks-io/src/format.rs` | 89.2% | 98.7% (385/390) | 98.0% (49/50) |
+| `veks-io/src/xvec/mmap.rs` | 72.6% | 95.4% (166/174) | 95.8% (23/24) |
+| `veks-io/src/xvec/reader.rs` | 87.0% | 90.0% (81/90) | 62.5% (10/16) |
+| `veks-io/src/scalar/mmap.rs` | 90.1% | 98.0% (145/148) | 94.7% (18/19) |
+| `veks-io/src/scalar/convert.rs` | 98.6% | 96.6% (199/206) | 98.4% (60/61) |
+| `veks-io/src/lib.rs` | 94.6% | 94.6% (507/536) | 91.4% (53/58) |
+
+The whole set is unchanged at 75.6%. What is left uncovered in the
+readers is the record-size overflow branch, which a 64-bit host cannot
+reach, and the `Open`/`Mmap` display arms.

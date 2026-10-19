@@ -1,48 +1,26 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Memory-mapped xvec reader for zero-copy random access.
-//!
-//! Provides typed random-access readers for f32 (fvec), i32 (ivec),
-//! f16 (mvec), f64 (dvec), u8 (bvec), and i16 (svec) formats.
+//! Memory-mapped xvec reader for zero-copy random access, at any
+//! [`Element`] type the file's extension names.
 
 use std::marker::PhantomData;
 use std::path::Path;
 
 use memmap2::Mmap;
 
-/// Error type for mmap I/O operations.
-#[derive(Debug)]
-pub enum MmapError {
-    /// File could not be opened.
-    Open(std::io::Error),
-    /// File could not be memory-mapped.
-    Mmap(std::io::Error),
-    /// File is empty or has invalid format.
-    InvalidFormat(String),
-}
-
-impl std::fmt::Display for MmapError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MmapError::Open(e) => write!(f, "open: {}", e),
-            MmapError::Mmap(e) => write!(f, "mmap: {}", e),
-            MmapError::InvalidFormat(s) => write!(f, "invalid format: {}", s),
-        }
-    }
-}
-
-impl std::error::Error for MmapError {}
+use crate::element::{Container, Element, aligned_for, decode_into, require_native};
+pub use crate::element::MmapError;
 
 /// Memory-mapped vector reader for zero-copy random access.
 ///
-/// Element type `T` determines how the raw bytes are interpreted:
-/// - `f32` for fvec files
-/// - `i32` for ivec files
-/// - `half::f16` for mvec files
-/// - `f64` for dvec files
-/// - `u8` for bvec files (note: bvec stores 4-byte groups)
-/// - `i16` for svec files
+/// `T` is the element type the file holds, which its extension names:
+/// `f32` for `.fvecs`, `u8` for `.bvecs`, [`bf16`](crate::bf16) for
+/// `.bf16vecs`, and so on through every [`ElementType`]. [`open`]
+/// refuses a file whose extension names another type.
+///
+/// [`ElementType`]: crate::ElementType
+/// [`open`]: Self::open
 pub struct MmapReader<T> {
     mmap: Mmap,
     dim: usize,
@@ -51,57 +29,135 @@ pub struct MmapReader<T> {
     _phantom: PhantomData<T>,
 }
 
-impl<T: Copy + 'static> MmapReader<T> {
-    /// Open a file and memory-map it.
-    fn open_impl(path: &Path, elem_size: usize) -> Result<Self, MmapError> {
+impl<T: Element> MmapReader<T> {
+    /// Open and memory-map a uniform vector file whose extension names
+    /// `T`.
+    ///
+    /// The file must be a whole number of records, each a positive
+    /// little-endian `i32` dimension followed by that many elements;
+    /// the first record's dimension is taken as every record's.
+    pub fn open(path: &Path) -> Result<Self, MmapError> {
+        require_native::<T>(path, Container::Vec)?;
+        Self::open_impl(path)
+    }
+
+    fn open_impl(path: &Path) -> Result<Self, MmapError> {
         let file = std::fs::File::open(path).map_err(MmapError::Open)?;
+        // SAFETY: the mapping is read-only, and a file changed underneath
+        // a mapping is the documented hazard of every mmap reader here.
         let mmap = unsafe { Mmap::map(&file) }.map_err(MmapError::Mmap)?;
 
         if mmap.len() < 4 {
-            return Err(MmapError::InvalidFormat("file too small".into()));
-        }
-
-        let dim = i32::from_le_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]) as usize;
-        if dim == 0 {
-            return Err(MmapError::InvalidFormat("zero dimension".into()));
-        }
-
-        let entry_bytes = 4 + dim * elem_size; // 4-byte dim header + data
-        let count = mmap.len() / entry_bytes;
-
-        if mmap.len() % entry_bytes != 0 {
             return Err(MmapError::InvalidFormat(format!(
-                "file size {} is not a multiple of record size {}",
-                mmap.len(), entry_bytes
+                "{}: {} bytes is too short for a record header",
+                path.display(),
+                mmap.len()
             )));
         }
+
+        let dim = i32::from_le_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]);
+        if dim <= 0 {
+            return Err(MmapError::InvalidFormat(format!(
+                "{}: dimension {dim} is not positive",
+                path.display()
+            )));
+        }
+        let dim = dim as usize;
+        let entry_bytes = dim
+            .checked_mul(T::SIZE)
+            .and_then(|payload| payload.checked_add(4))
+            .ok_or_else(|| {
+                MmapError::InvalidFormat(format!("{}: a record of dimension {dim} overflows", path.display()))
+            })?;
+
+        if !mmap.len().is_multiple_of(entry_bytes) {
+            return Err(MmapError::InvalidFormat(format!(
+                "{}: file size {} is not a whole number of {entry_bytes}-byte records",
+                path.display(),
+                mmap.len()
+            )));
+        }
+        let count = mmap.len() / entry_bytes;
 
         Ok(Self { mmap, dim, count, entry_bytes, _phantom: PhantomData })
     }
 
     /// Vector dimension.
-    pub fn dim(&self) -> usize { self.dim }
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
 
     /// Total number of vectors.
-    pub fn count(&self) -> usize { self.count }
+    pub fn count(&self) -> usize {
+        self.count
+    }
 
-    /// Bytes per record (including 4-byte dimension header).
-    pub fn entry_bytes(&self) -> usize { self.entry_bytes }
+    /// Bytes per record, including the 4-byte dimension header.
+    pub fn entry_bytes(&self) -> usize {
+        self.entry_bytes
+    }
 
-    /// Zero-copy slice access to vector at `index`.
+    /// The bytes of record `index`'s elements, after its header.
+    fn payload(&self, index: usize) -> Option<&[u8]> {
+        if index >= self.count {
+            return None;
+        }
+        let start = index * self.entry_bytes + 4;
+        Some(&self.mmap[start..start + self.dim * T::SIZE])
+    }
+
+    /// The vector at `index`, borrowed from the mapping: `dim` elements
+    /// with no copy.
     ///
-    /// Returns a slice of `T` with `dim` elements. Panics if index is
-    /// out of bounds.
-    pub fn get_slice(&self, index: usize) -> &[T] {
-        assert!(index < self.count, "index {} out of bounds (count={})", index, self.count);
-        let offset = index * self.entry_bytes + 4; // skip dim header
-        let ptr = self.mmap[offset..].as_ptr() as *const T;
-        unsafe { std::slice::from_raw_parts(ptr, self.dim) }
+    /// `None` when `index` is out of bounds, and when the record does
+    /// not start on a `T` boundary — every record's payload sits 4
+    /// bytes after a multiple of the record size, so an 8-byte element
+    /// type is aligned only when the record size is a multiple of 8.
+    /// Read such a record with [`get`](Self::get) or
+    /// [`read_into`](Self::read_into).
+    pub fn get_slice(&self, index: usize) -> Option<&[T]> {
+        let bytes = self.payload(index)?;
+        if !aligned_for::<T>(bytes) {
+            return None;
+        }
+        // SAFETY: `bytes` is `dim * T::SIZE` bytes of the mapping, on a
+        // `T` boundary, and every `Element` is a plain number.
+        Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, self.dim) })
+    }
+
+    /// The vector at `index`, decoded into a new `Vec`. `None` when
+    /// `index` is out of bounds.
+    pub fn get(&self, index: usize) -> Option<Vec<T>> {
+        let bytes = self.payload(index)?;
+        Some(bytes.chunks_exact(T::SIZE).map(T::from_le_bytes).collect())
+    }
+
+    /// Read whole records from `start` into `out`, which must hold a
+    /// whole number of `dim`-element records. Returns how many records
+    /// were read: as many as fit, or as many as remain.
+    pub fn read_into(&self, start: usize, out: &mut [T]) -> Result<usize, MmapError> {
+        if !out.len().is_multiple_of(self.dim) {
+            return Err(MmapError::InvalidFormat(format!(
+                "a buffer of {} elements is not a whole number of {}-element records",
+                out.len(),
+                self.dim
+            )));
+        }
+        if start > self.count {
+            return Err(MmapError::OutOfBounds { index: start, count: self.count });
+        }
+        let records = (out.len() / self.dim).min(self.count - start);
+        for (i, chunk) in out.chunks_exact_mut(self.dim).take(records).enumerate() {
+            let bytes = self.payload(start + i).expect("within count");
+            decode_into(bytes, chunk);
+        }
+        Ok(records)
     }
 
     /// Hint the kernel to use sequential read-ahead.
     pub fn advise_sequential(&self) {
         #[cfg(target_os = "linux")]
+        // SAFETY: the pointer and length are the live mapping's.
         unsafe {
             libc::posix_madvise(
                 self.mmap.as_ptr() as *mut libc::c_void,
@@ -112,47 +168,67 @@ impl<T: Copy + 'static> MmapReader<T> {
     }
 }
 
+impl<T: Element> std::fmt::Debug for MmapReader<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmapReader")
+            .field("element", &T::TYPE)
+            .field("dim", &self.dim)
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
+}
+
 // ── Type-specific constructors ─────────────────────────────────────────
+//
+// Each is `MmapReader::<T>::open` with the type spelled in the name.
+// They predate the element model, which makes the one generic open
+// enough.
 
 impl MmapReader<f32> {
-    /// Open an fvec file (float32 vectors).
+    /// Open an `.fvecs` file; `MmapReader::<f32>::open` with the type in the name.
+    #[deprecated(note = "use `MmapReader::<f32>::open`")]
     pub fn open_fvec(path: &Path) -> Result<Self, MmapError> {
-        Self::open_impl(path, 4)
+        Self::open(path)
     }
 }
 
 impl MmapReader<i32> {
-    /// Open an ivec file (int32 vectors).
+    /// Open an `.ivecs` file; `MmapReader::<i32>::open` with the type in the name.
+    #[deprecated(note = "use `MmapReader::<i32>::open`")]
     pub fn open_ivec(path: &Path) -> Result<Self, MmapError> {
-        Self::open_impl(path, 4)
+        Self::open(path)
     }
 }
 
 impl MmapReader<half::f16> {
-    /// Open an mvec file (float16 vectors).
+    /// Open an `.mvecs` file; `MmapReader::<f16>::open` with the type in the name.
+    #[deprecated(note = "use `MmapReader::<f16>::open`")]
     pub fn open_mvec(path: &Path) -> Result<Self, MmapError> {
-        Self::open_impl(path, 2)
+        Self::open(path)
     }
 }
 
 impl MmapReader<f64> {
-    /// Open a dvec file (float64 vectors).
+    /// Open a `.dvecs` file; `MmapReader::<f64>::open` with the type in the name.
+    #[deprecated(note = "use `MmapReader::<f64>::open`")]
     pub fn open_dvec(path: &Path) -> Result<Self, MmapError> {
-        Self::open_impl(path, 8)
+        Self::open(path)
     }
 }
 
 impl MmapReader<u8> {
-    /// Open a bvec file (uint8 vectors, 1 byte per element).
+    /// Open a `.bvecs` file (one byte per element); `MmapReader::<u8>::open` with the type in the name.
+    #[deprecated(note = "use `MmapReader::<u8>::open`")]
     pub fn open_bvec(path: &Path) -> Result<Self, MmapError> {
-        Self::open_impl(path, 1)
+        Self::open(path)
     }
 }
 
 impl MmapReader<i16> {
-    /// Open an svec file (int16 vectors).
+    /// Open an `.svecs` file; `MmapReader::<i16>::open` with the type in the name.
+    #[deprecated(note = "use `MmapReader::<i16>::open`")]
     pub fn open_svec(path: &Path) -> Result<Self, MmapError> {
-        Self::open_impl(path, 2)
+        Self::open(path)
     }
 }
 
@@ -161,59 +237,69 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn write_fvec(path: &Path, vectors: &[Vec<f32>]) {
+    fn write_records<T: Element>(path: &Path, vectors: &[Vec<T>]) {
         let mut f = std::fs::File::create(path).unwrap();
+        let mut buf = vec![0u8; T::SIZE];
         for v in vectors {
             f.write_all(&(v.len() as i32).to_le_bytes()).unwrap();
             for &val in v {
-                f.write_all(&val.to_le_bytes()).unwrap();
-            }
-        }
-    }
-
-    fn write_ivec(path: &Path, vectors: &[Vec<i32>]) {
-        let mut f = std::fs::File::create(path).unwrap();
-        for v in vectors {
-            f.write_all(&(v.len() as i32).to_le_bytes()).unwrap();
-            for &val in v {
-                f.write_all(&val.to_le_bytes()).unwrap();
+                val.write_le_bytes(&mut buf);
+                f.write_all(&buf).unwrap();
             }
         }
     }
 
     #[test]
-    fn test_fvec_mmap_roundtrip() {
+    fn an_fvec_reads_back_through_every_access_path() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.fvec");
-        let data = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
-        write_fvec(&path, &data);
+        let data = vec![vec![1.0f32, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        write_records(&path, &data);
 
-        let reader = MmapReader::<f32>::open_fvec(&path).unwrap();
+        let reader = MmapReader::<f32>::open(&path).unwrap();
         assert_eq!(reader.dim(), 3);
         assert_eq!(reader.count(), 2);
-        assert_eq!(reader.get_slice(0), &[1.0, 2.0, 3.0]);
-        assert_eq!(reader.get_slice(1), &[4.0, 5.0, 6.0]);
+        assert_eq!(reader.get_slice(0), Some(&[1.0f32, 2.0, 3.0][..]));
+        assert_eq!(reader.get_slice(1), Some(&[4.0f32, 5.0, 6.0][..]));
+        assert_eq!(reader.get_slice(2), None);
+        assert_eq!(reader.get(1), Some(vec![4.0, 5.0, 6.0]));
+        assert_eq!(reader.get(2), None);
+        let mut out = [0f32; 6];
+        assert_eq!(reader.read_into(0, &mut out).unwrap(), 2);
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(reader.read_into(1, &mut out).unwrap(), 1);
+        assert_eq!(&out[..3], &[4.0, 5.0, 6.0]);
+        assert_eq!(reader.read_into(2, &mut out).unwrap(), 0);
+        assert!(matches!(reader.read_into(3, &mut out), Err(MmapError::OutOfBounds { index: 3, count: 2 })));
+        assert!(matches!(reader.read_into(0, &mut out[..4]), Err(MmapError::InvalidFormat(_))));
     }
 
     #[test]
-    fn test_ivec_mmap() {
+    fn an_ivec_reads_as_i32() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.ivec");
-        let data = vec![vec![10, 20], vec![30, 40]];
-        write_ivec(&path, &data);
+        write_records(&path, &[vec![10i32, 20], vec![30, 40]]);
 
-        let reader = MmapReader::<i32>::open_ivec(&path).unwrap();
+        let reader = MmapReader::<i32>::open(&path).unwrap();
         assert_eq!(reader.dim(), 2);
         assert_eq!(reader.count(), 2);
-        assert_eq!(reader.get_slice(0), &[10, 20]);
-        assert_eq!(reader.get_slice(1), &[30, 40]);
+        assert_eq!(reader.get_slice(0), Some(&[10, 20][..]));
+        assert_eq!(reader.get_slice(1), Some(&[30, 40][..]));
     }
 
     #[test]
-    fn test_empty_file_error() {
+    fn an_empty_file_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("empty.fvec");
         std::fs::File::create(&path).unwrap();
-        assert!(MmapReader::<f32>::open_fvec(&path).is_err());
+        assert!(matches!(MmapReader::<f32>::open(&path), Err(MmapError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn a_file_without_an_extension_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vectors");
+        write_records(&path, &[vec![1.0f32]]);
+        assert!(matches!(MmapReader::<f32>::open(&path), Err(MmapError::InvalidFormat(_))));
     }
 }

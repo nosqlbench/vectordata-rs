@@ -4,9 +4,10 @@
 //! Example: zero-copy random access via memory-mapped I/O.
 //!
 //! Demonstrates `MmapReader<f32>` for zero-copy, random-access reads on
-//! fvec files. This is the fastest way to access individual vectors.
+//! fvec files, and `read_into` for a run of records at once. The reader
+//! opens a file at the type its extension names and no other.
 
-use veks_io::xvec::mmap::MmapReader;
+use veks_io::MmapReader;
 
 fn main() -> Result<(), String> {
     let path = std::env::temp_dir().join("veks_io_mmap_example.fvec");
@@ -25,19 +26,26 @@ fn main() -> Result<(), String> {
     println!("Wrote {} vectors (dim={}) to {}", count, dim, path.display());
 
     // Open for zero-copy mmap access
-    let reader = MmapReader::<f32>::open_fvec(&path)
+    let reader = MmapReader::<f32>::open(&path)
         .map_err(|e| format!("mmap open: {}", e))?;
     println!("Mmap: count={}, dim={}", reader.count(), reader.dim());
 
-    // Random access — no copying, no allocation
-    let vec_0: &[f32] = reader.get_slice(0);
-    let vec_999: &[f32] = reader.get_slice(999);
+    // Random access — no copying, no allocation. `None` only for an
+    // index past the end, or a record that is not on an f32 boundary
+    // (never, for a 4-byte element behind a 4-byte header).
+    let vec_0: &[f32] = reader.get_slice(0).expect("record 0");
+    let vec_999: &[f32] = reader.get_slice(999).expect("record 999");
     println!("\nvec[0]   first 4 elements: {:?}", &vec_0[..4]);
     println!("vec[999] first 4 elements: {:?}", &vec_999[..4]);
 
+    // A run of records into one buffer: the bulk path.
+    let mut block = vec![0f32; dim as usize * 10];
+    let got = reader.read_into(990, &mut block).map_err(|e| e.to_string())?;
+    println!("read_into(990): {} records, last starts {:?}", got, &block[dim as usize * 9..dim as usize * 9 + 2]);
+
     // Compute L2 distance between two vectors
-    let a = reader.get_slice(0);
-    let b = reader.get_slice(1);
+    let a = reader.get_slice(0).expect("record 0");
+    let b = reader.get_slice(1).expect("record 1");
     let l2: f32 = a.iter().zip(b.iter())
         .map(|(x, y)| (x - y).powi(2))
         .sum::<f32>()
