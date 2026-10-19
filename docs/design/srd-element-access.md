@@ -874,4 +874,35 @@ Decided 2026-10-19:
 
 ## 15. Implementation
 
-(Recorded per step as each lands.)
+### 15.1 Step 1: `veks-datatypes` (2026-10-19)
+
+**Built:** `crates/veks-datatypes`, depending on `half` only, in the
+workspace's members and default members at the lockstep version.
+- `ElementType` (EA-1), `#[non_exhaustive]`, with `ALL`, `byte_width`,
+  `kind`, `is_integer`, `is_float`, `name`, `from_name`, `Display`;
+  `ElementKind`, `FloatFormat`, `Container`.
+- One extension table (EA-3), a `const` of 36 rows generated from
+  twelve lines, behind `extension`, `aliases`, `parse_extension` and
+  `from_extension`. A test proves no spelling is claimed twice and
+  every spelling round-trips.
+- `Element` (EA-4) for the twelve types, `Value`, `convert`,
+  `Overflow` (EA-5), `ElementConversion` with `is_allowed` and
+  `converts`, and `conversion_to` as a `const fn`. The table test is
+  the literal 12 × 12 matrix.
+- `dispatch_element!` (EA-6) binds a type alias per arm, so the body
+  names the type as `T`; a wildcard arm keeps it usable from crates
+  that see the enum as non-exhaustive.
+- `pub use half::{bf16, f16}` (EA-2).
+
+**Decided during the step: canonical and legacy spellings are both
+answered.** `extension()` is the typed spelling the data-model doc
+calls canonical (`f32vecs`), but every writer in the workspace emits
+the historical plural (`fvecs`, `ivecs`, `bvecs`, `svecs`, `mvecs`,
+`dvecs`), and the published datasets are named that way. Changing what
+writers emit would rename files on regeneration and move every
+dataset's content key. So `legacy_extension(container)` returns that
+spelling where one exists, and step 2's `VecFormat::preferred_extension`
+reads it first. The two are separate questions — what a file may be
+called, and what a new file is called — and the table answers both.
+
+**Tests:** 20 unit, 2 doc. `cargo doc` clean with warnings denied.

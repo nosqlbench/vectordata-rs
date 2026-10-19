@@ -1,0 +1,21 @@
+[package]
+name = "veks-datatypes"
+version = "3.0.4"
+edition = "2024"
+description = "The element model shared by vectordata and veks: element types, the one extension table, and the conversion rules between types"
+license = "Apache-2.0"
+homepage = "https://github.com/nosqlbench/vectordata-rs"
+repository = "https://github.com/nosqlbench/vectordata-rs"
+keywords = ["vector", "dataset", "bf16", "f16"]
+categories = ["data-structures", "encoding"]
+
+# A leaf crate: nothing here reads a file or opens a connection. It
+# exists so every reader in the workspace (and any program that uses
+# one) names element types, extensions and conversions the same way.
+[dependencies]
+# f16 and bf16 storage types. Both are re-exported, so a downstream
+# crate never needs its own `half` pin to name them.
+half = "2"
+
+[lints]
+workspace = true

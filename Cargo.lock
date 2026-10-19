@@ -6551,6 +6551,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "veks-datatypes"
+version = "3.0.4"
+dependencies = [
+ "half",
+]
+
+[[package]]
 name = "veks-io"
 version = "3.0.4"
 dependencies = [
