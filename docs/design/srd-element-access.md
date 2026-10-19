@@ -1,6 +1,6 @@
 # SRD — Element types and typed facet access
 
-**Status:** proposed 2026-10-19. Decisions in §14 were taken on
+**Status:** proposed 2026-10-19. Decisions in §15 were taken on
 2026-10-19. Not implemented.
 **Scope:** the element model shared by every crate in the workspace (a
 new `veks-datatypes` crate), the `vectordata` readers and the facet
@@ -846,13 +846,301 @@ rule note under selectors; §2.15 element interrogation through
 `open_facet_native`), `CHANGELOG.md` under `## Unreleased` (a
 "Breaking" subsection with the §12 table; Fixes for the width check,
 the typed-reader float zero, the two catalog defects, the veks-io
-validation), this SRD's §15 records and `**Status:**`.
+validation), this SRD's §16 records and `**Status:**`.
 
 **Done when** the sysref tables agree with `ElementType::ALL` and
 `StandardFacet::PREFERRED_ORDER`, and the requester is told what
 shipped and the defect-2 ruling — after the maintainer releases.
 
-## 14. Settled questions
+## 14. Testing plan and coverage
+
+### 14.1 Rules for every test in this SRD
+
+- **Guard first.** A test that exists to pin a fix is run against the
+  code before the step, its failure is pasted into the step's §16
+  record (the assertion and the old value), and only then does the
+  step land. A guard that passes on the old code is not a guard.
+- **One fixture layer.** `crates/vectordata/tests/support/fixtures.rs`
+  grows generic writers — `write_xvec::<T>(path, records, dim, f)`,
+  `write_column::<T>(path, values)`, `write_vvec::<T>`, and
+  `write_dataset_yaml(dir, profile_lines)` — and every new test
+  builds its files through them. The five doc examples use the same
+  byte layouts inline (hidden lines), since a doctest cannot reach
+  `tests/support`. veks-io's tests keep their own small writers; its
+  crate must not depend on vectordata's test tree.
+- **Stateless, local, under `target/test-tmp`.** `tempfile::tempdir()`
+  everywhere; no test needs the network; the HTTP cases reuse
+  `tests/support/testserver.rs` and are limited to the two paths that
+  differ remotely (`as_slice()` is `None` over HTTP; `ElementMismatch`
+  is raised before any byte is fetched).
+- **Names say the behaviour**, in the suite's sentence style
+  (`a_dvec_opened_as_f32_is_refused`), not the function under test.
+- **Flips are listed, not silent.** An existing test whose assertion
+  this SRD reverses is named below with the reason; it is rewritten in
+  the step that changes the rule, never deleted in passing.
+- **Deprecated surfaces keep their tests.** `tests/typed_access.rs` and
+  the `TypedReader` unit tests get `#![allow(deprecated)]` and run
+  unchanged; they are the regression suite for the migration note.
+
+### 14.2 Where the existing tests stand
+
+Counts are `#[test]` functions as of 2026-10-19. "Direct references"
+is an approximate grep over test code for the symbol; zero means no
+test names it, not that no test reaches it.
+
+| Area | File(s) | Tests | What they cover today | Gap against this SRD |
+|---|---|---|---|---|
+| Element types | `vectordata/src/typed_access.rs` | 9 | extension detection, u8/i32 native, u8→i32 widening, u8→i8 overflow, narrowing refused, bounds, empty | floats absent entirely; no test notices `read_native_value` returning 0 |
+| Typed scalar access | `vectordata/tests/typed_access.rs` | 32 | every integer native read, 7 widenings, 7 cross-sign cases, 4 narrowings, ivec record access, dataset-level open and dispatch | integers only; `get_native_slice` referenced once; nothing opens a float through it |
+| Raw readers | `vectordata/src/io.rs` | 14 | vvec sidecar sentinel rules, scalar extension set (**pins integers-only**: `the_scalar_extensions_are_exactly_the_integer_widths`), sharded reads across seams | `validate_element_for_source`, `VariableLengthRecords`, `prefetch_range`, `advise_sequential`: zero direct references; no test opens a file as the wrong width |
+| View and series | `vectordata/src/view.rs` | 27 | window parsing, range coalescing, offset-index handles (including the width check on a reused handle), file-cap eviction | nothing on `open_uniform`'s type dispatch; `facet()` on a non-f32 facet untested |
+| Sharded facets | `vectordata/tests/sharded_facets.rs` | 50 | series open/refuse, seam reads, windows, typed scalar series (`typed_access_reads_a_scalar_series`, `_sliced_series`), plans, derive, version gates | all at f32/i32/u32; the scalar-series tests go through `TypedReader` and must also pass through `facet_as` |
+| Series consumers | `vectordata/tests/series_consumers.rs` | 13 | derive over series, typed reader over series, native read on series | same: `TypedReader` path only |
+| Record facets | `vectordata/tests/record_facets.rs` | 23 | slab shape, `facet_shape`, the Elements/Records refusal both ways | unchanged by this SRD; the shape refusal must still fire through `open_facet_as_type` |
+| Facet spec | `vectordata/src/dataset/facet.rs`, `conformance.rs` | 20 + 7 | key/alias/code round trips, `classify`, format validity, series conformance | no float scalar format; no quant facets; `facet_role` and `derive_sized_profile` have zero direct references |
+| Explorer reader | `vectordata/src/explore/shared.rs` | 12 | clump/prefetch arithmetic, sorted mirror | nothing opens a file through `AnyVectorReader`; no f16 base test |
+| Group / knn dir | `vectordata/src/group.rs` | 15 | file URI, built entries, **knn directory picks the entry named after it, else the first** (`a_knn_entries_directory_opens_the_entry_named_after_it`, second half — flips in step 6), defaults base_url, local-first | the multi-entry ambiguity has no test because it was not an error |
+| Catalog content | `vectordata/src/catalog/source.rs`, `tests/catalog_knn_entries_fallback.rs` | 5 + 19 | built vs located equality, diagnostics, arbitrary yaml filenames, knn fallbacks | no test gives a `dataset.yaml` as catalog content; `parse_catalog_content` has zero direct references |
+| veks-io readers | `veks-io/src/xvec/mmap.rs`, `scalar/mmap.rs`, `lib.rs` | 3 + 6 + 31 | f32/i32 mmap round trips, empty file, scalar round trips and size checks, streaming round trips for every xvec type, `truncated_file_stops_gracefully`, `corrupted_dim_mid_file`, `mmap_truncated_file` | `xvec/reader.rs` and `scalar/reader.rs` have no unit tests of their own; no negative-dimension test; no alignment test; `open_dvec`/`open_bvec` zero direct references; `preferred_extension` zero |
+| veks-io formats | `veks-io/src/format.rs` | 21 | extension round trips, **scalar set pins integers-only** (`test_scalar_extensions`), detect, writability | no bf16; no float scalars |
+| veks-core facets | `veks-core/src/formats/facet.rs` | 14 | key/alias/code round trips, **`test_preferred_formats_by_element_size` pins the width-keyed rule** (flips in step 7) | the `metadata_indices` alias gap has no test because it was not noticed |
+| Pipeline element types | `veks-pipeline/src/pipeline/element_type.rs` | 9 | extension parsing (including `.f32` scalar), `is_float`, sizes, epsilon | `dispatch_reader!` has zero direct references, so its I8→u8 and U16→i16 opens were never observed |
+| `veks check` | `veks/src/check/profiles.rs`, `tests/check_and_import.rs` | 7 + 87 | version, selectors, tags, predicate groups; e2e import/check | no ground-truth cardinality or bounds test; `integrity.rs` has no unit tests (covered through e2e) |
+
+Three existing tests assert what this SRD reverses and are rewritten
+in their step: `the_scalar_extensions_are_exactly_the_integer_widths`
+(step 3: floats join), `test_scalar_extensions` in veks-io (step 2),
+`test_preferred_formats_by_element_size` (step 7: keyed by type), and
+the second half of `a_knn_entries_directory_opens_the_entry_named_
+after_it` (step 6: ambiguity is an error).
+
+### 14.3 Tests per step
+
+Each entry: guards (fail on the code before the step), behaviour
+(new surface), flips (existing tests rewritten), fixtures.
+
+**Step 1 — `veks-datatypes`** (landed; 20 unit, 2 doc):
+`the_conversion_table` (the literal matrix), `native_is_the_diagonal_
+and_cross_sign_is_symmetric`, `widening_is_exact_at_the_edges`,
+`cross_sign_checks_each_value`, `the_integer_to_float_boundary_is_the_
+significand`, `f16_and_bf16_never_convert_to_each_other`; the
+extension table round trips, aliases, uniqueness, unknowns; byte
+round trips and little-endian layout for all twelve; `from_value`
+range refusals; dispatch at every width.
+
+**Step 2 — veks-io.**
+- Guards: `a_negative_dimension_is_rejected` (header `-4`; old: `dim`
+  becomes `usize::MAX - 3`), `a_dimension_that_overflows_the_record_is_
+  rejected` (old: wrapping arithmetic), `a_truncated_file_is_rejected_by_
+  the_streaming_reader` (old: tail dropped), `a_misaligned_f64_record_
+  has_no_slice` (old: a misaligned `&[f64]`), `a_bvecs_file_does_not_open_
+  as_f32` (old: `Ok`).
+- Behaviour: `every_type_round_trips_through_mmap` (twelve types,
+  `get`, `get_slice`, `read_into`), `a_scalar_column_is_one_slice`
+  (`as_slice` equals the written column, every type), `bf16_vectors_
+  round_trip_through_the_writer`, `f32_columns_round_trip_through_the_
+  scalar_writer`, `the_deprecated_constructors_open_the_same_file`,
+  `vec_format_names_every_element_type_and_layout` (`of` × `element_
+  type` round trip over `ALL × Container`), `preferred_extension_keeps_
+  the_historical_spelling` (`Fvec` → `fvecs`, `Bf16vec` → `bf16vecs`).
+- Flips: `test_scalar_extensions` admits the float columns.
+- Fixtures: a `write_xvec<T>`/`write_column<T>` pair local to veks-io's
+  tests.
+
+**Step 3 — vectordata model and width check.**
+- Guards: `an_ivec_does_not_open_as_f32_by_path`, `an_fvec_does_not_open_
+  as_i32`, `a_dvec_opened_as_f32_is_a_mismatch_not_a_short_file`
+  (asserts `ElementMismatch { file: F64, requested: F32 }`; old:
+  `count() == 9`), `a_u32vvec_does_not_open_as_i32`, `a_float_column_is_
+  refused_by_the_typed_reader` (old: zeros), `open_vec_refuses_a_
+  column`, `dispatch_reader_opens_an_i8_file_as_i8` (in veks-pipeline;
+  old: `XvecReader<u8>`).
+- Behaviour: `bf16_and_the_float_columns_are_recognised_extensions`,
+  `a_float_column_has_its_own_facet_format` (`FacetFormat::from_
+  extension("f32") == FloatScalar`; `"i32"` stays `ScalarPacked`),
+  `the_facet_format_lists_derive_from_the_element_table` (every
+  `ALL × Container` spelling lands in exactly one `FacetFormat`),
+  `the_mismatch_error_names_both_types_and_the_reason`.
+- Flips: `the_scalar_extensions_are_exactly_the_integer_widths` →
+  `the_scalar_extensions_are_every_element_type`.
+- Fixtures: `write_xvec::<T>`, `write_column::<T>`, `write_vvec::<T>`,
+  `write_dataset_yaml` in `tests/support/fixtures.rs`; `write_fvec`
+  becomes `write_xvec::<f32>`.
+
+**Step 4 — the generic API** (new `tests/facet_as.rs`).
+- Guards: `an_f16_facet_widens_to_f32_with_the_right_count` (old:
+  `count() == 2` and garbage), `facet_refuses_an_index_facet` (old:
+  reinterpreted bits).
+- Behaviour, native: `a_u8_facet_reads_in_place` (`conversion() ==
+  Native`, `native_element_type() == Some(U8)`, `as_slice().len() ==
+  count()`, `get_slice(i)` per element), `a_bf16_facet_reads_in_place`
+  (`get_slice` `Some`), `an_i32_index_facet_reads_in_place_as_i32`,
+  `base_vectors_equals_base_vectors_as_f32_on_a_windowed_profile`, the
+  same `_on_a_sharded_profile`.
+- Behaviour, converting: `a_u8_facet_widens_to_u16_i32_and_f32`
+  (`get_slice() == None`, values exact), `a_bf16_facet_widens_to_f32_
+  exactly` (per-element `to_f32`), `a_u8_facet_as_i8_reports_the_first_
+  overflow_by_ordinal` (`get` and `read_into` both), `an_i32_index_facet_
+  as_u32_fails_on_a_negative_sentinel`, `neighbor_indices_as_i64_equals_
+  neighbor_indices`.
+- Behaviour, refused: `an_f32_facet_as_u8_is_a_mismatch`, `an_f16_facet_
+  as_bf16_is_a_mismatch`, `into_typed_at_the_wrong_type_is_a_mismatch`.
+- Behaviour, columns and series: `a_scalar_series_reads_through_facet_
+  as` (the `sharded_facets.rs:407` fixture: `count() == 175`, `read_
+  into` across the seam, `as_slice() == None`), `a_sliced_scalar_series_
+  maps_ordinal_10` (`:445`), `a_window_over_a_column_is_a_sub_slice`
+  (`codes.u8[2..6)`), `a_remote_column_has_no_slice` (testserver).
+- Behaviour, dispatch: `open_facet_native_names_the_files_type`,
+  `the_extension_trait_works_on_a_dyn_view` (compile-level: a fn over
+  `&Arc<dyn TestDataView>` importing only `TestDataViewExt`), `a_record_
+  facet_is_still_refused_as_elements` (shape check through the new
+  path), `open_vec_as_widens_a_raw_file`, `the_explorer_opens_an_f16_and_
+  a_bf16_base`.
+- Doc tests (five, each a plain fenced block): `base_vectors_as`
+  (native, window, `read_into`), `facet_as` (u8 codes zero-copy),
+  `facet_as` (bf16 native then widened), `neighbor_indices_as` (bounds
+  against `base_count`), `IoError::ElementMismatch` (the refusal).
+- Flips: none; `tests/typed_access.rs` gets `#![allow(deprecated)]`.
+- Also: `tests/discoverability.rs` must stay green — the new modules
+  carry the `Library API.` first line and print nothing.
+
+**Step 5 — quantized corpora.**
+- Guards: none fail on old code (new surface); the cardinality checks
+  are proven by construction below.
+- Behaviour: `a_quantized_profile_opens_as_one_base` (`QuantizedBase<u8>`
+  with `Some` slices equal to the written columns and `scheme.codes ==
+  U8`), `quantized_base_at_the_wrong_code_type_is_a_mismatch`, `a_short_
+  quant_sum_is_a_cardinality_error` (at open, naming the facet and both
+  counts), `a_sized_profile_windows_the_columns_with_the_base`, `the_
+  renderer_writes_the_quant_facets_after_the_base_and_parses_back`,
+  `conformance_refuses_an_integer_scale` (`quant_scale.i32`), `the_
+  quantization_attribute_round_trips_through_serde` (every granularity,
+  `codes` as a name); in `veks check`: `columns_without_the_attribute_
+  are_reported`, `the_attribute_without_columns_is_reported`, `a_column_
+  count_that_disagrees_with_the_base_is_reported`, `a_consistent_
+  quantized_dataset_passes`.
+- Fixtures: `write_quantized_profile(dir, n, dim)` in
+  `tests/support/fixtures.rs` building codes and the three columns.
+
+**Step 6 — catalog defects.**
+- Guards: `a_dataset_yaml_as_catalog_content_lists_one_dataset` (old:
+  entries `profiles` and `attributes`), `a_dataset_yaml_at_a_catalog_
+  path_lists_one_dataset` (through `--at`/`LocatedCatalog`; old: the
+  same two), `a_knn_directory_with_two_entries_and_no_match_is_
+  ambiguous` (old: opens the first).
+- Behaviour: `a_knn_directory_with_one_entry_opens_it`, `the_ambiguity_
+  names_the_directory_and_every_entry`.
+- Flips: the second half of `a_knn_entries_directory_opens_the_entry_
+  named_after_it` becomes the ambiguity guard; `test_data_group_picks_
+  dataset_matching_directory_name` is unchanged.
+
+**Step 7 — pipeline and veks-core consolidation.**
+- Guards: `preferred_vec_format_is_keyed_by_type` (`I8` → `I8vec`,
+  `U16` → `U16vec`; old: `Bvec`, `Svec`), `metadata_indices_resolves_in_
+  veks_core` (old: `None`).
+- Behaviour: the existing pipeline, veks and veks-core suites (the arm
+  changes are mechanical); `the_pipeline_element_type_is_the_shared_one`
+  (type identity: `veks_pipeline::pipeline::ElementType` is
+  `veks_datatypes::ElementType`), `bf16_is_a_float_without_simd_distance`.
+- Flips: `test_preferred_formats_by_element_size` → by type.
+
+**Step 8 — ground truth in `veks check`.**
+- Behaviour: `an_index_at_the_base_count_is_reported_with_its_ordinal`,
+  `a_ground_truth_with_more_rows_than_queries_is_reported`, `distances_
+  whose_rows_differ_from_the_indices_are_reported`, `a_sparse_post_
+  filtered_truth_allows_minus_one`, `a_pre_filtered_truth_does_not`,
+  `the_scan_reports_progress` (the reporter sees a progress line on a
+  fixture large enough to cross the cadence, with the cadence lowered
+  through the existing knob rather than a large file).
+
+**Step 9 — docs.** `cargo test --doc` across the published crates with
+warnings denied; the sysref tables are checked by two small tests:
+`the_element_table_in_the_docs_matches_ALL` (parses the §1.2 rows and
+compares with `ElementType::ALL × Container`) and `the_facet_table_in_
+the_docs_matches_PREFERRED_ORDER`.
+
+### 14.4 Requirement to test
+
+| Requirement | Tests |
+|---|---|
+| EA-1, EA-2 | `every_type_has_a_row_per_container_and_round_trips`, `bf16_is_not_f16_and_not_u16`, `names_round_trip_and_widths_match_the_kind`, `little_endian_is_the_encoding` |
+| EA-3 | `canonical_spellings_are_the_type_name_plus_the_layout`, `the_historical_letters_name_the_types_they_always_did`, `no_spelling_is_claimed_twice`, `unknown_and_ambiguous_spellings_are_none` |
+| EA-4 | `bytes_round_trip_for_every_type`, `integers_refuse_what_does_not_fit`, `floats_take_integers_exactly_where_they_fit`, `values_and_f64_agree` |
+| EA-5 | `the_conversion_table`, `native_is_the_diagonal_and_cross_sign_is_symmetric`, `widening_is_exact_at_the_edges`, `cross_sign_checks_each_value`, `the_integer_to_float_boundary_is_the_significand`, `f16_and_bf16_never_convert_to_each_other` |
+| EA-6 | `dispatch_reaches_every_type_at_its_own_width`, the `dispatch_element!` doc test |
+| EA-7 | the existing suites compiling under the blanket traits; `tests/typed_access.rs` under `allow(deprecated)` |
+| EA-8 | `a_u8_facet_reads_in_place`, `a_u8_facet_widens_to_u16_i32_and_f32`, `a_window_over_a_column_is_a_sub_slice`, `a_remote_column_has_no_slice` |
+| EA-9 | `a_scalar_column_is_one_slice` (veks-io), `a_scalar_series_reads_through_facet_as`, `a_sliced_scalar_series_maps_ordinal_10`, `open_vec_refuses_a_column` |
+| EA-10 | `a_u8_facet_as_i8_reports_the_first_overflow_by_ordinal`, `an_i32_index_facet_as_u32_fails_on_a_negative_sentinel`, `a_bf16_facet_widens_to_f32_exactly` |
+| EA-11 | `an_ivec_does_not_open_as_f32_by_path`, `an_fvec_does_not_open_as_i32`, `a_dvec_opened_as_f32_is_a_mismatch_not_a_short_file`, `a_u32vvec_does_not_open_as_i32`, `the_mismatch_error_names_both_types_and_the_reason` |
+| EA-12 | `open_facet_native_names_the_files_type`, `into_typed_at_the_wrong_type_is_a_mismatch` |
+| EA-13 | `open_vec_as_widens_a_raw_file`, `the_explorer_opens_an_f16_and_a_bf16_base` |
+| EA-14 | `a_float_column_is_refused_by_the_typed_reader`; the deprecated suite unchanged |
+| EA-15, EA-16 | `the_extension_trait_works_on_a_dyn_view`, `base_vectors_equals_base_vectors_as_f32_*`, `neighbor_indices_as_i64_equals_neighbor_indices` |
+| EA-17 | `a_record_facet_is_still_refused_as_elements`, `an_f32_facet_as_u8_is_a_mismatch`, `an_f16_facet_as_bf16_is_a_mismatch` |
+| EA-18 | `facet_refuses_an_index_facet`, `an_f16_facet_widens_to_f32_with_the_right_count` |
+| EA-19 | the sharded and series suites at every type; `a_scalar_series_reads_through_facet_as` |
+| EA-20 | `a_float_column_has_its_own_facet_format`, `the_facet_format_lists_derive_from_the_element_table` |
+| EA-21 | `bf16_and_the_float_columns_are_recognised_extensions`; `the_element_table_in_the_docs_matches_ALL` |
+| EA-22 | `vec_format_names_every_element_type_and_layout`, `preferred_extension_keeps_the_historical_spelling`, `bf16_vectors_round_trip_through_the_writer`, `f32_columns_round_trip_through_the_scalar_writer` |
+| EA-23 | `the_renderer_writes_the_quant_facets_after_the_base_and_parses_back`, `a_sized_profile_windows_the_columns_with_the_base`, `conformance_refuses_an_integer_scale` |
+| EA-24 | `the_quantization_attribute_round_trips_through_serde` |
+| EA-25 | `a_quantized_profile_opens_as_one_base`, `quantized_base_at_the_wrong_code_type_is_a_mismatch`, `a_short_quant_sum_is_a_cardinality_error` |
+| EA-26 | the four `veks check` quantization tests |
+| EA-28 | the five veks-io guards, `every_type_round_trips_through_mmap`, `the_deprecated_constructors_open_the_same_file` |
+| EA-29 | `a_scalar_column_is_one_slice` |
+| EA-31 | `dispatch_reader_opens_an_i8_file_as_i8`, `the_pipeline_element_type_is_the_shared_one`, `bf16_is_a_float_without_simd_distance` |
+| EA-32 | `preferred_vec_format_is_keyed_by_type`, `metadata_indices_resolves_in_veks_core` |
+| EA-33 | the six step-8 tests |
+| EA-34 | the three step-6 guards and two behaviour tests |
+
+EA-27 and EA-30 are non-goals stated as requirements and have no test.
+
+### 14.5 Measured coverage
+
+`cargo-llvm-cov` 0.9.1 with the `llvm-tools` component was installed
+on 2026-10-19 (the maintainer's call). The baseline and the per-step
+comparison are:
+
+```
+RUSTFLAGS="-C debuginfo=1" cargo llvm-cov --workspace \
+  --exclude veks-studies --exclude tools --exclude vectordata-rs \
+  --lcov --output-path target/coverage/<step>.lcov
+```
+
+**`RUSTFLAGS` must be set.** `.cargo/config.toml` links every binary
+with mold, and mold 1.0.3 drops the profile runtime's section symbols:
+the instrumented binaries run, pass, and write no profile data (one
+`.profraw` with zero functions for the whole workspace; every file
+reported at 0%). Any `RUSTFLAGS` value replaces the config's
+`rustflags`, which takes mold out of the link; `-C debuginfo=1` is a
+harmless one. The flag is noted here rather than fixed in the config
+because mold is the right linker for every other build.
+
+Per-file numbers come from the lcov file (`SF`/`LF`/`LH`/`FNF`/`FNH`
+records), since `cargo llvm-cov report` cannot take the `--exclude`
+list.
+
+Targets this SRD holds itself to, by file, line coverage from the
+crate's own tests:
+- `veks-datatypes`: every line of `conversion.rs` and
+  `element_type.rs` (the tables are the product).
+- `vectordata/src/io.rs`: every open path (`open`, `open_path`,
+  `require_native`), `ScalarReader`, `ConvertingReader::read_into`
+  including the overflow branch, `AnyVectorReader::into_typed` both
+  outcomes.
+- `vectordata/src/view.rs`: `open_uniform` on all four conversions,
+  `open_any_native` on every type (through the twelve-type facet
+  fixture), `open_facet_as_type`'s default body.
+- `veks-io/src/xvec/mmap.rs` and `scalar/mmap.rs`: every validation
+  branch.
+- `veks/src/check/profiles.rs`: every new report line.
+
+Until the tool is present, the proxy is §14.4: every requirement names
+the tests that exercise it, and every guard's failure on the old code
+is recorded in §16.
+
+## 15. Settled questions
 
 Decided 2026-10-19:
 - **Where the model lives:** a new crate, `veks-datatypes`, not
@@ -872,9 +1160,9 @@ Decided 2026-10-19:
   requester asked that narrowing be refused at open, and a conversion
   that silently loses precision is a narrowing by another name.
 
-## 15. Implementation
+## 16. Implementation
 
-### 15.1 Step 1: `veks-datatypes` (2026-10-19)
+### 16.1 Step 1: `veks-datatypes` (2026-10-19)
 
 **Built:** `crates/veks-datatypes`, depending on `half` only, in the
 workspace's members and default members at the lockstep version.
