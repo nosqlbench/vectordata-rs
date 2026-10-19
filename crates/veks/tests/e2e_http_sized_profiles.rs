@@ -17,7 +17,7 @@
 //!    `profiles/{name}/...` — not inherited from the default profile.
 //! 3. The per-profile ground-truth files actually exist on disk.
 //! 4. They are fetchable over HTTP through
-//!    `TestDataGroup::load(http_url)` → `profile(name).neighbor_indices()`.
+//!    `TestDataGroup::load(http_url)` → `profile(name).neighbor_indices_as::<i32>()`.
 //! 5. Every neighbour index is in-range for the profile's `base_count`
 //!    — the "sized-range top-K mistakenly derived from the full-range
 //!    top-K" bug that burned us earlier.
@@ -34,6 +34,7 @@ use veks::prepare::import::ImportArgs;
 
 mod support;
 use support::testserver::TestServer;
+use vectordata::TestDataViewExt;
 
 #[path = "support/catalog_mirror.rs"]
 mod catalog_mirror;
@@ -343,7 +344,7 @@ fn e2e_sized_profiles_published_and_fetchable_over_http() {
         let view = group.profile(sized)
             .unwrap_or_else(|| panic!("profile '{}' not found over HTTP", sized));
 
-        let indices = view.neighbor_indices()
+        let indices = view.neighbor_indices_as::<i32>()
             .unwrap_or_else(|e| panic!("open neighbor_indices for {}: {:?}", sized, e));
         assert_eq!(
             indices.count(), q_count,
@@ -375,14 +376,14 @@ fn e2e_sized_profiles_published_and_fetchable_over_http() {
         }
 
         // Distances come back over HTTP too and have the same shape.
-        let dists = view.neighbor_distances()
+        let dists = view.neighbor_distances_as::<f32>()
             .unwrap_or_else(|e| panic!("open neighbor_distances for {}: {:?}", sized, e));
         assert_eq!(dists.count(), q_count);
         assert_eq!(dists.dim(), k);
 
         // ── Client-side window enforcement ─────────────────────────
         // The whole point of the sub-ordinal suffix model is that
-        // `view.base_vectors()` returns a reader clipped to the
+        // `view.base_vectors_as::<f32>()` returns a reader clipped to the
         // profile's window — consumers shouldn't have to remember
         // `view.base_count()` and clamp manually. Verify both:
         //   - count() reports the windowed length (base_count).
@@ -390,7 +391,7 @@ fn e2e_sized_profiles_published_and_fetchable_over_http() {
         //   - get(N) for N inside the window returns the same data
         //     as default's underlying file at that ordinal (proves
         //     it's a windowed view of the SAME file, not a copy).
-        let base = view.base_vectors()
+        let base = view.base_vectors_as::<f32>()
             .unwrap_or_else(|e| panic!("open base_vectors for {}: {:?}", sized, e));
         assert_eq!(
             base.count() as u64, base_count,
@@ -405,7 +406,7 @@ fn e2e_sized_profiles_published_and_fetchable_over_http() {
         );
         // In-window reads must succeed and match default's file.
         let default_view = group.profile("default").expect("default profile");
-        let default_base = default_view.base_vectors().expect("default base_vectors");
+        let default_base = default_view.base_vectors_as::<f32>().expect("default base_vectors");
         for &probe in &[0usize, 1, (base_count as usize / 2)] {
             if probe >= base_count as usize { continue; }
             let from_sized = base.get(probe)
@@ -431,7 +432,7 @@ fn e2e_sized_profiles_published_and_fetchable_over_http() {
     // full base (post-zero, post-dedup) in its address space.
     let default_view = group.profile("default")
         .expect("default profile over HTTP");
-    let default_idx = default_view.neighbor_indices()
+    let default_idx = default_view.neighbor_indices_as::<i32>()
         .expect("open default neighbor_indices");
     assert_eq!(default_idx.count(), q_count);
     assert_eq!(default_idx.dim(), k);

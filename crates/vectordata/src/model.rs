@@ -282,6 +282,9 @@ fn project_profile(p: &crate::dataset::DSProfile) -> ProfileConfig {
         metadata_predicates: facet("metadata_predicates"),
         predicate_results: facet("metadata_results"),
         metadata_layout: facet("metadata_layout"),
+        quant_scale: facet("quant_scale"),
+        quant_zero_point: facet("quant_zero_point"),
+        quant_sum: facet("quant_sum"),
     }
 }
 
@@ -453,6 +456,15 @@ pub struct ProfileConfig {
     pub predicate_results: Option<FacetConfig>,
     /// Metadata layout describing the field schema.
     pub metadata_layout: Option<FacetConfig>,
+
+    // -- Quantization parameters of a quantized base --
+
+    /// Per-vector scale (`quant_scale`), a float column.
+    pub quant_scale: Option<FacetConfig>,
+    /// Per-vector zero point (`quant_zero_point`), an integer column.
+    pub quant_zero_point: Option<FacetConfig>,
+    /// Per-vector code sum (`quant_sum`), an integer column.
+    pub quant_sum: Option<FacetConfig>,
 }
 
 impl ProfileConfig {
@@ -478,6 +490,9 @@ impl ProfileConfig {
             ("metadata_predicates", &self.metadata_predicates),
             ("metadata_results", &self.predicate_results),
             ("metadata_layout", &self.metadata_layout),
+            ("quant_scale", &self.quant_scale),
+            ("quant_zero_point", &self.quant_zero_point),
+            ("quant_sum", &self.quant_sum),
         ]
         .into_iter()
         .filter_map(|(name, slot)| slot.as_ref().map(|f| (name, f)))

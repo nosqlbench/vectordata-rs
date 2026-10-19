@@ -48,6 +48,7 @@ pub fn check(dataset_files: &[PathBuf]) -> CheckResult {
             ));
         }
         check_profiles(&config, ds_dir, &ds_rel, tagged, &mut failures, &mut notes);
+        check_quantization(&config, ds_dir, &ds_rel, &mut failures);
         check_layers(&config, ds_dir, &ds_rel, tagged, &mut failures, &mut notes);
     }
     if failures.is_empty() {
@@ -312,6 +313,116 @@ fn check_layers(
     }
 }
 
+/// EA-26: a quantized base travels with its three parameter columns
+/// and the scheme that applies them, and every column holds one value
+/// per base vector.
+fn check_quantization(
+    config: &vectordata::dataset::DatasetConfig,
+    ds_dir: &Path,
+    ds_rel: &str,
+    failures: &mut Vec<String>,
+) {
+    use vectordata::dataset::{Quantization, StandardFacet};
+    let group = &config.profiles;
+    let relpath = |v: &vectordata::dataset::DSView| -> String {
+        vectordata::dataset::catalog::strip_window_suffix(&v.source.path)
+            .trim_start_matches("./")
+            .to_string()
+    };
+    let count_of = |rel: &str| -> Option<Result<usize, String>> {
+        let path = ds_dir.join(rel);
+        if !path.exists() || rel.contains("NNNN") {
+            return None;
+        }
+        Some(
+            vectordata::io::open_vec_native(&path.to_string_lossy())
+                .map(|r| r.count())
+                .map_err(|e| e.to_string()),
+        )
+    };
+    for name in group.profiles.keys() {
+        if group.layered && group.is_layer(name) {
+            continue;
+        }
+        let present: Vec<&str> = StandardFacet::QUANT
+            .iter()
+            .map(|f| f.key())
+            .filter(|key| group.effective_view(name, key).is_some())
+            .collect();
+        let attribute = group
+            .profiles
+            .get(name)
+            .and_then(|p| p.attributes.get("quantization"))
+            .or_else(|| config.attributes.as_ref().and_then(|a| a.other.get("quantization")));
+        if present.is_empty() && attribute.is_none() {
+            continue;
+        }
+        if !present.is_empty() && present.len() != StandardFacet::QUANT.len() {
+            failures.push(format!(
+                "{ds_rel}: profile '{name}' declares {} of the three quantization columns ({}); \
+                 quant_scale, quant_zero_point and quant_sum travel together (EA-26)",
+                present.len(),
+                present.join(", ")
+            ));
+        }
+        let scheme = match attribute {
+            None => {
+                failures.push(format!(
+                    "{ds_rel}: profile '{name}' holds quantization columns but no `quantization` \
+                     attribute states the scheme (EA-26)"
+                ));
+                None
+            }
+            Some(value) => match Quantization::from_value(value) {
+                Ok(q) => Some(q),
+                Err(e) => {
+                    failures.push(format!(
+                        "{ds_rel}: profile '{name}': the quantization attribute does not parse: {e} (EA-26)"
+                    ));
+                    None
+                }
+            },
+        };
+        if present.is_empty() {
+            failures.push(format!(
+                "{ds_rel}: profile '{name}' states a quantization scheme but declares no \
+                 quantization columns (EA-26)"
+            ));
+            continue;
+        }
+        let Some(base) = group.effective_view(name, "base_vectors") else {
+            failures.push(format!(
+                "{ds_rel}: profile '{name}' holds quantization columns but no base_vectors to \
+                 describe (EA-26)"
+            ));
+            continue;
+        };
+        let base_rel = relpath(base);
+        if let Some(q) = &scheme
+            && let Some(ty) = vectordata::ElementType::from_extension(base_rel.rsplit('.').next().unwrap_or(""))
+            && ty != q.codes
+        {
+            failures.push(format!(
+                "{ds_rel}: profile '{name}' quantization codes are {} but base_vectors {base_rel} \
+                 holds {ty} (EA-26)",
+                q.codes
+            ));
+        }
+        let Some(Ok(base_count)) = count_of(&base_rel) else { continue };
+        for key in present {
+            let rel = relpath(group.effective_view(name, key).expect("present"));
+            match count_of(&rel) {
+                Some(Ok(n)) if n != base_count => failures.push(format!(
+                    "{ds_rel}: profile '{name}' {key} {rel} holds {n} values for {base_count} base \
+                     vectors (EA-26)"
+                )),
+                Some(Err(e)) => failures.push(format!("{ds_rel}: profile '{name}' {key} {rel}: {e} (EA-26)")),
+                _ => {}
+            }
+        }
+    }
+}
+
 fn slab_rows(path: &Path) -> Option<u64> {
     slabtastic::SlabReader::open(path).ok().map(|r| r.total_records())
 }
@@ -377,6 +488,90 @@ mod tests {
         let p = dir.join("dataset.yaml");
         std::fs::write(&p, yaml).unwrap();
         p
+    }
+
+    /// A u8 base of `n` vectors of dimension 2 and three columns of
+    /// `scale`, `zp` and `sum` values beside it.
+    fn quantized_files(dir: &Path, n: usize, scale: usize, zp: usize, sum: usize) {
+        let mut base = Vec::new();
+        for i in 0..n {
+            base.extend_from_slice(&2i32.to_le_bytes());
+            base.extend_from_slice(&[i as u8, (i * 2) as u8]);
+        }
+        std::fs::write(dir.join("base_vectors.bvecs"), base).unwrap();
+        let f32s = |k: usize| (0..k).flat_map(|i| (i as f32 * 0.5).to_le_bytes()).collect::<Vec<u8>>();
+        let i32s = |k: usize| (0..k).flat_map(|i| (i as i32).to_le_bytes()).collect::<Vec<u8>>();
+        std::fs::write(dir.join("quant_scale.f32"), f32s(scale)).unwrap();
+        std::fs::write(dir.join("quant_zero_point.i32"), i32s(zp)).unwrap();
+        std::fs::write(dir.join("quant_sum.i32"), i32s(sum)).unwrap();
+    }
+
+    const QUANT_ATTR: &str = "attributes:\n  quantization:\n    scheme: affine\n    granularity: per-vector\n    codes: u8\n    range: [0, 255]\n";
+    const QUANT_VIEWS: &str = "    base_vectors: base_vectors.bvecs\n    quant_scale: quant_scale.f32\n    quant_zero_point: quant_zero_point.i32\n    quant_sum: quant_sum.i32\n";
+
+    /// **A consistent quantized dataset passes** (EA-26): three
+    /// columns, one value per base vector, and the scheme beside them.
+    #[test]
+    fn a_consistent_quantized_dataset_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        quantized_files(tmp.path(), 5, 5, 5, 5);
+        let p = dataset(tmp.path(), &format!("format_version: 1\nname: q\n{QUANT_ATTR}profiles:\n  default:\n{QUANT_VIEWS}"));
+        let r = check(&[p]);
+        assert!(r.passed, "{:?}", r.messages);
+    }
+
+    /// **Columns without the attribute are reported**, as is an
+    /// incomplete set of columns.
+    #[test]
+    fn columns_without_the_attribute_are_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        quantized_files(tmp.path(), 5, 5, 5, 5);
+        let p = dataset(tmp.path(), &format!("format_version: 1\nname: q\nprofiles:\n  default:\n{QUANT_VIEWS}"));
+        let r = check(std::slice::from_ref(&p));
+        assert!(!r.passed);
+        assert!(r.messages.iter().any(|m| m.contains("no `quantization` attribute")), "{:?}", r.messages);
+
+        dataset(
+            tmp.path(),
+            &format!("format_version: 1\nname: q\n{QUANT_ATTR}profiles:\n  default:\n    base_vectors: base_vectors.bvecs\n    quant_scale: quant_scale.f32\n"),
+        );
+        let r = check(&[p]);
+        assert!(!r.passed);
+        assert!(r.messages.iter().any(|m| m.contains("1 of the three quantization columns")), "{:?}", r.messages);
+    }
+
+    /// **The attribute without columns is reported**, and so is a
+    /// scheme whose code type is not the base's.
+    #[test]
+    fn the_attribute_without_columns_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        quantized_files(tmp.path(), 5, 5, 5, 5);
+        let p = dataset(tmp.path(), &format!("format_version: 1\nname: q\n{QUANT_ATTR}profiles:\n  default:\n    base_vectors: base_vectors.bvecs\n"));
+        let r = check(std::slice::from_ref(&p));
+        assert!(!r.passed);
+        assert!(r.messages.iter().any(|m| m.contains("declares no quantization columns")), "{:?}", r.messages);
+
+        let wrong = QUANT_ATTR.replace("codes: u8", "codes: i8");
+        dataset(tmp.path(), &format!("format_version: 1\nname: q\n{wrong}profiles:\n  default:\n{QUANT_VIEWS}"));
+        let r = check(&[p]);
+        assert!(!r.passed);
+        assert!(r.messages.iter().any(|m| m.contains("codes are i8 but base_vectors")), "{:?}", r.messages);
+    }
+
+    /// **A column whose count disagrees with the base is reported**,
+    /// naming the column, its count and the base count.
+    #[test]
+    fn a_column_count_that_disagrees_with_the_base_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        quantized_files(tmp.path(), 5, 5, 4, 5);
+        let p = dataset(tmp.path(), &format!("format_version: 1\nname: q\n{QUANT_ATTR}profiles:\n  default:\n{QUANT_VIEWS}"));
+        let r = check(&[p]);
+        assert!(!r.passed);
+        assert!(
+            r.messages.iter().any(|m| m.contains("quant_zero_point quant_zero_point.i32 holds 4 values for 5 base vectors")),
+            "{:?}",
+            r.messages
+        );
     }
 
     /// **An unversioned dataset.yaml is refused** (V-25), and one below

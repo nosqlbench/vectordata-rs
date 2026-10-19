@@ -349,6 +349,19 @@ pub enum Error {
     /// A required facet (e.g., `base_vectors`) is not defined in the profile.
     #[error("Required facet not defined: {0}")]
     MissingFacet(String),
+    /// A facet that must hold one record per record of another holds
+    /// a different number: a quantization column against its base.
+    #[error("facet '{facet}' holds {found} records where {expected} were expected, one per record of '{against}'")]
+    FacetCardinality {
+        /// The facet with the wrong count.
+        facet: String,
+        /// The facet it must match.
+        against: String,
+        /// The count it must have.
+        expected: usize,
+        /// The count it has.
+        found: usize,
+    },
     /// The facet was opened through a reader for the wrong shape.
     ///
     /// Not a missing capability: the facet is readable, through the

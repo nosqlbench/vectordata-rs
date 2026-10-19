@@ -333,6 +333,27 @@ profiles:
         assert!(!err.iter().any(|v| v.key == "query_vectors"));
     }
 
+    /// The quantization columns are typed: a scale is a float column,
+    /// a zero point and a sum are integer columns, and nothing else.
+    #[test]
+    fn quantization_columns_are_typed() {
+        let bad: DatasetConfig = serde_yaml::from_str(
+            "name: q\nprofiles:\n  default:\n    base_vectors: base_vectors.bvecs\n    \
+             quant_scale: quant_scale.i32\n    quant_zero_point: quant_zero_point.f32\n    quant_sum: quant_sum.i32\n",
+        )
+        .unwrap();
+        let err = validate_conformance(&bad).expect_err("two mistyped columns");
+        assert_eq!(err.len(), 2, "{err:?}");
+        assert!(err.iter().any(|v| v.key == "quant_scale" && v.detail.contains("ScalarPacked")));
+        assert!(err.iter().any(|v| v.key == "quant_zero_point" && v.detail.contains("FloatScalar")));
+        let good: DatasetConfig = serde_yaml::from_str(
+            "name: q\nprofiles:\n  default:\n    base_vectors: base_vectors.bvecs\n    \
+             quant_scale: quant_scale.f32\n    quant_zero_point: quant_zero_point.i32\n    quant_sum: quant_sum.i32\n",
+        )
+        .unwrap();
+        validate_conformance(&good).expect("float scale, integer zero point and sum");
+    }
+
     /// The legacy `metadata_indices` alias resolves to `metadata_results`
     /// and validates against that facet's permitted formats.
     #[test]

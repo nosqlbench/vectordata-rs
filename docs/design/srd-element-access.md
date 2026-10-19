@@ -1545,12 +1545,81 @@ of `tests/element_model.rs`, every other integration suite unchanged,
 the changed files; the workspace compiles.
 
 **Coverage after the step** (the §14.5 command, whole workspace:
-75.6% → 75.6%; baseline → after, lines, then functions after). The
+75.6% → 75.7%; baseline → after, lines, then functions after). The
 veks-pipeline, veks, veks-core and vecd suites: 1,583 passed, 0 failed.
 
 | File | Baseline | After | Functions |
 |---|---|---|---|
-| `vectordata/src/io.rs` | 82.9% | 80.8% (985/1219) | 79.7% (145/182) |
-| `vectordata/src/view.rs` | 84.7% | 83.1% (2055/2474) | 71.7% (258/360) |
+| `vectordata/src/io.rs` | 82.9% | 87.4% (1065/1219) | 89.0% (162/182) |
+| `vectordata/src/view.rs` | 84.7% | 84.3% (2086/2474) | 73.9% (266/360) |
 | `vectordata/src/typed_access.rs` | 80.2% | 81.1% (279/344) | 66.1% (39/59) |
 | `vectordata/src/explore/shared.rs` | 42.4% | 44.3% (209/472) | 39.5% (30/76) |
+
+### 16.5 Step 5: quantized corpora (2026-10-19)
+
+**Guards:** none fail on the code before the step — the surface is
+new — except what the step itself turned up (below).
+
+**Built:**
+- `StandardFacet::QuantScale`, `QuantZeroPoint`, `QuantSum` (EA-23):
+  keys `quant_scale`, `quant_zero_point`, `quant_sum`; no code letter;
+  `formats()` of `[FloatScalar]` for the scale and `[ScalarPacked]` for
+  the two integer columns, so a consumer borrows each as one slice;
+  placed after `BaseVectors` in `PREFERRED_ORDER`; `StandardFacet::
+  QUANT` and `is_quant` name the three as a set. `ProfileConfig` carries
+  them as fields beside the other standard facets; the view's lookup
+  and manifest list them; `facet_role` makes them `Windowed`, so a
+  sized profile windows them with `base_vectors`.
+- `dataset::Quantization` (EA-24): `scheme` (`affine` | `symmetric`),
+  `granularity` (`per-vector` | `per-dimension` | `per-block`), `block`
+  for the last, `codes` as an element type name, `range: [lo, hi]`;
+  serde round trip; `validate` refuses a non-integer code type, a
+  reversed range, per-block without a block, and a block elsewhere.
+  `TestDataView::quantization()` (provided, default `None`) reads the
+  profile's attribute, else the dataset's.
+- `QuantizedBase<C>` and `TestDataViewExt::quantized_base::<C>()`
+  (EA-25): opens the codes at `C`, the three columns at their types,
+  requires `C::TYPE == scheme.codes` (`ElementMismatch` otherwise) and
+  each column's count to equal the codes' count, else the new
+  `Error::FacetCardinality { facet, against, expected, found }`.
+- `veks check` (EA-26): the three columns are present together or not
+  at all; the attribute is present iff the columns are; the attribute
+  parses; its `codes` is the base's element type; each column's count
+  equals the base's, by `open_vec_native` on both. In the
+  `profile-selectors` category, after PL-3.
+- A fixture, `write_quantized_profile`, and a doc example on
+  `QuantizedBase`.
+- `crates/veks/tests/e2e_http_sized_profiles.rs` moved from the
+  deprecated pinned readers to `*_as` (the one caller outside
+  vectordata, found by its deprecation warnings).
+
+**Decided during the step: `base_vectors` and `query_vectors` admit
+integer vectors.** The facet spec allowed only `FloatXvec` for B and Q,
+so a quantized u8 base — the input this step exists for — failed
+conformance in `veks check`. The spec now lists `[FloatXvec,
+IntegerXvec]` for both: a base or query facet is vectors of any element
+type, and the conversion table decides how each reads as f32. Distances
+stay float. The test that pinned float-only (`spec_answers_facet_
+format_validity`) now pins the new rule.
+
+**Tests:** `dataset::quantization` 2 unit tests; `quant_facets_are_
+standard_columns`; `quantization_columns_are_typed` (conformance);
+`a_sized_profile_windows_the_quant_columns_with_the_base`; 6 in
+`tests/quantized.rs` (one base, the wrong code type, a short column,
+no attribute, the profile's attribute winning, a malformed attribute);
+4 in `veks check`. The vectordata suite and the doc tests (31) pass;
+clippy clean on the changed files; docs with warnings denied; the
+workspace compiles.
+
+**Coverage after the step** (the §14.5 command, whole workspace:
+75.6% → 75.7%; baseline → after, lines, then functions after). The
+veks-pipeline, veks, veks-core and vecd suites: 1587 passed, 0 failed.
+
+| File | Baseline | After | Functions |
+|---|---|---|---|
+| `vectordata/src/dataset/quantization.rs` | — | 95.3% (61/64) | 100.0% (10/10) |
+| `vectordata/src/dataset/facet.rs` | 93.3% | 94.0% (358/381) | 96.7% (59/61) |
+| `vectordata/src/dataset/conformance.rs` | 88.2% | 89.0% (219/246) | 100.0% (24/24) |
+| `vectordata/src/dataset/profile.rs` | 95.5% | 95.5% (2337/2447) | 90.0% (217/241) |
+| `vectordata/src/view.rs` | 84.7% | 84.4% (2143/2539) | 74.0% (271/366) |
+| `veks/src/check/profiles.rs` | 86.6% | 88.9% (503/566) | 90.6% (58/64) |

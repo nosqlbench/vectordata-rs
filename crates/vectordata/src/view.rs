@@ -624,6 +624,15 @@ pub trait TestDataView: Send + Sync {
     /// Returns the distance function name if declared in attributes.
     fn distance_function(&self) -> Option<String>;
 
+    /// The `quantization` attribute, when the profile or the dataset
+    /// declares one: how the codes in `base_vectors` relate to the
+    /// vectors they stand for. The profile's wins over the dataset's.
+    /// `None` when neither declares it; `Some(Err)` when one does and it
+    /// does not parse.
+    fn quantization(&self) -> Option<std::result::Result<crate::dataset::Quantization, String>> {
+        None
+    }
+
     /// Resolved source string (path or URL) for a named facet, if it
     /// exists. Used by [`open_facet_typed`] so callers holding an
     /// `Arc<dyn TestDataView>` can construct typed readers without
@@ -1392,6 +1401,105 @@ pub trait TestDataViewExt: TestDataView {
     /// converted.
     fn metadata_results_as<T: Element>(&self) -> Result<Arc<dyn VvecReader<T>>> {
         Ok(self.open_vvec_facet_native("metadata_results")?.into_typed::<T>()?)
+    }
+
+    /// A quantized base as one thing: the codes at their own type `C`,
+    /// the three parameter columns, and the scheme, checked against
+    /// each other. See [`QuantizedBase`].
+    fn quantized_base<C: Element>(&self) -> Result<QuantizedBase<C>> {
+        QuantizedBase::open(self)
+    }
+}
+
+/// A pre-quantized base resolved as one dataset: the codes, the
+/// per-vector parameters the dequantized distance needs, and the scheme
+/// that says how to apply them.
+///
+/// Opening checks what a consumer would otherwise have to: that the
+/// `quantization` attribute names the type the codes are read at, and
+/// that every column holds exactly one value per base vector
+/// ([`Error::FacetCardinality`] otherwise). On a local single-file
+/// dataset each column's [`as_slice`](VectorReader::as_slice) is `Some`,
+/// so the three reach a kernel as borrowed slices with no copy.
+///
+/// ```
+/// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader};
+/// # use std::io::Write;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// # let ds = dir.path().join("ds");
+/// # std::fs::create_dir_all(&ds)?;
+/// # let mut f = std::fs::File::create(ds.join("base_vectors.bvecs"))?;
+/// # for v in [[10u8, 20, 30], [40, 50, 60]] { f.write_all(&3i32.to_le_bytes())?; f.write_all(&v)?; }
+/// # drop(f);
+/// # std::fs::write(ds.join("quant_scale.f32"), [0.5f32, 0.25].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())?;
+/// # std::fs::write(ds.join("quant_zero_point.i32"), [128i32, 100].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())?;
+/// # std::fs::write(ds.join("quant_sum.i32"), [60i32, 150].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())?;
+/// # std::fs::write(ds.join("dataset.yaml"), "name: q\nattributes:\n  quantization:\n    scheme: affine\n    granularity: per-vector\n    codes: u8\n    range: [0, 255]\nprofiles:\n  default:\n    base_vectors: base_vectors.bvecs\n    quant_scale: quant_scale.f32\n    quant_zero_point: quant_zero_point.i32\n    quant_sum: quant_sum.i32\n")?;
+/// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
+/// let q = view.quantized_base::<u8>()?;
+/// assert_eq!(q.codes.get_slice(1), Some(&[40u8, 50, 60][..]));
+/// assert_eq!(q.scale.as_slice(), Some(&[0.5f32, 0.25][..]));
+/// assert_eq!(q.zero_point.as_slice(), Some(&[128i32, 100][..]));
+/// assert_eq!(q.sum.as_slice(), Some(&[60i32, 150][..]));
+/// assert_eq!(q.scheme.range, [0, 255]);
+/// # Ok(()) }
+/// ```
+pub struct QuantizedBase<C: Element> {
+    /// The codes: `base_vectors` at its own type.
+    pub codes: Arc<dyn VectorReader<C>>,
+    /// Per-vector scale (`quant_scale`).
+    pub scale: Arc<dyn VectorReader<f32>>,
+    /// Per-vector zero point (`quant_zero_point`).
+    pub zero_point: Arc<dyn VectorReader<i32>>,
+    /// Per-vector sum of the codes (`quant_sum`).
+    pub sum: Arc<dyn VectorReader<i32>>,
+    /// The scheme, from the `quantization` attribute.
+    pub scheme: crate::dataset::Quantization,
+}
+
+impl<C: Element> QuantizedBase<C> {
+    fn open<V: TestDataView + ?Sized>(view: &V) -> Result<Self> {
+        let scheme = match view.quantization() {
+            Some(Ok(q)) => q,
+            Some(Err(e)) => return Err(Error::Other(format!("the quantization attribute does not parse: {e}"))),
+            None => {
+                return Err(Error::Other(
+                    "no quantization attribute: a quantized base declares its scheme at the dataset or \
+                     profile level"
+                        .into(),
+                ));
+            }
+        };
+        if scheme.codes != C::TYPE {
+            return Err(IoError::ElementMismatch {
+                file: scheme.codes,
+                requested: C::TYPE,
+                reason: "the quantization attribute names the type the codes are read at",
+            }
+            .into());
+        }
+        let codes = view.base_vectors_as::<C>()?;
+        let expected = codes.count();
+        let column = |name: &str, count: usize| -> Result<()> {
+            if count == expected {
+                Ok(())
+            } else {
+                Err(Error::FacetCardinality {
+                    facet: name.to_string(),
+                    against: "base_vectors".to_string(),
+                    expected,
+                    found: count,
+                })
+            }
+        };
+        let scale = view.facet_as::<f32>("quant_scale")?;
+        column("quant_scale", scale.count())?;
+        let zero_point = view.facet_as::<i32>("quant_zero_point")?;
+        column("quant_zero_point", zero_point.count())?;
+        let sum = view.facet_as::<i32>("quant_sum")?;
+        column("quant_sum", sum.count())?;
+        Ok(Self { codes, scale, zero_point, sum, scheme })
     }
 }
 
@@ -3576,6 +3684,13 @@ impl GenericTestDataView {
                 self.config.postfiltered_neighbor_distances.as_ref(),
                 Some(StandardFacet::PostfilteredNeighborDistances),
             ),
+            ("quant_scale", self.config.quant_scale.as_ref(), Some(StandardFacet::QuantScale)),
+            (
+                "quant_zero_point",
+                self.config.quant_zero_point.as_ref(),
+                Some(StandardFacet::QuantZeroPoint),
+            ),
+            ("quant_sum", self.config.quant_sum.as_ref(), Some(StandardFacet::QuantSum)),
             ("base_content", self.config.base_content.as_ref(), None),
             ("query_terms", self.config.query_terms.as_ref(), None),
             ("query_filters", self.config.query_filters.as_ref(), None),
@@ -3660,6 +3775,9 @@ impl GenericTestDataView {
             "postfiltered_neighbor_distances" => {
                 self.config.postfiltered_neighbor_distances.as_ref()
             }
+            "quant_scale" => self.config.quant_scale.as_ref(),
+            "quant_zero_point" => self.config.quant_zero_point.as_ref(),
+            "quant_sum" => self.config.quant_sum.as_ref(),
             _ => None,
         }
     }
@@ -3934,6 +4052,14 @@ impl TestDataView for GenericTestDataView {
             .map(|s| s.to_string())
     }
 
+    fn quantization(&self) -> Option<std::result::Result<crate::dataset::Quantization, String>> {
+        self.config
+            .attributes
+            .get("quantization")
+            .or_else(|| self.attributes.get("quantization"))
+            .map(crate::dataset::Quantization::from_value)
+    }
+
     fn facet_source(&self, name: &str) -> Option<String> {
         let facet = self.facet_config_by_name(name)?;
         // `None` for a series: it has no single path, and answering with
@@ -4165,6 +4291,9 @@ mod tests {
                 metadata_predicates: None,
                 predicate_results: None,
                 metadata_layout: None,
+                quant_scale: None,
+                quant_zero_point: None,
+                quant_sum: None,
             }
         }
 

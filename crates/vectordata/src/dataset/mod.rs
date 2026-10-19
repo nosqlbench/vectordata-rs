@@ -28,6 +28,7 @@ pub mod parents;
 pub mod layout;
 pub mod pipeline;
 pub mod profile;
+pub mod quantization;
 pub mod selector;
 pub mod shard_sizing;
 pub mod shards;
@@ -44,5 +45,6 @@ pub use shard_sizing::{DEFAULT_MAX_SHARD_BYTES, RecordSize, ShardPlan, Sharding}
 pub use shards::{discover_shards, shard_name, shard_source_spec};
 pub use pipeline::{OnPartial, PipelineConfig, StepDef};
 pub use profile::{DSProfile, DSProfileGroup, DSView};
+pub use quantization::{QuantGranularity, QuantScheme, Quantization};
 pub use source::{DSInterval, DSSource, DSWindow};
 pub use strata::{Strata, Stratum};

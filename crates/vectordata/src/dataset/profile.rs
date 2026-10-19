@@ -1196,7 +1196,9 @@ pub enum FacetRole {
 /// The [`FacetRole`] of a facet key, canonical or legacy.
 pub fn facet_role(key: &str) -> FacetRole {
     match key {
-        "base_vectors" | "metadata_content" => FacetRole::Windowed,
+        "base_vectors" | "metadata_content" | "quant_scale" | "quant_zero_point" | "quant_sum" => {
+            FacetRole::Windowed
+        }
         "neighbor_indices" | "neighbor_distances"
         | "prefiltered_neighbor_indices" | "prefiltered_neighbor_distances"
         | "postfiltered_neighbor_indices" | "postfiltered_neighbor_distances"
@@ -3998,4 +4000,26 @@ sized: ["1m", "2m"]
             );
         }
     }
+
+    /// The quantization columns follow `base_vectors` into a sized
+    /// profile: each is windowed to the profile's count, as the base
+    /// is, because every value describes one base vector.
+    #[test]
+    fn a_sized_profile_windows_the_quant_columns_with_the_base() {
+        let yaml = "name: q\nprofiles:\n  default:\n    base_vectors: base_vectors.bvecs\n    \
+                    quant_scale: quant_scale.f32\n    quant_zero_point: quant_zero_point.i32\n    \
+                    quant_sum: quant_sum.i32\n    neighbor_indices: profiles/default/neighbor_indices.ivecs\n";
+        let group: DSProfileGroup = serde_yaml::from_str::<crate::dataset::DatasetConfig>(yaml).unwrap().profiles;
+        let default = group.profiles.get("default").unwrap();
+        let sized = derive_sized_profile(default, "10", 10);
+        for key in ["base_vectors", "quant_scale", "quant_zero_point", "quant_sum"] {
+            assert_eq!(facet_role(key), FacetRole::Windowed, "{key}");
+            let view = sized.views.get(key).unwrap();
+            assert_eq!(view.source.window.0.len(), 1, "{key} is windowed");
+            assert_eq!(view.source.window.0[0].max_excl, 10, "{key} window ends at the count");
+        }
+        assert_eq!(facet_role("neighbor_indices"), FacetRole::PerProfile);
+        assert!(sized.views.get("neighbor_indices").unwrap().source.path.contains("profiles/10/"));
+    }
 }
+

@@ -109,3 +109,27 @@ pub fn write_dataset_yaml(dir: &Path, name: &str, facets: &[(&str, &str)]) {
     }
     std::fs::write(dir.join("dataset.yaml"), yaml).unwrap();
 }
+
+/// A quantized profile under `dir`: `n` u8 code vectors of `dim`, the
+/// three parameter columns beside them, and a `dataset.yaml` whose
+/// dataset-level attribute states the scheme. Returns the codes and
+/// the three columns as written.
+#[allow(clippy::type_complexity)]
+pub fn write_quantized_profile(dir: &Path, n: usize, dim: usize) -> (Vec<Vec<u8>>, Vec<f32>, Vec<i32>, Vec<i32>) {
+    let codes: Vec<Vec<u8>> = (0..n).map(|i| (0..dim).map(|d| ((i * dim + d) * 13 % 256) as u8).collect()).collect();
+    let scale: Vec<f32> = (0..n).map(|i| 0.01 * (i + 1) as f32).collect();
+    let zero_point: Vec<i32> = (0..n).map(|i| 100 + i as i32).collect();
+    let sum: Vec<i32> = codes.iter().map(|c| c.iter().map(|&x| x as i32).sum()).collect();
+    write_xvec::<u8>(&dir.join("base_vectors.bvecs"), n, dim, |i, d| codes[i][d]);
+    write_column(&dir.join("quant_scale.f32"), &scale);
+    write_column(&dir.join("quant_zero_point.i32"), &zero_point);
+    write_column(&dir.join("quant_sum.i32"), &sum);
+    std::fs::write(
+        dir.join("dataset.yaml"),
+        "name: quantized\nattributes:\n  quantization:\n    scheme: affine\n    granularity: per-vector\n    \
+         codes: u8\n    range: [0, 255]\nprofiles:\n  default:\n    base_vectors: base_vectors.bvecs\n    \
+         quant_scale: quant_scale.f32\n    quant_zero_point: quant_zero_point.i32\n    quant_sum: quant_sum.i32\n",
+    )
+    .unwrap();
+    (codes, scale, zero_point, sum)
+}

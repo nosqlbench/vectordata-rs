@@ -222,12 +222,25 @@ pub enum StandardFacet {
     PostfilteredNeighborIndices,
     /// Post-filter KNN ground-truth distances — facet code `E`.
     PostfilteredNeighborDistances,
+    /// Per-vector scale of a quantized base: a float column,
+    /// index-aligned with `base_vectors`.
+    QuantScale,
+    /// Per-vector zero point of a quantized base: an integer column,
+    /// index-aligned with `base_vectors`.
+    QuantZeroPoint,
+    /// Per-vector sum of a quantized base's codes: an integer column,
+    /// index-aligned with `base_vectors`. Cached for the dequantized
+    /// distance correction.
+    QuantSum,
 }
 
 impl StandardFacet {
     /// All facets in preferred ordering for dataset.yaml.
     pub const PREFERRED_ORDER: &[StandardFacet] = &[
         Self::BaseVectors,
+        Self::QuantScale,
+        Self::QuantZeroPoint,
+        Self::QuantSum,
         Self::QueryVectors,
         Self::NeighborIndices,
         Self::NeighborDistances,
@@ -256,7 +269,18 @@ impl StandardFacet {
             Self::PrefilteredNeighborDistances => "prefiltered_neighbor_distances",
             Self::PostfilteredNeighborIndices => "postfiltered_neighbor_indices",
             Self::PostfilteredNeighborDistances => "postfiltered_neighbor_distances",
+            Self::QuantScale => "quant_scale",
+            Self::QuantZeroPoint => "quant_zero_point",
+            Self::QuantSum => "quant_sum",
         }
+    }
+
+    /// The three quantization-parameter facets, which travel together.
+    pub const QUANT: &[StandardFacet] = &[Self::QuantScale, Self::QuantZeroPoint, Self::QuantSum];
+
+    /// Whether this is one of the quantization-parameter facets.
+    pub fn is_quant(self) -> bool {
+        Self::QUANT.contains(&self)
     }
 
     /// Single-character facet code used by the partition sub-facet scoping
@@ -271,7 +295,7 @@ impl StandardFacet {
             Self::MetadataContent => Some('M'),
             Self::MetadataPredicates => Some('P'),
             Self::MetadataResults => Some('R'),
-            Self::MetadataLayout => None,
+            Self::MetadataLayout | Self::QuantScale | Self::QuantZeroPoint | Self::QuantSum => None,
             Self::PrefilteredNeighborIndices | Self::PrefilteredNeighborDistances => Some('F'),
             Self::PostfilteredNeighborIndices | Self::PostfilteredNeighborDistances => Some('E'),
         }
@@ -307,7 +331,12 @@ impl StandardFacet {
     pub fn formats(self) -> &'static [FacetFormat] {
         use FacetFormat::*;
         match self {
-            Self::BaseVectors | Self::QueryVectors | Self::NeighborDistances
+            // A base or query facet is vectors of any element type: a
+            // float corpus, or the integer codes of a quantized one,
+            // which the conversion table reads as f32 where that is
+            // lossless and otherwise serves at their own type.
+            Self::BaseVectors | Self::QueryVectors => &[FloatXvec, IntegerXvec],
+            Self::NeighborDistances
             | Self::PrefilteredNeighborDistances | Self::PostfilteredNeighborDistances => &[FloatXvec],
             Self::NeighborIndices
             | Self::PrefilteredNeighborIndices | Self::PostfilteredNeighborIndices => &[IntegerXvec],
@@ -323,6 +352,11 @@ impl StandardFacet {
             // The schema: a slab (its own file, or a `#layout` namespace
             // inside a metadata slab).
             Self::MetadataLayout => &[Slab],
+            // Quantization parameters: one packed column each, a float
+            // scale and integer zero points and sums, so a consumer
+            // borrows each as one slice.
+            Self::QuantScale => &[FloatScalar],
+            Self::QuantZeroPoint | Self::QuantSum => &[ScalarPacked],
         }
     }
 
@@ -345,6 +379,9 @@ impl StandardFacet {
             Self::PrefilteredNeighborDistances => &["prefiltered_neighbor_distances", "filtered_neighbor_distances"],
             Self::PostfilteredNeighborIndices => &["postfiltered_neighbor_indices"],
             Self::PostfilteredNeighborDistances => &["postfiltered_neighbor_distances"],
+            Self::QuantScale => &["quant_scale"],
+            Self::QuantZeroPoint => &["quant_zero_point"],
+            Self::QuantSum => &["quant_sum"],
         }
     }
 
@@ -431,6 +468,9 @@ impl StandardFacet {
             "prefiltered_neighbor_distances" => Some(Self::PrefilteredNeighborDistances),
             "postfiltered_neighbor_indices" => Some(Self::PostfilteredNeighborIndices),
             "postfiltered_neighbor_distances" => Some(Self::PostfilteredNeighborDistances),
+            "quant_scale" => Some(Self::QuantScale),
+            "quant_zero_point" => Some(Self::QuantZeroPoint),
+            "quant_sum" => Some(Self::QuantSum),
             _ => None,
         }
     }
@@ -541,7 +581,34 @@ mod tests {
 
     #[test]
     fn test_preferred_order_is_complete() {
-        assert_eq!(StandardFacet::PREFERRED_ORDER.len(), 12);
+        assert_eq!(StandardFacet::PREFERRED_ORDER.len(), 15);
+        for facet in StandardFacet::PREFERRED_ORDER {
+            assert_eq!(StandardFacet::from_key(facet.key()), Some(*facet));
+        }
+    }
+
+    /// The quantization parameters are three column facets that follow
+    /// the base: a float scale, integer zero points and sums, no code
+    /// letter, each a packed column and nothing else.
+    #[test]
+    fn quant_facets_are_standard_columns() {
+        for facet in StandardFacet::QUANT {
+            assert!(facet.is_quant());
+            assert_eq!(facet.code(), None);
+            assert!(facet.formats().iter().all(|f| matches!(f, FacetFormat::FloatScalar | FacetFormat::ScalarPacked)));
+            assert!(!facet.accepts_extension("fvecs"), "{facet:?} is not vectors");
+        }
+        assert!(StandardFacet::QuantScale.accepts_extension("f32"));
+        assert!(!StandardFacet::QuantScale.accepts_extension("i32"), "a scale is a float");
+        assert!(StandardFacet::QuantZeroPoint.accepts_extension("i32"));
+        assert!(!StandardFacet::QuantZeroPoint.accepts_extension("f32"), "a zero point is an integer");
+        assert_eq!(
+            StandardFacet::classify("profiles/default/quant_scale.f32"),
+            Some((StandardFacet::QuantScale, FacetFormat::FloatScalar))
+        );
+        let order = StandardFacet::PREFERRED_ORDER;
+        let at = |f: StandardFacet| order.iter().position(|x| *x == f).unwrap();
+        assert!(at(StandardFacet::BaseVectors) < at(StandardFacet::QuantScale) && at(StandardFacet::QuantSum) < at(StandardFacet::QueryVectors));
     }
 
     /// The three questions the standardized spec must answer cheaply.
@@ -550,9 +617,15 @@ mod tests {
         // "Can I store my metadata (content) in an integer xvec file?" — yes.
         assert!(StandardFacet::MetadataContent.accepts_format(FacetFormat::IntegerXvec));
         assert!(StandardFacet::MetadataContent.accepts_extension("ivecs"));
-        // Base vectors are float xvec only — not integer.
-        assert!(!StandardFacet::BaseVectors.accepts_format(FacetFormat::IntegerXvec));
+        // Base vectors are vectors of any element type: floats, or the
+        // integer codes of a quantized corpus. Never a column or a slab.
+        assert!(StandardFacet::BaseVectors.accepts_format(FacetFormat::IntegerXvec));
         assert!(StandardFacet::BaseVectors.accepts_extension("fvecs"));
+        assert!(StandardFacet::BaseVectors.accepts_extension("bvecs"));
+        assert!(!StandardFacet::BaseVectors.accepts_format(FacetFormat::ScalarPacked));
+        assert!(!StandardFacet::BaseVectors.accepts_format(FacetFormat::Slab));
+        // Distances stay float.
+        assert!(!StandardFacet::NeighborDistances.accepts_format(FacetFormat::IntegerXvec));
         // The R index accepts the variable-length integer xvec form.
         assert!(StandardFacet::MetadataResults.accepts_format(FacetFormat::IntegerVarXvec));
         assert!(StandardFacet::MetadataResults.accepts_extension("ivvecs"));
