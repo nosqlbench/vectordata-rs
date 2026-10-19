@@ -4,6 +4,10 @@
 //! The library fetch, end to end against a served dataset: the
 //! acceptance cases of `docs/design/srd-api-discoverability.md` §9.
 
+// The pinned readers and the typed reader are deprecated in favour of
+// `TestDataViewExt::facet_as`; this suite still covers them.
+#![allow(deprecated)]
+
 mod support;
 
 use std::path::Path;

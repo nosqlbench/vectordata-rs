@@ -7,6 +7,10 @@
 //! dataset.yaml → load via TestDataGroup → access facets via TypedReader
 //! with native, widening, and cross-sign conversions.
 
+// The pinned readers and the typed reader are deprecated in favour of
+// `TestDataViewExt::facet_as`; this suite still covers them.
+#![allow(deprecated)]
+
 mod support;
 
 use std::io::Write;

@@ -39,6 +39,10 @@
 //! let val: i32 = reader.get_value(42).unwrap();
 //! ```
 
+// The reader this module defines is deprecated in favour of
+// `TestDataViewExt::facet_as`; its own impls and tests still use it.
+#![allow(deprecated)]
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -116,6 +120,7 @@ impl ElementTypeExt for ElementType {
 
 /// Failure opening or reading a [`TypedReader`].
 #[derive(Debug)]
+#[deprecated(note = "the errors of `TestDataViewExt::facet_as` are `IoError::ElementMismatch` and `IoError::ValueOverflow`")]
 pub enum TypedAccessError {
     /// Target type is narrower than native type.
     Narrowing {
@@ -210,6 +215,7 @@ fn check_open<T: Element>(native: ElementType) -> Result<(), TypedAccessError> {
 /// Single concrete struct over the crate's internal `Storage`. The
 /// transport choice (local mmap, merkle-cached remote, direct HTTP)
 /// is hidden inside the storage and selected by `Storage::open`.
+#[deprecated(note = "use `TestDataViewExt::facet_as::<T>(name)` on a dataset view, or `io::open_vec_as::<T>` on a file: `get_value(i)` becomes `get(i)?[0]` or `as_slice()?[i]`, `get_native_slice(i)` becomes `get_slice(i)`, `is_native()` becomes `conversion() == Native`")]
 pub struct TypedReader<T: Element> {
     storage: Arc<Storage>,
     /// The remaining shards, when this facet is a series.
@@ -547,6 +553,7 @@ impl TypedReader<i32> {
 /// Dispatch on a file's native element type, opening it as that type
 /// and binding the resulting reader to `$reader`.
 #[macro_export]
+#[deprecated(note = "use `io::open_vec_native`, which returns an `AnyVectorReader` to match on")]
 macro_rules! dispatch_typed {
     ($path:expr, $reader:ident => $body:expr) => {{
         let etype = <$crate::typed_access::ElementType as $crate::typed_access::ElementTypeExt>::from_path($path)

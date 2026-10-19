@@ -10,6 +10,10 @@
 //! the ad-hoc path exists, resolves to the same bytes the profile path
 //! would, and reports its cost before spending it.
 
+// The pinned readers and the typed reader are deprecated in favour of
+// `TestDataViewExt::facet_as`; this suite still covers them.
+#![allow(deprecated)]
+
 use std::io::Write;
 use vectordata::WholeFacetFallback;
 use vectordata::fetch::{FetchEvent, FetchRequest};

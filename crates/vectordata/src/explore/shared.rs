@@ -5,6 +5,7 @@
 //! caching, and common utilities.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 
 /// Sampling strategy for visualization commands.
@@ -90,10 +91,10 @@ pub(super) fn names_catalog_dataset(source: &str) -> bool {
     !is_local_source(source) && !crate::transport::is_remote_url(source)
 }
 
-/// Unified data reader that wraps both local (AnyVectorReader) and
+/// Unified data reader that wraps both local (LocalVectorReader) and
 /// remote (AnyDatasetReader) access behind the same interface.
 pub(super) enum UnifiedReader {
-    Local(AnyVectorReader),
+    Local(LocalVectorReader),
     Remote(AnyDatasetReader),
 }
 
@@ -103,7 +104,7 @@ impl UnifiedReader {
     pub(super) fn open(source: &str, catalog: &crate::catalog::Catalog) -> Self {
         if is_local_source(source) {
             let path = resolve_source(source);
-            UnifiedReader::Local(AnyVectorReader::open(&path))
+            UnifiedReader::Local(LocalVectorReader::open(&path))
         } else {
             UnifiedReader::Remote(AnyDatasetReader::from_source(source, catalog))
         }
@@ -166,74 +167,41 @@ pub(super) fn resolve_source(source: &str) -> PathBuf {
     std::process::exit(1);
 }
 
-/// Format-agnostic vector reader that returns f64 values.
-///
-/// Wraps any supported vector format (fvec, mvec, dvec) and converts
-/// individual vectors to f64 on read. No bulk file conversion needed.
-pub(super) enum AnyVectorReader {
-    F32(crate::io::XvecReader<f32>),
-    F16(crate::io::XvecReader<half::f16>),
-}
+/// A local vector file as f32, for the SIMD hot paths: opened at the
+/// type its extension names and widened where the conversion table
+/// allows (f16, bf16, u8, i8, i16), so every format a facet may hold
+/// is browsable. A file that holds what f32 cannot (f64, i32 and
+/// wider) is refused by the table and reported.
+pub(super) struct LocalVectorReader(Arc<dyn crate::VectorReader<f32>>);
 
-impl AnyVectorReader {
+impl LocalVectorReader {
     /// Open a vector file, auto-detecting format from extension.
     pub(super) fn open(path: &std::path::Path) -> Self {
-        use crate::io::XvecReader;
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-        match ext {
-            "fvec" | "fvecs" => {
-                AnyVectorReader::F32(XvecReader::<f32>::open_path(path).unwrap_or_else(|e| {
-                    eprintln!("error: failed to open {}: {}", path.display(), e);
-                    std::process::exit(1);
-                }))
-            }
-            "mvec" | "mvecs" => {
-                AnyVectorReader::F16(XvecReader::<half::f16>::open_path(path).unwrap_or_else(|e| {
-                    eprintln!("error: failed to open {}: {}", path.display(), e);
-                    std::process::exit(1);
-                }))
-            }
-            _ => {
-                eprintln!("error: unsupported format '.{}' for visualization. Use fvec or mvec.", ext);
+        match crate::io::open_vec_as::<f32>(&path.to_string_lossy()) {
+            Ok(reader) => Self(reader),
+            Err(e) => {
+                eprintln!("error: failed to open {} for visualization: {e}", path.display());
                 std::process::exit(1);
             }
         }
     }
 
     pub(super) fn count(&self) -> usize {
-        use crate::VectorReader;
-        match self {
-            AnyVectorReader::F32(r) => <crate::io::XvecReader<f32> as VectorReader<f32>>::count(r),
-            AnyVectorReader::F16(r) => <crate::io::XvecReader<half::f16> as VectorReader<half::f16>>::count(r),
-        }
+        self.0.count()
     }
 
     pub(super) fn dim(&self) -> usize {
-        use crate::VectorReader;
-        match self {
-            AnyVectorReader::F32(r) => <crate::io::XvecReader<f32> as VectorReader<f32>>::dim(r),
-            AnyVectorReader::F16(r) => <crate::io::XvecReader<half::f16> as VectorReader<half::f16>>::dim(r),
-        }
+        self.0.dim()
     }
 
     /// Read a single vector as f32 values (for the SIMD hot paths).
     pub(super) fn get_f32(&self, index: usize) -> Option<Vec<f32>> {
-        use crate::VectorReader;
-        match self {
-            AnyVectorReader::F32(r) => {
-                r.get(index).ok().map(|v| v.to_vec())
-            }
-            AnyVectorReader::F16(r) => {
-                r.get(index).ok().map(|v| v.iter().map(|x| x.to_f32()).collect())
-            }
-        }
+        self.0.get(index).ok()
     }
 
     pub(super) fn get_f32_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f32>>> {
         (0..count).map(|i| self.get_f32(start + i)).collect()
     }
-
 }
 
 /// Byte-level geometry of a remote facet, resolved once at open time.
@@ -306,7 +274,7 @@ impl AnyDatasetReader {
         // cache_stats() to the TUI's status line and the chunk
         // geometry to the sampler/prefetcher.
         let facet_storage = view.open_facet_storage("base_vectors").ok();
-        let base = view.base_vectors().unwrap_or_else(|e| {
+        let base = crate::TestDataViewExt::base_vectors_as::<f32>(&*view).unwrap_or_else(|e| {
             eprintln!("error: failed to open base_vectors: {e}");
             std::process::exit(1);
         });

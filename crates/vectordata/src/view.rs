@@ -456,6 +456,16 @@ impl<T: Send + Sync> VectorReader<T> for WindowedVectorReader<T> {
     fn is_complete(&self) -> bool {
         self.inner.is_complete()
     }
+    fn as_slice(&self) -> Option<&[T]> {
+        let dim = self.inner.dim();
+        self.inner.as_slice().map(|all| &all[self.start * dim..(self.start + self.len) * dim])
+    }
+    fn conversion(&self) -> crate::typed_access::ElementConversion {
+        self.inner.conversion()
+    }
+    fn native_element_type(&self) -> Option<crate::typed_access::ElementType> {
+        self.inner.native_element_type()
+    }
 }
 
 /// Describes a single facet declared in a dataset profile.
@@ -529,12 +539,16 @@ pub trait TestDataView: Send + Sync {
     // -- Vector facets --
 
     /// Returns a reader for the base (database) vectors.
+    #[deprecated(note = "use `TestDataViewExt::base_vectors_as::<f32>()`, which also takes any other element type")]
     fn base_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>>;
     /// Returns a reader for the query vectors.
+    #[deprecated(note = "use `TestDataViewExt::query_vectors_as::<f32>()`, which also takes any other element type")]
     fn query_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>>;
     /// Returns a reader for the neighbor indices (ground truth).
+    #[deprecated(note = "use `TestDataViewExt::neighbor_indices_as::<i32>()`, which also takes any other element type")]
     fn neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
     /// Returns a reader for the neighbor distances (ground truth).
+    #[deprecated(note = "use `TestDataViewExt::neighbor_distances_as::<f32>()`, which also takes any other element type")]
     fn neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
     // -- Filtered neighbor facets (F / E) --
@@ -542,15 +556,19 @@ pub trait TestDataView: Send + Sync {
     /// Returns a reader for the **pre-filter** KNN ground-truth indices (F).
     /// Top-K of `X_p` by distance; full K when `|X_p| ≥ K`. The legacy
     /// `filtered_neighbor_indices` YAML key resolves to this facet.
+    #[deprecated(note = "use `TestDataViewExt::prefiltered_neighbor_indices_as::<i32>()`, which also takes any other element type")]
     fn prefiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
     /// Returns a reader for the **pre-filter** KNN ground-truth distances (F).
+    #[deprecated(note = "use `TestDataViewExt::prefiltered_neighbor_distances_as::<f32>()`, which also takes any other element type")]
     fn prefiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
     /// Returns a reader for the **post-filter** KNN ground-truth indices (E).
     /// `G ∩ R` — the unfiltered top-K intersected with the predicate-passing
     /// set; sparse possible.
+    #[deprecated(note = "use `TestDataViewExt::postfiltered_neighbor_indices_as::<i32>()`, which also takes any other element type")]
     fn postfiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
     /// Returns a reader for the **post-filter** KNN ground-truth distances (E).
+    #[deprecated(note = "use `TestDataViewExt::postfiltered_neighbor_distances_as::<f32>()`, which also takes any other element type")]
     fn postfiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
     // -- Metadata facets --
@@ -569,6 +587,7 @@ pub trait TestDataView: Send + Sync {
     /// resolved on read). This is typically a variable-length file (ivvec)
     /// where each predicate maps to a different number of matching base
     /// ordinals.
+    #[deprecated(note = "use `TestDataViewExt::metadata_results_as::<i32>()`")]
     fn metadata_results(&self) -> Result<Arc<dyn VvecReader<i32>>>;
 
     // -- Facet discovery --
@@ -582,6 +601,7 @@ pub trait TestDataView: Send + Sync {
     /// For standard vector facets, delegates to the typed accessor.
     /// For custom facets or facets with non-standard types, this is
     /// the generic access path. Returns f32 vectors.
+    #[deprecated(note = "use `TestDataViewExt::facet_as::<T>(name)`; `facet_as::<f32>` is this call")]
     fn facet(&self, name: &str) -> Result<Arc<dyn VectorReader<f32>>>;
 
     // -- Typed facet access --
@@ -821,6 +841,67 @@ pub trait TestDataView: Send + Sync {
     /// them. Every implementor provides it; the default fetch, planning
     /// and typed-access methods are built on it.
     fn open_facet_storage(&self, name: &str) -> Result<FacetStorage>;
+
+    // -- Typed access, erased -------------------------------------
+
+    /// Open an element facet as `target`: at the file's own type when
+    /// `target` is it, converted where
+    /// [`ElementType::conversion_to`](crate::typed_access::ElementType::conversion_to)
+    /// allows, refused with [`IoError::ElementMismatch`]
+    /// otherwise. Dyn-safe; the typed `*_as` methods of
+    /// [`TestDataViewExt`] are built on it, and are what a caller with
+    /// a `T` in hand uses.
+    ///
+    /// A view that cannot open typed facets leaves the default, which
+    /// says so.
+    ///
+    /// The refusal is a value, so a caller learns the rule from the
+    /// error: an f32 facet asked for as u8 is not narrowed.
+    ///
+    /// ```
+    /// use vectordata::{Error, ElementType, TestDataGroup, TestDataViewExt};
+    /// use vectordata::io::IoError;
+    /// # use std::io::Write;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let ds = dir.path().join("ds");
+    /// # std::fs::create_dir_all(&ds)?;
+    /// # let mut f = std::fs::File::create(ds.join("base.fvecs"))?;
+    /// # f.write_all(&1i32.to_le_bytes())?; f.write_all(&1.5f32.to_le_bytes())?;
+    /// # drop(f);
+    /// # std::fs::write(ds.join("dataset.yaml"), "name: floats\nprofiles:\n  default:\n    base_vectors: base.fvecs\n")?;
+    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
+    /// match view.base_vectors_as::<u8>() {
+    ///     Err(Error::VectorIo(IoError::ElementMismatch { file, requested, reason })) => {
+    ///         assert_eq!((file, requested), (ElementType::F32, ElementType::U8));
+    ///         assert_eq!(reason, "no conversion between the two");
+    ///     }
+    ///     other => panic!("expected a refusal, got {:?}", other.map(|r| r.count())),
+    /// }
+    /// # Ok(()) }
+    /// ```
+    fn open_facet_as_type(
+        &self,
+        name: &str,
+        target: crate::typed_access::ElementType,
+    ) -> Result<crate::io::AnyVectorReader> {
+        let _ = (name, target);
+        Err(Error::Other("this view does not open typed facets".into()))
+    }
+
+    /// Open an element facet at the type its file holds, for a caller
+    /// that does not know the type ahead of time.
+    fn open_facet_native(&self, name: &str) -> Result<crate::io::AnyVectorReader> {
+        let native = self.facet_element_type(name)?;
+        self.open_facet_as_type(name, native)
+    }
+
+    /// Open a variable-length facet at the type its file holds. A
+    /// variable-length facet is never converted.
+    fn open_vvec_facet_native(&self, name: &str) -> Result<crate::io::AnyVvecReader> {
+        let _ = name;
+        Err(Error::Other("this view does not open typed facets".into()))
+    }
 
     // -- Prefetch --------------------------------------------------
 
@@ -1106,6 +1187,216 @@ pub(crate) fn prebuffer_progress_adapter<'c>(
     }
 }
 
+/// The typed facet readers: every [`TestDataView`] method that serves
+/// a vector facet, with the element type a parameter.
+///
+/// `view.base_vectors_as::<f32>()` is what `view.base_vectors()` was;
+/// `view.base_vectors_as::<u8>()` reads a quantized base in place, and
+/// `view.base_vectors_as::<f32>()` over a `bf16` base widens it. What
+/// each pair of types means is one table,
+/// [`ElementType::conversion_to`](crate::typed_access::ElementType::conversion_to):
+/// the file's own type reads in place (zero-copy where the storage is
+/// mapped), a lossless conversion widens, a same-width sign change is
+/// checked value by value, and anything else is refused at open with
+/// [`IoError::ElementMismatch`].
+/// The reader says which it is: [`VectorReader::conversion`].
+///
+/// Implemented for every view, so it works on an `Arc<dyn
+/// TestDataView>` as on the concrete one; bring it into scope with
+/// `use vectordata::TestDataViewExt`.
+///
+/// ```
+/// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader};
+/// # use std::io::Write;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// # let ds = dir.path().join("ds");
+/// # std::fs::create_dir_all(&ds)?;
+/// # let mut f = std::fs::File::create(ds.join("codes.bvecs"))?;
+/// # for v in [[1u8, 2, 3], [4, 5, 6]] { f.write_all(&3i32.to_le_bytes())?; f.write_all(&v)?; }
+/// # drop(f);
+/// # std::fs::write(ds.join("dataset.yaml"), "name: codes\nprofiles:\n  default:\n    base_vectors: codes.bvecs\n")?;
+/// let group = TestDataGroup::load(ds.to_str().unwrap())?;
+/// let view = group.profile("default").unwrap();
+///
+/// // Native: the u8 codes as they are, borrowed from the mapping.
+/// let codes = view.base_vectors_as::<u8>()?;
+/// assert_eq!(codes.get_slice(1), Some(&[4u8, 5, 6][..]));
+///
+/// // Widening: the same facet as f32, converted on read.
+/// let wide = view.base_vectors_as::<f32>()?;
+/// assert_eq!(wide.get(1)?, vec![4.0, 5.0, 6.0]);
+/// assert_eq!(wide.get_slice(1), None, "nothing of f32 exists to borrow");
+/// # Ok(()) }
+/// ```
+pub trait TestDataViewExt: TestDataView {
+    /// Any element facet as `T`; see the trait docs for what `T` may be.
+    ///
+    /// A `bf16` facet at its own type is zero-copy; as `f32` it widens
+    /// exactly, at the cost of one conversion per element read:
+    ///
+    /// ```
+    /// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader, ElementConversion};
+    /// use vectordata::typed_access::bf16;
+    /// # use std::io::Write;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let ds = dir.path().join("ds");
+    /// # std::fs::create_dir_all(&ds)?;
+    /// # let mut f = std::fs::File::create(ds.join("base.bf16vecs"))?;
+    /// # for v in [[1.5f32, -2.0], [0.25, 8.0]] {
+    /// #     f.write_all(&2i32.to_le_bytes())?;
+    /// #     for x in v { f.write_all(&bf16::from_f32(x).to_le_bytes())?; }
+    /// # }
+    /// # drop(f);
+    /// # std::fs::write(ds.join("dataset.yaml"), "name: brains\nprofiles:\n  default:\n    base_vectors: base.bf16vecs\n")?;
+    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
+    ///
+    /// // Native: the bf16 values borrowed from the mapping, no conversion.
+    /// let native = view.facet_as::<bf16>("base_vectors")?;
+    /// assert_eq!(native.conversion(), ElementConversion::Native);
+    /// assert_eq!(native.get_slice(1).map(|r| r[1].to_f32()), Some(8.0));
+    ///
+    /// // Widening: every bf16 is an f32, so the values are exact; each
+    /// // read converts, and there is no slice of f32 to borrow.
+    /// let wide = view.facet_as::<f32>("base_vectors")?;
+    /// assert_eq!(wide.conversion(), ElementConversion::Widening);
+    /// assert_eq!(wide.get(0)?, vec![1.5, -2.0]);
+    /// assert_eq!(wide.get_slice(0), None);
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// A column facet (`.u8`, `.f32`, …) is one slice at its own type —
+    /// the zero-copy path for quantization parameters and labels:
+    ///
+    /// ```
+    /// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let ds = dir.path().join("ds");
+    /// # std::fs::create_dir_all(&ds)?;
+    /// # std::fs::write(ds.join("labels.u8"), [3u8, 1, 4, 1, 5])?;
+    /// # std::fs::write(ds.join("dataset.yaml"), "name: labels\nprofiles:\n  default:\n    metadata_content: labels.u8\n")?;
+    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
+    /// let labels = view.facet_as::<u8>("metadata_content")?;
+    /// assert_eq!(labels.dim(), 1);
+    /// let all: &[u8] = labels.as_slice().expect("a local column maps whole");
+    /// assert_eq!(all, &[3, 1, 4, 1, 5]);
+    /// # Ok(()) }
+    /// ```
+    fn facet_as<T: Element>(&self, name: &str) -> Result<Arc<dyn VectorReader<T>>> {
+        Ok(self.open_facet_as_type(name, T::TYPE)?.into_typed::<T>()?)
+    }
+
+    /// The base (database) vectors as `T`.
+    ///
+    /// At the file's own type, a profile window reads in place through
+    /// [`read_into`](VectorReader::read_into) into a buffer you keep —
+    /// the bulk path for a chunked build:
+    ///
+    /// ```
+    /// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader, ElementConversion};
+    /// # use std::io::Write;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let ds = dir.path().join("ds");
+    /// # std::fs::create_dir_all(&ds)?;
+    /// # let mut f = std::fs::File::create(ds.join("base.fvecs"))?;
+    /// # for i in 0..6i32 { f.write_all(&2i32.to_le_bytes())?; for d in 0..2 { f.write_all(&((i * 2 + d) as f32).to_le_bytes())?; } }
+    /// # drop(f);
+    /// // The profile reads records 1..5 of the six in the file.
+    /// # std::fs::write(ds.join("dataset.yaml"), "name: window\nprofiles:\n  default:\n    base_vectors: base.fvecs[1..5)\n")?;
+    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
+    /// let base = view.base_vectors_as::<f32>()?;
+    /// assert_eq!(base.conversion(), ElementConversion::Native);
+    /// assert_eq!(base.count(), 4);
+    ///
+    /// let mut block = vec![0f32; base.dim() * 2];      // two records at a time
+    /// let mut start = 0;
+    /// while start < base.count() {
+    ///     let got = base.read_into(start, &mut block)?;
+    ///     if start == 0 { assert_eq!(&block[..4], &[2.0, 3.0, 4.0, 5.0]); }
+    ///     start += got;
+    /// }
+    /// assert_eq!(start, 4);
+    /// # Ok(()) }
+    /// ```
+    fn base_vectors_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
+        self.facet_as("base_vectors")
+    }
+
+    /// The query vectors as `T`.
+    fn query_vectors_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
+        self.facet_as("query_vectors")
+    }
+
+    /// The neighbor indices (ground truth) as `T`.
+    ///
+    /// Read at their own type, i32, and checked against the base count
+    /// the way a consumer should check any ground truth it is handed:
+    ///
+    /// ```
+    /// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader};
+    /// # use std::io::Write;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let ds = dir.path().join("ds");
+    /// # std::fs::create_dir_all(&ds)?;
+    /// # let mut f = std::fs::File::create(ds.join("base.fvecs"))?;
+    /// # for i in 0..3i32 { f.write_all(&1i32.to_le_bytes())?; f.write_all(&(i as f32).to_le_bytes())?; }
+    /// # drop(f);
+    /// # let mut g = std::fs::File::create(ds.join("gt.ivecs"))?;
+    /// # for row in [[0i32, 1], [1, 2]] { g.write_all(&2i32.to_le_bytes())?; for id in row { g.write_all(&id.to_le_bytes())?; } }
+    /// # drop(g);
+    /// # std::fs::write(ds.join("dataset.yaml"), "name: gt\nprofiles:\n  default:\n    base_vectors: base.fvecs\n    neighbor_indices: gt.ivecs\n")?;
+    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
+    /// let base = view.base_vectors_as::<f32>()?;
+    /// let gt = view.neighbor_indices_as::<i32>()?;
+    /// for q in 0..gt.count() {
+    ///     let ids = gt.get_slice(q).expect("a local i32 file borrows");
+    ///     assert!(ids.iter().all(|&id| (id as usize) < base.count()), "query {q} names a base vector");
+    /// }
+    /// # Ok(()) }
+    /// ```
+    fn neighbor_indices_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
+        self.facet_as("neighbor_indices")
+    }
+
+    /// The neighbor distances (ground truth) as `T`.
+    fn neighbor_distances_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
+        self.facet_as("neighbor_distances")
+    }
+
+    /// The pre-filter KNN ground-truth indices (F) as `T`.
+    fn prefiltered_neighbor_indices_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
+        self.facet_as("prefiltered_neighbor_indices")
+    }
+
+    /// The pre-filter KNN ground-truth distances (F) as `T`.
+    fn prefiltered_neighbor_distances_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
+        self.facet_as("prefiltered_neighbor_distances")
+    }
+
+    /// The post-filter KNN ground-truth indices (E) as `T`.
+    fn postfiltered_neighbor_indices_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
+        self.facet_as("postfiltered_neighbor_indices")
+    }
+
+    /// The post-filter KNN ground-truth distances (E) as `T`.
+    fn postfiltered_neighbor_distances_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
+        self.facet_as("postfiltered_neighbor_distances")
+    }
+
+    /// The predicate-result indices (the `R` facet) as `T`, which must
+    /// be the type the file holds: a variable-length facet is never
+    /// converted.
+    fn metadata_results_as<T: Element>(&self) -> Result<Arc<dyn VvecReader<T>>> {
+        Ok(self.open_vvec_facet_native("metadata_results")?.into_typed::<T>()?)
+    }
+}
+
+impl<V: TestDataView + ?Sized> TestDataViewExt for V {}
+
 /// Open a typed reader for a named facet on any [`TestDataView`].
 ///
 /// This is the dyn-compatible companion to
@@ -1125,6 +1416,8 @@ pub(crate) fn prebuffer_progress_adapter<'c>(
 /// The native element type is inferred from the facet's source
 /// extension via [`TestDataView::facet_element_type`]; the transport
 /// is inferred from the source string via [`TypedReader::open_auto`](crate::typed_access::TypedReader::open_auto).
+#[deprecated(note = "use `TestDataViewExt::facet_as::<T>(name)`: `get_value(i)` becomes `get(i)?[0]` or `as_slice()?[i]`, `get_native_slice(i)` becomes `get_slice(i)`, `is_native()` becomes `conversion() == Native`")]
+#[allow(deprecated)]
 pub fn open_facet_typed<T: crate::typed_access::Element>(
     view: &dyn TestDataView,
     facet_name: &str,
@@ -2640,7 +2933,7 @@ impl FacetStorage {
     }
 }
 
-/// A uniform-stride reader over a facet spread across several files.
+/// A facet spread across several files, read as one vector space.
 ///
 /// Presents the **same surface** as a single-file reader (SH-22): a
 /// caller that never asks about layout never learns there is one.
@@ -2649,18 +2942,29 @@ impl FacetStorage {
 /// that holds `o`.
 ///
 /// One reader per **file**, not per shard (SH-81) — two shards sliced
-/// from one file read through one reader at their own offsets.
-pub(crate) struct ShardedXvecReader<T> {
+/// from one file read through one reader at their own offsets. `R` is
+/// the single-file reader for the facet's layout:
+/// [`XvecReader`](crate::io::XvecReader) for vectors,
+/// [`ScalarReader`](crate::io::ScalarReader) for a column. Locating an
+/// ordinal, reading across a seam and the shape check are written once
+/// here for both.
+pub(crate) struct ShardedReader<T, R> {
     series: std::sync::Arc<Series>,
     /// Per-file readers, opened on first touch (SH-26).
-    readers: Vec<std::sync::OnceLock<crate::io::XvecReader<T>>>,
+    readers: Vec<std::sync::OnceLock<R>>,
+    /// How a file's storage becomes an `R`.
+    open: fn(std::sync::Arc<crate::storage::Storage>) -> std::result::Result<R, crate::io::IoError>,
     dim: usize,
     count: usize,
+    _t: std::marker::PhantomData<T>,
 }
 
-impl<T> std::fmt::Debug for ShardedXvecReader<T> {
+pub(crate) type ShardedXvecReader<T> = ShardedReader<T, crate::io::XvecReader<T>>;
+pub(crate) type ShardedScalarReader<T> = ShardedReader<T, crate::io::ScalarReader<T>>;
+
+impl<T, R> std::fmt::Debug for ShardedReader<T, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShardedXvecReader")
+        f.debug_struct("ShardedReader")
             .field("shards", &self.series.shards().entries().len())
             .field("files", &self.series.file_count())
             .field("dim", &self.dim)
@@ -2670,22 +2974,36 @@ impl<T> std::fmt::Debug for ShardedXvecReader<T> {
 }
 
 impl<T: Element> ShardedXvecReader<T> {
-    /// Open a series, verifying that every file agrees on the shape.
-    ///
-    /// The dimension check is eager and total: a series whose shards
-    /// disagree resolves ordinals to records of the wrong width, and
-    /// there is no later moment at which that becomes visible
-    /// (SH-15). Paying one header read per file at open is what makes
-    /// every read after it trustworthy.
-    fn open(series: std::sync::Arc<Series>) -> Result<Self> {
+    fn open_xvec(series: std::sync::Arc<Series>) -> Result<Self> {
+        Self::open(series, crate::io::XvecReader::<T>::from_storage)
+    }
+}
+
+impl<T: Element> ShardedScalarReader<T> {
+    fn open_scalar(series: std::sync::Arc<Series>) -> Result<Self> {
+        Self::open(series, crate::io::ScalarReader::<T>::from_storage)
+    }
+}
+
+impl<T: Element, R: VectorReader<T>> ShardedReader<T, R> {
+    /// Open every file's reader and check that the shards agree on
+    /// one shape. A file whose dimension disagrees resolves ordinals to
+    /// records of the wrong width, and there is no later moment at
+    /// which that becomes visible (SH-15). Paying one header read per
+    /// file at open is what makes every read after it trustworthy.
+    fn open(
+        series: std::sync::Arc<Series>,
+        open: fn(std::sync::Arc<crate::storage::Storage>) -> std::result::Result<R, crate::io::IoError>,
+    ) -> Result<Self> {
         let n = series.file_count();
-        let readers: Vec<std::sync::OnceLock<crate::io::XvecReader<T>>> =
-            (0..n).map(|_| std::sync::OnceLock::new()).collect();
+        let readers: Vec<std::sync::OnceLock<R>> = (0..n).map(|_| std::sync::OnceLock::new()).collect();
         let me = Self {
             series,
             readers,
+            open,
             dim: 0,
             count: 0,
+            _t: std::marker::PhantomData,
         };
         let first = me.reader(0)?;
         let dim = first.dim();
@@ -2693,7 +3011,8 @@ impl<T: Element> ShardedXvecReader<T> {
             let d = me.reader(i)?.dim();
             if d != dim {
                 return Err(Error::Other(format!(
-                    "shard file {i} has dim {d}, but the series is dim {dim} —                      every shard of a facet must share one shape"
+                    "shard file {i} has dim {d}, but the series is dim {dim} — \
+                     every shard of a facet must share one shape"
                 )));
             }
         }
@@ -2704,8 +3023,7 @@ impl<T: Element> ShardedXvecReader<T> {
         })
     }
 
-    /// The reader for file `i`, opened on first use.
-    fn reader(&self, i: usize) -> Result<&crate::io::XvecReader<T>> {
+    fn reader(&self, i: usize) -> Result<&R> {
         let slot = self
             .readers
             .get(i)
@@ -2714,16 +3032,14 @@ impl<T: Element> ShardedXvecReader<T> {
             return Ok(r);
         }
         let storage = self.series.file(i)?.clone();
-        let opened = crate::io::XvecReader::<T>::from_storage(storage)
+        let opened = (self.open)(storage)
             .map_err(|e| Error::Other(format!("open shard file {i}: {e}")))?;
         let _ = slot.set(opened);
         slot.get()
             .ok_or_else(|| Error::Other("shard reader vanished after set".into()))
     }
 
-    /// Resolve a global ordinal to the reader that holds it and the
-    /// ordinal within that reader's file (SH-64).
-    fn locate(&self, index: usize) -> Result<(&crate::io::XvecReader<T>, usize)> {
+    fn locate(&self, index: usize) -> Result<(&R, usize)> {
         let at = self
             .series
             .shards()
@@ -2734,12 +3050,15 @@ impl<T: Element> ShardedXvecReader<T> {
     }
 }
 
-impl<T: Element> VectorReader<T> for ShardedXvecReader<T> {
+impl<T: Element, R: VectorReader<T>> VectorReader<T> for ShardedReader<T, R> {
     fn dim(&self) -> usize {
         self.dim
     }
     fn count(&self) -> usize {
         self.count
+    }
+    fn native_element_type(&self) -> Option<crate::typed_access::ElementType> {
+        Some(T::TYPE)
     }
 
     fn get(&self, index: usize) -> std::result::Result<Vec<T>, crate::io::IoError> {
@@ -3007,6 +3326,12 @@ impl GenericTestDataView {
     /// `base_vectors` from default with `[0..base_count)` so every
     /// consumer reading via the trait gets a clipped reader without
     /// having to honor `view.base_count()` manually.
+    /// Open an element facet as `T`: at the file's own type when `T`
+    /// is it, converted where [`ElementType::conversion_to`] allows,
+    /// refused otherwise. The one place in the crate a conversion is
+    /// accepted; the raw readers never convert.
+    ///
+    /// [`ElementType::conversion_to`]: crate::typed_access::ElementType::conversion_to
     fn open_uniform<T: Element>(
         &self,
         facet_opt: Option<&FacetConfig>,
@@ -3019,6 +3344,33 @@ impl GenericTestDataView {
         // with "cannot infer element size", which describes the symptom
         // and points nowhere.
         self.require_facet_shape(name, crate::dataset::facet::FacetShape::Elements)?;
+        let native = self.facet_element_type(name)?;
+        let any = self.open_any_native(facet, name, native)?;
+        Ok(any.as_type::<T>()?)
+    }
+
+    /// Open an element facet at the file's own type, erased, so a
+    /// runtime [`ElementType`](crate::typed_access::ElementType)
+    /// reaches the monomorphic reader.
+    fn open_any_native(
+        &self,
+        facet: &FacetConfig,
+        name: &str,
+        native: crate::typed_access::ElementType,
+    ) -> Result<crate::io::AnyVectorReader> {
+        veks_datatypes::dispatch_element!(native, N => {
+            let reader = self.open_native::<N>(facet, name)?;
+            Ok(<N as crate::io::AnyElement>::into_any(reader))
+        })
+    }
+
+    /// Open an element facet at its own type `N`, with the window and
+    /// series logic written once for vectors and for columns.
+    fn open_native<N: Element>(
+        &self,
+        facet: &FacetConfig,
+        name: &str,
+    ) -> Result<Arc<dyn VectorReader<N>>> {
 
         // A series reads through the shard model. The profile window
         // still applies on top, in *facet* ordinals (SH-67) — an entry
@@ -3030,7 +3382,14 @@ impl GenericTestDataView {
                 .series_ref()
                 .ok_or_else(|| Error::Other(format!("facet '{name}': series not realized")))?
                 .clone();
-            let reader: Box<dyn VectorReader<T>> = Box::new(ShardedXvecReader::<T>::open(series)?);
+            let column = series.shards().entries().first().is_some_and(|e| {
+                crate::io::is_scalar_ext(e.source.path.rsplit('.').next().unwrap_or(""))
+            });
+            let reader: Box<dyn VectorReader<N>> = if column {
+                Box::new(ShardedScalarReader::<N>::open_scalar(series)?)
+            } else {
+                Box::new(ShardedXvecReader::<N>::open_xvec(series)?)
+            };
             return Ok(match facet.window().and_then(parse_window_first) {
                 Some((start, end)) => Arc::new(WindowedVectorReader::new(reader, start, end)),
                 None => Arc::from(reader),
@@ -3074,10 +3433,14 @@ impl GenericTestDataView {
         // fetch brought in. Opening the resolved URL directly would key a
         // second cache entry by URL: everything downloaded twice, and
         // every read a range request against the empty one.
-        io::require_native::<T>(&path_str)?;
+        let (_, container) = io::require_native::<N>(&path_str)?;
         let storage = self.open_facet_storage(name)?;
-        let reader: Box<dyn VectorReader<T>> =
-            Box::new(io::XvecReader::<T>::from_storage(storage.storage_handle())?);
+        let reader: Box<dyn VectorReader<N>> = match container {
+            crate::typed_access::Container::Scalar => {
+                Box::new(io::ScalarReader::<N>::from_storage(storage.storage_handle())?)
+            }
+            _ => Box::new(io::XvecReader::<N>::from_storage(storage.storage_handle())?),
+        };
 
         let window = window_from_suffix.or_else(|| facet.window().and_then(parse_window_first));
         if let Some((start, end)) = window {
@@ -3106,6 +3469,15 @@ impl GenericTestDataView {
     ) -> Result<Arc<dyn VvecReader<T>>> {
         let facet = facet_opt.ok_or_else(|| Error::MissingFacet(name.to_string()))?;
         if facet.is_series() {
+            let native = self.facet_element_type(name)?;
+            if native != T::TYPE {
+                return Err(io::IoError::ElementMismatch {
+                    file: native,
+                    requested: T::TYPE,
+                    reason: "a variable-length facet is read at its own type only",
+                }
+                .into());
+            }
             let storage = self.open_facet_storage(name)?;
             let series = storage
                 .series_ref()
@@ -3304,6 +3676,8 @@ impl GenericTestDataView {
     /// // Open with wider type — always succeeds
     /// let r = view.open_facet_typed::<i32>("metadata_content")?;
     /// ```
+    #[deprecated(note = "use `TestDataViewExt::facet_as::<T>(name)`")]
+    #[allow(deprecated)]
     pub fn open_facet_typed<T: crate::typed_access::Element>(
         &self,
         name: &str,
@@ -3477,27 +3851,45 @@ impl TestDataView for GenericTestDataView {
         self.open_variable(self.config.predicate_results.as_ref(), "metadata_results")
     }
 
+    fn open_facet_as_type(
+        &self,
+        name: &str,
+        target: crate::typed_access::ElementType,
+    ) -> Result<crate::io::AnyVectorReader> {
+        let name = match name {
+            "filtered_neighbor_indices" => "prefiltered_neighbor_indices",
+            "filtered_neighbor_distances" => "prefiltered_neighbor_distances",
+            other => other,
+        };
+        veks_datatypes::dispatch_element!(target, T => {
+            let reader = self.open_uniform::<T>(self.facet_config_by_name(name), name)?;
+            Ok(<T as crate::io::AnyElement>::into_any(reader))
+        })
+    }
+
+    fn open_vvec_facet_native(&self, name: &str) -> Result<crate::io::AnyVvecReader> {
+        let (config, name) = match name {
+            "metadata_results" | "metadata_indices" | "predicate_results" => {
+                (self.config.predicate_results.as_ref(), "metadata_results")
+            }
+            other => (self.facet_config_by_name(other), other),
+        };
+        let native = self.facet_element_type(name)?;
+        veks_datatypes::dispatch_element!(native, T => {
+            let reader = self.open_variable::<T>(config, name)?;
+            Ok(<T as crate::io::AnyElement>::into_any_vvec(reader))
+        })
+    }
+
     fn facet(&self, name: &str) -> Result<Arc<dyn VectorReader<f32>>> {
         // Try standard facets first (uniform vector types). The legacy
         // `filtered_*` aliases route to the prefilter distances method
         // because legacy on-disk files carry pre-filter shape.
-        match name {
-            "base_vectors" => return self.base_vectors(),
-            "query_vectors" => return self.query_vectors(),
-            "neighbor_distances" => return self.neighbor_distances(),
-            "prefiltered_neighbor_distances" | "filtered_neighbor_distances" => {
-                return self.prefiltered_neighbor_distances();
-            }
-            "postfiltered_neighbor_distances" => return self.postfiltered_neighbor_distances(),
-            _ => {}
-        }
-
-        // For f32-compatible facets, open via unified API
-        let facet_config = self.facet_config_by_name(name);
-        match facet_config {
-            Some(fc) => self.open_uniform::<f32>(Some(fc), name),
-            None => Err(Error::MissingFacet(name.to_string())),
-        }
+        let name = match name {
+            "filtered_neighbor_distances" => "prefiltered_neighbor_distances",
+            other => other,
+        };
+        self.open_uniform::<f32>(self.facet_config_by_name(name), name)
     }
 
     fn facet_element_type(&self, name: &str) -> Result<crate::typed_access::ElementType> {

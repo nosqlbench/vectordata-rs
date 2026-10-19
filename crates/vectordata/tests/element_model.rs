@@ -5,6 +5,10 @@
 //! §14.3 step 3): the guards that failed on the code before it, and
 //! the behaviour of the shared model's tables as this crate uses them.
 
+// The typed reader is deprecated in favour of `TestDataViewExt::facet_as`;
+// the float guard here is about that reader.
+#![allow(deprecated)]
+
 use std::io::Write;
 use std::path::Path;
 

@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use vectordata::merkle::MerkleRef;
+use vectordata::Element;
 
 /// The value `write_fvec` puts at element `d` of record `i`.
 pub fn fvec_value(seed: f32, dim: usize, i: usize, d: usize) -> f32 {
@@ -58,4 +59,53 @@ pub fn write_catalogs(root: &Path, datasets: &[&str]) {
     }
     let tree = CatalogTree::scan(root, &mut |_| {});
     tree.write(&tree.catalog_dirs(), "catalog", &mut |_| {}).unwrap();
+}
+
+/// `records` uniform records of `dim` elements of `T`, element `d` of
+/// record `i` being `f(i, d)`, under a dimension header each.
+pub fn write_xvec<T: Element>(path: &Path, records: usize, dim: usize, f: impl Fn(usize, usize) -> T) {
+    let mut buf = Vec::with_capacity(records * (4 + dim * T::SIZE));
+    let mut elem = vec![0u8; T::SIZE];
+    for i in 0..records {
+        buf.extend_from_slice(&(dim as i32).to_le_bytes());
+        for d in 0..dim {
+            f(i, d).write_le_bytes(&mut elem);
+            buf.extend_from_slice(&elem);
+        }
+    }
+    std::fs::write(path, buf).unwrap();
+}
+
+/// A header-free column of `values`.
+pub fn write_column<T: Element>(path: &Path, values: &[T]) {
+    let mut buf = vec![0u8; values.len() * T::SIZE];
+    for (v, slot) in values.iter().zip(buf.chunks_exact_mut(T::SIZE)) {
+        v.write_le_bytes(slot);
+    }
+    std::fs::write(path, buf).unwrap();
+}
+
+/// Variable-length records of `T`: each slice of `records` under its
+/// own dimension header.
+pub fn write_vvec<T: Element>(path: &Path, records: &[Vec<T>]) {
+    let mut buf = Vec::new();
+    let mut elem = vec![0u8; T::SIZE];
+    for r in records {
+        buf.extend_from_slice(&(r.len() as i32).to_le_bytes());
+        for v in r {
+            v.write_le_bytes(&mut elem);
+            buf.extend_from_slice(&elem);
+        }
+    }
+    std::fs::write(path, buf).unwrap();
+}
+
+/// A `dataset.yaml` under `dir` with one `default` profile whose facet
+/// lines are `facets` (each `key: locator`, already indented or not).
+pub fn write_dataset_yaml(dir: &Path, name: &str, facets: &[(&str, &str)]) {
+    let mut yaml = format!("name: {name}\nprofiles:\n  default:\n");
+    for (key, locator) in facets {
+        yaml.push_str(&format!("    {key}: {locator}\n"));
+    }
+    std::fs::write(dir.join("dataset.yaml"), yaml).unwrap();
 }

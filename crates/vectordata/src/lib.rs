@@ -29,10 +29,13 @@
 //! | Draw the CLI's progress meter | [`TextMeter`](fetch::TextMeter) | `examples/fetch_with_progress.rs` |
 //! | Report fetch progress as log lines | [`LogMeter`](fetch::LogMeter), throttled by [`ProgressStep`](fetch::ProgressStep) | — |
 //! | Warm a window in the background while reading | [`TestDataView::prefetch_in_background`] | `examples/stream_base_vectors.rs` |
-//! | Read vectors by ordinal | [`TestDataView::base_vectors`] → [`VectorReader::get`] | below |
+//! | Read vectors by ordinal | [`TestDataViewExt::base_vectors_as`] → [`VectorReader::get`] | below |
+//! | Read a facet at its own element type, or widened (u8 codes, bf16, f16 → f32) | [`TestDataViewExt::facet_as`]; the rules: [`ElementType::conversion_to`] | [`TestDataViewExt`] |
 //! | Load or stream records in bulk, into your own buffer | [`VectorReader::read_into`] | `examples/stream_base_vectors.rs` |
-//! | Read ground truth | [`TestDataView::neighbor_indices`], [`TestDataView::neighbor_distances`] | — |
-//! | Read a metadata or scalar facet | [`open_facet_typed`] → [`TypedReader`] | below |
+//! | Borrow a whole column (quantization parameters, labels) with no copy | [`VectorReader::as_slice`] on a scalar facet | [`TestDataViewExt::facet_as`] |
+//! | Open a facet without knowing its type | [`TestDataView::open_facet_native`] → [`AnyVectorReader`] | — |
+//! | Read ground truth | [`TestDataViewExt::neighbor_indices_as`], [`TestDataViewExt::neighbor_distances_as`] | [`TestDataViewExt::neighbor_indices_as`] |
+//! | Read a metadata or scalar facet | [`TestDataViewExt::facet_as`] (`open_facet_typed` is deprecated) | below |
 //! | Read a record (slab) facet | [`TestDataView::open_facet_records`] | — |
 //! | List profiles and facets | [`TestDataGroup::profile_names`], [`TestDataView::facet_manifest`] | below |
 //! | Find datasets by pattern | [`Catalog::match_glob`](catalog::Catalog::match_glob), [`Catalog::datasets`](catalog::Catalog::datasets) | — |
@@ -51,12 +54,13 @@
 //!
 //! ```no_run
 //! use vectordata::catalog::{Catalog, CatalogSources};
+//! use vectordata::{TestDataViewExt, VectorReader};
 //!
 //! # fn main() -> vectordata::Result<()> {
 //! // Catalogs come from ~/.config/vectordata/catalogs.yaml.
 //! let catalog = Catalog::of(&CatalogSources::new().configure_default());
 //! let view = catalog.open_profile("my-dataset", "default")?;
-//! let base = view.base_vectors()?;
+//! let base = view.base_vectors_as::<f32>()?;
 //! println!("{} vectors, dim={}", base.count(), base.dim());
 //! let v: Vec<f32> = base.get(42)?;
 //! # let _ = v; Ok(()) }
@@ -84,7 +88,7 @@
 //!
 //! ```no_run
 //! # use vectordata::catalog::{Catalog, CatalogSources};
-//! use vectordata::{open_facet_typed, TypedReader};
+//! use vectordata::{TestDataViewExt, VectorReader};
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # let catalog = Catalog::of(&CatalogSources::new().configure_default());
 //! let group = catalog.open("my-dataset")?;
@@ -95,10 +99,13 @@
 //!     }
 //! }
 //! let view = group.profile("default").unwrap();
-//! // A u8 metadata facet read as i32: widening is automatic.
-//! let labels: TypedReader<i32> = open_facet_typed(&*view, "metadata_content")?;
-//! let label = labels.get_value(42)?;
-//! # let _ = label; Ok(()) }
+//! // A u8 metadata facet read as i32: widening, by the conversion table.
+//! let labels = view.facet_as::<i32>("metadata_content")?;
+//! let label = labels.get(42)?[0];
+//! // Or at its own type, borrowed whole from the mapping.
+//! let native = view.facet_as::<u8>("metadata_content")?;
+//! let all: Option<&[u8]> = native.as_slice();
+//! # let _ = (label, all); Ok(()) }
 //! ```
 //!
 //! ### Catalogs a program supplies
@@ -301,12 +308,19 @@ pub use location::Location;
 pub use model::FacetConfig;
 pub use view::{
     CacheStats, FacetDescriptor, FacetStorage, PrebufferProgress, PrefetchHandle, PrefetchPlan,
-    PrefetchReport, RangeFill, TestDataView, WholeFacetFallback, open_facet_typed,
+    PrefetchReport, RangeFill, TestDataView, TestDataViewExt, WholeFacetFallback,
 };
-pub use io::{VectorReader, VvecReader, XvecReader, IndexedVvecReader, IoError};
+#[allow(deprecated)]
+pub use view::open_facet_typed;
+pub use io::{
+    AnyVectorReader, AnyVvecReader, ConvertingReader, IndexedVvecReader, IoError, ScalarReader,
+    VectorReader, VvecReader, XvecReader, open_vec_as, open_vec_native,
+};
 pub use cache::InsufficientCacheSpace;
 pub use access::AccessMode;
-pub use typed_access::{Element, ElementConversion, ElementType, ElementTypeExt, TypedAccessError, TypedReader};
+pub use typed_access::{Element, ElementConversion, ElementType, ElementTypeExt};
+#[allow(deprecated)]
+pub use typed_access::{TypedAccessError, TypedReader};
 /// Re-exported so external callers of
 /// [`FacetStorage::prebuffer_with_progress`] can name the
 /// progress type their callback receives.

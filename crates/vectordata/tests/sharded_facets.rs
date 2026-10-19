@@ -9,6 +9,10 @@
 //!
 //! See `docs/design/srd-multifile-facet-shards.md`.
 
+// The pinned readers and the typed reader are deprecated in favour of
+// `TestDataViewExt::facet_as`; this suite still covers them.
+#![allow(deprecated)]
+
 mod support;
 
 use std::io::Write;

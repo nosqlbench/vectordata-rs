@@ -9,6 +9,10 @@
 //! `knn_entries.yaml` (but no `catalog.json` / `catalog.yaml` /
 //! `dataset.yaml`) and synthesizes the canonical view.
 
+// The pinned readers and the typed reader are deprecated in favour of
+// `TestDataViewExt::facet_as`; this suite still covers them.
+#![allow(deprecated)]
+
 mod support;
 
 use std::sync::LazyLock;

@@ -8,6 +8,10 @@
 //! and a choice that cannot take effect is refused. The choice is
 //! per-process, so each case runs in a fresh process.
 
+// The pinned readers and the typed reader are deprecated in favour of
+// `TestDataViewExt::facet_as`; this suite still covers them.
+#![allow(deprecated)]
+
 mod support;
 
 use std::path::{Path, PathBuf};

@@ -191,6 +191,29 @@ pub trait VectorReader<T>: Send + Sync {
     fn is_complete(&self) -> bool {
         true
     }
+
+    /// Every element of every record, contiguous, borrowed from the
+    /// mapping: `count() * dim()` elements with no copy.
+    ///
+    /// `Some` only for a header-free column in one resident mapped file
+    /// ([`ScalarReader`]), or a window over one. `None` for xvec files,
+    /// whose record headers interleave the elements; for a series; for
+    /// storage that is not mapped; and for a converting reader, which
+    /// has nothing of `T` to borrow.
+    fn as_slice(&self) -> Option<&[T]> {
+        None
+    }
+
+    /// How values reach `T`: [`Native`](ElementConversion::Native)
+    /// unless this reader converts them from the file's own type.
+    fn conversion(&self) -> ElementConversion {
+        ElementConversion::Native
+    }
+
+    /// The element type the file holds, when the reader knows it.
+    fn native_element_type(&self) -> Option<ElementType> {
+        None
+    }
 }
 
 /// How many records a [`VectorReader::read_into`] call copies: as many
@@ -630,6 +653,9 @@ impl<T: Element> VectorReader<T> for XvecReader<T> {
     fn count(&self) -> usize {
         self.count
     }
+    fn native_element_type(&self) -> Option<ElementType> {
+        Some(T::TYPE)
+    }
 
     fn get(&self, index: usize) -> Result<Vec<T>, IoError> {
         if index >= self.count {
@@ -1000,6 +1026,444 @@ impl<'a, T: Element> Drop for StreamReclaim<'a, T> {
 // ═══════════════════════════════════════════════════════════════════════
 // Top-level dispatchers
 // ═══════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════
+// Generic access: a column reader, conversion, and type erasure
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Whether `bytes` starts on a `T` boundary, so a slice of `T` may be
+/// borrowed from it.
+fn aligned_for<T>(bytes: &[u8]) -> bool {
+    (bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<T>())
+}
+
+/// Decode `out.len()` elements from their little-endian bytes: one copy
+/// on a little-endian host, a decode per element elsewhere.
+fn copy_elements<T: Element>(bytes: &[u8], out: &mut [T]) {
+    debug_assert_eq!(bytes.len(), out.len() * T::SIZE);
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: every `Element` is a plain number whose in-memory form
+        // on this host is its little-endian encoding; `out` holds
+        // exactly `bytes.len()` bytes of them, and the regions cannot
+        // overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
+    for (dst, b) in out.iter_mut().zip(bytes.chunks_exact(T::SIZE)) {
+        *dst = T::from_le_bytes(b);
+    }
+}
+
+/// A zero of `T`, for a scratch buffer.
+fn zero<T: Element>() -> T {
+    T::from_value(veks_datatypes::Value::Int(0)).expect("every element type holds zero")
+}
+
+/// A header-free column: `T` after `T`, nothing else. The reader for
+/// a scalar facet (`.u8`, `.i32`, `.f32`, `.bf16`, …), with `dim() ==
+/// 1` and the whole column borrowable as one slice.
+///
+/// Like [`XvecReader`], it reads a file at its own type only; a dataset
+/// view converts where [`ElementType::conversion_to`] allows it.
+pub struct ScalarReader<T> {
+    storage: Arc<Storage>,
+    count: usize,
+    _phantom: PhantomData<T>,
+}
+
+impl<T: Element> ScalarReader<T> {
+    /// Open a column from a path or URL string whose extension names
+    /// `T` in the column layout.
+    pub fn open(source: &str) -> Result<Self, IoError> {
+        Self::require_column(source)?;
+        Self::from_storage(Storage::open(source)?)
+    }
+
+    /// Open a local column file by path.
+    pub fn open_path(path: &Path) -> Result<Self, IoError> {
+        Self::require_column(&path.to_string_lossy())?;
+        Self::from_storage(Storage::open_path(path)?)
+    }
+
+    fn require_column(source: &str) -> Result<(), IoError> {
+        match require_native::<T>(source)? {
+            (_, Container::Scalar) => Ok(()),
+            (file, _) => Err(IoError::InvalidFormat(format!(
+                "'{}' holds vectors of {file}, not a column; read it with XvecReader",
+                ext_of(source)
+            ))),
+        }
+    }
+
+    /// Construct from a pre-opened storage. **Crate-internal**: the
+    /// caller has established that the bytes are a column of `T`.
+    pub(crate) fn from_storage(storage: Arc<Storage>) -> Result<Self, IoError> {
+        let total = storage.total_size();
+        if !total.is_multiple_of(T::SIZE as u64) {
+            return Err(IoError::InvalidFormat(format!(
+                "a column of {total} bytes is not a whole number of {}-byte {} elements",
+                T::SIZE,
+                T::TYPE
+            )));
+        }
+        Ok(Self { storage, count: (total / T::SIZE as u64) as usize, _phantom: PhantomData })
+    }
+
+    /// Number of elements.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The bytes of elements `start..start + n`, borrowed when the
+    /// storage is mapped, read otherwise.
+    fn bytes(&self, start: usize, n: usize) -> Result<std::borrow::Cow<'_, [u8]>, IoError> {
+        let (offset, len) = ((start * T::SIZE) as u64, (n * T::SIZE) as u64);
+        Ok(match self.storage.mmap_slice(offset, len) {
+            Some(slice) => std::borrow::Cow::Borrowed(slice),
+            None => std::borrow::Cow::Owned(self.storage.read_bytes(offset, len)?),
+        })
+    }
+}
+
+impl<T: Element> std::fmt::Debug for ScalarReader<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScalarReader")
+            .field("element", &T::TYPE)
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: Element> VectorReader<T> for ScalarReader<T> {
+    fn dim(&self) -> usize {
+        1
+    }
+    fn count(&self) -> usize {
+        self.count
+    }
+    fn get(&self, index: usize) -> Result<Vec<T>, IoError> {
+        if index >= self.count {
+            return Err(IoError::OutOfBounds(index));
+        }
+        Ok(vec![T::from_le_bytes(&self.bytes(index, 1)?)])
+    }
+    fn get_slice(&self, index: usize) -> Option<&[T]> {
+        self.as_slice()?.get(index..index + 1)
+    }
+    fn read_into(&self, start: usize, out: &mut [T]) -> Result<usize, IoError> {
+        let n = records_to_read(start, out.len(), 1, self.count)?;
+        copy_elements(&self.bytes(start, n)?, &mut out[..n]);
+        Ok(n)
+    }
+    fn precache(&self) -> io::Result<()> {
+        self.storage.precache()
+    }
+    fn is_complete(&self) -> bool {
+        self.storage.is_complete()
+    }
+    fn as_slice(&self) -> Option<&[T]> {
+        let bytes = self.storage.mmap_slice(0, (self.count * T::SIZE) as u64)?;
+        if !aligned_for::<T>(bytes) {
+            return None;
+        }
+        // SAFETY: `bytes` is `count * T::SIZE` bytes of the mapping on a
+        // `T` boundary, and every `Element` is a plain number.
+        Some(unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const T, self.count) })
+    }
+    fn native_element_type(&self) -> Option<ElementType> {
+        Some(T::TYPE)
+    }
+}
+
+/// A reader of `T` over a reader of the file's own type `N`, for the
+/// conversions [`ElementType::conversion_to`] allows:
+/// [`Widening`](ElementConversion::Widening), which never fails, and
+/// [`CrossSign`](ElementConversion::CrossSign), where a value outside
+/// `T`'s range is [`IoError::ValueOverflow`] at its ordinal.
+///
+/// Nothing of `T` exists to borrow, so [`get_slice`](VectorReader::get_slice)
+/// and [`as_slice`](VectorReader::as_slice) are `None`; [`get`](VectorReader::get)
+/// and [`read_into`](VectorReader::read_into) convert. It is never
+/// built for a native read, so the native path costs nothing.
+pub struct ConvertingReader<N: Element, T: Element> {
+    inner: Arc<dyn VectorReader<N>>,
+    mode: ElementConversion,
+    _t: PhantomData<T>,
+}
+
+/// Bytes of the file's own type per scratch buffer in a converting bulk
+/// read.
+const CONVERT_SCRATCH_BYTES: usize = 64 << 10;
+
+impl<N: Element, T: Element> ConvertingReader<N, T> {
+    /// Wrap `inner`, or refuse: a native pair needs no conversion and
+    /// a refused pair has none.
+    pub fn new(inner: Arc<dyn VectorReader<N>>) -> Result<Self, IoError> {
+        let mode = N::TYPE.conversion_to(T::TYPE);
+        let reason = match mode {
+            ElementConversion::Widening | ElementConversion::CrossSign => {
+                return Ok(Self { inner, mode, _t: PhantomData });
+            }
+            ElementConversion::Native => "the reader already holds this type",
+            ElementConversion::Refused => "no conversion between the two",
+        };
+        Err(IoError::ElementMismatch { file: N::TYPE, requested: T::TYPE, reason })
+    }
+
+    fn convert_run(&self, from: &[N], into: &mut [T], first_ordinal: usize) -> Result<(), IoError> {
+        let dim = self.inner.dim().max(1);
+        for (k, (n, slot)) in from.iter().zip(into.iter_mut()).enumerate() {
+            *slot = veks_datatypes::convert::<N, T>(*n).map_err(|e| IoError::ValueOverflow {
+                index: first_ordinal + k / dim,
+                value: e.value,
+                target: T::TYPE,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl<N: Element, T: Element> std::fmt::Debug for ConvertingReader<N, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConvertingReader")
+            .field("from", &N::TYPE)
+            .field("to", &T::TYPE)
+            .field("mode", &self.mode)
+            .field("dim", &self.inner.dim())
+            .field("count", &self.inner.count())
+            .finish()
+    }
+}
+
+impl<N: Element, T: Element> VectorReader<T> for ConvertingReader<N, T> {
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+    fn count(&self) -> usize {
+        self.inner.count()
+    }
+    fn get(&self, index: usize) -> Result<Vec<T>, IoError> {
+        let native = self.inner.get(index)?;
+        let mut out = vec![zero::<T>(); native.len()];
+        self.convert_run(&native, &mut out, index)?;
+        Ok(out)
+    }
+    fn get_slice(&self, _index: usize) -> Option<&[T]> {
+        None
+    }
+    fn read_into(&self, start: usize, out: &mut [T]) -> Result<usize, IoError> {
+        let dim = self.dim();
+        let n = records_to_read(start, out.len(), dim, self.count())?;
+        let per_scratch = (CONVERT_SCRATCH_BYTES / (dim * N::SIZE).max(1)).max(1);
+        let mut scratch = vec![zero::<N>(); per_scratch * dim];
+        let mut done = 0;
+        while done < n {
+            let want = (n - done).min(per_scratch);
+            let got = self.inner.read_into(start + done, &mut scratch[..want * dim])?;
+            if got == 0 {
+                break;
+            }
+            let span = &mut out[done * dim..(done + got) * dim];
+            self.convert_run(&scratch[..got * dim], span, start + done)?;
+            done += got;
+        }
+        Ok(done)
+    }
+    fn precache(&self) -> io::Result<()> {
+        self.inner.precache()
+    }
+    fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+    fn as_slice(&self) -> Option<&[T]> {
+        None
+    }
+    fn conversion(&self) -> ElementConversion {
+        self.mode
+    }
+    fn native_element_type(&self) -> Option<ElementType> {
+        self.inner.native_element_type().or(Some(N::TYPE))
+    }
+}
+
+/// The element types a reader can be erased to and recovered from.
+/// Implemented for every [`Element`]; crate-internal.
+pub(crate) trait AnyElement: Element {
+    fn into_any(reader: Arc<dyn VectorReader<Self>>) -> AnyVectorReader;
+    fn into_any_vvec(reader: Arc<dyn VvecReader<Self>>) -> AnyVvecReader;
+}
+
+fn downcast<N: Element, T: Element>(reader: Arc<dyn VectorReader<N>>) -> Result<Arc<dyn VectorReader<T>>, IoError> {
+    let boxed: Box<dyn std::any::Any> = Box::new(reader);
+    boxed.downcast::<Arc<dyn VectorReader<T>>>().map(|b| *b).map_err(|_| IoError::ElementMismatch {
+        file: N::TYPE,
+        requested: T::TYPE,
+        reason: "the reader holds the file's own type; ask for that, or convert through a dataset view",
+    })
+}
+
+fn downcast_vvec<N: Element, T: Element>(reader: Arc<dyn VvecReader<N>>) -> Result<Arc<dyn VvecReader<T>>, IoError> {
+    let boxed: Box<dyn std::any::Any> = Box::new(reader);
+    boxed.downcast::<Arc<dyn VvecReader<T>>>().map(|b| *b).map_err(|_| IoError::ElementMismatch {
+        file: N::TYPE,
+        requested: T::TYPE,
+        reason: "a variable-length reader holds the file's own type only",
+    })
+}
+
+macro_rules! any_readers {
+    ($($variant:ident $t:ty),* $(,)?) => {
+        /// A reader at one of the element types, before the caller's
+        /// `T` is known to the compiler.
+        ///
+        /// What [`open_vec_native`] and
+        /// [`TestDataView::open_facet_native`](crate::TestDataView::open_facet_native)
+        /// return: the file read at its own type. Recover the typed
+        /// reader with [`into_typed`](Self::into_typed), convert with
+        /// [`as_type`](Self::as_type), or match on the variant.
+        #[non_exhaustive]
+        pub enum AnyVectorReader {
+            $(
+                #[doc = concat!("A reader of `", stringify!($t), "`.")]
+                $variant(Arc<dyn VectorReader<$t>>),
+            )*
+        }
+
+        impl AnyVectorReader {
+            /// The element type the reader holds.
+            pub fn element_type(&self) -> ElementType {
+                match self { $(Self::$variant(_) => ElementType::$variant,)* }
+            }
+
+            /// Number of records.
+            pub fn count(&self) -> usize {
+                match self { $(Self::$variant(r) => r.count(),)* }
+            }
+
+            /// Elements per record.
+            pub fn dim(&self) -> usize {
+                match self { $(Self::$variant(r) => r.dim(),)* }
+            }
+
+            /// The reader as `T`, which must be the type it holds:
+            /// [`IoError::ElementMismatch`] otherwise. No conversion
+            /// happens here; see [`as_type`](Self::as_type) for one.
+            pub fn into_typed<T: Element>(self) -> Result<Arc<dyn VectorReader<T>>, IoError> {
+                match self { $(Self::$variant(r) => downcast::<$t, T>(r),)* }
+            }
+
+            /// The reader converted to `T` by the table.
+            pub(crate) fn converted_to<T: Element>(self) -> Result<Arc<dyn VectorReader<T>>, IoError> {
+                match self { $(Self::$variant(r) => Ok(Arc::new(ConvertingReader::<$t, T>::new(r)?)),)* }
+            }
+
+            /// The reader as `T`: in place when `T` is the file's type,
+            /// converted where [`ElementType::conversion_to`] allows,
+            /// refused otherwise.
+            pub fn as_type<T: Element>(self) -> Result<Arc<dyn VectorReader<T>>, IoError> {
+                match self.element_type().conversion_to(T::TYPE) {
+                    ElementConversion::Native => self.into_typed::<T>(),
+                    ElementConversion::Widening | ElementConversion::CrossSign => self.converted_to::<T>(),
+                    ElementConversion::Refused => Err(IoError::ElementMismatch {
+                        file: self.element_type(),
+                        requested: T::TYPE,
+                        reason: "no conversion between the two",
+                    }),
+                }
+            }
+        }
+
+        impl std::fmt::Debug for AnyVectorReader {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("AnyVectorReader")
+                    .field("element", &self.element_type())
+                    .field("dim", &self.dim())
+                    .field("count", &self.count())
+                    .finish()
+            }
+        }
+
+        /// A variable-length reader at one of the element types, before
+        /// the caller's `T` is known to the compiler. Recovered with
+        /// [`into_typed`](Self::into_typed) at the type it holds; a
+        /// variable-length facet is never converted.
+        #[non_exhaustive]
+        pub enum AnyVvecReader {
+            $(
+                #[doc = concat!("A reader of `", stringify!($t), "` records.")]
+                $variant(Arc<dyn VvecReader<$t>>),
+            )*
+        }
+
+        impl AnyVvecReader {
+            /// The element type the reader holds.
+            pub fn element_type(&self) -> ElementType {
+                match self { $(Self::$variant(_) => ElementType::$variant,)* }
+            }
+
+            /// Number of records.
+            pub fn count(&self) -> usize {
+                match self { $(Self::$variant(r) => r.count(),)* }
+            }
+
+            /// The reader as `T`, which must be the type it holds.
+            pub fn into_typed<T: Element>(self) -> Result<Arc<dyn VvecReader<T>>, IoError> {
+                match self { $(Self::$variant(r) => downcast_vvec::<$t, T>(r),)* }
+            }
+        }
+
+        impl std::fmt::Debug for AnyVvecReader {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("AnyVvecReader")
+                    .field("element", &self.element_type())
+                    .field("count", &self.count())
+                    .finish()
+            }
+        }
+
+        $(
+            impl AnyElement for $t {
+                fn into_any(reader: Arc<dyn VectorReader<$t>>) -> AnyVectorReader {
+                    AnyVectorReader::$variant(reader)
+                }
+                fn into_any_vvec(reader: Arc<dyn VvecReader<$t>>) -> AnyVvecReader {
+                    AnyVvecReader::$variant(reader)
+                }
+            }
+        )*
+    };
+}
+
+any_readers! {
+    U8 u8, I8 i8, U16 u16, I16 i16, U32 u32, I32 i32, U64 u64, I64 i64,
+    F16 half::f16, BF16 half::bf16, F32 f32, F64 f64,
+}
+
+/// Open a vector or column file at the type its extension names, for
+/// a caller that does not know the type ahead of time. A column opens
+/// as a [`ScalarReader`] (`dim() == 1`), anything else as an
+/// [`XvecReader`].
+pub fn open_vec_native(source: &str) -> Result<AnyVectorReader, IoError> {
+    let ext = ext_of(source);
+    let (file, container) = ElementType::parse_extension(ext).ok_or_else(|| {
+        IoError::InvalidFormat(format!("cannot infer element type from extension '.{ext}'"))
+    })?;
+    veks_datatypes::dispatch_element!(file, N => Ok(match container {
+        Container::Scalar => <N as AnyElement>::into_any(Arc::new(ScalarReader::<N>::open(source)?)),
+        _ => <N as AnyElement>::into_any(Arc::new(XvecReader::<N>::open(source)?)),
+    }))
+}
+
+/// Open a vector or column file as `T`: in place when `T` is the type
+/// the extension names, converted by [`ElementType::conversion_to`]
+/// where the table allows (an `.mvec` as f32, a `.bvecs` as i32),
+/// refused otherwise. [`open_vec`] is the native-only form.
+pub fn open_vec_as<T: Element>(source: &str) -> Result<Arc<dyn VectorReader<T>>, IoError> {
+    open_vec_native(source)?.as_type::<T>()
+}
 
 /// Open a uniform vector file for typed random access. Local or
 /// remote — the source string is the dispatch. For a remote dataset,

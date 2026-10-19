@@ -4,6 +4,10 @@
 //! A fetched dataset opens and reads with no network, and a changed
 //! upstream is still caught where the network is meant to be used.
 
+// The pinned readers and the typed reader are deprecated in favour of
+// `TestDataViewExt::facet_as`; this suite still covers them.
+#![allow(deprecated)]
+
 mod support;
 
 use std::path::Path;

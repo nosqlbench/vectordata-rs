@@ -31,6 +31,10 @@
 //! - `cache_stats`: `FacetStorage::cache_stats` reports
 //!   valid/total/complete during partial fill.
 
+// The pinned readers and the typed reader are deprecated in favour of
+// `TestDataViewExt::facet_as`; this suite still covers them.
+#![allow(deprecated)]
+
 mod support;
 
 use std::path::Path;

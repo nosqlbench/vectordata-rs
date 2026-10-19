@@ -603,6 +603,7 @@ fn last_segment(base_url: &Url) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestDataViewExt;
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -656,7 +657,7 @@ mod tests {
             catalog_dir.join("ds").join("b.fvec"),
         );
         let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
-        let base = group.profile("default").unwrap().base_vectors().expect("the listed file opens");
+        let base = group.profile("default").unwrap().base_vectors_as::<f32>().expect("the listed file opens");
         assert_eq!(base.count(), 3);
     }
 
@@ -677,7 +678,7 @@ mod tests {
             .unwrap();
         let group = crate::catalog::Catalog::open_entry(&entry).unwrap();
         assert_eq!(group.name.as_deref(), Some("built"));
-        assert_eq!(group.profile("default").unwrap().base_vectors().unwrap().count(), 3);
+        assert_eq!(group.profile("default").unwrap().base_vectors_as::<f32>().unwrap().count(), 3);
     }
 
     /// **A description built in code opens as a dataset**, its relative
@@ -692,7 +693,7 @@ mod tests {
             .unwrap();
         let group = TestDataGroup::from_config("built", Location::from_path(dir.path()), description);
         assert_eq!(group.name.as_deref(), Some("built"));
-        let base = group.profile("default").unwrap().base_vectors().unwrap();
+        let base = group.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
         assert_eq!(base.count(), 3);
     }
 
@@ -736,7 +737,7 @@ mod tests {
         );
         fs::write(ds.join("knn_entries.yaml"), content).unwrap();
         let group = TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-        let base = group.profile("default").unwrap().base_vectors().expect("the file under base_url opens");
+        let base = group.profile("default").unwrap().base_vectors_as::<f32>().expect("the file under base_url opens");
         assert_eq!(base.count(), 3);
         assert_eq!(group.name.as_deref(), Some("ds"), "the directory keeps its cache name");
     }
@@ -756,7 +757,7 @@ mod tests {
         fs::write(ds.join("knn_entries.yaml"), content).unwrap();
         let group = TestDataGroup::load(ds.to_str().unwrap()).unwrap();
         let profile = group.profile("default").unwrap();
-        assert_eq!(profile.base_vectors().expect("the local copy opens, with no request").count(), 3);
+        assert_eq!(profile.base_vectors_as::<f32>().expect("the local copy opens, with no request").count(), 3);
         let gt = group.config().profiles["default"].neighbor_indices.as_ref().unwrap();
         assert_eq!(gt.source(), Some("s3://no-such-bucket/ds/g.ivec"), "a file not beside it is still the remote's");
     }

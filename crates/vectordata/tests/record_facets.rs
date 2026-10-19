@@ -14,6 +14,10 @@
 //! See `docs/design/srd-multifile-facet-shards.md` (SH-96, SH-98) and
 //! `docs/design/metadata-facets-and-layout-namespace.md`.
 
+// The pinned readers and the typed reader are deprecated in favour of
+// `TestDataViewExt::facet_as`; this suite still covers them.
+#![allow(deprecated)]
+
 use vectordata::formats::anode::ANode;
 use vectordata::formats::anode_vernacular::Vernacular;
 use vectordata::formats::mnode::{MNode, MValue};

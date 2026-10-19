@@ -27,7 +27,7 @@ use std::path::Path;
 
 use vectordata::catalog::{Catalog, CatalogBuilder, CatalogSources};
 use vectordata::dataset::{CatalogEntry, DatasetConfig, StandardFacet};
-use vectordata::Location;
+use vectordata::{Location, TestDataViewExt};
 
 /// A shipped catalog in the `knn_entries.yaml` shape: `<dataset>:<profile>`
 /// keys, facet paths relative to the catalog's base.
@@ -68,8 +68,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for name in ["demo", "listed"] {
         let entry = catalog.lookup(name)?;
         let view = catalog.open_profile(name, "default")?;
-        let base = view.base_vectors()?;
-        let gt = view.neighbor_indices()?;
+        let base = view.base_vectors_as::<f32>()?;
+        let gt = view.neighbor_indices_as::<i32>()?;
         println!(
             "{name} (catalog '{}'): {} base vectors, dim {}; vector 1 = {:?}; nearest to query 0: {:?}",
             entry.catalog_name().unwrap_or("?"),

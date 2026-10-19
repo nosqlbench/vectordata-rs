@@ -26,6 +26,10 @@
 //! port; the `Storage` layer goes through `HttpTransport` →
 //! `ChunkStore` exactly as it would for an S3 fetch.
 
+// The pinned readers and the typed reader are deprecated in favour of
+// `TestDataViewExt::facet_as`; this suite still covers them.
+#![allow(deprecated)]
+
 mod support;
 
 use std::path::Path;

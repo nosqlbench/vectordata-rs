@@ -14,6 +14,7 @@
 
 use vectordata::catalog::{Catalog, CatalogSources};
 use vectordata::fetch::{FetchRequest, TextMeter};
+use vectordata::TestDataViewExt;
 
 fn main() -> vectordata::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -40,7 +41,7 @@ fn main() -> vectordata::Result<()> {
     }
     // Everything fetched is now local: reads are zero-copy.
     if report.facet("base_vectors").is_some() {
-        let base = view.base_vectors()?;
+        let base = view.base_vectors_as::<f32>()?;
         println!("base_vectors: {} × {}", base.count(), base.dim());
     }
     Ok(())

@@ -17,7 +17,7 @@
 use vectordata::catalog::{Catalog, CatalogSources};
 use vectordata::dataset::source::{DSInterval, DSWindow};
 use vectordata::fetch::{FetchRequest, Silent};
-use vectordata::WholeFacetFallback;
+use vectordata::{TestDataViewExt, WholeFacetFallback};
 
 fn window(start: u64, end: u64) -> DSWindow {
     DSWindow(vec![DSInterval { min_incl: start, max_excl: end }])
@@ -30,7 +30,7 @@ fn main() -> vectordata::Result<()> {
 
     let catalog = Catalog::of(&CatalogSources::new().configure_default());
     let view = catalog.open_spec(&spec)?.view()?;
-    let base = view.base_vectors()?;
+    let base = view.base_vectors_as::<f32>()?;
     let count = base.count() as u64;
     let dim = base.dim();
     let mut buf = vec![0f32; step as usize * dim];

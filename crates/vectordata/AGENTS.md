@@ -68,9 +68,12 @@ documentation's **Common tasks** table is the same index with examples.
 - Read ground truth:
   [`TestDataView::neighbor_indices`](crate::TestDataView::neighbor_indices),
   [`neighbor_distances`](crate::TestDataView::neighbor_distances).
-- Read metadata or scalar facets with type widening:
-  [`open_facet_typed`](crate::open_facet_typed) →
-  [`TypedReader`](crate::TypedReader). Record (slab) facets:
+- Read any element facet at the type it holds or converted (u8 codes
+  in place, bf16 or f16 widened to f32, a metadata column as i32):
+  [`TestDataViewExt::facet_as`](crate::TestDataViewExt::facet_as); the
+  rules are [`ElementType::conversion_to`](crate::ElementType::conversion_to).
+  A whole column borrows with [`VectorReader::as_slice`](crate::VectorReader::as_slice).
+  Record (slab) facets:
   [`TestDataView::open_facet_records`](crate::TestDataView::open_facet_records).
 - List profiles and facets:
   [`TestDataGroup::profile_names`](crate::TestDataGroup::profile_names),
