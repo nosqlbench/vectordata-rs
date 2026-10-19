@@ -6442,6 +6442,7 @@ dependencies = [
  "veks-anode",
  "veks-completion",
  "veks-completion-derive",
+ "veks-datatypes",
  "veks-simd",
 ]
 

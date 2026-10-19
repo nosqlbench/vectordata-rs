@@ -47,6 +47,7 @@ use crate::dataset::config::DatasetConfig as RichDatasetConfig;
 use crate::dataset::source::DSWindow;
 use crate::dataset::Sharding;
 use crate::merkle::MerkleRef;
+use crate::typed_access::ElementTypeExt;
 use crate::typed_access::ElementType;
 use crate::dataset::selector::DatasetSpec;
 

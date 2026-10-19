@@ -1334,3 +1334,110 @@ baseline → after, lines, then functions after):
 The whole set is unchanged at 75.6%. What is left uncovered in the
 readers is the record-size overflow branch, which a 64-bit host cannot
 reach, and the `Open`/`Mmap` display arms.
+
+### 16.3 Step 3: vectordata's element model and the width check (2026-10-19)
+
+**Guards, run against the code before the step** (`crates/vectordata/
+tests/element_model.rs`, first written in the old API's spellings, and
+one in `veks-pipeline`'s `element_type.rs` tests):
+- `an_ivec_does_not_open_as_f32_by_path` and
+  `an_fvec_does_not_open_as_i32`: both opened `Ok`.
+- `a_dvec_opened_as_f32_is_a_mismatch_not_a_short_file`: "opened an
+  f64 file as f32 with count 9" — five records of four f64 read as
+  nine records of garbage.
+- `a_u32vvec_does_not_open_as_i32`: opened `Ok` (the width-only check
+  passed).
+- `a_float_file_is_refused_by_the_typed_reader`: `TypedReader::<i32>::
+  open("base.fvec")` was `Ok`; every value read as 0. (§14.3 named this
+  guard with a `.f32` column; the old code refused that for the wrong
+  reason — an unknown extension — so the guard uses an `.fvec`, where
+  the zeros were real.)
+- `bf16_and_the_float_columns_are_recognised_extensions`: `None` for
+  all three.
+- `dispatch_reader_opens_an_i8_file_as_i8`: `XvecReader<u8>` where
+  `XvecReader<i8>` is named.
+
+**Built:**
+- `vectordata` depends on `veks-datatypes`. `typed_access::ElementType`
+  is the shared enum (EA-1: `BF16`, `#[non_exhaustive]`); `Element`,
+  `ElementConversion`, `ElementKind`, `FloatFormat`, `Container`,
+  `Value`, `bf16` and `f16` are re-exported there and at the root
+  (`io` re-exports `Element` and `ElementType` too). The path and URL
+  forms (`from_path`, `from_url`, `is_scalar_format`) and the deprecated
+  `can_open_as` are an extension trait, `ElementTypeExt`, since they
+  cannot be inherent on a foreign type.
+- `io::VvecElement` and `typed_access::TypedElement` are deprecated
+  blanket traits over `Element` (EA-7); every bound in `io.rs` and
+  `view.rs` is `T: Element` and every `ELEM_SIZE` is `SIZE`. The eleven
+  hand-written `VvecElement` impls and `impl_typed_element!` are gone.
+- `io::infer_elem_size`, `is_vvec_ext` (still counting the bare
+  `ivec(s)`) and `is_scalar_ext` answer from `ElementType::
+  parse_extension`. The three extension tables in `typed_access.rs`,
+  `io.rs` and `datasets/filter.rs` are gone; `filter.rs` names a file's
+  type through a new `ElementType::long_name` (`float32`, `bfloat16`),
+  which veks-io's `data_type_name` now uses as well.
+- `io::require_native::<T>(source) -> (ElementType, Container)` (EA-11)
+  replaces `validate_element_for_source`; `XvecReader::open` and
+  `open_path` (which checked nothing) call it and also refuse a column;
+  `IndexedVvecReader::open_path` and `validate_source` call it in place
+  of the width comparison. `IoError` is `#[non_exhaustive]` and gains
+  `ElementMismatch { file, requested, reason }` and `ValueOverflow {
+  index, value, target }`. The `reason` says what to do: "open it
+  through a dataset view to widen" for a pair the table allows, "no
+  conversion between the two" otherwise.
+- The view's `open_uniform` calls `require_native::<T>` before
+  `from_storage`, so `base_vectors()` on an `.mvec` facet is now an
+  `ElementMismatch` where it reinterpreted bits; step 4 makes it widen.
+- `XvecReader`'s unchecked inherent `get_slice` is one generic impl
+  over `Element` in place of the f32 one plus a macro for five more
+  types. Generic code that wants the checked form names it
+  (`VectorReader::get_slice(reader, i)`); the sharded reader did.
+- `TypedReader` (EA-14's guard): `check_open` consults
+  `conversion_to`, so a float file is refused as an integer, and —
+  since the reader now decodes through `Element::to_value` — opens at
+  its own float type or widened (`TypedReader::<f64>` over an `.fvec`
+  reads the values). `is_native()` is by type, not width. `dispatch_
+  typed!` reaches the float types and carries a wildcard arm.
+- `FacetFormat` (EA-20): `FloatScalar`; `#[non_exhaustive]`; `ALL`;
+  `of(Container, ElementType)`; every `extensions()` list is derived
+  from `ElementType::ALL × Container` (each type's canonical spelling,
+  then its aliases) and held in a `LazyLock`. `IntegerVarXvec` thereby
+  admits every integer width, where it listed 32-bit only.
+- `veks-pipeline`'s `dispatch_reader!` opens i8, u16, u32, u64 and i64
+  files as themselves (EA-31's first half; the enum itself moves in
+  step 7); `compute_knn_distances` bounds on `Element`.
+
+**Decided during the step:**
+- **`ivec(s)` stays a variable-length spelling for the vvec reader**
+  while parsing as `(I32, Vec)` in the model — both readers accept it,
+  as before, because old datasets used it both ways.
+- **The raw readers refuse a column** (`open_vec::<f32>("x.f32")` is
+  `InvalidFormat` naming the typed reader) rather than reading its
+  first four bytes as a dimension.
+- **`FacetFormat::extensions()` leads with the typed spelling**
+  (`f16vecs` before `mvecs`): it lists what a file may be called;
+  what a new file is called is veks-io's `preferred_extension`, which
+  keeps the historical spelling (§16.1).
+
+**Flips:** `the_scalar_extensions_are_exactly_the_integer_widths` →
+`the_scalar_extensions_are_every_element_type` (§14.2).
+
+**Tests:** vectordata 896 unit and every integration suite, with the
+10 in `tests/element_model.rs` (six guards and four behaviour tests);
+veks-io 123; veks-core 131; the veks-pipeline, veks and vecd suites
+pass unchanged but for the dispatch guard. `cargo doc` clean with
+warnings denied for the three crates; clippy clean on the changed
+files.
+
+**Coverage after the step** (the §14.5 command, whole workspace:
+75.6% -> 75.6%; baseline → after, lines, then functions after):
+
+| File | Baseline | After | Functions |
+|---|---|---|---|
+| `vectordata/src/io.rs` | 82.9% | 85.3% (824/966) | 85.6% (107/125) |
+| `vectordata/src/typed_access.rs` | 80.2% | 81.1% (279/344) | 66.1% (39/59) |
+| `vectordata/src/view.rs` | 84.7% | 84.7% (1992/2353) | 73.4% (246/335) |
+| `vectordata/src/dataset/facet.rs` | 93.3% | 93.5% (319/341) | 96.4% (54/56) |
+| `vectordata/src/datasets/filter.rs` | 83.5% | 84.6% (871/1029) | 86.2% (106/123) |
+| `veks-pipeline/src/pipeline/element_type.rs` | 81.1% | 81.6% (146/179) | 48.8% (21/43) |
+| `veks-datatypes/src/element_type.rs` | 97.9% | 100.0% (162/162) | 100.0% (26/26) |

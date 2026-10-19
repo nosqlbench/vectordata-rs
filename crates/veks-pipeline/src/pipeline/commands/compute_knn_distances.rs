@@ -24,7 +24,7 @@ use std::time::Instant;
 use byteorder::{LittleEndian, WriteBytesExt};
 
 use vectordata::VectorReader;
-use vectordata::io::{VvecElement, XvecReader};
+use vectordata::io::{Element, XvecReader};
 
 use crate::pipeline::atomic_write::{AtomicWriter, safe_create_file};
 use crate::pipeline::command::{
@@ -358,7 +358,7 @@ impl UpcastF32 for half::f16 {
 
 /// Read every vector through the generic `VectorReader::get` API and
 /// upcast into the supplied f32 buffer.
-fn upcast_into<T: UpcastF32 + VvecElement>(
+fn upcast_into<T: UpcastF32 + Element>(
     reader: &XvecReader<T>, idx: usize, out: &mut [f32], dim: usize,
 )
 where XvecReader<T>: VectorReader<T>,
@@ -370,7 +370,7 @@ where XvecReader<T>: VectorReader<T>,
     }
 }
 
-fn run<B: UpcastF32 + VvecElement, Q: UpcastF32 + VvecElement>(
+fn run<B: UpcastF32 + Element, Q: UpcastF32 + Element>(
     base_path: &Path,
     query_path: &Path,
     indices_reader: &XvecReader<i32>,

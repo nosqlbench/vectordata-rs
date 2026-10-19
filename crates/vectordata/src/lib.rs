@@ -306,7 +306,7 @@ pub use view::{
 pub use io::{VectorReader, VvecReader, XvecReader, IndexedVvecReader, IoError};
 pub use cache::InsufficientCacheSpace;
 pub use access::AccessMode;
-pub use typed_access::{ElementType, TypedAccessError, TypedReader};
+pub use typed_access::{Element, ElementConversion, ElementType, ElementTypeExt, TypedAccessError, TypedReader};
 /// Re-exported so external callers of
 /// [`FacetStorage::prebuffer_with_progress`] can name the
 /// progress type their callback receives.

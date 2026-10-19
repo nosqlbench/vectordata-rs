@@ -192,32 +192,27 @@ macro_rules! dispatch_reader {
                 $body
             }
             $crate::pipeline::element_type::ElementType::I8 => {
-                // i8vec: reinterpret as u8 (same byte layout)
-                let $reader = vectordata::io::XvecReader::<u8>::open_path($path)
+                let $reader = vectordata::io::XvecReader::<i8>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::U16 => {
-                // u16vec: same layout as i16 but unsigned
-                let $reader = vectordata::io::XvecReader::<i16>::open_path($path)
+                let $reader = vectordata::io::XvecReader::<u16>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::U32 => {
-                // u32vec: same layout as i32 but unsigned
-                let $reader = vectordata::io::XvecReader::<i32>::open_path($path)
+                let $reader = vectordata::io::XvecReader::<u32>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::U64 => {
-                // u64vec: same byte layout as i64
-                let $reader = vectordata::io::XvecReader::<f64>::open_path($path)
+                let $reader = vectordata::io::XvecReader::<u64>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::I64 => {
-                // i64vec: same byte layout as f64 (8 bytes)
-                let $reader = vectordata::io::XvecReader::<f64>::open_path($path)
+                let $reader = vectordata::io::XvecReader::<i64>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
@@ -322,6 +317,22 @@ mod tests {
         assert_eq!(format!("{}", ElementType::F64), "f64");
         assert_eq!(format!("{}", ElementType::U16), "u16");
         assert_eq!(format!("{}", ElementType::I64), "i64");
+    }
+
+    /// The dispatch opens every file as the type its extension names:
+    /// an `.i8vecs` as `XvecReader<i8>`, not as the u8 reader of the
+    /// same width.
+    #[test]
+    fn dispatch_reader_opens_an_i8_file_as_i8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codes.i8vecs");
+        std::fs::write(&path, [2i32.to_le_bytes().as_slice(), &[0xff, 0x7f]].concat()).unwrap();
+        let opened: Result<&'static str, String> = (|| {
+            crate::dispatch_reader!(ElementType::I8, &path, reader => {
+                Ok(std::any::type_name_of_val(&reader))
+            })
+        })();
+        assert_eq!(opened.unwrap(), std::any::type_name::<vectordata::io::XvecReader<i8>>());
     }
 
     #[test]

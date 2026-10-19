@@ -304,21 +304,7 @@ impl VecFormat {
 
     /// Human-readable data type name.
     pub fn data_type_name(self) -> &'static str {
-        match self.element_type() {
-            Some(ElementType::F32) => "float32",
-            Some(ElementType::F64) => "float64",
-            Some(ElementType::F16) => "float16",
-            Some(ElementType::BF16) => "bfloat16",
-            Some(ElementType::U8) => "uint8",
-            Some(ElementType::I8) => "int8",
-            Some(ElementType::U16) => "uint16",
-            Some(ElementType::I16) => "int16",
-            Some(ElementType::U32) => "uint32",
-            Some(ElementType::I32) => "int32",
-            Some(ElementType::U64) => "uint64",
-            Some(ElementType::I64) => "int64",
-            _ => "float",
-        }
+        self.element_type().map_or("float", ElementType::long_name)
     }
 }
 

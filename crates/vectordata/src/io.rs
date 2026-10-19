@@ -43,7 +43,31 @@ pub const DIM_UNDEFINED: usize = usize::MAX;
 
 /// Errors that can occur during vector I/O operations.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum IoError {
+    /// The file holds one element type and the reader was asked for
+    /// another. A raw reader never reinterprets; see
+    /// [`ElementType::conversion_to`] for what a dataset view converts.
+    #[error("the file holds {file} elements and cannot be read as {requested}: {reason}")]
+    ElementMismatch {
+        /// The element type the file holds, by its extension.
+        file: ElementType,
+        /// The element type the reader was asked for.
+        requested: ElementType,
+        /// Why not, in a few words.
+        reason: &'static str,
+    },
+    /// A value of the file's type does not fit the requested type,
+    /// under a conversion that checks each value.
+    #[error("value {value} at ordinal {index} does not fit in {target}")]
+    ValueOverflow {
+        /// The ordinal of the value, in the reader's own numbering.
+        index: usize,
+        /// The value as the file holds it.
+        value: veks_datatypes::Value,
+        /// The type it was asked to become.
+        target: ElementType,
+    },
     /// Wrapper for standard IO errors.
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
@@ -88,80 +112,14 @@ pub enum IoError {
 // Element trait
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Trait for types that can be decoded from little-endian bytes.
-pub trait VvecElement: Copy + Send + Sync + 'static {
-    /// Size of one element in bytes.
-    const ELEM_SIZE: usize;
-    /// Decode one element from a little-endian byte slice.
-    fn from_le_bytes(bytes: &[u8]) -> Self;
-}
+pub use veks_datatypes::{Container, Element, ElementConversion, ElementType};
 
-impl VvecElement for u8 {
-    const ELEM_SIZE: usize = 1;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        b[0]
-    }
-}
-impl VvecElement for i8 {
-    const ELEM_SIZE: usize = 1;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        b[0] as i8
-    }
-}
-impl VvecElement for u16 {
-    const ELEM_SIZE: usize = 2;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        LittleEndian::read_u16(b)
-    }
-}
-impl VvecElement for i16 {
-    const ELEM_SIZE: usize = 2;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        LittleEndian::read_i16(b)
-    }
-}
-impl VvecElement for u32 {
-    const ELEM_SIZE: usize = 4;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        LittleEndian::read_u32(b)
-    }
-}
-impl VvecElement for i32 {
-    const ELEM_SIZE: usize = 4;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        LittleEndian::read_i32(b)
-    }
-}
-impl VvecElement for f32 {
-    const ELEM_SIZE: usize = 4;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        LittleEndian::read_f32(b)
-    }
-}
-impl VvecElement for u64 {
-    const ELEM_SIZE: usize = 8;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        LittleEndian::read_u64(b)
-    }
-}
-impl VvecElement for i64 {
-    const ELEM_SIZE: usize = 8;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        LittleEndian::read_i64(b)
-    }
-}
-impl VvecElement for f64 {
-    const ELEM_SIZE: usize = 8;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        LittleEndian::read_f64(b)
-    }
-}
-impl VvecElement for half::f16 {
-    const ELEM_SIZE: usize = 2;
-    fn from_le_bytes(b: &[u8]) -> Self {
-        half::f16::from_le_bytes([b[0], b[1]])
-    }
-}
+/// The bound the readers put on their element type before the shared
+/// model. Every [`Element`] is one; bound on [`Element`] instead.
+#[deprecated(note = "bound on `Element` (re-exported here and at the crate root)")]
+pub trait VvecElement: Element {}
+#[allow(deprecated)]
+impl<T: Element> VvecElement for T {}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Traits — VectorReader / VvecReader
@@ -260,13 +218,13 @@ pub(crate) fn records_to_read(
 /// Copy `n` xvec records out of `bytes` — each a 4-byte dimension header
 /// followed by `dim` little-endian elements, `entry_size` bytes apart —
 /// into `out`, dropping the headers.
-fn copy_records<T: VvecElement>(bytes: &[u8], entry_size: usize, dim: usize, out: &mut [T]) {
-    let body = dim * T::ELEM_SIZE;
+fn copy_records<T: Element>(bytes: &[u8], entry_size: usize, dim: usize, out: &mut [T]) {
+    let body = dim * T::SIZE;
     for (k, record) in out.chunks_exact_mut(dim).enumerate() {
         let src = &bytes[k * entry_size + 4..k * entry_size + 4 + body];
         #[cfg(target_endian = "little")]
         {
-            debug_assert_eq!(core::mem::size_of::<T>(), T::ELEM_SIZE);
+            debug_assert_eq!(core::mem::size_of::<T>(), T::SIZE);
             // SAFETY: `VvecElement` types are plain little-endian numbers
             // whose in-memory form, on a little-endian host, is exactly
             // their on-disk bytes; `record` holds `dim` of them, which is
@@ -276,14 +234,14 @@ fn copy_records<T: VvecElement>(bytes: &[u8], entry_size: usize, dim: usize, out
             }
         }
         #[cfg(not(target_endian = "little"))]
-        for (dst, b) in record.iter_mut().zip(src.chunks_exact(T::ELEM_SIZE)) {
+        for (dst, b) in record.iter_mut().zip(src.chunks_exact(T::SIZE)) {
             *dst = T::from_le_bytes(b);
         }
     }
 }
 
 /// Random-access reader for variable-length vector record files.
-pub trait VvecReader<T: VvecElement>: Send + Sync {
+pub trait VvecReader<T: Element>: Send + Sync {
     /// Total number of records in the file.
     fn count(&self) -> usize;
     /// Dimension of the record at the given ordinal.
@@ -294,7 +252,7 @@ pub trait VvecReader<T: VvecElement>: Send + Sync {
     fn get(&self, index: usize) -> Result<Vec<T>, IoError> {
         let bytes = self.get_bytes(index)?;
         Ok(bytes
-            .chunks_exact(T::ELEM_SIZE)
+            .chunks_exact(T::SIZE)
             .map(T::from_le_bytes)
             .collect())
     }
@@ -312,32 +270,19 @@ pub trait VvecReader<T: VvecElement>: Send + Sync {
 // Extension / size inference helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Infer element size from an extension string (0 = unknown).
+/// Infer element size from an extension string (0 = unknown). Answers
+/// from the element model's one table.
 pub(crate) fn infer_elem_size(ext: &str) -> usize {
-    match ext.to_lowercase().as_str() {
-        // 4-byte
-        "fvec" | "fvecs" | "f32vec" | "f32vecs" | "ivec" | "ivecs" | "i32vec" | "i32vecs"
-        | "u32vec" | "u32vecs" | "fvvec" | "fvvecs" | "ivvec" | "ivvecs" | "f32vvec"
-        | "f32vvecs" | "i32vvec" | "i32vvecs" | "u32vvec" | "u32vvecs" | "u32" | "i32" => 4,
-        // 8-byte
-        "dvec" | "dvecs" | "f64vec" | "f64vecs" | "dvvec" | "dvvecs" | "i64vec" | "i64vecs"
-        | "u64vec" | "u64vecs" | "f64vvec" | "f64vvecs" | "i64vvec" | "i64vvecs" | "u64vvec"
-        | "u64vvecs" | "u64" | "i64" => 8,
-        // 2-byte
-        "mvec" | "mvecs" | "f16vec" | "f16vecs" | "svec" | "svecs" | "i16vec" | "i16vecs"
-        | "u16vec" | "u16vecs" | "mvvec" | "mvvecs" | "svvec" | "svvecs" | "f16vvec"
-        | "f16vvecs" | "i16vvec" | "i16vvecs" | "u16vvec" | "u16vvecs" | "u16" | "i16" => 2,
-        // 1-byte
-        "bvec" | "bvecs" | "u8vec" | "u8vecs" | "i8vec" | "i8vecs" | "bvvec" | "bvvecs"
-        | "u8vvec" | "u8vvecs" | "i8vvec" | "i8vvecs" | "u8" | "i8" => 1,
-        _ => 0,
-    }
+    ElementType::from_extension(ext).map_or(0, ElementType::byte_width)
 }
 
-/// Whether the extension implies a variable-length record file.
+/// Whether the extension implies a variable-length record file. The
+/// bare `ivec(s)` is counted: the earliest datasets used it for
+/// variable-length files, and the vvec reader still opens them.
 pub(crate) fn is_vvec_ext(ext: &str) -> bool {
-    let e = ext.to_lowercase();
-    e.contains("vvec") || e == "ivec" || e == "ivecs"
+    matches!(ElementType::parse_extension(ext), Some((_, Container::Vvec)))
+        || ext.eq_ignore_ascii_case("ivec")
+        || ext.eq_ignore_ascii_case("ivecs")
 }
 
 /// Whether `ext` names a *scalar* facet: raw packed values with no
@@ -347,30 +292,46 @@ pub(crate) fn is_vvec_ext(ext: &str) -> bool {
 /// classifies both paths and URLs through here. Keeping one table
 /// matters because the answer decides whether the first four bytes of
 /// a file are a dimension header or data: classify a scalar file as
-/// xvec and every offset past the first is wrong.
-///
-/// Deliberately only the eight integer widths. There is no bare
-/// `.f32`/`.f64` scalar extension — [`crate::typed_access::ElementType::from_extension`]
-/// does not recognise one, so such a file is rejected at open before
-/// any of this is reached.
+/// xvec and every offset past the first is wrong. The table is the
+/// element model's: every element type has a column spelling, the
+/// floats included (`.f32`, `.bf16`).
 pub(crate) fn is_scalar_ext(ext: &str) -> bool {
-    matches!(
-        ext.to_lowercase().as_str(),
-        "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64"
-    )
+    matches!(ElementType::parse_extension(ext), Some((_, Container::Scalar)))
 }
 
-/// Validate that a file's extension is compatible with `T`'s element width.
-pub(crate) fn validate_element_for_source(source: &str) -> Result<(), IoError> {
-    let name = source.rsplit('/').next().unwrap_or(source);
-    let ext = name.rsplit('.').next().unwrap_or("");
-    let size = infer_elem_size(ext);
-    if size == 0 {
-        return Err(IoError::InvalidFormat(format!(
-            "cannot infer element size from extension '.{ext}'"
-        )));
+/// The one check a typed open makes: the extension of `source` must
+/// name a file whose element type is `T`'s. Returns the file's type and
+/// layout.
+///
+/// A reader never reinterprets. A `.bvecs` is not opened as f32 because
+/// the stride happens to divide, and a `.dvec` is not opened as f32
+/// because both are floats: anything but `Native` under
+/// [`ElementType::conversion_to`] is an [`IoError::ElementMismatch`].
+/// A dataset view converts where the table allows it; a raw reader
+/// reads a file at its own type only.
+pub(crate) fn require_native<T: Element>(source: &str) -> Result<(ElementType, Container), IoError> {
+    let ext = ext_of(source);
+    let (file, container) = ElementType::parse_extension(ext).ok_or_else(|| {
+        IoError::InvalidFormat(format!("cannot infer element type from extension '.{ext}'"))
+    })?;
+    match file.conversion_to(T::TYPE) {
+        ElementConversion::Native => Ok((file, container)),
+        ElementConversion::Widening => Err(IoError::ElementMismatch {
+            file,
+            requested: T::TYPE,
+            reason: "a raw reader reads a file at its own type; open it through a dataset view to widen",
+        }),
+        ElementConversion::CrossSign => Err(IoError::ElementMismatch {
+            file,
+            requested: T::TYPE,
+            reason: "a raw reader reads a file at its own type; open it through a dataset view to check each value",
+        }),
+        ElementConversion::Refused => Err(IoError::ElementMismatch {
+            file,
+            requested: T::TYPE,
+            reason: "no conversion between the two",
+        }),
     }
-    Ok(())
 }
 
 pub(crate) fn ext_of(source: &str) -> &str {
@@ -431,7 +392,7 @@ impl<T> XvecReader<T> {
     pub fn count(&self) -> usize {
         self.count
     }
-    /// Byte size of each record (4-byte dim header + `dim * ELEM_SIZE`).
+    /// Byte size of each record (4-byte dim header + `dim * SIZE`).
     pub fn entry_size(&self) -> usize {
         self.entry_size
     }
@@ -502,7 +463,7 @@ impl<T> XvecReader<T> {
     }
 }
 
-impl<T: VvecElement> XvecReader<T> {
+impl<T: Element> XvecReader<T> {
     /// Open from a path or URL string. Local paths use mmap; URLs try
     /// the merkle-cache path first and fall back to direct HTTP.
     ///
@@ -519,7 +480,7 @@ impl<T: VvecElement> XvecReader<T> {
     /// ([`TestDataView::fetch`](crate::TestDataView::fetch)) to see that
     /// download with progress.
     pub fn open(source: &str) -> Result<Self, IoError> {
-        validate_element_for_source(source)?;
+        Self::require_vectors(source)?;
         let storage = Storage::open(source)?;
         Self::from_storage(storage)
     }
@@ -527,8 +488,21 @@ impl<T: VvecElement> XvecReader<T> {
     /// Open a local file by path. Functionally equivalent to
     /// `open(path.to_str().unwrap())` but skips URL parsing.
     pub fn open_path(path: &Path) -> Result<Self, IoError> {
+        Self::require_vectors(&path.to_string_lossy())?;
         let storage = Storage::open_path(path)?;
         Self::from_storage(storage)
+    }
+
+    /// The extension must name `T` ([`require_native`]) in a vector
+    /// layout: a column has no record header to read a dimension from.
+    fn require_vectors(source: &str) -> Result<(), IoError> {
+        match require_native::<T>(source)? {
+            (file, Container::Scalar) => Err(IoError::InvalidFormat(format!(
+                "'{}' is a column of {file}, not vectors; read it with ScalarReader or TypedReader",
+                ext_of(source)
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// Deprecated: open a remote dataset through
@@ -574,7 +548,7 @@ impl<T: VvecElement> XvecReader<T> {
             )));
         }
         let dim = dim_i32 as usize;
-        let entry_size = 4 + dim * T::ELEM_SIZE;
+        let entry_size = 4 + dim * T::SIZE;
         if !total_size.is_multiple_of(entry_size as u64) {
             return Err(IoError::VariableLengthRecords(format!(
                 "file size {total_size} is not a multiple of stride {entry_size} (dim={dim}). \
@@ -632,7 +606,7 @@ impl<T: VvecElement> XvecReader<T> {
     }
 }
 
-impl XvecReader<f32> {
+impl<T: Element> XvecReader<T> {
     /// Zero-copy slice of the vector at `index`. **Panics** if the
     /// underlying storage is not mmap-backed.
     ///
@@ -642,33 +616,14 @@ impl XvecReader<f32> {
     /// `index < self.count()`. Use [`VectorReader::get_slice`] for
     /// the bounds-checked `Option<&[T]>` form.
     #[inline]
-    pub fn get_slice(&self, index: usize) -> &[f32] {
+    pub fn get_slice(&self, index: usize) -> &[T] {
         let (base, local) = self.slice_base(index);
         let data_start = local * self.entry_size + 4;
-        unsafe { core::slice::from_raw_parts(base.add(data_start) as *const f32, self.dim) }
+        unsafe { core::slice::from_raw_parts(base.add(data_start) as *const T, self.dim) }
     }
 }
 
-macro_rules! impl_get_slice {
-    ($t:ty) => {
-        impl XvecReader<$t> {
-            /// See [`XvecReader::<f32>::get_slice`] — same semantics.
-            #[inline]
-            pub fn get_slice(&self, index: usize) -> &[$t] {
-                let (base, local) = self.slice_base(index);
-                let data_start = local * self.entry_size + 4;
-                unsafe { core::slice::from_raw_parts(base.add(data_start) as *const $t, self.dim) }
-            }
-        }
-    };
-}
-impl_get_slice!(half::f16);
-impl_get_slice!(f64);
-impl_get_slice!(i32);
-impl_get_slice!(u8);
-impl_get_slice!(i16);
-
-impl<T: VvecElement> VectorReader<T> for XvecReader<T> {
+impl<T: Element> VectorReader<T> for XvecReader<T> {
     fn dim(&self) -> usize {
         self.dim
     }
@@ -681,16 +636,16 @@ impl<T: VvecElement> VectorReader<T> for XvecReader<T> {
             return Err(IoError::OutOfBounds(index));
         }
         let data_start = (index * self.entry_size + 4) as u64;
-        let data_len = (self.dim * T::ELEM_SIZE) as u64;
+        let data_len = (self.dim * T::SIZE) as u64;
         if let Some(slice) = self.storage.mmap_slice(data_start, data_len) {
             return Ok(slice
-                .chunks_exact(T::ELEM_SIZE)
+                .chunks_exact(T::SIZE)
                 .map(T::from_le_bytes)
                 .collect());
         }
         let bytes = self.storage.read_bytes(data_start, data_len)?;
         Ok(bytes
-            .chunks_exact(T::ELEM_SIZE)
+            .chunks_exact(T::SIZE)
             .map(T::from_le_bytes)
             .collect())
     }
@@ -700,18 +655,18 @@ impl<T: VvecElement> VectorReader<T> for XvecReader<T> {
             return None;
         }
         let data_start = (index * self.entry_size + 4) as u64;
-        let data_len = (self.dim * T::ELEM_SIZE) as u64;
+        let data_len = (self.dim * T::SIZE) as u64;
         let bytes = self.storage.mmap_slice(data_start, data_len)?;
         // Cast bytes → &[T]. Safe under the LE-host assumption that
         // the rest of the crate already makes (storage values are
         // little-endian on disk; native LE on x86/ARM means the byte
         // order is identical). Alignment is satisfied by mmap (page-
         // aligned base) and the per-record offset (4-byte dim header
-        // keeps T::ELEM_SIZE-aligned data starts aligned for sizes ≤
+        // keeps T::SIZE-aligned data starts aligned for sizes ≤
         // 8). For 8-byte types, the leading dim header forces all
         // records to start at offsets that are 4-aligned, not 8-
         // aligned — so we conservatively bail out on 8-byte types.
-        if T::ELEM_SIZE > 4 {
+        if T::SIZE > 4 {
             return None;
         }
         let ptr = bytes.as_ptr() as *const T;
@@ -778,26 +733,18 @@ impl<T> std::fmt::Debug for IndexedVvecReader<T> {
     }
 }
 
-impl<T: VvecElement> IndexedVvecReader<T> {
+impl<T: Element> IndexedVvecReader<T> {
     /// Open a local variable-length file by path. The element width
-    /// is taken from `T::ELEM_SIZE`. Errors if the file extension's
+    /// is taken from `T::SIZE`. Errors if the file extension's
     /// implied size disagrees with `T`.
     pub fn open_path(path: &Path) -> Result<Self, IoError> {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let inferred = infer_elem_size(ext);
-        if inferred != 0 && inferred != T::ELEM_SIZE {
-            return Err(IoError::InvalidFormat(format!(
-                "extension '.{ext}' implies {inferred}-byte elements but type {} requires {}",
-                std::any::type_name::<T>(),
-                T::ELEM_SIZE
-            )));
-        }
+        Self::validate_source(&path.to_string_lossy())?;
         let storage = Storage::open_path(path)?;
-        let offsets = load_or_build_local_offsets(path, &storage, T::ELEM_SIZE)?;
+        let offsets = load_or_build_local_offsets(path, &storage, T::SIZE)?;
         Ok(Self {
             storage,
             offsets,
-            elem_size: T::ELEM_SIZE,
+            elem_size: T::SIZE,
             _phantom: PhantomData,
         })
     }
@@ -806,20 +753,8 @@ impl<T: VvecElement> IndexedVvecReader<T> {
     /// width is `T`'s, before any storage is opened.
     pub(crate) fn validate_source(source: &str) -> Result<(), IoError> {
         let ext = ext_of(source);
-        let elem_size = infer_elem_size(ext);
-        if elem_size == 0 {
-            return Err(IoError::InvalidFormat(format!(
-                "cannot infer element size from extension '.{ext}'"
-            )));
-        }
-        if elem_size != T::ELEM_SIZE {
-            return Err(IoError::InvalidFormat(format!(
-                "extension '.{ext}' implies {elem_size}-byte elements but type {} requires {}",
-                std::any::type_name::<T>(),
-                T::ELEM_SIZE
-            )));
-        }
-        if !is_vvec_ext(ext) && ext != "ivec" {
+        require_native::<T>(source)?;
+        if !is_vvec_ext(ext) {
             return Err(IoError::InvalidFormat(format!(
                 "extension '.{ext}' is not a variable-length format; use XvecReader for uniform-stride files"
             )));
@@ -837,7 +772,7 @@ impl<T: VvecElement> IndexedVvecReader<T> {
     /// ([`TestDataView::fetch`](crate::TestDataView::fetch)).
     pub fn open(source: &str) -> Result<Self, IoError> {
         Self::validate_source(source)?;
-        let elem_size = T::ELEM_SIZE;
+        let elem_size = T::SIZE;
 
         // `s3://` URLs are remote and get dispatched through the
         // same HTTPS-based offset-fetch path as `http(s)://`. The
@@ -961,7 +896,7 @@ impl IndexedVvecReader<i32> {
     }
 }
 
-impl<T: VvecElement> VvecReader<T> for IndexedVvecReader<T> {
+impl<T: Element> VvecReader<T> for IndexedVvecReader<T> {
     fn count(&self) -> usize {
         self.offsets.len()
     }
@@ -1005,14 +940,14 @@ impl<T: VvecElement> VvecReader<T> for IndexedVvecReader<T> {
 /// }
 /// // drop releases the trailing tail
 /// ```
-pub struct StreamReclaim<'a, T: VvecElement> {
+pub struct StreamReclaim<'a, T: Element> {
     reader: &'a XvecReader<T>,
     last_released: usize,
     end: usize,
     reclaim_window_records: usize,
 }
 
-impl<'a, T: VvecElement> StreamReclaim<'a, T> {
+impl<'a, T: Element> StreamReclaim<'a, T> {
     /// Default 256 MiB reclaim windows. Large enough that the per-
     /// window `madvise` overhead is negligible, small enough that
     /// resident-set growth is bounded.
@@ -1054,7 +989,7 @@ impl<'a, T: VvecElement> StreamReclaim<'a, T> {
     }
 }
 
-impl<'a, T: VvecElement> Drop for StreamReclaim<'a, T> {
+impl<'a, T: Element> Drop for StreamReclaim<'a, T> {
     fn drop(&mut self) {
         if self.last_released < self.end {
             self.reader.release_range(self.last_released, self.end);
@@ -1076,7 +1011,7 @@ impl<'a, T: VvecElement> Drop for StreamReclaim<'a, T> {
 /// let reader = open_vec::<f32>("base_vectors.fvec").unwrap();
 /// let v = reader.get(0).unwrap();
 /// ```
-pub fn open_vec<T: VvecElement>(source: &str) -> Result<Box<dyn VectorReader<T>>, IoError> {
+pub fn open_vec<T: Element>(source: &str) -> Result<Box<dyn VectorReader<T>>, IoError> {
     Ok(Box::new(XvecReader::<T>::open(source)?))
 }
 
@@ -1084,7 +1019,7 @@ pub fn open_vec<T: VvecElement>(source: &str) -> Result<Box<dyn VectorReader<T>>
 ///
 /// A remote file with no published offset index is refused rather than
 /// downloaded whole; see [`IndexedVvecReader::open`].
-pub fn open_vvec<T: VvecElement>(source: &str) -> Result<Box<dyn VvecReader<T>>, IoError> {
+pub fn open_vvec<T: Element>(source: &str) -> Result<Box<dyn VvecReader<T>>, IoError> {
     Ok(Box::new(IndexedVvecReader::<T>::open(source)?))
 }
 
@@ -1672,20 +1607,21 @@ mod scalar_classification {
     /// Scalar facets are the eight integer widths and nothing else.
     ///
     /// The set decides whether a file's first four bytes are a
-    /// dimension header or data, so it must be one table. `f32`/`f64`
-    /// are absent deliberately: `ElementType::from_extension` has no
-    /// bare-`f32` entry, so such a file never opens in the first place.
+    /// dimension header or data, so it must be one table: the element
+    /// model's, where every type has a column spelling.
     #[test]
-    fn the_scalar_extensions_are_exactly_the_integer_widths() {
-        for ext in ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64"] {
+    fn the_scalar_extensions_are_every_element_type() {
+        for ty in ElementType::ALL {
+            let ext = ty.extension(Container::Scalar);
             assert!(is_scalar_ext(ext), "{ext} is a scalar facet");
             assert!(!is_vvec_ext(ext), "{ext} is not variable-length");
-            assert_ne!(infer_elem_size(ext), 0, "{ext} has a known width");
+            assert_eq!(infer_elem_size(ext), ty.byte_width(), "{ext} has its width");
         }
-        for ext in ["fvec", "ivvec", "parquet", "f32", "f64", ""] {
+        for ext in ["fvec", "ivvec", "bf16vecs", "parquet", ""] {
             assert!(!is_scalar_ext(ext), "{ext} is not a scalar facet");
         }
         assert!(is_scalar_ext("I32"), "extension case must not matter");
+        assert!(is_scalar_ext("f32") && is_scalar_ext("bf16"), "float columns are scalar facets");
     }
 
     /// The path and URL classifiers must answer from that one table.
@@ -1696,7 +1632,7 @@ mod scalar_classification {
         for ext in [
             "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "fvec", "ivvec", "f32", "f64",
         ] {
-            let by_path = crate::typed_access::ElementType::is_scalar_format(format!("/d/x.{ext}"));
+            let by_path = <crate::typed_access::ElementType as crate::typed_access::ElementTypeExt>::is_scalar_format(format!("/d/x.{ext}"));
             let by_ext = is_scalar_ext(ext);
             assert_eq!(by_path, by_ext, "path classification of .{ext}");
         }

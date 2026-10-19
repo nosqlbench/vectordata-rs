@@ -31,58 +31,97 @@
 //! produced by the legacy `compute filtered-knn` command.
 
 use std::fmt;
+use std::sync::LazyLock;
 
-/// Canonical facet kinds for predicated vector datasets.
+use veks_datatypes::{Container, ElementType};
+
+/// The on-disk format a facet's resource may take: a vector layout
+/// of floats or integers, a variable-length layout of integers, a
+/// header-free column of either, or a slab.
 ///
-/// Each variant identifies a specific role within a test dataset. The
-/// canonical key name is used in `dataset.yaml` profile definitions.
-/// The value-shape a facet's bytes take in a file/resource. This is the
-/// coarse format taxonomy; specific element widths live in the extension
-/// list each format owns. It is the authority for questions like
-/// "can this facet be stored as an integer xvec?".
+/// The extension spellings are the element model's
+/// ([`ElementType`], `veks-datatypes`): each format is a set of
+/// element types in one [`Container`], and
+/// [`extensions`](Self::extensions) lists every spelling of every
+/// type in the set, canonical first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum FacetFormat {
-    /// Float xvec (`fvecs`/`fvec`/`dvecs`/…) — vectors and distances.
+    /// Uniform vectors of a float type: `f32`, `f64`, `f16`, `bf16`.
     FloatXvec,
-    /// Fixed-width integer xvec (`ivecs`/`ivec`/`i32vecs`/…) — neighbor IDs.
+    /// Uniform vectors of an integer type.
     IntegerXvec,
-    /// Variable-length integer xvec (`ivvecs`/`ivvec`/…) — the per-query
-    /// predicate-match index (R).
+    /// Variable-length vectors of an integer type.
     IntegerVarXvec,
-    /// Raw packed scalars (`u8`/`i32`/…) — flat metadata columns.
+    /// A header-free column of an integer type (`.u8`, `.i32`, …).
     ScalarPacked,
-    /// A slabtastic slab (`slab`) — MNode/PNode records, layout namespaces.
+    /// A header-free column of a float type (`.f32`, `.bf16`, …).
+    FloatScalar,
+    /// A slab: records of their own length, in pages.
     Slab,
 }
 
+/// Every spelling of every element type that `keep` admits, in one
+/// layout: the canonical spelling of each type first, then its
+/// aliases. Built once; the lists are static for the callers that
+/// iterate them.
+fn spellings(keep: fn(ElementType) -> bool, container: Container) -> Vec<&'static str> {
+    ElementType::ALL
+        .iter()
+        .copied()
+        .filter(|ty| keep(*ty))
+        .flat_map(|ty| std::iter::once(ty.extension(container)).chain(ty.aliases(container).iter().copied()))
+        .collect()
+}
+
+static FLOAT_XVEC: LazyLock<Vec<&'static str>> = LazyLock::new(|| spellings(ElementType::is_float, Container::Vec));
+static INTEGER_XVEC: LazyLock<Vec<&'static str>> = LazyLock::new(|| spellings(ElementType::is_integer, Container::Vec));
+static INTEGER_VVEC: LazyLock<Vec<&'static str>> = LazyLock::new(|| spellings(ElementType::is_integer, Container::Vvec));
+static INTEGER_SCALAR: LazyLock<Vec<&'static str>> = LazyLock::new(|| spellings(ElementType::is_integer, Container::Scalar));
+static FLOAT_SCALAR: LazyLock<Vec<&'static str>> = LazyLock::new(|| spellings(ElementType::is_float, Container::Scalar));
+
 impl FacetFormat {
-    /// Every recognized file extension for this format, plural (canonical)
-    /// forms first.
+    /// Every format.
+    pub const ALL: &[FacetFormat] = &[
+        Self::FloatXvec,
+        Self::IntegerXvec,
+        Self::IntegerVarXvec,
+        Self::ScalarPacked,
+        Self::FloatScalar,
+        Self::Slab,
+    ];
+
+    /// Every recognized file extension for this format: for each
+    /// element type in the set, its canonical spelling and then its
+    /// aliases.
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
-            Self::FloatXvec => &[
-                "fvecs", "dvecs", "mvecs", "fvec", "dvec", "mvec",
-                "f32vecs", "f64vecs", "f16vecs", "f32vec", "f64vec", "f16vec",
-            ],
-            Self::IntegerXvec => &[
-                "ivecs", "i32vecs", "u32vecs", "ivec", "i32vec", "u32vec",
-                "i8vecs", "u8vecs", "bvecs", "i16vecs", "u16vecs", "svecs",
-                "i8vec", "u8vec", "bvec", "i16vec", "u16vec", "svec",
-                "i64vecs", "u64vecs", "i64vec", "u64vec",
-            ],
-            Self::IntegerVarXvec => &[
-                "ivvecs", "i32vvecs", "u32vvecs", "ivvec", "i32vvec", "u32vvec",
-            ],
-            Self::ScalarPacked => &["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64"],
+            Self::FloatXvec => &FLOAT_XVEC,
+            Self::IntegerXvec => &INTEGER_XVEC,
+            Self::IntegerVarXvec => &INTEGER_VVEC,
+            Self::ScalarPacked => &INTEGER_SCALAR,
+            Self::FloatScalar => &FLOAT_SCALAR,
             Self::Slab => &["slab"],
         }
     }
 
     /// The format an extension belongs to, if recognized.
     pub fn from_extension(ext: &str) -> Option<Self> {
-        [Self::FloatXvec, Self::IntegerXvec, Self::IntegerVarXvec, Self::ScalarPacked, Self::Slab]
-            .into_iter()
-            .find(|f| f.extensions().contains(&ext))
+        Self::ALL.iter().copied().find(|f| f.extensions().contains(&ext))
+    }
+
+    /// The format a file of `element_type` in `container` has, if a
+    /// facet may hold one: a float vvec has none, and a slab is not an
+    /// element layout.
+    pub fn of(container: Container, element_type: ElementType) -> Option<Self> {
+        Some(match (container, element_type.is_float()) {
+            (Container::Vec, true) => Self::FloatXvec,
+            (Container::Vec, false) => Self::IntegerXvec,
+            (Container::Vvec, false) => Self::IntegerVarXvec,
+            (Container::Vvec, true) => return None,
+            (Container::Scalar, false) => Self::ScalarPacked,
+            (Container::Scalar, true) => Self::FloatScalar,
+        })
     }
 }
 
@@ -142,7 +181,7 @@ impl FacetFormat {
             // Everything else is a run of elements — fixed per record
             // for xvec and scalar, per record for vvec, but elements
             // either way, with a width the reader can act on.
-            Self::FloatXvec | Self::IntegerXvec | Self::IntegerVarXvec | Self::ScalarPacked => {
+            Self::FloatXvec | Self::IntegerXvec | Self::IntegerVarXvec | Self::ScalarPacked | Self::FloatScalar => {
                 FacetShape::Elements
             }
         }

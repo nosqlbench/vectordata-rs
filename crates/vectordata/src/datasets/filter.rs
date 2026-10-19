@@ -659,31 +659,22 @@ pub fn infer_vtype(entry: &CatalogEntry) -> Option<String> {
     None
 }
 
-/// Map a file extension to a vector type name. Local table —
-/// avoids depending on `veks-core` from the `vectordata` library
-/// (which would be a circular dep). Kept in sync with
-/// `veks-core::formats::VecFormat::from_extension` by extension.
+/// Map a file extension to a vector type name: the element model's
+/// long name (`float32`, `bfloat16`, `uint8`) for a vector file, and
+/// the container's name otherwise.
 fn vtype_from_extension(path: &str) -> Option<String> {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())?
         .to_lowercase();
     let name = match ext.as_str() {
-        "fvec" | "fvecs" => "float32",
-        "mvec" | "mvecs" => "float16",
-        "bvec" | "bvecs" => "uint8",
-        "i8vec" | "i8vecs" => "int8",
-        "ivec" | "ivecs" => "int32",
-        "dvec" | "dvecs" => "float64",
-        "svec" | "svecs" => "int16",
-        "u16vec" | "u16vecs" => "uint16",
-        "u32vec" | "u32vecs" => "uint32",
-        "i64vec" | "i64vecs" => "int64",
-        "u64vec" | "u64vecs" => "uint64",
         "npy" => "numpy",
         "h5" | "hdf5" => "hdf5",
         "parquet" => "parquet",
-        _ => return None,
+        other => match crate::typed_access::ElementType::parse_extension(other) {
+            Some((ty, crate::typed_access::Container::Vec)) => ty.long_name(),
+            _ => return None,
+        },
     };
     Some(name.to_string())
 }

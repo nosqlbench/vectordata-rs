@@ -1,7 +1,14 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Library API. Typed data access with runtime type negotiation.
+//! Library API. The element model, and typed data access with runtime
+//! type negotiation.
+//!
+//! The model — [`ElementType`], the [`Element`] trait, the extension
+//! table and the conversion table ([`ElementType::conversion_to`]) —
+//! is `veks-datatypes`, re-exported here and at the crate root;
+//! [`ElementTypeExt`] adds the path and URL forms this crate reads
+//! extensions from.
 //!
 //! [`TypedReader<T>`] opens vector and scalar files with compile-time
 //! type safety and runtime width/signedness validation. The transport
@@ -10,10 +17,13 @@
 //!
 //! # Access modes
 //!
+//! What a file of one type may be read as is one table,
+//! [`ElementType::conversion_to`]:
+//!
 //! - **Native**: open with the exact native type → zero-copy `&[T]` access
-//! - **Widening**: open a narrower file as a wider type → checked conversion, always succeeds
+//! - **Widening**: open a file as a type that holds every value of its own → checked conversion, always succeeds
 //! - **Cross-sign same width**: u8↔i8, u16↔i16, etc. → checked per-value, fails on overflow
-//! - **Narrowing**: rejected at open time
+//! - **Refused**: narrowing, a float as an integer, a lossy integer-to-float → rejected at open time
 //!
 //! # Examples
 //!
@@ -35,42 +45,45 @@ use std::sync::Arc;
 use crate::storage::Storage;
 
 // ═══════════════════════════════════════════════════════════════════════
-// ElementType — file-format → native-type mapping
+// ElementType — the shared element model, plus its path forms
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Element type of a data file, inferred from the file extension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ElementType {
-    /// Unsigned 8-bit integer (`.u8`, `.bvec`, `.u8vec`, ...).
-    U8,
-    /// Signed 8-bit integer (`.i8`, `.i8vec`, ...).
-    I8,
-    /// Unsigned 16-bit integer (`.u16`, `.u16vec`, ...).
-    U16,
-    /// Signed 16-bit integer (`.i16`, `.svec`, `.i16vec`, ...).
-    I16,
-    /// Unsigned 32-bit integer (`.u32`, `.u32vec`, ...).
-    U32,
-    /// Signed 32-bit integer (`.i32`, `.ivec`, `.i32vec`, ...).
-    I32,
-    /// Unsigned 64-bit integer (`.u64`, `.u64vec`, ...).
-    U64,
-    /// Signed 64-bit integer (`.i64`, `.i64vec`, ...).
-    I64,
-    /// IEEE 754 half-precision float (`.mvec`, `.f16vec`, ...).
-    F16,
-    /// IEEE 754 single-precision float (`.fvec`, `.f32vec`, ...).
-    F32,
-    /// IEEE 754 double-precision float (`.dvec`, `.f64vec`, ...).
-    F64,
-}
+pub use veks_datatypes::{
+    Container, Element, ElementConversion, ElementKind, ElementType, FloatFormat, Value, bf16, f16,
+};
 
-impl ElementType {
+/// The path and URL forms of [`ElementType::from_extension`], and the
+/// scalar-layout question, as this crate asks them.
+///
+/// Brought into scope with `use vectordata::ElementTypeExt` (or
+/// `vectordata::typed_access::ElementTypeExt`).
+pub trait ElementTypeExt: Sized {
     /// Infer the element type from the extension of a local path.
     ///
     /// Errors when the path has no extension or the extension is not
     /// one [`ElementType::from_extension`] recognises.
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, String> {
+    fn from_path(path: impl AsRef<Path>) -> Result<Self, String>;
+
+    /// Infer the element type from the extension of a URL's path
+    /// (the text after the last `.`).
+    ///
+    /// Errors when that text is not a recognised extension.
+    fn from_url(url: &url::Url) -> Result<Self, String>;
+
+    /// Whether `path` names a scalar facet — raw packed values with no
+    /// per-record header. See `crate::io::is_scalar_ext`, the single
+    /// table both this and the URL form answer from.
+    fn is_scalar_format(path: impl AsRef<Path>) -> bool;
+
+    /// Whether a file of this type may be opened as a target type of
+    /// `target_width` bytes — true unless that would narrow. Width
+    /// alone no longer decides: [`ElementType::conversion_to`] does.
+    #[deprecated(note = "use `ElementType::conversion_to`, which answers by type rather than width")]
+    fn can_open_as(self, target_width: usize) -> bool;
+}
+
+impl ElementTypeExt for ElementType {
+    fn from_path(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let ext = path.extension()
             .and_then(|e| e.to_str())
@@ -79,11 +92,7 @@ impl ElementType {
             .ok_or_else(|| format!("unknown extension '.{ext}': {}", path.display()))
     }
 
-    /// Infer the element type from the extension of a URL's path
-    /// (the text after the last `.`).
-    ///
-    /// Errors when that text is not a recognised extension.
-    pub fn from_url(url: &url::Url) -> Result<Self, String> {
+    fn from_url(url: &url::Url) -> Result<Self, String> {
         let path = url.path();
         let ext = path.rsplit('.').next()
             .ok_or_else(|| format!("no extension in URL: {url}"))?;
@@ -91,78 +100,13 @@ impl ElementType {
             .ok_or_else(|| format!("unknown extension '.{ext}' in URL: {url}"))
     }
 
-    /// Map a file extension (without the leading `.`, case-insensitive)
-    /// to its element type.
-    ///
-    /// Accepts the bare scalar forms (`u8`, `i32`, ...) and every
-    /// uniform and variable-length vector spelling (`fvec`, `f32vecs`,
-    /// `ivvec`, ...). Returns `None` for anything else.
-    pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext.to_lowercase().as_str() {
-            "u8" => Some(Self::U8),
-            "i8" => Some(Self::I8),
-            "u16" => Some(Self::U16),
-            "i16" => Some(Self::I16),
-            "u32" => Some(Self::U32),
-            "i32" => Some(Self::I32),
-            "u64" => Some(Self::U64),
-            "i64" => Some(Self::I64),
-            "bvec" | "bvecs" | "u8vec" | "u8vecs" | "bvvec" | "bvvecs" | "u8vvec" | "u8vvecs" => Some(Self::U8),
-            "i8vec" | "i8vecs" | "i8vvec" | "i8vvecs" => Some(Self::I8),
-            "svec" | "svecs" | "i16vec" | "i16vecs" | "svvec" | "svvecs" | "i16vvec" | "i16vvecs" => Some(Self::I16),
-            "u16vec" | "u16vecs" | "u16vvec" | "u16vvecs" => Some(Self::U16),
-            "ivec" | "ivecs" | "i32vec" | "i32vecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => Some(Self::I32),
-            "u32vec" | "u32vecs" | "u32vvec" | "u32vvecs" => Some(Self::U32),
-            "i64vec" | "i64vecs" | "i64vvec" | "i64vvecs" => Some(Self::I64),
-            "u64vec" | "u64vecs" | "u64vvec" | "u64vvecs" => Some(Self::U64),
-            "fvec" | "fvecs" | "fvvec" | "fvvecs" | "f32vec" | "f32vecs" | "f32vvec" | "f32vvecs" => Some(Self::F32),
-            "mvec" | "mvecs" | "mvvec" | "mvvecs" | "f16vec" | "f16vecs" | "f16vvec" | "f16vvecs" => Some(Self::F16),
-            "dvec" | "dvecs" | "dvvec" | "dvvecs" | "f64vec" | "f64vecs" | "f64vvec" | "f64vvecs" => Some(Self::F64),
-            _ => None,
-        }
-    }
-
-    /// Size of one element in bytes: 1, 2, 4 or 8.
-    pub fn byte_width(self) -> usize {
-        match self {
-            Self::U8 | Self::I8 => 1,
-            Self::U16 | Self::I16 | Self::F16 => 2,
-            Self::U32 | Self::I32 | Self::F32 => 4,
-            Self::U64 | Self::I64 | Self::F64 => 8,
-        }
-    }
-
-    /// Whether `path` names a scalar facet — raw packed values with no
-    /// per-record header. See `crate::io::is_scalar_ext`, the single
-    /// table both this and the URL form answer from.
-    pub fn is_scalar_format(path: impl AsRef<Path>) -> bool {
+    fn is_scalar_format(path: impl AsRef<Path>) -> bool {
         let ext = path.as_ref().extension().and_then(|e| e.to_str()).unwrap_or("");
         crate::io::is_scalar_ext(ext)
     }
 
-    /// Short lowercase type name (`"u8"`, `"f32"`, ...), as used by
-    /// `Display` and in error messages.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::U8 => "u8", Self::I8 => "i8",
-            Self::U16 => "u16", Self::I16 => "i16",
-            Self::U32 => "u32", Self::I32 => "i32",
-            Self::U64 => "u64", Self::I64 => "i64",
-            Self::F16 => "f16", Self::F32 => "f32", Self::F64 => "f64",
-        }
-    }
-
-    /// Whether a file of this type may be opened as a target type of
-    /// `target_width` bytes — true unless that would narrow. Signedness
-    /// is not considered here; cross-sign values are checked per read.
-    pub fn can_open_as(self, target_width: usize) -> bool {
+    fn can_open_as(self, target_width: usize) -> bool {
         target_width >= self.byte_width()
-    }
-}
-
-impl std::fmt::Display for ElementType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
     }
 }
 
@@ -208,44 +152,15 @@ impl std::fmt::Display for TypedAccessError {
 impl std::error::Error for TypedAccessError {}
 
 // ═══════════════════════════════════════════════════════════════════════
-// TypedElement trait
+// TypedElement — the bound this reader used before the element model
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Rust integer type a [`TypedReader`] can yield.
-///
-/// Implemented for `u8`..`i64`. Values travel through `i128` so that
-/// every supported native type can be widened or range-checked into
-/// every target type.
-pub trait TypedElement: Copy + Send + Sync + 'static {
-    /// Short lowercase type name (`"u8"`, `"i32"`, ...), used in errors.
-    fn type_name() -> &'static str;
-    /// Size of the type in bytes.
-    fn width() -> usize;
-    /// Convert from `i128`, or `None` when the value is out of range.
-    fn from_i128(val: i128) -> Option<Self>;
-    /// Widen to `i128` losslessly.
-    fn to_i128(self) -> i128;
-}
-
-macro_rules! impl_typed_element {
-    ($t:ty, $name:expr) => {
-        impl TypedElement for $t {
-            fn type_name() -> &'static str { $name }
-            fn width() -> usize { std::mem::size_of::<$t>() }
-            fn from_i128(val: i128) -> Option<Self> { <$t>::try_from(val).ok() }
-            fn to_i128(self) -> i128 { self as i128 }
-        }
-    };
-}
-
-impl_typed_element!(u8,  "u8");
-impl_typed_element!(i8,  "i8");
-impl_typed_element!(u16, "u16");
-impl_typed_element!(i16, "i16");
-impl_typed_element!(u32, "u32");
-impl_typed_element!(i32, "i32");
-impl_typed_element!(u64, "u64");
-impl_typed_element!(i64, "i64");
+/// The bound [`TypedReader`] put on its element type before the shared
+/// model. Every [`Element`] is one; bound on [`Element`] instead.
+#[deprecated(note = "bound on `Element` (re-exported here and at the crate root)")]
+pub trait TypedElement: Element {}
+#[allow(deprecated)]
+impl<T: Element> TypedElement for T {}
 
 /// URL form of [`ElementType::is_scalar_format`] — same table, applied
 /// to a URL path where `Path::extension` cannot be used.
@@ -261,17 +176,28 @@ fn is_scalar_url_path(path: &str) -> bool {
     crate::io::is_scalar_ext(ext)
 }
 
-fn read_native_value(data: &[u8], native: ElementType) -> i128 {
-    match native {
-        ElementType::U8  => data[0] as i128,
-        ElementType::I8  => data[0] as i8 as i128,
-        ElementType::U16 => u16::from_le_bytes([data[0], data[1]]) as i128,
-        ElementType::I16 => i16::from_le_bytes([data[0], data[1]]) as i128,
-        ElementType::U32 => u32::from_le_bytes(data[..4].try_into().unwrap()) as i128,
-        ElementType::I32 => i32::from_le_bytes(data[..4].try_into().unwrap()) as i128,
-        ElementType::U64 => u64::from_le_bytes(data[..8].try_into().unwrap()) as i128,
-        ElementType::I64 => i64::from_le_bytes(data[..8].try_into().unwrap()) as i128,
-        ElementType::F16 | ElementType::F32 | ElementType::F64 => 0, // float not supported here
+/// One element of the file's own type, decoded from its bytes, as a
+/// [`Value`] for conversion to `T`.
+fn read_native_value(data: &[u8], native: ElementType) -> Value {
+    veks_datatypes::dispatch_element!(native, N => <N as Element>::from_le_bytes(data).to_value())
+}
+
+/// The value a [`TypedAccessError::ValueOverflow`] reports: the integer
+/// as stored. A float never overflows here, because the table never
+/// lets a float be read as an integer.
+fn overflow_value(value: Value) -> i128 {
+    match value {
+        Value::Int(i) => i,
+        Value::Float(x) => x as i128,
+    }
+}
+
+/// The open-time check: the file's type must convert to `T` by the
+/// table, or the reader does not open.
+fn check_open<T: Element>(native: ElementType) -> Result<(), TypedAccessError> {
+    match native.conversion_to(T::TYPE) {
+        ElementConversion::Refused => Err(TypedAccessError::Narrowing { native, target: T::TYPE.name() }),
+        _ => Ok(()),
     }
 }
 
@@ -284,7 +210,7 @@ fn read_native_value(data: &[u8], native: ElementType) -> i128 {
 /// Single concrete struct over the crate's internal `Storage`. The
 /// transport choice (local mmap, merkle-cached remote, direct HTTP)
 /// is hidden inside the storage and selected by `Storage::open`.
-pub struct TypedReader<T: TypedElement> {
+pub struct TypedReader<T: Element> {
     storage: Arc<Storage>,
     /// The remaining shards, when this facet is a series.
     ///
@@ -301,15 +227,24 @@ pub struct TypedReader<T: TypedElement> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: TypedElement> TypedReader<T> {
+impl<T: Element> std::fmt::Debug for TypedReader<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedReader")
+            .field("as", &T::TYPE)
+            .field("native", &self.native_type)
+            .field("dim", &self.dim)
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: Element> TypedReader<T> {
     /// Open a local file by path. Inferred element type from extension.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TypedAccessError> {
         let path = path.as_ref();
         let native_type = ElementType::from_path(path)
             .map_err(TypedAccessError::Io)?;
-        if T::width() < native_type.byte_width() {
-            return Err(TypedAccessError::Narrowing { native: native_type, target: T::type_name() });
-        }
+        check_open::<T>(native_type)?;
         let storage = Storage::open_path(path)
             .map_err(|e| TypedAccessError::Io(format!("open {}: {e}", path.display())))?;
         let is_scalar = ElementType::is_scalar_format(path);
@@ -333,9 +268,7 @@ impl<T: TypedElement> TypedReader<T> {
     /// Open a remote URL with cache-first dispatch (merkle cache when
     /// `.mref` is published, direct HTTP otherwise).
     fn open_remote(url: url::Url, native_type: ElementType) -> Result<Self, TypedAccessError> {
-        if T::width() < native_type.byte_width() {
-            return Err(TypedAccessError::Narrowing { native: native_type, target: T::type_name() });
-        }
+        check_open::<T>(native_type)?;
         let is_scalar = is_scalar_url_path(url.path());
         let storage = Storage::open_url(url.clone())
             .map_err(|e| TypedAccessError::Io(format!("open_url {url}: {e}")))?;
@@ -457,7 +390,7 @@ impl<T: TypedElement> TypedReader<T> {
     pub fn native_type(&self) -> ElementType { self.native_type }
     /// Whether `T` has the same byte width as the native type, i.e. no
     /// widening is involved.
-    pub fn is_native(&self) -> bool { T::width() == self.native_width }
+    pub fn is_native(&self) -> bool { T::TYPE == self.native_type }
     /// Number of records (values, for a scalar file); for a series, the
     /// declared total across all shards.
     pub fn count(&self) -> usize { self.count }
@@ -507,8 +440,8 @@ impl<T: TypedElement> TypedReader<T> {
         };
         let bytes = Self::read_from(&storage, offset, self.native_width)?;
         let val = read_native_value(&bytes, self.native_type);
-        T::from_i128(val).ok_or(TypedAccessError::ValueOverflow {
-            ordinal, value: val, target: T::type_name(),
+        T::from_value(val).ok_or(TypedAccessError::ValueOverflow {
+            ordinal, value: overflow_value(val), target: T::TYPE.name(),
         })
     }
 
@@ -531,8 +464,8 @@ impl<T: TypedElement> TypedReader<T> {
         for d in 0..self.dim {
             let elem_offset = d * self.native_width;
             let val = read_native_value(&bytes[elem_offset..], self.native_type);
-            result.push(T::from_i128(val).ok_or(TypedAccessError::ValueOverflow {
-                ordinal, value: val, target: T::type_name(),
+            result.push(T::from_value(val).ok_or(TypedAccessError::ValueOverflow {
+                ordinal, value: overflow_value(val), target: T::TYPE.name(),
             })?);
         }
         Ok(result)
@@ -541,7 +474,7 @@ impl<T: TypedElement> TypedReader<T> {
 
 // ─── Native zero-copy access (only when T matches native type) ──────────
 
-impl<T: TypedElement> TypedReader<T> {
+impl<T: Element> TypedReader<T> {
     /// The mapped bytes at `offset` of a single-file facet. `None` for a
     /// series — an offset is only meaningful within the file that holds
     /// the ordinal, which `get_value` finds — and for storage that is
@@ -616,7 +549,7 @@ impl TypedReader<i32> {
 #[macro_export]
 macro_rules! dispatch_typed {
     ($path:expr, $reader:ident => $body:expr) => {{
-        let etype = $crate::typed_access::ElementType::from_path($path)
+        let etype = <$crate::typed_access::ElementType as $crate::typed_access::ElementTypeExt>::from_path($path)
             .map_err(|e| e.to_string())?;
         match etype {
             $crate::typed_access::ElementType::U8  => { let $reader = $crate::typed_access::TypedReader::<u8> ::open($path).map_err(|e| e.to_string())?; $body }
@@ -627,6 +560,10 @@ macro_rules! dispatch_typed {
             $crate::typed_access::ElementType::I32 => { let $reader = $crate::typed_access::TypedReader::<i32>::open($path).map_err(|e| e.to_string())?; $body }
             $crate::typed_access::ElementType::U64 => { let $reader = $crate::typed_access::TypedReader::<u64>::open($path).map_err(|e| e.to_string())?; $body }
             $crate::typed_access::ElementType::I64 => { let $reader = $crate::typed_access::TypedReader::<i64>::open($path).map_err(|e| e.to_string())?; $body }
+            $crate::typed_access::ElementType::F16 => { let $reader = $crate::typed_access::TypedReader::<$crate::typed_access::f16>::open($path).map_err(|e| e.to_string())?; $body }
+            $crate::typed_access::ElementType::BF16 => { let $reader = $crate::typed_access::TypedReader::<$crate::typed_access::bf16>::open($path).map_err(|e| e.to_string())?; $body }
+            $crate::typed_access::ElementType::F32 => { let $reader = $crate::typed_access::TypedReader::<f32>::open($path).map_err(|e| e.to_string())?; $body }
+            $crate::typed_access::ElementType::F64 => { let $reader = $crate::typed_access::TypedReader::<f64>::open($path).map_err(|e| e.to_string())?; $body }
             _ => Err(format!("unsupported element type {:?} for typed access", etype)),
         }
     }};

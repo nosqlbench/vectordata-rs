@@ -14,7 +14,7 @@ use crate::dataset::facet::StandardFacet;
 use crate::dataset::source::DSWindow;
 use crate::location::Location;
 use crate::io::IoError;
-use crate::io::{self, VectorReader, VvecElement, VvecReader};
+use crate::io::{self, Element, VectorReader, VvecReader};
 use crate::model::{FacetConfig, ProfileConfig};
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -1125,7 +1125,7 @@ pub(crate) fn prebuffer_progress_adapter<'c>(
 /// The native element type is inferred from the facet's source
 /// extension via [`TestDataView::facet_element_type`]; the transport
 /// is inferred from the source string via [`TypedReader::open_auto`](crate::typed_access::TypedReader::open_auto).
-pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
+pub fn open_facet_typed<T: crate::typed_access::Element>(
     view: &dyn TestDataView,
     facet_name: &str,
 ) -> std::result::Result<crate::typed_access::TypedReader<T>, crate::typed_access::TypedAccessError>
@@ -1134,10 +1134,10 @@ pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
         .facet_element_type(facet_name)
         .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
 
-    if T::width() < native.byte_width() {
+    if native.conversion_to(T::TYPE) == crate::typed_access::ElementConversion::Refused {
         return Err(crate::typed_access::TypedAccessError::Narrowing {
             native,
-            target: T::type_name(),
+            target: T::TYPE.name(),
         });
     }
     if !view.facet_manifest().contains_key(facet_name) {
@@ -2669,7 +2669,7 @@ impl<T> std::fmt::Debug for ShardedXvecReader<T> {
     }
 }
 
-impl<T: VvecElement> ShardedXvecReader<T> {
+impl<T: Element> ShardedXvecReader<T> {
     /// Open a series, verifying that every file agrees on the shape.
     ///
     /// The dimension check is eager and total: a series whose shards
@@ -2734,7 +2734,7 @@ impl<T: VvecElement> ShardedXvecReader<T> {
     }
 }
 
-impl<T: VvecElement> VectorReader<T> for ShardedXvecReader<T> {
+impl<T: Element> VectorReader<T> for ShardedXvecReader<T> {
     fn dim(&self) -> usize {
         self.dim
     }
@@ -2758,7 +2758,9 @@ impl<T: VvecElement> VectorReader<T> for ShardedXvecReader<T> {
     /// an honest `None` rather than a copy pretending to be a borrow.
     fn get_slice(&self, index: usize) -> Option<&[T]> {
         let (reader, at) = self.locate(index).ok()?;
-        reader.get_slice(at)
+        // The trait's checked form: the inherent `get_slice` on a mapped
+        // reader is the unchecked hot-path one.
+        VectorReader::get_slice(reader, at)
     }
 
     /// One bulk read per shard the span touches.
@@ -2836,7 +2838,7 @@ impl<T> std::fmt::Debug for ShardedVvecReader<T> {
     }
 }
 
-impl<T: VvecElement> ShardedVvecReader<T> {
+impl<T: Element> ShardedVvecReader<T> {
     fn open(series: std::sync::Arc<Series>, elem_size: usize) -> Result<Self> {
         // One source per distinct file, in file order — the sidecar is
         // found beside the file, so the shard's own path is what names
@@ -2892,7 +2894,7 @@ impl<T: VvecElement> ShardedVvecReader<T> {
     }
 }
 
-impl<T: VvecElement> VvecReader<T> for ShardedVvecReader<T> {
+impl<T: Element> VvecReader<T> for ShardedVvecReader<T> {
     fn count(&self) -> usize {
         self.count
     }
@@ -3005,7 +3007,7 @@ impl GenericTestDataView {
     /// `base_vectors` from default with `[0..base_count)` so every
     /// consumer reading via the trait gets a clipped reader without
     /// having to honor `view.base_count()` manually.
-    fn open_uniform<T: VvecElement>(
+    fn open_uniform<T: Element>(
         &self,
         facet_opt: Option<&FacetConfig>,
         name: &str,
@@ -3072,7 +3074,7 @@ impl GenericTestDataView {
         // fetch brought in. Opening the resolved URL directly would key a
         // second cache entry by URL: everything downloaded twice, and
         // every read a range request against the empty one.
-        io::validate_element_for_source(&path_str)?;
+        io::require_native::<T>(&path_str)?;
         let storage = self.open_facet_storage(name)?;
         let reader: Box<dyn VectorReader<T>> =
             Box::new(io::XvecReader::<T>::from_storage(storage.storage_handle())?);
@@ -3097,7 +3099,7 @@ impl GenericTestDataView {
 
     /// Open a variable-length vector facet with the unified `open_vvec` API.
     /// Handles local (mmap + index) and remote (HTTP + index) transparently.
-    fn open_variable<T: VvecElement>(
+    fn open_variable<T: Element>(
         &self,
         facet_opt: Option<&FacetConfig>,
         name: &str,
@@ -3111,7 +3113,7 @@ impl GenericTestDataView {
                 .clone();
             return Ok(Arc::new(ShardedVvecReader::<T>::open(
                 series,
-                T::ELEM_SIZE,
+                T::SIZE,
             )?));
         }
         // On the facet's own storage, as `open_uniform` is, so the cache
@@ -3123,7 +3125,7 @@ impl GenericTestDataView {
         Ok(Arc::new(io::IndexedVvecReader::<T>::from_storage(
             storage.storage_handle(),
             &path_or_url,
-            T::ELEM_SIZE,
+            T::SIZE,
         )?))
     }
 
@@ -3302,7 +3304,7 @@ impl GenericTestDataView {
     /// // Open with wider type — always succeeds
     /// let r = view.open_facet_typed::<i32>("metadata_content")?;
     /// ```
-    pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
+    pub fn open_facet_typed<T: crate::typed_access::Element>(
         &self,
         name: &str,
     ) -> std::result::Result<

@@ -12,6 +12,10 @@ categories = ["filesystem", "network-programming", "science"]
 
 [dependencies]
 indexmap = { version = "2", features = ["serde"] }
+# The element model: element types, the extension table, and the
+# conversion rules every reader applies. Shared with veks-io so the
+# two agree by construction.
+veks-datatypes = { path = "../veks-datatypes", version = "=3.0.4" }
 veks-anode = { path = "../veks-anode", version = "=3.0.4" }
 slabtastic = { path = "../slabtastic", version = "=3.0.4" }
 regex = "1"

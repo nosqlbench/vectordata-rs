@@ -200,6 +200,25 @@ impl ElementType {
         }
     }
 
+    /// The type's name as data tools spell it: `uint8`, `float32`,
+    /// `bfloat16`.
+    pub const fn long_name(self) -> &'static str {
+        match self {
+            Self::U8 => "uint8",
+            Self::I8 => "int8",
+            Self::U16 => "uint16",
+            Self::I16 => "int16",
+            Self::U32 => "uint32",
+            Self::I32 => "int32",
+            Self::U64 => "uint64",
+            Self::I64 => "int64",
+            Self::F16 => "float16",
+            Self::BF16 => "bfloat16",
+            Self::F32 => "float32",
+            Self::F64 => "float64",
+        }
+    }
+
     /// The type with this [`name`](Self::name), case-insensitively.
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|t| t.name().eq_ignore_ascii_case(name))
@@ -363,6 +382,8 @@ mod tests {
             assert_eq!(ty.is_integer(), !ty.is_float());
         }
         assert_eq!(ElementType::from_name("float"), None);
+        assert_eq!(ElementType::BF16.long_name(), "bfloat16");
+        assert_eq!(ElementType::U8.long_name(), "uint8");
         assert_eq!(ElementType::ALL.len(), TABLE.len() / Container::ALL.len());
     }
 }
