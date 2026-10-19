@@ -81,16 +81,31 @@ impl DatasetHandle {
     }
 
     /// A dataset at `home` described by `knn_entries.yaml` content: the
-    /// entry named after the directory, or the file's first. The file is
-    /// read by the parser its catalog is read by, so `_defaults`
-    /// (`base_url`, `cache_dir`) and `${VAR}` apply as they do there.
-    /// The dataset keeps the directory's name and origin, the cache
-    /// identity a directory open has always had.
+    /// entry named after the directory, or the only entry. A file that
+    /// lists several datasets and none named after the directory is
+    /// ambiguous ([`Error::AmbiguousDataset`], naming every entry) — a
+    /// choice is never made by order, as it is never made between
+    /// catalogs. The file is read by the parser its catalog is read by,
+    /// so `_defaults` (`base_url`, `cache_dir`) and `${VAR}` apply as
+    /// they do there. The dataset keeps the directory's name and origin,
+    /// the cache identity a directory open has always had.
     fn of_knn_entries(home: Location, content: &str) -> Result<Self> {
         let entries = crate::catalog::knn_entries::parse_knn_entries_yaml(content, &home.to_string())
             .map_err(Error::Other)?;
         let dir_name = home.last_segment().unwrap_or_default();
-        let chosen = entries.iter().position(|e| e.name() == dir_name).unwrap_or(0);
+        let chosen = match entries.iter().position(|e| e.name() == dir_name) {
+            Some(i) => i,
+            None if entries.len() > 1 => {
+                return Err(Error::AmbiguousDataset {
+                    name: dir_name.to_string(),
+                    matches: entries
+                        .iter()
+                        .map(|e| format!("{} (knn_entries.yaml: {})", e.name(), e.dataset_home_url()))
+                        .collect(),
+                });
+            }
+            None => 0,
+        };
         let config = match entries.get(chosen).map(|e| e.description()) {
             Some(crate::dataset::EntryDescription::Embedded(description)) => {
                 DatasetConfig::opened((**description).clone())
@@ -712,12 +727,37 @@ mod tests {
         assert_eq!(base.source().map(Path::new), Some(ds.join("b.fvec").as_path()));
         assert_eq!(group.name.as_deref(), Some("second"));
 
+    }
+
+    /// **A directory whose `knn_entries.yaml` lists several datasets,
+    /// none named after it, is ambiguous**: opening it names every entry
+    /// rather than picking the first, as two catalogs declaring one name
+    /// are never resolved by order. One entry opens whatever it is
+    /// called.
+    #[test]
+    fn a_knn_entries_directory_with_two_entries_and_no_match_is_ambiguous() {
+        let dir = tempdir().unwrap();
+        let content = "first:\n  base: a.fvec\n  query: q.fvec\n  gt: g.ivec\n\
+                       second:\n  base: b.fvec\n  query: q.fvec\n  gt: g.ivec\n";
         let other = dir.path().join("other");
         fs::create_dir_all(&other).unwrap();
         fs::write(other.join("knn_entries.yaml"), content).unwrap();
-        let group = TestDataGroup::load(other.to_str().unwrap()).unwrap();
+        match TestDataGroup::load(other.to_str().unwrap()) {
+            Err(Error::AmbiguousDataset { name, matches }) => {
+                assert_eq!(name, "other");
+                assert_eq!(matches.len(), 2, "{matches:?}");
+                assert!(matches[0].starts_with("first") && matches[1].starts_with("second"), "{matches:?}");
+            }
+            Err(e) => panic!("the wrong error: {e}"),
+            Ok(group) => panic!("opened {:?} out of two entries", group.name),
+        }
+
+        let only = dir.path().join("only");
+        fs::create_dir_all(&only).unwrap();
+        fs::write(only.join("knn_entries.yaml"), "lone:\n  base: a.fvec\n  query: q.fvec\n  gt: g.ivec\n").unwrap();
+        let group = TestDataGroup::load(only.to_str().unwrap()).unwrap();
         let base = group.config().profiles["default"].base_vectors.as_ref().unwrap();
-        assert_eq!(base.source().map(Path::new), Some(other.join("a.fvec").as_path()));
+        assert_eq!(base.source().map(Path::new), Some(only.join("a.fvec").as_path()));
     }
 
     /// **A directory's `knn_entries.yaml` reads its facets where its

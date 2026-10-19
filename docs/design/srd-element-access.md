@@ -1623,3 +1623,55 @@ veks-pipeline, veks, veks-core and vecd suites: 1587 passed, 0 failed.
 | `vectordata/src/dataset/profile.rs` | 95.5% | 95.5% (2337/2447) | 90.0% (217/241) |
 | `vectordata/src/view.rs` | 84.7% | 84.4% (2143/2539) | 74.0% (271/366) |
 | `veks/src/check/profiles.rs` | 86.6% | 88.9% (503/566) | 90.6% (58/64) |
+
+### 16.6 Step 6: the catalog defects (2026-10-19)
+
+**Guards, run against the code before the step:**
+- `a_dataset_yaml_as_catalog_content_lists_one_dataset`
+  (`catalog/source.rs`): the entries were named `["attributes",
+  "profiles"]` where `["ds"]` was expected — every top-level key of the
+  description read as a dataset of a `knn_entries` document.
+- `a_knn_entries_directory_with_two_entries_and_no_match_is_ambiguous`
+  (`group.rs`): "opened Some("other") out of two entries" — the first
+  entry, silently.
+
+**Built (EA-34):**
+- `parse_catalog_content`: a map with a `profiles` key is one dataset's
+  `dataset.yaml` — the rule `DatasetHandle::of_content` already applied
+  — and lists as one embedded entry at the base, named as the
+  description names itself or, when it does not, after the base's
+  directory. Content with no base is a diagnostic (an embedded dataset
+  needs a home), as relative paths already were. This covers
+  `CatalogBuilder::content`, `--at <dataset.yaml>` and a `catalogs.yaml`
+  entry naming the file, which all read through `LocatedCatalog`. The
+  three doc comments say so.
+- `of_knn_entries`: the entry named after the directory, else the only
+  entry; several entries and no match is `Error::AmbiguousDataset`
+  naming the directory and every entry with its home, as same-named
+  datasets across catalogs already are. No entry still opens the empty
+  dataset named after the directory.
+- Defect 2 (`open_spec` on a spec that exists on disk) is unchanged: a
+  path that exists is a path, whatever punctuation it holds, in the
+  three places that apply it. Step 9 states it in the sysref.
+
+**Flips:** the second half of `a_knn_entries_directory_opens_the_entry_
+named_after_it` (which asserted the first entry) became the ambiguity
+guard; `test_data_group_picks_dataset_matching_directory_name` is
+unchanged.
+
+**Tests:** the two guards; `a_dataset_yaml_as_content_is_named_homed_
+or_refused` (no base is a diagnostic, a nameless description is named
+after its directory, a malformed one is a parse diagnostic), added
+after the coverage run below showed `dataset_entry`'s error branches
+unexercised; the source.rs and group.rs test modules and the whole
+vectordata suite pass; clippy clean on the two files; docs with
+warnings denied; the workspace compiles.
+
+**Coverage after the step** (the §14.5 command, whole workspace:
+75.6% → 75.7%; baseline → after, lines, then functions after). The
+veks-pipeline, veks, veks-core and vecd suites: 1587 passed, 0 failed.
+
+| File | Baseline | After | Functions |
+|---|---|---|---|
+| `vectordata/src/catalog/source.rs` | 92.1% | 89.3% (226/253) | 87.8% (36/41) |
+| `vectordata/src/group.rs` | 93.2% | 93.1% (473/508) | 95.2% (59/62) |

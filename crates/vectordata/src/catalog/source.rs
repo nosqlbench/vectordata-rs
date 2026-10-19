@@ -103,7 +103,8 @@ pub enum Requirement {
 /// local file) is that file. A directory or URL prefix is probed for
 /// `catalog.json`, `catalog.yaml` and `knn_entries.yaml`, in that order;
 /// the first found is the catalog. Either way the content's shape
-/// decides how it reads: a list is a canonical catalog, a map is a
+/// decides how it reads: a list is a canonical catalog, a map with
+/// `profiles` is one dataset's `dataset.yaml`, and any other map is a
 /// `knn_entries.yaml` document (jvector `DataSetLoaderSimpleMFD`
 /// parity). Every entry records the document it was read from.
 #[derive(Debug, Clone)]
@@ -186,12 +187,13 @@ fn read_catalog_file(file: &str) -> Option<String> {
 }
 
 /// The entries a catalog document holds, read by its shape: a list is a
-/// canonical catalog (`catalog.json`/`catalog.yaml`), a map is a
-/// `knn_entries.yaml` document. Relative entry paths and facets resolve
-/// against `base`. Without a base, a relative one is a diagnostic and
-/// its entry is skipped, rather than resolved against wherever the
-/// process happens to run. `document` is recorded on every entry as the
-/// file it was read from.
+/// canonical catalog (`catalog.json`/`catalog.yaml`), a map with
+/// `profiles` is one dataset's `dataset.yaml` (the rule a directory
+/// open applies), and any other map is a `knn_entries.yaml` document.
+/// Relative entry paths and facets resolve against `base`. Without a
+/// base, a relative one is a diagnostic and its entry is skipped,
+/// rather than resolved against wherever the process happens to run.
+/// `document` is recorded on every entry as the file it was read from.
 pub(crate) fn parse_catalog_content(
     content: &str,
     base: Option<&str>,
@@ -221,6 +223,19 @@ pub(crate) fn parse_catalog_content(
                 }
             })
             .collect(),
+        // A dataset description is a map too, and its top-level keys
+        // (`profiles`, `attributes`) would each read as a dataset of a
+        // `knn_entries` document. The key that makes it a description is
+        // the one `DatasetHandle::of_content` decides by.
+        serde_json::Value::Object(ref map) if map.contains_key("profiles") => {
+            match dataset_entry(content, base, named) {
+                Ok(entry) => vec![entry],
+                Err(e) => {
+                    diagnostics.push(CatalogDiagnostic::error(e));
+                    Vec::new()
+                }
+            }
+        }
         serde_json::Value::Object(ref map) => {
             let states_base = map
                 .get("_defaults")
@@ -257,6 +272,24 @@ pub(crate) fn parse_catalog_content(
         }
     }
     entries
+}
+
+/// One dataset's `dataset.yaml` as a catalog entry: embedded, at `base`,
+/// named as the description names itself or, when it does not, after
+/// the directory it is in. An embedded dataset needs a home, so content
+/// with no base is refused.
+fn dataset_entry(content: &str, base: Option<&str>, named: &str) -> Result<CatalogEntry, String> {
+    let base = base.ok_or_else(|| {
+        format!("{named}: a dataset.yaml given as catalog content needs a base to be the dataset's home")
+    })?;
+    let description =
+        crate::dataset::DatasetConfig::parse(content).map_err(|e| format!("failed to parse {named}: {e}"))?;
+    let name = if description.name.is_empty() {
+        crate::Location::parse(base).ok().and_then(|home| home.last_segment().map(str::to_string)).unwrap_or_default()
+    } else {
+        description.name.clone()
+    };
+    CatalogEntry::builder(name).home_as_written(base).dataset(description).build()
 }
 
 /// A catalog built in memory. See [`CatalogBuilder`].
@@ -321,8 +354,10 @@ impl CatalogBuilder {
         self
     }
 
-    /// Catalog content: a canonical catalog list or a `knn_entries.yaml`
-    /// document, in JSON or YAML.
+    /// Catalog content: a canonical catalog list, a `knn_entries.yaml`
+    /// document, or one dataset's `dataset.yaml`, in JSON or YAML. A
+    /// `dataset.yaml` lists as one entry, embedded, at the builder's
+    /// [`base`](Self::base).
     pub fn content(mut self, text: impl Into<String>) -> Self {
         self.contents.push(text.into());
         self
@@ -384,6 +419,66 @@ mod tests {
             assert_eq!(from_file.len(), 1, "{file}");
             assert_eq!(shapes(&from_file), shapes(&from_content), "{file}");
         }
+    }
+
+    /// **A `dataset.yaml` given as catalog content is one dataset**, by
+    /// the rule a directory open applies: a map with `profiles` is a
+    /// description, not a `knn_entries` document. Before, it listed a
+    /// dataset named `profiles` (and one named `attributes`).
+    #[test]
+    fn a_dataset_yaml_as_catalog_content_lists_one_dataset() {
+        const DATASET: &str = "name: ds\nattributes:\n  distance_function: L2\n  model: synthetic\n\
+                               profiles:\n  default:\n    base_vectors: base.fvec\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dataset.yaml"), DATASET).unwrap();
+        let base = crate::Location::from_path(dir.path());
+        let mut diagnostics = Vec::new();
+        let built = CatalogBuilder::named("c").base(base.clone()).content(DATASET).build();
+        let from_content = built.entries(&mut diagnostics).unwrap();
+        let located = LocatedCatalog::new("c", &crate::Location::from_path(dir.path().join("dataset.yaml")));
+        let from_file = located.entries(&mut diagnostics).expect("the file is there");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        for (entries, how) in [(&from_content, "content"), (&from_file, "file")] {
+            let names: Vec<&str> = entries.iter().map(|e| e.name()).collect();
+            assert_eq!(names, vec!["ds"], "{how}");
+            assert!(matches!(entries[0].description(), crate::dataset::EntryDescription::Embedded(_)), "{how}");
+            assert_eq!(entries[0].dataset_home_url(), crate::location::dir_form(&base.to_string()), "{how}");
+        }
+        assert_eq!(shapes(&from_file), shapes(&from_content));
+    }
+
+    /// **A `dataset.yaml` as content needs a base to be its home**; a
+    /// description that does not name itself is named after that base's
+    /// directory; and one that does not parse is a diagnostic, not a
+    /// `knn_entries` document of its keys.
+    #[test]
+    fn a_dataset_yaml_as_content_is_named_homed_or_refused() {
+        let mut diagnostics = Vec::new();
+        let homeless = CatalogBuilder::named("c").content("name: ds\nprofiles:\n  default:\n    base_vectors: base.fvec\n").build();
+        assert!(homeless.entries(&mut diagnostics).unwrap().is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("needs a base"), "{}", diagnostics[0]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("corpus");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut diagnostics = Vec::new();
+        let nameless = CatalogBuilder::named("c")
+            .base(crate::Location::from_path(&home))
+            .content("profiles:\n  default:\n    base_vectors: base.fvec\n")
+            .build();
+        let entries = nameless.entries(&mut diagnostics).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(entries.iter().map(|e| e.name()).collect::<Vec<_>>(), vec!["corpus"]);
+
+        let mut diagnostics = Vec::new();
+        let malformed = CatalogBuilder::named("c")
+            .base(crate::Location::from_path(&home))
+            .content("name: ds\nprofiles: [not, a, map]\n")
+            .build();
+        assert!(malformed.entries(&mut diagnostics).unwrap().is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("failed to parse"), "{}", diagnostics[0]);
     }
 
     /// **Content whose paths are relative needs a base**: without one
