@@ -5,8 +5,8 @@
 //!
 //! `Storage` hides the transport choice (local mmap, direct HTTP RANGE,
 //! merkle-cached HTTP-with-mmap-promotion) behind a single byte-oriented
-//! interface. Shape adapters (`XvecReader`, `IndexedVvecReader`,
-//! `TypedReader`) are parameterised on `Arc<Storage>` so they share one
+//! interface. Shape adapters (`XvecReader`, `ScalarReader`,
+//! `IndexedVvecReader`, the deprecated `TypedReader`) are parameterised on `Arc<Storage>` so they share one
 //! transport implementation regardless of data shape.
 //!
 //! This module is `pub(crate)` on purpose: callers outside the crate

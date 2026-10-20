@@ -92,8 +92,7 @@ let dim: usize = reader.dim_at(0)?;
 Load a dataset by URL or path:
 
 ```rust
-use vectordata::TestDataGroup;
-use vectordata::view::TestDataView;
+use vectordata::{TestDataGroup, TestDataView, TestDataViewExt};
 
 let group = TestDataGroup::load("https://example.com/dataset/")?;
 let view = group.profile("default").unwrap();
@@ -118,7 +117,7 @@ four:
 | Catalog | `catalog::Catalog` | names → locations; specs (`name:selector`) → datasets |
 | Group | `TestDataGroup` | one dataset: its `dataset.yaml`, its profiles, selection |
 | View | `TestDataView` | one profile: its facets, and the `fetch` call |
-| Reader | `VectorReader`, `VvecReader`, `TypedReader`, `records` | ordinal access to one facet |
+| Reader | `VectorReader`, `VvecReader`, `AnyVectorReader`, `records` | ordinal access to one facet |
 | Storage | `FacetStorage` (low-level) | a facet's bytes: cache state, range fetches |
 
 Transport and cache internals below storage are crate-private. Nothing
@@ -470,7 +469,7 @@ The concrete implementations, each generic over `T: Element`:
 ### `VvecReader<T>` — variable-length vectors
 
 ```rust
-pub trait VvecReader<T: VvecElement>: Send + Sync {
+pub trait VvecReader<T: Element>: Send + Sync {
     fn count(&self) -> usize;
     fn dim_at(&self, index: usize) -> Result<usize, IoError>;
     fn get_bytes(&self, index: usize) -> Result<Vec<u8>, IoError>;
@@ -511,8 +510,7 @@ VvecElement` bound compiles with a warning; write `T: Element`.
 ### Loading a dataset
 
 ```rust
-use vectordata::TestDataGroup;
-use vectordata::view::TestDataView;
+use vectordata::{TestDataGroup, TestDataView, TestDataViewExt};
 
 // From a local directory containing dataset.yaml
 let group = TestDataGroup::load("./my-dataset/")?;
@@ -1340,7 +1338,7 @@ cannot be reached. A cached dataset therefore opens by name with no
 network.
 
 A file URL opened with no catalog context (`XvecReader::open(url)`,
-`io::open_vec(url)`, `TypedReader::open_auto(url)`) lands in the cache
+`io::open_vec(url)`, `io::open_vec_as::<T>(url)`) lands in the cache
 directory of the dataset whose recorded origin covers it, so it shares
 the copy a fetch filled instead of keying a second one.
 `XvecReader::open_url` and `TypedReader::open_url` are deprecated in
@@ -1379,7 +1377,7 @@ readers account for that. Read through the facet readers, which are
 zero-copy once the facet is fetched.
 
 ```rust
-use vectordata::CacheStats;
+use vectordata::{CacheStats, TestDataViewExt};
 
 let storage = view.open_facet_storage("base_vectors")?;
 
@@ -1393,7 +1391,7 @@ if let Some(cs): Option<CacheStats> = storage.cache_stats() {
 // then read it through its reader — zero-copy once resident.
 view.fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent)?;
 assert!(storage.is_complete());
-let base = view.base_vectors()?;
+let base = view.base_vectors_as::<f32>()?;
 let first: &[f32] = base.get_slice(0).expect("mapped once fetched");
 ```
 
@@ -1443,7 +1441,7 @@ canonical source identity (URL or canonicalised path) and returns
 the same `Arc<Storage>` for concurrent opens of the same source.
 Concrete consequences:
 
-- N threads each calling `view.base_vectors()` against the same
+- N threads each calling `view.base_vectors_as::<f32>()` against the same
   dataset get readers that share one underlying `Storage` (one
   cache file handle, one `MerkleState`, one mmap promotion).
 - Per-source serialization at open time means the `.mref` fetch
@@ -1476,25 +1474,24 @@ All reader types are `Send + Sync`:
 
 - `VectorReader<T>` and `VvecReader<T>` traits both require
   `Send + Sync`.
-- `XvecReader<T>`, `IndexedVvecReader<T>`, and `TypedReader<T>` are
+- `XvecReader<T>`, `ScalarReader<T>` and `IndexedVvecReader<T>` are
   built on `Arc<Storage>` (each variant — `Mmap`, `Http`, `Cached`
   — is internally thread-safe). Cloning the outer `Arc` shares the
   underlying storage and any promoted-mmap state, so two clones see
   the same `is_complete()` and the same zero-copy slices.
 - `Arc<dyn VectorReader<T>>` and `Arc<dyn VvecReader<T>>` returned
-  by `TestDataView` methods are safe to share across threads.
+  by `TestDataViewExt` methods are safe to share across threads.
 
 Typical parallel access pattern:
 
 ```rust
 use std::sync::Arc;
 use rayon::prelude::*;
-use vectordata::TestDataGroup;
-use vectordata::view::TestDataView;
+use vectordata::{TestDataGroup, TestDataView, TestDataViewExt};
 
 let group = TestDataGroup::load("https://host/dataset/")?;
 let view = group.profile("default").unwrap();
-let base = view.base_vectors()?;          // Arc<dyn VectorReader<f32>>
+let base = view.base_vectors_as::<f32>()?; // Arc<dyn VectorReader<f32>>
 
 let results: Vec<f64> = (0..base.count())
     .into_par_iter()
@@ -1519,8 +1516,7 @@ or configurations of the same data:
 ### Accessing profiles
 
 ```rust
-use vectordata::TestDataGroup;
-use vectordata::view::TestDataView;
+use vectordata::{TestDataGroup, TestDataView, TestDataViewExt};
 
 let group = TestDataGroup::load("./my-dataset/")?;
 
@@ -1530,7 +1526,7 @@ if let Some(view) = group.profile("default") {
 }
 
 if let Some(view) = group.profile("100K") {
-    let base = view.base_vectors()?;
+    let base = view.base_vectors_as::<f32>()?;
     println!("100K profile: {} vectors", base.count());
 }
 ```

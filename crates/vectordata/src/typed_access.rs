@@ -10,10 +10,12 @@
 //! [`ElementTypeExt`] adds the path and URL forms this crate reads
 //! extensions from.
 //!
-//! [`TypedReader<T>`] opens vector and scalar files with compile-time
-//! type safety and runtime width/signedness validation. The transport
-//! choice (local mmap, merkle-cached remote, direct HTTP) is hidden
-//! inside the crate-private `Storage` abstraction.
+//! A facet is read at a type with
+//! [`TestDataViewExt::facet_as`](crate::TestDataViewExt::facet_as) and the
+//! per-facet `*_as` calls, a raw file with
+//! [`io::open_vec_as`](crate::io::open_vec_as), both under the table
+//! below. [`TypedReader<T>`], which this module also holds, is
+//! deprecated in their favour.
 //!
 //! # Access modes
 //!
@@ -28,15 +30,18 @@
 //! # Examples
 //!
 //! ```rust,no_run
-//! use vectordata::typed_access::{ElementType, TypedReader};
+//! use vectordata::io::{open_vec_as, ScalarReader};
+//! use vectordata::VectorReader;
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!
 //! // Open with native type — zero-copy
-//! let reader = TypedReader::<u8>::open("metadata.u8").unwrap();
-//! let val: u8 = reader.get_native(42).unwrap();
+//! let reader = ScalarReader::<u8>::open("metadata.u8")?;
+//! let val: u8 = reader.as_slice().expect("a resident local column")[42];
 //!
 //! // Open with wider type — always succeeds
-//! let reader = TypedReader::<i32>::open("metadata.u8").unwrap();
-//! let val: i32 = reader.get_value(42).unwrap();
+//! let reader = open_vec_as::<i32>("metadata.u8")?;
+//! let val: i32 = reader.get(42)?[0];
+//! # let _ = val; Ok(()) }
 //! ```
 
 // The reader this module defines is deprecated in favour of
@@ -82,7 +87,7 @@ pub trait ElementTypeExt: Sized {
     /// Whether a file of this type may be opened as a target type of
     /// `target_width` bytes — true unless that would narrow. Width
     /// alone no longer decides: [`ElementType::conversion_to`] does.
-    #[deprecated(note = "use `ElementType::conversion_to`, which answers by type rather than width")]
+    #[deprecated(since = "4.0.0", note = "use `ElementType::conversion_to`, which answers by type rather than width")]
     fn can_open_as(self, target_width: usize) -> bool;
 }
 
@@ -120,7 +125,7 @@ impl ElementTypeExt for ElementType {
 
 /// Failure opening or reading a [`TypedReader`].
 #[derive(Debug)]
-#[deprecated(note = "the errors of `TestDataViewExt::facet_as` are `IoError::ElementMismatch` and `IoError::ValueOverflow`")]
+#[deprecated(since = "4.0.0", note = "the errors of `TestDataViewExt::facet_as` are `IoError::ElementMismatch` and `IoError::ValueOverflow`")]
 pub enum TypedAccessError {
     /// Target type is narrower than native type.
     Narrowing {
@@ -162,7 +167,7 @@ impl std::error::Error for TypedAccessError {}
 
 /// The bound [`TypedReader`] put on its element type before the shared
 /// model. Every [`Element`] is one; bound on [`Element`] instead.
-#[deprecated(note = "bound on `Element` (re-exported here and at the crate root)")]
+#[deprecated(since = "4.0.0", note = "bound on `Element` (re-exported here and at the crate root)")]
 pub trait TypedElement: Element {}
 #[allow(deprecated)]
 impl<T: Element> TypedElement for T {}
@@ -215,7 +220,7 @@ fn check_open<T: Element>(native: ElementType) -> Result<(), TypedAccessError> {
 /// Single concrete struct over the crate's internal `Storage`. The
 /// transport choice (local mmap, merkle-cached remote, direct HTTP)
 /// is hidden inside the storage and selected by `Storage::open`.
-#[deprecated(note = "use `TestDataViewExt::facet_as::<T>(name)` on a dataset view, or `io::open_vec_as::<T>` on a file: `get_value(i)` becomes `get(i)?[0]` or `as_slice()?[i]`, `get_native_slice(i)` becomes `get_slice(i)`, `is_native()` becomes `conversion() == Native`")]
+#[deprecated(since = "4.0.0", note = "use `TestDataViewExt::facet_as::<T>(name)` on a dataset view, or `io::open_vec_as::<T>` on a file: `get_value(i)` becomes `get(i)?[0]` or `as_slice()?[i]`, `get_native_slice(i)` becomes `get_slice(i)`, `is_native()` becomes `conversion() == Native`")]
 pub struct TypedReader<T: Element> {
     storage: Arc<Storage>,
     /// The remaining shards, when this facet is a series.
@@ -553,7 +558,7 @@ impl TypedReader<i32> {
 /// Dispatch on a file's native element type, opening it as that type
 /// and binding the resulting reader to `$reader`.
 #[macro_export]
-#[deprecated(note = "use `io::open_vec_native`, which returns an `AnyVectorReader` to match on")]
+#[deprecated(since = "4.0.0", note = "use `io::open_vec_native`, which returns an `AnyVectorReader` to match on")]
 macro_rules! dispatch_typed {
     ($path:expr, $reader:ident => $body:expr) => {{
         let etype = <$crate::typed_access::ElementType as $crate::typed_access::ElementTypeExt>::from_path($path)

@@ -116,7 +116,7 @@ pub use veks_datatypes::{Container, Element, ElementConversion, ElementType};
 
 /// The bound the readers put on their element type before the shared
 /// model. Every [`Element`] is one; bound on [`Element`] instead.
-#[deprecated(note = "bound on `Element` (re-exported here and at the crate root)")]
+#[deprecated(since = "4.0.0", note = "bound on `Element` (re-exported here and at the crate root)")]
 pub trait VvecElement: Element {}
 #[allow(deprecated)]
 impl<T: Element> VvecElement for T {}

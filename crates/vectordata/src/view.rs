@@ -539,16 +539,16 @@ pub trait TestDataView: Send + Sync {
     // -- Vector facets --
 
     /// Returns a reader for the base (database) vectors.
-    #[deprecated(note = "use `TestDataViewExt::base_vectors_as::<f32>()`, which also takes any other element type")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::base_vectors_as::<f32>()`, which also takes any other element type")]
     fn base_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>>;
     /// Returns a reader for the query vectors.
-    #[deprecated(note = "use `TestDataViewExt::query_vectors_as::<f32>()`, which also takes any other element type")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::query_vectors_as::<f32>()`, which also takes any other element type")]
     fn query_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>>;
     /// Returns a reader for the neighbor indices (ground truth).
-    #[deprecated(note = "use `TestDataViewExt::neighbor_indices_as::<i32>()`, which also takes any other element type")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::neighbor_indices_as::<i32>()`, which also takes any other element type")]
     fn neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
     /// Returns a reader for the neighbor distances (ground truth).
-    #[deprecated(note = "use `TestDataViewExt::neighbor_distances_as::<f32>()`, which also takes any other element type")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::neighbor_distances_as::<f32>()`, which also takes any other element type")]
     fn neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
     // -- Filtered neighbor facets (F / E) --
@@ -556,19 +556,19 @@ pub trait TestDataView: Send + Sync {
     /// Returns a reader for the **pre-filter** KNN ground-truth indices (F).
     /// Top-K of `X_p` by distance; full K when `|X_p| ≥ K`. The legacy
     /// `filtered_neighbor_indices` YAML key resolves to this facet.
-    #[deprecated(note = "use `TestDataViewExt::prefiltered_neighbor_indices_as::<i32>()`, which also takes any other element type")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::prefiltered_neighbor_indices_as::<i32>()`, which also takes any other element type")]
     fn prefiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
     /// Returns a reader for the **pre-filter** KNN ground-truth distances (F).
-    #[deprecated(note = "use `TestDataViewExt::prefiltered_neighbor_distances_as::<f32>()`, which also takes any other element type")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::prefiltered_neighbor_distances_as::<f32>()`, which also takes any other element type")]
     fn prefiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
     /// Returns a reader for the **post-filter** KNN ground-truth indices (E).
     /// `G ∩ R` — the unfiltered top-K intersected with the predicate-passing
     /// set; sparse possible.
-    #[deprecated(note = "use `TestDataViewExt::postfiltered_neighbor_indices_as::<i32>()`, which also takes any other element type")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::postfiltered_neighbor_indices_as::<i32>()`, which also takes any other element type")]
     fn postfiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
     /// Returns a reader for the **post-filter** KNN ground-truth distances (E).
-    #[deprecated(note = "use `TestDataViewExt::postfiltered_neighbor_distances_as::<f32>()`, which also takes any other element type")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::postfiltered_neighbor_distances_as::<f32>()`, which also takes any other element type")]
     fn postfiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
     // -- Metadata facets --
@@ -587,7 +587,7 @@ pub trait TestDataView: Send + Sync {
     /// resolved on read). This is typically a variable-length file (ivvec)
     /// where each predicate maps to a different number of matching base
     /// ordinals.
-    #[deprecated(note = "use `TestDataViewExt::metadata_results_as::<i32>()`")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::metadata_results_as::<i32>()`")]
     fn metadata_results(&self) -> Result<Arc<dyn VvecReader<i32>>>;
 
     // -- Facet discovery --
@@ -601,7 +601,7 @@ pub trait TestDataView: Send + Sync {
     /// For standard vector facets, delegates to the typed accessor.
     /// For custom facets or facets with non-standard types, this is
     /// the generic access path. Returns f32 vectors.
-    #[deprecated(note = "use `TestDataViewExt::facet_as::<T>(name)`; `facet_as::<f32>` is this call")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::facet_as::<T>(name)`; `facet_as::<f32>` is this call")]
     fn facet(&self, name: &str) -> Result<Arc<dyn VectorReader<f32>>>;
 
     // -- Typed facet access --
@@ -634,9 +634,9 @@ pub trait TestDataView: Send + Sync {
     }
 
     /// Resolved source string (path or URL) for a named facet, if it
-    /// exists. Used by [`open_facet_typed`] so callers holding an
-    /// `Arc<dyn TestDataView>` can construct typed readers without
-    /// knowing the dataset's transport details.
+    /// exists, for a caller holding an `Arc<dyn TestDataView>` that
+    /// opens the file itself (with [`open_vec_as`](crate::io::open_vec_as),
+    /// say) without knowing the dataset's transport details.
     fn facet_source(&self, name: &str) -> Option<String>;
 
     // -- Fetch --------------------------------------------------------
@@ -776,7 +776,7 @@ pub trait TestDataView: Send + Sync {
     ///
     /// ```rust,ignore
     /// match view.facet_shape("metadata_content")? {
-    ///     FacetShape::Elements => { let r = view.facet("metadata_content")?; }
+    ///     FacetShape::Elements => { let r = view.facet_as::<i32>("metadata_content")?; }
     ///     FacetShape::Records  => { let r = view.open_facet_records("metadata_content")?; }
     /// }
     /// ```
@@ -1603,6 +1603,7 @@ impl<V: TestDataView + ?Sized> TestDataViewExt for V {}
 /// from `Catalog::open_profile` works directly:
 ///
 /// ```no_run
+/// # #![allow(deprecated)] // this item's own example
 /// # use std::sync::Arc;
 /// use vectordata::{open_facet_typed, TypedReader, TestDataView};
 /// # fn demo(view: Arc<dyn TestDataView>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1615,7 +1616,7 @@ impl<V: TestDataView + ?Sized> TestDataViewExt for V {}
 /// The native element type is inferred from the facet's source
 /// extension via [`TestDataView::facet_element_type`]; the transport
 /// is inferred from the source string via [`TypedReader::open_auto`](crate::typed_access::TypedReader::open_auto).
-#[deprecated(note = "use `TestDataViewExt::facet_as::<T>(name)`: `get_value(i)` becomes `get(i)?[0]` or `as_slice()?[i]`, `get_native_slice(i)` becomes `get_slice(i)`, `is_native()` becomes `conversion() == Native`")]
+#[deprecated(since = "4.0.0", note = "use `TestDataViewExt::facet_as::<T>(name)`: `get_value(i)` becomes `get(i)?[0]` or `as_slice()?[i]`, `get_native_slice(i)` becomes `get_slice(i)`, `is_native()` becomes `conversion() == Native`")]
 #[allow(deprecated)]
 pub fn open_facet_typed<T: crate::typed_access::Element>(
     view: &dyn TestDataView,
@@ -2540,7 +2541,7 @@ impl Series {
 /// Low-level: an open handle on a facet's bytes — one file, or every
 /// shard of a series — for cache inspection and range fetches. Most
 /// callers want [`TestDataView::fetch`] to bring bytes in and a reader
-/// (`base_vectors()`, `facet()`, `open_facet_typed`) to read them.
+/// ([`TestDataViewExt::facet_as`] and the per-facet `*_as` calls) to read them.
 ///
 /// There is no public API for reading bytes through this handle; it
 /// answers what is resident ([`cache_stats`](Self::cache_stats),
@@ -3885,7 +3886,7 @@ impl GenericTestDataView {
     /// // Open with wider type — always succeeds
     /// let r = view.open_facet_typed::<i32>("metadata_content")?;
     /// ```
-    #[deprecated(note = "use `TestDataViewExt::facet_as::<T>(name)`")]
+    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::facet_as::<T>(name)`")]
     #[allow(deprecated)]
     pub fn open_facet_typed<T: crate::typed_access::Element>(
         &self,

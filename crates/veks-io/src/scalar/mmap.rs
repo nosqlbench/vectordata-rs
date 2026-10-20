@@ -183,7 +183,7 @@ macro_rules! deprecated_open {
     ($($t:ty, $name:ident, $ext:literal, $note:literal;)*) => {$(
         impl ScalarMmapReader<$t> {
             #[doc = concat!("Open a `.", $ext, "` column; `ScalarMmapReader::<", $ext, ">::open` with the type in the name.")]
-            #[deprecated(note = $note)]
+            #[deprecated(since = "4.0.0", note = $note)]
             pub fn $name(path: &Path) -> Result<Self, MmapError> {
                 Self::open(path)
             }

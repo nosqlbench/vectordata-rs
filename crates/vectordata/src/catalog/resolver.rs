@@ -187,10 +187,11 @@ impl Catalog {
     ///
     /// ```no_run
     /// # use vectordata::catalog::{Catalog, CatalogSources};
+    /// use vectordata::TestDataViewExt;
     /// let catalog = Catalog::of(&CatalogSources::new().configure_default());
     /// let group = catalog.open("my-dataset")?;
     /// let view = group.profile("default").unwrap();
-    /// let base = view.base_vectors()?;
+    /// let base = view.base_vectors_as::<f32>()?;
     /// # Ok::<(), vectordata::Error>(())
     /// ```
     pub fn open(&self, name: &str) -> crate::Result<crate::TestDataGroup> {
@@ -307,9 +308,10 @@ impl Catalog {
     ///
     /// ```no_run
     /// # use vectordata::catalog::{Catalog, CatalogSources};
+    /// use vectordata::TestDataViewExt;
     /// let catalog = Catalog::of(&CatalogSources::new().configure_default());
     /// let view = catalog.open_profile("my-dataset", "default")?;
-    /// let base = view.base_vectors()?;
+    /// let base = view.base_vectors_as::<f32>()?;
     /// # Ok::<(), vectordata::Error>(())
     /// ```
     pub fn open_profile(&self, name: &str, profile: &str) -> crate::Result<std::sync::Arc<dyn crate::view::TestDataView>> {

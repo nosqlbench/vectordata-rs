@@ -41,6 +41,9 @@
 //! ```
 
 #![warn(missing_docs)]
+// An example that calls a deprecated item teaches the old API; only a
+// deprecated item's own example may, and it says so with an allow.
+#![doc(test(attr(deny(deprecated))))]
 
 mod conversion;
 mod element;

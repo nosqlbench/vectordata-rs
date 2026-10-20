@@ -61,8 +61,8 @@ For random-access on xvec files, use memory-mapped readers:
 ```rust
 use veks_io::xvec::mmap::MmapReader;
 
-let reader = MmapReader::<f32>::open_fvec("base.fvecs".as_ref())?;
-let vec: &[f32] = reader.get_slice(42);  // zero-copy, no allocation
+let reader = MmapReader::<f32>::open("base.fvecs".as_ref())?;
+let vec: Option<&[f32]> = reader.get_slice(42);  // zero-copy, no allocation
 ```
 
 ## Variable-Length Vectors

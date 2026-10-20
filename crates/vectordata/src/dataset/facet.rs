@@ -141,8 +141,8 @@ impl FacetFormat {
 pub enum FacetShape {
     /// Records are runs of a fixed-width element, addressed as vectors.
     ///
-    /// Opened with `facet()`, `base_vectors()`, `open_facet_typed()` —
-    /// the readers that answer `dim()` and hand back `Vec<T>`.
+    /// Opened with `facet_as::<T>()` and the per-facet `*_as::<T>()`
+    /// calls — the readers that answer `dim()` and hand back `Vec<T>`.
     Elements,
     /// Records are opaque and individually sized, addressed by ordinal.
     ///

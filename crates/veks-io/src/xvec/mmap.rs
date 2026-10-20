@@ -274,7 +274,7 @@ impl<T: Element> std::fmt::Debug for MmapReader<T> {
 
 impl MmapReader<f32> {
     /// Open an `.fvecs` file; `MmapReader::<f32>::open` with the type in the name.
-    #[deprecated(note = "use `MmapReader::<f32>::open`")]
+    #[deprecated(since = "4.0.0", note = "use `MmapReader::<f32>::open`")]
     pub fn open_fvec(path: &Path) -> Result<Self, MmapError> {
         Self::open(path)
     }
@@ -282,7 +282,7 @@ impl MmapReader<f32> {
 
 impl MmapReader<i32> {
     /// Open an `.ivecs` file; `MmapReader::<i32>::open` with the type in the name.
-    #[deprecated(note = "use `MmapReader::<i32>::open`")]
+    #[deprecated(since = "4.0.0", note = "use `MmapReader::<i32>::open`")]
     pub fn open_ivec(path: &Path) -> Result<Self, MmapError> {
         Self::open(path)
     }
@@ -290,7 +290,7 @@ impl MmapReader<i32> {
 
 impl MmapReader<half::f16> {
     /// Open an `.mvecs` file; `MmapReader::<f16>::open` with the type in the name.
-    #[deprecated(note = "use `MmapReader::<f16>::open`")]
+    #[deprecated(since = "4.0.0", note = "use `MmapReader::<f16>::open`")]
     pub fn open_mvec(path: &Path) -> Result<Self, MmapError> {
         Self::open(path)
     }
@@ -298,7 +298,7 @@ impl MmapReader<half::f16> {
 
 impl MmapReader<f64> {
     /// Open a `.dvecs` file; `MmapReader::<f64>::open` with the type in the name.
-    #[deprecated(note = "use `MmapReader::<f64>::open`")]
+    #[deprecated(since = "4.0.0", note = "use `MmapReader::<f64>::open`")]
     pub fn open_dvec(path: &Path) -> Result<Self, MmapError> {
         Self::open(path)
     }
@@ -306,7 +306,7 @@ impl MmapReader<f64> {
 
 impl MmapReader<u8> {
     /// Open a `.bvecs` file (one byte per element); `MmapReader::<u8>::open` with the type in the name.
-    #[deprecated(note = "use `MmapReader::<u8>::open`")]
+    #[deprecated(since = "4.0.0", note = "use `MmapReader::<u8>::open`")]
     pub fn open_bvec(path: &Path) -> Result<Self, MmapError> {
         Self::open(path)
     }
@@ -314,7 +314,7 @@ impl MmapReader<u8> {
 
 impl MmapReader<i16> {
     /// Open an `.svecs` file; `MmapReader::<i16>::open` with the type in the name.
-    #[deprecated(note = "use `MmapReader::<i16>::open`")]
+    #[deprecated(since = "4.0.0", note = "use `MmapReader::<i16>::open`")]
     pub fn open_svec(path: &Path) -> Result<Self, MmapError> {
         Self::open(path)
     }

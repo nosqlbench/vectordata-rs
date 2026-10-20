@@ -71,6 +71,7 @@
 //! ```no_run
 //! use vectordata::catalog::{Catalog, CatalogSources};
 //! use vectordata::fetch::{FetchRequest, TextMeter};
+//! use vectordata::TestDataViewExt;
 //!
 //! # fn main() -> vectordata::Result<()> {
 //! let catalog = Catalog::of(&CatalogSources::new().configure_default());
@@ -80,7 +81,7 @@
 //!     &mut TextMeter::stderr("Fetch"),
 //! )?;
 //! // Every read below is local and zero-copy.
-//! let queries = view.query_vectors()?;
+//! let queries = view.query_vectors_as::<f32>()?;
 //! # let _ = queries; Ok(()) }
 //! ```
 //!
@@ -151,7 +152,7 @@
 //!    its profiles, and profile selection.
 //! 3. **View** ([`TestDataView`]) — one profile: its facets, and the
 //!    fetch call.
-//! 4. **Reader** ([`VectorReader`], [`VvecReader`], [`TypedReader`],
+//! 4. **Reader** ([`VectorReader`], [`VvecReader`], [`AnyVectorReader`],
 //!    [`records`]) — ordinal access to one facet.
 //! 5. **Storage** ([`FacetStorage`], low-level) — a facet's bytes:
 //!    cache state, range fetches. Transport and cache internals beneath
@@ -223,6 +224,9 @@
 //! switch to mmap for zero-copy access.
 
 #![warn(missing_docs)]
+// An example that calls a deprecated item teaches the old API; only a
+// deprecated item's own example may, and it says so with an allow.
+#![doc(test(attr(deny(deprecated))))]
 
 // Module docs, each opening with whether the module is library API,
 // CLI support or internal, live in the module files themselves.

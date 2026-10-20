@@ -17,7 +17,7 @@ use veks_datatypes::{Element, ElementConversion, ElementType, Value, convert, di
 
 /// The element types a column may hold. The name predates the shared
 /// model; the type is [`ElementType`].
-#[deprecated(note = "use `ElementType`")]
+#[deprecated(since = "4.0.0", note = "use `ElementType`")]
 pub type ScalarType = ElementType;
 
 /// Why a conversion did not produce a column.

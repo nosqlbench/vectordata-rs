@@ -299,7 +299,8 @@ impl TestDataGroup {
     /// Returns the concrete `GenericTestDataView` for typed facet access.
     ///
     /// Unlike `profile()` which returns a trait object, this returns the
-    /// concrete type so clients can call `open_facet_typed::<T>()`.
+    /// concrete type. Every facet call is on the trait object too,
+    /// through [`TestDataViewExt`](crate::TestDataViewExt).
     pub fn generic_view(&self, name: &str) -> Option<GenericTestDataView> {
         self.view_of(name)
     }
