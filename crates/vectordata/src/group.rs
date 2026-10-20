@@ -304,6 +304,32 @@ impl TestDataGroup {
         self.view_of(name)
     }
 
+    /// The dataset's name: the one its cache directory
+    /// (`<cache_root>/<name>/`) and its views carry.
+    ///
+    /// - A catalog entry's dataset is named by the entry.
+    /// - A dataset opened by directory, `dataset.yaml` or URL is named
+    ///   after the directory, its last segment, whatever `name:` its
+    ///   `dataset.yaml` states (that one is the description's,
+    ///   [`dataset::DatasetConfig::name`](crate::dataset::DatasetConfig)).
+    /// - [`from_config`](Self::from_config) takes the name it is given.
+    /// - `None` for a dataset at a server's root, which has no segment
+    ///   to be named after; its facets cache by URL.
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let tmp = tempfile::tempdir()?;
+    /// let dir = tmp.path().join("mydata");
+    /// # std::fs::create_dir(&dir)?;
+    /// std::fs::write(dir.join("dataset.yaml"), "name: stated\nprofiles:\n  default: {}\n")?;
+    /// let group = vectordata::TestDataGroup::load(dir.to_str().unwrap())?;
+    /// assert_eq!(group.name(), Some("mydata"));
+    /// # Ok(()) }
+    /// ```
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
     /// Returns the names of all available profiles.
     pub fn profile_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.config.profiles.keys().cloned().collect();
@@ -819,6 +845,37 @@ mod tests {
             DatasetConfig::opened(empty),
         );
         assert_eq!(handle.name.as_deref(), Some("ds"));
+    }
+
+    /// **`name()` is the cache identity of every route**: a catalog
+    /// entry's name, a directory's last segment over the `name:` its
+    /// `dataset.yaml` states, `from_config`'s argument, and `None` at a
+    /// server's root.
+    #[test]
+    fn name_is_the_cache_identity_of_every_route() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("mydata");
+        write_fvec(&dir.join("b.fvec"));
+        std::fs::write(dir.join("dataset.yaml"), "name: stated\nprofiles:\n  default:\n    base_vectors: b.fvec\n").unwrap();
+        assert_eq!(TestDataGroup::load(dir.to_str().unwrap()).unwrap().name(), Some("mydata"), "by directory");
+        let yaml = dir.join("dataset.yaml");
+        assert_eq!(TestDataGroup::load(yaml.to_str().unwrap()).unwrap().name(), Some("mydata"), "by dataset.yaml");
+
+        let description = crate::dataset::DatasetConfig::builder("described")
+            .profile("default", |p| p.facet(crate::dataset::StandardFacet::BaseVectors, "b.fvec"))
+            .build()
+            .unwrap();
+        let entry = crate::dataset::CatalogEntry::builder("listed")
+            .home(&Location::from_path(&dir))
+            .dataset(description.clone())
+            .build()
+            .unwrap();
+        assert_eq!(crate::catalog::Catalog::open_entry(&entry).unwrap().name(), Some("listed"), "by catalog entry");
+        let home = Location::from_path(&dir);
+        assert_eq!(TestDataGroup::from_config("given", home, description.clone()).name(), Some("given"));
+
+        let root = DatasetHandle::at(Location::parse("http://127.0.0.1:9/").unwrap(), DatasetConfig::opened(description));
+        assert_eq!(TestDataGroup::from_handle(root).name(), None, "a server's root");
     }
 
     /// **A scheme vectordata does not read is named as such**, not

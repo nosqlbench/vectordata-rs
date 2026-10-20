@@ -522,7 +522,15 @@ let group = TestDataGroup::load("https://host/datasets/my-dataset/")?;
 
 // Top-level dataset attributes
 let dist = group.attribute("distance_function");  // Option<&Value>
+
+// The dataset's name, its cache directory's (Option<&str>)
+let name = group.name();
 ```
+
+`group.name()` is the catalog entry's name for a catalog open, the
+directory's last segment for a directory, `dataset.yaml` or URL open
+(whatever `name:` the file states), the given name for `from_config`,
+and `None` for a dataset at a server's root.
 
 ### Profile access
 
