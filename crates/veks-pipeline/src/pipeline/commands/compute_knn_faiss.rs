@@ -44,13 +44,12 @@ pub fn factory() -> Box<dyn CommandOp> {
 /// For cosine similarity on normalized vectors, inner product is
 /// equivalent — matching what knn\_utils does with `--metric ip`.
 fn faiss_metric(metric_str: &str) -> Result<faiss::MetricType, String> {
-    match metric_str.to_uppercase().as_str() {
-        "L2" => Ok(faiss::MetricType::L2),
-        "IP" | "DOT_PRODUCT" | "COSINE" => Ok(faiss::MetricType::InnerProduct),
-        other => Err(format!(
-            "unsupported FAISS metric: '{}'. Use L2, DOT_PRODUCT, COSINE, or IP",
-            other
-        )),
+    use veks_datatypes::DistanceFunction;
+    match DistanceFunction::parse(metric_str) {
+        Some(DistanceFunction::L2) => Ok(faiss::MetricType::L2),
+        Some(DistanceFunction::DotProduct | DistanceFunction::Cosine) => Ok(faiss::MetricType::InnerProduct),
+        _ => Err(format!(
+            "unsupported FAISS metric: '{metric_str}'. Use L2, DOT_PRODUCT (IP), or COSINE")),
     }
 }
 
@@ -361,9 +360,11 @@ Only f32 (fvec) inputs are supported.
         // whatever its own kernel produced. FAISS already treats
         // COSINE as inner-product internally (assumes normalized
         // inputs), so the rerank metric mirrors that mapping.
-        let rerank_metric = match metric_str.to_uppercase().as_str() {
-            "L2" => Some(super::knn_segment::Metric::L2),
-            "IP" | "DOT_PRODUCT" | "COSINE" => Some(super::knn_segment::Metric::DotProduct),
+        let rerank_metric = match veks_datatypes::DistanceFunction::parse(metric_str) {
+            Some(veks_datatypes::DistanceFunction::L2) => Some(super::knn_segment::Metric::L2),
+            Some(veks_datatypes::DistanceFunction::DotProduct | veks_datatypes::DistanceFunction::Cosine) => {
+                Some(super::knn_segment::Metric::DotProduct)
+            }
             _ => None,
         };
         if let Some(m) = rerank_metric {

@@ -58,16 +58,12 @@ fn resolve_path(value: &str, workspace: &Path) -> PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
 }
 
+/// The metric `s` names, through the one spelling table
+/// (`veks_datatypes::DistanceFunction`), or why there is none.
 fn parse_metric(s: &str) -> Result<Metric, String> {
-    match s.to_uppercase().as_str() {
-        "L2" | "EUCLIDEAN" => Ok(Metric::L2),
-        "IP" | "DOT" | "DOT_PRODUCT" | "DOTPRODUCT" => Ok(Metric::DotProduct),
-        "COSINE" | "COS" => Ok(Metric::Cosine),
-        "L1" | "MANHATTAN" => Ok(Metric::L1),
-        other => Err(format!(
-            "unsupported metric '{}'; expected L2, IP/DOT, COSINE, or L1",
-            other,
-        )),
+    match veks_datatypes::DistanceFunction::parse(s) {
+        Some(f) => Metric::try_from(f).map_err(|e| e.to_string()),
+        None => Err(format!("unsupported metric '{s}'; expected L2, DOT_PRODUCT (IP), COSINE, or L1")),
     }
 }
 
@@ -474,6 +470,20 @@ mod tests {
     use crate::pipeline::progress::ProgressLog;
     use indexmap::IndexMap;
     use std::io::Write as _;
+
+    /// **`metric` takes every spelling of the one table**, and names the
+    /// function no kernel computes rather than calling it unknown.
+    #[test]
+    fn the_metric_option_reads_the_one_spelling_table() {
+        assert_eq!(parse_metric("angular"), Ok(Metric::Cosine));
+        assert_eq!(parse_metric("mips"), Ok(Metric::DotProduct));
+        assert_eq!(parse_metric("taxicab"), Ok(Metric::L1));
+        assert_eq!(parse_metric("Inner-Product"), Ok(Metric::DotProduct));
+        let err = parse_metric("hamming").unwrap_err();
+        assert!(err.contains("HAMMING") && err.contains("kernel"), "{err}");
+        let err = parse_metric("chebyshev").unwrap_err();
+        assert!(err.contains("'chebyshev'"), "{err}");
+    }
 
     fn make_ctx(workspace: &Path) -> StreamContext {
         StreamContext {

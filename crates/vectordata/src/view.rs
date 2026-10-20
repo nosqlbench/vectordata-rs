@@ -621,8 +621,18 @@ pub trait TestDataView: Send + Sync {
 
     // -- Dataset metadata --
 
-    /// Returns the distance function name if declared in attributes.
+    /// Returns the distance function name if declared in attributes,
+    /// as written; [`distance`](Self::distance) is it typed.
     fn distance_function(&self) -> Option<String>;
+
+    /// The declared distance function, read through the one spelling
+    /// table ([`DistanceFunction::parse`](crate::DistanceFunction::parse)),
+    /// so a catalog's `angular`, `ip` or `euclidean` is the same as
+    /// `COSINE`, `DOT_PRODUCT` or `L2`. `None` when none is declared or
+    /// the spelling is not one the table holds.
+    fn distance(&self) -> Option<crate::DistanceFunction> {
+        self.distance_function().as_deref().and_then(crate::DistanceFunction::parse)
+    }
 
     /// The `quantization` attribute, when the profile or the dataset
     /// declares one: how the codes in `base_vectors` relate to the

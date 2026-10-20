@@ -49,7 +49,9 @@ pub struct DatasetAttributes {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 
-    /// Distance function — COSINE, L2, DOT_PRODUCT, etc.
+    /// Distance function — COSINE, L2, DOT_PRODUCT, etc., as written;
+    /// [`distance`](Self::distance) reads it as a
+    /// [`DistanceFunction`](crate::DistanceFunction).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance_function: Option<String>,
 
@@ -103,6 +105,15 @@ pub struct DatasetAttributes {
 }
 
 impl DatasetAttributes {
+    /// The declared `distance_function`, read through the one spelling
+    /// table ([`DistanceFunction::parse`](crate::DistanceFunction::parse)):
+    /// `None` when none is declared or the spelling is not one it holds.
+    /// [`distance_function`](Self::distance_function) keeps the text as
+    /// written.
+    pub fn distance(&self) -> Option<crate::DistanceFunction> {
+        self.distance_function.as_deref().and_then(crate::DistanceFunction::parse)
+    }
+
     /// Store `value` in the field `key` names, when the type has one:
     /// a string for the text fields, `true`/`false` (or their spelling)
     /// for the flags. Returns `false` for a key with no field, or a
@@ -581,9 +592,27 @@ impl DatasetConfig {
 
     // -- Attribute accessors --------------------------------------------------
 
-    /// Distance function (e.g., `"COSINE"`, `"L2"`, `"DOT_PRODUCT"`).
+    /// Distance function as written (e.g., `"COSINE"`, `"L2"`,
+    /// `"DOT_PRODUCT"`); [`distance`](Self::distance) is it typed.
     pub fn distance_function(&self) -> Option<&str> {
         self.attributes.as_ref().and_then(|a| a.distance_function.as_deref())
+    }
+
+    /// The declared distance function, typed
+    /// ([`DatasetAttributes::distance`]): `None` when none is declared or
+    /// the spelling is not in the table.
+    ///
+    /// ```
+    /// use vectordata::DistanceFunction;
+    /// use vectordata::dataset::DatasetConfig;
+    /// let config = DatasetConfig::parse("name: d\nattributes:\n  distance_function: angular\nprofiles: {}\n")
+    ///     .map_err(|e| e.to_string())?;
+    /// assert_eq!(config.distance_function(), Some("angular"));
+    /// assert_eq!(config.distance(), Some(DistanceFunction::Cosine));
+    /// # Ok::<(), String>(())
+    /// ```
+    pub fn distance(&self) -> Option<crate::DistanceFunction> {
+        self.attributes.as_ref().and_then(|a| a.distance())
     }
 
     /// Whether the base vectors are L2-normalized.

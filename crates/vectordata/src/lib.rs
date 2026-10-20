@@ -323,6 +323,7 @@ pub use io::{
 pub use cache::InsufficientCacheSpace;
 pub use access::AccessMode;
 pub use typed_access::{Container, Element, ElementConversion, ElementType, ElementTypeExt};
+pub use veks_datatypes::{DistanceFunction, UnknownDistanceFunction};
 #[allow(deprecated)]
 pub use typed_access::{TypedAccessError, TypedReader};
 /// Re-exported so external callers of

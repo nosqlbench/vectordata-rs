@@ -23,6 +23,11 @@
 //!   checked value by value; everything else is refused. A reader
 //!   never reinterprets bytes as a type the file does not hold.
 //!
+//! One more name is shared the same way: the distance function a
+//! dataset declares. [`DistanceFunction`] holds the one table of its
+//! spellings, so a catalog's `angular` and a pipeline's `COSINE` are
+//! read as the same thing everywhere.
+//!
 //! Nothing here touches a file. The readers live in `veks-io` and
 //! `vectordata`; both depend on this crate so that they agree.
 //!
@@ -46,10 +51,12 @@
 #![doc(test(attr(deny(deprecated))))]
 
 mod conversion;
+mod distance;
 mod element;
 mod element_type;
 
 pub use conversion::{ElementConversion, Overflow, convert};
+pub use distance::{DistanceFunction, UnknownDistanceFunction};
 pub use element::{Element, Value};
 pub use element_type::{Container, ElementKind, ElementType, FloatFormat};
 

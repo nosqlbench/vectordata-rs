@@ -61,7 +61,9 @@ pub mod simsimd_backend;
 
 pub use batch::{BATCH_WIDTH, PackedBatches, TransposedBatch};
 pub use level::SimdLevel;
-pub use metric::Metric;
+pub use metric::{Metric, NoKernel};
+/// The distance-function vocabulary [`Metric`] converts from.
+pub use veks_datatypes::DistanceFunction;
 pub use table::{
     BatchFnF32, ConvertBytes, ConvertF16ToF32, ConvertF32ToF16, DistFnF16, DistFnF32,
     DistFnF64, DualBatchFnF32, Kernels, NormFnF32, PackedNegDotFn,

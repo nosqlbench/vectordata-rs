@@ -1597,12 +1597,23 @@ let zero_free = group.attribute("is_zero_vector_free")
     .and_then(|v| v.as_bool())
     .unwrap_or(false);
 
-// Distance function is also exposed on the view
+// Distance function is also exposed on the view: as written, and typed
+// through the one spelling table (`angular` is Cosine, `ip` DotProduct)
 let view = group.profile("default").unwrap();
 if let Some(df) = view.distance_function() {
     println!("metric: {df}");
 }
+match view.distance() {
+    Some(vectordata::DistanceFunction::DotProduct) => { /* an inner-product index can score it */ }
+    Some(other) => println!("metric: {other}"),
+    None => println!("no metric declared, or a spelling the table does not hold"),
+}
 ```
+
+`distance()` is on `TestDataView`, `dataset::DatasetConfig` and
+`dataset::DatasetAttributes`, beside `distance_function()`, which keeps
+the text as written. The spellings are in sysref 01 ("Distance function
+spellings").
 
 ### Metadata facets
 

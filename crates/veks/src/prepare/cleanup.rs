@@ -476,13 +476,8 @@ fn save_manifest_excerpt(subdir: &Path, name: &str, entry: &ManifestEntry) {
 /// uppercase form used by the pipeline (`COSINE`, `DOT_PRODUCT`, `L2`,
 /// `L1`). Returns `None` for unrecognized values.
 fn normalize_metric(s: &str) -> Option<String> {
-    match s.to_uppercase().as_str() {
-        "COSINE" => Some("COSINE".into()),
-        "DOT_PRODUCT" | "DOTPRODUCT" | "DOT" | "INNER_PRODUCT" | "IP" => Some("DOT_PRODUCT".into()),
-        "L2" | "EUCLIDEAN" => Some("L2".into()),
-        "L1" | "MANHATTAN" => Some("L1".into()),
-        _ => None,
-    }
+    // The one spelling table, narrowed to the metrics a kernel computes.
+    veks_pipeline::pipeline::simd_distance::Metric::parse(s).map(|m| m.name().to_string())
 }
 
 /// Place a source file into `subdir` with an underscore-prefixed name

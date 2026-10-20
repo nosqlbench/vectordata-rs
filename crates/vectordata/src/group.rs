@@ -879,6 +879,31 @@ mod tests {
         assert_eq!(TestDataGroup::from_handle(root).name(), None, "a server's root");
     }
 
+    /// **A view's `distance()` reads the declared spelling through the
+    /// one table**: a catalog's `ip` is `DotProduct`; an undeclared or
+    /// unknown function is `None`, while `distance_function()` keeps the
+    /// text as written.
+    #[test]
+    fn a_views_distance_reads_any_spelling_and_none_when_unknown() {
+        use crate::DistanceFunction;
+        let tmp = tempdir().unwrap();
+        for (attributes, written, typed) in [
+            ("attributes:\n  distance_function: ip\n", Some("ip"), Some(DistanceFunction::DotProduct)),
+            ("attributes:\n  distance_function: Euclidean\n", Some("Euclidean"), Some(DistanceFunction::L2)),
+            ("attributes:\n  distance_function: chebyshev\n", Some("chebyshev"), None),
+            ("", None, None),
+        ] {
+            let dir = tmp.path().join(format!("d{}", attributes.len()));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("dataset.yaml"), format!("name: d\n{attributes}profiles:\n  default:\n    base_vectors: b.fvec\n"))
+                .unwrap();
+            let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+            let view = group.profile("default").unwrap();
+            assert_eq!(view.distance_function().as_deref(), written, "{attributes:?}");
+            assert_eq!(view.distance(), typed, "{attributes:?}");
+        }
+    }
+
     /// **A scheme vectordata does not read is named as such**, not
     /// reported as a missing local file.
     #[test]

@@ -49,7 +49,8 @@ use std::sync::Arc;
 let catalog = Catalog::of(&CatalogSources::new().configure_default());
 let view: Arc<dyn TestDataView> = catalog.open_profile("my-dataset", "default")?;
 
-println!("distance: {:?}", view.distance_function());
+println!("distance: {:?}", view.distance_function()); // as written
+println!("typed: {:?}", view.distance());              // Option<DistanceFunction>
 println!("base_count: {:?}", view.base_count());
 ```
 

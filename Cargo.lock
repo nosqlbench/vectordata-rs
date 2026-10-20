@@ -6643,6 +6643,7 @@ dependencies = [
  "fearless_simd_macros",
  "half",
  "simsimd",
+ "veks-datatypes",
 ]
 
 [[package]]

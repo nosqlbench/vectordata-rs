@@ -731,13 +731,8 @@ fn infer_dataset_name(path: &Path) -> String {
 
 /// Normalize a metric/similarity function string to canonical uppercase.
 fn normalize_metric_name(s: &str) -> Option<String> {
-    match s.to_uppercase().as_str() {
-        "COSINE" => Some("COSINE".into()),
-        "DOT_PRODUCT" | "DOTPRODUCT" | "DOT" | "INNER_PRODUCT" | "IP" => Some("DOT_PRODUCT".into()),
-        "L2" | "EUCLIDEAN" => Some("L2".into()),
-        "L1" | "MANHATTAN" => Some("L1".into()),
-        _ => None,
-    }
+    // The one spelling table, narrowed to the metrics a kernel computes.
+    veks_pipeline::pipeline::simd_distance::Metric::parse(s).map(|m| m.name().to_string())
 }
 
 /// Determine which role a file was assigned to by detect_roles.

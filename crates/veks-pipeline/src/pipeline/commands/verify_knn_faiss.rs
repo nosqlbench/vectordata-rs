@@ -30,11 +30,12 @@ pub fn factory() -> Box<dyn CommandOp> {
 }
 
 fn faiss_metric(metric_str: &str) -> Result<faiss::MetricType, String> {
-    match metric_str.to_uppercase().as_str() {
-        "L2" => Ok(faiss::MetricType::L2),
-        "IP" | "DOT_PRODUCT" | "COSINE" => Ok(faiss::MetricType::InnerProduct),
-        other => Err(format!(
-            "unsupported FAISS metric: '{}'. Use L2, IP, DOT_PRODUCT, or COSINE", other)),
+    use veks_datatypes::DistanceFunction;
+    match DistanceFunction::parse(metric_str) {
+        Some(DistanceFunction::L2) => Ok(faiss::MetricType::L2),
+        Some(DistanceFunction::DotProduct | DistanceFunction::Cosine) => Ok(faiss::MetricType::InnerProduct),
+        _ => Err(format!(
+            "unsupported FAISS metric: '{metric_str}'. Use L2, DOT_PRODUCT (IP), or COSINE")),
     }
 }
 

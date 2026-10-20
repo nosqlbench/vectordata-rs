@@ -81,7 +81,7 @@ pub(crate) fn run(args: SynthesizeArgs) {
     // ── 2) Bootstrap the dataset + pipeline (sized profiles passed through) ──
     // Synthetic vectors aren't pre-normalized, so COSINE evaluates the proper
     // cosine kernel; other metrics need no cosine strategy.
-    let cosine_mode = if args.metric.eq_ignore_ascii_case("cosine") {
+    let cosine_mode = if vectordata::DistanceFunction::parse(&args.metric) == Some(vectordata::DistanceFunction::Cosine) {
         Some("proper".to_string())
     } else {
         None

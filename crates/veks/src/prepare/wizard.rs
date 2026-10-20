@@ -735,7 +735,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     // cosine in-kernel". Default is to assume normalized because
     // that's the knn_utils convention and the numerically-exact
     // match against FAISS / numpy.
-    let cosine_mode: Option<String> = if metric.to_uppercase() == "COSINE" {
+    let cosine_mode: Option<String> = if vectordata::DistanceFunction::parse(&metric) == Some(vectordata::DistanceFunction::Cosine) {
         println!();
         println!("--- Cosine strategy ---");
         println!("  knn_utils / FAISS / numpy treat COSINE as inner product on");

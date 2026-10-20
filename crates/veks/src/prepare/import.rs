@@ -985,7 +985,7 @@ fn cmd_knn(_personality: &str) -> &'static str {
 /// generated dataset.yaml that don't know the new flags will still
 /// understand `normalized`.
 fn knn_cosine_opts(args: &ImportArgs) -> Vec<(String, String)> {
-    if args.metric.to_uppercase() != "COSINE" {
+    if vectordata::DistanceFunction::parse(&args.metric) != Some(vectordata::DistanceFunction::Cosine) {
         // L2 / DOT_PRODUCT: carry the normalized hint through so
         // downstream steps (compute_filtered_knn, etc.) that still
         // read it can infer pipeline-level normalization.
@@ -3609,6 +3609,24 @@ mod tests {
             }
         }
         w.flush().unwrap();
+    }
+
+    /// **A cosine metric in any spelling gets the cosine strategy**: the
+    /// engines read `angular` as COSINE, so the steps import emits for
+    /// it carry the strategy flag COSINE requires; an L2 spelling gets
+    /// none.
+    #[test]
+    fn any_spelling_of_cosine_gets_the_cosine_strategy() {
+        for metric in ["COSINE", "cosine", "angular", "cos"] {
+            let args = ImportArgs { metric: metric.into(), ..default_args() };
+            let opts = knn_cosine_opts(&args);
+            assert!(opts.iter().any(|(k, v)| k == "assume_normalized_like_faiss" && v == "true"), "{metric}: {opts:?}");
+        }
+        for metric in ["L2", "euclidean", "ip"] {
+            let args = ImportArgs { metric: metric.into(), ..default_args() };
+            let opts = knn_cosine_opts(&args);
+            assert!(opts.iter().all(|(k, _)| k == "normalized"), "{metric}: {opts:?}");
+        }
     }
 
     fn default_args() -> ImportArgs {

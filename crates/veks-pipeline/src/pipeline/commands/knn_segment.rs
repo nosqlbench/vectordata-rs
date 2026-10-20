@@ -111,11 +111,14 @@ pub enum Metric {
 impl Metric {
     /// Named `parse` (not `from_str`) to avoid confusion with
     /// `std::str::FromStr::from_str`, which returns `Result`.
+    /// Any spelling of the one table (`veks_datatypes::DistanceFunction`)
+    /// for the three metrics this engine computes; `None` otherwise.
     pub(super) fn parse(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
-            "L2" => Some(Metric::L2),
-            "DOT_PRODUCT" | "IP" | "DOT" => Some(Metric::DotProduct),
-            "COSINE" => Some(Metric::Cosine),
+        use veks_datatypes::DistanceFunction;
+        match DistanceFunction::parse(s)? {
+            DistanceFunction::L2 => Some(Metric::L2),
+            DistanceFunction::DotProduct => Some(Metric::DotProduct),
+            DistanceFunction::Cosine => Some(Metric::Cosine),
             _ => None,
         }
     }
@@ -957,6 +960,27 @@ pub(super) fn rerank_output_post_pass(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// **The engine reads every spelling of the one table** for the
+    /// three metrics it computes, and refuses the rest: a catalog's
+    /// `angular`, `euclidean` or `mips` is the metric a pipeline step's
+    /// `COSINE`, `L2` or `DOT_PRODUCT` is.
+    #[test]
+    fn every_spelling_of_the_three_metrics_parses() {
+        use veks_datatypes::DistanceFunction;
+        for &f in DistanceFunction::ALL {
+            let want = match f {
+                DistanceFunction::L2 => Some(Metric::L2),
+                DistanceFunction::Cosine => Some(Metric::Cosine),
+                DistanceFunction::DotProduct => Some(Metric::DotProduct),
+                _ => None,
+            };
+            for &s in f.spellings() {
+                assert_eq!(Metric::parse(s), want, "{s}");
+                assert_eq!(Metric::parse(&s.to_lowercase()), want, "{s} lower-case");
+            }
+        }
+    }
 
     /// Regression: two engines (different `engine` strings) scanning
     /// the same input files MUST land on different cache paths. This

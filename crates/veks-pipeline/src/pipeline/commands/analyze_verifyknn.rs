@@ -33,28 +33,17 @@ pub fn factory() -> Box<dyn CommandOp> {
     Box::new(AnalyzeVerifyKnnOp)
 }
 
-/// Distance metric (shared with compute_knn but self-contained here).
-#[derive(Debug, Clone, Copy)]
-enum DistanceMetric {
-    L2,
-    Cosine,
-    DotProduct,
-    L1,
+/// Distance metric: the workspace's [`Metric`], with this command's own
+/// f64 reference distance.
+use veks_simd::Metric as DistanceMetric;
+
+/// The reference distance this command checks a ground truth against,
+/// in f64 and independent of the SIMD kernels.
+trait ReferenceDistance {
+    fn distance(&self, a: &[f32], b: &[f32]) -> f32;
 }
 
-impl DistanceMetric {
-    /// Named `parse` (not `from_str`) to avoid confusion with
-    /// `std::str::FromStr::from_str`, which returns `Result`.
-    fn parse(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
-            "L2" | "EUCLIDEAN" => Some(DistanceMetric::L2),
-            "COSINE" => Some(DistanceMetric::Cosine),
-            "DOT_PRODUCT" | "DOTPRODUCT" | "DOT" => Some(DistanceMetric::DotProduct),
-            "L1" | "MANHATTAN" => Some(DistanceMetric::L1),
-            _ => None,
-        }
-    }
-
+impl ReferenceDistance for DistanceMetric {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         match self {
             DistanceMetric::L2 => {

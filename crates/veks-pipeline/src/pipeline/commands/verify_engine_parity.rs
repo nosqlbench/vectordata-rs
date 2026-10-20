@@ -410,8 +410,8 @@ impl CommandOp for VerifyEngineParityOp {
             .map(|s| s == "true").unwrap_or(false);
         let use_proper_cosine = options.get("use_proper_cosine_metric")
             .map(|s| s == "true").unwrap_or(false);
-        let metric_upper = metric.to_uppercase();
-        if metric_upper == "COSINE" && !(assume_normalized ^ use_proper_cosine) {
+        let is_cosine = veks_datatypes::DistanceFunction::parse(&metric) == Some(veks_datatypes::DistanceFunction::Cosine);
+        if is_cosine && !(assume_normalized ^ use_proper_cosine) {
             return error(
                 "metric=COSINE: set exactly one of assume_normalized_like_faiss=true \
                  or use_proper_cosine_metric=true on `verify engine-parity` so the flag \
@@ -481,7 +481,7 @@ impl CommandOp for VerifyEngineParityOp {
             // `use_proper_cosine_metric=true`, FAISS would compare
             // against a different ranking — that's a genuine
             // semantic difference, not a parity violation, so skip.
-            if metric_upper == "COSINE" && use_proper_cosine {
+            if is_cosine && use_proper_cosine {
                 runs.push(skipped("faiss",
                     "metric=COSINE use_proper_cosine_metric=true: FAISS has no \
                      native proper-cosine kernel (it treats COSINE as IP on \
@@ -1192,11 +1192,11 @@ fn run_blas_mirror(
     //   - COSINE + assume_normalized: same as IP (FAISS convention)
     //   - COSINE + use_proper_cosine: `ip / (|q|·|b|)`
     enum MirrorMode { L2, Ip, CosineProper }
-    let m_upper = metric.to_uppercase();
-    let mode = match m_upper.as_str() {
-        "L2" => MirrorMode::L2,
-        "IP" | "DOT_PRODUCT" => MirrorMode::Ip,
-        "COSINE" => {
+    use veks_datatypes::DistanceFunction;
+    let mode = match DistanceFunction::parse(metric) {
+        Some(DistanceFunction::L2) => MirrorMode::L2,
+        Some(DistanceFunction::DotProduct) => MirrorMode::Ip,
+        Some(DistanceFunction::Cosine) => {
             if assume_normalized && !use_proper_cosine {
                 MirrorMode::Ip
             } else if use_proper_cosine && !assume_normalized {
@@ -1208,7 +1208,7 @@ fn run_blas_mirror(
                 );
             }
         }
-        other => return Err(format!("blas-mirror: unsupported metric '{}'", other)),
+        _ => return Err(format!("blas-mirror: unsupported metric '{metric}'")),
     };
     // The kernel-internal distance type used downstream:
     //   L2  → Metric::L2 (positive distance, smaller better)

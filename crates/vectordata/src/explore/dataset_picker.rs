@@ -1502,7 +1502,9 @@ fn profile_access_mode(
 /// declares none. The jvector SimpleMFD convention encodes it as an
 /// underscore-delimited token in the ground-truth (and sometimes
 /// base) filename: `_ip_`, `_l2_`, `_cos`/`_cosine`, `_angular`,
-/// `_dot`. Returns the canonical lowercase token.
+/// `_dot`. Returns the metric's canonical name
+/// ([`DistanceFunction::name`](crate::DistanceFunction::name)), read
+/// through the one spelling table.
 fn infer_metric_from_entry(entry: &CatalogEntry) -> Option<String> {
     for (_pname, profile) in &entry.profiles().profiles {
         for (_facet, view) in &profile.views {
@@ -1517,15 +1519,9 @@ fn infer_metric_from_entry(entry: &CatalogEntry) -> Option<String> {
 /// Token scan of one filename. Pure; see [`infer_metric_from_entry`].
 fn infer_metric_from_filename(path: &str) -> Option<String> {
     let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
-    for t in name.split(['_', '.', '-']) {
-        match t {
-            "ip" | "dot" | "dotproduct" => return Some("ip".to_string()),
-            "l2" | "euclidean" => return Some("l2".to_string()),
-            "cos" | "cosine" | "angular" => return Some("cosine".to_string()),
-            _ => {}
-        }
-    }
-    None
+    name.split(['_', '.', '-'])
+        .find_map(crate::DistanceFunction::parse)
+        .map(|f| f.name().to_string())
 }
 
 /// Marker shown in a COUNT/SIZE cell while a background remote
@@ -4454,11 +4450,14 @@ mod tests {
     #[test]
     fn metric_inferred_from_filename_tokens() {
         use super::infer_metric_from_filename as infer;
-        assert_eq!(infer("cap/cap_1m_gt_norm_shuffle_ip_k100.ivecs"), Some("ip".into()));
-        assert_eq!(infer("x/some_gt_l2_k100.ivecs"), Some("l2".into()));
-        assert_eq!(infer("a_cosine_gt.ivecs"), Some("cosine".into()));
-        assert_eq!(infer("a_angular_gt.ivecs"), Some("cosine".into()));
-        assert_eq!(infer("dpr_gemma_gt_ip_100.ivecs"), Some("ip".into()));
+        assert_eq!(infer("cap/cap_1m_gt_norm_shuffle_ip_k100.ivecs"), Some("DOT_PRODUCT".into()));
+        assert_eq!(infer("x/some_gt_l2_k100.ivecs"), Some("L2".into()));
+        assert_eq!(infer("a_cosine_gt.ivecs"), Some("COSINE".into()));
+        assert_eq!(infer("a_angular_gt.ivecs"), Some("COSINE".into()));
+        assert_eq!(infer("dpr_gemma_gt_ip_100.ivecs"), Some("DOT_PRODUCT".into()));
+        // The spellings are the table's: a declared `mips` and an inferred
+        // `_mips_` name the same metric.
+        assert_eq!(infer("a_gt_mips_k10.ivecs"), Some("DOT_PRODUCT".into()));
         // No token → no claim. ("ship.fvecs" must not match "ip".)
         assert_eq!(infer("base_vectors.fvecs"), None);
         assert_eq!(infer("ship.fvecs"), None);

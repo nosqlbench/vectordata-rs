@@ -392,21 +392,12 @@ pub fn canonicalize_metric(token: &str) -> String {
         .unwrap_or_else(|| token.to_uppercase())
 }
 
-/// The synonym table behind [`canonicalize_metric`]. `None` for
-/// tokens that don't name a metric at all — which is what lets
-/// [`infer_metric`] scan name tokens without false positives.
+/// The canonical name of the metric `token` spells, through the one
+/// spelling table ([`DistanceFunction::parse`](crate::DistanceFunction::parse)).
+/// `None` for tokens that don't name a metric at all — which is what
+/// lets [`infer_metric`] scan name tokens without false positives.
 fn metric_synonym(token: &str) -> Option<&'static str> {
-    match token.to_ascii_lowercase().as_str() {
-        "cosine" | "angular" => Some("COSINE"),
-        "euclidean" | "l2" => Some("L2"),
-        "dot" | "dot_product" | "dotproduct" | "ip" | "inner_product" | "mips" => {
-            Some("DOT_PRODUCT")
-        }
-        "l1" | "manhattan" | "taxicab" => Some("L1"),
-        "hamming" => Some("HAMMING"),
-        "jaccard" => Some("JACCARD"),
-        _ => None,
-    }
+    crate::DistanceFunction::parse(token).map(crate::DistanceFunction::name)
 }
 
 /// Infer the distance metric of an entry, canonicalized via

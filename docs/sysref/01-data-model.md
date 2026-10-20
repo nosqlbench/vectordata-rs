@@ -455,6 +455,27 @@ Every published dataset must have:
 - `is_zero_vector_free` — set automatically after zero-vector scan
 - `is_duplicate_vector_free` — set automatically after dedup scan
 
+### Distance function spellings
+
+`distance_function` is read through one table,
+`veks_datatypes::DistanceFunction` (re-exported as
+`vectordata::DistanceFunction`), which every reader of the attribute
+and every pipeline `metric` option uses. Case is ignored and `-` or a
+space counts as `_`. The first spelling is the one written.
+
+| Function | Spellings |
+|---|---|
+| `L2` | `L2`, `EUCLIDEAN` |
+| `COSINE` | `COSINE`, `COS`, `ANGULAR` |
+| `DOT_PRODUCT` | `DOT_PRODUCT`, `DOTPRODUCT`, `DOT`, `IP`, `INNER_PRODUCT`, `MIPS` |
+| `L1` | `L1`, `MANHATTAN`, `TAXICAB` |
+| `HAMMING` | `HAMMING` |
+| `JACCARD` | `JACCARD` |
+
+The distance kernels (`veks_simd::Metric`) compute the first four; a
+dataset may declare `HAMMING` or `JACCARD`, and a command asked to
+compute one refuses it by name.
+
 ### Quantization attribute
 
 A profile whose `base_vectors` are the codes of a quantized corpus

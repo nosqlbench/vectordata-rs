@@ -739,10 +739,12 @@ checks, in a single pipeline step.
         // ── KNN Accuracy (replicates validate_knn_utils.py) ─────────────
         emit(ctx, "--- KNN Accuracy Check ---");
 
-        let faiss_mt_is_ip = match metric_str.to_uppercase().as_str() {
-            "IP" | "DOT_PRODUCT" | "COSINE" => true,
-            "L2" => false,
-            other => {
+        use veks_datatypes::DistanceFunction;
+        let faiss_mt_is_ip = match DistanceFunction::parse(metric_str) {
+            Some(DistanceFunction::DotProduct | DistanceFunction::Cosine) => true,
+            Some(DistanceFunction::L2) => false,
+            _ => {
+                let other = metric_str;
                 emit(ctx, &format!("  SKIP: unsupported metric '{}' for accuracy check", other));
                 emit(ctx, "");
                 // fall through to overall
