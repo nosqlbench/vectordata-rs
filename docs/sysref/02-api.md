@@ -259,6 +259,10 @@ let catalog = Catalog::of(&sources);
   `dataset.yaml`, a URL), rendered as a catalog would list its
   `dataset.yaml`; `datasets::describe::run_via_catalog` takes such a
   head too.
+- **Over a catalog the caller holds:** `datasets::list::run_via_catalog`,
+  `datasets::describe::run_via_catalog` and `PrecacheRequest::catalog`
+  render the listing, the description and the fetch without assembling
+  catalogs; none ends the caller's process.
 
 `examples/register_catalog.rs` builds both kinds of catalog over a
 dataset it writes, and opens and reads from each.

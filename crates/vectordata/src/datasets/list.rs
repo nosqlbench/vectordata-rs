@@ -234,8 +234,8 @@ struct DatasetProfileSummary {
 /// configuration in `configdir` plus `extra_catalogs`. `format` is
 /// `json`, `yaml` or `csv`; anything else prints the text table,
 /// grouped by `group_by` when set. With `select`, prints the single
-/// matching `dataset:profile` instead, exiting the process with 1 when
-/// the match is not unique. Returns the exit code: 1 when no source is
+/// matching `dataset:profile` instead, returning 1 when the match is
+/// not unique. Returns the exit code: 1 when no source is
 /// configured, or when nothing is found and the user named a source,
 /// gave filters, or asked to select; otherwise 0.
 pub fn run(
@@ -267,16 +267,43 @@ pub fn run(
         Err(code) => return code,
     };
 
+    // An empty listing of catalogs the user pointed at (`--at` /
+    // `--catalog`) is a failure — most likely a bad URL or unreadable
+    // file; of the configured ones it is an informational result.
+    let user_pinned_source = !at.is_empty() || !extra_catalogs.is_empty();
+    if catalog.is_empty() && user_pinned_source {
+        eprintln!("error: no datasets found in any configured catalog");
+        return 1;
+    }
+    run_via_catalog(&catalog, format, verbose, group_by, filter, profile_view, select)
+}
+
+/// [`run`] over a catalog the caller already assembled: apply `filter`
+/// and print the matching entries, limited to the profiles
+/// `profile_view` admits, in `format` (`json`, `yaml`, `csv`, else the
+/// text table, grouped by `group_by` when set), or with `select` the
+/// single matching `dataset:profile`. The listing a program embedding
+/// vectordata shows over its own choice of catalogs, the way
+/// [`describe::run_via_catalog`](super::describe::run_via_catalog) and
+/// `PrecacheRequest::catalog` take one.
+///
+/// Returns the exit code: 1 when nothing is found and filters or a
+/// `select` were given, or `select` matches other than one entry;
+/// otherwise 0.
+pub fn run_via_catalog(
+    catalog: &crate::catalog::Catalog,
+    format: &str,
+    verbose: bool,
+    group_by: Option<&str>,
+    filter: &DatasetFilter,
+    profile_view: &ProfileView,
+    select: Option<&str>,
+) -> i32 {
     if catalog.is_empty() {
         eprintln!("error: no datasets found in any configured catalog");
-        // Treat as a failure when the user explicitly pointed at
-        // something (`--at`/`--catalog`) — most likely cause is a bad
-        // URL or unreadable file. Also a failure when `--select` is
-        // set, since that asks for a specific entry we couldn't
-        // produce. Otherwise it's an empty informational result and
-        // exits clean.
-        let user_pinned_source = !at.is_empty() || !extra_catalogs.is_empty();
-        if user_pinned_source || select.is_some() {
+        // `--select` asks for a specific entry we couldn't produce.
+        // Otherwise it's an empty informational result and exits clean.
+        if select.is_some() {
             return 1;
         }
         return 0;
@@ -310,8 +337,7 @@ pub fn run(
     }
 
     if let Some(select) = select {
-        output_select(&filtered, profile_view, select);
-        return 0;
+        return output_select(&filtered, profile_view, select);
     }
 
     match format {
@@ -328,8 +354,10 @@ pub fn run(
 ///
 /// The `select_value` is the argument to `--select`. If it matches exactly
 /// one dataset:profile pair, that pair is printed. If the value doesn't
-/// uniquely identify a pair, the remaining matches are shown.
-fn output_select(entries: &[&CatalogEntry], pv: &ProfileView, select_value: &str) {
+/// uniquely identify a pair, the remaining matches are shown. Returns
+/// the exit code, 0 or 1: a library caller's process is not this
+/// function's to end.
+fn output_select(entries: &[&CatalogEntry], pv: &ProfileView, select_value: &str) -> i32 {
     // Collect all matching dataset:profile pairs
     let mut matches: Vec<String> = Vec::new();
     for entry in entries {
@@ -352,16 +380,16 @@ fn output_select(entries: &[&CatalogEntry], pv: &ProfileView, select_value: &str
     {
         let Some(entry) = entries.iter().find(|e| e.name().eq_ignore_ascii_case(&spec.head)) else {
             eprintln!("--select '{select_value}': dataset '{}' does not match any dataset.", spec.head);
-            std::process::exit(1);
+            return 1;
         };
         match entry.select_one(Some(sel.text())) {
             Ok(profile) => {
                 println!("{}:{profile}", entry.name());
-                return;
+                return 0;
             }
             Err(e) => {
                 eprintln!("--select '{select_value}': {e}");
-                std::process::exit(1);
+                return 1;
             }
         }
     }
@@ -373,7 +401,7 @@ fn output_select(entries: &[&CatalogEntry], pv: &ProfileView, select_value: &str
             .collect();
         if exact.len() == 1 {
             println!("{}", exact[0]);
-            return;
+            return 0;
         }
         // Try prefix match if no exact match
         let prefix_matches: Vec<&String> = matches.iter()
@@ -381,7 +409,7 @@ fn output_select(entries: &[&CatalogEntry], pv: &ProfileView, select_value: &str
             .collect();
         if prefix_matches.len() == 1 {
             println!("{}", prefix_matches[0]);
-            return;
+            return 0;
         }
         if prefix_matches.is_empty() {
             eprintln!("--select '{}' does not match any dataset.", select_value);
@@ -391,31 +419,32 @@ fn output_select(entries: &[&CatalogEntry], pv: &ProfileView, select_value: &str
                     eprintln!("  {}", m);
                 }
             }
-            std::process::exit(1);
+            return 1;
         }
         // Multiple prefix matches — ambiguous
         eprintln!("--select '{}' is ambiguous; {} matches remain:", select_value, prefix_matches.len());
         for m in &prefix_matches {
             eprintln!("  {}", m);
         }
-        std::process::exit(1);
+        return 1;
     }
 
     // No value given — check if filters narrowed to exactly one
     match matches.len() {
         0 => {
             eprintln!("No datasets match the specified filters.");
-            std::process::exit(1);
+            1
         }
         1 => {
             println!("{}", matches[0]);
+            0
         }
         _ => {
             eprintln!("--select is ambiguous; {} matches remain:", matches.len());
             for m in &matches {
                 eprintln!("  {}", m);
             }
-            std::process::exit(1);
+            1
         }
     }
 }
@@ -810,6 +839,33 @@ mod tests {
         );
         // Should have both the configured and extra catalog
         assert!(!sources.is_empty());
+    }
+
+    /// **`run_via_catalog` lists a catalog a program assembled**, and a
+    /// `select` that matches nothing returns 1 rather than ending the
+    /// caller's process (it exited).
+    #[test]
+    fn run_via_catalog_lists_a_given_catalog_and_returns_its_codes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let description = crate::dataset::DatasetConfig::builder("given")
+            .profile("default", |p| p.facet(crate::dataset::StandardFacet::BaseVectors, "b.fvec"))
+            .build()
+            .unwrap();
+        let entry = CatalogEntry::builder("given")
+            .home(&crate::Location::from_path(tmp.path()))
+            .dataset(description)
+            .build()
+            .unwrap();
+        let sources = CatalogSources::new().with(crate::catalog::CatalogBuilder::named("mine").entry(entry).build());
+        let catalog = Catalog::of(&sources);
+        let (all, view) = (DatasetFilter::default(), ProfileView::default());
+        for format in ["text", "json", "yaml", "csv"] {
+            assert_eq!(run_via_catalog(&catalog, format, false, None, &all, &view, None), 0, "{format}");
+        }
+        assert_eq!(run_via_catalog(&catalog, "text", false, None, &all, &view, Some("given:default")), 0);
+        assert_eq!(run_via_catalog(&catalog, "text", false, None, &all, &view, Some("absent")), 1);
+        assert_eq!(run_via_catalog(&Catalog::default(), "text", false, None, &all, &view, Some("given")), 1);
+        assert_eq!(run_via_catalog(&Catalog::default(), "text", false, None, &all, &view, None), 0, "an empty listing is informational");
     }
 
     #[test]
