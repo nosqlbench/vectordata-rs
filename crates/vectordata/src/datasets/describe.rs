@@ -72,11 +72,14 @@ pub fn run_args(args: DescribeArgs, program: &crate::catalog::CatalogSources, co
 /// rendered (PS-9): `None` is `default`, and a selector matching more
 /// or fewer than one profile is an error naming what it matched.
 pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&str>) -> i32 {
-    let Some(entry) = catalog.find_exact(dataset_name) else {
-        eprintln!("error: dataset '{dataset_name}' not found in any configured catalog");
-        eprintln!();
-        eprintln!("Try `vectordata datasets list` to see what's reachable.");
-        return 1;
+    // `lookup`, not `find_exact`: a name two catalogs hold is ambiguous,
+    // and saying so is the opposite of saying it is nowhere.
+    let entry = match catalog.lookup(dataset_name) {
+        Ok(entry) => entry,
+        Err(e) => {
+            super::report_lookup_failure(catalog, &e);
+            return 1;
+        }
     };
     let profile_name = match entry.select_one(selector) {
         Ok(p) => p,

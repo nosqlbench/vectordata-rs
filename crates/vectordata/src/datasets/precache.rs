@@ -52,7 +52,9 @@ pub struct PrecacheRequest {
     pub at: Vec<String>,
     /// The catalogs the program running the command supplies, after
     /// the configured ones and before `--catalog`'s; `--at` replaces
-    /// them with the rest. Empty for the `vectordata` binary.
+    /// them with the rest. Empty for the `vectordata` binary. The
+    /// program's own catalogs only: the configured ones are added from
+    /// `configdir`, and a set holding them too lists each twice.
     pub program_catalogs: crate::catalog::CatalogSources,
     /// Cache directory for this run in place of the configured one
     /// (`--cache-dir`), set with [`crate::settings::set_cache_dir`].

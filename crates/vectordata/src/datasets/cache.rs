@@ -174,7 +174,16 @@ pub fn run_cache_status(
     let catalog = super::build_sources(program, configdir, extra_catalogs, at)
         .open()
         .unwrap_or_else(|code| std::process::exit(code));
-    let entry = catalog.find_exact(dataset_name);
+    // The profile summary needs the one entry; a name two catalogs hold
+    // gets the cache status without it, and is told why.
+    let entry = match catalog.lookup(dataset_name) {
+        Ok(entry) => Some(entry),
+        Err(e @ crate::Error::AmbiguousDataset { .. }) => {
+            eprintln!("note: no profile summary: {e}");
+            None
+        }
+        Err(_) => None,
+    };
 
     println!("Cache status: {}", dataset_name);
     println!("  Cache dir: {}", rel_display(&ds_cache));

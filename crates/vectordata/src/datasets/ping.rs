@@ -96,10 +96,10 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&
         eprintln!("      or:  vectordata config set cache <directory>");
         return 1;
     }
-    if catalog.find_exact(dataset_name).is_none() {
-        eprintln!("error: dataset '{dataset_name}' not found in any configured catalog");
-        eprintln!();
-        eprintln!("Try `vectordata datasets list` to see what's reachable.");
+    // `lookup`, not `find_exact`: a name two catalogs hold is ambiguous,
+    // and saying so is the opposite of saying it is nowhere.
+    if let Err(e) = catalog.lookup(dataset_name) {
+        super::report_lookup_failure(catalog, &e);
         return 1;
     }
     println!(

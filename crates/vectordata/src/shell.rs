@@ -641,6 +641,11 @@ pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
 /// count the configured catalogs. The assembly is
 /// [`datasets::build_sources`](crate::datasets::build_sources).
 ///
+/// `program` is the program's own catalogs only. The configured ones
+/// are added for every command; a set that already holds them (one
+/// built with `configure_default()`) lists each twice, and every name
+/// in one becomes ambiguous.
+///
 /// ```no_run
 /// use vectordata::catalog::{CatalogBuilder, CatalogSources};
 /// # let entry: vectordata::dataset::CatalogEntry = unimplemented!();

@@ -93,6 +93,11 @@ impl RunSources {
 /// and any `--catalog` locations follow those. Catalogs given by `--at`
 /// or `--catalog` are [named for the run](RunSources::open).
 ///
+/// `program` is the program's own catalogs only, not the configured
+/// ones, which are added here: a set built with `configure_default()`
+/// lists each configured catalog twice, and every name in one becomes
+/// ambiguous.
+///
 /// Numbered catalog shortcuts (`--at 2`, `--catalog 1`) resolve
 /// against the configured list in every position — this seam is what
 /// makes the shortcuts work identically from every binary that
@@ -148,6 +153,10 @@ pub fn open_catalog(sources: &CatalogSources) -> crate::catalog::Catalog {
 pub fn report_lookup_failure(catalog: &crate::catalog::Catalog, error: &crate::Error) {
     let crate::Error::UnknownDataset { name, .. } = error else {
         eprintln!("error: {error}");
+        if matches!(error, crate::Error::AmbiguousDataset { .. }) {
+            // Never resolved by catalog order: the user picks the catalog.
+            eprintln!("Name the catalog to read it from with `--at <catalog>`.");
+        }
         return;
     };
     eprintln!("Dataset '{name}' not found.");
