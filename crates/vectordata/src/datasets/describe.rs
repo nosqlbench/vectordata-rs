@@ -42,6 +42,24 @@ pub fn run_args(args: DescribeArgs, program: &crate::catalog::CatalogSources, co
     // `--at` pins the command to the catalogs it names, numbered
     // shortcuts (`--at 2`) included, by the one assembly every
     // command uses.
+    // A path that exists is a path, whatever punctuation it holds;
+    // otherwise the spec splits into a head and a selector.
+    let (head, selector) = if std::path::Path::new(&args.spec).exists() {
+        (args.spec.clone(), None)
+    } else {
+        match DatasetSpec::parse(&args.spec) {
+            Ok(s) => (s.head, s.selector.map(|s| s.text().to_string())),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        }
+    };
+    // Catalogs are read only for a head that names a dataset in one: a
+    // path or URL opens directly, as precache opens it.
+    if opens_directly(&head) {
+        return run_via_catalog(&Catalog::default(), &head, selector.as_deref());
+    }
     let at: Vec<String> = args.at.iter().cloned().collect();
     let sources = super::build_sources(program, configdir, catalog, &at);
     if sources.is_empty() {
@@ -51,22 +69,26 @@ pub fn run_args(args: DescribeArgs, program: &crate::catalog::CatalogSources, co
         eprintln!("or pass `--at <URL-or-path>` for one-off use.");
         return 1;
     }
-    let spec = match DatasetSpec::parse(&args.spec) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 2;
-        }
-    };
     let cat = match sources.open() {
         Ok(cat) => cat,
         Err(code) => return code,
     };
-    run_via_catalog(&cat, &spec.head, spec.selector.as_ref().map(|s| s.text()))
+    run_via_catalog(&cat, &head, selector.as_deref())
+}
+
+/// A head [`open_selection`](crate::catalog::Catalog::open_selection)
+/// opens without a catalog: a URL, or a path that exists.
+fn opens_directly(head: &str) -> bool {
+    crate::transport::is_remote_url(head) || std::path::Path::new(head).exists()
 }
 
 /// Render the descriptor using a pre-built catalog. Used by both the
 /// CLI path and any future programmatic caller.
+///
+/// `dataset_name` is a head as [`Catalog::open_selection`] takes it: a
+/// catalog name, looked up in `catalog`, or a local directory,
+/// `dataset.yaml` or URL, opened directly (its `dataset.yaml` read, and
+/// rendered as a catalog would list it).
 ///
 /// `selector` is resolved against the entry before anything is
 /// rendered (PS-9): `None` is `default`, and a selector matching more
@@ -74,11 +96,23 @@ pub fn run_args(args: DescribeArgs, program: &crate::catalog::CatalogSources, co
 pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&str>) -> i32 {
     // `lookup`, not `find_exact`: a name two catalogs hold is ambiguous,
     // and saying so is the opposite of saying it is nowhere.
-    let entry = match catalog.lookup(dataset_name) {
-        Ok(entry) => entry,
-        Err(e) => {
-            super::report_lookup_failure(catalog, &e);
-            return 1;
+    let opened;
+    let entry = if opens_directly(dataset_name) {
+        opened = match crate::TestDataGroup::load(dataset_name) {
+            Ok(group) => group,
+            Err(e) => {
+                eprintln!("error: failed to open dataset '{dataset_name}': {e}");
+                return 1;
+            }
+        };
+        opened.catalog_entry()
+    } else {
+        match catalog.lookup(dataset_name) {
+            Ok(entry) => entry,
+            Err(e) => {
+                super::report_lookup_failure(catalog, &e);
+                return 1;
+            }
         }
     };
     let profile_name = match entry.select_one(selector) {

@@ -254,6 +254,11 @@ let catalog = Catalog::of(&sources);
   same with none. `datasets::build_sources(program, configdir, catalog,
   at)` is the one assembly; `CatalogSources::extend` appends one set to
   another.
+- **`describe` on a path or URL:** `datasets describe` takes a head as
+  `open_spec` does (`describe ./mydata`, `describe ./mydata:default`, a
+  `dataset.yaml`, a URL), rendered as a catalog would list its
+  `dataset.yaml`; `datasets::describe::run_via_catalog` takes such a
+  head too.
 
 `examples/register_catalog.rs` builds both kinds of catalog over a
 dataset it writes, and opens and reads from each.

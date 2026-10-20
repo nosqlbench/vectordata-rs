@@ -99,3 +99,33 @@ fn describe_counts_the_files_a_uniform_series_spans() {
     }
     assert!(text.contains("pattern       base__NNNN.fvec"), "{text}");
 }
+
+/// **A path is described as a catalog name is**: a dataset directory,
+/// its `dataset.yaml`, and the directory with a selector each render the
+/// dataset, as `precache` opens them, with no catalog configured. It was
+/// "not found in any configured catalog".
+#[test]
+fn describe_takes_a_directory_or_dataset_yaml_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path());
+    let ds = tmp.path().join("mydata");
+    std::fs::create_dir_all(&ds).unwrap();
+    write_fvec(&ds.join("base.fvec"), 10, 4, 1.0);
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "name: mydata\nattributes:\n  distance_function: L2\nprofiles:\n  default:\n    base_vectors: base.fvec\n",
+    )
+    .unwrap();
+    let dir = ds.to_string_lossy().into_owned();
+    for spec in [dir.clone(), format!("{dir}/dataset.yaml"), format!("{dir}:default")] {
+        let out = vectordata(&home, &["datasets", "describe", &spec]);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{spec}: {text}\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("Dataset: mydata"), "{spec}: {text}");
+        assert!(text.contains("Type:    dataset.yaml"), "{spec}: {text}");
+        assert!(text.contains("base_vectors"), "{spec}: {text}");
+    }
+    let out = vectordata(&home, &["datasets", "describe", &format!("{dir}:nosuch")]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nosuch"), "the selector is checked against the path's profiles");
+}

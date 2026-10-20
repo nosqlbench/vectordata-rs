@@ -30,6 +30,10 @@ pub struct TestDataGroup {
     /// facets cache by URL instead, as no directory can be named.
     name: Option<String>,
     config: DatasetConfig,
+    /// The dataset as a catalog lists it, whichever route opened it:
+    /// what `datasets describe` renders for a path or URL as it does
+    /// for a catalog name.
+    entry: crate::dataset::CatalogEntry,
 }
 
 /// A dataset resolved for opening: what every route to a
@@ -46,17 +50,31 @@ struct DatasetHandle {
     home: Location,
     origin: String,
     config: DatasetConfig,
+    entry: crate::dataset::CatalogEntry,
+}
+
+/// The embedded catalog entry for `description` at `home`, named `name`.
+fn embedded_entry(name: &str, home: &Location, description: crate::dataset::DatasetConfig) -> crate::dataset::CatalogEntry {
+    crate::dataset::CatalogEntry::builder(name)
+        .home(home)
+        .dataset(description)
+        .build()
+        .expect("an entry with a home and a description always builds")
 }
 
 impl DatasetHandle {
-    /// A dataset at `home`, named after its last segment, whose origin
-    /// is `home` as a directory.
-    fn at(home: Location, config: DatasetConfig) -> Self {
+    /// A dataset at `home` described by `description`, named after its
+    /// last segment (or, at a server's root, by the description), whose
+    /// origin is `home` as a directory.
+    fn at(home: Location, description: crate::dataset::DatasetConfig) -> Self {
+        let name = home.last_segment().map(str::to_string);
+        let entry = embedded_entry(name.as_deref().unwrap_or(&description.name), &home, description.clone());
         DatasetHandle {
-            name: home.last_segment().map(str::to_string),
+            name,
             origin: dir_form(&home.to_string()),
             home,
-            config,
+            config: DatasetConfig::opened(description),
+            entry,
         }
     }
 
@@ -64,20 +82,34 @@ impl DatasetHandle {
     /// either shape: `dataset.yaml` (it has `profiles:`) or
     /// `knn_entries.yaml`. The shape decides, not the file's name, as in
     /// jvector's `DataSetLoaderSimpleMFD`.
-    fn of_content(home: Location, content: &str) -> Result<Self> {
+    fn of_content(home: Location, descriptor: &Location, content: &str) -> Result<Self> {
         let value: serde_yaml::Value = serde_yaml::from_str(content)?;
         let is_dataset_yaml = value.as_mapping().is_some_and(|m| m.contains_key("profiles"));
         if is_dataset_yaml {
-            Self::of_dataset_yaml(home, content)
+            Self::of_dataset_yaml(home, descriptor, content)
         } else {
             Self::of_knn_entries(home, content)
         }
     }
 
-    /// A dataset at `home` described by `dataset.yaml` content.
-    fn of_dataset_yaml(home: Location, content: &str) -> Result<Self> {
+    /// A dataset at `home` described by `dataset.yaml` content, read
+    /// from `descriptor`: listed as a catalog lists a `dataset.yaml`, by
+    /// its descriptor and its layout.
+    fn of_dataset_yaml(home: Location, descriptor: &Location, content: &str) -> Result<Self> {
         let description = crate::dataset::DatasetConfig::parse(content)?;
-        Ok(Self::at(home, DatasetConfig::opened(description)))
+        let handle = Self::at(home, description.clone());
+        let name = handle.entry.name().to_string();
+        let layout = crate::dataset::CatalogLayout {
+            format_version: description.format_version,
+            profile_tags: description.profile_tags,
+            attributes: description.attributes,
+            profiles: description.profiles,
+        };
+        let entry = crate::dataset::CatalogEntry::builder(name)
+            .descriptor(descriptor, layout)
+            .build()
+            .expect("an entry with a descriptor always builds");
+        Ok(Self { entry, ..handle })
     }
 
     /// A dataset at `home` described by `knn_entries.yaml` content: the
@@ -106,15 +138,18 @@ impl DatasetHandle {
             }
             None => 0,
         };
-        let config = match entries.get(chosen).map(|e| e.description()) {
-            Some(crate::dataset::EntryDescription::Embedded(description)) => {
-                DatasetConfig::opened((**description).clone())
-            }
-            _ => DatasetConfig::opened(
-                crate::dataset::DatasetConfig::builder(dir_name).build().map_err(Error::Other)?,
-            ),
-        };
-        Ok(Self::at(home, config))
+        // A listing with no description of its own is an empty dataset.
+        let empty = crate::dataset::DatasetConfig::builder(dir_name).build().map_err(Error::Other)?;
+        match entries.get(chosen) {
+            Some(entry) => match entry.description() {
+                // The entry is the catalog's own listing of it: kept whole.
+                crate::dataset::EntryDescription::Embedded(description) => {
+                    Ok(Self { entry: entry.clone(), ..Self::at(home, (**description).clone()) })
+                }
+                crate::dataset::EntryDescription::Referenced { .. } => Ok(Self::at(home, empty)),
+            },
+            None => Ok(Self::at(home, empty)),
+        }
     }
 }
 
@@ -161,7 +196,7 @@ impl TestDataGroup {
         // sibling probing.
         if path.is_file() && is_yaml_name(&path.to_string_lossy()) {
             let dir = path.parent().unwrap_or(Path::new("."));
-            let handle = DatasetHandle::of_content(Location::from_path(dir), &read(path)?)?;
+            let handle = DatasetHandle::of_content(Location::from_path(dir), &Location::from_path(path), &read(path)?)?;
             return Ok(Self::from_handle(handle));
         }
 
@@ -173,7 +208,7 @@ impl TestDataGroup {
         let handle = if !dataset_path.exists() && knn_path.exists() {
             DatasetHandle::of_knn_entries(home, &read(&knn_path)?)?
         } else {
-            DatasetHandle::of_dataset_yaml(home, &read(&dataset_path)?)?
+            DatasetHandle::of_dataset_yaml(home, &Location::from_path(&dataset_path), &read(&dataset_path)?)?
         };
         Ok(Self::from_handle(handle))
     }
@@ -196,7 +231,7 @@ impl TestDataGroup {
         if is_yaml_name(url.path()) {
             let base_url = url.join(".")?;
             let content = fetch_descriptor(&client, &url, &base_url)?.required(&url)?;
-            let handle = DatasetHandle::of_content(Location::Url(base_url), &content)?;
+            let handle = DatasetHandle::of_content(Location::Url(base_url), &Location::Url(url.clone()), &content)?;
             return Ok(Self::from_handle(handle));
         }
 
@@ -214,7 +249,7 @@ impl TestDataGroup {
         let mut unavailable = None;
         match fetch_descriptor(&client, &dataset_url, &base_url)? {
             Descriptor::Text(content) => {
-                return Ok(Self::from_handle(DatasetHandle::of_dataset_yaml(home, &content)?));
+                return Ok(Self::from_handle(DatasetHandle::of_dataset_yaml(home, &Location::Url(dataset_url), &content)?));
             }
             Descriptor::Absent => {}
             Descriptor::Unavailable(e) => unavailable = Some(e),
@@ -260,17 +295,17 @@ impl TestDataGroup {
         home: Location,
         description: crate::dataset::DatasetConfig,
     ) -> Self {
-        let handle = DatasetHandle {
-            name: Some(name.into()),
-            ..DatasetHandle::at(home.as_dir(), DatasetConfig::opened(description))
-        };
+        let name = name.into();
+        let home = home.as_dir();
+        let entry = embedded_entry(&name, &home, description.clone());
+        let handle = DatasetHandle { name: Some(name), entry, ..DatasetHandle::at(home, description) };
         Self::from_handle(handle)
     }
 
     /// The one constructor every open ends in (RC-7).
     fn from_handle(handle: DatasetHandle) -> Self {
-        let DatasetHandle { name, home, origin, config } = handle;
-        TestDataGroup { home, origin, name, config }
+        let DatasetHandle { name, home, origin, config, entry } = handle;
+        TestDataGroup { home, origin, name, config, entry }
     }
 
     /// The view of one profile, anchored to this dataset's cache
@@ -367,6 +402,13 @@ impl TestDataGroup {
     /// Retrieves a top-level attribute from the dataset configuration.
     pub fn attribute(&self, name: &str) -> Option<&serde_yaml::Value> {
         self.config.attributes.get(name)
+    }
+
+    /// The dataset as a catalog lists it: the catalog's own entry for a
+    /// dataset opened from one, else an entry embedding the description
+    /// it was opened with, named and homed as the group is.
+    pub(crate) fn catalog_entry(&self) -> &crate::dataset::CatalogEntry {
+        &self.entry
     }
 
     /// Direct read-only access to the underlying parsed
@@ -623,6 +665,7 @@ impl TestDataGroup {
                     home: Location::parse(&origin)?,
                     origin,
                     config: DatasetConfig::opened((**description).clone()),
+                    entry: entry.clone(),
                 }))
             }
             crate::dataset::EntryDescription::Referenced { descriptor, .. } => Self::load(descriptor),
@@ -837,13 +880,13 @@ mod tests {
     fn a_dataset_at_a_server_root_is_not_given_an_empty_name() {
         let empty = crate::dataset::DatasetConfig::builder("").build().unwrap();
         for root in ["http://127.0.0.1:9/", "http://127.0.0.1:10/"] {
-            let handle = DatasetHandle::at(Location::parse(root).unwrap(), DatasetConfig::opened(empty.clone()));
+            let handle = DatasetHandle::at(Location::parse(root).unwrap(), empty.clone());
             assert_eq!(handle.name, None, "{root}");
             assert_eq!(handle.origin, root);
         }
         let handle = DatasetHandle::at(
             Location::parse("http://127.0.0.1:9/ds/").unwrap(),
-            DatasetConfig::opened(empty),
+            empty,
         );
         assert_eq!(handle.name.as_deref(), Some("ds"));
     }
@@ -875,7 +918,7 @@ mod tests {
         let home = Location::from_path(&dir);
         assert_eq!(TestDataGroup::from_config("given", home, description.clone()).name(), Some("given"));
 
-        let root = DatasetHandle::at(Location::parse("http://127.0.0.1:9/").unwrap(), DatasetConfig::opened(description));
+        let root = DatasetHandle::at(Location::parse("http://127.0.0.1:9/").unwrap(), description);
         assert_eq!(TestDataGroup::from_handle(root).name(), None, "a server's root");
     }
 
