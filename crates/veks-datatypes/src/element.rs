@@ -12,6 +12,16 @@ use crate::ElementType;
 /// exactly; floats travel as `f64`, which holds every `f16`, `bf16`
 /// and `f32` exactly. This is how [`convert`](crate::convert) moves a
 /// value between types; the native path never builds one.
+///
+/// ```
+/// use veks_datatypes::{Element, Value, f16};
+/// assert_eq!(300u32.to_value(), Value::Int(300));
+/// assert_eq!(f16::from_f32(0.5).to_value(), Value::Float(0.5));
+/// assert_eq!(Value::Int(-7).to_string(), "-7");
+/// assert_eq!(u8::from_value(Value::Int(255)), Some(255));
+/// assert_eq!(i32::from_value(Value::Int(1 << 40)), None, "does not fit");
+/// assert_eq!(i64::from_value(Value::Float(1.0)), None, "a float never becomes an integer");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
     /// An integer element.
@@ -37,6 +47,22 @@ impl std::fmt::Display for Value {
 /// every file uses; the value methods are the conversion path, used
 /// only when a caller asks for a type the file does not hold and the
 /// [conversion table](ElementType::conversion_to) allows it.
+///
+/// ```
+/// use veks_datatypes::{bf16, f16, Element, ElementType, Value};
+/// assert_eq!((<i16 as Element>::TYPE, <i16 as Element>::SIZE), (ElementType::I16, 2));
+/// let mut buf = [0u8; 8];
+/// (-2i16).write_le_bytes(&mut buf);                       // the on-disk encoding: little-endian
+/// assert_eq!((&buf[..2], <i16 as Element>::from_le_bytes(&buf)), (&[0xfe, 0xff][..], -2));
+/// bf16::from_f32(1.0).write_le_bytes(&mut buf);
+/// assert_eq!(&buf[..2], &[0x80, 0x3f], "a bf16 is the top half of its f32");
+/// f16::from_f32(1.0).write_le_bytes(&mut buf);
+/// assert_eq!(&buf[..2], &[0x00, 0x3c], "an f16 is not");
+/// assert_eq!(u64::MAX.to_value(), Value::Int(u64::MAX as i128));   // the conversion path, never the native one
+/// assert_eq!(f16::from_value(Value::Int(2048)), Some(f16::from_f32(2048.0)));
+/// assert_eq!(i8::from_value(Value::Int(200)), None, "does not fit");
+/// assert_eq!(bf16::from_f32(-0.5).as_f64(), -0.5);
+/// ```
 pub trait Element: Copy + Send + Sync + 'static {
     /// Which element type this is.
     const TYPE: ElementType;

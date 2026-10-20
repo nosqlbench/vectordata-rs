@@ -27,6 +27,45 @@ pub struct ScalarMmapReader<T> {
 impl<T: Element> ScalarMmapReader<T> {
     /// Open and memory-map a column file whose extension names `T`.
     /// The file must be non-empty and a whole number of elements.
+    ///
+    /// # Examples
+    ///
+    /// An integer column (`.u64` holds `u64`): one element at a time,
+    /// or the whole column as a zero-copy slice:
+    ///
+    /// ```
+    /// use veks_io::scalar::mmap::ScalarMmapReader;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let path = dir.path().join("offsets.u64");
+    /// # let bytes: Vec<u8> = [0u64, 4096, u64::MAX].iter().flat_map(|v| v.to_le_bytes()).collect();
+    /// # std::fs::write(&path, bytes).unwrap();
+    /// let offsets = ScalarMmapReader::<u64>::open(&path).unwrap();
+    /// assert_eq!(offsets.count(), 3);
+    /// assert_eq!(offsets.get(1), Some(4096));                      // decoded
+    /// assert_eq!(offsets.as_slice().unwrap(), &[0, 4096, u64::MAX]); // zero-copy
+    /// ```
+    ///
+    /// A float column (`.f16` holds [`f16`](crate::f16)), and the error
+    /// for asking the wrong type of it:
+    ///
+    /// ```
+    /// use veks_io::scalar::mmap::ScalarMmapReader;
+    /// use veks_io::{ElementType, MmapError, f16};
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let path = dir.path().join("scale.f16");
+    /// # let bytes: Vec<u8> = [0.5f32, 2.0].iter().flat_map(|v| f16::from_f32(*v).to_le_bytes()).collect();
+    /// # std::fs::write(&path, bytes).unwrap();
+    /// let scale = ScalarMmapReader::<f16>::open(&path).unwrap();
+    /// assert_eq!(scale.get(1).map(|v| v.to_f32()), Some(2.0));
+    ///
+    /// // A reader never converts: an f16 column is not opened as f32.
+    /// match ScalarMmapReader::<f32>::open(&path) {
+    ///     Err(MmapError::ElementMismatch { file, requested }) => {
+    ///         assert_eq!((file, requested), (ElementType::F16, ElementType::F32));
+    ///     }
+    ///     other => panic!("expected ElementMismatch, got {other:?}"),
+    /// }
+    /// ```
     pub fn open(path: &Path) -> Result<Self, MmapError> {
         require_native::<T>(path, Container::Scalar)?;
         Self::open_impl(path)
@@ -89,6 +128,22 @@ impl<T: Element> ScalarMmapReader<T> {
     /// The whole column, borrowed from the mapping: `count()` elements
     /// with no copy. `None` when the mapping does not start on a `T`
     /// boundary, which a page-aligned mapping of a file always does.
+    ///
+    /// # Example
+    ///
+    /// An `i32` column of ground-truth indices, borrowed whole:
+    ///
+    /// ```
+    /// use veks_io::scalar::mmap::ScalarMmapReader;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let path = dir.path().join("labels.i32");
+    /// # let bytes: Vec<u8> = [3i32, -1, 42].iter().flat_map(|v| v.to_le_bytes()).collect();
+    /// # std::fs::write(&path, bytes).unwrap();
+    /// let labels = ScalarMmapReader::<i32>::open(&path).unwrap();
+    /// let all: &[i32] = labels.as_slice().unwrap(); // zero-copy
+    /// assert_eq!(all, &[3, -1, 42]);
+    /// assert_eq!(all.iter().max(), Some(&42));
+    /// ```
     pub fn as_slice(&self) -> Option<&[T]> {
         if !aligned_for::<T>(&self.mmap) {
             return None;

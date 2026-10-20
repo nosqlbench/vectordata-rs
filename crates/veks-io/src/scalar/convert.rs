@@ -82,6 +82,48 @@ fn allowed(from: ElementType, to: ElementType) -> bool {
 
 /// Convert a packed column of `from` elements to a packed column of
 /// `to` elements, checking every value.
+///
+/// # Examples
+///
+/// A widening (`i16` to `i32`) converts every value; the output is a
+/// new column, not a view:
+///
+/// ```
+/// use veks_io::ElementType;
+/// use veks_io::scalar::convert::convert_scalars;
+///
+/// let column: Vec<u8> = [-300i16, 0, 300].iter().flat_map(|v| v.to_le_bytes()).collect();
+/// let widened = convert_scalars(&column, ElementType::I16, ElementType::I32).unwrap();
+/// let values: Vec<i32> = widened.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+/// assert_eq!(values, [-300, 0, 300]);
+/// ```
+///
+/// A float to an integer is refused before any value is looked at:
+///
+/// ```
+/// use veks_io::ElementType;
+/// use veks_io::scalar::convert::{ConvertError, convert_scalars};
+///
+/// let column: Vec<u8> = [1.5f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+/// let err = convert_scalars(&column, ElementType::F32, ElementType::I32).unwrap_err();
+/// assert_eq!(err, ConvertError::Refused { from_type: ElementType::F32, to_type: ElementType::I32 });
+/// ```
+///
+/// An integer narrowing (`u16` to `u8`) is taken, and the first value
+/// that does not fit is named by ordinal:
+///
+/// ```
+/// use veks_io::ElementType;
+/// use veks_io::scalar::convert::{ConvertError, convert_scalars};
+///
+/// let column: Vec<u8> = [1u16, 255, 256].iter().flat_map(|v| v.to_le_bytes()).collect();
+/// match convert_scalars(&column, ElementType::U16, ElementType::U8) {
+///     Err(ConvertError::Overflow { ordinal, from_type, to_type, .. }) => {
+///         assert_eq!((ordinal, from_type, to_type), (2, ElementType::U16, ElementType::U8));
+///     }
+///     other => panic!("expected an overflow at ordinal 2, got {other:?}"),
+/// }
+/// ```
 pub fn convert_scalars(data: &[u8], from: ElementType, to: ElementType) -> Result<Vec<u8>, ConvertError> {
     let from_size = from.byte_width();
     let to_size = to.byte_width();

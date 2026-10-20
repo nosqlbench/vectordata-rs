@@ -26,6 +26,29 @@ const WRITE_BUF_SIZE: usize = 16 << 20; // 16 MiB
 /// The `dimension` is written as the header of every record.
 /// Element size is inferred from the output format (determined by
 /// the file extension at the call site).
+///
+/// # Example
+///
+/// Two `i8` records; the writer prefixes each with the dimension and
+/// copies the bytes as given, so the file is `2 × (4 + 3)` bytes:
+///
+/// ```
+/// use veks_io::xvec;
+/// # let dir = tempfile::tempdir().unwrap();
+/// let path = dir.path().join("codes.i8vecs");
+/// let mut writer = xvec::writer::open(&path, 3).unwrap();
+/// for row in [[-1i8, 2, -3], [i8::MIN, 0, i8::MAX]] {
+///     let bytes: Vec<u8> = row.iter().map(|v| v.to_le_bytes()[0]).collect();
+///     writer.write_record(0, &bytes);
+/// }
+/// writer.finish().unwrap();
+/// assert_eq!(std::fs::metadata(&path).unwrap().len(), 2 * (4 + 3));
+///
+/// let mut reader = veks_io::open(&path).unwrap();
+/// reader.next_record().unwrap();
+/// let second = reader.next_record().unwrap();
+/// assert_eq!(second.iter().map(|&b| i8::from_le_bytes([b])).collect::<Vec<_>>(), [i8::MIN, 0, i8::MAX]);
+/// ```
 pub fn open(path: &Path, dimension: u32) -> Result<Box<dyn VecSink>, String> {
     let file = File::create(path)
         .map_err(|e| format!("create {}: {}", path.display(), e))?;

@@ -373,6 +373,28 @@ pub(crate) fn ext_of(source: &str) -> &str {
 /// All transport choice is hidden inside `Storage`. There is no public
 /// way to construct an `XvecReader` against a specific transport
 /// variant — `open` dispatches based on the source string.
+///
+/// It reads a file at its own type only (`T` must be what the
+/// extension names). A record borrows from the mapping when its bytes
+/// are aligned for `T` — an 8-byte type at a 4-byte header is not,
+/// every other record — and reads by copy otherwise:
+///
+/// ```
+/// use vectordata::io::XvecReader;
+/// use vectordata::VectorReader;
+/// # use std::io::Write;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// # let mut f = std::fs::File::create(dir.path().join("dist.dvecs"))?;
+/// # for v in [[0.25f64], [-1e300]] { f.write_all(&1i32.to_le_bytes())?; for x in v { f.write_all(&f64::to_le_bytes(x))?; } }
+/// # drop(f);
+/// let r = XvecReader::<f64>::open_path(&dir.path().join("dist.dvecs"))?;
+/// assert_eq!((r.count(), r.dim()), (2, 1));
+/// assert_eq!(VectorReader::get(&r, 1)?, vec![-1e300]);              // always: a decoded copy
+/// assert!(VectorReader::get_slice(&r, 0).is_none(), "offset 4 is not 8-aligned");
+/// assert_eq!(VectorReader::get_slice(&r, 1), Some(&[-1e300][..]));   // offset 16 is: zero-copy
+/// # Ok(()) }
+/// ```
 pub struct XvecReader<T> {
     storage: Arc<Storage>,
     dim: usize,
@@ -738,6 +760,22 @@ impl<T: Element> VectorReader<T> for XvecReader<T> {
 /// persists for next time. For remote-cached storage the sidecar is
 /// fetched from the same URL prefix; for local files it lives next
 /// to the data file.
+///
+/// ```
+/// use vectordata::io::IndexedVvecReader;
+/// use vectordata::VvecReader;
+/// # use std::io::Write;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// # let mut f = std::fs::File::create(dir.path().join("labels.u8vvecs"))?;
+/// # for v in [vec![9u8, 8, 7], vec![], vec![255]] { f.write_all(&(v.len() as i32).to_le_bytes())?; f.write_all(&v)?; }
+/// # drop(f);
+/// let r = IndexedVvecReader::<u8>::open_path(&dir.path().join("labels.u8vvecs"))?;   // builds IDXFOR__labels.u8vvecs.i32 beside it
+/// assert_eq!(r.count(), 3);
+/// assert_eq!((r.dim_at(0)?, r.dim_at(1)?, r.dim_at(2)?), (3, 0, 1));
+/// assert_eq!(VvecReader::get(&r, 2)?, vec![255u8]);
+/// # Ok(()) }
+/// ```
 pub struct IndexedVvecReader<T> {
     storage: Arc<Storage>,
     offsets: Vec<u64>,
@@ -1064,6 +1102,26 @@ fn zero<T: Element>() -> T {
 ///
 /// Like [`XvecReader`], it reads a file at its own type only; a dataset
 /// view converts where [`ElementType::conversion_to`] allows it.
+///
+/// ```
+/// use vectordata::io::ScalarReader;
+/// use vectordata::VectorReader;
+/// # use std::io::Write;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// # let mut f = std::fs::File::create(dir.path().join("scale.f32"))?;
+/// # for x in [0.5f32, 0.25, 2.0] { f.write_all(&x.to_le_bytes())?; }
+/// # drop(f);
+/// # let mut g = std::fs::File::create(dir.path().join("hash.u64"))?;
+/// # for x in [u64::MAX, 1] { g.write_all(&x.to_le_bytes())?; }
+/// # drop(g);
+/// let scale = ScalarReader::<f32>::open_path(&dir.path().join("scale.f32"))?;
+/// assert_eq!((scale.count(), scale.dim()), (3, 1));
+/// assert_eq!(scale.as_slice(), Some(&[0.5f32, 0.25, 2.0][..]));     // the whole column, zero-copy
+/// let hash = ScalarReader::<u64>::open_path(&dir.path().join("hash.u64"))?;
+/// assert_eq!(hash.get(0)?, vec![u64::MAX]);
+/// # Ok(()) }
+/// ```
 pub struct ScalarReader<T> {
     storage: Arc<Storage>,
     count: usize,
@@ -1184,6 +1242,27 @@ impl<T: Element> VectorReader<T> for ScalarReader<T> {
 /// and [`as_slice`](VectorReader::as_slice) are `None`; [`get`](VectorReader::get)
 /// and [`read_into`](VectorReader::read_into) convert. It is never
 /// built for a native read, so the native path costs nothing.
+///
+/// ```
+/// use std::sync::Arc;
+/// use vectordata::io::{ConvertingReader, IoError, XvecReader};
+/// use vectordata::{ElementConversion, VectorReader};
+/// # use std::io::Write;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// # let mut f = std::fs::File::create(dir.path().join("counts.u16vecs"))?;
+/// # for v in [[1u16, 2], [3, 40000]] { f.write_all(&2i32.to_le_bytes())?; for x in v { f.write_all(&u16::to_le_bytes(x))?; } }
+/// # drop(f);
+/// let native: Arc<dyn VectorReader<u16>> = Arc::new(XvecReader::<u16>::open_path(&dir.path().join("counts.u16vecs"))?);
+/// let checked = ConvertingReader::<u16, i16>::new(native.clone())?;      // same width, other sign: per value
+/// assert_eq!(checked.conversion(), ElementConversion::CrossSign);
+/// assert_eq!(checked.get(0)?, vec![1i16, 2]);
+/// assert!(matches!(checked.get(1), Err(IoError::ValueOverflow { index: 1, .. })), "40000 is not an i16");
+/// let wide = ConvertingReader::<u16, f32>::new(native)?;                 // wider: never fails
+/// assert_eq!(wide.get(1)?, vec![3.0, 40000.0]);
+/// assert!(ConvertingReader::<u16, u16>::new(Arc::new(XvecReader::<u16>::open_path(&dir.path().join("counts.u16vecs"))?)).is_err(), "never built for a native pair");
+/// # Ok(()) }
+/// ```
 pub struct ConvertingReader<N: Element, T: Element> {
     inner: Arc<dyn VectorReader<N>>,
     mode: ElementConversion,
@@ -1320,6 +1399,27 @@ macro_rules! any_readers {
         /// return: the file read at its own type. Recover the typed
         /// reader with [`into_typed`](Self::into_typed), convert with
         /// [`as_type`](Self::as_type), or match on the variant.
+        ///
+        /// ```
+        /// use vectordata::io::{open_vec_native, AnyVectorReader, IoError};
+        /// use vectordata::typed_access::bf16;
+        /// use vectordata::{ElementType, VectorReader};
+        /// # use std::io::Write;
+        /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+        /// # let dir = tempfile::tempdir()?;
+        /// # let mut f = std::fs::File::create(dir.path().join("emb.bf16vecs"))?;
+        /// # for v in [[bf16::from_f32(1.5), bf16::from_f32(-0.125)]] { f.write_all(&2i32.to_le_bytes())?; for x in v { f.write_all(&x.to_le_bytes())?; } }
+        /// # drop(f);
+        /// # let path = dir.path().join("emb.bf16vecs");
+        /// let any = open_vec_native(path.to_str().unwrap())?;
+        /// assert_eq!(any.element_type(), ElementType::BF16);
+        /// assert!(matches!(any, AnyVectorReader::BF16(_)));
+        /// let as_f64 = any.as_type::<f64>()?;                                // widened: exact, converted on read
+        /// assert_eq!(as_f64.get(0)?, vec![1.5, -0.125]);
+        /// let any = open_vec_native(path.to_str().unwrap())?;
+        /// assert!(matches!(any.into_typed::<f32>(), Err(IoError::ElementMismatch { .. })), "into_typed takes the native type only");
+        /// # Ok(()) }
+        /// ```
         #[non_exhaustive]
         pub enum AnyVectorReader {
             $(
@@ -1442,6 +1542,24 @@ any_readers! {
 /// a caller that does not know the type ahead of time. A column opens
 /// as a [`ScalarReader`] (`dim() == 1`), anything else as an
 /// [`XvecReader`].
+///
+/// ```
+/// use vectordata::io::{open_vec_native, AnyVectorReader};
+/// use vectordata::ElementType;
+/// # use std::io::Write;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// # let mut f = std::fs::File::create(dir.path().join("scores.i16vecs"))?;
+/// # for v in [[-3i16, 7], [i16::MIN, i16::MAX]] { f.write_all(&2i32.to_le_bytes())?; for x in v { f.write_all(&i16::to_le_bytes(x))?; } }
+/// # drop(f);
+/// let any = open_vec_native(dir.path().join("scores.i16vecs").to_str().unwrap())?;
+/// assert_eq!((any.element_type(), any.count(), any.dim()), (ElementType::I16, 2, 2));
+/// match any {
+///     AnyVectorReader::I16(r) => assert_eq!(r.get(1)?, vec![i16::MIN, i16::MAX]),   // zero-copy, its own type
+///     other => panic!("an .i16vecs is i16, not {}", other.element_type()),
+/// }
+/// # Ok(()) }
+/// ```
 pub fn open_vec_native(source: &str) -> Result<AnyVectorReader, IoError> {
     let ext = ext_of(source);
     let (file, container) = ElementType::parse_extension(ext).ok_or_else(|| {
@@ -1457,6 +1575,47 @@ pub fn open_vec_native(source: &str) -> Result<AnyVectorReader, IoError> {
 /// the extension names, converted by [`ElementType::conversion_to`]
 /// where the table allows (an `.mvec` as f32, a `.bvecs` as i32),
 /// refused otherwise. [`open_vec`] is the native-only form.
+///
+/// One call, four outcomes, by the table:
+///
+/// ```
+/// use vectordata::io::{open_vec_as, IoError};
+/// use vectordata::{ElementConversion, ElementType, VectorReader};
+/// use vectordata::typed_access::f16;
+/// # use std::io::Write;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// # let mut f = std::fs::File::create(dir.path().join("half.mvecs"))?;
+/// # for v in [[f16::from_f32(0.5), f16::from_f32(-2.0)]] { f.write_all(&2i32.to_le_bytes())?; for x in v { f.write_all(&f16::to_le_bytes(x))?; } }
+/// # drop(f);
+/// # let mut f = std::fs::File::create(dir.path().join("ids.ivecs"))?;
+/// # for v in [[5i32], [-1]] { f.write_all(&1i32.to_le_bytes())?; for x in v { f.write_all(&i32::to_le_bytes(x))?; } }
+/// # drop(f);
+/// # let mut f = std::fs::File::create(dir.path().join("codes.bvecs"))?;
+/// # for v in [[100u8], [200]] { f.write_all(&1i32.to_le_bytes())?; for x in v { f.write_all(&u8::to_le_bytes(x))?; } }
+/// # drop(f);
+/// # let mut f = std::fs::File::create(dir.path().join("base.fvecs"))?;
+/// # for v in [[1.0f32]] { f.write_all(&1i32.to_le_bytes())?; for x in v { f.write_all(&f32::to_le_bytes(x))?; } }
+/// # drop(f);
+/// # let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+/// // Widening: an f16 file as f32 — exact, one conversion per element read.
+/// let wide = open_vec_as::<f32>(&p("half.mvecs"))?;
+/// assert_eq!((wide.conversion(), wide.native_element_type()), (ElementConversion::Widening, Some(ElementType::F16)));
+/// assert_eq!(wide.get(0)?, vec![0.5, -2.0]);
+/// assert!(wide.get_slice(0).is_none(), "nothing of f32 exists to borrow");
+///
+/// // Widening across integers: i32 ground truth as i64, -1 included.
+/// assert_eq!(open_vec_as::<i64>(&p("ids.ivecs"))?.get(1)?, vec![-1i64]);
+///
+/// // CrossSign: u8 codes as i8 — read what fits, refuse the value that does not, at its ordinal.
+/// let checked = open_vec_as::<i8>(&p("codes.bvecs"))?;
+/// assert_eq!(checked.get(0)?, vec![100i8]);
+/// assert!(matches!(checked.get(1), Err(IoError::ValueOverflow { index: 1, .. })));
+///
+/// // Refused: f32 as u8 is not lossless, and never a reinterpretation.
+/// assert!(matches!(open_vec_as::<u8>(&p("base.fvecs")), Err(IoError::ElementMismatch { file: ElementType::F32, requested: ElementType::U8, .. })));
+/// # Ok(()) }
+/// ```
 pub fn open_vec_as<T: Element>(source: &str) -> Result<Arc<dyn VectorReader<T>>, IoError> {
     open_vec_native(source)?.as_type::<T>()
 }
@@ -1466,10 +1625,23 @@ pub fn open_vec_as<T: Element>(source: &str) -> Result<Arc<dyn VectorReader<T>>,
 /// prefer [`Catalog`](crate::catalog::Catalog) or
 /// [`TestDataGroup`](crate::TestDataGroup) and the view's readers.
 ///
-/// ```no_run
-/// use vectordata::io::open_vec;
-/// let reader = open_vec::<f32>("base_vectors.fvec").unwrap();
-/// let v = reader.get(0).unwrap();
+/// The open is native-only: `T` must be the type the extension names.
+///
+/// ```
+/// use vectordata::io::{open_vec, IoError};
+/// use vectordata::ElementType;
+/// # use std::io::Write;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// # let mut f = std::fs::File::create(dir.path().join("ords.u32vecs"))?;
+/// # for v in [[1u32, 2, u32::MAX]] { f.write_all(&3i32.to_le_bytes())?; for x in v { f.write_all(&u32::to_le_bytes(x))?; } }
+/// # drop(f);
+/// # let path = dir.path().join("ords.u32vecs");
+/// let reader = open_vec::<u32>(path.to_str().unwrap())?;              // zero-copy
+/// assert_eq!(reader.get(0)?, vec![1, 2, u32::MAX]);
+/// // Same width, other sign: refused here; open_vec_as checks it per value.
+/// assert!(matches!(open_vec::<i32>(path.to_str().unwrap()), Err(IoError::ElementMismatch { file: ElementType::U32, requested: ElementType::I32, .. })));
+/// # Ok(()) }
 /// ```
 pub fn open_vec<T: Element>(source: &str) -> Result<Box<dyn VectorReader<T>>, IoError> {
     Ok(Box::new(XvecReader::<T>::open(source)?))
@@ -1479,6 +1651,20 @@ pub fn open_vec<T: Element>(source: &str) -> Result<Box<dyn VectorReader<T>>, Io
 ///
 /// A remote file with no published offset index is refused rather than
 /// downloaded whole; see [`IndexedVvecReader::open`].
+///
+/// ```
+/// use vectordata::io::open_vvec;
+/// # use std::io::Write;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = tempfile::tempdir()?;
+/// # let mut f = std::fs::File::create(dir.path().join("matches.i64vvecs"))?;
+/// # for v in [vec![7i64, -7], vec![i64::MAX]] { f.write_all(&(v.len() as i32).to_le_bytes())?; for x in v { f.write_all(&x.to_le_bytes())?; } }
+/// # drop(f);
+/// let r = open_vvec::<i64>(dir.path().join("matches.i64vvecs").to_str().unwrap())?;
+/// assert_eq!((r.count(), r.dim_at(0)?, r.dim_at(1)?), (2, 2, 1));
+/// assert_eq!(r.get(1)?, vec![i64::MAX]);
+/// # Ok(()) }
+/// ```
 pub fn open_vvec<T: Element>(source: &str) -> Result<Box<dyn VvecReader<T>>, IoError> {
     Ok(Box::new(IndexedVvecReader::<T>::open(source)?))
 }

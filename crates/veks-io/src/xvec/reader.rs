@@ -40,6 +40,35 @@ fn shape(path: &Path, dim: i32, file_size: u64, elem_size: usize) -> Result<(u32
 }
 
 /// Open an xvec file as a streaming [`VecSource`].
+///
+/// # Example
+///
+/// A round trip at `u64`: written through
+/// [`xvec::writer::open`](crate::xvec::writer::open), probed, then
+/// streamed back one copied record at a time.
+///
+/// ```
+/// use veks_io::{VecFormat, xvec};
+/// # let dir = tempfile::tempdir().unwrap();
+/// let path = dir.path().join("ids.u64vecs");
+///
+/// let mut writer = xvec::writer::open(&path, 2).unwrap();
+/// for row in [[1u64, 2], [u64::MAX, 0]] {
+///     let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+///     writer.write_record(0, &bytes);
+/// }
+/// writer.finish().unwrap();
+///
+/// let meta = xvec::reader::probe(&path, VecFormat::U64vec).unwrap();
+/// assert_eq!((meta.dimension, meta.element_size, meta.record_count), (2, 8, Some(2)));
+///
+/// let mut reader = xvec::reader::open(&path, VecFormat::U64vec).unwrap();
+/// let first = reader.next_record().unwrap();
+/// assert_eq!(u64::from_le_bytes(first[8..16].try_into().unwrap()), 2);
+/// let second = reader.next_record().unwrap();
+/// assert_eq!(u64::from_le_bytes(second[0..8].try_into().unwrap()), u64::MAX);
+/// assert!(reader.next_record().is_none());
+/// ```
 pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String> {
     let file = File::open(path)
         .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
@@ -73,6 +102,31 @@ pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String
 }
 
 /// Probe an xvec file for metadata without reading all data.
+///
+/// # Example
+///
+/// The element size is the format's (`u16` is 2 bytes); the count is
+/// the file size over the record size, and a file that is not a whole
+/// number of records is refused rather than truncated:
+///
+/// ```
+/// use veks_io::{VecFormat, xvec};
+/// # use std::io::Write;
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let path = dir.path().join("counts.u16vecs");
+/// # let mut f = std::fs::File::create(&path).unwrap();
+/// # for row in [[1u16, 2, 3], [4, 5, 6]] {
+/// #     f.write_all(&3i32.to_le_bytes()).unwrap();
+/// #     for v in row { f.write_all(&v.to_le_bytes()).unwrap(); }
+/// # }
+/// # drop(f);
+/// let meta = xvec::reader::probe(&path, VecFormat::U16vec).unwrap();
+/// assert_eq!((meta.dimension, meta.element_size, meta.record_count), (3, 2, Some(2)));
+///
+/// // the same bytes read as a 1-byte type are not a whole number of 7-byte records
+/// let err = xvec::reader::probe(&path, VecFormat::Bvec).unwrap_err();
+/// assert!(err.contains("not a whole number"), "{err}");
+/// ```
 pub fn probe(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
     let file = File::open(path)
         .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;

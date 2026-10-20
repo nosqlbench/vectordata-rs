@@ -132,6 +132,17 @@ impl VecFormat {
 
     /// The element type a vector or scalar format holds. `None` for the
     /// container formats, which describe their own.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use veks_io::{ElementType, VecFormat};
+    ///
+    /// assert_eq!(VecFormat::Dvec.element_type(), Some(ElementType::F64));      // f64 vectors
+    /// assert_eq!(VecFormat::ScalarF16.element_type(), Some(ElementType::F16)); // an f16 column
+    /// assert_eq!(VecFormat::Bvec.element_type(), Some(ElementType::U8));       // u8 vectors
+    /// assert_eq!(VecFormat::Npy.element_type(), None);
+    /// ```
     pub fn element_type(self) -> Option<ElementType> {
         Some(match self {
             Self::Npy | Self::Parquet | Self::Slab => return None,
@@ -169,6 +180,20 @@ impl VecFormat {
     /// [`Container::Vvec`], which this crate reads through
     /// [`open_varlen`](crate::open_varlen) under the vector format's
     /// name rather than as a format of its own.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use veks_io::{Container, ElementType, VecFormat};
+    ///
+    /// // i32 vectors are the historical ivec format; the bf16 ones have only the typed name
+    /// assert_eq!(VecFormat::of(Container::Vec, ElementType::I32), Some(VecFormat::Ivec));
+    /// assert_eq!(VecFormat::of(Container::Vec, ElementType::BF16), Some(VecFormat::Bf16vec));
+    /// // every type has a column format, the float ones included (f32, f64)
+    /// assert_eq!(VecFormat::of(Container::Scalar, ElementType::F64), Some(VecFormat::ScalarF64));
+    /// // variable-length layouts are not formats of their own
+    /// assert_eq!(VecFormat::of(Container::Vvec, ElementType::F32), None);
+    /// ```
     pub fn of(container: Container, element_type: ElementType) -> Option<Self> {
         Self::ALL
             .iter()
@@ -218,6 +243,18 @@ impl VecFormat {
     ///
     /// Reading accepts every spelling; see
     /// [`from_extension`](Self::from_extension).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use veks_io::VecFormat;
+    ///
+    /// assert_eq!(VecFormat::Ivec.preferred_extension(), "ivecs");        // i32: the historical letter
+    /// assert_eq!(VecFormat::Bf16vec.preferred_extension(), "bf16vecs");  // bf16: the typed plural
+    /// assert_eq!(VecFormat::ScalarF64.preferred_extension(), "f64");     // a column: the type name
+    /// // the legacy spelling normalizes to the same thing
+    /// assert_eq!(VecFormat::canonical_extension("i32vec"), Some("ivecs"));
+    /// ```
     pub fn preferred_extension(self) -> &'static str {
         match (self.container(), self.element_type()) {
             (Some(Container::Vec), Some(ty)) => {
@@ -240,6 +277,26 @@ impl VecFormat {
     ///
     /// Every spelling the element model reads is accepted; a
     /// variable-length spelling (`fvvecs`) names no format here.
+    ///
+    /// # Example
+    ///
+    /// The typed and legacy spellings of one type name the same format;
+    /// the float scalar columns are `.f16`, `.bf16`, `.f32`, `.f64`:
+    ///
+    /// ```
+    /// use veks_io::VecFormat;
+    ///
+    /// // i32 vectors: legacy letter, typed name, singular or plural
+    /// assert_eq!(VecFormat::from_extension("ivecs"), Some(VecFormat::Ivec));
+    /// assert_eq!(VecFormat::from_extension("i32vec"), Some(VecFormat::Ivec));
+    /// // bf16 vectors have only the typed spelling
+    /// assert_eq!(VecFormat::from_extension("bf16vecs"), Some(VecFormat::Bf16vec));
+    /// // float scalar columns
+    /// assert_eq!(VecFormat::from_extension("f16"), Some(VecFormat::ScalarF16));
+    /// assert_eq!(VecFormat::from_extension("f64"), Some(VecFormat::ScalarF64));
+    /// // variable-length spellings are read through `open_varlen`, not as a format
+    /// assert_eq!(VecFormat::from_extension("fvvecs"), None);
+    /// ```
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
             "slab" => Some(Self::Slab),

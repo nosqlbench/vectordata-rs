@@ -900,6 +900,29 @@ pub trait TestDataView: Send + Sync {
 
     /// Open an element facet at the type its file holds, for a caller
     /// that does not know the type ahead of time.
+    ///
+    /// ```
+    /// use vectordata::{ElementType, TestDataGroup, TestDataView, VectorReader};
+    /// use vectordata::io::AnyVectorReader;
+    /// # use std::io::Write;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let ds = dir.path().join("ds");
+    /// # std::fs::create_dir_all(&ds)?;
+    /// # let mut f = std::fs::File::create(ds.join("gt.i64vecs"))?;
+    /// # for v in [[0i64, 1 << 40]] { f.write_all(&2i32.to_le_bytes())?; for x in v { f.write_all(&x.to_le_bytes())?; } }
+    /// # drop(f);
+    /// # std::fs::write(ds.join("dataset.yaml"), "name: wide\nprofiles:\n  default:\n    neighbor_indices: gt.i64vecs\n")?;
+    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
+    /// assert_eq!(view.facet_element_type("neighbor_indices")?, ElementType::I64);   // from the extension, no open
+    /// let ids: Vec<i64> = match view.open_facet_native("neighbor_indices")? {
+    ///     AnyVectorReader::I32(r) => r.get(0)?.into_iter().map(i64::from).collect(),  // the common case
+    ///     AnyVectorReader::I64(r) => r.get(0)?,                                        // a corpus past 2^31 vectors
+    ///     other => other.as_type::<i64>()?.get(0)?,                                    // any other integer widens
+    /// };
+    /// assert_eq!(ids, vec![0, 1 << 40]);
+    /// # Ok(()) }
+    /// ```
     fn open_facet_native(&self, name: &str) -> Result<crate::io::AnyVectorReader> {
         let native = self.facet_element_type(name)?;
         self.open_facet_as_type(name, native)
@@ -1372,6 +1395,24 @@ pub trait TestDataViewExt: TestDataView {
     }
 
     /// The neighbor distances (ground truth) as `T`.
+    ///
+    /// ```
+    /// use vectordata::{ElementConversion, TestDataGroup, TestDataViewExt, VectorReader};
+    /// # use std::io::Write;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let ds = dir.path().join("ds");
+    /// # std::fs::create_dir_all(&ds)?;
+    /// # let mut f = std::fs::File::create(ds.join("dist.dvecs"))?;
+    /// # for v in [[0.0f64, 1e-300]] { f.write_all(&2i32.to_le_bytes())?; for x in v { f.write_all(&x.to_le_bytes())?; } }
+    /// # drop(f);
+    /// # std::fs::write(ds.join("dataset.yaml"), "name: d\nprofiles:\n  default:\n    neighbor_distances: dist.dvecs\n")?;
+    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
+    /// let d = view.neighbor_distances_as::<f64>()?;                     // the file's type: zero-copy
+    /// assert_eq!((d.conversion(), d.get(0)?), (ElementConversion::Native, vec![0.0, 1e-300]));
+    /// assert!(view.neighbor_distances_as::<f32>().is_err(), "f64 never narrows: read it as f64");
+    /// # Ok(()) }
+    /// ```
     fn neighbor_distances_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
         self.facet_as("neighbor_distances")
     }
@@ -1399,6 +1440,29 @@ pub trait TestDataViewExt: TestDataView {
     /// The predicate-result indices (the `R` facet) as `T`, which must
     /// be the type the file holds: a variable-length facet is never
     /// converted.
+    ///
+    /// ```
+    /// use vectordata::{Error, ElementType, TestDataGroup, TestDataViewExt};
+    /// use vectordata::io::IoError;
+    /// # use std::io::Write;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let ds = dir.path().join("ds");
+    /// # std::fs::create_dir_all(&ds)?;
+    /// # let mut f = std::fs::File::create(ds.join("matches.i16vvecs"))?;
+    /// # for v in [vec![3i16, 1, 2], vec![], vec![-1]] { f.write_all(&(v.len() as i32).to_le_bytes())?; for x in v { f.write_all(&x.to_le_bytes())?; } }
+    /// # drop(f);
+    /// # std::fs::write(ds.join("dataset.yaml"), "name: r\nprofiles:\n  default:\n    metadata_results: matches.i16vvecs\n")?;
+    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
+    /// let r = view.metadata_results_as::<i16>()?;                       // the file's type: zero-copy index, decoded records
+    /// assert_eq!((r.count(), r.dim_at(1)?), (3, 0));
+    /// assert_eq!(r.get(0)?, vec![3i16, 1, 2]);
+    /// match view.metadata_results_as::<i32>() {                         // wider, but a vvec is never converted
+    ///     Err(Error::VectorIo(IoError::ElementMismatch { file, requested, .. })) => assert_eq!((file, requested), (ElementType::I16, ElementType::I32)),
+    ///     other => panic!("{:?}", other.map(|r| r.count())),
+    /// }
+    /// # Ok(()) }
+    /// ```
     fn metadata_results_as<T: Element>(&self) -> Result<Arc<dyn VvecReader<T>>> {
         Ok(self.open_vvec_facet_native("metadata_results")?.into_typed::<T>()?)
     }
@@ -1406,6 +1470,33 @@ pub trait TestDataViewExt: TestDataView {
     /// A quantized base as one thing: the codes at their own type `C`,
     /// the three parameter columns, and the scheme, checked against
     /// each other. See [`QuantizedBase`].
+    ///
+    /// `C` is the type the `quantization` attribute's `codes` names —
+    /// here signed, symmetric codes:
+    ///
+    /// ```
+    /// use vectordata::{ElementType, TestDataGroup, TestDataViewExt, VectorReader};
+    /// use vectordata::dataset::QuantScheme;
+    /// # use std::io::Write;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let ds = dir.path().join("ds");
+    /// # std::fs::create_dir_all(&ds)?;
+    /// # let mut f = std::fs::File::create(ds.join("codes.i8vecs"))?;
+    /// # for v in [[-128i8, 0, 127], [1, -1, 64]] { f.write_all(&3i32.to_le_bytes())?; for x in v { f.write_all(&x.to_le_bytes())?; } }
+    /// # drop(f);
+    /// # std::fs::write(ds.join("quant_scale.f32"), [0.5f32, 0.25].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+    /// # std::fs::write(ds.join("quant_zero_point.i32"), [0i32, 0].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+    /// # std::fs::write(ds.join("quant_sum.i32"), [-1i32, 64].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+    /// # std::fs::write(ds.join("dataset.yaml"), "name: q\nattributes:\n  quantization:\n    scheme: symmetric\n    granularity: per-vector\n    codes: i8\n    range: [-127, 127]\nprofiles:\n  default:\n    base_vectors: codes.i8vecs\n    quant_scale: quant_scale.f32\n    quant_zero_point: quant_zero_point.i32\n    quant_sum: quant_sum.i32\n")?;
+    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
+    /// let q = view.quantized_base::<i8>()?;
+    /// assert_eq!(q.codes.get_slice(0), Some(&[-128i8, 0, 127][..]));    // the codes, zero-copy
+    /// assert_eq!(q.scale.as_slice(), Some(&[0.5f32, 0.25][..]));        // each column, one slice
+    /// assert_eq!((q.scheme.scheme, q.scheme.codes), (QuantScheme::Symmetric, ElementType::I8));
+    /// assert!(view.quantized_base::<u8>().is_err(), "the scheme names i8; no other type opens the codes");
+    /// # Ok(()) }
+    /// ```
     fn quantized_base<C: Element>(&self) -> Result<QuantizedBase<C>> {
         QuantizedBase::open(self)
     }

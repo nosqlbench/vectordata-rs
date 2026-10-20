@@ -83,6 +83,20 @@ impl ElementType {
     /// | `f16` or `bf16` → `f32` or `f64`; `f32` → `f64` | `Widening` |
     /// | `f16` ↔ `bf16` | `Refused` — neither direction is lossless |
     /// | float → narrower float, float → integer | `Refused` |
+    ///
+    /// ```
+    /// use veks_datatypes::{ElementConversion::*, ElementType::*};
+    /// assert_eq!(U8.conversion_to(U8), Native);        // the same type: zero-copy
+    /// assert_eq!(U8.conversion_to(I16), Widening);     // wider, signed: every u8 fits
+    /// assert_eq!(I16.conversion_to(U16), CrossSign);   // same width, other sign: each value checked
+    /// assert_eq!(I8.conversion_to(U64), CrossSign);    // wider but unsigned: a negative i8 does not fit
+    /// assert_eq!(I64.conversion_to(I32), Refused);     // narrower
+    /// assert_eq!(U16.conversion_to(F32), Widening);    // 16 bits fit f32's 24-bit significand
+    /// assert_eq!(U32.conversion_to(F32), Refused);     // 32 do not; u32 → f64 is Widening
+    /// assert_eq!(BF16.conversion_to(F64), Widening);
+    /// assert_eq!(F16.conversion_to(BF16), Refused);    // neither direction is lossless
+    /// assert_eq!(F32.conversion_to(I32), Refused);     // a float never becomes an integer
+    /// ```
     pub const fn conversion_to(self, target: ElementType) -> ElementConversion {
         use ElementConversion::*;
         if self as u8 == target as u8 {
@@ -149,6 +163,16 @@ impl std::error::Error for Overflow {}
 /// [`Native`](ElementConversion::Native) reads, and a
 /// [`Refused`](ElementConversion::Refused) pair never reaches it
 /// because no reader opens.
+///
+/// ```
+/// use veks_datatypes::{convert, bf16, f16, ElementType, Overflow, Value};
+/// assert_eq!(convert::<u16, f32>(65535), Ok(65535.0));                                  // widening: exact
+/// assert_eq!(convert::<i8, bf16>(-128), Ok(bf16::from_f32(-128.0)));
+/// assert_eq!(convert::<f16, f64>(f16::from_bits(1)), Ok(f16::from_bits(1).to_f64()));   // a subnormal, exactly
+/// assert_eq!(convert::<i16, u16>(300), Ok(300));                                        // cross-sign: in range
+/// assert_eq!(convert::<i16, u16>(-1), Err(Overflow { value: Value::Int(-1), target: ElementType::U16 }));
+/// assert_eq!(convert::<u64, i64>(u64::MAX).unwrap_err().to_string(), "value 18446744073709551615 does not fit in i64");
+/// ```
 #[inline]
 pub fn convert<N: Element, T: Element>(n: N) -> Result<T, Overflow> {
     let value = n.to_value();

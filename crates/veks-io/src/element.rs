@@ -74,6 +74,33 @@ impl std::error::Error for MmapError {}
 /// as f32 because both are floats. A caller that wants a conversion
 /// reads the file at its own type and converts, or uses a converting
 /// reader where one exists.
+///
+/// # Example
+///
+/// Through the public readers: a `.bvecs` file holds `u8`, and
+/// opening it as `f32` is refused with [`MmapError::ElementMismatch`]
+/// before the file is mapped, even though the conversion table would
+/// allow the widening in a converting reader.
+///
+/// ```
+/// use veks_io::{ElementType, MmapError, MmapReader};
+/// # use std::io::Write;
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let path = dir.path().join("codes.bvecs");
+/// # let mut f = std::fs::File::create(&path).unwrap();
+/// # f.write_all(&4i32.to_le_bytes()).unwrap();
+/// # f.write_all(&[1u8, 2, 3, 4]).unwrap();
+/// # drop(f);
+/// let codes = MmapReader::<u8>::open(&path).unwrap(); // native: zero-copy
+/// assert_eq!(codes.get_slice(0).unwrap(), &[1, 2, 3, 4]);
+///
+/// match MmapReader::<f32>::open(&path) {
+///     Err(MmapError::ElementMismatch { file, requested }) => {
+///         assert_eq!((file, requested), (ElementType::U8, ElementType::F32)); // refused
+///     }
+///     other => panic!("expected ElementMismatch, got {other:?}"),
+/// }
+/// ```
 pub(crate) fn require_native<T: Element>(path: &Path, container: Container) -> Result<ElementType, MmapError> {
     let ext = path
         .extension()

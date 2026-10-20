@@ -36,6 +36,69 @@ impl<T: Element> MmapReader<T> {
     /// The file must be a whole number of records, each a positive
     /// little-endian `i32` dimension followed by that many elements;
     /// the first record's dimension is taken as every record's.
+    ///
+    /// # Examples
+    ///
+    /// An integer file (`.u32vecs` holds `u32`), read zero-copy:
+    ///
+    /// ```
+    /// use veks_io::MmapReader;
+    /// # use std::io::Write;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let path = dir.path().join("ids.u32vecs");
+    /// # let mut f = std::fs::File::create(&path).unwrap();
+    /// # for row in [[1u32, 2], [u32::MAX, 0]] {
+    /// #     f.write_all(&2i32.to_le_bytes()).unwrap();
+    /// #     for v in row { f.write_all(&v.to_le_bytes()).unwrap(); }
+    /// # }
+    /// # drop(f);
+    /// let ids = MmapReader::<u32>::open(&path).unwrap();
+    /// assert_eq!((ids.dim(), ids.count()), (2, 2));
+    /// assert_eq!(ids.get_slice(1).unwrap(), &[u32::MAX, 0]); // zero-copy
+    /// ```
+    ///
+    /// A `bf16` file (`.bf16vecs`), the same way; the elements come
+    /// back as [`bf16`](crate::bf16) and widen to `f32` exactly:
+    ///
+    /// ```
+    /// use veks_io::{MmapReader, bf16};
+    /// # use std::io::Write;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let path = dir.path().join("base.bf16vecs");
+    /// # let mut f = std::fs::File::create(&path).unwrap();
+    /// # for row in [[1.5f32, -2.0], [0.0, 64.0]] {
+    /// #     f.write_all(&2i32.to_le_bytes()).unwrap();
+    /// #     for v in row { f.write_all(&bf16::from_f32(v).to_le_bytes()).unwrap(); }
+    /// # }
+    /// # drop(f);
+    /// let base = MmapReader::<bf16>::open(&path).unwrap();
+    /// let row: &[bf16] = base.get_slice(0).unwrap(); // zero-copy
+    /// let widened: Vec<f32> = row.iter().map(|v| v.to_f32()).collect();
+    /// assert_eq!(widened, [1.5, -2.0]);
+    /// ```
+    ///
+    /// An 8-byte element type (`f64` in `.dvecs`): a record's payload
+    /// sits 4 bytes after a multiple of the record size, and every
+    /// `f64` record size is 4 more than a multiple of 8, so even
+    /// records are not on an 8-byte boundary. [`get_slice`](Self::get_slice)
+    /// is `None` there and [`get`](Self::get) still reads (a decoded copy):
+    ///
+    /// ```
+    /// use veks_io::MmapReader;
+    /// # use std::io::Write;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let path = dir.path().join("precise.dvecs");
+    /// # let mut f = std::fs::File::create(&path).unwrap();
+    /// # for row in [[1.0f64, 2.0, 3.0], [4.0, 5.0, 6.0]] {
+    /// #     f.write_all(&3i32.to_le_bytes()).unwrap();
+    /// #     for v in row { f.write_all(&v.to_le_bytes()).unwrap(); }
+    /// # }
+    /// # drop(f);
+    /// let precise = MmapReader::<f64>::open(&path).unwrap();
+    /// assert!(precise.get_slice(0).is_none());           // unaligned: refused, not reinterpreted
+    /// assert_eq!(precise.get(0).unwrap(), [1.0, 2.0, 3.0]); // decoded copy
+    /// assert_eq!(precise.get_slice(1).unwrap(), &[4.0, 5.0, 6.0]); // the odd record is aligned
+    /// ```
     pub fn open(path: &Path) -> Result<Self, MmapError> {
         require_native::<T>(path, Container::Vec)?;
         Self::open_impl(path)
@@ -135,6 +198,31 @@ impl<T: Element> MmapReader<T> {
     /// Read whole records from `start` into `out`, which must hold a
     /// whole number of `dim`-element records. Returns how many records
     /// were read: as many as fit, or as many as remain.
+    ///
+    /// # Example
+    ///
+    /// Three `i16` records in an `.svecs` file; a buffer for two reads
+    /// records 1 and 2 as one decoded copy, and from the last record
+    /// only what remains:
+    ///
+    /// ```
+    /// use veks_io::MmapReader;
+    /// # use std::io::Write;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let path = dir.path().join("short.svecs");
+    /// # let mut f = std::fs::File::create(&path).unwrap();
+    /// # for row in [[1i16, -1], [200, -200], [i16::MAX, i16::MIN]] {
+    /// #     f.write_all(&2i32.to_le_bytes()).unwrap();
+    /// #     for v in row { f.write_all(&v.to_le_bytes()).unwrap(); }
+    /// # }
+    /// # drop(f);
+    /// let short = MmapReader::<i16>::open(&path).unwrap();
+    /// let mut out = vec![0i16; short.dim() * 2];
+    /// assert_eq!(short.read_into(1, &mut out).unwrap(), 2);
+    /// assert_eq!(out, [200, -200, i16::MAX, i16::MIN]);
+    /// assert_eq!(short.read_into(2, &mut out).unwrap(), 1); // only one record remains
+    /// assert_eq!(&out[..2], &[i16::MAX, i16::MIN]);
+    /// ```
     pub fn read_into(&self, start: usize, out: &mut [T]) -> Result<usize, MmapError> {
         if !out.len().is_multiple_of(self.dim) {
             return Err(MmapError::InvalidFormat(format!(

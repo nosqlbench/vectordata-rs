@@ -1,8 +1,8 @@
 # SRD — Element types and typed facet access
 
 **Status:** implemented 2026-10-20 (records in §16; steps 1–9 of §13).
-Step 10 (the type matrix in tests, from the review in §14.6) is
-implemented too (§16.10). Decisions in §15 were taken on 2026-10-19. The
+Steps 10–11 (the type matrix in tests and in rustdoc, from the review
+in §14.6) are implemented too (§16.10, §16.11). Decisions in §15 were taken on 2026-10-19. The
 release that carries it, and the version it takes, are the
 maintainer's.
 **Scope:** the element model shared by every crate in the workspace (a
@@ -897,6 +897,29 @@ fixed in the same step.
 
 **Done when** every cell of the two §14.6 matrices that a scenario
 applies to is `●`, and the §14.1 rule is in force.
+
+### 13.11 Step 11 — rustdoc examples per type
+
+**Files.** Item docs, each with a runnable example (`tempfile`
+fixtures, hidden setup lines; `no_run` only where a network is
+implied): veks-datatypes `ElementType::{parse_extension, extension,
+aliases, conversion_to}`, `Element` (an integer, `f16`, `bf16` round
+trip through bytes), `convert` (a widening and an overflow), `Value`;
+vectordata `io::{open_vec, open_vec_native, open_vec_as, XvecReader,
+ScalarReader, ConvertingReader, AnyVectorReader, AnyVvecReader,
+IndexedVvecReader}` and `TestDataViewExt::{facet_as, quantized_base,
+metadata_results_as}` — between them every conversion class
+(native, widening, cross-sign with the overflow, refused) and every
+type kind (an unsigned, a signed, f16, bf16, f32, f64, a 64-bit
+integer), with the cost of each path stated; veks-io `MmapReader`,
+`ScalarMmapReader`, `VecFormat::of`, `convert_scalars`, and the crate
+root's examples made runnable. A guard in `tests/discoverability.rs`
+(vectordata) and a sibling in veks-io and veks-datatypes: every item
+on a named list has a fenced example without `ignore`, and the set of
+element types named across the crate's examples is `ALL`.
+
+**Done when** `cargo test --doc` runs every example and the guards
+pass.
 
 ## 14. Testing plan and coverage
 
@@ -2222,3 +2245,56 @@ scan f32 and f16 only and refuse the rest by name;
 `ElementTypeKnn::normalization_threshold` does not depend on the
 dimension — each pinned by a test, none extended.
 
+### 16.11 Step 11: rustdoc examples per type (2026-10-20)
+
+**Written.** Runnable examples (fixtures written in hidden lines under
+`tempfile::tempdir()`; no `no_run`, no `ignore`), each naming its cost:
+
+- veks-datatypes: `ElementType::parse_extension` (u16, legacy `DVECS`,
+  singular `ivvec`, the `bf16` column), `aliases` with `extension` and
+  `legacy_extension` (i16, i8, f16 vvec, a u64 column),
+  `conversion_to` (one line per class, u32 → f32 refused beside u32 →
+  f64), `convert` (u16 → f32, i8 → bf16, an f16 subnormal → f64, i16 ↔
+  u16 in and out of range, the u64 → i64 message), `Element` (i16 bytes,
+  bf16 as the top half of its f32, f16 not, the value path) and `Value`.
+- vectordata: `open_vec_native` (an i16 file, matched by variant),
+  `open_vec_as` (f16 widened, i32 → i64 with −1, u8 → i8 cross-sign with
+  the overflow at its ordinal, f32 → u8 refused), `open_vec` (u32
+  native, the same-width signed open refused), `open_vvec` (i64),
+  `XvecReader` (f64: the decoded copy always, the zero-copy slice on the
+  aligned record only), `ScalarReader` (an f32 column whole, a u64
+  column), `ConvertingReader` (u16 → i16 per value, u16 → f32, never
+  native), `IndexedVvecReader` (u8 records with an empty one),
+  `AnyVectorReader` (bf16 → f64, `into_typed` native only), and on the
+  view `metadata_results_as` (i16; wider refused), `quantized_base`
+  (signed symmetric i8 codes), `open_facet_native` (i64 indices),
+  `neighbor_distances_as` (f64 native, f32 refused) — beside the six
+  step 4 wrote.
+- veks-io: the crate root's three examples made runnable, and examples
+  on `open` (i8), `create` (f32), `probe` (f64), `open_varlen` (u16),
+  `create_varlen` (i64), `MmapReader::open` (u32, bf16, f64 alignment),
+  `read_into` (i16), `ScalarMmapReader::open` (u64; an f16 column
+  refused as f32) and `as_slice` (i32), `VecFormat::{element_type, of,
+  preferred_extension, from_extension}`, `convert_scalars` (widening,
+  refused, overflow at its ordinal), the streaming reader's `open` and
+  `probe` and the writer's `open`, and `require_native` (u8 → f32
+  refused).
+
+**Guards.** `tests/doc_examples.rs` in each of the three crates: every
+item on a fixed list carries a fenced example that `cargo test --doc`
+runs (vectordata 18 items, veks-datatypes 7, veks-io 18), and the
+element types named across the runnable examples of the element
+modules are exactly `ElementType::ALL` (a type counts bare or as an
+extension stem, `bf16` in `.bf16vecs`); veks-io's also refuses any
+`ignore` or `no_run` example in the crate. Each was shown to fail on a
+held-back example: with `open_vvec`'s example marked `no_run`,
+vectordata's reported `items without a runnable example`; with
+`Value`'s marked `ignore`, veks-datatypes' reported `src/element.rs:
+pub enum Value {`; on veks-io's original sources, 4 of its 7 failed
+(the root's three `rust,no_run` blocks, the listed items without
+examples, and "element types no runnable example names: [all
+twelve]").
+
+**Tests.** `cargo test --doc`: vectordata 43 (7 `ignore`d, all in the
+catalog and transport modules, none an element example), veks-datatypes
+8, veks-io 26; `cargo doc` for the three with warnings denied.

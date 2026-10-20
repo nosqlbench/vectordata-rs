@@ -244,6 +244,16 @@ impl ElementType {
     /// Every spelling read for this type in the given layout other
     /// than the canonical one: the singular form, and the historical
     /// letter in both forms. No leading dot.
+    ///
+    /// ```
+    /// use veks_datatypes::{Container, ElementType};
+    /// assert_eq!(ElementType::I16.extension(Container::Vec), "i16vecs");                 // what a new writer emits
+    /// assert_eq!(ElementType::I16.legacy_extension(Container::Vec), Some("svecs"));      // what the pipeline keeps emitting
+    /// assert_eq!(ElementType::I16.aliases(Container::Vec), ["i16vec", "svecs", "svec"]);
+    /// assert_eq!(ElementType::I8.legacy_extension(Container::Vec), None);                // i8 never had a letter
+    /// assert_eq!(ElementType::F16.aliases(Container::Vvec), ["f16vvec", "mvvecs", "mvvec"]);
+    /// assert!(ElementType::U64.aliases(Container::Scalar).is_empty(), "a column has one spelling");
+    /// ```
     pub fn aliases(self, container: Container) -> &'static [&'static str] {
         row(self, container).aliases
     }
@@ -251,6 +261,15 @@ impl ElementType {
     /// The type and layout a file extension names, case-insensitively,
     /// with or without a leading dot. Canonical spellings and every
     /// alias are read.
+    ///
+    /// ```
+    /// use veks_datatypes::{Container, ElementType};
+    /// assert_eq!(ElementType::parse_extension("u16vecs"), Some((ElementType::U16, Container::Vec)));
+    /// assert_eq!(ElementType::parse_extension(".DVECS"), Some((ElementType::F64, Container::Vec)));   // legacy, any case
+    /// assert_eq!(ElementType::parse_extension("ivvec"), Some((ElementType::I32, Container::Vvec)));   // singular, variable-length
+    /// assert_eq!(ElementType::parse_extension("bf16"), Some((ElementType::BF16, Container::Scalar))); // a column
+    /// assert_eq!(ElementType::parse_extension("csv"), None);
+    /// ```
     pub fn parse_extension(ext: &str) -> Option<(ElementType, Container)> {
         let ext = ext.strip_prefix('.').unwrap_or(ext);
         TABLE

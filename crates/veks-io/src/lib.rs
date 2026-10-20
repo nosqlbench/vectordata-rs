@@ -19,46 +19,78 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,no_run
+//! The streaming API moves raw little-endian bytes; the element type
+//! is whatever the extension names, here `f32` for `.fvecs`.
+//!
+//! ```
 //! use veks_io::{open, create, probe};
+//! # let dir = tempfile::tempdir().unwrap();
+//! let path = dir.path().join("dataset.fvecs");
 //!
-//! // Probe a file for metadata
-//! let meta = probe("dataset.fvec").unwrap();
-//! println!("dim={}, records={:?}", meta.dimension, meta.record_count);
-//!
-//! // Stream-read all records
-//! let mut reader = open("dataset.fvec").unwrap();
-//! while let Some(record) = reader.next_record() {
-//!     // record is Vec<u8> — raw element bytes
+//! // Write records: each is dim × 4 bytes of f32, no header
+//! let mut writer = create(&path, 3).unwrap();
+//! for row in [[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]] {
+//!     let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+//!     writer.write_record(0, &bytes);
 //! }
-//!
-//! // Write records
-//! let mut writer = create("output.fvec", 128).unwrap();
-//! writer.write_record(0, &vec![0u8; 128 * 4]);
 //! writer.finish().unwrap();
+//!
+//! // Probe a file for metadata (reads one header, not the data)
+//! let meta = probe(&path).unwrap();
+//! assert_eq!((meta.dimension, meta.element_size, meta.record_count), (3, 4, Some(2)));
+//!
+//! // Stream-read all records: each is a fresh Vec<u8> of element bytes
+//! let mut reader = open(&path).unwrap();
+//! let mut sum = 0.0f32;
+//! while let Some(record) = reader.next_record() {
+//!     for chunk in record.chunks_exact(4) {
+//!         sum += f32::from_le_bytes(chunk.try_into().unwrap());
+//!     }
+//! }
+//! assert_eq!(sum, 21.0);
 //! ```
 //!
 //! ## Zero-Copy Mmap Access
 //!
 //! For random access on xvec files, use the typed mmap reader at the
-//! file's own type:
+//! file's own type. `get_slice` borrows from the mapping (zero-copy);
+//! `read_into` decodes into a caller's buffer (one copy).
 //!
-//! ```rust,no_run
+//! ```
 //! use veks_io::MmapReader;
+//! # use std::io::Write;
+//! # let dir = tempfile::tempdir().unwrap();
+//! # let path = dir.path().join("base.fvecs");
+//! # let mut f = std::fs::File::create(&path).unwrap();
+//! # for row in [[0.5f32, 1.5], [2.5, 3.5], [4.5, 5.5]] {
+//! #     f.write_all(&2i32.to_le_bytes()).unwrap();
+//! #     for v in row { f.write_all(&v.to_le_bytes()).unwrap(); }
+//! # }
+//! # drop(f);
 //!
-//! let reader = MmapReader::<f32>::open("base.fvecs".as_ref()).unwrap();
-//! let vec = reader.get_slice(42).unwrap(); // &[f32], zero-copy
-//! let mut rows = vec![0f32; reader.dim() * 1000];
-//! let read = reader.read_into(0, &mut rows).unwrap(); // the first 1000 records
+//! let reader = MmapReader::<f32>::open(&path).unwrap();
+//! let vec: &[f32] = reader.get_slice(1).unwrap(); // zero-copy
+//! assert_eq!(vec, &[2.5, 3.5]);
+//!
+//! let mut rows = vec![0f32; reader.dim() * 2];
+//! let read = reader.read_into(1, &mut rows).unwrap(); // decoded copy of records 1 and 2
+//! assert_eq!(read, 2);
+//! assert_eq!(rows, [2.5, 3.5, 4.5, 5.5]);
 //! ```
 //!
-//! A header-free column is one slice:
+//! A header-free column is one slice, at the type its extension names
+//! (`.f32` here; `.u8`, `.i64`, `.bf16` and the rest work the same way):
 //!
-//! ```rust,no_run
+//! ```
 //! use veks_io::scalar::mmap::ScalarMmapReader;
+//! # let dir = tempfile::tempdir().unwrap();
+//! # let path = dir.path().join("quant_scale.f32");
+//! # let bytes: Vec<u8> = [0.25f32, 0.5, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+//! # std::fs::write(&path, bytes).unwrap();
 //!
-//! let scale = ScalarMmapReader::<f32>::open("quant_scale.f32".as_ref()).unwrap();
-//! let all: &[f32] = scale.as_slice().unwrap();
+//! let scale = ScalarMmapReader::<f32>::open(&path).unwrap();
+//! let all: &[f32] = scale.as_slice().unwrap(); // zero-copy, the whole column
+//! assert_eq!(all, &[0.25, 0.5, 1.0]);
 //! ```
 //!
 //! ## Feature Flags
@@ -90,11 +122,26 @@ use std::path::Path;
 ///
 /// # Example
 ///
-/// ```rust,no_run
-/// let mut reader = veks_io::open("data.fvec").unwrap();
+/// An `.i8vecs` file streams as records of `i8` bytes; the reader
+/// copies each record out of its buffer, and the caller decodes.
+///
+/// ```
+/// # use std::io::Write;
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let path = dir.path().join("codes.i8vecs");
+/// # let mut f = std::fs::File::create(&path).unwrap();
+/// # for row in [[-1i8, 2, -3], [4, -5, 6]] {
+/// #     f.write_all(&3i32.to_le_bytes()).unwrap();
+/// #     for v in row { f.write_all(&v.to_le_bytes()).unwrap(); }
+/// # }
+/// # drop(f);
+/// let mut reader = veks_io::open(&path).unwrap();
+/// assert_eq!((reader.dimension(), reader.element_size()), (3, 1));
+/// let mut rows: Vec<Vec<i8>> = Vec::new();
 /// while let Some(record) = reader.next_record() {
-///     // process record bytes
+///     rows.push(record.iter().map(|&b| i8::from_le_bytes([b])).collect());
 /// }
+/// assert_eq!(rows, [[-1, 2, -3], [4, -5, 6]]);
 /// ```
 pub fn open(path: impl AsRef<Path>) -> Result<Box<dyn VecSource>, String> {
     let path = path.as_ref();
@@ -129,10 +176,20 @@ pub fn open_format(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>,
 ///
 /// # Example
 ///
-/// ```rust,no_run
-/// let mut writer = veks_io::create("output.fvec", 128).unwrap();
-/// writer.write_record(0, &vec![0u8; 128 * 4]); // 128 f32s
+/// The extension picks the element width the writer expects per
+/// record: `.fvecs` is `f32`, so a record of dimension 128 is
+/// `128 * 4` bytes.
+///
+/// ```
+/// # let dir = tempfile::tempdir().unwrap();
+/// let path = dir.path().join("output.fvecs");
+/// let mut writer = veks_io::create(&path, 128).unwrap();
+/// writer.write_record(0, &vec![0u8; 128 * 4]); // 128 f32s, all zero
 /// writer.finish().unwrap();
+///
+/// let meta = veks_io::probe(&path).unwrap();
+/// assert_eq!((meta.dimension, meta.record_count), (128, Some(1)));
+/// assert_eq!(std::fs::metadata(&path).unwrap().len(), 4 + 128 * 4);
 /// ```
 pub fn create(path: impl AsRef<Path>, dimension: u32) -> Result<Box<dyn VecSink>, String> {
     let path = path.as_ref();
@@ -158,6 +215,27 @@ pub fn create_format(path: &Path, format: VecFormat, dimension: u32) -> Result<B
 /// Probe a vector file for metadata without reading all data.
 ///
 /// Returns dimension, element size, and record count.
+///
+/// # Example
+///
+/// One header read and a size check; the element size comes from the
+/// extension, here 8 bytes for the `f64` of a `.dvecs` file.
+///
+/// ```
+/// # use std::io::Write;
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let path = dir.path().join("precise.dvecs");
+/// # let mut f = std::fs::File::create(&path).unwrap();
+/// # for row in [[1.0f64, 2.0], [3.0, 4.0], [5.0, 6.0]] {
+/// #     f.write_all(&2i32.to_le_bytes()).unwrap();
+/// #     for v in row { f.write_all(&v.to_le_bytes()).unwrap(); }
+/// # }
+/// # drop(f);
+/// let meta = veks_io::probe(&path).unwrap();
+/// assert_eq!(meta.dimension, 2);
+/// assert_eq!(meta.element_size, 8); // f64
+/// assert_eq!(meta.record_count, Some(3));
+/// ```
 pub fn probe(path: impl AsRef<Path>) -> Result<SourceMeta, String> {
     let path = path.as_ref();
     let format = VecFormat::detect(path)
@@ -172,11 +250,27 @@ pub fn probe(path: impl AsRef<Path>) -> Result<SourceMeta, String> {
 ///
 /// # Example
 ///
-/// ```rust,no_run
-/// let mut reader = veks_io::open_varlen("data.fvec").unwrap();
+/// A `.u16vecs` file whose records have dimensions 2 and 3; each
+/// record comes back with its own dimension and `u16` bytes.
+///
+/// ```
+/// # use std::io::Write;
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let path = dir.path().join("ragged.u16vecs");
+/// # let mut f = std::fs::File::create(&path).unwrap();
+/// # for row in [vec![10u16, 20], vec![30, 40, 50]] {
+/// #     f.write_all(&(row.len() as i32).to_le_bytes()).unwrap();
+/// #     for v in row { f.write_all(&v.to_le_bytes()).unwrap(); }
+/// # }
+/// # drop(f);
+/// let mut reader = veks_io::open_varlen(&path).unwrap();
+/// assert_eq!(reader.element_size(), 2); // u16
+/// let mut dims = Vec::new();
 /// while let Some(record) = reader.next_record() {
-///     println!("dim={}, bytes={}", record.dimension, record.data.len());
+///     assert_eq!(record.data.len(), record.dimension as usize * 2);
+///     dims.push(record.dimension);
 /// }
+/// assert_eq!(dims, [2, 3]);
 /// ```
 pub fn open_varlen(path: impl AsRef<Path>) -> Result<Box<dyn VarlenSource>, String> {
     let path = path.as_ref();
@@ -195,11 +289,24 @@ pub fn open_varlen(path: impl AsRef<Path>) -> Result<Box<dyn VarlenSource>, Stri
 ///
 /// # Example
 ///
-/// ```rust,no_run
-/// let mut writer = veks_io::create_varlen("output.fvec").unwrap();
-/// writer.write_record(128, &vec![0u8; 128 * 4]);  // dim=128
-/// writer.write_record(256, &vec![0u8; 256 * 4]);  // dim=256
+/// Two `i64` records of different dimension into an `.i64vecs` file,
+/// read back through [`open_varlen`].
+///
+/// ```
+/// # let dir = tempfile::tempdir().unwrap();
+/// let path = dir.path().join("ragged.i64vecs");
+/// let mut writer = veks_io::create_varlen(&path).unwrap();
+/// let short: Vec<u8> = [7i64, -8].iter().flat_map(|v| v.to_le_bytes()).collect();
+/// let long: Vec<u8> = [i64::MIN, 0, i64::MAX].iter().flat_map(|v| v.to_le_bytes()).collect();
+/// writer.write_record(2, &short); // dim=2
+/// writer.write_record(3, &long);  // dim=3
 /// writer.finish().unwrap();
+///
+/// let mut reader = veks_io::open_varlen(&path).unwrap();
+/// let first = reader.next_record().unwrap();
+/// assert_eq!(first.dimension, 2);
+/// assert_eq!(i64::from_le_bytes(first.data[8..16].try_into().unwrap()), -8);
+/// assert_eq!(reader.next_record().unwrap().dimension, 3);
 /// ```
 pub fn create_varlen(path: impl AsRef<Path>) -> Result<Box<dyn VarlenSink>, String> {
     let path = path.as_ref();
