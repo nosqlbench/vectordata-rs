@@ -231,7 +231,7 @@ fn resolve_input(
 /// Launch the unified explore TUI over the configured catalogs: the
 /// `vectordata explore` command. See [`run_with_sources`].
 pub fn run(args: ExploreArgs) -> i32 {
-    let run = crate::datasets::build_sources(&crate::catalog::sources::config_dir(), &[], &[]);
+    let run = crate::datasets::build_sources(&crate::catalog::CatalogSources::new(), &crate::catalog::sources::config_dir(), &[], &[]);
     run_with_sources(args, run.sources().clone())
 }
 

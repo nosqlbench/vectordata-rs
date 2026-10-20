@@ -152,6 +152,7 @@ pub fn run(
     dataset: &str,
     profile: Option<&str>,
     output: &Path,
+    program: &crate::catalog::CatalogSources,
     configdir: &str,
     extra_catalogs: &[String],
     at: &[String],
@@ -191,7 +192,7 @@ pub fn run(
 
     // Otherwise: catalog / URL → runtime access layer.
     derive_via_access_layer(
-        dataset, selector.as_deref(), output, configdir, extra_catalogs, at, name_override, sharding)
+        dataset, selector.as_deref(), output, program, configdir, extra_catalogs, at, name_override, sharding)
 }
 
 /// If `dataset` points at a local directory containing a
@@ -279,6 +280,7 @@ fn derive_via_access_layer(
     dataset: &str,
     selector: Option<&str>,
     output: &Path,
+    program: &crate::catalog::CatalogSources,
     configdir: &str,
     extra_catalogs: &[String],
     at: &[String],
@@ -286,7 +288,7 @@ fn derive_via_access_layer(
     sharding: Sharding,
 ) -> i32 {
     let (resolution, derived_default_name) =
-        match resolve_spec(dataset, configdir, extra_catalogs, at) {
+        match resolve_spec(dataset, program, configdir, extra_catalogs, at) {
             Some(t) => t,
             None => return 1,
         };
@@ -1858,6 +1860,7 @@ fn derived_description(
 /// passed.
 fn resolve_spec(
     head: &str,
+    program: &crate::catalog::CatalogSources,
     configdir: &str,
     extra_catalogs: &[String],
     at: &[String],
@@ -1873,7 +1876,7 @@ fn resolve_spec(
             .unwrap_or("derived").to_string();
         return Some((Resolved::Local(head.to_string()), name));
     }
-    let sources = build_sources(configdir, extra_catalogs, at);
+    let sources = build_sources(program, configdir, extra_catalogs, at);
     if sources.is_empty() {
         eprintln!("'{head}' is not a local path, not a URL, and no catalog is configured.");
         eprintln!("Add a catalog with: vectordata config catalog add <URL-or-path>");

@@ -97,6 +97,7 @@ pub fn run(cache_dir: Option<&Path>, verbose: bool) {
 /// Show cache status for all cached datasets.
 pub fn run_cache_status_all(
     verbose: bool,
+    program: &crate::catalog::CatalogSources,
     configdir: &str,
     extra_catalogs: &[String],
     at: &[String],
@@ -134,7 +135,7 @@ pub fn run_cache_status_all(
             if has_origin || has_mrkl {
                 if found { println!(); }
                 found = true;
-                run_cache_status(&name, verbose, configdir, extra_catalogs, at);
+                run_cache_status(&name, verbose, program, configdir, extra_catalogs, at);
             }
         }
     }
@@ -159,6 +160,7 @@ fn has_mrkl_files(dir: &std::path::Path) -> bool {
 pub fn run_cache_status(
     dataset_name: &str,
     verbose: bool,
+    program: &crate::catalog::CatalogSources,
     configdir: &str,
     extra_catalogs: &[String],
     at: &[String],
@@ -169,7 +171,7 @@ pub fn run_cache_status(
     let ds_cache = cache_dir.join(dataset_name);
 
     // Load catalog to get profile info
-    let catalog = super::build_sources(configdir, extra_catalogs, at)
+    let catalog = super::build_sources(program, configdir, extra_catalogs, at)
         .open()
         .unwrap_or_else(|code| std::process::exit(code));
     let entry = catalog.find_exact(dataset_name);

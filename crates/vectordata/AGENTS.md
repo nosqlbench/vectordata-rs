@@ -123,8 +123,14 @@ documentation's **Common tasks** table is the same index with examples.
   `CatalogSources` you assembled. It lists and opens exactly those, and
   an edit on its catalogs screen re-reads only the configured part
   ([`reload_configured`](crate::catalog::CatalogSources::reload_configured)).
+- Embed the `vectordata` command line with a program's catalogs:
+  [`shell::bin_main_with_catalogs`](crate::shell::bin_main_with_catalogs)
+  — they follow the configured catalogs in every command, and `--at`
+  replaces them for a run.
 - Build the catalogs a `datasets` command runs against:
-  [`datasets::build_sources`](crate::datasets::build_sources), then
+  [`datasets::build_sources`](crate::datasets::build_sources) (the
+  program's catalogs, then the `--configdir` / `--catalog` / `--at`
+  trio), then
   [`RunSources::open`](crate::datasets::RunSources::open), which reports
   every problem and fails only for a catalog named for the run. Do not
   assemble `CatalogSources` per command.

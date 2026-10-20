@@ -134,7 +134,7 @@ fn resolve_catalog(context: &[&str]) -> Catalog {
             .filter_map(|v| resolve_catalog_value_opt(v, &configured))
             .collect()
     };
-    let run = super::build_sources(&sources::config_dir(), &typed("--catalog"), &typed("--at"));
+    let run = super::build_sources(&crate::catalog::CatalogSources::new(), &sources::config_dir(), &typed("--catalog"), &typed("--at"));
     Catalog::of(run.sources())
 }
 

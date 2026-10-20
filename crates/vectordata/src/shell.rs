@@ -627,6 +627,28 @@ pub fn bin_main(argv: Vec<String>) {
 /// answering to the embedding executable's own variable, which is that
 /// executable's to set up.
 pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
+    bin_main_with_catalogs(invoked, argv, crate::catalog::CatalogSources::new())
+}
+
+/// [`bin_main_as`] for a program with catalogs of its own: every
+/// command that reads catalogs (`datasets list`, `describe`, `ping`,
+/// `precache`, `derive`, and `explore`) sees `program`'s catalogs after
+/// the configured ones and before any `--catalog` location, so a
+/// dataset the program registered (with
+/// [`CatalogBuilder`](crate::catalog::CatalogBuilder), say) is listed
+/// and opens by name. `--at` replaces all of them for the run, as it
+/// replaces the configured ones; numbered shortcuts (`--at 2`) still
+/// count the configured catalogs. The assembly is
+/// [`datasets::build_sources`](crate::datasets::build_sources).
+///
+/// ```no_run
+/// use vectordata::catalog::{CatalogBuilder, CatalogSources};
+/// # let entry: vectordata::dataset::CatalogEntry = unimplemented!();
+/// let mine = CatalogSources::new().with(CatalogBuilder::named("bench").entry(entry).build());
+/// let argv: Vec<String> = std::env::args().skip(2).collect();
+/// vectordata::shell::bin_main_with_catalogs("fvec bench vectordata", argv, mine);
+/// ```
+pub fn bin_main_with_catalogs(invoked: &str, argv: Vec<String>, program: crate::catalog::CatalogSources) {
     // Detached update-probe child (see update_check module docs):
     // marked by an internal env var, does one fetch + state write,
     // and exits before any CLI machinery runs.
@@ -709,17 +731,17 @@ pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
                 std::process::exit(0);
             };
             let code = match command {
-                DatasetsCmd::List(args) => crate::datasets::list::run_args(args),
+                DatasetsCmd::List(args) => crate::datasets::list::run_args(args, &program),
                 DatasetsCmd::Ping {
                     args,
                     configdir,
                     catalog,
-                } => crate::datasets::ping::run_args(args, &configdir, &catalog),
+                } => crate::datasets::ping::run_args(args, &program, &configdir, &catalog),
                 DatasetsCmd::Describe {
                     args,
                     configdir,
                     catalog,
-                } => crate::datasets::describe::run_args(args, &configdir, &catalog),
+                } => crate::datasets::describe::run_args(args, &program, &configdir, &catalog),
                 DatasetsCmd::Curlify(args) => crate::datasets::curlify::run_args(args),
                 DatasetsCmd::Push(args) => crate::push::run(args),
                 DatasetsCmd::Derive {
@@ -737,6 +759,7 @@ pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
                     &dataset,
                     profile.as_deref(),
                     &output,
+                    &program,
                     &configdir,
                     &catalog,
                     &at,
@@ -776,6 +799,7 @@ pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
                     plan_only: plan,
                     allow_whole_facet,
                     catalog: None,
+                    program_catalogs: program.clone(),
                 }),
             };
             if code != 0 {
@@ -939,7 +963,10 @@ pub fn bin_main_as(invoked: &str, argv: Vec<String>) {
         }
         #[cfg(feature = "explore")]
         Cmd::Explore(args) => {
-            let code = crate::explore::run(args);
+            // The program's catalogs follow the configured ones, as in
+            // every other command.
+            let run = crate::datasets::build_sources(&program, &crate::catalog::sources::config_dir(), &[], &[]);
+            let code = crate::explore::run_with_sources(args, run.sources().clone());
             if code != 0 {
                 std::process::exit(code);
             }

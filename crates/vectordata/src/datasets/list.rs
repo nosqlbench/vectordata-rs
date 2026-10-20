@@ -133,7 +133,7 @@ pub struct ListArgs {
 /// run_args(args);
 /// ```
 #[cfg(feature = "cli")]
-pub fn run_args(args: ListArgs) -> i32 {
+pub fn run_args(args: ListArgs, program: &crate::catalog::CatalogSources) -> i32 {
     let name_filter = args.dataset.or(args.matching_name);
     let name = name_filter.map(|p| filter::normalize_match_pattern(&p, "--dataset"));
     let desc = args.matching_desc.map(|p| filter::normalize_match_pattern(&p, "--matching-desc"));
@@ -159,6 +159,7 @@ pub fn run_args(args: ListArgs) -> i32 {
     };
     let view = ProfileView::new(profile_pat);
     run(
+        program,
         &args.configdir,
         &args.catalog,
         &args.at,
@@ -238,6 +239,7 @@ struct DatasetProfileSummary {
 /// configured, or when nothing is found and the user named a source,
 /// gave filters, or asked to select; otherwise 0.
 pub fn run(
+    program: &crate::catalog::CatalogSources,
     configdir: &str,
     extra_catalogs: &[String],
     at: &[String],
@@ -248,7 +250,7 @@ pub fn run(
     profile_view: &ProfileView,
     select: Option<&str>,
 ) -> i32 {
-    let sources = build_sources(configdir, extra_catalogs, at);
+    let sources = build_sources(program, configdir, extra_catalogs, at);
 
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
@@ -783,6 +785,7 @@ mod tests {
     #[test]
     fn test_build_sources_at_overrides() {
         let sources = build_sources(
+            &CatalogSources::new(),
             "~/.config/vectordata",
             &["extra".to_string()],
             &["https://example.com/catalog".to_string()],
@@ -800,6 +803,7 @@ mod tests {
         std::fs::write(tmp.path().join("catalogs.yaml"), yaml).unwrap();
 
         let sources = build_sources(
+            &CatalogSources::new(),
             tmp.path().to_str().unwrap(),
             &["/some/extra/path".to_string()],
             &[],

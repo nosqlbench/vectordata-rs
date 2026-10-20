@@ -36,14 +36,14 @@ pub struct DescribeArgs {
 
 /// Drive `describe` from parsed [`DescribeArgs`].
 #[cfg(feature = "cli")]
-pub fn run_args(args: DescribeArgs, configdir: &str, catalog: &[String]) -> i32 {
+pub fn run_args(args: DescribeArgs, program: &crate::catalog::CatalogSources, configdir: &str, catalog: &[String]) -> i32 {
     // `--at` pins describe to a single catalog source; numbered
     // shortcuts (`--at 2`) resolve against the configured list.
     // `--at` pins the command to the catalogs it names, numbered
     // shortcuts (`--at 2`) included, by the one assembly every
     // command uses.
     let at: Vec<String> = args.at.iter().cloned().collect();
-    let sources = super::build_sources(configdir, catalog, &at);
+    let sources = super::build_sources(program, configdir, catalog, &at);
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
         eprintln!();

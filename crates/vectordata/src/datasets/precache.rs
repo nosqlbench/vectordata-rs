@@ -50,6 +50,10 @@ pub struct PrecacheRequest {
     pub extra_catalogs: Vec<String>,
     /// Catalog locations used instead of the configured ones (`--at`).
     pub at: Vec<String>,
+    /// The catalogs the program running the command supplies, after
+    /// the configured ones and before `--catalog`'s; `--at` replaces
+    /// them with the rest. Empty for the `vectordata` binary.
+    pub program_catalogs: crate::catalog::CatalogSources,
     /// Cache directory for this run in place of the configured one
     /// (`--cache-dir`), set with [`crate::settings::set_cache_dir`].
     pub cache_dir: Option<PathBuf>,
@@ -78,8 +82,9 @@ pub struct PrecacheRequest {
     /// something they discover afterwards.
     pub allow_whole_facet: bool,
     /// A catalog already opened to look the dataset up in, in place of
-    /// the one `configdir` / `extra_catalogs` / `at` describe: the
-    /// explorer's, so a download from it sees the catalogs it lists.
+    /// the one `program_catalogs` / `configdir` / `extra_catalogs` /
+    /// `at` describe: the explorer's, so a download from it sees the
+    /// catalogs it lists.
     pub catalog: Option<Catalog>,
 }
 
@@ -177,7 +182,7 @@ pub fn run(req: PrecacheRequest) -> i32 {
     } else if let Some(catalog) = req.catalog.clone() {
         catalog
     } else {
-        let sources = build_sources(&req.configdir, &req.extra_catalogs, &req.at);
+        let sources = build_sources(&req.program_catalogs, &req.configdir, &req.extra_catalogs, &req.at);
         if sources.is_empty() {
             eprintln!("'{head}' is not a local path, not a URL, and no catalog is configured.");
             eprintln!("Add a catalog with:");

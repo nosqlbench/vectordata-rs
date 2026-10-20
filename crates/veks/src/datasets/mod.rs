@@ -509,6 +509,7 @@ pub fn run(args: DatasetsArgs) {
             };
             let profile_view = filter::ProfileView::new(profile_pat);
             list::run(
+                &vectordata::catalog::CatalogSources::new(),
                 &configdir,
                 &catalog,
                 &at,
@@ -537,9 +538,9 @@ pub fn run(args: DatasetsArgs) {
         } => {
             let catalog: Vec<String> = vectordata::datasets::catalog_args(&raw_catalog);
             if all {
-                cache::run_cache_status_all(verbose, &configdir, &catalog, &at);
+                cache::run_cache_status_all(verbose, &vectordata::catalog::CatalogSources::new(), &configdir, &catalog, &at);
             } else if let Some(ds) = dataset {
-                cache::run_cache_status(&ds, verbose, &configdir, &catalog, &at);
+                cache::run_cache_status(&ds, verbose, &vectordata::catalog::CatalogSources::new(), &configdir, &catalog, &at);
                 if tree {
                     let cache_dir =
                         crate::pipeline::commands::config::configured_cache_dir_or_exit();
@@ -564,6 +565,7 @@ pub fn run(args: DatasetsArgs) {
             // search to that catalog, otherwise every configured one is
             // in play and the dataset is looked up against the union.
             let catalog = vectordata::datasets::build_sources(
+                &vectordata::catalog::CatalogSources::new(),
                 &crate::catalog::sources::config_dir(),
                 &[],
                 &at,
@@ -672,6 +674,7 @@ pub fn run(args: DatasetsArgs) {
                 &dataset,
                 profile.as_deref(),
                 &output,
+                &vectordata::catalog::CatalogSources::new(),
                 &configdir,
                 &catalog,
                 &at,
@@ -708,6 +711,7 @@ pub fn run(args: DatasetsArgs) {
                 plan_only: plan,
                 allow_whole_facet,
                 catalog: None,
+                program_catalogs: Default::default(),
             });
         }
     }

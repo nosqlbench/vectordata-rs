@@ -178,6 +178,30 @@ impl CatalogSources {
         self
     }
 
+    /// This set followed by every catalog of `other`, in its order, each
+    /// as required as it was there. `other`'s configured catalogs stay
+    /// configured, so [`reload_configured`](Self::reload_configured)
+    /// re-reads them where they now stand, and its diagnostics come
+    /// along.
+    ///
+    /// ```
+    /// use vectordata::catalog::{CatalogBuilder, CatalogSources};
+    /// let program = CatalogSources::new().with(CatalogBuilder::named("mine").build());
+    /// let run = CatalogSources::new().with(CatalogBuilder::named("first").build()).extend(program);
+    /// let names: Vec<&str> = run.iter().map(|(s, _)| s.name()).collect();
+    /// assert_eq!(names, ["first", "mine"]);
+    /// ```
+    pub fn extend(mut self, other: CatalogSources) -> Self {
+        let offset = self.configured.len();
+        self.configured.extend(other.configured);
+        self.sources.extend(other.sources.into_iter().map(|slot| Slot {
+            from_config: slot.from_config.map(|k| k + offset),
+            ..slot
+        }));
+        self.diagnostics.extend(other.diagnostics);
+        self
+    }
+
     /// The catalogs, in order, each with whether it must load.
     pub fn iter(&self) -> impl Iterator<Item = (&dyn CatalogSource, Requirement)> + '_ {
         self.sources.iter().map(|slot| (slot.source.as_ref(), slot.requirement))

@@ -245,6 +245,15 @@ let catalog = Catalog::of(&sources);
   sources)` opens it over the same set. A program's catalogs are shown
   read-only on its catalogs screen, and survive an edit to
   `catalogs.yaml` there (`CatalogSources::reload_configured`).
+- **The embedded CLI:** `vectordata::shell::bin_main_with_catalogs(
+  invoked, argv, sources)` runs the `vectordata` command line inside a
+  program with the program's catalogs in every command that reads
+  catalogs (`datasets list`, `describe`, `ping`, `precache`, `derive`,
+  `explore`): after the configured ones and before `--catalog`'s, and
+  replaced with the rest by `--at`. `bin_main_as(invoked, argv)` is the
+  same with none. `datasets::build_sources(program, configdir, catalog,
+  at)` is the one assembly; `CatalogSources::extend` appends one set to
+  another.
 
 `examples/register_catalog.rs` builds both kinds of catalog over a
 dataset it writes, and opens and reads from each.

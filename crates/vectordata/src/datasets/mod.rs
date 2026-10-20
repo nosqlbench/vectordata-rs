@@ -84,21 +84,24 @@ impl RunSources {
 }
 
 /// Build the catalogs a `datasets` command runs against, from the
-/// `--configdir` / `--catalog` / `--at` trio: the one assembly every
-/// command uses. `--at` locations replace the configured catalogs;
-/// otherwise `configdir`'s `catalogs.yaml` is read and any `--catalog`
-/// locations follow it. Catalogs given by `--at` or `--catalog` are
-/// [named for the run](RunSources::open).
+/// catalogs the program running it supplies and the `--configdir` /
+/// `--catalog` / `--at` trio: the one assembly every command uses.
+/// `--at` locations replace every other catalog for the run;
+/// otherwise `configdir`'s `catalogs.yaml` is read, `program`'s catalogs
+/// follow it (empty for the `vectordata` binary; a program embedding
+/// the CLI passes its own, [`bin_main_with_catalogs`](crate::shell::bin_main_with_catalogs)),
+/// and any `--catalog` locations follow those. Catalogs given by `--at`
+/// or `--catalog` are [named for the run](RunSources::open).
 ///
 /// Numbered catalog shortcuts (`--at 2`, `--catalog 1`) resolve
 /// against the configured list in every position — this seam is what
 /// makes the shortcuts work identically from every binary that
 /// dispatches into this module.
-pub fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> RunSources {
+pub fn build_sources(program: &CatalogSources, configdir: &str, extra_catalogs: &[String], at: &[String]) -> RunSources {
     let at = catalog_args(at);
     let extra_catalogs = catalog_args(extra_catalogs);
     let (configured, named) = if at.is_empty() {
-        (CatalogSources::new().configure(configdir), extra_catalogs)
+        (CatalogSources::new().configure(configdir).extend(program.clone()), extra_catalogs)
     } else {
         (CatalogSources::new(), at)
     };
@@ -188,6 +191,32 @@ mod tests {
         dir.to_string_lossy().into_owned()
     }
 
+    /// **A program's catalogs follow the configured ones and precede
+    /// `--catalog`'s; `--at` replaces them all.** The order every
+    /// command reads catalogs in, so an embedded CLI sees the catalogs
+    /// its program registered.
+    #[test]
+    fn a_programs_catalogs_follow_the_configured_ones_and_at_replaces_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_naming_a_missing_catalog(dir.path());
+        let program = CatalogSources::new().with(crate::catalog::CatalogBuilder::named("mine").build());
+        let extra = dir.path().join("extra").to_string_lossy().into_owned();
+        let names = |run: &RunSources| run.sources().iter().map(|(s, _)| s.name().to_string()).collect::<Vec<_>>();
+
+        let run = build_sources(&program, &config, std::slice::from_ref(&extra), &[]);
+        let got = names(&run);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(&got[..2], ["lab", "mine"], "configured, then the program's, then --catalog: {got:?}");
+
+        let run = build_sources(&program, &config, &[], std::slice::from_ref(&extra));
+        let got = names(&run);
+        assert!(!got.iter().any(|n| n == "mine" || n == "lab"), "--at replaces both: {got:?}");
+        assert_eq!(got.len(), 1, "{got:?}");
+
+        let run = build_sources(&CatalogSources::new(), &config, &[], &[]);
+        assert_eq!(names(&run), ["lab"], "no program catalogs: the configured ones alone");
+    }
+
     /// **A configured catalog that fails to load is reported, and the
     /// command goes on; one named for the run is an error** (SRD §11,
     /// item 4). Each problem names the catalog it concerns.
@@ -195,13 +224,13 @@ mod tests {
     fn only_a_catalog_named_for_the_run_fails_the_command() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_naming_a_missing_catalog(dir.path());
-        let configured = build_sources(&config, &[], &[]).open().expect("a broken configured catalog is reported only");
+        let configured = build_sources(&CatalogSources::new(), &config, &[], &[]).open().expect("a broken configured catalog is reported only");
         let problem = configured.diagnostics().iter().find(|d| d.catalog.as_deref() == Some("lab"));
         assert!(problem.is_some(), "{:?}", configured.diagnostics());
 
         let missing = dir.path().join("also-missing").to_string_lossy().into_owned();
-        assert_eq!(build_sources(&config, &[], std::slice::from_ref(&missing)).open().err(), Some(1), "--at");
-        assert_eq!(build_sources(&config, std::slice::from_ref(&missing), &[]).open().err(), Some(1), "--catalog");
+        assert_eq!(build_sources(&CatalogSources::new(), &config, &[], std::slice::from_ref(&missing)).open().err(), Some(1), "--at");
+        assert_eq!(build_sources(&CatalogSources::new(), &config, std::slice::from_ref(&missing), &[]).open().err(), Some(1), "--catalog");
     }
 }
 
