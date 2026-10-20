@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 
+pub mod progress;
 pub mod publish_url;
 pub mod catalogs;
 pub mod extraneous;

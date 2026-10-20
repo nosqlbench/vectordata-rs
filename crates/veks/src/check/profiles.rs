@@ -18,6 +18,11 @@ use std::path::{Path, PathBuf};
 use super::{rel_display, CheckResult};
 
 pub fn check(dataset_files: &[PathBuf]) -> CheckResult {
+    check_with(dataset_files, &mut super::progress::StderrSink::default())
+}
+
+/// [`check`], reporting the scans it runs to `sink`.
+pub fn check_with(dataset_files: &[PathBuf], sink: &mut dyn super::progress::ScanSink) -> CheckResult {
     let mut failures: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     for ds_path in dataset_files {
@@ -49,6 +54,7 @@ pub fn check(dataset_files: &[PathBuf]) -> CheckResult {
         }
         check_profiles(&config, ds_dir, &ds_rel, tagged, &mut failures, &mut notes);
         check_quantization(&config, ds_dir, &ds_rel, &mut failures);
+        check_ground_truth(&config, ds_dir, &ds_rel, &mut failures, sink);
         check_layers(&config, ds_dir, &ds_rel, tagged, &mut failures, &mut notes);
     }
     if failures.is_empty() {
@@ -265,27 +271,12 @@ fn check_layers(
                 }
             }
         }
-        let query_count = group
-            .effective_view(name, "query_vectors")
-            .map(relpath)
-            .map(|q| ds_dir.join(q))
-            .filter(|q| q.exists() && !q.to_string_lossy().contains("NNNN"))
-            .and_then(|q| vectordata::io::open_vec::<f32>(&q.to_string_lossy()).ok().map(|r| r.count()));
         for facet in ["prefiltered_neighbor_indices", "postfiltered_neighbor_indices"] {
             let Some(view) = group.effective_view(name, facet) else { continue };
             let rel = relpath(view);
             let path = ds_dir.join(&rel);
             if !path.exists() || rel.contains("NNNN") {
                 continue;
-            }
-            if let (Some(q), Ok(reader)) =
-                (query_count, vectordata::io::open_vec::<i32>(&path.to_string_lossy()))
-                && reader.count() != q
-            {
-                failures.push(format!(
-                    "{ds_rel}: profile '{name}' {facet} {rel} holds {} rows for {q} queries (PL-3)",
-                    reader.count()
-                ));
             }
             if let Some(log) = &progress {
                 let producer = log.steps.values().find(|r| {
@@ -309,6 +300,113 @@ fn check_layers(
                     )),
                 }
             }
+        }
+    }
+}
+
+/// EA-33: a ground truth has one row per query, its distances have one
+/// row per row of indices, and every index names a base vector — or,
+/// in a filtered truth, is the `-1` sentinel of a row shorter than K:
+/// a pre-filtered row when fewer than K base vectors pass the
+/// predicate, a post-filtered row whenever the intersection is short.
+/// The plain truth ranks every base vector and never holds one. The
+/// last check needs every index read, so the scan reports progress.
+fn check_ground_truth(
+    config: &vectordata::dataset::DatasetConfig,
+    ds_dir: &Path,
+    ds_rel: &str,
+    failures: &mut Vec<String>,
+    sink: &mut dyn super::progress::ScanSink,
+) {
+    let group = &config.profiles;
+    let relpath = |v: &vectordata::dataset::DSView| -> String {
+        vectordata::dataset::catalog::strip_window_suffix(&v.source.path)
+            .trim_start_matches("./")
+            .to_string()
+    };
+    let local = |rel: &str| -> Option<PathBuf> {
+        let path = ds_dir.join(rel);
+        (path.exists() && !rel.contains("NNNN")).then_some(path)
+    };
+    let count_of = |path: &Path| vectordata::io::open_vec_native(&path.to_string_lossy()).ok().map(|r| r.count());
+    const PAIRS: [(&str, &str, bool); 3] = [
+        ("neighbor_indices", "neighbor_distances", false),
+        ("prefiltered_neighbor_indices", "prefiltered_neighbor_distances", true),
+        ("postfiltered_neighbor_indices", "postfiltered_neighbor_distances", true),
+    ];
+    for name in group.profiles.keys() {
+        if group.layered && group.is_layer(name) {
+            continue;
+        }
+        let facet_count = |key: &str| group.effective_view(name, key).map(relpath).and_then(|r| local(&r)).and_then(|p| count_of(&p));
+        let base_count = facet_count("base_vectors");
+        let query_count = facet_count("query_vectors");
+        for (idx_key, dist_key, sparse) in PAIRS {
+            let Some(view) = group.effective_view(name, idx_key) else { continue };
+            let rel = relpath(view);
+            let Some(path) = local(&rel) else { continue };
+            // Any integer type reads as i64; a u64 index is checked value
+            // by value, which is what the scan does anyway.
+            let ids = match vectordata::io::open_vec_as::<i64>(&path.to_string_lossy()) {
+                Ok(r) => r,
+                Err(e) => {
+                    failures.push(format!("{ds_rel}: profile '{name}' {idx_key} {rel}: {e} (EA-33)"));
+                    continue;
+                }
+            };
+            let rows = ids.count();
+            if let Some(q) = query_count
+                && rows != q
+            {
+                failures.push(format!(
+                    "{ds_rel}: profile '{name}' {idx_key} {rel} holds {rows} rows for {q} queries (EA-33)"
+                ));
+            }
+            if let Some(dview) = group.effective_view(name, dist_key)
+                && let drel = relpath(dview)
+                && let Some(dpath) = local(&drel)
+                && let Some(drows) = count_of(&dpath)
+                && drows != rows
+            {
+                failures.push(format!(
+                    "{ds_rel}: profile '{name}' {dist_key} {drel} holds {drows} rows for the {rows} rows of \
+                     {idx_key} (EA-33)"
+                ));
+            }
+            let Some(base) = base_count else { continue };
+            let dim = ids.dim();
+            if dim == 0 || rows == 0 {
+                continue;
+            }
+            let label = format!("{ds_rel}: scanning {idx_key} of profile '{name}'");
+            let per_block = ((1usize << 16) / dim).max(1);
+            let mut block = vec![0i64; per_block * dim];
+            let mut done = 0usize;
+            sink.report(&label, 0, rows as u64);
+            while done < rows {
+                let got = match ids.read_into(done, &mut block) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let bad = block[..got * dim]
+                    .iter()
+                    .position(|&id| !((0..base as i64).contains(&id) || (sparse && id == -1)));
+                if let Some(k) = bad {
+                    let id = block[k];
+                    failures.push(format!(
+                        "{ds_rel}: profile '{name}' {idx_key} {rel} row {} column {} holds {id}, which names no \
+                         base vector of {base} base vectors{} (EA-33)",
+                        done + k / dim,
+                        k % dim,
+                        if sparse { "" } else { "; only a filtered truth may hold the -1 sentinel" }
+                    ));
+                    done += k / dim + 1;
+                    break;
+                }
+                done += got;
+                sink.report(&label, done as u64, rows as u64);
+            }
+            sink.report(&label, done.min(rows) as u64, rows as u64);
         }
     }
 }
@@ -504,6 +602,125 @@ mod tests {
         std::fs::write(dir.join("quant_scale.f32"), f32s(scale)).unwrap();
         std::fs::write(dir.join("quant_zero_point.i32"), i32s(zp)).unwrap();
         std::fs::write(dir.join("quant_sum.i32"), i32s(sum)).unwrap();
+    }
+
+    /// A base of `base` f32 vectors, `queries` queries, a ground truth of
+    /// `gt_rows` rows of `k` i32 indices drawn from `ids(row, col)`, and
+    /// `dist_rows` rows of distances, under the facet keys `idx` and
+    /// `dist`.
+    #[allow(clippy::too_many_arguments)]
+    fn ground_truth_files(
+        dir: &Path, base: usize, queries: usize, gt_rows: usize, k: usize, dist_rows: usize,
+        idx: &str, dist: &str, ids: impl Fn(usize, usize) -> i32,
+    ) -> String {
+        let fvec = |n: usize| -> Vec<u8> {
+            (0..n).flat_map(|i| [2i32.to_le_bytes(), (i as f32).to_le_bytes(), (i as f32 * 0.5).to_le_bytes()].concat()).collect()
+        };
+        std::fs::write(dir.join("base_vectors.fvecs"), fvec(base)).unwrap();
+        std::fs::write(dir.join("query_vectors.fvecs"), fvec(queries)).unwrap();
+        let mut gt = Vec::new();
+        for r in 0..gt_rows {
+            gt.extend_from_slice(&(k as i32).to_le_bytes());
+            for c in 0..k { gt.extend_from_slice(&ids(r, c).to_le_bytes()); }
+        }
+        std::fs::write(dir.join(format!("{idx}.ivecs")), gt).unwrap();
+        let mut d = Vec::new();
+        for r in 0..dist_rows {
+            d.extend_from_slice(&(k as i32).to_le_bytes());
+            for c in 0..k { d.extend_from_slice(&((r * k + c) as f32).to_le_bytes()); }
+        }
+        std::fs::write(dir.join(format!("{dist}.fvecs")), d).unwrap();
+        format!(
+            "format_version: 1\nname: gt\nprofiles:\n  default:\n    base_vectors: base_vectors.fvecs\n    \
+             query_vectors: query_vectors.fvecs\n    {idx}: {idx}.ivecs\n    {dist}: {dist}.fvecs\n"
+        )
+    }
+
+    /// **An index at the base count is reported with its ordinal**
+    /// (EA-33): every ground-truth index names a base vector.
+    #[test]
+    fn an_index_at_the_base_count_is_reported_with_its_ordinal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = ground_truth_files(tmp.path(), 10, 3, 3, 4, 3, "neighbor_indices", "neighbor_distances",
+            |r, c| if (r, c) == (1, 2) { 10 } else { ((r + c) % 10) as i32 });
+        let p = dataset(tmp.path(), &yaml);
+        let r = check(&[p]);
+        assert!(!r.passed, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("neighbor_indices") && m.contains("row 1") && m.contains("10") && m.contains("base vectors")),
+            "{:?}", r.messages
+        );
+    }
+
+    /// **A ground truth with more rows than queries is reported**, and
+    /// so are distances whose rows differ from the indices'.
+    #[test]
+    fn ground_truth_rows_must_match_the_queries_and_the_distances() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = ground_truth_files(tmp.path(), 10, 3, 4, 2, 4, "neighbor_indices", "neighbor_distances", |r, c| ((r + c) % 10) as i32);
+        let p = dataset(tmp.path(), &yaml);
+        let r = check(std::slice::from_ref(&p));
+        assert!(!r.passed, "{:?}", r.messages);
+        assert!(r.messages.iter().any(|m| m.contains("neighbor_indices") && m.contains("4 rows for 3 queries")), "{:?}", r.messages);
+
+        let yaml = ground_truth_files(tmp.path(), 10, 3, 3, 2, 2, "neighbor_indices", "neighbor_distances", |r, c| ((r + c) % 10) as i32);
+        dataset(tmp.path(), &yaml);
+        let r = check(&[p]);
+        assert!(!r.passed, "{:?}", r.messages);
+        assert!(r.messages.iter().any(|m| m.contains("neighbor_distances") && m.contains("2 rows") && m.contains("3 rows")), "{:?}", r.messages);
+    }
+
+    /// **A filtered truth allows the `-1` sentinel of a short row** —
+    /// a pre-filtered row when fewer than K base vectors pass the
+    /// predicate, a post-filtered row whenever the intersection is
+    /// short — **and the plain truth does not**: it ranks every base
+    /// vector.
+    #[test]
+    fn a_filtered_truth_allows_the_minus_one_sentinel_and_a_plain_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sparse = |r: usize, c: usize| if c == 1 { -1 } else { ((r + c) % 10) as i32 };
+        let p = tmp.path().join("dataset.yaml");
+        for (idx, dist) in [
+            ("postfiltered_neighbor_indices", "postfiltered_neighbor_distances"),
+            ("prefiltered_neighbor_indices", "prefiltered_neighbor_distances"),
+        ] {
+            let yaml = ground_truth_files(tmp.path(), 10, 3, 3, 2, 3, idx, dist, sparse);
+            dataset(tmp.path(), &yaml);
+            let r = check(std::slice::from_ref(&p));
+            assert!(r.passed, "{idx}: {:?}", r.messages);
+        }
+
+        let yaml = ground_truth_files(tmp.path(), 10, 3, 3, 2, 3, "neighbor_indices", "neighbor_distances", sparse);
+        dataset(tmp.path(), &yaml);
+        let r = check(&[p]);
+        assert!(!r.passed, "{:?}", r.messages);
+        assert!(r.messages.iter().any(|m| m.contains("neighbor_indices") && m.contains("-1") && m.contains("sentinel")), "{:?}", r.messages);
+    }
+
+    /// **The scan reports progress**: a capturing sink hears the start,
+    /// every block and the end of each index facet's scan, labelled.
+    #[test]
+    fn the_scan_reports_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = ground_truth_files(tmp.path(), 10, 3, 3, 4, 3, "neighbor_indices", "neighbor_distances", |r, c| ((r * 3 + c) % 10) as i32);
+        let p = dataset(tmp.path(), &yaml);
+        let mut lines: Vec<String> = Vec::new();
+        let r = check_with(std::slice::from_ref(&p), &mut lines);
+        assert!(r.passed, "{:?}", r.messages);
+        let scan: Vec<&String> = lines.iter().filter(|l| l.contains("scanning neighbor_indices of profile 'default'")).collect();
+        assert!(scan.len() >= 2, "{lines:?}");
+        assert!(scan.first().unwrap().ends_with(": 0/3"), "{lines:?}");
+        assert!(scan.last().unwrap().ends_with(": 3/3"), "{lines:?}");
+    }
+
+    /// **A consistent ground truth passes.**
+    #[test]
+    fn a_consistent_ground_truth_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = ground_truth_files(tmp.path(), 10, 3, 3, 4, 3, "neighbor_indices", "neighbor_distances", |r, c| ((r * 3 + c) % 10) as i32);
+        let p = dataset(tmp.path(), &yaml);
+        let r = check(&[p]);
+        assert!(r.passed, "{:?}", r.messages);
     }
 
     const QUANT_ATTR: &str = "attributes:\n  quantization:\n    scheme: affine\n    granularity: per-vector\n    codes: u8\n    range: [0, 255]\n";

@@ -1758,3 +1758,64 @@ target format chosen from the source's element type — is covered only
 by `preferred_vec_format_is_keyed_by_type` on the function it calls. A
 fixture that runs the command over an xvec and a container source is
 owed; it is not this step's.
+
+### 16.8 Step 8: ground truth in `veks check` (2026-10-20)
+
+**Guards, run against the code before the step:** three of the four
+new tests failed because the old check passed every dataset —
+`an_index_at_the_base_count_is_reported_with_its_ordinal`,
+`ground_truth_rows_must_match_the_queries_and_the_distances`, and the
+pre-filtered half of `a_sparse_post_filtered_truth_allows_minus_one_
+and_a_pre_filtered_does_not`. `a_consistent_ground_truth_passes` passed
+before and after, as it should.
+
+**Built (EA-33):**
+- `check_ground_truth`, in the `profile-selectors` category after the
+  quantization check: for `neighbor_indices` and each pre/post-filtered
+  pair, the rows equal the query count; the distances' rows equal the
+  indices' rows; every index is in `0..base_count`, with the `-1`
+  sentinel allowed in either filtered truth and never in the plain
+  one. The indices open through `open_vec_as::<i64>`, so any integer
+  type reads (a u64 index is checked value by value, which the scan
+  does anyway) and are read in 64 KiB blocks by `read_into`; the first
+  bad index stops that file's scan and is reported by row, column and
+  value against the base count.
+- PL-3 keeps its provenance half; the rows-versus-queries check it had
+  for F and E moved here, where G has it too.
+- `check::progress`: `ScanSink` (one report at the start, one per
+  block, one at the end) with `StderrSink` — one line redrawn at most
+  every 250 ms on a tty, a line at every tenth otherwise, and always
+  the last — and a `Vec<String>` sink for tests. `profiles::check_with`
+  takes a sink; `check` is it with the terminal.
+
+**Corrected during the step: a pre-filtered truth holds the sentinel
+too.** §13.8 and §14.3 said `-1` was allowed only in a post-filtered
+truth. The topic-predicates e2e (`e2e_topic_stratified_predicates`)
+failed the first version of the check on its own generated dataset:
+`compute prefiltered-knn` pads a row with `-1` when fewer than K base
+vectors pass the predicate (`docs/sysref/commands/compute-prefiltered-
+knn.md`). The rule is now: a filtered truth, pre or post, may hold the
+sentinel; the plain truth, which ranks every base vector, may not. The
+test `a_sparse_post_filtered_truth_allows_minus_one_and_a_pre_filtered_
+does_not` became `a_filtered_truth_allows_the_minus_one_sentinel_and_a_
+plain_one_does_not`.
+
+**Tests:** the four behaviour tests above and `the_scan_reports_
+progress` (the capturing sink hears `0/3` through `3/3` under the
+scan's label); `a_vec_sink_keeps_every_report` and `the_stderr_sink_
+paces_by_tty_and_closes_the_label` (the terminal sink's two cadences,
+on its private state); the check module's 18 and the veks and
+veks-pipeline suites (1327 passed, 0 failed); clippy clean on the
+changed files; docs with warnings denied.
+
+**Coverage after the step** (the §14.5 command, whole workspace:
+75.6% → 76.0%; baseline → after, lines, then functions after).
+
+| File | Baseline | After | Functions |
+|---|---|---|---|
+| `veks/src/check/profiles.rs` | 86.6% | 90.7% (667/735) | 93.3% (83/89) |
+| `veks/src/check/progress.rs` | — (new) | 100.0% (61/61) | 100.0% (6/6) |
+| `veks/src/check/mod.rs` | 61.7% | 61.7% (275/446) | 70.6% (24/34) |
+
+`check/mod.rs` is unchanged but for the module line; its uncovered
+half is the command's wiring of the other checks, not this step's.
