@@ -11,6 +11,7 @@
 //! Uses the same optimized SIMD distance infrastructure and batched
 //! parallel processing pattern as `compute knn`.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;

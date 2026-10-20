@@ -8,6 +8,8 @@
 //! Produces gaussian distribution statistics of the epsilon values as
 //! pipeline variables.
 
+use crate::pipeline::element_type::ElementTypeKnn;
+use crate::pipeline::element_type::ElementTypeExt;
 use std::path::Path;
 use std::time::Instant;
 

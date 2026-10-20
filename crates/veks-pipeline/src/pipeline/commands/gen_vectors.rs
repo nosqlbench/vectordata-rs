@@ -9,6 +9,7 @@
 //!
 //! Equivalent to the Java `CMD_generate_vectors` command.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

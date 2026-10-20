@@ -17,6 +17,7 @@
 //!   2. `variables.yaml`
 //!   3. CLI `--set key=value` overrides
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

@@ -8,6 +8,7 @@
 //! produces a rich summary with duplicate group analysis. In recursive
 //! mode, produces a concise per-file table.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

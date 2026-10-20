@@ -22,6 +22,7 @@
 //! final global top-K. Cached partitions are reusable across runs with different
 //! base-vector ranges.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::io::{BufReader, Cursor, Read, Write};

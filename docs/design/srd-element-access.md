@@ -1675,3 +1675,86 @@ veks-pipeline, veks, veks-core and vecd suites: 1587 passed, 0 failed.
 |---|---|---|---|
 | `vectordata/src/catalog/source.rs` | 92.1% | 89.3% (226/253) | 87.8% (36/41) |
 | `vectordata/src/group.rs` | 93.2% | 93.1% (473/508) | 95.2% (59/62) |
+
+### 16.7 Step 7: the pipeline's and veks-core's copies (2026-10-19)
+
+**Guards:**
+- `dispatch_reader_opens_an_i8_file_as_i8` (run on the old code in step
+  3: `XvecReader<u8>` where `<i8>` is named) keeps passing through the
+  rewritten macro.
+- `preferred_vec_format_is_keyed_by_type` and
+  `metadata_indices_resolves_in_veks_core` (veks-core): the functions
+  they pin replace ones deleted in the same step, so they were not run
+  against the old code; the old behaviour is read from it.
+  `Facet::preferred_format(element_size)` chose by width through
+  `xvec_for_element_size` (`1 => Bvec`, `2 => Svec`, `8 => Dvec`, else
+  `Fvec`), so an i8 or u16 source was written as u8 or i16; the copied
+  `from_alias` had no `metadata_indices` arm, which vectordata's has.
+
+**Built (EA-31, EA-32):**
+- `veks-pipeline/src/pipeline/element_type.rs` re-exports the shared
+  `ElementType`, `Element`, `ElementConversion` and `ElementTypeExt`
+  under the path the pipeline always imported, and keeps only the
+  pipeline's numeric policy as `ElementTypeKnn` (`supports_simd_
+  distance`, `machine_epsilon`, `normalization_threshold`; bf16 is a
+  float the kernels do not take directly). `ToF64` is gone
+  (`Element::as_f64`); `is_scalar_extension` is the model's layout
+  question; `element_size` is `byte_width`. `dispatch_reader!` is
+  `dispatch_element!` over `XvecReader<T>`.
+- A new `F64Vectors` (same file): a uniform vector file opened at its
+  own type through `open_vec_native` and read as f64 by `as_f64`. It
+  replaces nine hand-written twelve-arm dispatches in the analysis
+  commands (`analyze zeros`, `stats`, `slice`, `select`, `histogram`,
+  `find` ×2, `compare` ×2), each of which reinterpreted widths — an
+  `.i8vecs` as u8, a `.u16vecs` as i16, a `.u32vecs` as i32, and the
+  64-bit integers as **f64** — and all of which step 3's check had
+  therefore turned into open errors for those types. `analyze select`'s
+  own width-keyed column reader went with them.
+- veks-core's `Facet` is deleted; `formats::{StandardFacet, FacetFormat,
+  FacetShape}` re-export vectordata's, the single authority. Its
+  consumers (`convert`, `import`, the facet-aware readers) use
+  `StandardFacet`. `preferred_format(element_size)` becomes
+  `formats::preferred_vec_format(StandardFacet, ElementType)`, keyed
+  by type, with `element_type_of_width` for a container source whose
+  probe states only a width; the pipeline's `import` resolves the
+  source's element type first. The dead `IoMmapReader` re-export is
+  gone.
+- veks-core's own `VecFormat` (a third format enum, with vvec
+  variants and HDF5) is on the model: `Bf16vec`, `Bf16vvec` and the
+  four float columns; `ALL`, `element_type`, `container`, `of`; the
+  predicates, `element_size`, `from_extension`, `preferred_extension`
+  and `data_type_name` derive from `ElementType`. The extension table
+  in `formats/mod.rs` is gone (EA-21).
+- `veks prepare import` chooses the output extension from the source's
+  element type, not its width.
+- `crates/veks/tests/e2e_shard_sizing.rs` moved to the typed readers.
+
+**Decided during the step: the analysis commands read every file
+through `F64Vectors`.** The nine dispatches differed only in their
+error prefixes; one helper that opens at the file's own type is what
+the model is for, and it is where bf16 reaches those commands.
+
+**Tests:** the element_type module's 11, veks-core's 3 new; the
+veks-core, veks-pipeline, veks and vecd suites; clippy clean on the
+changed files; the workspace compiles.
+
+**Coverage after the step** (the §14.5 command, whole workspace:
+75.6% → 76.0%; baseline → after, lines, then functions after). Every
+crate's suite (vectordata, veks-core, veks-pipeline, veks, vecd):
+2916 passed, 0 failed.
+
+| File | Baseline | After | Functions |
+|---|---|---|---|
+| `veks-pipeline/src/pipeline/element_type.rs` | 81.1% | 96.5% (136/141) | 92.6% (25/27) |
+| `veks-core/src/formats/mod.rs` | 65.3% | 80.8% (194/240) | 90.9% (30/33) |
+| `veks-pipeline/src/pipeline/commands/analyze_select.rs` | 62.8% | 80.3% (241/300) | 65.4% (17/26) |
+| `veks-pipeline/src/pipeline/commands/analyze_stats.rs` | 72.8% | 84.5% (377/446) | 73.3% (22/30) |
+| `veks-pipeline/src/pipeline/commands/import.rs` | 0.0% | 0.0% (0/359) | 0.0% (0/21) |
+| `veks/src/prepare/import.rs` | 85.3% | 85.4% (2144/2511) | 79.2% (118/149) |
+
+The pipeline's `import` command (`commands/import.rs`) is at 0% before
+and after: nothing in the workspace runs it. Its one change here — the
+target format chosen from the source's element type — is covered only
+by `preferred_vec_format_is_keyed_by_type` on the function it calls. A
+fixture that runs the command over an xvec and a container source is
+owed; it is not this step's.

@@ -8,6 +8,7 @@
 //! base set. Overlap makes KNN ground truth unreliable because a query's
 //! nearest neighbor would be itself (distance ≈ 0).
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

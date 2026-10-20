@@ -9,6 +9,7 @@
 //!
 //! Equivalent to the Java `CMD_analyze_check_endian` command.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -42,7 +43,7 @@ fn check_endianness(path: &Path) -> Result<String, String> {
 
     let etype = ElementType::from_path(path)
         .map_err(|_| format!("unknown vector format: '.{}'", ext))?;
-    let element_width = etype.element_size();
+    let element_width = etype.byte_width();
 
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("cannot stat {}: {}", path.display(), e))?

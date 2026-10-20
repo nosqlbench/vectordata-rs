@@ -25,6 +25,8 @@
 //!
 //! Equivalent to Java `CMD_generate_fvecExtract` and `CMD_generate_ivecExtract`.
 
+use crate::pipeline::element_type::ElementTypeKnn;
+use crate::pipeline::element_type::ElementTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -3303,7 +3305,7 @@ impl CommandOp for GenerateScalarExtractOp {
             Ok(et) => et,
             Err(e) => return error_result(format!("detect element type: {}", e), start),
         };
-        let elem_size = elem_type.element_size();
+        let elem_size = elem_type.byte_width();
 
         // Read source
         let source_data = match std::fs::read(&source_path) {
@@ -3466,7 +3468,7 @@ impl CommandOp for TransformExtractOp {
         // to format-specific names.
         let mut delegate_opts = Options::new();
         // Detect format: slab, xvec (fvec/mvec/ivec), or scalar (u8/i32/etc.)
-        let is_scalar = ElementType::is_scalar_extension(ext);
+        let is_scalar = matches!(ElementType::parse_extension(ext), Some((_, vectordata::typed_access::Container::Scalar)));
         let etype = if ext == "slab" {
             delegate_opts.set("slab-file", source_str);
             None

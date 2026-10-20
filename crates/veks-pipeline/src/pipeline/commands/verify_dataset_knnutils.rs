@@ -35,6 +35,7 @@
 //!
 //! Output follows the knn\_utils report style for familiarity.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;

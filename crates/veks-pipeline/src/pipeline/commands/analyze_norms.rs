@@ -7,6 +7,7 @@
 //! each in f64 precision, records the values in an HDR histogram, and
 //! displays a percentile summary plus an ASCII plot.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::path::Path;
 use std::time::Instant;
 

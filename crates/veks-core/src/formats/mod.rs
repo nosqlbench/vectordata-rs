@@ -10,7 +10,6 @@
 
 // Re-export veks-io traits so downstream code can access them via veks-core.
 pub use veks_io::{VecSource as IoVecSource, VecSink as IoVecSink, SourceMeta as IoSourceMeta};
-pub use veks_io::MmapReader as IoMmapReader;
 
 // Wire format codecs re-exported from vectordata.
 #[allow(dead_code)]
@@ -22,7 +21,9 @@ pub use vectordata::formats::anode;
 #[allow(dead_code)]
 pub use vectordata::formats::anode_vernacular;
 
-pub mod facet;
+/// The facet spec is vectordata's, the single authority: what a facet
+/// is called, which formats it may take, how a resource classifies.
+pub use vectordata::dataset::facet::{FacetFormat, FacetShape, StandardFacet};
 pub mod parquet_compiler;
 pub mod passage_table;
 pub mod parquet_vector_compiler;
@@ -33,6 +34,8 @@ pub mod reader;
 pub mod writer;
 
 use std::fmt;
+
+use vectordata::typed_access::{Container, ElementType};
 use std::path::Path;
 
 /// A vector data format recognized by veks.
@@ -63,6 +66,8 @@ pub enum VecFormat {
     Dvec,
     /// xvec float16 / half (2 bytes/element). Extension: `.mvec`
     Mvec,
+    /// xvec bfloat16 (2 bytes/element). Extension: `.bf16vec`
+    Bf16vec,
     /// xvec uint8 (1 byte/element). Extension: `.bvec` or `.u8vec`
     Bvec,
     /// xvec int8 (1 byte/element). Extension: `.i8vec`
@@ -89,6 +94,8 @@ pub enum VecFormat {
     Dvvec,
     /// vvec float16 (2 bytes/element). Extension: `.mvvec` or `.f16vvec`
     Mvvec,
+    /// vvec bfloat16 (2 bytes/element). Extension: `.bf16vvec`
+    Bf16vvec,
     /// vvec uint8 (1 byte/element). Extension: `.bvvec` or `.u8vvec`
     Bvvec,
     /// vvec int8 (1 byte/element). Extension: `.i8vvec`
@@ -123,11 +130,50 @@ pub enum VecFormat {
     ScalarU64,
     /// Scalar int64 (8 bytes/element). Extension: `.i64`
     ScalarI64,
+    /// Scalar float16 (2 bytes/element). Extension: `.f16`
+    ScalarF16,
+    /// Scalar bfloat16 (2 bytes/element). Extension: `.bf16`
+    ScalarBf16,
+    /// Scalar float32 (4 bytes/element). Extension: `.f32`
+    ScalarF32,
+    /// Scalar float64 (8 bytes/element). Extension: `.f64`
+    ScalarF64,
 }
 
 /// Bytes a slab spends per record beyond its payload: one entry in
 /// the page's offset array.
 pub const SLAB_RECORD_FRAMING: u64 = 4;
+
+/// The format a facet is written in when its source holds `element`:
+/// vectors and distances keep the source's element type (an `.i8vecs`
+/// source writes `.i8vecs`, a `bf16` one `.bf16vecs`); indices are
+/// `i32` vectors; the metadata facets are slabs; the quantization
+/// columns are the columns the facet spec names.
+pub fn preferred_vec_format(facet: StandardFacet, element: ElementType) -> VecFormat {
+    use StandardFacet as F;
+    match facet {
+        F::BaseVectors | F::QueryVectors | F::NeighborDistances
+        | F::PrefilteredNeighborDistances | F::PostfilteredNeighborDistances => {
+            VecFormat::of(Container::Vec, element).unwrap_or(VecFormat::Fvec)
+        }
+        F::NeighborIndices | F::PrefilteredNeighborIndices | F::PostfilteredNeighborIndices => VecFormat::Ivec,
+        F::MetadataContent | F::MetadataPredicates | F::MetadataResults | F::MetadataLayout => VecFormat::Slab,
+        F::QuantScale => VecFormat::ScalarF32,
+        F::QuantZeroPoint | F::QuantSum => VecFormat::ScalarI32,
+    }
+}
+
+/// The element type a container source (npy, parquet, hdf5) holds,
+/// which its probe states only as a width: containers hold floats, and
+/// one byte is a code.
+pub fn element_type_of_width(bytes: usize) -> ElementType {
+    match bytes {
+        1 => ElementType::U8,
+        2 => ElementType::F16,
+        8 => ElementType::F64,
+        _ => ElementType::F32,
+    }
+}
 
 impl VecFormat {
     /// Human-readable name matching the file extension.
@@ -140,6 +186,7 @@ impl VecFormat {
             Self::Fvec => "fvec",
             Self::Dvec => "dvec",
             Self::Mvec => "mvec",
+            Self::Bf16vec => "bf16vec",
             Self::Bvec => "bvec",
             Self::I8vec => "i8vec",
             Self::Svec => "svec",
@@ -151,6 +198,7 @@ impl VecFormat {
             Self::Fvvec => "fvvec",
             Self::Dvvec => "dvvec",
             Self::Mvvec => "mvvec",
+            Self::Bf16vvec => "bf16vvec",
             Self::Bvvec => "bvvec",
             Self::I8vvec => "i8vvec",
             Self::Svvec => "svvec",
@@ -167,7 +215,67 @@ impl VecFormat {
             Self::ScalarI32 => "i32",
             Self::ScalarU64 => "u64",
             Self::ScalarI64 => "i64",
+            Self::ScalarF16 => "f16",
+            Self::ScalarBf16 => "bf16",
+            Self::ScalarF32 => "f32",
+            Self::ScalarF64 => "f64",
         }
+    }
+
+    /// Every format.
+    pub const ALL: &[VecFormat] = &[
+        Self::Npy, Self::Parquet, Self::Slab, Self::Hdf5,
+        Self::Fvec, Self::Dvec, Self::Mvec, Self::Bf16vec, Self::Bvec, Self::I8vec, Self::Svec, Self::U16vec,
+        Self::Ivec, Self::U32vec, Self::I64vec, Self::U64vec,
+        Self::Fvvec, Self::Dvvec, Self::Mvvec, Self::Bf16vvec, Self::Bvvec, Self::I8vvec, Self::Svvec, Self::U16vvec,
+        Self::Ivvec, Self::U32vvec, Self::I64vvec, Self::U64vvec,
+        Self::ScalarU8, Self::ScalarI8, Self::ScalarU16, Self::ScalarI16,
+        Self::ScalarU32, Self::ScalarI32, Self::ScalarU64, Self::ScalarI64,
+        Self::ScalarF16, Self::ScalarBf16, Self::ScalarF32, Self::ScalarF64,
+    ];
+
+    /// The element type a vector, vvec or scalar format holds; `None`
+    /// for a container, which describes its own.
+    pub fn element_type(self) -> Option<ElementType> {
+        use ElementType as E;
+        Some(match self {
+            Self::Npy | Self::Parquet | Self::Slab | Self::Hdf5 => return None,
+            Self::Fvec | Self::Fvvec | Self::ScalarF32 => E::F32,
+            Self::Dvec | Self::Dvvec | Self::ScalarF64 => E::F64,
+            Self::Mvec | Self::Mvvec | Self::ScalarF16 => E::F16,
+            Self::Bf16vec | Self::Bf16vvec | Self::ScalarBf16 => E::BF16,
+            Self::Bvec | Self::Bvvec | Self::ScalarU8 => E::U8,
+            Self::I8vec | Self::I8vvec | Self::ScalarI8 => E::I8,
+            Self::Svec | Self::Svvec | Self::ScalarI16 => E::I16,
+            Self::U16vec | Self::U16vvec | Self::ScalarU16 => E::U16,
+            Self::Ivec | Self::Ivvec | Self::ScalarI32 => E::I32,
+            Self::U32vec | Self::U32vvec | Self::ScalarU32 => E::U32,
+            Self::I64vec | Self::I64vvec | Self::ScalarI64 => E::I64,
+            Self::U64vec | Self::U64vvec | Self::ScalarU64 => E::U64,
+        })
+    }
+
+    /// The layout of a vector, vvec or scalar format; `None` for a
+    /// container.
+    pub fn container(self) -> Option<Container> {
+        Some(match self {
+            Self::Npy | Self::Parquet | Self::Slab | Self::Hdf5 => return None,
+            Self::Fvec | Self::Dvec | Self::Mvec | Self::Bf16vec | Self::Bvec | Self::I8vec | Self::Svec
+            | Self::U16vec | Self::Ivec | Self::U32vec | Self::I64vec | Self::U64vec => Container::Vec,
+            Self::Fvvec | Self::Dvvec | Self::Mvvec | Self::Bf16vvec | Self::Bvvec | Self::I8vvec | Self::Svvec
+            | Self::U16vvec | Self::Ivvec | Self::U32vvec | Self::I64vvec | Self::U64vvec => Container::Vvec,
+            Self::ScalarU8 | Self::ScalarI8 | Self::ScalarU16 | Self::ScalarI16 | Self::ScalarU32
+            | Self::ScalarI32 | Self::ScalarU64 | Self::ScalarI64 | Self::ScalarF16 | Self::ScalarBf16
+            | Self::ScalarF32 | Self::ScalarF64 => Container::Scalar,
+        })
+    }
+
+    /// The format that holds `element_type` in `container`.
+    pub fn of(container: Container, element_type: ElementType) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|f| f.container() == Some(container) && f.element_type() == Some(element_type))
     }
 
     /// True for the xvec family (vector formats with `[dim:i32, data...]` header).
@@ -178,159 +286,60 @@ impl VecFormat {
 
     /// True for uniform xvec (all records have the same dimension).
     pub fn is_uniform_xvec(self) -> bool {
-        matches!(self,
-            Self::Fvec | Self::Dvec | Self::Mvec |
-            Self::Bvec | Self::I8vec |
-            Self::Svec | Self::U16vec |
-            Self::Ivec | Self::U32vec |
-            Self::I64vec | Self::U64vec
-        )
+        self.container() == Some(Container::Vec)
     }
 
-    /// True for variable-length vector formats (per-record dimension).
+    /// True for variable-length vector formats (vvec family).
     pub fn is_vvec(self) -> bool {
-        matches!(self,
-            Self::Fvvec | Self::Dvvec | Self::Mvvec |
-            Self::Bvvec | Self::I8vvec |
-            Self::Svvec | Self::U16vvec |
-            Self::Ivvec | Self::U32vvec |
-            Self::I64vvec | Self::U64vvec
-        )
+        self.container() == Some(Container::Vvec)
     }
 
     /// True for scalar formats (flat packed, no header, one value per ordinal).
     pub fn is_scalar(self) -> bool {
-        matches!(self,
-            Self::ScalarU8 | Self::ScalarI8 |
-            Self::ScalarU16 | Self::ScalarI16 |
-            Self::ScalarU32 | Self::ScalarI32 |
-            Self::ScalarU64 | Self::ScalarI64
-        )
+        self.container() == Some(Container::Scalar)
     }
 
-    /// True for integer element types (scalar, uniform, or variable vector).
+    /// True for integer element types (scalar or vector).
     pub fn is_integer(self) -> bool {
-        matches!(self,
-            Self::Bvec | Self::I8vec | Self::Svec | Self::U16vec |
-            Self::Ivec | Self::U32vec | Self::I64vec | Self::U64vec |
-            Self::Bvvec | Self::I8vvec | Self::Svvec | Self::U16vvec |
-            Self::Ivvec | Self::U32vvec | Self::I64vvec | Self::U64vvec |
-            Self::ScalarU8 | Self::ScalarI8 | Self::ScalarU16 | Self::ScalarI16 |
-            Self::ScalarU32 | Self::ScalarI32 | Self::ScalarU64 | Self::ScalarI64
-        )
+        self.element_type().is_some_and(ElementType::is_integer)
     }
 
-    /// Bytes per element. Returns `0` for container formats.
+    /// Bytes per element. Returns 0 for container formats.
     pub fn element_size(self) -> usize {
-        match self {
-            Self::Bvec | Self::I8vec | Self::Bvvec | Self::I8vvec |
-                Self::ScalarU8 | Self::ScalarI8 => 1,
-            Self::Mvec | Self::Svec | Self::U16vec | Self::Mvvec | Self::Svvec | Self::U16vvec |
-                Self::ScalarU16 | Self::ScalarI16 => 2,
-            Self::Fvec | Self::Ivec | Self::U32vec | Self::Fvvec | Self::Ivvec | Self::U32vvec |
-                Self::ScalarU32 | Self::ScalarI32 => 4,
-            Self::Dvec | Self::I64vec | Self::U64vec | Self::Dvvec | Self::I64vvec | Self::U64vvec |
-                Self::ScalarU64 | Self::ScalarI64 => 8,
-            Self::Npy | Self::Parquet | Self::Slab | Self::Hdf5 => 0,
-        }
+        self.element_type().map_or(0, ElementType::byte_width)
     }
 
-    /// Preferred file extension for writing a new file of this format.
-    ///
-    /// For xvec and vvec formats this returns the plural form (e.g.
-    /// `"fvecs"`, `"ivvecs"`) — the convention this project now writes. For
-    /// scalar and container formats it matches [`name`](Self::name) (they
-    /// have no singular/plural split).
-    ///
-    /// Reading accepts both singular and plural forms; see
+    /// Preferred file extension for writing a new file of this format:
+    /// the historical plural where there is one (`fvecs`, `ivvecs`), the
+    /// typed plural otherwise (`bf16vecs`); scalars and containers have
+    /// no plural convention. Reading accepts every spelling; see
     /// [`from_extension`](Self::from_extension).
     pub fn preferred_extension(self) -> &'static str {
-        match self {
-            // Uniform xvec
-            Self::Fvec => "fvecs",
-            Self::Dvec => "dvecs",
-            Self::Mvec => "mvecs",
-            Self::Bvec => "bvecs",
-            Self::I8vec => "i8vecs",
-            Self::Svec => "svecs",
-            Self::U16vec => "u16vecs",
-            Self::Ivec => "ivecs",
-            Self::U32vec => "u32vecs",
-            Self::I64vec => "i64vecs",
-            Self::U64vec => "u64vecs",
-            // Variable-length vvec
-            Self::Fvvec => "fvvecs",
-            Self::Dvvec => "dvvecs",
-            Self::Mvvec => "mvvecs",
-            Self::Bvvec => "bvvecs",
-            Self::I8vvec => "i8vvecs",
-            Self::Svvec => "svvecs",
-            Self::U16vvec => "u16vvecs",
-            Self::Ivvec => "ivvecs",
-            Self::U32vvec => "u32vvecs",
-            Self::I64vvec => "i64vvecs",
-            Self::U64vvec => "u64vvecs",
-            // Scalars and containers: no plural convention.
+        match (self.container(), self.element_type()) {
+            (Some(c @ (Container::Vec | Container::Vvec)), Some(ty)) => {
+                ty.legacy_extension(c).unwrap_or(ty.extension(c))
+            }
             _ => self.name(),
         }
     }
 
     /// Normalize an extension string to the preferred canonical form.
-    ///
-    /// Accepts any recognized synonym (e.g. `"fvec"`, `"fvecs"`, `"f32vec"`)
-    /// and returns the preferred extension string to use when writing a new
-    /// file of the same format — the plural form for xvec/vvec types.
     pub fn canonical_extension(ext: &str) -> Option<&'static str> {
         Self::from_extension(ext).map(|f| f.preferred_extension())
     }
 
-    /// Detect format from a bare file extension.
+    /// Detect format from a file extension string: the containers by
+    /// name, everything else by the element model's one table.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
-            // Container
             "npy" => Some(Self::Npy),
             "parquet" => Some(Self::Parquet),
             "slab" => Some(Self::Slab),
             "hdf5" | "h5" => Some(Self::Hdf5),
-            // Float vector
-            "fvec" | "fvecs" => Some(Self::Fvec),
-            "dvec" | "dvecs" => Some(Self::Dvec),
-            "mvec" | "mvecs" => Some(Self::Mvec),
-            // Integer vector (legacy names)
-            "bvec" | "bvecs" => Some(Self::Bvec),
-            "svec" | "svecs" => Some(Self::Svec),
-            "ivec" | "ivecs" => Some(Self::Ivec),
-            // Integer vector (explicit names)
-            "u8vec" | "u8vecs" => Some(Self::Bvec),
-            "i8vec" | "i8vecs" => Some(Self::I8vec),
-            "u16vec" | "u16vecs" => Some(Self::U16vec),
-            "i16vec" | "i16vecs" => Some(Self::Svec),
-            "u32vec" | "u32vecs" => Some(Self::U32vec),
-            "i32vec" | "i32vecs" => Some(Self::Ivec),
-            "i64vec" | "i64vecs" => Some(Self::I64vec),
-            "u64vec" | "u64vecs" => Some(Self::U64vec),
-            // Variable-length vector (vvec)
-            "fvvec" | "fvvecs" | "f32vvec" | "f32vvecs" => Some(Self::Fvvec),
-            "dvvec" | "dvvecs" | "f64vvec" | "f64vvecs" => Some(Self::Dvvec),
-            "mvvec" | "mvvecs" | "f16vvec" | "f16vvecs" => Some(Self::Mvvec),
-            "bvvec" | "bvvecs" | "u8vvec" | "u8vvecs" => Some(Self::Bvvec),
-            "i8vvec" | "i8vvecs" => Some(Self::I8vvec),
-            "svvec" | "svvecs" | "i16vvec" | "i16vvecs" => Some(Self::Svvec),
-            "u16vvec" | "u16vvecs" => Some(Self::U16vvec),
-            "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => Some(Self::Ivvec),
-            "u32vvec" | "u32vvecs" => Some(Self::U32vvec),
-            "i64vvec" | "i64vvecs" => Some(Self::I64vvec),
-            "u64vvec" | "u64vvecs" => Some(Self::U64vvec),
-            // Scalar (flat packed)
-            "u8" => Some(Self::ScalarU8),
-            "i8" => Some(Self::ScalarI8),
-            "u16" => Some(Self::ScalarU16),
-            "i16" => Some(Self::ScalarI16),
-            "u32" => Some(Self::ScalarU32),
-            "i32" => Some(Self::ScalarI32),
-            "u64" => Some(Self::ScalarU64),
-            "i64" => Some(Self::ScalarI64),
-            _ => None,
+            other => {
+                let (ty, container) = ElementType::parse_extension(other)?;
+                Self::of(container, ty)
+            }
         }
     }
 
@@ -434,20 +443,10 @@ impl VecFormat {
 
     /// Human-readable data type name.
     pub fn data_type_name(self) -> &'static str {
-        match self {
-            Self::Fvec | Self::Fvvec => "float32",
-            Self::Dvec | Self::Dvvec => "float64",
-            Self::Mvec | Self::Mvvec => "float16",
-            Self::Bvec | Self::Bvvec | Self::ScalarU8 => "uint8",
-            Self::I8vec | Self::I8vvec | Self::ScalarI8 => "int8",
-            Self::U16vec | Self::U16vvec | Self::ScalarU16 => "uint16",
-            Self::Svec | Self::Svvec | Self::ScalarI16 => "int16",
-            Self::U32vec | Self::U32vvec | Self::ScalarU32 => "uint32",
-            Self::Ivec | Self::Ivvec | Self::ScalarI32 => "int32",
-            Self::U64vec | Self::U64vvec | Self::ScalarU64 => "uint64",
-            Self::I64vec | Self::I64vvec | Self::ScalarI64 => "int64",
-            Self::Slab => "bytes",
-            Self::Npy | Self::Parquet | Self::Hdf5 => "float",
+        match self.element_type() {
+            Some(ty) => ty.long_name(),
+            None if self == Self::Slab => "bytes",
+            None => "float",
         }
     }
 
@@ -460,5 +459,65 @@ impl VecFormat {
 impl fmt::Display for VecFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The format a facet is written in is keyed by element type**,
+    /// not by width: an i8 source writes `.i8vecs` and a u16 source
+    /// `.u16vecs`. The retired `Facet::preferred_format(element_size)`
+    /// chose by width — `xvec_for_element_size` gave `Bvec` for every
+    /// 1-byte type and `Svec` for every 2-byte one.
+    #[test]
+    fn preferred_vec_format_is_keyed_by_type() {
+        use vectordata::dataset::StandardFacet as F;
+        assert_eq!(preferred_vec_format(F::BaseVectors, ElementType::I8), VecFormat::I8vec);
+        assert_eq!(preferred_vec_format(F::BaseVectors, ElementType::U16), VecFormat::U16vec);
+        assert_eq!(preferred_vec_format(F::QueryVectors, ElementType::BF16), VecFormat::Bf16vec);
+        assert_eq!(preferred_vec_format(F::NeighborDistances, ElementType::F32), VecFormat::Fvec);
+        assert_eq!(preferred_vec_format(F::NeighborIndices, ElementType::F32), VecFormat::Ivec);
+        assert_eq!(preferred_vec_format(F::MetadataContent, ElementType::U8), VecFormat::Slab);
+        assert_eq!(preferred_vec_format(F::QuantScale, ElementType::U8), VecFormat::ScalarF32);
+        assert_eq!(preferred_vec_format(F::QuantSum, ElementType::U8), VecFormat::ScalarI32);
+        assert_eq!(element_type_of_width(1), ElementType::U8);
+        assert_eq!(element_type_of_width(2), ElementType::F16);
+        assert_eq!(element_type_of_width(4), ElementType::F32);
+        assert_eq!(element_type_of_width(8), ElementType::F64);
+    }
+
+    /// **The facet spec veks-core answers from is vectordata's**: the
+    /// `metadata_indices` alias resolves, which the retired copy had
+    /// lost.
+    #[test]
+    fn metadata_indices_resolves_in_veks_core() {
+        assert_eq!(StandardFacet::from_alias("metadata_indices"), Some(StandardFacet::MetadataResults));
+        assert_eq!(StandardFacet::from_key("quant_scale"), Some(StandardFacet::QuantScale));
+    }
+
+    /// **veks-core's `VecFormat` names every element type in every
+    /// layout**, and its spellings are the model's.
+    #[test]
+    fn vec_format_covers_the_element_model() {
+        for &ty in ElementType::ALL {
+            for container in [Container::Vec, Container::Vvec, Container::Scalar] {
+                let fmt = VecFormat::of(container, ty).unwrap_or_else(|| panic!("{ty} in {container:?}"));
+                assert_eq!((fmt.element_type(), fmt.container()), (Some(ty), Some(container)));
+                assert_eq!(fmt.element_size(), ty.byte_width());
+                assert_eq!(VecFormat::from_extension(ty.extension(container)), Some(fmt));
+                for alias in ty.aliases(container) {
+                    assert_eq!(VecFormat::from_extension(alias), Some(fmt), "{alias}");
+                }
+                assert_eq!(VecFormat::from_extension(fmt.preferred_extension()), Some(fmt));
+            }
+        }
+        assert_eq!(VecFormat::Fvec.preferred_extension(), "fvecs");
+        assert_eq!(VecFormat::Ivvec.preferred_extension(), "ivvecs");
+        assert_eq!(VecFormat::Bf16vec.preferred_extension(), "bf16vecs");
+        assert_eq!(VecFormat::Bf16vec.data_type_name(), "bfloat16");
+        assert_eq!(VecFormat::Slab.data_type_name(), "bytes");
+        assert_eq!(VecFormat::from_extension("h5"), Some(VecFormat::Hdf5));
     }
 }

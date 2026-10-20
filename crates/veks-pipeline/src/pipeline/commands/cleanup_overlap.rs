@@ -10,6 +10,7 @@
 //! This is the fix counterpart to `analyze overlap`, which only detects
 //! the problem. When overlap count is zero the query file is untouched.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -103,7 +104,7 @@ impl CommandOp for CleanupOverlapOp {
             );
         }
 
-        let elem_size = base_etype.element_size();
+        let elem_size = base_etype.byte_width();
 
         let write_path = output_path.as_ref().unwrap_or(&query_path);
         let result = fix_overlap(&base_path, &query_path, write_path, elem_size, &ctx.ui);

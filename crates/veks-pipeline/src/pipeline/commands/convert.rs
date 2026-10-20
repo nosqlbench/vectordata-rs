@@ -224,8 +224,8 @@ Convert with explicit source format override:
         // Use facet-aware reader: metadata_content parquet uses the MNode
         // reader which handles arbitrary scalar columns, not just list-of-float.
         let facet = options.get("facet")
-            .and_then(|f| veks_core::formats::facet::Facet::from_key(f)
-                .or_else(|| veks_core::formats::facet::Facet::from_alias(f)));
+            .and_then(|f| veks_core::formats::StandardFacet::from_key(f)
+                .or_else(|| veks_core::formats::StandardFacet::from_alias(f)));
         let source_result = match facet {
             Some(f) => reader::open_source_for_facet(&source_path, source_format, f, threads, None),
             None => reader::open_source(&source_path, source_format, threads, None),
@@ -1001,10 +1001,10 @@ fn build_schema_sidecar(
     source_path: &Path,
     source_format: VecFormat,
     to_format: VecFormat,
-    facet: Option<veks_core::formats::facet::Facet>,
+    facet: Option<veks_core::formats::StandardFacet>,
     record_count: Option<u64>,
 ) -> Option<vectordata::metadata_schema::MetadataSchema> {
-    use veks_core::formats::facet::Facet;
+    use veks_core::formats::StandardFacet as Facet;
     use veks_core::formats::reader::parquet_mnode::ParquetMnodeReader;
 
     if !matches!(to_format, VecFormat::Slab) { return None; }
@@ -1063,7 +1063,7 @@ fn try_fast_parquet_to_xvec(
     if source_format != VecFormat::Parquet { return None; }
     if !to_format.is_uniform_xvec() { return None; }
     if let Some(f) = options.get("facet") {
-        use veks_core::formats::facet::Facet;
+        use veks_core::formats::StandardFacet as Facet;
         if let Some(facet) = Facet::from_key(f).or_else(|| Facet::from_alias(f))
             && matches!(
                 facet,
@@ -1275,7 +1275,7 @@ fn try_fast_xvec_dir_to_xvec(
     // (base_vectors, query_vectors, etc.) are pure xvec payloads and
     // are exactly what this fast path is built to gather.
     if let Some(f) = options.get("facet") {
-        use veks_core::formats::facet::Facet;
+        use veks_core::formats::StandardFacet as Facet;
         if let Some(facet) = Facet::from_key(f).or_else(|| Facet::from_alias(f))
             && matches!(
                 facet,

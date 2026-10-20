@@ -13,7 +13,7 @@ pub mod xvec;
 use std::path::Path;
 
 use super::VecFormat;
-use crate::formats::facet::Facet;
+use crate::formats::StandardFacet;
 
 /// Trait for reading vector records from a source format.
 ///
@@ -137,7 +137,7 @@ pub fn open_source(path: &Path, format: VecFormat, threads: usize, max_count: Op
 pub fn probe_source_for_facet(
     path: &Path,
     format: VecFormat,
-    facet: Facet,
+    facet: StandardFacet,
 ) -> Result<SourceMeta, String> {
     if facet.is_mnode() && format == VecFormat::Parquet {
         parquet_mnode::ParquetMnodeReader::probe(path)
@@ -158,7 +158,7 @@ pub fn probe_source_for_facet(
 pub fn open_source_for_facet(
     path: &Path,
     format: VecFormat,
-    facet: Facet,
+    facet: StandardFacet,
     threads: usize,
     max_count: Option<u64>,
 ) -> Result<Box<dyn VecSource>, String> {

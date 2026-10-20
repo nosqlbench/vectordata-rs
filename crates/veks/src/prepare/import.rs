@@ -7,6 +7,8 @@
 //! builds the superset pipeline graph, resolves each slot to `Materialized`,
 //! `Identity`, or `Absent`, then emits only the materialized steps.
 
+use veks_pipeline::pipeline::element_type::ElementTypeKnn;
+use veks_pipeline::pipeline::element_type::ElementTypeExt;
 use std::path::{Path, PathBuf};
 
 use crate::formats::VecFormat;
@@ -521,14 +523,11 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     let import_ext = if needs_import {
         args.base_vectors.as_ref()
             .and_then(|p| {
+                // A vector file keeps its own element type through the
+                // import; a container (npy, parquet, hdf5) holds floats.
                 let fmt = VecFormat::detect(p)?;
-                let meta = veks_core::formats::reader::probe_source(p, fmt).ok()?;
-                Some(match meta.element_size {
-                    1 => "bvecs",
-                    2 => "mvecs",
-                    8 => "dvecs",
-                    _ => "fvecs", // 4 bytes (f32/i32) → fvecs
-                })
+                let ty = fmt.element_type()?;
+                Some(VecFormat::of(vectordata::typed_access::Container::Vec, ty)?.preferred_extension())
             })
             .unwrap_or("fvecs")
     } else {

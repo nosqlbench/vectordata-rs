@@ -14,15 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
-use vectordata::io::XvecReader;
-use vectordata::io::VectorReader;
 
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     ResourceDesc, Status, StreamContext, render_options_table,
 };
 use crate::pipeline::atomic_write::safe_create_file;
-use crate::pipeline::element_type::ElementType;
 
 /// Default L2-norm threshold for near-zero detection.
 const DEFAULT_THRESHOLD: f64 = 1e-6;
@@ -101,78 +98,12 @@ impl CommandOp for AnalyzeZerosOp {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_THRESHOLD);
 
-        let etype = match ElementType::from_path(&source_path) {
-            Ok(t) => t,
-            Err(e) => return error_result(e, start),
-        };
-
         // Open reader and extract (count, get_f64_fn) based on element type.
         // All components are upcast to f64 for norm computation (SRD §19.2).
-        let (count, get_f64): (usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
-            ElementType::F32 => {
-                let r = match XvecReader::<f32>::open_path(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<f32>::count(&r);
-                (fc, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::F16 => {
-                let r = match XvecReader::<half::f16>::open_path(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<half::f16>::count(&r);
-                (fc, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
-            }
-            ElementType::F64 => {
-                let r = match XvecReader::<f64>::open_path(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<f64>::count(&r);
-                (fc, Box::new(move |i| r.get(i).unwrap_or_default()))
-            }
-            ElementType::I32 => {
-                let r = match XvecReader::<i32>::open_path(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i32>::count(&r);
-                (fc, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::I16 => {
-                let r = match XvecReader::<i16>::open_path(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i16>::count(&r);
-                (fc, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U8 | ElementType::I8 => {
-                let r = match XvecReader::<u8>::open_path(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<u8>::count(&r);
-                (fc, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U16 => {
-                let r = match XvecReader::<i16>::open_path(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i16>::count(&r);
-                (fc, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U32 => {
-                let r = match XvecReader::<i32>::open_path(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i32>::count(&r);
-                (fc, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U64 | ElementType::I64 => {
-                let r = match XvecReader::<f64>::open_path(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<f64>::count(&r);
-                (fc, Box::new(move |i| r.get(i).unwrap_or_default().to_vec()))
-            }
+        let src = match crate::pipeline::element_type::F64Vectors::open(&source_path) {
+            Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
         };
+        let (count, get_f64): (usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = (src.count(), src.into_get());
 
         let threads = ctx.governor.current_or("threads", ctx.threads as u64) as usize;
         let pool = rayon::ThreadPoolBuilder::new()

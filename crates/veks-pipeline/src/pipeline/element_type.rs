@@ -1,223 +1,129 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared element type enum for vector and scalar file formats.
+//! Library API. The element model as the pipeline uses it.
 //!
-//! [`ElementType`] maps file extensions to their element types and provides
-//! convenience methods for querying type properties such as element size,
-//! floating-point status, and SIMD distance support.
+//! The types, the extension table and the conversion rules are the
+//! shared model ([`ElementType`], [`Element`], from `veks-datatypes`
+//! through vectordata), re-exported here under the path the pipeline
+//! has always imported them from. What this module adds is the
+//! pipeline's own numeric policy for each type — which types the SIMD
+//! kernels take, what counts as a unit-norm vector at each precision —
+//! as [`ElementTypeKnn`], and [`dispatch_reader!`](crate::dispatch_reader), which opens a file
+//! at the type its extension names.
 
-use std::path::Path;
+pub use vectordata::typed_access::{Element, ElementConversion, ElementType, ElementTypeExt};
 
-/// Element type of a vector or scalar file, inferred from the file extension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ElementType {
-    /// 64-bit IEEE 754 double-precision float (`.dvec`).
-    F64,
-    /// 32-bit IEEE 754 single-precision float (`.fvec`).
-    F32,
-    /// 16-bit IEEE 754 half-precision float (`.mvec`).
-    F16,
-    /// 8-bit unsigned integer (`.bvec`, `.u8vec`, `.u8`).
-    U8,
-    /// 8-bit signed integer (`.i8vec`, `.i8`).
-    I8,
-    /// 16-bit unsigned integer (`.u16vec`, `.u16`).
-    U16,
-    /// 16-bit signed integer (`.svec`, `.i16vec`, `.i16`).
-    I16,
-    /// 32-bit unsigned integer (`.u32vec`, `.u32`).
-    U32,
-    /// 32-bit signed integer (`.ivec`, `.i32vec`, `.i32`).
-    I32,
-    /// 64-bit unsigned integer (`.u64vec`, `.u64`).
-    U64,
-    /// 64-bit signed integer (`.i64vec`, `.i64`).
-    I64,
+/// The pipeline's numeric policy per element type.
+pub trait ElementTypeKnn: Copy {
+    /// Whether the SIMD distance kernels take this type directly: the
+    /// IEEE floats. A `bf16` or integer corpus reaches them widened to
+    /// f32 by the conversion table.
+    fn supports_simd_distance(self) -> bool;
+
+    /// The machine epsilon of a float type; `None` for an integer.
+    fn machine_epsilon(self) -> Option<f64>;
+
+    /// How far from 1.0 a vector's norm may be and still count as
+    /// normalized, for a float type; `None` for an integer.
+    fn normalization_threshold(self, dim: usize) -> Option<f64>;
 }
 
-impl ElementType {
-    /// Detect the element type from a file path's extension.
-    ///
-    /// Returns an error if the extension is missing or unrecognized.
-    pub fn from_path(path: &Path) -> Result<Self, String> {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .ok_or_else(|| format!("no file extension: {}", path.display()))?;
-
-        match ext.to_lowercase().as_str() {
-            "dvec" | "dvecs" | "dvvec" | "dvvecs" | "f64vec" | "f64vecs" | "f64vvec" | "f64vvecs" => Ok(Self::F64),
-            "fvec" | "fvecs" | "fvvec" | "fvvecs" | "f32vec" | "f32vecs" | "f32vvec" | "f32vvecs" => Ok(Self::F32),
-            "mvec" | "mvecs" | "mvvec" | "mvvecs" | "f16vec" | "f16vecs" | "f16vvec" | "f16vvecs" => Ok(Self::F16),
-            "bvec" | "bvecs" | "bvvec" | "bvvecs" | "u8vec" | "u8vecs" | "u8vvec" | "u8vvecs" | "u8" => Ok(Self::U8),
-            "i8vec" | "i8vecs" | "i8vvec" | "i8vvecs" | "i8" => Ok(Self::I8),
-            "u16vec" | "u16vecs" | "u16vvec" | "u16vvecs" | "u16" => Ok(Self::U16),
-            "svec" | "svecs" | "svvec" | "svvecs" | "i16vec" | "i16vecs" | "i16vvec" | "i16vvecs" | "i16" => Ok(Self::I16),
-            "u32vec" | "u32vecs" | "u32vvec" | "u32vvecs" | "u32" => Ok(Self::U32),
-            "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vec" | "i32vecs" | "i32vvec" | "i32vvecs" | "i32" => Ok(Self::I32),
-            "u64vec" | "u64vecs" | "u64vvec" | "u64vvecs" | "u64" => Ok(Self::U64),
-            "i64vec" | "i64vecs" | "i64vvec" | "i64vvecs" | "i64" => Ok(Self::I64),
-            _ => Err(format!("unrecognized vector extension '.{}': {}", ext, path.display())),
-        }
-    }
-
-    /// Returns `true` if this is a floating-point element type.
-    pub fn is_float(&self) -> bool {
+impl ElementTypeKnn for ElementType {
+    fn supports_simd_distance(self) -> bool {
         matches!(self, Self::F64 | Self::F32 | Self::F16)
     }
 
-    /// Returns `true` if SIMD-accelerated distance functions are available
-    /// (the float types; `veks-simd` has no integer kernels).
-    pub fn supports_simd_distance(&self) -> bool {
-        matches!(self, Self::F64 | Self::F32 | Self::F16)
-    }
-
-    /// Machine epsilon for floating-point types. `None` for integers.
-    pub fn machine_epsilon(&self) -> Option<f64> {
+    fn machine_epsilon(self) -> Option<f64> {
         match self {
             Self::F16 => Some(9.77e-4_f64),
+            Self::BF16 => Some(7.81e-3_f64),
             Self::F32 => Some(1.19e-7_f64),
             Self::F64 => Some(2.22e-16_f64),
             _ => None,
         }
     }
 
-    /// Fixed normalization threshold per element type. `None` for non-float.
-    pub fn normalization_threshold(&self, _dim: usize) -> Option<f64> {
+    fn normalization_threshold(self, _dim: usize) -> Option<f64> {
         match self {
             Self::F16 => Some(1e-1),
+            Self::BF16 => Some(1e-1),
             Self::F32 => Some(1e-5),
             Self::F64 => Some(1e-14),
             _ => None,
         }
     }
-
-    /// Size of a single element in bytes.
-    pub fn element_size(&self) -> usize {
-        match self {
-            Self::F64 | Self::I64 | Self::U64 => 8,
-            Self::F32 | Self::I32 | Self::U32 => 4,
-            Self::F16 | Self::I16 | Self::U16 => 2,
-            Self::U8 | Self::I8 => 1,
-        }
-    }
-
-    /// Returns `true` if the file extension is a bare scalar format (`.u8`,
-    /// `.i32`, etc.) rather than an xvec format (`.fvec`, `.ivec`, `.bvec`).
-    ///
-    /// Scalar files have one element per record with no dimension header.
-    /// Xvec files have a 4-byte dimension prefix per record.
-    pub fn is_scalar_extension(ext: &str) -> bool {
-        matches!(ext.to_lowercase().as_str(),
-            "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64"
-            | "f32" | "f64"
-        )
-    }
 }
 
-impl std::fmt::Display for ElementType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let label = match self {
-            Self::F64 => "f64",
-            Self::F32 => "f32",
-            Self::F16 => "f16",
-            Self::U8 => "u8",
-            Self::I8 => "i8",
-            Self::U16 => "u16",
-            Self::I16 => "i16",
-            Self::U32 => "u32",
-            Self::I32 => "i32",
-            Self::U64 => "u64",
-            Self::I64 => "i64",
-        };
-        write!(f, "{}", label)
-    }
-}
-
-/// Trait for converting vector elements to `f64` for analysis.
-pub trait ToF64: Copy {
-    /// Widen `self` to `f64`.
-    fn to_f64(self) -> f64;
-}
-
-impl ToF64 for f64 { #[inline] fn to_f64(self) -> f64 { self } }
-impl ToF64 for f32 { #[inline] fn to_f64(self) -> f64 { self as f64 } }
-impl ToF64 for half::f16 { #[inline] fn to_f64(self) -> f64 { self.to_f64() } }
-impl ToF64 for i32 { #[inline] fn to_f64(self) -> f64 { self as f64 } }
-impl ToF64 for i16 { #[inline] fn to_f64(self) -> f64 { self as f64 } }
-impl ToF64 for u8 { #[inline] fn to_f64(self) -> f64 { self as f64 } }
-impl ToF64 for i8 { #[inline] fn to_f64(self) -> f64 { self as f64 } }
-impl ToF64 for u16 { #[inline] fn to_f64(self) -> f64 { self as f64 } }
-impl ToF64 for u32 { #[inline] fn to_f64(self) -> f64 { self as f64 } }
-impl ToF64 for u64 { #[inline] fn to_f64(self) -> f64 { self as f64 } }
-impl ToF64 for i64 { #[inline] fn to_f64(self) -> f64 { self as f64 } }
-
-/// Dispatch macro for vector element types.
-///
-/// Opens the appropriate `XvecReader<T>` based on `ElementType` and
-/// calls the provided expression block with the reader bound as `$reader`.
+/// Open a uniform vector file at the type `$etype` names and run
+/// `$body` with `$reader` bound to the `XvecReader<T>` of that type.
+/// Every type opens as itself; the conversion table decides what a
+/// caller may then read it as.
 #[macro_export]
 macro_rules! dispatch_reader {
     ($etype:expr, $path:expr, $reader:ident => $body:expr) => {
-        match $etype {
-            $crate::pipeline::element_type::ElementType::F64 => {
-                let $reader = vectordata::io::XvecReader::<f64>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-            $crate::pipeline::element_type::ElementType::F32 => {
-                let $reader = vectordata::io::XvecReader::<f32>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-            $crate::pipeline::element_type::ElementType::F16 => {
-                let $reader = vectordata::io::XvecReader::<half::f16>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-            $crate::pipeline::element_type::ElementType::I32 => {
-                let $reader = vectordata::io::XvecReader::<i32>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-            $crate::pipeline::element_type::ElementType::I16 => {
-                let $reader = vectordata::io::XvecReader::<i16>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-            $crate::pipeline::element_type::ElementType::U8 => {
-                let $reader = vectordata::io::XvecReader::<u8>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-            $crate::pipeline::element_type::ElementType::I8 => {
-                let $reader = vectordata::io::XvecReader::<i8>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-            $crate::pipeline::element_type::ElementType::U16 => {
-                let $reader = vectordata::io::XvecReader::<u16>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-            $crate::pipeline::element_type::ElementType::U32 => {
-                let $reader = vectordata::io::XvecReader::<u32>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-            $crate::pipeline::element_type::ElementType::U64 => {
-                let $reader = vectordata::io::XvecReader::<u64>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-            $crate::pipeline::element_type::ElementType::I64 => {
-                let $reader = vectordata::io::XvecReader::<i64>::open_path($path)
-                    .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
-                $body
-            }
-        }
+        $crate::pipeline::element_type::dispatch_element!($etype, T => {
+            let $reader = vectordata::io::XvecReader::<T>::open_path($path)
+                .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
+            $body
+        })
     };
+}
+
+pub use veks_datatypes::dispatch_element;
+
+/// A uniform vector file read as f64 whatever element type it holds,
+/// for the analysis commands that upcast every component (SRD §19.2).
+/// The file is opened at its own type and each element is widened by
+/// [`Element::as_f64`]: exact for every float and for integers up to
+/// 53 bits, rounded above that.
+pub struct F64Vectors {
+    reader: vectordata::io::AnyVectorReader,
+}
+
+impl F64Vectors {
+    /// Open `path` at the type its extension names.
+    pub fn open(path: &std::path::Path) -> Result<Self, String> {
+        vectordata::io::open_vec_native(&path.to_string_lossy())
+            .map(|reader| Self { reader })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Number of records.
+    pub fn count(&self) -> usize {
+        self.reader.count()
+    }
+
+    /// Elements per record.
+    pub fn dim(&self) -> usize {
+        self.reader.dim()
+    }
+
+    /// The element type the file holds.
+    pub fn element_type(&self) -> ElementType {
+        self.reader.element_type()
+    }
+
+    /// Record `index` as f64, or an empty vector past the end — the
+    /// shape the analysis loops have always read.
+    pub fn get(&self, index: usize) -> Vec<f64> {
+        use vectordata::io::AnyVectorReader as A;
+        macro_rules! widen {
+            ($($v:ident),*) => {
+                match &self.reader {
+                    $(A::$v(r) => r.get(index).unwrap_or_default().iter().map(|x| x.as_f64()).collect(),)*
+                    _ => Vec::new(),
+                }
+            };
+        }
+        widen!(U8, I8, U16, I16, U32, I32, U64, I64, F16, BF16, F32, F64)
+    }
+
+    /// The reader as the record-fetching closure the analysis commands
+    /// run across their thread pools.
+    pub fn into_get(self) -> Box<dyn Fn(usize) -> Vec<f64> + Send + Sync> {
+        Box::new(move |i| self.get(i))
+    }
 }
 
 #[cfg(test)]
@@ -234,9 +140,10 @@ mod tests {
             ("data.ivec", ElementType::I32),
             ("data.svec", ElementType::I16),
             ("data.bvec", ElementType::U8),
+            ("data.bf16vecs", ElementType::BF16),
         ];
         for (filename, expected) in &cases {
-            assert_eq!(ElementType::from_path(&PathBuf::from(filename)).unwrap(), *expected,
+            assert_eq!(ElementType::from_path(PathBuf::from(filename)).unwrap(), *expected,
                 "failed for {}", filename);
         }
     }
@@ -254,7 +161,7 @@ mod tests {
             ("data.i64vec", ElementType::I64),
         ];
         for (filename, expected) in &cases {
-            assert_eq!(ElementType::from_path(&PathBuf::from(filename)).unwrap(), *expected,
+            assert_eq!(ElementType::from_path(PathBuf::from(filename)).unwrap(), *expected,
                 "failed for {}", filename);
         }
     }
@@ -270,21 +177,23 @@ mod tests {
             ("data.i32", ElementType::I32),
             ("data.u64", ElementType::U64),
             ("data.i64", ElementType::I64),
+            ("data.f32", ElementType::F32),
+            ("data.bf16", ElementType::BF16),
         ];
         for (filename, expected) in &cases {
-            assert_eq!(ElementType::from_path(&PathBuf::from(filename)).unwrap(), *expected,
+            assert_eq!(ElementType::from_path(PathBuf::from(filename)).unwrap(), *expected,
                 "failed for {}", filename);
         }
     }
 
     #[test]
     fn test_from_path_unknown_extension() {
-        assert!(ElementType::from_path(&PathBuf::from("data.csv")).is_err());
+        assert!(ElementType::from_path(PathBuf::from("data.csv")).is_err());
     }
 
     #[test]
     fn test_from_path_no_extension() {
-        assert!(ElementType::from_path(&PathBuf::from("data")).is_err());
+        assert!(ElementType::from_path(PathBuf::from("data")).is_err());
     }
 
     #[test]
@@ -292,24 +201,36 @@ mod tests {
         assert!(ElementType::F64.is_float());
         assert!(ElementType::F32.is_float());
         assert!(ElementType::F16.is_float());
+        assert!(ElementType::BF16.is_float());
         assert!(!ElementType::I32.is_float());
         assert!(!ElementType::U8.is_float());
         assert!(!ElementType::U64.is_float());
     }
 
+    /// The shared model and the pipeline's policy agree on which types
+    /// are floats, and only the IEEE floats go to the kernels as they
+    /// are.
     #[test]
-    fn test_element_size() {
-        assert_eq!(ElementType::F64.element_size(), 8);
-        assert_eq!(ElementType::F32.element_size(), 4);
-        assert_eq!(ElementType::F16.element_size(), 2);
-        assert_eq!(ElementType::I32.element_size(), 4);
-        assert_eq!(ElementType::I16.element_size(), 2);
-        assert_eq!(ElementType::U8.element_size(), 1);
-        assert_eq!(ElementType::I8.element_size(), 1);
-        assert_eq!(ElementType::U16.element_size(), 2);
-        assert_eq!(ElementType::U32.element_size(), 4);
-        assert_eq!(ElementType::U64.element_size(), 8);
-        assert_eq!(ElementType::I64.element_size(), 8);
+    fn bf16_is_a_float_without_simd_distance() {
+        for ty in ElementType::ALL {
+            assert_eq!(ty.machine_epsilon().is_some(), ty.is_float(), "{ty}");
+            assert_eq!(ty.normalization_threshold(128).is_some(), ty.is_float(), "{ty}");
+            if ty.supports_simd_distance() {
+                assert!(ty.is_float() && *ty != ElementType::BF16, "{ty}");
+            }
+        }
+        assert!(!ElementType::BF16.supports_simd_distance());
+        assert!(ElementType::F16.supports_simd_distance());
+    }
+
+    /// The path the pipeline imports from names the shared type.
+    #[test]
+    fn the_pipeline_element_type_is_the_shared_one() {
+        fn same<T: 'static>() -> bool {
+            std::any::TypeId::of::<T>() == std::any::TypeId::of::<veks_datatypes::ElementType>()
+        }
+        assert!(same::<ElementType>());
+        assert!(same::<vectordata::ElementType>());
     }
 
     #[test]
@@ -317,6 +238,15 @@ mod tests {
         assert_eq!(format!("{}", ElementType::F64), "f64");
         assert_eq!(format!("{}", ElementType::U16), "u16");
         assert_eq!(format!("{}", ElementType::I64), "i64");
+    }
+
+    #[test]
+    fn test_machine_epsilon() {
+        assert!(ElementType::F16.machine_epsilon().is_some());
+        assert!(ElementType::F32.machine_epsilon().is_some());
+        assert!(ElementType::F64.machine_epsilon().is_some());
+        assert!(ElementType::I32.machine_epsilon().is_none());
+        assert!(ElementType::U64.machine_epsilon().is_none());
     }
 
     /// The dispatch opens every file as the type its extension names:
@@ -333,14 +263,5 @@ mod tests {
             })
         })();
         assert_eq!(opened.unwrap(), std::any::type_name::<vectordata::io::XvecReader<i8>>());
-    }
-
-    #[test]
-    fn test_machine_epsilon() {
-        assert!(ElementType::F16.machine_epsilon().is_some());
-        assert!(ElementType::F32.machine_epsilon().is_some());
-        assert!(ElementType::F64.machine_epsilon().is_some());
-        assert!(ElementType::I32.machine_epsilon().is_none());
-        assert!(ElementType::U64.machine_epsilon().is_none());
     }
 }

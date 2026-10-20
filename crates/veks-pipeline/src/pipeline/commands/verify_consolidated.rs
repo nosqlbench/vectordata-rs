@@ -22,6 +22,7 @@
 //! partitioned across threads, each maintaining its own per-query heaps.
 //! At each boundary, partial heaps are merged before verification.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

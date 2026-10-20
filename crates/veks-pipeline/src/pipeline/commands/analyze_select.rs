@@ -8,11 +8,10 @@
 //!
 //! Equivalent to the Java `CMD_analyze_select` command.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use vectordata::VectorReader;
-use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
@@ -97,129 +96,13 @@ impl CommandOp for AnalyzeSelectOp {
             Err(e) => return error_result(e, start),
         };
 
-        // Detect scalar format (no xvec header — flat packed values)
-        let ext = input_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let is_scalar = veks_core::formats::VecFormat::from_extension(ext)
-            .map(|f| f.is_scalar())
-            .unwrap_or(false);
-
-        // Open reader and extract (count, dim, get_f64_fn) based on element type.
-        let (count, _dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = if is_scalar {
-            // Scalar file: each record is a single element, no dim header
-            let file_size = std::fs::metadata(&input_path).map(|m| m.len()).unwrap_or(0);
-            let elem_size = etype.element_size();
-            let rc = if elem_size > 0 { file_size as usize / elem_size } else { 0 };
-            let path_clone = input_path.clone();
-            (rc, 1, Box::new(move |i: usize| {
-                use std::io::{Read, Seek, SeekFrom};
-                let elem_size = match ext {
-                    "u8" | "i8" => 1, "u16" | "i16" => 2,
-                    "u32" | "i32" => 4, "u64" | "i64" => 8,
-                    _ => 1,
-                };
-                let mut f = match std::fs::File::open(&path_clone) {
-                    Ok(f) => f, Err(_) => return vec![],
-                };
-                let _ = f.seek(SeekFrom::Start(i as u64 * elem_size as u64));
-                let mut buf = [0u8; 8];
-                let _ = f.read_exact(&mut buf[..elem_size]);
-                let val: f64 = match elem_size {
-                    1 => buf[0] as f64,
-                    2 => i16::from_le_bytes([buf[0], buf[1]]) as f64,
-                    4 => i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as f64,
-                    8 => i64::from_le_bytes(buf) as f64,
-                    _ => 0.0,
-                };
-                vec![val]
-            }) as Box<dyn Fn(usize) -> Vec<f64> + Sync>)
-        } else { match etype {
-            ElementType::F32 => {
-                let r = match XvecReader::<f32>::open_path(&input_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<f32>::count(&r);
-                let d = VectorReader::<f32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::F16 => {
-                let r = match XvecReader::<half::f16>::open_path(&input_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<half::f16>::count(&r);
-                let d = VectorReader::<half::f16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
-            }
-            ElementType::F64 => {
-                let r = match XvecReader::<f64>::open_path(&input_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<f64>::count(&r);
-                let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
-            }
-            ElementType::I32 => {
-                match XvecReader::<i32>::open_path(&input_path) {
-                    Ok(r) => {
-                        // Uniform-dimension ivec
-                        let fc = VectorReader::<i32>::count(&r);
-                        let d = VectorReader::<i32>::dim(&r);
-                        (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-                    }
-                    Err(vectordata::io::IoError::VariableLengthRecords(_)) => {
-                        // Variable-length ivec — use indexed reader
-                        let r = match vectordata::io::IndexedVvecReader::<i32>::open_path(&input_path) {
-                            Ok(r) => r,
-                            Err(e) => return error_result(format!("open indexed ivec: {}", e), start),
-                        };
-                        let rc = r.count();
-                        (rc, 0, Box::new(move |i: usize| {
-                            r.get_i32(i).unwrap_or_default().iter().map(|&v| v as f64).collect()
-                        }) as Box<dyn Fn(usize) -> Vec<f64> + Sync>)
-                    }
-                    Err(e) => return error_result(format!("open: {}", e), start),
-                }
-            }
-            ElementType::I16 => {
-                let r = match XvecReader::<i16>::open_path(&input_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i16>::count(&r);
-                let d = VectorReader::<i16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U8 | ElementType::I8 => {
-                let r = match XvecReader::<u8>::open_path(&input_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<u8>::count(&r);
-                let d = VectorReader::<u8>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U16 => {
-                let r = match XvecReader::<i16>::open_path(&input_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i16>::count(&r);
-                let d = VectorReader::<i16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U32 => {
-                let r = match XvecReader::<i32>::open_path(&input_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i32>::count(&r);
-                let d = VectorReader::<i32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U64 | ElementType::I64 => {
-                let r = match XvecReader::<f64>::open_path(&input_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<f64>::count(&r);
-                let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().to_vec()))
-            }
-        } }; // close match etype + else
+        // Open the file at its own type, a column or vectors, and read
+        // every component as f64.
+        let src = match crate::pipeline::element_type::F64Vectors::open(&input_path) {
+            Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+        };
+        let (count, _dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) =
+            (src.count(), src.dim(), src.into_get());
 
         // Parse ordinal spec: single number, comma-separated, or range [start,end)
         let ordinals = match parse_ordinal_spec(&ordinal_str, count) {

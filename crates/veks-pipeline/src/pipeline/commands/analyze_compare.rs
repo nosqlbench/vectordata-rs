@@ -14,14 +14,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
-use vectordata::io::XvecReader;
-use vectordata::io::VectorReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
-use crate::pipeline::element_type::ElementType;
 
 /// Pipeline command: K-S distribution comparison.
 pub struct AnalyzeCompareOp;
@@ -183,164 +180,16 @@ impl CommandOp for AnalyzeCompareOp {
         let synth_path = resolve_path(synthetic_str, &ctx.workspace);
 
         // Open original file with element-type dispatch
-        let orig_etype = match ElementType::from_path(&orig_path) {
-            Ok(t) => t,
-            Err(e) => return error_result(e, start),
+        let src = match crate::pipeline::element_type::F64Vectors::open(&orig_path) {
+            Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
         };
-        let (orig_count, orig_dim, orig_get): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match orig_etype {
-            ElementType::F32 => {
-                let r = match XvecReader::<f32>::open_path(&orig_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
-                };
-                let fc = VectorReader::<f32>::count(&r);
-                let d = VectorReader::<f32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::F16 => {
-                let r = match XvecReader::<half::f16>::open_path(&orig_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
-                };
-                let fc = VectorReader::<half::f16>::count(&r);
-                let d = VectorReader::<half::f16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
-            }
-            ElementType::F64 => {
-                let r = match XvecReader::<f64>::open_path(&orig_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
-                };
-                let fc = VectorReader::<f64>::count(&r);
-                let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
-            }
-            ElementType::I32 => {
-                let r = match XvecReader::<i32>::open_path(&orig_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
-                };
-                let fc = VectorReader::<i32>::count(&r);
-                let d = VectorReader::<i32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::I16 => {
-                let r = match XvecReader::<i16>::open_path(&orig_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
-                };
-                let fc = VectorReader::<i16>::count(&r);
-                let d = VectorReader::<i16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U8 | ElementType::I8 => {
-                let r = match XvecReader::<u8>::open_path(&orig_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
-                };
-                let fc = VectorReader::<u8>::count(&r);
-                let d = VectorReader::<u8>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U16 => {
-                let r = match XvecReader::<i16>::open_path(&orig_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
-                };
-                let fc = VectorReader::<i16>::count(&r);
-                let d = VectorReader::<i16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U32 => {
-                let r = match XvecReader::<i32>::open_path(&orig_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
-                };
-                let fc = VectorReader::<i32>::count(&r);
-                let d = VectorReader::<i32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U64 | ElementType::I64 => {
-                let r = match XvecReader::<f64>::open_path(&orig_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
-                };
-                let fc = VectorReader::<f64>::count(&r);
-                let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().to_vec()))
-            }
-        };
+        let (orig_count, orig_dim, orig_get): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = (src.count(), src.dim(), src.into_get());
 
         // Open synthetic file with element-type dispatch
-        let synth_etype = match ElementType::from_path(&synth_path) {
-            Ok(t) => t,
-            Err(e) => return error_result(e, start),
+        let src = match crate::pipeline::element_type::F64Vectors::open(&synth_path) {
+            Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
         };
-        let (synth_count, synth_dim, synth_get): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match synth_etype {
-            ElementType::F32 => {
-                let r = match XvecReader::<f32>::open_path(&synth_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
-                };
-                let fc = VectorReader::<f32>::count(&r);
-                let d = VectorReader::<f32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::F16 => {
-                let r = match XvecReader::<half::f16>::open_path(&synth_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
-                };
-                let fc = VectorReader::<half::f16>::count(&r);
-                let d = VectorReader::<half::f16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
-            }
-            ElementType::F64 => {
-                let r = match XvecReader::<f64>::open_path(&synth_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
-                };
-                let fc = VectorReader::<f64>::count(&r);
-                let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
-            }
-            ElementType::I32 => {
-                let r = match XvecReader::<i32>::open_path(&synth_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
-                };
-                let fc = VectorReader::<i32>::count(&r);
-                let d = VectorReader::<i32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::I16 => {
-                let r = match XvecReader::<i16>::open_path(&synth_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
-                };
-                let fc = VectorReader::<i16>::count(&r);
-                let d = VectorReader::<i16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U8 | ElementType::I8 => {
-                let r = match XvecReader::<u8>::open_path(&synth_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
-                };
-                let fc = VectorReader::<u8>::count(&r);
-                let d = VectorReader::<u8>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U16 => {
-                let r = match XvecReader::<i16>::open_path(&synth_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
-                };
-                let fc = VectorReader::<i16>::count(&r);
-                let d = VectorReader::<i16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U32 => {
-                let r = match XvecReader::<i32>::open_path(&synth_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
-                };
-                let fc = VectorReader::<i32>::count(&r);
-                let d = VectorReader::<i32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U64 | ElementType::I64 => {
-                let r = match XvecReader::<f64>::open_path(&synth_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
-                };
-                let fc = VectorReader::<f64>::count(&r);
-                let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().to_vec()))
-            }
-        };
+        let (synth_count, synth_dim, synth_get): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = (src.count(), src.dim(), src.into_get());
 
         if orig_dim != synth_dim {
             return error_result(

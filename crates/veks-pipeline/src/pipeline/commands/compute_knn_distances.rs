@@ -18,6 +18,7 @@
 //! convention (sign + sqrt-or-not) as `compute knn`, so verifiers can
 //! compare values bit-for-bit.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

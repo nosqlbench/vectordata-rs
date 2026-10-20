@@ -88,6 +88,7 @@ gemm = { version = "0.19", default-features = false, features = ["std", "rayon",
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 vectordata = { path = "../vectordata", version = "=3.0.4" }
+veks-datatypes = { path = "../veks-datatypes", version = "=3.0.4" }
 veks-core = { path = "../veks-core", version = "=3.0.4" }
 veks-completion = { path = "../veks-completion", version = "=3.0.4" }
 veks-completion-derive = { path = "../veks-completion-derive", version = "=3.0.4" }

@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use veks::prepare::import::ImportArgs;
+use vectordata::TestDataViewExt;
 
 #[path = "support/catalog_mirror.rs"]
 mod catalog_mirror;
@@ -402,7 +403,7 @@ fn a_capped_dataset_still_opens_and_reads() {
     let group = vectordata::TestDataGroup::load(out.to_str().unwrap())
         .expect("a capped dataset must still load");
     let view = group.profile("default").expect("default profile");
-    let base = view.base_vectors().expect("base vectors must open");
+    let base = view.base_vectors_as::<f32>().expect("base vectors must open");
     assert!(base.count() > 0, "base vectors read back empty");
     assert_eq!(base.dim(), 4);
     // And a value round-trips, so the declaration points at real data.
@@ -453,7 +454,7 @@ fn a_converted_dataset_builds_under_a_small_cap() {
     let group = vectordata::TestDataGroup::load(out.to_str().unwrap())
         .expect("a converted, capped dataset must load");
     let view = group.profile("default").expect("default profile");
-    let base = view.base_vectors().expect("base vectors must open");
+    let base = view.base_vectors_as::<f32>().expect("base vectors must open");
     assert!(base.count() > 0);
     assert_eq!(base.dim(), 4);
 }
@@ -476,7 +477,7 @@ fn an_f16_facet_shards_at_its_own_record_width() {
     // And the dataset still reads.
     let group = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
     let view = group.profile("default").unwrap();
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     assert!(base.count() > 0);
     assert_eq!(base.dim(), 4);
 }
@@ -528,6 +529,6 @@ fn the_neighbour_facets_shard_and_are_still_read_back() {
     assert!(log.contains("Pipeline complete") || !log.contains("failed"), "{log}");
     let group = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
     let view = group.profile("default").unwrap();
-    assert!(view.neighbor_indices().is_ok(), "neighbours must read back");
+    assert!(view.neighbor_indices_as::<i32>().is_ok(), "neighbours must read back");
     eprintln!("sharded neighbour facets: {sharded:?}");
 }

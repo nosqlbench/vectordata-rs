@@ -13,7 +13,7 @@ use std::time::Instant;
 use veks_core::formats::VecFormat;
 use veks_core::formats::reader;
 use veks_core::formats::writer::{self, SinkConfig};
-use veks_core::formats::facet::Facet;
+use veks_core::formats::StandardFacet as Facet;
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     ResourceDesc, Status, StreamContext, render_options_table,
@@ -173,7 +173,10 @@ work with.
             Ok(m) => m,
             Err(e) => return error_result(format!("failed to probe source {}: {}", source_path.display(), e), start),
         };
-        let target_format = facet.preferred_format(probe.element_size);
+        let element = source_format
+            .element_type()
+            .unwrap_or_else(|| veks_core::formats::element_type_of_width(probe.element_size));
+        let target_format = veks_core::formats::preferred_vec_format(facet, element);
 
         // Symlink fast path: if the source is already in the target format,
         // is a single file (not a directory), and no count limit is specified,
@@ -238,7 +241,10 @@ work with.
 
         let dimension = source.dimension();
         let element_size = source.element_size();
-        let target_format = facet.preferred_format(element_size);
+        let element = source_format
+            .element_type()
+            .unwrap_or_else(|| veks_core::formats::element_type_of_width(element_size));
+        let target_format = veks_core::formats::preferred_vec_format(facet, element);
 
         // Create output directory
         if let Some(parent) = output_path.parent()

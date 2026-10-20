@@ -38,6 +38,8 @@
 //! This gives the same sequential I/O, bounded memory, and resumability
 //! characteristics as unfiltered KNN.
 
+use crate::pipeline::element_type::ElementTypeKnn;
+use crate::pipeline::element_type::ElementTypeExt;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::io::{BufReader, Read as _, Write};

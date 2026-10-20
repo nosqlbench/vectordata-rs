@@ -7,6 +7,7 @@
 //! precision, and reports all vectors below the zero threshold.
 //! Multi-threaded with madvise(SEQUENTIAL) for maximum I/O throughput.
 
+use crate::pipeline::element_type::ElementTypeExt;
 use std::path::Path;
 use std::time::Instant;
 
