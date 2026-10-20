@@ -36,17 +36,23 @@ use vectordata::catalog::resolver::Catalog;
 // Load configured catalogs (~/.config/vectordata/catalogs.yaml)
 let catalog = Catalog::of(&CatalogSources::new().configure_default());
 
+use vectordata::TestDataViewExt;
+
 // Open a dataset by name → get vectors in two calls
 let group = catalog.open("my-dataset")?;
 let view = group.profile("default").unwrap();
-let base = view.base_vectors()?;
+let base = view.base_vectors_as::<f32>()?;
 println!("{} vectors, dim={}", base.count(), base.dim());
 let v: Vec<f32> = base.get(42)?;
 
 // Or even shorter — open a profile directly
 let view = catalog.open_profile("my-dataset", "default")?;
-let gt = view.neighbor_indices()?;
+let gt = view.neighbor_indices_as::<i32>()?;
 ```
+
+The type you ask for is yours to choose: a `bf16` or `u8` base reads
+as `f32` through the conversion table of §2.7, and `base_vectors_as::
+<u8>()` on a quantized corpus borrows the codes as they are.
 
 ### Discover available profiles and facets
 
@@ -92,9 +98,9 @@ use vectordata::view::TestDataView;
 let group = TestDataGroup::load("https://example.com/dataset/")?;
 let view = group.profile("default").unwrap();
 
-let base = view.base_vectors()?;           // Arc<dyn VectorReader<f32>>
-let gt   = view.neighbor_indices()?;       // Arc<dyn VectorReader<i32>>
-let mi   = view.metadata_indices()?;       // Arc<dyn VvecReader<i32>>
+let base = view.base_vectors_as::<f32>()?;       // Arc<dyn VectorReader<f32>>
+let gt   = view.neighbor_indices_as::<i32>()?;   // Arc<dyn VectorReader<i32>>
+let mi   = view.metadata_results_as::<i32>()?;   // Arc<dyn VvecReader<i32>>
 ```
 
 `TestDataGroup::load` falls back to `knn_entries.yaml`
@@ -289,20 +295,35 @@ run with `--at` or `--catalog`. In the library, problems are values on
 
 ## 2.3 File Extension Scheme
 
-See [SRD §22](22-vector-file-extensions.md) for the full
-specification.
+An extension names an element type and a container, and nothing
+else. The one table that reads them is `ElementType::parse_extension`
+in `veks-datatypes`, re-exported as `vectordata::ElementType`; the full
+table of types and spellings is [§1.2](01-data-model.md#12-element-types),
+and the design is `docs/design/srd-element-access.md` §3.
 
 ### Summary
 
 | Suffix | Structure | Example |
 |--------|-----------|---------|
-| `.<type>` | Scalar (flat packed, no header) | `.u8`, `.i32`, `.f64` |
-| `.<type>vec` | Uniform vector (fixed dimension per record) | `.fvecs`, `.ivecs`, `.u8vecs` |
-| `.<type>vvec` | Variable-length vector (per-record dimension) | `.ivvecs`, `.fvvecs`, `.u8vvecs` |
+| `.<type>` | Scalar (flat packed, no header) | `.u8`, `.i32`, `.f32`, `.bf16` |
+| `.<type>vecs` | Uniform vector (fixed dimension per record) | `.f32vecs`, `.u8vecs`, `.bf16vecs` |
+| `.<type>vvecs` | Variable-length vector (per-record dimension) | `.i32vvecs`, `.u8vvecs` |
 
-Legacy aliases: `.fvecs`=`.f32vecs`, `.ivecs`=`.i32vecs`,
-`.bvecs`=`.u8vecs`, `.svecs`=`.i16vecs`, `.mvecs`=`.f16vecs`,
-`.dvecs`=`.f64vecs`.
+Legacy aliases, read everywhere and still written by the pipeline:
+`.fvecs`=`.f32vecs`, `.ivecs`=`.i32vecs`, `.bvecs`=`.u8vecs`,
+`.svecs`=`.i16vecs`, `.mvecs`=`.f16vecs`, `.dvecs`=`.f64vecs`, and
+the same letters before `vvecs`. Singular forms (`.fvec`, `.u8vec`,
+`.ivvec`) are aliases too. `bf16` is a type of its own: `.bf16`,
+`.bf16vecs`, `.bf16vvecs`, never a reinterpreted `u16` or `f16`.
+
+```rust
+use vectordata::{Container, ElementType, ElementTypeExt};
+
+assert_eq!(ElementType::parse_extension("fvecs"), Some((ElementType::F32, Container::Vec)));
+assert_eq!(ElementType::F32.extension(Container::Vec), "f32vecs");          // canonical
+assert_eq!(ElementType::F32.legacy_extension(Container::Vec), Some("fvecs")); // what writers emit
+let ty = ElementType::from_path("profiles/base/base_vectors.bf16vecs")?;    // BF16
+```
 
 ### Record layout
 
@@ -321,7 +342,7 @@ local open and fetched as a sibling URL on remote open.
 
 ### `open_vec<T>(path_or_url) → Box<dyn VectorReader<T>>`
 
-Opens a uniform vector file for typed random access. Local paths
+Opens a uniform vector file at its own element type. Local paths
 mmap; URLs go through the merkle-cached path when a `.mref` is
 published, falling back silently to direct HTTP RANGE otherwise.
 
@@ -335,12 +356,36 @@ println!("count={}, dim={}", r.count(), r.dim());
 let vec: Vec<f32> = r.get(0)?;
 ```
 
-**Supported types:** `f32`, `f64`, `half::f16`, `i32`, `i16`, `i8`,
-`u8`, `u16`, `u32`, `u64`, `i64`.
+**Supported types:** every `T: Element` — `u8 i8 u16 i16 u32 i32 u64
+i64`, `half::f16`, `half::bf16`, `f32`, `f64` (the `half` types are
+re-exported as `vectordata::typed_access::{f16, bf16}`).
 
-The type parameter `T` must match the file's element width. A
-mismatch (e.g., `open_vec::<f32>("data.dvecs")` where `.dvecs` is
-8-byte f64) returns an error at open time.
+The raw readers are **native-only**: `T` must be the type the
+extension names, not merely its width. `open_vec::<f32>("x.ivecs")`,
+`open_vec::<i32>("x.fvecs")` and `open_vec::<u8>("x.i8vecs")` are
+each `IoError::ElementMismatch { file, requested, reason }` at open,
+where they once reinterpreted the bytes. The same holds for
+`XvecReader::open` / `open_path`, `IndexedVvecReader` and
+`ScalarReader`.
+
+### `open_vec_native(path_or_url) → AnyVectorReader` and `open_vec_as<T>`
+
+To read a file whose type you do not know, or at a type the file does
+not hold:
+
+```rust
+use vectordata::io::{open_vec_as, open_vec_native, AnyVectorReader};
+
+// Whatever the file holds, at its own type.
+let any: AnyVectorReader = open_vec_native("codes.u8vecs")?;
+println!("{} × {} of {}", any.count(), any.dim(), any.element_type());
+let codes = any.into_typed::<u8>()?;                      // ElementMismatch if not u8
+
+// At the type you want, through the conversion table (§2.7).
+let base = open_vec_as::<f32>("base.bf16vecs")?;          // widened per read
+let base = open_vec_as::<f32>("base.fvecs")?;             // native: the same zero-copy reader
+let err  = open_vec_as::<u8>("base.fvecs").unwrap_err();  // Refused: ElementMismatch
+```
 
 ### `open_vvec<T>(path_or_url) → Box<dyn VvecReader<T>>`
 
@@ -376,6 +421,20 @@ pub trait VectorReader<T>: Send + Sync {
     // bounds-checked zero-copy slice; None when storage is not mmap-backed
     fn get_slice(&self, index: usize) -> Option<&[T]> { None }
 
+    // records [start, start + buf.len() / dim) into buf, through storage
+    fn read_into(&self, start: usize, buf: &mut [T]) -> Result<usize, IoError>;
+
+    // every element of every record, contiguous, borrowed from the mapping:
+    // Some only for a header-free column (or a window over one) in one
+    // resident mapped file; None for xvec files, series, HTTP, conversions
+    fn as_slice(&self) -> Option<&[T]> { None }
+
+    // Native unless this reader converts (§2.7)
+    fn conversion(&self) -> ElementConversion { ElementConversion::Native }
+
+    // the element type the file holds, when the reader knows it
+    fn native_element_type(&self) -> Option<ElementType> { None }
+
     // drive underlying storage to fully resident; no-op for local/direct-HTTP
     fn prebuffer(&self) -> std::io::Result<()> { Ok(()) }
 
@@ -384,13 +443,29 @@ pub trait VectorReader<T>: Send + Sync {
 }
 ```
 
-The canonical concrete implementation is `XvecReader<T>`. It also
-exposes hot-path inherent methods that the `dyn VectorReader<T>`
-surface can't: an unchecked `get_slice(index) -> &[T]` (panics if
-the storage is not mmap-backed; intended for KNN inner loops), plus
-`advise_sequential` / `advise_random`, `prefetch_range`,
-`release_range`, and `prefetch_pages` (madvise hints; no-op when
-not mmap-backed).
+The concrete implementations, each generic over `T: Element`:
+
+- `XvecReader<T>` — a uniform vector file. It also exposes hot-path
+  inherent methods that the `dyn VectorReader<T>` surface can't: an
+  unchecked `get_slice(index) -> &[T]` (panics if the storage is not
+  mmap-backed; intended for KNN inner loops), plus `advise_sequential`
+  / `advise_random`, `prefetch_range`, `release_range`, and
+  `prefetch_pages` (madvise hints; no-op when not mmap-backed).
+- `ScalarReader<T>` — a header-free column (`.u8`, `.f32`, …): `dim()
+  == 1`, `count = size / T::SIZE` (a remainder is `InvalidFormat`),
+  `get`/`get_slice` at `i × SIZE`, and `as_slice()` is the whole
+  column once the file is mapped and aligned.
+- `ConvertingReader<N, T>` — `VectorReader<T>` over an `Arc<dyn
+  VectorReader<N>>` for a `Widening` or `CrossSign` conversion: `get`
+  and `read_into` convert through a bounded scratch; `get_slice` and
+  `as_slice` are `None`; the first value that does not fit is
+  `IoError::ValueOverflow { index, value, target }` at its ordinal.
+  Never built for `Native`, so the native path costs nothing.
+- `AnyVectorReader` — one variant per element type holding an
+  `Arc<dyn VectorReader<T>>`: what a file opens as before a type is
+  chosen. `element_type()`, `count()`, `dim()`, `into_typed::<T>()`
+  (native only, else `ElementMismatch`), `as_type::<T>()` (through the
+  conversion table). `AnyVvecReader` is the same over `VvecReader`.
 
 ### `VvecReader<T>` — variable-length vectors
 
@@ -409,17 +484,25 @@ The canonical concrete implementation is `IndexedVvecReader<T>`.
 `get_raw(index) -> Option<&[u8]>` provides a zero-copy slice when
 the storage is mmap-backed.
 
-### `VvecElement` — byte decoding
+### `Element` — the one element bound
 
 ```rust
-pub trait VvecElement: Copy + Send + Sync + 'static {
-    const ELEM_SIZE: usize;
+pub trait Element: Copy + Send + Sync + 'static {
+    const TYPE: ElementType;
+    const SIZE: usize;
     fn from_le_bytes(bytes: &[u8]) -> Self;
+    fn write_le_bytes(self, out: &mut [u8]);
+    fn to_value(self) -> Value;                 // Value::{Int(i128), Float(f64)}
+    fn from_value(v: Value) -> Option<Self>;    // None: does not fit
+    fn as_f64(self) -> f64;
 }
 ```
 
-Implemented for: `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`,
-`i64`, `f32`, `f64`, `half::f16`.
+Defined in `veks-datatypes` and implemented for the twelve types of
+§2.3; `vectordata::{Element, ElementType, ElementConversion,
+Container}` re-export it. `VvecElement` and `TypedElement` remain as
+deprecated blanket traits over `Element`, so an existing `T:
+VvecElement` bound compiles with a warning; write `T: Element`.
 
 ---
 
@@ -447,8 +530,8 @@ let dist = group.attribute("distance_function");  // Option<&Value>
 // Trait object — the universal handle. Use this for almost everything.
 let view: Arc<dyn TestDataView> = group.profile("default").unwrap();
 
-// Concrete type — only needed for the typed open_facet_typed::<T> method
-// when you don't want to use the free function. See §2.7.
+// Concrete type — rarely needed; every facet method below is on the
+// trait object, through TestDataViewExt.
 let gview: GenericTestDataView = group.generic_view("default").unwrap();
 ```
 
@@ -473,24 +556,35 @@ the caller.
 
 ### Standard facet methods
 
-All methods on `TestDataView` return readers that work identically
-for local and remote datasets:
+The facet methods are on `TestDataViewExt`, implemented for every
+`TestDataView` (so for `Arc<dyn TestDataView>` and the concrete view
+alike — import the trait). Each takes the element type you want to
+read at and returns a reader that works identically for local and
+remote datasets:
 
 ```rust
-// Uniform vector facets → Arc<dyn VectorReader<T>>
-let base:  Arc<dyn VectorReader<f32>> = view.base_vectors()?;
-let query: Arc<dyn VectorReader<f32>> = view.query_vectors()?;
-let gt:    Arc<dyn VectorReader<i32>> = view.neighbor_indices()?;
-let dist:  Arc<dyn VectorReader<f32>> = view.neighbor_distances()?;
-// F facet — pre-filter ground truth (ACORN G_K).
-let fki:   Arc<dyn VectorReader<i32>> = view.prefiltered_neighbor_indices()?;
-let fkd:   Arc<dyn VectorReader<f32>> = view.prefiltered_neighbor_distances()?;
-// E facet — post-filter ground truth (G ∩ R).
-let pki:   Arc<dyn VectorReader<i32>> = view.postfiltered_neighbor_indices()?;
-let pkd:   Arc<dyn VectorReader<f32>> = view.postfiltered_neighbor_distances()?;
+use vectordata::TestDataViewExt;
 
-// Variable-length facet → Arc<dyn VvecReader<i32>>
-let mi: Arc<dyn VvecReader<i32>> = view.metadata_indices()?;
+// Uniform vector facets → Arc<dyn VectorReader<T>>
+let base:  Arc<dyn VectorReader<f32>> = view.base_vectors_as::<f32>()?;
+let query: Arc<dyn VectorReader<f32>> = view.query_vectors_as::<f32>()?;
+let gt:    Arc<dyn VectorReader<i32>> = view.neighbor_indices_as::<i32>()?;
+let dist:  Arc<dyn VectorReader<f32>> = view.neighbor_distances_as::<f32>()?;
+// F facet — pre-filter ground truth (ACORN G_K).
+let fki = view.prefiltered_neighbor_indices_as::<i32>()?;
+let fkd = view.prefiltered_neighbor_distances_as::<f32>()?;
+// E facet — post-filter ground truth (G ∩ R).
+let pki = view.postfiltered_neighbor_indices_as::<i32>()?;
+let pkd = view.postfiltered_neighbor_distances_as::<f32>()?;
+// Any facet by key, at any type the conversion table allows (§2.7)
+let codes: Arc<dyn VectorReader<u8>> = view.facet_as::<u8>("base_vectors")?;
+let labels: Arc<dyn VectorReader<i64>> = view.facet_as::<i64>("metadata_content")?;
+
+// Variable-length facet → Arc<dyn VvecReader<i32>> (native type only)
+let mi: Arc<dyn VvecReader<i32>> = view.metadata_results_as::<i32>()?;
+
+// A quantized base with its parameters (§2.7)
+let q = view.quantized_base::<u8>()?;
 
 // Metadata configuration (declared facets, no data access)
 let meta_cfg: Option<&FacetConfig> = view.metadata_content();
@@ -499,8 +593,9 @@ let pred_cfg: Option<&FacetConfig> = view.metadata_predicates();
 // Facet discovery
 let manifest: HashMap<String, FacetDescriptor> = view.facet_manifest();
 
-// Element type interrogation
+// Element type interrogation, without opening or with
 let etype = view.facet_element_type("metadata_content")?;  // ElementType::U8
+let any = view.open_facet_native("metadata_content")?;     // AnyVectorReader
 
 // Resolved source path/URL for any declared facet
 let src: Option<String> = view.facet_source("metadata_content");
@@ -510,91 +605,178 @@ view.fetch(&FetchRequest::all(), &mut Silent)?;
 let storage = view.open_facet_storage("base_vectors")?;    // FacetStorage
 ```
 
+The pinned methods of 3.0 — `base_vectors()`, `query_vectors()`,
+`neighbor_indices()`, `facet(name)` and the filtered six — remain on
+`TestDataView`, deprecated, as `*_as::<f32>` or `<i32>`. They now go
+through the same table: `facet("codes")` on a `.u8` facet widens where
+it once reinterpreted the bytes, and on an `.ivecs` facet is refused.
+
 ---
 
-## 2.7 Typed scalar access
+## 2.7 Typed facet access
 
-Metadata (M) and predicates (P) are scalar files — flat-packed
-arrays with no per-record header. Read them as type-checked values
-via `TypedReader<T>`, with widening conversions and runtime
-overflow checks.
+Every facet is a file of one element type (§2.3), read from its
+extension at open. `facet_as::<T>(name)` opens the facet **at `T`**:
+natively when the file holds `T`, through a conversion when the table
+below allows one, and refused otherwise — never a reinterpretation of
+the bytes, never a silent loss of precision. The three readers a
+facet may come back as are the `XvecReader`/`ScalarReader` of §2.5
+(native), a window or series over them, or a `ConvertingReader`.
 
-### From a `TestDataView` (catalog or dyn handle)
-
-The free function `open_facet_typed::<T>` works against any
-`&dyn TestDataView`:
-
-```rust
-use vectordata::{open_facet_typed, TypedReader};
-
-let view = catalog.open_profile("my-dataset", "default")?;
-
-// Open with native type — zero-copy when storage is mmap-backed
-let r: TypedReader<u8> = open_facet_typed(&*view, "metadata_content")?;
-let val: u8 = r.get_native(42);
-
-// Open with a wider type — widening always succeeds
-let r: TypedReader<i32> = open_facet_typed(&*view, "metadata_content")?;
-let val: i32 = r.get_value(42)?;
-```
-
-### From a known-concrete `GenericTestDataView`
-
-The same call exists as a method on `GenericTestDataView`:
+### Native: zero-copy
 
 ```rust
-let gview = group.generic_view("default").unwrap();
-let r: TypedReader<u8> = gview.open_facet_typed::<u8>("metadata_content")?;
+use vectordata::{ElementConversion, TestDataViewExt, VectorReader};
+
+// u8 codes of a quantized corpus, read as what they are
+let codes = view.base_vectors_as::<u8>()?;
+assert_eq!(codes.conversion(), ElementConversion::Native);
+let row: &[u8] = codes.get_slice(42).expect("mapped and complete");
+
+// a header-free column is one slice once the file is resident
+let labels = view.facet_as::<u8>("metadata_content")?;
+if let Some(all) = labels.as_slice() {
+    assert_eq!(all.len(), labels.count());
+}
+
+// bulk reads into a buffer you own, through any storage
+let mut buf = vec![0f32; 1024 * base.dim()];
+let n = base.read_into(0, &mut buf)?;
 ```
 
-### Direct file open
+`get_slice` and `as_slice` are `Some` only when the storage is mapped
+and the records are resident (`fetch` first, §2.12); `get` and
+`read_into` always work.
+
+### Widened: the file's type is narrower than yours
 
 ```rust
-use vectordata::typed_access::{ElementType, TypedReader};
-
-// Local path, native type from extension
-let r = TypedReader::<u8>::open("metadata.u8")?;
-
-// Remote URL, native type explicit (cache-first; falls back to direct HTTP)
-let r = TypedReader::<i32>::open_url(
-    url::Url::parse("https://host/metadata.u8")?,
-    ElementType::U8,
-)?;
-
-// Path-or-URL string, dispatched automatically
-let r = TypedReader::<i64>::open_auto("https://host/metadata.i32",
-    ElementType::I32)?;
+// a bf16 base, as f32 — each read converts; the mapping is still shared
+let base = view.base_vectors_as::<f32>()?;
+assert_eq!(base.conversion(), ElementConversion::Widening);
+assert_eq!(base.native_element_type(), Some(ElementType::BF16));
+assert!(base.get_slice(0).is_none());          // nothing to borrow at f32
+let v: Vec<f32> = base.get(0)?;                // exact: every bf16 is an f32
 ```
 
-### Width compatibility
+### Refused
 
-| target T | native type | result |
-|---|---|---|
-| same width, same sign | exact match | zero-copy `get_native` works |
-| same width, cross sign | e.g. `u8` ↔ `i8` | checked per value via `get_value`, fails on overflow |
-| wider | e.g. `i32` from `u8` | widening; `get_value` always succeeds |
-| narrower | e.g. `u8` from `i32` | rejected at open time (`Narrowing` error) |
+```rust
+use vectordata::io::IoError;
+use vectordata::Error;
+
+match view.facet_as::<u8>("base_vectors") {       // an f32 facet
+    Err(Error::VectorIo(IoError::ElementMismatch { file, requested, reason })) => {
+        assert_eq!((file, requested), (ElementType::F32, ElementType::U8));
+    }
+    _ => unreachable!(),
+}
+```
+
+### The conversion table
+
+`ElementType::conversion_to(target)`, stated once in
+`veks-datatypes` and used by every open:
+
+| file → requested | result |
+|---|---|
+| same type | `Native` — zero-copy |
+| int → wider int, source unsigned or target signed (u8→i16, u8→u32, i16→i64) | `Widening` — never fails |
+| int → int, same width, other sign (u8↔i8, i32↔u32) | `CrossSign` — every value checked |
+| int → wider unsigned from signed (i8→u16) | `CrossSign` |
+| int → narrower int | `Refused` |
+| int → float, integer bits ≤ significand bits (u8/i8/u16/i16→f32; ≤32-bit→f64; u8/i8→f16; u8/i8→bf16) | `Widening` |
+| int → float otherwise (i32→f32, i64→f64) | `Refused` — not lossless |
+| f16→f32, f16→f64, bf16→f32, bf16→f64, f32→f64 | `Widening` |
+| f16↔bf16 | `Refused` — neither direction is lossless, and never a reinterpretation |
+| float → narrower float, float → int | `Refused` |
+
+A `CrossSign` reader checks each value: a `u8` of 200 read as `i8` is
+`IoError::ValueOverflow { index, value, target }` from `get` and from
+`read_into`, at the facet ordinal. `Refused` means read natively and
+convert yourself — `open_facet_native` gives the reader at the file's
+type:
+
+```rust
+use vectordata::io::AnyVectorReader;
+
+match view.open_facet_native("base_vectors")? {
+    AnyVectorReader::F32(r) => { /* zero-copy f32 */ }
+    AnyVectorReader::I32(r) => { /* i32 is not lossless as f32: your rounding, your call */ }
+    other => { let as_f64 = other.as_type::<f64>()?; /* or widen to f64, which every ≤32-bit type is */ }
+}
+```
+
+### Quantized corpora
+
+A profile whose base is the codes of a quantized corpus carries the
+parameters as three standard facets and the scheme as an attribute
+([§1.5, §1.7](01-data-model.md#15-dataset-facets-bqgdmpref)).
+`quantized_base::<C>()` opens the four as one thing:
+
+```rust
+let q = view.quantized_base::<u8>()?;    // QuantizedBase<u8>
+let codes: &[u8] = q.codes.get_slice(i).unwrap();
+let (scale, zp, sum) = (q.scale.as_slice().unwrap()[i], q.zero_point.as_slice().unwrap()[i], q.sum.as_slice().unwrap()[i]);
+assert_eq!(q.scheme.scheme, vectordata::dataset::QuantScheme::Affine);
+```
+
+`C` must be the type the attribute's `codes` names (else
+`ElementMismatch`); each column must hold one record per code vector
+(else `Error::FacetCardinality { facet, against, expected, found }`);
+the attribute must parse (`view.quantization()` is `Some(Err(why))`
+when it does not).
+
+### Migrating from `TypedReader`
+
+`open_facet_typed`, `TypedReader<T>`, `TypedElement`,
+`TypedAccessError` and `dispatch_typed!` are deprecated and will be
+removed; they covered integer scalars only and read every float as
+zero.
+
+| 3.0 | now |
+|---|---|
+| `open_facet_typed::<T>(&*view, name)` | `view.facet_as::<T>(name)` |
+| `r.get_native(i)` | `r.get_slice(i)?[0]` or `r.as_slice()?[i]` |
+| `r.get_value(i)?` | `r.get(i)?[0]` |
+| `r.get_native_slice(i)` | `r.get_slice(i)` |
+| `r.is_native()` | `r.conversion() == ElementConversion::Native` |
+| `TypedReader::<T>::open(path)` | `ScalarReader::<T>::open_path(path)` (native) or `open_vec_as::<T>(path)` |
+| `TypedReader::<T>::open_url(url, native)` / `open_auto` | `open_vec_as::<T>(url)` — the native type comes from the extension |
+| `dispatch_typed!(etype, T => …)` | `veks_datatypes::dispatch_element!(etype, T => …)` |
 
 ---
 
 ## 2.8 Facet Reference
 
-| Facet code | YAML key | Trait method | Reader type | Typical format |
-|-----------|----------|-------------|-------------|---------------|
-| B | `base_vectors` | `base_vectors()` | `VectorReader<f32>` | `.fvecs` |
-| Q | `query_vectors` | `query_vectors()` | `VectorReader<f32>` | `.fvecs` |
-| G | `neighbor_indices` | `neighbor_indices()` | `VectorReader<i32>` | `.ivecs` |
-| D | `neighbor_distances` | `neighbor_distances()` | `VectorReader<f32>` | `.fvecs` |
-| M | `metadata_content` | `metadata_content()` | config + `open_facet_typed` | `.u8`, `.slab` |
-| P | `metadata_predicates` | `metadata_predicates()` | config + `open_facet_typed` | `.u8`, `.slab` |
-| R | `metadata_indices` | `metadata_indices()` | `VvecReader<i32>` | `.ivvecs` |
-| F (indices) | `prefiltered_neighbor_indices` (canonical) or `filtered_neighbor_indices` (legacy alias) | `prefiltered_neighbor_indices()` | `VectorReader<i32>` | `.ivecs` |
-| F (distances) | `prefiltered_neighbor_distances` (canonical) or `filtered_neighbor_distances` (legacy alias) | `prefiltered_neighbor_distances()` | `VectorReader<f32>` | `.fvecs` |
-| E (indices) | `postfiltered_neighbor_indices` | `postfiltered_neighbor_indices()` | `VectorReader<i32>` | `.ivecs` |
-| E (distances) | `postfiltered_neighbor_distances` | `postfiltered_neighbor_distances()` | `VectorReader<f32>` | `.fvecs` |
+One row per `StandardFacet`, in `PREFERRED_ORDER` (a test in
+`vectordata` holds the keys to the code). `facet_as::<T>(key)` opens
+any of the vector and scalar rows; the method column is the
+`TestDataViewExt` shorthand where there is one.
 
-For M and P facets, use `open_facet_typed::<T>(view, name)` for
-typed data access (see §2.7).
+| Facet code | YAML key | Method | Natural reader | Typical format |
+|-----------|----------|-------------|-------------|---------------|
+| B | `base_vectors` | `base_vectors_as::<T>()` | `VectorReader<f32>`, or the codes' type | `.fvecs`, `.bf16vecs`, `.u8vecs` |
+| — | `quant_scale` | `quantized_base::<C>()` | `VectorReader<f32>` | `.f32` |
+| — | `quant_zero_point` | `quantized_base::<C>()` | `VectorReader<i32>` | `.i32` |
+| — | `quant_sum` | `quantized_base::<C>()` | `VectorReader<i32>` | `.i32` |
+| Q | `query_vectors` | `query_vectors_as::<T>()` | `VectorReader<f32>` | `.fvecs` |
+| G | `neighbor_indices` | `neighbor_indices_as::<T>()` | `VectorReader<i32>` | `.ivecs` |
+| D | `neighbor_distances` | `neighbor_distances_as::<T>()` | `VectorReader<f32>` | `.fvecs` |
+| M | `metadata_content` | `metadata_content()` (config) + `facet_as::<T>` | `VectorReader<u8>`, or a slab | `.u8`, `.slab` |
+| P | `metadata_predicates` | `metadata_predicates()` (config) + `facet_as::<T>` | `VectorReader<u8>`, or a slab | `.u8`, `.slab` |
+| R | `metadata_results` (alias `metadata_indices`) | `metadata_results_as::<T>()` | `VvecReader<i32>` | `.ivvecs` |
+| — | `metadata_layout` | `metadata_layout()` | the schema slab | `.slab` |
+| F (indices) | `prefiltered_neighbor_indices` (canonical) or `filtered_neighbor_indices` (legacy alias) | `prefiltered_neighbor_indices_as::<T>()` | `VectorReader<i32>` | `.ivecs` |
+| F (distances) | `prefiltered_neighbor_distances` (canonical) or `filtered_neighbor_distances` (legacy alias) | `prefiltered_neighbor_distances_as::<T>()` | `VectorReader<f32>` | `.fvecs` |
+| E (indices) | `postfiltered_neighbor_indices` | `postfiltered_neighbor_indices_as::<T>()` | `VectorReader<i32>` | `.ivecs` |
+| E (distances) | `postfiltered_neighbor_distances` | `postfiltered_neighbor_distances_as::<T>()` | `VectorReader<f32>` | `.fvecs` |
+
+The index facets (G, F, E) hold base ordinals; a filtered row shorter
+than K is padded with `-1` (F when fewer than K base vectors pass the
+predicate, E whenever the intersection is short), and G never is.
+`veks check` holds every truth's rows to its queries, its distances'
+rows to its indices, and every index to the base count.
 
 ---
 
@@ -741,7 +923,12 @@ does; a map is addressed by dotted keys.
 The head of a spec is found by its shape — a URL by scheme and
 authority, a path by its separators or a drive letter, otherwise a
 catalog name — so `https://host:8080/ds:10m` and `C:\data\ds:10m` split
-where they should. A spec with no selector means `default`.
+where they should. A spec with no selector means `default`. **A head
+that exists on disk is a path**, before the catalogs are consulted: in
+a directory that holds a `my-dataset/`, `open_spec("my-dataset:default")`
+opens that directory, not the catalog entry of the same name. Run
+from elsewhere, or name the catalog entry by a spelling that is not a
+path, to reach the catalog.
 
 Which surface receives a selector decides what a set means. `precache`,
 `ping`, the explorer's purge and picker filter, and
@@ -817,7 +1004,16 @@ _defaults:
 The file is read by the catalog's `knn_entries.yaml` parser, so a
 directory open honours `_defaults.base_url`, `cache_dir` and `${VAR}`
 exactly as a catalog listing of the same file does. The dataset opened
-is the entry named after the directory, or the file's first.
+is the entry named after the directory; failing that, the file's only
+entry. A file with several entries and none named after the directory
+is `Error::AmbiguousDataset`, listing them — ambiguity is never
+resolved by order. Name the entry after its directory, or open the
+file as a catalog and pick an entry.
+
+The reverse holds too: a catalog source that points at a
+`dataset.yaml` lists that one dataset (named by its `name:`, else by
+its directory), with its profiles embedded, rather than a dataset per
+top-level key.
 
 ---
 
@@ -862,13 +1058,31 @@ match open_vec::<f32>("data.fvecs") {
         // Wrong shape — file has variable-length records; use open_vvec
         eprintln!("use open_vvec for this file: {msg}");
     }
+    Err(IoError::ElementMismatch { file, requested, reason }) => {
+        // The extension names `file`; `requested` is not it and the
+        // conversion table has no path between them (§2.7)
+        eprintln!("{file} file opened as {requested}: {reason}");
+    }
+    Err(IoError::ValueOverflow { index, value, target }) => {
+        eprintln!("record {index} holds {value}, which is not a {target}");
+    }
+    Err(other) => eprintln!("{other}"),   // IoError is #[non_exhaustive]
 }
 ```
 
 `VariableLengthRecords` is returned by `open_vec` when the file
 turns out to have variable-length records (its size is not a
 multiple of the implied stride). The caller should switch to
-`open_vvec`.
+`open_vvec`. `ElementMismatch` is an open-time error; `ValueOverflow`
+is raised by `get` and `read_into` of a `CrossSign` reader at the
+first value that does not fit.
+
+A view's facet methods return `vectordata::Error`, which wraps
+`IoError` as `Error::VectorIo` and adds, among others,
+`Error::FacetCardinality { facet, against, expected, found }` (a
+quantization column whose count disagrees with its base) and
+`Error::AmbiguousDataset { name, matches }` (a name, or a
+`knn_entries.yaml` directory, that resolves to more than one dataset).
 
 ---
 
@@ -1339,7 +1553,8 @@ profiles:
 ```
 
 Sized profiles share base/query data — `base_vectors` is windowed
-via the `[lo..hi)` suffix rather than copied — but have their own
+via the `[lo..hi)` suffix rather than copied, and a quantized base's
+`quant_*` columns are windowed with it — but have their own
 computed KNN, filtered results, and metadata indices. The
 pipeline's `per_profile` mechanism generates these automatically;
 see §1.7 for the full list of generator strategies (`decade`,
@@ -1388,51 +1603,49 @@ if let Some(df) = view.distance_function() {
 ### Metadata facets
 
 ```rust
-use vectordata::open_facet_typed;
+use vectordata::TestDataViewExt;
 
 let view = catalog.open_profile("my-dataset", "default")?;
 
-// Metadata content (e.g., labels as u8)
-let meta = open_facet_typed::<u8>(&*view, "metadata_content")?;
+// Metadata content (e.g., labels as u8): a column, one slice once resident
+let meta = view.facet_as::<u8>("metadata_content")?;
 println!("{} metadata records", meta.count());
-for i in 0..5 {
-    println!("  base[{}] label = {}", i, meta.get_native(i));
+let labels = meta.as_slice().expect("fetched local column");
+for (i, label) in labels.iter().take(5).enumerate() {
+    println!("  base[{i}] label = {label}");
 }
 
 // Predicates (e.g., equality filters as u8)
-let pred = open_facet_typed::<u8>(&*view, "metadata_predicates")?;
+let pred = view.facet_as::<u8>("metadata_predicates")?;
 
 // Predicate results (variable-length ordinal lists)
-let mi = view.metadata_indices()?;
+let mi = view.metadata_results_as::<i32>()?;
 for qi in 0..5 {
     let matching = mi.get(qi)?;
     println!("  query[{qi}] (field_0 == {}): {} matching base vectors",
-        pred.get_native(qi), matching.len());
+        pred.get(qi)?[0], matching.len());
 }
 ```
 
 ### Element type interrogation
 
 ```rust
-use vectordata::typed_access::ElementType;
-use vectordata::open_facet_typed;
+use vectordata::io::AnyVectorReader;
+use vectordata::{ElementType, TestDataViewExt};
 
 let view = catalog.open_profile("my-dataset", "default")?;
 
-let etype = view.facet_element_type("metadata_content")?;
-match etype {
-    ElementType::U8 => {
-        let r = open_facet_typed::<u8>(&*view, "metadata_content")?;
-        let val: u8 = r.get_native(0);
-    }
-    ElementType::I32 => {
-        let r = open_facet_typed::<i32>(&*view, "metadata_content")?;
-        let val: i32 = r.get_native(0);
-    }
-    _ => {
-        // Widen to i64 for any integer type
-        let r = open_facet_typed::<i64>(&*view, "metadata_content")?;
-        let val: i64 = r.get_value(0)?;
+// Without opening: from the extension
+let etype: ElementType = view.facet_element_type("metadata_content")?;
+
+// Opened at its own type, then chosen
+match view.open_facet_native("metadata_content")? {
+    AnyVectorReader::U8(r) => { let val: u8 = r.get(0)?[0]; }
+    AnyVectorReader::I32(r) => { let val: i32 = r.get(0)?[0]; }
+    other => {
+        // Any integer type of 32 bits or fewer widens to i64
+        let r = other.as_type::<i64>()?;
+        let val: i64 = r.get(0)?[0];
     }
 }
 ```

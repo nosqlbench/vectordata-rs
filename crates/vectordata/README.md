@@ -31,6 +31,7 @@ Walk-through: [Find and fetch datasets with the CLI](https://github.com/nosqlben
 ```rust
 use vectordata::catalog::{Catalog, CatalogSources};
 use vectordata::fetch::{FetchRequest, TextMeter};
+use vectordata::TestDataViewExt;
 
 let catalog = Catalog::of(&CatalogSources::new().configure_default());
 let view = catalog.open_spec("my-dataset:default")?.view()?;
@@ -41,7 +42,7 @@ view.fetch(
     &mut TextMeter::stderr("Fetch"),
 )?;
 
-let base = view.base_vectors()?;
+let base = view.base_vectors_as::<f32>()?;
 let v: Vec<f32> = base.get(42)?;
 ```
 

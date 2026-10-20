@@ -2,8 +2,105 @@
 
 ## Unreleased
 
+One element model for the workspace, and a typed facet access API on
+it. A new leaf crate, `veks-datatypes`, holds the twelve element
+types (`bf16` is new), the one extension table, the `Element` trait
+and the conversion table that says how a facet of one type may be
+read as another: natively, widened when lossless, checked per value
+across a sign, or refused — never a reinterpretation of the bytes.
+`vectordata`, `veks-io`, `veks-core` and `veks-pipeline` are all on
+it; their own copies of the element enum, the facet enum and the
+extension tables are gone.
+
+This changes the library API: see [Upgrading](#upgrading-from-30).
+Every pinned call of 3.0 still compiles, deprecated, beside its
+replacement. The design is `docs/design/srd-element-access.md`.
+
+### Highlights
+
+- **Any facet at any type: `view.facet_as::<T>(name)`** and the
+  per-facet `base_vectors_as::<T>()`, `query_vectors_as`,
+  `neighbor_indices_as`, `neighbor_distances_as`, the filtered six,
+  `metadata_results_as` — on `TestDataViewExt`, implemented for every
+  `TestDataView`. A `bf16`, `f16` or `u8` base reads as `f32`; `u8`
+  codes read as `u8`, zero-copy; an `f32` base asked for as `u8` is
+  `IoError::ElementMismatch`. `open_facet_native(name)` opens a facet
+  at whatever type it holds (`AnyVectorReader`), `open_vec_as::<T>`
+  and `open_vec_native` do the same for a raw path or URL.
+- **`VectorReader<T>` says what it is**: `as_slice()` borrows a whole
+  header-free column from the mapping, `conversion()` says whether the
+  reader converts, `native_element_type()` says what the file holds.
+  `ScalarReader<T>` reads a column natively; `ConvertingReader<N, T>`
+  carries a widening or cross-sign read and reports the first value
+  that does not fit as `IoError::ValueOverflow` at its ordinal.
+- **`bf16`** everywhere: `.bf16`, `.bf16vecs`, `.bf16vvecs`, a type of
+  its own in the readers, the writers, the facet spec, the pipeline's
+  analysis commands and the explorer. `half::{f16, bf16}` are
+  re-exported from `veks-datatypes` and `vectordata::typed_access`.
+- **Float scalar columns** (`.f32`, `.f64`, `.f16`, `.bf16`) are a
+  facet format, `FacetFormat::FloatScalar`.
+- **Pre-quantized corpora**: three standard facets — `quant_scale`
+  (`.f32`), `quant_zero_point` (`.i32`), `quant_sum` (`.i32`), one
+  column each, index-aligned with `base_vectors` and windowed with it
+  — and a typed `quantization` attribute (scheme, granularity, code
+  type, range). `view.quantized_base::<u8>()` opens the codes and the
+  three columns as one thing, checked against each other
+  (`Error::FacetCardinality`) and against the attribute. `veks check`
+  holds the columns, the attribute and the counts.
+- **`veks check` holds every ground truth** — G, F and E: one row per
+  query, distances' rows equal to the indices' rows, every index
+  under the base count with the `-1` sentinel admitted only in a
+  filtered truth's short row. The index scan reports progress.
+- **The explorer browses `f16`, `bf16` and integer bases.**
+- **`veks-io`** readers are generic over `Element`
+  (`MmapReader::<f32>::open`, `ScalarMmapReader::<u8>::open`, with
+  `as_slice`) and validate what they map: a negative or zero
+  dimension, a truncated file and a wrong element type are refused at
+  open, and an unaligned `get_slice` is `None` rather than undefined
+  behaviour. `VecFormat` carries `bf16` and the float scalars.
+- **`veks-pipeline`'s `dispatch_reader!`** opens an `.i8vecs` as `i8`
+  and a `.u16vecs` as `u16`; it opened them as the unsigned or signed
+  type of the same width.
+### Upgrading from 3.0
+
+Each changed call, and what replaces it. The old spelling stays,
+deprecated, unless the row says otherwise.
+
+| 3.0 | now |
+|---|---|
+| `view.base_vectors()`, `query_vectors()`, `neighbor_indices()`, `neighbor_distances()`, the filtered six (f32 / i32) | `view.base_vectors_as::<f32>()` … on `TestDataViewExt` (import it); the type is yours to choose |
+| `view.facet(name)` (f32) | `view.facet_as::<T>(name)` |
+| `view.metadata_results()` / `metadata_indices()` | `view.metadata_results_as::<i32>()` |
+| `open_facet_typed::<T>(&*view, name)`, `TypedReader<T>`, `TypedAccessError`, `dispatch_typed!` | `view.facet_as::<T>(name)`; `get_value(i)` → `get(i)?[0]`, `get_native(i)` → `as_slice()?[i]` or `get_slice(i)?[0]`, `is_native()` → `conversion() == Native`; `dispatch_element!` |
+| `T: VvecElement`, `T: TypedElement` | `T: Element` (the shims remain; `TypedElement::width`/`to_i128` are gone) |
+| `XvecReader::<f32>::open("x.mvecs")` — reinterpreted the bytes | `open_vec_as::<f32>("x.mvecs")` — widened; the raw open is now `ElementMismatch` |
+| `match ElementType { … }` exhaustively | `ElementType` is `#[non_exhaustive]` and has `BF16`: add a `_` arm |
+| `match IoError { … }` exhaustively | `#[non_exhaustive]`; new `ElementMismatch`, `ValueOverflow` |
+| `match FacetFormat` / `StandardFacet` exhaustively | new `FloatScalar`; new `QuantScale`, `QuantZeroPoint`, `QuantSum` |
+| `TestDataGroup::load` on a `knn_entries.yaml` directory with several entries | opens the entry named after the directory, else the only one, else `Error::AmbiguousDataset` |
+| `veks_core::formats::Facet` | `vectordata::dataset::StandardFacet` (removed, no shim) |
+| `veks_core::formats::preferred_format(facet, width)` | `preferred_vec_format(StandardFacet, ElementType)` |
+| `veks_pipeline::pipeline::ElementType` (its own enum), `ToF64` | the same path, now `veks_datatypes::ElementType`; `Element::as_f64` |
+| `veks_io::MmapReader::open_fvec(p)`, `ScalarMmapReader::open_u8(p)` | `MmapReader::<f32>::open(p)`, `ScalarMmapReader::<u8>::open(p)` |
+| `veks_io::ScalarType` | `ElementType` |
+
 ### Fixes
 
+- **A raw reader refuses a file of another type.** `XvecReader::open`
+  and `open_path` compared nothing to the extension, so
+  `XvecReader::<f32>::open("x.ivecs")` read integers as floats and a
+  `.dvecs` opened as `f32` gave a reader of garbage with the wrong
+  count. Every raw open now requires the extension's type to be the
+  requested one; a conversion goes through `open_vec_as`.
+- **`TypedReader` read every float as zero.** A `.f32` column opened as
+  `TypedReader<i32>` passed the width check and returned `0` for every
+  value. A float native type is now refused at open.
+- **A `dataset.yaml` named as a catalog source** listed a dataset per
+  top-level key (`profiles`, `attributes`, …). It is now one entry.
+- **`veks-io` validated nothing it mapped.** A negative dimension was
+  cast to a size, the entry size overflowed, a truncated file read
+  past its end, and an 8-byte `get_slice` at an unaligned offset was
+  undefined behaviour.
 - **`generate dataset-json` rewrites a `dataset.json` an older veks
   rendered.** It skipped whenever `dataset.json` was newer than
   `dataset.yaml`, so the 3.0.1 re-run of the finalize steps left an

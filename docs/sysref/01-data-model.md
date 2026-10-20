@@ -8,9 +8,14 @@ Three record structures, distinguished by file extension:
 
 | Structure | Extension pattern | Header | Random access |
 |-----------|------------------|--------|---------------|
-| **Scalar** | `.<type>` (`.u8`, `.i32`, `.f64`) | None | `offset = ordinal × elem_size` |
-| **Uniform vector** | `.<type>vec` (`.fvecs`, `.ivecs`) | 4-byte dim per record | `offset = ordinal × stride` |
-| **Variable vector** | `.<type>vvec` (`.ivvecs`, `.fvvecs`) | 4-byte dim per record | Requires offset index |
+| **Scalar** | `.<type>` (`.u8`, `.i32`, `.f32`, `.bf16`) | None | `offset = ordinal × elem_size` |
+| **Uniform vector** | `.<type>vecs` (`.f32vecs`, `.u8vecs`; legacy `.fvecs`, `.ivecs`) | 4-byte dim per record | `offset = ordinal × stride` |
+| **Variable vector** | `.<type>vvecs` (`.i32vvecs`; legacy `.ivvecs`) | 4-byte dim per record | Requires offset index |
+
+The `<type>` is an element type of §1.2; the three structures are
+the `Container`s of the element model (`veks-datatypes`), and one
+table there — `ElementType::parse_extension` — reads every spelling
+below.
 
 ### Scalar
 
@@ -58,11 +63,13 @@ The index is a scalar file of byte offsets — one per record.
 
 ## 1.2 Element Types
 
+Twelve element types, each readable in every container. The table is
+`ElementType::ALL` of `veks-datatypes` with the canonical spelling of
+each container and the legacy vec spelling; a test in `vectordata`
+holds this table to the code.
+
 | Type | Size | Scalar ext | Vec ext | Vvec ext | Legacy |
 |------|------|-----------|---------|----------|--------|
-| f32 | 4 B | — | `.f32vecs` | `.f32vvecs` | `.fvecs` |
-| f64 | 8 B | — | `.f64vecs` | `.f64vvecs` | `.dvecs` |
-| f16 | 2 B | — | `.f16vecs` | `.f16vvecs` | `.mvecs` |
 | u8 | 1 B | `.u8` | `.u8vecs` | `.u8vvecs` | `.bvecs` |
 | i8 | 1 B | `.i8` | `.i8vecs` | `.i8vvecs` | — |
 | u16 | 2 B | `.u16` | `.u16vecs` | `.u16vvecs` | — |
@@ -71,9 +78,23 @@ The index is a scalar file of byte offsets — one per record.
 | i32 | 4 B | `.i32` | `.i32vecs` | `.i32vvecs` | `.ivecs` |
 | u64 | 8 B | `.u64` | `.u64vecs` | `.u64vvecs` | — |
 | i64 | 8 B | `.i64` | `.i64vecs` | `.i64vvecs` | — |
+| f16 | 2 B | `.f16` | `.f16vecs` | `.f16vvecs` | `.mvecs` |
+| bf16 | 2 B | `.bf16` | `.bf16vecs` | `.bf16vvecs` | — |
+| f32 | 4 B | `.f32` | `.f32vecs` | `.f32vvecs` | `.fvecs` |
+| f64 | 8 B | `.f64` | `.f64vecs` | `.f64vvecs` | `.dvecs` |
 
-All legacy extensions are fully supported as aliases. Plural forms
-(`.fvecs`, `.ivvecs`) are accepted everywhere.
+`f16` is IEEE binary16 (`.mvecs` has always meant it); `bf16` is the
+brain float, a different type with its own spellings — never a
+`u16`, and never reinterpreted as `f16`. Every legacy spelling is an
+alias, in the vvec form too (`.bvvecs`, `.ivvecs`, `.fvvecs`), and
+every vec and vvec spelling is read in the singular as well
+(`.fvec`, `.u8vec`, `.ivvec`). Spellings are case-insensitive. The
+pipeline keeps writing the legacy spelling where one exists, so a
+dataset built today still names its base `base_vectors.fvecs`.
+
+Which types a facet may hold is the facet spec (§1.5, `FacetFormat`);
+how a facet of one type is read as another is the conversion table of
+the API ([§2.7](02-api.md#27-typed-facet-access)).
 
 ---
 
@@ -214,6 +235,23 @@ describe a vector search benchmark:
 | **F** | Pre-filter KNN ground truth | uniform vec | `.ivecs` + `.fvecs` | ACORN `G_K`: top-K over `X_p` (predicate-passing base vectors). Full K when `\|X_p\| ≥ K`; perfect recall. Canonical key: `prefiltered_neighbor_*`. Legacy key `filtered_neighbor_*` resolves here. |
 | **E** | Post-filter KNN ground truth | uniform vec | `.ivecs` + `.fvecs` | `G ∩ R`: unfiltered top-K intersected with predicate-passing set. Sparse possible (`\|E\| ∈ [0, K]`). Canonical key: `postfiltered_neighbor_*`. |
 | **O** | Oracle partitions | per-label profiles | directories | Per-label base vectors + partitioned KNN |
+
+B and Q are vectors of any element type: a float corpus, or the
+integer codes of a quantized one. Three further facets have no code
+letter, like `metadata_layout`; they carry a quantized base's
+parameters, one header-free column each, index-aligned with
+`base_vectors` and windowed with it in sized profiles:
+
+| Key | Canonical file | Structure | Holds |
+|-----|----------------|-----------|-------|
+| `quant_scale` | `quant_scale.f32` | float scalar | per-vector scale |
+| `quant_zero_point` | `quant_zero_point.i32` | integer scalar | per-vector zero point |
+| `quant_sum` | `quant_sum.i32` | integer scalar | per-vector sum of the codes |
+
+They are present together or not at all, and only with the
+`quantization` attribute (§1.7), which names the scheme and the code
+type. `veks check` holds all of that, and the columns' counts against
+the base.
 
 The F (pre-filter) and E (post-filter) facets are *both* filtered
 ground truths but answer different questions. F is the verification
@@ -416,6 +454,31 @@ Every published dataset must have:
 - `distance_function` — the metric used for KNN computation
 - `is_zero_vector_free` — set automatically after zero-vector scan
 - `is_duplicate_vector_free` — set automatically after dedup scan
+
+### Quantization attribute
+
+A profile whose `base_vectors` are the codes of a quantized corpus
+declares how the codes map back to values, at the dataset level or on
+the profile (the profile's wins):
+
+```yaml
+attributes:
+  quantization:
+    scheme: affine            # affine | symmetric
+    granularity: per-vector   # per-vector | per-dimension | per-block
+    block: 64                 # per-block only
+    codes: u8                 # the element type of base_vectors
+    range: [0, 255]           # inclusive range of the codes
+```
+
+`affine` is `value = scale × (code − zero_point)`; `symmetric` fixes
+the zero point at zero. The parameters are the three `quant_*` facets
+of §1.5. The attribute is typed in `vectordata` (`dataset::
+Quantization`): a non-integer `codes`, a reversed `range`, a
+`per-block` granularity without a `block`, or a `block` on another
+granularity is an error at open, not a scheme. Only `per-vector` has
+its column layout specified; the other two granularities are declared
+for the day a producer needs them.
 
 ### Provenance attributes
 

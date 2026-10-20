@@ -1,7 +1,9 @@
 # SRD — Element types and typed facet access
 
-**Status:** proposed 2026-10-19. Decisions in §15 were taken on
-2026-10-19. Not implemented.
+**Status:** implemented 2026-10-20 (records in §16; steps 1–9 of §13).
+Decisions in §15 were taken on 2026-10-19. The
+release that carries it, and the version it takes, are the
+maintainer's.
 **Scope:** the element model shared by every crate in the workspace (a
 new `veks-datatypes` crate), the `vectordata` readers and the facet
 access API on a dataset view, the `veks-io` readers, the file-format
@@ -1819,3 +1821,60 @@ changed files; docs with warnings denied.
 
 `check/mod.rs` is unchanged but for the module line; its uncovered
 half is the command's wiring of the other checks, not this step's.
+
+### 16.9 Step 9: the docs (2026-10-20)
+
+**Written.** `docs/sysref/01-data-model.md`: §1.1 names the three
+containers and the one table that reads them; §1.2 is the twelve-row
+element table in `ElementType::ALL` order with the float scalar
+spellings, the `bf16` row, the singular and vvec aliases and the
+writers' legacy spellings; §1.5 the three `quant_*` facets under the
+code-letter table; §1.7 the `quantization` attribute. `docs/sysref/
+02-api.md`: §2.1 on `*_as`; §2.3 the scheme on the element model
+(the dangling "SRD §22" link, which named a file that does not exist,
+now points at this SRD); §2.4 native-only raw opens, `open_vec_native`
+and `open_vec_as`; §2.5 the three `VectorReader` additions and
+`read_into`, the concrete readers, `Element` in place of
+`VvecElement`; §2.6 the facet methods as `TestDataViewExt`, the pinned
+methods deprecated and on the same table; §2.7 rewritten as "Typed
+facet access" — native, widened, refused, the EA-5 table, `ValueOverflow`,
+`open_facet_native`, quantized corpora, the `TypedReader` migration
+table; §2.8 one row per `StandardFacet` in `PREFERRED_ORDER` (the four
+rows it lacked: `metadata_layout` and the three `quant_*`) with the
+sentinel rule; §2.9 the path-before-catalog rule under selectors, and
+the `knn_entries.yaml` directory and `dataset.yaml`-as-catalog rules;
+§2.11 the two new `IoError` variants, the `_` arm, `FacetCardinality`
+and `AmbiguousDataset`; §2.14 the windowed columns; §2.15 metadata and
+element interrogation through `facet_as` and `open_facet_native`.
+`docs/sysref/README.md` and `08-architecture.md` name the new surface.
+Both tutorials (`crates/vectordata/docs/access-datasets-from-rust.md`,
+`docs/tutorials/build-predicated-dataset.md`) and both READMEs teach
+`*_as` and `facet_as`; nothing user-facing teaches `open_facet_typed`
+any more (the design docs that mention it are records and stand).
+`CHANGELOG.md` under Unreleased: the summary, Highlights, an
+"Upgrading from 3.0" table (every row of §12 and the matches that
+`#[non_exhaustive]` and the new variants break) and four Fixes. No
+version, no date.
+
+**Code.** One line: `vectordata` re-exports `Container` at the root
+beside `ElementType`, where the docs and the table test name it.
+
+**Guards.** `crates/vectordata/tests/sysref_tables.rs`:
+`the_element_table_in_the_docs_matches_all` (§1.2 is `ElementType::
+ALL` in order, each row's size, scalar, vec and vvec spelling and
+legacy vec spelling equal to the type's) and `the_facet_table_in_the_
+docs_matches_preferred_order` (§2.8 is `PREFERRED_ORDER` in order by
+canonical key, with the code letter or `—`). Proven to fail on a
+drifted document: with `.bf16vecs` misspelt `.bf16vec` and `quant_sum`
+misspelt `quant_sums`, both panicked (`sysref_tables.rs:54`, `:71`);
+the documents were restored byte for byte.
+
+**Tests.** The two guards; `discoverability` (5) after the root
+re-export; `cargo test --doc` for `vectordata`, `veks-datatypes` and
+`veks-io` (31, 2 and 7 examples); `cargo doc` for the three with
+warnings denied; clippy on the new file.
+
+**Coverage after the step** (the §14.5 command, whole workspace:
+75.6% → 76.0%; unchanged from step 8, as the step's one code change is a
+re-export). The whole workspace under it: 3625 passed, 0 failed.
+

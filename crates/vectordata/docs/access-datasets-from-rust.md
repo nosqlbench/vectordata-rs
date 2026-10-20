@@ -10,10 +10,11 @@ this tutorial covers — **catalog → profile → reader**:
 ```rust
 use vectordata::catalog::sources::CatalogSources;
 use vectordata::catalog::resolver::Catalog;
+use vectordata::TestDataViewExt;
 
 let catalog = Catalog::of(&CatalogSources::new().configure_default());
 let view    = catalog.open_profile("my-dataset", "default")?;
-let base    = view.base_vectors()?;       // Arc<dyn VectorReader<f32>>
+let base    = view.base_vectors_as::<f32>()?;   // Arc<dyn VectorReader<f32>>
 let v: Vec<f32> = base.get(42)?;
 ```
 
@@ -54,20 +55,32 @@ println!("base_count: {:?}", view.base_count());
 
 ## 2. Read uniform vectors
 
-Standard facets return readers parameterised on the natural
-element type:
+Every facet opens at the element type you ask for, through
+`TestDataViewExt` (import it): natively when the file holds that
+type, widened when the conversion is lossless (a `bf16` or `u8` base
+as `f32`), refused otherwise (an `f32` base as `u8`) — never a
+reinterpretation of the bytes.
 
 ```rust
-let base  = view.base_vectors()?;        // Arc<dyn VectorReader<f32>>
-let query = view.query_vectors()?;
-let gt    = view.neighbor_indices()?;    // Arc<dyn VectorReader<i32>>
-let dist  = view.neighbor_distances()?;
+use vectordata::TestDataViewExt;
+
+let base  = view.base_vectors_as::<f32>()?;        // Arc<dyn VectorReader<f32>>
+let query = view.query_vectors_as::<f32>()?;
+let gt    = view.neighbor_indices_as::<i32>()?;    // Arc<dyn VectorReader<i32>>
+let dist  = view.neighbor_distances_as::<f32>()?;
 
 println!("{} vectors, dim={}", base.count(), base.dim());
 
 let v: Vec<f32> = base.get(42)?;
 let neighbors: Vec<i32> = gt.get(0)?;
+
+// What the file holds, and whether this reader converts
+println!("{:?} read as {:?}", base.native_element_type(), base.conversion());
 ```
+
+A quantized corpus reads as its codes — `base_vectors_as::<u8>()` —
+and `quantized_base::<u8>()` opens the codes with their per-vector
+scale, zero point and code sum as one thing (API reference §2.7).
 
 ## 3. Read variable-length vectors
 
@@ -77,7 +90,7 @@ predicate, so they're served as a `VvecReader`:
 ```rust
 use vectordata::VvecReader;
 
-let mi = view.metadata_indices()?;       // Arc<dyn VvecReader<i32>>
+let mi = view.metadata_results_as::<i32>()?;   // Arc<dyn VvecReader<i32>>
 println!("{} records", mi.count());
 
 let matching: Vec<i32> = mi.get(0)?;     // length varies per record
@@ -86,28 +99,29 @@ let dim: usize = mi.dim_at(0)?;
 
 ## 4. Read typed scalars and metadata
 
-Scalar metadata (`.u8`, `.i32`, etc.) is opened via
-`open_facet_typed`, which dispatches on the facet's native element
-type and gives you a `TypedReader<T>` with widening conversions:
+Scalar metadata (`.u8`, `.i32`, `.f32`, …) is a header-free column.
+`facet_as::<T>(name)` opens it like any other facet; once the file is
+resident, `as_slice()` is the whole column, borrowed from the mapping:
 
 ```rust
-use vectordata::{open_facet_typed, TypedReader};
+let meta = view.facet_as::<u8>("metadata_content")?;
+let pred = view.facet_as::<u8>("metadata_predicates")?;
 
-let meta: TypedReader<u8>  = open_facet_typed(&*view, "metadata_content")?;
-let pred: TypedReader<u8>  = open_facet_typed(&*view, "metadata_predicates")?;
-
+let labels  = meta.as_slice().expect("local and fetched");
+let filters = pred.as_slice().expect("local and fetched");
 for i in 0..5 {
-    println!("base[{}] label={}, query[{}] filter={}",
-        i, meta.get_native(i), i, pred.get_native(i));
+    println!("base[{}] label={}, query[{}] filter={}", i, labels[i], i, filters[i]);
 }
 
-// Widening: open a u8 file as i32 — every value succeeds
-let widened: TypedReader<i32> = open_facet_typed(&*view, "metadata_content")?;
-let v: i32 = widened.get_value(42)?;
+// Widening: open a u8 column as i32 — every value succeeds
+let widened = view.facet_as::<i32>("metadata_content")?;
+let v: i32 = widened.get(42)?[0];           // as_slice() is None: nothing to borrow at i32
 ```
 
-Same-width cross-sign (e.g., `u8` ↔ `i8`) is allowed and checked
-per value; narrowing is rejected at open time.
+Same-width cross-sign (`u8` ↔ `i8`) is allowed and checked per value
+(`IoError::ValueOverflow` at the first that does not fit); narrowing,
+and any conversion that could lose precision, is refused at open with
+`IoError::ElementMismatch`. The table is in the API reference, §2.7.
 
 ## 5. Discover what's available
 
@@ -182,8 +196,8 @@ if let Some(cs) = storage.cache_stats() {
 cache to report on. `is_local()` is true for local datasets from the
 start and for cached-remote once promoted.
 
-Read the data through the facet readers (`base_vectors()`, `facet()`,
-`open_facet_typed`), never by opening cache files yourself: a cache
+Read the data through the facet readers (`base_vectors_as`,
+`facet_as`), never by opening cache files yourself: a cache
 file is pre-sized and sparse until complete, which chunks are valid is
 recorded separately, and a sharded facet spans several files. The
 readers handle all of that and are zero-copy once the facet is fetched
@@ -211,11 +225,11 @@ let group = vectordata::TestDataGroup::load("./my-dataset/")?;
 let view = group.profile("default").unwrap();
 
 // base_vectors → Storage::Mmap (local, no cache, no copy)
-let base = view.base_vectors()?;
+let base = view.base_vectors_as::<f32>()?;
 
 // query_vectors → Storage::Cached (downloads to cache_dir on first
 // read, promotes to mmap once complete)
-let query = view.query_vectors()?;
+let query = view.query_vectors_as::<f32>()?;
 
 // fetch is per-facet aware: local facets cost nothing, remote facets
 // download.
@@ -236,7 +250,7 @@ reader on every thread zero-copy:
 ```rust
 use rayon::prelude::*;
 
-let base = view.base_vectors()?;
+let base = view.base_vectors_as::<f32>()?;
 let norms: Vec<f64> = (0..base.count())
     .into_par_iter()
     .map(|i| {
@@ -293,18 +307,17 @@ let r = open_vec::<i32>("https://example.com/neighbors.ivecs")?;
 let r = open_vvec::<i32>("metadata_indices.ivvecs")?;
 ```
 
-For typed scalar access without a `TestDataView`:
+The raw opens are native-only: `open_vec::<f32>("x.ivecs")` is an
+`ElementMismatch`, not a reinterpretation. For a file whose type you
+do not know, or at a type the file does not hold:
 
 ```rust
-use vectordata::typed_access::{ElementType, TypedReader};
+use vectordata::io::{open_vec_as, open_vec_native, ScalarReader};
 
-let r = TypedReader::<u8>::open("metadata.u8")?;
-let r = TypedReader::<i32>::open_url(
-    url::Url::parse("https://example.com/metadata.u8")?,
-    ElementType::U8,
-)?;
-let r = TypedReader::<i64>::open_auto("https://host/metadata.i32",
-    ElementType::I32)?;
+let any = open_vec_native("metadata.u8")?;                // AnyVectorReader, at its own type
+println!("{} of {}", any.count(), any.element_type());
+let r = open_vec_as::<i64>("https://host/metadata.i32")?; // widened; the type comes from the extension
+let r = ScalarReader::<u8>::open_path("metadata.u8")?;    // a column, natively, with as_slice()
 ```
 
 ---

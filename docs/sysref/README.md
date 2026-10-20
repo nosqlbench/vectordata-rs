@@ -24,10 +24,10 @@ facet system. The foundation everything else builds on.
 The vectordata consumer library. How to load datasets, read vectors,
 and access metadata from Rust code.
 
-- `open_vec<T>()` and `open_vvec<T>()` — unified file access
+- `open_vec<T>()`, `open_vec_as<T>()` and `open_vvec<T>()` — unified file access
 - `TestDataGroup` and `TestDataView` — catalog-driven dataset access
-- `TypedReader<T>` — scalar access with width negotiation
-- Traits: `VectorReader<T>`, `VvecReader<T>`, `VvecElement`
+- `TestDataViewExt::facet_as<T>()` — any facet at any type the conversion table allows
+- Traits: `VectorReader<T>`, `VvecReader<T>`, `Element`
 - Thread safety, error handling
 
 ### [3. Catalogs and Publishing](./03-catalogs.md)

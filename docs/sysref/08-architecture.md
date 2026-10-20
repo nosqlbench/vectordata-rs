@@ -34,10 +34,10 @@ and UI layer.
 ```
 vectordata-rs/
 ├── vectordata/        Access library (consumer crate)
-│   ├── io.rs          VectorReader/VvecReader traits + XvecReader/IndexedVvecReader, open_vec, open_vvec
-│   ├── view.rs        TestDataView trait (fetch, plan_fetch), FacetStorage, open_facet_typed
+│   ├── io.rs          VectorReader/VvecReader traits + XvecReader/ScalarReader/IndexedVvecReader, AnyVectorReader, open_vec, open_vec_as, open_vvec
+│   ├── view.rs        TestDataView trait (fetch, plan_fetch), TestDataViewExt (facet_as, quantized_base), FacetStorage
 │   ├── fetch.rs       FetchRequest, FetchPlan, FetchReport, FetchProgress sinks, TextMeter
-│   ├── typed_access.rs  TypedReader<T> over crate-private Storage
+│   ├── typed_access.rs  ElementType re-exports and ElementTypeExt; the deprecated TypedReader<T>
 │   ├── settings.rs    cache_dir resolution (single source of truth, strict — no silent fallback)
 │   ├── storage.rs     pub(crate) Storage enum (Mmap | Http | Cached) — hidden from consumers
 │   ├── dataset/       dataset.yaml parsing, profiles, catalogs

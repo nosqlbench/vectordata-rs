@@ -52,22 +52,22 @@ name, read its facets through typed readers.
 use vectordata::catalog::sources::CatalogSources;
 use vectordata::catalog::resolver::Catalog;
 use vectordata::fetch::{FetchRequest, TextMeter};
-use vectordata::{open_facet_typed, TestDataView, TypedReader};
+use vectordata::{TestDataView, TestDataViewExt};
 
 // Catalog → profile → reader. The prescribed entry path.
 let catalog = Catalog::of(&CatalogSources::new().configure_default());
 let view    = catalog.open_profile("myset", "default")?;
 
-let base = view.base_vectors()?;       // Arc<dyn VectorReader<f32>>  — 1M vectors
-let gt   = view.neighbor_indices()?;   // Arc<dyn VectorReader<i32>>  — exact KNN
-let mi   = view.metadata_results()?;   // Arc<dyn VvecReader<i32>>    — predicate matches
+let base = view.base_vectors_as::<f32>()?;      // Arc<dyn VectorReader<f32>>  — 1M vectors
+let gt   = view.neighbor_indices_as::<i32>()?;  // Arc<dyn VectorReader<i32>>  — exact KNN
+let mi   = view.metadata_results_as::<i32>()?;  // Arc<dyn VvecReader<i32>>    — predicate matches
 
 let nearest:  Vec<i32> = gt.get(0)?;
 let matching: Vec<i32> = mi.get(0)?;
 
-// Typed scalar metadata via the same view handle
-let label: TypedReader<u8> = open_facet_typed(&*view, "metadata_content")?;
-let v: u8 = label.get_native(42)?;
+// Scalar metadata via the same view handle, at the type you want
+let label = view.facet_as::<u8>("metadata_content")?;
+let v: u8 = label.get(42)?[0];
 
 // Fetch the whole profile so hot loops read zero-copy mmap
 view.fetch(&FetchRequest::all(), &mut TextMeter::stderr("Fetch"))?;
@@ -77,8 +77,9 @@ You never construct URLs, never name a transport, and never decide
 whether a remote dataset should be cached. The crate picks the
 right backing storage (local mmap, merkle-cached HTTP with
 auto-promotion to mmap, or direct HTTP fallback) from the catalog
-entry alone. Uniform and variable-length facets share the same
-`view.X()` shape; typed scalars come through `open_facet_typed`.
+entry alone. Every facet opens through the same `view.X_as::<T>()`
+shape — natively when the file holds `T`, widened when that is
+lossless, refused otherwise.
 
 This is the prescribed pattern — full walk-through in
 [Accessing datasets from Rust](./crates/vectordata/docs/access-datasets-from-rust.md).

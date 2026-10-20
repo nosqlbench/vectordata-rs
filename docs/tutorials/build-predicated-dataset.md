@@ -246,23 +246,24 @@ veks analyze describe --source profiles/default/metadata_indices.ivvecs --scan t
 ## Access from Rust
 
 ```rust
-use vectordata::{open_facet_typed, TestDataGroup, TestDataView, TypedReader};
+use vectordata::{TestDataGroup, TestDataView, TestDataViewExt};
 
 let group = TestDataGroup::load("./my-predicated-dataset/")?;
 let view = group.profile("default").unwrap();
 
-// Verify: every filtered neighbor passes its predicate
-let fki = view.filtered_neighbor_indices()?;
-let mi  = view.metadata_indices()?;       // Arc<dyn VvecReader<i32>>
-let meta: TypedReader<u8> = open_facet_typed(&*view, "metadata_content")?;
-let pred: TypedReader<u8> = open_facet_typed(&*view, "metadata_predicates")?;
+// Verify: every pre-filtered neighbor passes its predicate
+let fki  = view.prefiltered_neighbor_indices_as::<i32>()?;
+let mi   = view.metadata_results_as::<i32>()?;      // Arc<dyn VvecReader<i32>>
+let meta = view.facet_as::<u8>("metadata_content")?;
+let pred = view.facet_as::<u8>("metadata_predicates")?;
+let (labels, filters) = (meta.as_slice().unwrap(), pred.as_slice().unwrap());
 
 for qi in 0..10 {
-    let pred_val = pred.get_native(qi);
+    let pred_val = filters[qi];
     let neighbors = fki.get(qi)?;
     for &ord in &neighbors {
-        if ord < 0 { continue; }
-        assert_eq!(meta.get_native(ord as usize), pred_val);
+        if ord < 0 { continue; }                     // a row shorter than K is padded with -1
+        assert_eq!(labels[ord as usize], pred_val);
     }
     // (mi.get(qi)? gives the variable-length list of base ordinals
     // matching the predicate, useful for cross-checking coverage.)
