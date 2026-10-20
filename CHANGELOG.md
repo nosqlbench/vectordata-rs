@@ -69,6 +69,10 @@ replacement. The design is `docs/design/srd-element-access.md`.
   one vector or one streamed chunk at a time, never copied as f32;
   queries may be f32 or any type that widens to it. A 32- or 64-bit
   integer base is refused by name.
+- **`transform extract` takes a vector file of every element type**,
+  gathering whole records at the source's type for the types without a
+  specialized extractor.
+
 ### Upgrading from 3.0
 
 Each changed call, and what replaces it. The old spelling stays,
@@ -105,6 +109,19 @@ deprecated, unless the row says otherwise.
   value. A float native type is now refused at open.
 - **A `dataset.yaml` named as a catalog source** listed a dataset per
   top-level key (`profiles`, `attributes`, …). It is now one entry.
+- **`transform convert` f32 → bf16 wrote f16 bits under a bf16
+  extension**, and a width pair it had no converter for wrote the
+  source bytes into the target unchanged (f32 → u8 a corrupt file;
+  u8 → f32 broken; same-width pairs reinterpreted). The conversion is
+  chosen from the two element types: widening and cross-sign as the
+  conversion table allows, or any float to float; anything else is
+  refused naming both.
+- **`transform extract` refused `.dvec`, `.svec` and `.bvec` sources**
+  its documentation listed.
+- **`veks prepare import` of a base-only source never wrote the base
+  facet.**
+- **`XvecReader::get_slice` gave `None` for every 8-byte element type**;
+  every other record of such a file is aligned and now borrows.
 - **`veks-io` validated nothing it mapped.** A negative dimension was
   cast to a size, the entry size overflowed, a truncated file read
   past its end, and an 8-byte `get_slice` at an unaligned offset was

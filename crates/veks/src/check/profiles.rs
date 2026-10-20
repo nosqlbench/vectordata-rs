@@ -346,7 +346,8 @@ fn check_ground_truth(
             let rel = relpath(view);
             let Some(path) = local(&rel) else { continue };
             // Any integer type reads as i64; a u64 index is checked value
-            // by value, which is what the scan does anyway.
+            // by value, and one above i64::MAX surfaces as a read error
+            // the scan reports below rather than swallows.
             let ids = match vectordata::io::open_vec_as::<i64>(&path.to_string_lossy()) {
                 Ok(r) => r,
                 Err(e) => {
@@ -385,7 +386,13 @@ fn check_ground_truth(
             sink.report(&label, 0, rows as u64);
             while done < rows {
                 let got = match ids.read_into(done, &mut block) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    // A value the conversion to i64 refuses, or a short
+                    // read, is a failure of the facet, not an end of it.
+                    Err(e) => {
+                        failures.push(format!("{ds_rel}: profile '{name}' {idx_key} {rel}: {e} (EA-33)"));
+                        break;
+                    }
                     Ok(n) => n,
                 };
                 let bad = block[..got * dim]

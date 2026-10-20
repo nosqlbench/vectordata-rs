@@ -686,15 +686,11 @@ impl<T: Element> VectorReader<T> for XvecReader<T> {
         // Cast bytes → &[T]. Safe under the LE-host assumption that
         // the rest of the crate already makes (storage values are
         // little-endian on disk; native LE on x86/ARM means the byte
-        // order is identical). Alignment is satisfied by mmap (page-
-        // aligned base) and the per-record offset (4-byte dim header
-        // keeps T::SIZE-aligned data starts aligned for sizes ≤
-        // 8). For 8-byte types, the leading dim header forces all
-        // records to start at offsets that are 4-aligned, not 8-
-        // aligned — so we conservatively bail out on 8-byte types.
-        if T::SIZE > 4 {
-            return None;
-        }
+        // order is identical). The mapping is page-aligned, so a
+        // record's data is aligned for T when its offset is: always
+        // for sizes ≤ 4; for an 8-byte type the 4-byte header puts
+        // every other record at 4 mod 8, and those read by copy. The
+        // same rule veks-io's MmapReader applies, record by record.
         let ptr = bytes.as_ptr() as *const T;
         if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
             return None;

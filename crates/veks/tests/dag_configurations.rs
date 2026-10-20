@@ -600,8 +600,33 @@ fn dag_12_base_only_no_queries() {
     // No query/KNN chain (Q, G not in facets)
     assert_step_absent(&steps, "generate-shuffle");
     assert_step_absent(&steps, "extract-queries");
-    assert_step_absent(&steps, "extract-base");
     assert_step_absent(&steps, "compute-knn");
+    // Dedup is on, so the clean subset is extracted to the base facet
+    // the profile names; without the step that file is never written.
+    assert_step_present(&steps, "extract-base");
+}
+
+// ── Config 12b: Base only, no dedup — the source is the base ──────────
+#[test]
+fn dag_12b_base_only_without_dedup_uses_the_source() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvecs");
+    write_fvec(&fvec, 200);
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("base-only-raw", &out);
+    args.base_vectors = Some(fvec);
+    args.required_facets = Some("B".to_string());
+    args.no_dedup = true;
+
+    veks::prepare::import::run(args);
+    let yaml = read_yaml(&out);
+    let steps = parse_steps(&yaml);
+
+    // Nothing rewrites the base, so nothing extracts it: the profile
+    // names the source.
+    assert_step_absent(&steps, "extract-base");
+    assert!(yaml.contains("vectors.fvecs"), "the profile names the source:\n{yaml}");
 }
 
 // ── Config 13: Explicit BQG — queries but no distances ────────────────

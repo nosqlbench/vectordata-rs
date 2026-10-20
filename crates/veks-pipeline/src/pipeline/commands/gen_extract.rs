@@ -3262,6 +3262,148 @@ fn error_result(message: String, start: Instant) -> CommandResult {
 /// Scalar files have one fixed-size element per record (no dimension header).
 /// Used for metadata labels (`.u8`), predicate keys, and similar per-vector
 /// scalar data that must be reordered to match shuffled/partitioned vectors.
+/// Internal delegate: gather whole records of a uniform vector file of
+/// any element type without a specialized extractor (bf16, f64, and the
+/// integers but i32), at the source's own type — each record is copied
+/// as it is, so no value is converted. `ivec-file` selects records by
+/// ordinal (identity over `range` if omitted); `normalize` is a float
+/// transform the f32 and f16 extractors carry and is refused here.
+struct GenerateRecordExtractOp;
+
+impl GenerateRecordExtractOp {
+    /// Gather `ordinals` of `source` (records of `T`) into `output`.
+    fn gather<T: crate::pipeline::element_type::Element>(
+        source: &Path,
+        output: &Path,
+        ordinals: &mut dyn Iterator<Item = Result<usize, String>>,
+        total: usize,
+        ctx: &mut StreamContext,
+    ) -> Result<Vec<PathBuf>, String> {
+        let reader = XvecReader::<T>::open_path(source).map_err(|e| format!("failed to open {}: {e}", source.display()))?;
+        let (count, dim) = (VectorReader::<T>::count(&reader), VectorReader::<T>::dim(&reader));
+        let record_bytes = 4 + (dim * T::SIZE) as u64;
+        let cap = crate::pipeline::shard_write::cap_for_output(&ctx.governor, &ctx.workspace, output);
+        let mut writer = crate::pipeline::shard_write::FacetWriter::open(output, record_bytes, cap)
+            .map_err(|e| format!("failed to create {}: {e}", output.display()))?;
+        let mut record = vec![0u8; record_bytes as usize];
+        record[..4].copy_from_slice(&(dim as i32).to_le_bytes());
+        let pb = ctx.ui.bar(total as u64, format!("extracting {}", T::TYPE.name()));
+        for ord in ordinals {
+            let ord = ord?;
+            if ord >= count {
+                return Err(format!("ordinal {ord} is past the {count} records of {}", source.display()));
+            }
+            let values = VectorReader::<T>::get(&reader, ord).map_err(|e| format!("read error at {ord}: {e}"))?;
+            for (v, slot) in values.iter().zip(record[4..].chunks_exact_mut(T::SIZE)) {
+                v.write_le_bytes(slot);
+            }
+            std::io::Write::write_all(&mut writer, &record).map_err(|e| format!("write {}: {e}", output.display()))?;
+            pb.inc(1);
+        }
+        pb.finish();
+        let outcome = writer.finish().map_err(|e| format!("failed to finalize {}: {e}", output.display()))?;
+        Ok(outcome.files)
+    }
+}
+
+impl CommandOp for GenerateRecordExtractOp {
+    fn command_path(&self) -> &str {
+        "transform extract"
+    }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_TRANSFORM
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
+    fn command_doc(&self) -> CommandDoc {
+        CommandDoc {
+            summary: "Gather whole records of a uniform vector file of any element type".into(),
+            body: "Internal delegate for transform extract when the source is a uniform vector file \
+                   without a specialized extractor (bf16, f64, and every integer type but i32).".into(),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false }]
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+        let source_str = match options.require("source") { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let output_str = match options.require("output") { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let source = resolve_path(source_str, &ctx.workspace);
+        let output = resolve_path(output_str, &ctx.workspace);
+        let ty = match ElementType::from_path(&source) { Ok(t) => t, Err(e) => return error_result(e, start) };
+        if options.get("normalize").is_some_and(|s| s == "true") {
+            return error_result(
+                format!("normalize is an f32 or f16 transform; a {ty} source is gathered as it is"),
+                start,
+            );
+        }
+        let range = match options.get("range") {
+            Some(r) => match parse_range(r) {
+                Ok(rng) => rng,
+                Err(e) => return error_result(format!("invalid range '{}': {}", r, e), start),
+            },
+            None => Range { start: 0, end: None },
+        };
+        if let Some(parent) = output.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let count = match vectordata::io::open_vec_native(&source.to_string_lossy()) {
+            Ok(r) => r.count(),
+            Err(e) => return error_result(format!("failed to open {}: {e}", source.display()), start),
+        };
+
+        let index = options.get("ivec-file").map(|s| resolve_path(s, &ctx.workspace));
+        let index_reader = match &index {
+            Some(p) => match XvecReader::<i32>::open_path(p) {
+                Ok(r) => Some(r),
+                Err(e) => return error_result(format!("failed to open ivec file {}: {e}", p.display()), start),
+            },
+            None => None,
+        };
+        let limit = index_reader.as_ref().map_or(count, VectorReader::<i32>::count);
+        let (from, to) = (range.start, range.end.unwrap_or(limit).min(limit));
+        if from >= limit {
+            return error_result(format!("range start {from} exceeds {limit} records"), start);
+        }
+        let mut ordinals: Box<dyn Iterator<Item = Result<usize, String>>> = match &index_reader {
+            Some(r) => Box::new((from..to).map(move |i| {
+                let ord = VectorReader::<i32>::get(r, i).map_err(|e| format!("read index {i}: {e}"))?[0];
+                usize::try_from(ord).map_err(|_| format!("index {i} holds {ord}, which names no record"))
+            })),
+            None => Box::new((from..to).map(Ok)),
+        };
+        let gathered = veks_datatypes::dispatch_element!(ty, T => Self::gather::<T>(&source, &output, &mut *ordinals, to - from, ctx));
+        match gathered {
+            Ok(files) => {
+                let extracted = to - from;
+                let var_name = format!("verified_count:{}", output.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+                let _ = crate::pipeline::variables::set_and_save(&ctx.workspace, &var_name, &extracted.to_string());
+                ctx.defaults.insert(var_name, extracted.to_string());
+                CommandResult {
+                    status: Status::Ok,
+                    message: format!("extracted {extracted} {ty} records to {}", output.display()),
+                    produced: files,
+                    elapsed: start.elapsed(),
+                }
+            }
+            Err(e) => error_result(e, start),
+        }
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        Vec::new()
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(step_id, self.command_path(), options, &["source", "ivec-file"], &["output"])
+    }
+}
+
 struct GenerateScalarExtractOp;
 
 impl CommandOp for GenerateScalarExtractOp {
@@ -3425,7 +3567,10 @@ impl CommandOp for TransformExtractOp {
                 Auto-detects the source file format from its extension and delegates \
                 to the appropriate format-specific extractor.\n\n\
                 Supported formats:\n\
-                - Vector files: `.fvec` (f32), `.mvec` (f16), `.ivec` (i32), `.dvec`, `.svec`, `.bvec`\n\
+                - Vector files of every element type: `.fvec` (f32), `.mvec` (f16) and `.ivec` \
+                (i32) through their own extractors; `.bf16vecs`, `.dvec` (f64), `.bvec` (u8), \
+                `.i8vecs`, `.u16vecs`, `.svec` (i16), `.u32vecs`, `.u64vecs`, `.i64vecs` by \
+                gathering whole records at the source's type (`normalize` is refused for these)\n\
                 - Scalar files: `.u8`, `.i8`, `.u16`, `.i16`, `.u32`, `.i32`, `.u64`, `.i64` \
                 (one element per record, no dimension header)\n\
                 - Container files: `.slab` (record-oriented binary — may contain vectors, \
@@ -3481,12 +3626,9 @@ impl CommandOp for TransformExtractOp {
                 Ok(ElementType::F32) => { delegate_opts.set("fvec-file", source_str); Some(ElementType::F32) }
                 Ok(ElementType::F16) => { delegate_opts.set("mvec-file", source_str); Some(ElementType::F16) }
                 Ok(ElementType::I32) => { delegate_opts.set("ivec-file", source_str); Some(ElementType::I32) }
-                Ok(et) => {
-                    return error_result(
-                        format!("unsupported xvec format '.{}' ({}) for extract", ext, et),
-                        start,
-                    );
-                }
+                // Every other element type gathers whole records as
+                // they are, at the source's own type.
+                Ok(et) => { delegate_opts.set("source", source_str); Some(et) }
                 Err(e) => {
                     return error_result(
                         format!("unsupported format '.{}' for extract: {}", ext, e),
@@ -3592,8 +3734,8 @@ impl CommandOp for TransformExtractOp {
                 Some(ElementType::F32) => Box::new(GenerateFvecExtractOp),
                 Some(ElementType::F16) => Box::new(GenerateMvecExtractOp),
                 Some(ElementType::I32) => Box::new(GenerateIvecExtractOp),
+                Some(_) => Box::new(GenerateRecordExtractOp),
                 None => Box::new(GenerateSlabExtractOp),
-                _ => unreachable!(),
             }
         };
 

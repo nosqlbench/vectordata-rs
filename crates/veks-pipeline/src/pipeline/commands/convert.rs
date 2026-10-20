@@ -13,6 +13,8 @@ use std::time::Instant;
 
 use veks_core::formats::VecFormat;
 use veks_core::formats::convert::convert_elements_into;
+use veks_datatypes::{Element, ElementConversion, ElementKind, FloatFormat};
+use crate::pipeline::element_type::ElementType;
 use veks_core::formats::parquet_vector_compiler;
 use veks_core::formats::reader;
 use veks_core::formats::writer::{self, SinkConfig};
@@ -61,12 +63,16 @@ It supports all recognized vector formats including fvec, ivec, bvec, npy, mvec,
 slab, and xvec. Both the source and target formats can be specified explicitly,
 or the source format can be auto-detected from the file extension.
 
-When the source and target formats use different element sizes, the command
-performs element widening or narrowing automatically. For example, converting
-from fvec (f32, 4 bytes per element) to a half-precision format (f16, 2 bytes
-per element) narrows each element, while going from bvec (u8, 1 byte) to fvec
-widens them. The conversion is applied per-element across every dimension of
-every record.
+When the source and target formats hold different element types, the command
+converts each element by the pair of types, never by their widths alone: a
+widening (bvec u8 to fvec f32, mvec f16 or bf16vec to fvec, ivec i32 to i64) is
+exact; a change of sign at the same width (u8 to i8) is checked value by value,
+and a value that does not fit fails the conversion naming it; a narrowing
+between float types (fvec f32 to mvec f16 or to bf16vec, dvec f64 to fvec)
+rounds, and is the one deliberate loss of precision this command performs. A
+float into an integer type, or an integer into a narrower integer or into a
+float that would round it, is refused with both types named. The conversion is
+applied per-element across every dimension of every record.
 
 Internally, the command uses a read-ahead pipeline architecture: a background
 reader thread fills a bounded channel with source records while the main thread
@@ -254,10 +260,23 @@ Convert with explicit source format override:
             (count, _) => count,
         };
 
-        // Determine if element conversion is needed
-        let needs_conversion = dst_element_size > 0
-            && src_element_size > 0
-            && src_element_size != dst_element_size;
+        // The element conversion, decided by the pair of types rather
+        // than by their widths: a `.bf16vecs` is not a `.mvecs` because
+        // both are two bytes wide, and an `f32` is not an `i32`. A
+        // container source (npy, parquet, slab) states its type by
+        // width, as it always has; a container target takes the source
+        // bytes as they are.
+        let src_ty = source_format
+            .element_type()
+            .unwrap_or_else(|| veks_core::formats::element_type_of_width(src_element_size));
+        let plan = match to_format.element_type() {
+            Some(dst_ty) if dst_ty != src_ty => match ElementPlan::for_pair(src_ty, dst_ty) {
+                Some(plan) => Some(plan),
+                None => return error_result(refusal_message(src_ty, dst_ty), start),
+            },
+            _ => None,
+        };
+        let needs_conversion = plan.is_some();
 
         ctx.ui.log(&format!(
             "  source: dimension={}, element_size={}, records={}",
@@ -575,14 +594,16 @@ Convert with explicit source format override:
                             for row in chunk.start_row..chunk.end_row {
                                 let data = chunk.file.array.row_bytes(row);
                                 let ordinal = file_offset + row as u64;
-                                let record_data: &[u8] = if needs_conversion {
-                                    if convert_elements_into(&data, src_element_size, dst_element_size, &mut conv_buf).is_some() {
-                                        &conv_buf[..]
-                                    } else {
-                                        &data[..]
-                                    }
-                                } else {
-                                    &data[..]
+                                let record_data: &[u8] = match plan {
+                                    Some(plan) => match plan.convert_record(&data, &mut conv_buf) {
+                                        Ok(n) => &conv_buf[..n],
+                                        Err(e) => {
+                                            err.store(true, std::sync::atomic::Ordering::Relaxed);
+                                            log::error!("record {}: {}", ordinal, e);
+                                            break;
+                                        }
+                                    },
+                                    None => &data[..],
                                 };
                                 if normalize && dst_element_size == 4 {
                                     if normalize_f32_record(record_data, &mut norm_buf_local, zero_threshold_sq, skip_normalize) {
@@ -693,18 +714,18 @@ Convert with explicit source format override:
 
         let mut norm_buf = if normalize { vec![0u8; dst_record_bytes] } else { Vec::new() };
         count = 0;
+        let mut failed: Option<String> = None;
         for data in rx {
             input_count += 1;
-            let record_data = if needs_conversion {
-                if convert_elements_into(
-                    &data, src_element_size, dst_element_size, &mut conv_buf,
-                ).is_some() {
-                    &conv_buf[..]
-                } else {
-                    &data[..]
-                }
-            } else {
-                &data[..]
+            let record_data = match plan {
+                Some(plan) => match plan.convert_record(&data, &mut conv_buf) {
+                    Ok(n) => &conv_buf[..n],
+                    Err(e) => {
+                        failed = Some(format!("record {}: {}", input_count - 1, e));
+                        break;
+                    }
+                },
+                None => &data[..],
             };
 
             if normalize && dst_element_size == 4 {
@@ -723,8 +744,14 @@ Convert with explicit source format override:
                 && count >= lim { break; }
         }
 
+        // The loop consumed `rx`; a `break` dropped it, so the reader's
+        // next send fails and it exits.
         reader_handle.join().expect("reader thread panicked");
         pb.finish();
+
+        if let Some(e) = failed {
+            return error_result(e, start);
+        }
 
         if let Err(e) = sink.finish() {
             return error_result(format!("failed to finalize output: {}", e), start);
@@ -926,6 +953,74 @@ fn format_size(bytes: u64) -> String {
     else if bytes >= 1_048_576 { format!("{:.1} MiB", bytes as f64 / 1_048_576.0) }
     else if bytes >= 1024 { format!("{:.1} KiB", bytes as f64 / 1024.0) }
     else { format!("{} B", bytes) }
+}
+
+/// How `transform convert` moves one record's elements from the source
+/// type to the target type, decided once per run from the pair by
+/// [`ElementPlan::for_pair`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElementPlan {
+    /// IEEE float to IEEE float of another width (`f16`, `f32`, `f64`):
+    /// veks-core's SIMD width converters, bit-identical with `half`.
+    IeeeWidths { from: usize, to: usize },
+    /// Value by value through the shared element model: exact for a
+    /// widening, rounded for a float narrowing, and checked for a sign
+    /// change, where a value that does not fit fails the record.
+    Values { src: ElementType, dst: ElementType },
+}
+
+impl ElementPlan {
+    /// The plan for converting `src` elements to `dst`, or `None` when
+    /// the pair is refused: the shared conversion table allows it
+    /// ([`Widening`](ElementConversion::Widening) or
+    /// [`CrossSign`](ElementConversion::CrossSign)), or both are floats
+    /// — a float narrowing is this command's documented, deliberate
+    /// loss of precision. A float into an integer, or an integer into a
+    /// narrower integer or a float that rounds it, is refused.
+    fn for_pair(src: ElementType, dst: ElementType) -> Option<Self> {
+        let allowed = matches!(src.conversion_to(dst), ElementConversion::Widening | ElementConversion::CrossSign)
+            || (src.is_float() && dst.is_float());
+        if !allowed {
+            return None;
+        }
+        let ieee = |ty: ElementType| ty.kind() == ElementKind::Float(FloatFormat::Ieee);
+        Some(if ieee(src) && ieee(dst) {
+            Self::IeeeWidths { from: src.byte_width(), to: dst.byte_width() }
+        } else {
+            Self::Values { src, dst }
+        })
+    }
+
+    /// Convert one record's element bytes `data` into `out`, which holds
+    /// at least `data.len() / src width * dst width` bytes; the bytes
+    /// written, or the value that did not fit.
+    fn convert_record(self, data: &[u8], out: &mut [u8]) -> Result<usize, String> {
+        match self {
+            Self::IeeeWidths { from, to } => convert_elements_into(data, from, to, out)
+                .ok_or_else(|| format!("no width conversion from {from} to {to} bytes")),
+            Self::Values { src, dst } => veks_datatypes::dispatch_element!(src, S => {
+                veks_datatypes::dispatch_element!(dst, D => {
+                    let mut written = 0;
+                    for chunk in data.as_chunks::<{ S::SIZE }>().0 {
+                        let converted: D = veks_datatypes::convert(<S as Element>::from_le_bytes(chunk))
+                            .map_err(|e| e.to_string())?;
+                        <D as Element>::write_le_bytes(converted, &mut out[written..written + D::SIZE]);
+                        written += D::SIZE;
+                    }
+                    Ok(written)
+                })
+            }),
+        }
+    }
+}
+
+/// The message for a pair [`ElementPlan::for_pair`] refuses.
+fn refusal_message(src: ElementType, dst: ElementType) -> String {
+    format!(
+        "cannot convert {src} elements to {dst}: not every {src} value is a {dst} value, \
+         and transform convert only widens, changes sign with a per-value check, \
+         or narrows between float types"
+    )
 }
 
 /// L2-normalize an f32 vector record.

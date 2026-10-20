@@ -716,16 +716,27 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         };
         (shuffle, Some(qv), bv, bc)
     } else {
-        // No queries at all
-        let bv = Artifact::Materialized {
-            step_id: "extract-base".into(),
-            output: format!("{}base_vectors.{}", pp, vec_ext),
-        };
-        let bc = Artifact::Materialized {
-            step_id: "count-base".into(),
-            output: String::new(),
-        };
-        (None, None, bv, Some(bc))
+        // No queries at all: the base is extracted on the rule the
+        // separate-query branch follows — when dedup leaves a clean
+        // subset or normalization rewrites it — and is the source as it
+        // is otherwise (no shuffle: there is no query split to make).
+        let needs_base_extract = !args.no_dedup || args.normalize;
+        if needs_base_extract {
+            let bv = Artifact::Materialized {
+                step_id: "extract-base".into(),
+                output: format!("{}base_vectors.{}", pp, vec_ext),
+            };
+            let bc = Artifact::Materialized {
+                step_id: "count-base".into(),
+                output: String::new(),
+            };
+            (None, None, bv, Some(bc))
+        } else {
+            let bv = Artifact::Identity {
+                path: relativize_path(args.base_vectors.as_ref().unwrap(), output_dir),
+            };
+            (None, None, bv, None)
+        }
     };
 
     // ── Metadata chain ───────────────────────────────────────────────
@@ -1495,9 +1506,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 // Normalization stats are computed by prepare-vectors (SRD §20).
                 // No separate measure-normals step needed.
             }
-    } else if let Some(ref qv) = slots.query_vectors {
+    } else {
         // Separate query import
-        if qv.is_materialized() {
+        if let Some(ref qv) = slots.query_vectors
+            && qv.is_materialized()
+        {
             let query_source = args.query_vectors.as_ref().unwrap();
             let query_vec_format = VecFormat::detect(query_source);
             let format = query_vec_format
@@ -1535,6 +1548,9 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // Extract base vectors to the profile path when materialized:
         // - HDF5/npy sources: extract from converted all_vectors
         // - Native xvec with dedup: extract clean subset via clean_ordinals
+        // - No queries at all: the base-only dataset's one facet, which
+        //   `resolve_slots` always materializes and every later step
+        //   (the zero and duplicate scans, count-base) opens by this path
         if slots.base_vectors.is_materialized() {
             let working = slots.all_vectors.path();
             let has_shuffle = slots.shuffle.as_ref().is_some_and(|s| s.is_materialized());
@@ -2905,7 +2921,9 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
 
     // Base vectors: symlink ONLY when Identity (not Materialized).
     // When Materialized, the extract-base step will create the file.
-    if !self_search && !slots.base_vectors.is_materialized()
+    // Keyed on the slots' self-search decision, not on "no query file":
+    // a base-only dataset has no query file and is not self-search.
+    if !slots.self_search && !slots.base_vectors.is_materialized()
         && let Some(ref base_path) = args.base_vectors
             && is_native_xvec_file(base_path) {
                 let ext = base_path.extension()
