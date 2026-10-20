@@ -5,3 +5,4 @@ pub mod objectstore;
 pub mod testserver;
 pub mod fetch;
 pub mod fixtures;
+pub mod samples;

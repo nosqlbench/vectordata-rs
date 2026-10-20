@@ -720,6 +720,108 @@ mod tests {
         assert!(scan.last().unwrap().ends_with(": 3/3"), "{lines:?}");
     }
 
+    /// A uniform vector file of `rows` records of `dim` elements, each
+    /// element from `value(row, column)`, named `<stem>.<T's extension>`.
+    fn write_vectors<T: vectordata::typed_access::Element>(
+        dir: &Path, stem: &str, rows: usize, dim: usize, value: impl Fn(usize, usize) -> T,
+    ) -> String {
+        use vectordata::typed_access::Container;
+        let name = format!("{stem}.{}", T::TYPE.extension(Container::Vec));
+        let mut bytes = Vec::new();
+        for r in 0..rows {
+            bytes.extend_from_slice(&(dim as i32).to_le_bytes());
+            for c in 0..dim {
+                let at = bytes.len();
+                bytes.resize(at + T::SIZE, 0);
+                value(r, c).write_le_bytes(&mut bytes[at..]);
+            }
+        }
+        std::fs::write(dir.join(&name), bytes).unwrap();
+        name
+    }
+
+    /// A base of ten f32 vectors, three queries, a ground truth of three
+    /// rows of four indices of type `I` from `ids(row, column)`, and the
+    /// distances as `D`; the dataset.yaml naming all four.
+    fn typed_ground_truth<I: vectordata::typed_access::Element, D: vectordata::typed_access::Element>(
+        dir: &Path, ids: impl Fn(usize, usize) -> I, dist: impl Fn(usize, usize) -> D,
+    ) -> PathBuf {
+        write_vectors::<f32>(dir, "base_vectors", 10, 2, |r, c| r as f32 + c as f32 * 0.5);
+        write_vectors::<f32>(dir, "query_vectors", 3, 2, |r, c| r as f32 + c as f32 * 0.5);
+        let idx = write_vectors::<I>(dir, "neighbor_indices", 3, 4, ids);
+        let dst = write_vectors::<D>(dir, "neighbor_distances", 3, 4, dist);
+        dataset(
+            dir,
+            &format!(
+                "format_version: 1\nname: gt\nprofiles:\n  default:\n    base_vectors: base_vectors.f32vecs\n    \
+                 query_vectors: query_vectors.f32vecs\n    neighbor_indices: {idx}\n    neighbor_distances: {dst}\n"
+            ),
+        )
+    }
+
+    /// **A ground truth passes at every integer index type the check
+    /// reads as i64** — every one `conversion_to(I64)` admits, which is
+    /// all eight — when its indices are in range, and at every float
+    /// distance type.
+    #[test]
+    fn a_ground_truth_passes_at_every_integer_index_type_and_every_float_distance_type() {
+        use vectordata::typed_access::{Element, ElementConversion, ElementType};
+        let index_types: Vec<ElementType> = ElementType::ALL
+            .iter()
+            .copied()
+            .filter(|t| t.is_integer())
+            .collect();
+        for &ty in &index_types {
+            assert_ne!(ty.conversion_to(ElementType::I64), ElementConversion::Refused, "{ty}");
+        }
+        for &ty in &index_types {
+            let tmp = tempfile::tempdir().unwrap();
+            let p = veks_datatypes::dispatch_element!(ty, I => typed_ground_truth::<I, f32>(
+                tmp.path(),
+                |r, c| I::from_value(vectordata::typed_access::Value::Int(((r * 3 + c) % 10) as i128)).unwrap(),
+                |r, c| (r * 4 + c) as f32,
+            ));
+            let r = check(&[p]);
+            assert!(r.passed, "{ty} indices: {:?}", r.messages);
+        }
+        for &ty in ElementType::ALL.iter().filter(|t| t.is_float()) {
+            let tmp = tempfile::tempdir().unwrap();
+            let p = veks_datatypes::dispatch_element!(ty, D => typed_ground_truth::<i32, D>(
+                tmp.path(),
+                |r, c| ((r * 3 + c) % 10) as i32,
+                |r, c| D::from_value(vectordata::typed_access::Value::Int((r * 4 + c) as i128)).unwrap(),
+            ));
+            let r = check(&[p]);
+            assert!(r.passed, "{ty} distances: {:?}", r.messages);
+        }
+    }
+
+    /// **A u64 index above `i64::MAX` is reported** (EA-33): the check
+    /// reads every integer index type as i64, and a value the
+    /// cross-sign conversion refuses is a failure naming the facet, the
+    /// value and the type it would not fit — never a silent end of the
+    /// scan that leaves the dataset passing.
+    #[test]
+    fn a_u64_index_above_i64_max_is_reported_as_not_fitting_i64() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = typed_ground_truth::<u64, f32>(
+            tmp.path(),
+            |r, c| if (r, c) == (2, 1) { i64::MAX as u64 + 1 } else { ((r * 3 + c) % 10) as u64 },
+            |r, c| (r * 4 + c) as f32,
+        );
+        let r = check(&[p]);
+        assert!(!r.passed, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| {
+                m.contains("neighbor_indices")
+                    && m.contains(&(i64::MAX as u64 + 1).to_string())
+                    && m.contains("does not fit in i64")
+            }),
+            "{:?}",
+            r.messages
+        );
+    }
+
     /// **A consistent ground truth passes.**
     #[test]
     fn a_consistent_ground_truth_passes() {
@@ -742,6 +844,31 @@ mod tests {
         let p = dataset(tmp.path(), &format!("format_version: 1\nname: q\n{QUANT_ATTR}profiles:\n  default:\n{QUANT_VIEWS}"));
         let r = check(&[p]);
         assert!(r.passed, "{:?}", r.messages);
+    }
+
+    /// **A signed-code corpus checks as its own type** (EA-26): an i8
+    /// base with `codes: i8` passes, and `codes: u8` against the same
+    /// base is reported as naming a type the base does not hold.
+    #[test]
+    fn an_i8_coded_dataset_passes_at_i8_and_is_reported_at_u8() {
+        let tmp = tempfile::tempdir().unwrap();
+        quantized_files(tmp.path(), 4, 4, 4, 4);
+        let mut base = Vec::new();
+        for i in 0..4i8 {
+            base.extend_from_slice(&2i32.to_le_bytes());
+            base.extend_from_slice(&[(-i) as u8, (i * 30) as u8]);
+        }
+        std::fs::write(tmp.path().join("base_vectors.i8vecs"), base).unwrap();
+        let views = QUANT_VIEWS.replace("base_vectors.bvecs", "base_vectors.i8vecs");
+        let signed = QUANT_ATTR.replace("codes: u8", "codes: i8").replace("range: [0, 255]", "range: [-127, 127]");
+        let p = dataset(tmp.path(), &format!("format_version: 1\nname: q\n{signed}profiles:\n  default:\n{views}"));
+        let r = check(std::slice::from_ref(&p));
+        assert!(r.passed, "{:?}", r.messages);
+
+        dataset(tmp.path(), &format!("format_version: 1\nname: q\n{QUANT_ATTR}profiles:\n  default:\n{views}"));
+        let r = check(&[p]);
+        assert!(!r.passed, "u8 codes over an i8 base: {:?}", r.messages);
+        assert!(r.messages.iter().any(|m| m.contains("u8") && m.contains("i8")), "{:?}", r.messages);
     }
 
     /// **Columns without the attribute are reported**, as is an
@@ -780,6 +907,38 @@ mod tests {
         let r = check(&[p]);
         assert!(!r.passed);
         assert!(r.messages.iter().any(|m| m.contains("codes are i8 but base_vectors")), "{:?}", r.messages);
+    }
+
+    /// **An i8-coded base passes with `codes: i8`, and `codes: u8`
+    /// against it is refused** (EA-26): the scheme's code type is the
+    /// base file's element type, read from its extension.
+    #[test]
+    fn an_i8_coded_base_passes_with_i8_codes_and_is_refused_with_u8_codes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_vectors::<i8>(tmp.path(), "base_vectors", 5, 2, |r, c| (r as i8 - 2) * (c as i8 + 1));
+        let f32s = |k: usize| (0..k).flat_map(|i| (i as f32 * 0.5).to_le_bytes()).collect::<Vec<u8>>();
+        let i32s = |k: usize| (0..k).flat_map(|i| (i as i32).to_le_bytes()).collect::<Vec<u8>>();
+        std::fs::write(tmp.path().join("quant_scale.f32"), f32s(5)).unwrap();
+        std::fs::write(tmp.path().join("quant_zero_point.i32"), i32s(5)).unwrap();
+        std::fs::write(tmp.path().join("quant_sum.i32"), i32s(5)).unwrap();
+        let views = "    base_vectors: base_vectors.i8vecs\n    quant_scale: quant_scale.f32\n    \
+                     quant_zero_point: quant_zero_point.i32\n    quant_sum: quant_sum.i32\n";
+        let attr = |codes: &str| {
+            format!("attributes:\n  quantization:\n    scheme: affine\n    granularity: per-vector\n    codes: {codes}\n    range: [-128, 127]\n")
+        };
+
+        let p = dataset(tmp.path(), &format!("format_version: 1\nname: q\n{}profiles:\n  default:\n{views}", attr("i8")));
+        let r = check(std::slice::from_ref(&p));
+        assert!(r.passed, "{:?}", r.messages);
+
+        dataset(tmp.path(), &format!("format_version: 1\nname: q\n{}profiles:\n  default:\n{views}", attr("u8")));
+        let r = check(&[p]);
+        assert!(!r.passed, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("codes are u8 but base_vectors base_vectors.i8vecs holds i8")),
+            "{:?}",
+            r.messages
+        );
     }
 
     /// **A column whose count disagrees with the base is reported**,

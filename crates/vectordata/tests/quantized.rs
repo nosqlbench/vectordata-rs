@@ -126,3 +126,43 @@ fn a_malformed_attribute_is_an_error_not_a_scheme() {
     let err = view.quantized_base::<u8>().err().unwrap();
     assert!(err.to_string().contains("does not parse"), "{err}");
 }
+
+/// **A profile of i8 codes opens as i8**: the attribute names the
+/// type, `quantized_base::<i8>` borrows the codes as written, and
+/// asking for u8 codes — the cross-sign pair the table would check
+/// per value — is refused outright, because a quantized base is read
+/// at the type its scheme names and no other.
+#[test]
+fn an_i8_quantized_profile_opens_as_i8_codes() {
+    use support::fixtures::write_xvec;
+    let dir = tempfile::tempdir().unwrap();
+    let (n, dim) = (5usize, 3usize);
+    let codes: Vec<Vec<i8>> = (0..n).map(|i| (0..dim).map(|d| ((i * dim + d) as i32 * 37 % 256 - 128) as i8).collect()).collect();
+    write_xvec::<i8>(&dir.path().join("base_vectors.i8vecs"), n, dim, |i, d| codes[i][d]);
+    write_column(&dir.path().join("quant_scale.f32"), &[0.5f32, 0.25, 0.125, 1.0, 2.0]);
+    write_column(&dir.path().join("quant_zero_point.i32"), &[0i32, -1, 1, -128, 127]);
+    let sums: Vec<i32> = codes.iter().map(|c| c.iter().map(|&x| x as i32).sum()).collect();
+    write_column(&dir.path().join("quant_sum.i32"), &sums);
+    std::fs::write(
+        dir.path().join("dataset.yaml"),
+        "name: signed\nattributes:\n  quantization:\n    scheme: symmetric\n    granularity: per-vector\n    codes: i8\n    \
+         range: [-127, 127]\nprofiles:\n  default:\n    base_vectors: base_vectors.i8vecs\n    quant_scale: quant_scale.f32\n    \
+         quant_zero_point: quant_zero_point.i32\n    quant_sum: quant_sum.i32\n",
+    )
+    .unwrap();
+    let view = load(dir.path());
+
+    let q = view.quantized_base::<i8>().unwrap();
+    assert_eq!((q.codes.count(), q.codes.dim()), (n, dim));
+    for (i, row) in codes.iter().enumerate() {
+        assert_eq!(q.codes.get_slice(i), Some(&row[..]), "record {i} borrows from the mapping");
+    }
+    assert_eq!(q.sum.as_slice(), Some(&sums[..]));
+    assert_eq!((q.scheme.scheme, q.scheme.codes, q.scheme.range), (QuantScheme::Symmetric, ElementType::I8, [-127, 127]));
+    match view.quantized_base::<u8>() {
+        Err(Error::VectorIo(IoError::ElementMismatch { file, requested, .. })) => assert_eq!((file, requested), (ElementType::I8, ElementType::U8)),
+        other => panic!("u8 codes on an i8 corpus: {:?}", other.map(|q| q.codes.count())),
+    }
+    // The codes still read at any type the table admits, outside the scheme.
+    assert_eq!(view.base_vectors_as::<i32>().unwrap().get(1).unwrap(), codes[1].iter().map(|&x| x as i32).collect::<Vec<_>>());
+}

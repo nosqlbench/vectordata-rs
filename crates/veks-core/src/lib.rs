@@ -47,3 +47,6 @@ pub mod legacy_sweep;
 pub mod paths;
 pub mod term;
 pub mod ui;
+
+#[cfg(test)]
+pub(crate) mod test_support;

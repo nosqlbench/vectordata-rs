@@ -354,6 +354,43 @@ profiles:
         validate_conformance(&good).expect("float scale, integer zero point and sum");
     }
 
+    /// **Every facet accepts or refuses every element type in every
+    /// layout as its `formats()` say** (SRD element-access §13.10): a
+    /// profile naming one file `<key>.<ext>` passes conformance exactly
+    /// when `FacetFormat::of(container, type)` is a format the facet
+    /// lists, in every spelling of the extension; and a refusal names
+    /// the facet and the extension.
+    #[test]
+    fn every_facet_accepts_or_refuses_every_element_type_per_its_formats() {
+        use crate::typed_access::{Container, ElementType};
+        for &facet in StandardFacet::PREFERRED_ORDER {
+            let key = facet.key();
+            for &ty in ElementType::ALL {
+                for &container in Container::ALL {
+                    let expected = FacetFormat::of(container, ty).is_some_and(|f| facet.formats().contains(&f));
+                    let spellings = std::iter::once(ty.extension(container)).chain(ty.aliases(container).iter().copied());
+                    for ext in spellings {
+                        let yaml = format!("name: m\nprofiles:\n  default:\n    {key}: profiles/default/{key}.{ext}\n");
+                        let cfg: DatasetConfig = serde_yaml::from_str(&yaml).expect("parse");
+                        let result = validate_conformance(&cfg);
+                        match (expected, result) {
+                            (true, Ok(())) => {}
+                            (true, Err(v)) => panic!("{key} must accept {ty} in {container:?} (.{ext}): {v:?}"),
+                            (false, Ok(())) => panic!("{key} must refuse {ty} in {container:?} (.{ext})"),
+                            (false, Err(v)) => {
+                                assert_eq!(v.len(), 1, "{key} .{ext}: {v:?}");
+                                assert_eq!(v[0].key, key, "{v:?}");
+                                assert!(v[0].path.ends_with(&format!("{key}.{ext}")), "{v:?}");
+                                assert!(v[0].detail.contains(&format!("'{key}'")), "names the facet: {v:?}");
+                                assert!(v[0].detail.contains(&format!(".{ext}")), "names the extension: {v:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// The legacy `metadata_indices` alias resolves to `metadata_results`
     /// and validates against that facet's permitted formats.
     #[test]

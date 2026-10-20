@@ -6494,6 +6494,7 @@ dependencies = [
  "veks-completion",
  "veks-completion-derive",
  "veks-core",
+ "veks-datatypes",
  "veks-pipeline",
 ]
 
@@ -6547,6 +6548,7 @@ dependencies = [
  "slabtastic",
  "tempfile",
  "vectordata",
+ "veks-datatypes",
  "veks-io",
  "veks-simd",
 ]

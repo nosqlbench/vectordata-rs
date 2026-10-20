@@ -345,3 +345,52 @@ fn a_column_does_not_open_as_vectors_and_vice_versa() {
     let err = ScalarMmapReader::<u8>::open(&vectors).unwrap_err();
     assert!(err.to_string().contains("a vector file, not a column file"), "{err}");
 }
+
+// ── The writers, every type (SRD element access, §13.10) ───────────────
+
+/// **The scalar writer writes a column of every element type**, read
+/// back through `ScalarMmapReader<T>` as one slice equal to what was
+/// written; and the xvec writer writes records of every type, read
+/// back value for value — the 16- and 32-bit unsigned types included,
+/// which were only ever probed for size.
+#[test]
+fn the_writers_write_every_element_type() {
+    use veks_io::VecFormat;
+    for &ty in ElementType::ALL {
+        veks_datatypes::dispatch_element!(ty, T => {
+            let dir = tmp();
+            let values: Vec<T> = (0..9).map(sample::<T>).collect();
+            let elem = bytes_of(&values);
+
+            let column = dir.path().join(format!("c.{}", ty.extension(Container::Scalar)));
+            let format = VecFormat::of(Container::Scalar, ty).unwrap_or_else(|| panic!("{ty} has a scalar format"));
+            let mut sink = veks_io::create_format(&column, format, 1).unwrap_or_else(|e| panic!("{ty}: {e}"));
+            for i in 0..values.len() {
+                sink.write_record(i as i64, &elem[i * T::SIZE..(i + 1) * T::SIZE]);
+            }
+            sink.finish().unwrap();
+            let reader = ScalarMmapReader::<T>::open(&column).unwrap_or_else(|e| panic!("{ty}: {e}"));
+            assert_eq!(reader.count(), values.len(), "{ty}");
+            assert_eq!(bytes_of(reader.as_slice().unwrap()), elem, "{ty}: the column read back");
+            let meta = veks_io::probe(&column).unwrap();
+            assert_eq!((meta.element_size, meta.record_count), (T::SIZE, Some(values.len() as u64)), "{ty}: probed");
+
+            let dim = 3;
+            let vectors = dir.path().join(format!("v.{}", ty.extension(Container::Vec)));
+            let format = VecFormat::of(Container::Vec, ty).unwrap();
+            let mut sink = veks_io::create_format(&vectors, format, dim as u32).unwrap_or_else(|e| panic!("{ty}: {e}"));
+            for (i, record) in elem.chunks_exact(T::SIZE * dim).enumerate() {
+                sink.write_record(i as i64, record);
+            }
+            sink.finish().unwrap();
+            let reader = MmapReader::<T>::open(&vectors).unwrap_or_else(|e| panic!("{ty}: {e}"));
+            assert_eq!((reader.count(), reader.dim()), (3, dim), "{ty}");
+            for i in 0..3 {
+                assert_eq!(bytes_of(&reader.get(i).unwrap()), elem[i * dim * T::SIZE..(i + 1) * dim * T::SIZE], "{ty}: record {i}");
+            }
+            let mut streamed = veks_io::open(&vectors).unwrap();
+            let first = streamed.next_record().unwrap();
+            assert_eq!(first, elem[..dim * T::SIZE], "{ty}: the streaming reader agrees");
+        });
+    }
+}

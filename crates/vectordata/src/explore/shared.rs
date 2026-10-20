@@ -872,4 +872,167 @@ mod tests {
         assert_eq!(&s[..3], &[0.0, 1.0, 2.0]);
         assert!(s[3].is_nan());
     }
+
+    // ── The explorer's base open, over the element types (SRD EA-13, §13.10) ──
+
+    use veks_datatypes::{Container, Element, ElementConversion, ElementType, Value};
+
+    /// Records of `dim` elements of `T` under a 4-byte little-endian
+    /// dimension header each — the uniform `xvec` layout, written
+    /// here so the test depends on nothing but the element encoding.
+    fn write_vec_file<T: Element>(path: &std::path::Path, records: usize, dim: usize, f: impl Fn(usize, usize) -> T) {
+        let mut buf = Vec::with_capacity(records * (4 + dim * T::SIZE));
+        let mut elem = vec![0u8; T::SIZE];
+        for i in 0..records {
+            buf.extend_from_slice(&(dim as i32).to_le_bytes());
+            for d in 0..dim {
+                f(i, d).write_le_bytes(&mut elem);
+                buf.extend_from_slice(&elem);
+            }
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
+    /// The `n`th sample value for `ty`: halves from -4 for a float
+    /// (exact in f16 and bf16), integers from -8 for a signed integer,
+    /// and from 0 for an unsigned one — every one in range of every
+    /// type and exact once widened to f32.
+    fn sample(ty: ElementType, n: usize) -> Value {
+        if ty.is_float() {
+            Value::Float(n as f64 * 0.5 - 4.0)
+        } else if ty.kind() == veks_datatypes::ElementKind::Signed {
+            Value::Int(n as i128 - 8)
+        } else {
+            Value::Int(n as i128)
+        }
+    }
+
+    /// What the explorer must see for [`sample`]`(ty, n)`: the value
+    /// widened to f32.
+    fn widened(ty: ElementType, n: usize) -> f32 {
+        match sample(ty, n) {
+            Value::Float(x) => x as f32,
+            Value::Int(i) => i as f32,
+        }
+    }
+
+    const RECORDS: usize = 6;
+    const DIM: usize = 4;
+
+    /// Write a base of `ty` at `path`, element `d` of record `i` being
+    /// [`sample`]`(ty, i * DIM + d)`.
+    fn write_base(ty: ElementType, path: &std::path::Path) {
+        veks_datatypes::dispatch_element!(ty, T => write_vec_file::<T>(path, RECORDS, DIM, |i, d| {
+            T::from_value(sample(ty, i * DIM + d)).expect("a sample value fits its own type")
+        }));
+    }
+
+    /// Every spelling a uniform vector file of `ty` may carry: the
+    /// canonical one and, where one exists, the historical one
+    /// (`fvecs`, `mvecs`, `bvecs`, `ivecs`, ...).
+    fn vec_extensions(ty: ElementType) -> Vec<&'static str> {
+        let mut exts = vec![ty.extension(Container::Vec)];
+        exts.extend(ty.legacy_extension(Container::Vec));
+        exts
+    }
+
+    /// The element types the conversion table lets the explorer show
+    /// as f32, and the ones it refuses.
+    fn by_table() -> (Vec<ElementType>, Vec<ElementType>) {
+        ElementType::ALL
+            .iter()
+            .copied()
+            .partition(|ty| ty.conversion_to(ElementType::F32) != ElementConversion::Refused)
+    }
+
+    /// The count, dimension and every value `reader` shows, against
+    /// the base [`write_base`] wrote at `ty`.
+    fn assert_reads_the_base(reader: &UnifiedReader, ty: ElementType, what: &str) {
+        assert_eq!(reader.count(), RECORDS, "{what}: count");
+        assert_eq!(reader.dim(), DIM, "{what}: dim");
+        for i in 0..RECORDS {
+            let want: Vec<f32> = (0..DIM).map(|d| widened(ty, i * DIM + d)).collect();
+            assert_eq!(reader.get_f32(i), Some(want), "{what}: record {i}");
+        }
+        assert_eq!(reader.get_f32(RECORDS), None, "{what}: one past the end");
+        let range = reader.get_f32_range(2, 3);
+        assert_eq!(range.len(), 3, "{what}: range length");
+        for (k, got) in range.iter().enumerate() {
+            let i = 2 + k;
+            let want: Vec<f32> = (0..DIM).map(|d| widened(ty, i * DIM + d)).collect();
+            assert_eq!(got.as_ref(), Some(&want), "{what}: range record {i}");
+        }
+    }
+
+    /// **The table decides what the explorer can show**: f32 natively,
+    /// the narrower floats and integers widened, and i32 among the
+    /// types it refuses — pinned here so the two tests below cannot
+    /// both pass over an empty partition.
+    #[test]
+    fn the_table_widens_the_narrow_types_to_f32_and_refuses_i32() {
+        let (accepted, refused) = by_table();
+        for ty in [ElementType::F32, ElementType::F16, ElementType::BF16, ElementType::U8, ElementType::I8] {
+            assert!(accepted.contains(&ty), "{ty} must be browsable (EA-13)");
+        }
+        assert!(refused.contains(&ElementType::I32), "an i32 base cannot be shown as f32");
+        assert_eq!(accepted.len() + refused.len(), ElementType::ALL.len());
+    }
+
+    /// **A local base file of every type the table widens to f32 opens
+    /// through the explorer's path** (`UnifiedReader::open` →
+    /// `LocalVectorReader` → `open_vec_as::<f32>`), under each spelling
+    /// of its extension, with the written count, dimension and values
+    /// widened exactly.
+    #[test]
+    fn the_explorer_opens_a_local_base_of_every_type_the_table_widens_to_f32() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = crate::catalog::Catalog::default();
+        let (accepted, _) = by_table();
+        for ty in accepted {
+            for ext in vec_extensions(ty) {
+                let path = dir.path().join(format!("base.{ext}"));
+                write_base(ty, &path);
+                let source = path.to_string_lossy().into_owned();
+                assert!(is_local_source(&source), "{source} is a local path");
+                let reader = UnifiedReader::open(&source, &catalog);
+                assert!(matches!(reader, UnifiedReader::Local(_)), "{ext}: a path opens locally");
+                assert_reads_the_base(&reader, ty, ext);
+            }
+        }
+    }
+
+    /// **A dataset's base of every type the table widens to f32 opens
+    /// through the explorer's dataset path** (`UnifiedReader::open` →
+    /// `AnyDatasetReader::from_source` → `base_vectors_as::<f32>`),
+    /// with the written values widened exactly and the record size
+    /// accounted at the file's own element width, not f32's.
+    #[test]
+    fn the_explorer_opens_a_datasets_base_of_every_type_the_table_widens_to_f32() {
+        let (accepted, _) = by_table();
+        for ty in accepted {
+            let ext = ty.extension(Container::Vec);
+            let dir = tempfile::tempdir().unwrap();
+            let name = format!("explorebase-{}", ty.name());
+            write_base(ty, &dir.path().join(format!("base.{ext}")));
+            std::fs::write(
+                dir.path().join("dataset.yaml"),
+                format!("name: {name}\nprofiles:\n  default:\n    base_vectors: base.{ext}\n"),
+            )
+            .unwrap();
+            let sources = crate::catalog::CatalogSources::new()
+                .add_catalogs(&[dir.path().join("dataset.yaml").to_string_lossy().into_owned()]);
+            let catalog = crate::catalog::Catalog::of(&sources);
+            assert!(names_catalog_dataset(&name), "{name} names a dataset, not a path");
+            let reader = UnifiedReader::open(&name, &catalog);
+            let UnifiedReader::Remote(dataset) = &reader else {
+                panic!("{ext}: a dataset name opens through the view");
+            };
+            assert_eq!(
+                dataset.entry_bytes,
+                4 + (DIM * ty.byte_width()) as u64,
+                "{ext}: a record is its header plus dim elements of {ty}"
+            );
+            assert_reads_the_base(&reader, ty, ext);
+        }
+    }
 }

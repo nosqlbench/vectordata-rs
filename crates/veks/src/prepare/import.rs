@@ -4009,4 +4009,39 @@ mod tests {
         assert_eq!(parse_facet_spec("base,query"), "BQ");
         assert_eq!(parse_facet_spec("base,query,gt,dist"), "BQGD");
     }
+
+    /// **A uniform-vector source of every element type keeps its type
+    /// through import** (SRD element-access §13.10): the source is
+    /// native, so no convert step is emitted, and the profile's base and
+    /// query facets carry the type's preferred extension — the legacy
+    /// plural where there is one (`fvecs`, `ivecs`), the typed plural
+    /// otherwise (`bf16vecs`) — whatever spelling the source used.
+    #[test]
+    fn a_source_of_every_element_type_keeps_its_type_as_the_preferred_extension() {
+        use vectordata::typed_access::{Container, ElementType};
+        let dir = tempfile::tempdir().unwrap();
+        for &ty in ElementType::ALL {
+            let preferred = VecFormat::of(Container::Vec, ty).unwrap().preferred_extension();
+            let spellings = std::iter::once(ty.extension(Container::Vec))
+                .chain(ty.aliases(Container::Vec).iter().copied());
+            for ext in spellings {
+                let src = dir.path().join(format!("vectors.{ext}"));
+                std::fs::write(&src, b"").unwrap();
+                let mut args = default_args();
+                args.output = dir.path().join("out");
+                args.base_vectors = Some(src);
+                let slots = resolve_slots(&args);
+                assert!(!slots.all_vectors.is_materialized(), "{ty} .{ext}: a native source needs no convert step");
+                assert_eq!(slots.base_vectors.path(), format!("profiles/base/base_vectors.{preferred}"), "{ty} .{ext}");
+                assert_eq!(
+                    slots.query_vectors.as_ref().map(Artifact::path),
+                    Some(format!("profiles/base/query_vectors.{preferred}").as_str()),
+                    "{ty} .{ext}"
+                );
+                let steps = emit_steps(&slots, &args, &args.output);
+                let ids: Vec<&str> = steps.iter().filter(|s| s.run == "transform convert").map(|s| s.id.as_str()).collect();
+                assert!(ids.is_empty(), "{ty} .{ext}: convert steps {ids:?}");
+            }
+        }
+    }
 }

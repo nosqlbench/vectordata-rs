@@ -156,7 +156,7 @@ float_element! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch_element;
+    use crate::{ElementKind, dispatch_element};
 
     #[test]
     fn every_type_states_its_own_width() {
@@ -214,6 +214,58 @@ mod tests {
         assert_eq!(u64::from_value(Value::Int(i128::from(u64::MAX) + 1)), None);
         assert_eq!(i64::from_value(Value::Int(i128::from(i64::MIN))), Some(i64::MIN));
         assert_eq!(i32::from_value(Value::Float(1.0)), None, "a float never becomes an integer");
+    }
+
+    /// The bounds of each integer type, by its width and sign.
+    fn bounds(ty: ElementType) -> (i128, i128) {
+        let bits = 8 * ty.byte_width() as u32;
+        match ty.kind() {
+            ElementKind::Unsigned => (0, (1i128 << bits) - 1),
+            ElementKind::Signed => (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1),
+            ElementKind::Float(_) => unreachable!("not an integer"),
+        }
+    }
+
+    /// **Every integer type takes exactly its own range**: its minimum
+    /// and maximum fit, one past either does not, and no float ever
+    /// becomes an integer.
+    #[test]
+    fn every_integer_type_takes_exactly_its_range() {
+        for &ty in ElementType::ALL.iter().filter(|t| t.is_integer()) {
+            let (lo, hi) = bounds(ty);
+            dispatch_element!(ty, T => {
+                assert_eq!(T::from_value(Value::Int(lo)).map(|v| v.to_value()), Some(Value::Int(lo)), "{ty} min");
+                assert_eq!(T::from_value(Value::Int(hi)).map(|v| v.to_value()), Some(Value::Int(hi)), "{ty} max");
+                assert!(T::from_value(Value::Int(lo - 1)).is_none(), "{ty}: one below the minimum");
+                assert!(T::from_value(Value::Int(hi + 1)).is_none(), "{ty}: one above the maximum");
+                assert!(T::from_value(Value::Float(1.0)).is_none(), "{ty}: a float never becomes an integer");
+                assert_eq!(T::from_value(Value::Int(0)).unwrap().as_f64(), 0.0, "{ty}");
+            });
+        }
+    }
+
+    /// **A float takes a value as `as` does**: exactly where the
+    /// conversion table admits the source (that is the table's promise,
+    /// not this method's), rounded otherwise — so an inexact integer
+    /// into a float is the nearest float, never `None`, and the table
+    /// is what keeps such a pair from being read.
+    #[test]
+    fn a_float_takes_a_value_as_as_does() {
+        assert_eq!(half::f16::from_value(Value::Int(2049)), Some(half::f16::from_f64(2049.0)), "rounded, as `as`");
+        assert_ne!(half::f16::from_value(Value::Int(2049)).unwrap().as_f64(), 2049.0, "and 2049 is not exact in f16");
+        assert_eq!(half::bf16::from_value(Value::Int(257)), Some(half::bf16::from_f64(257.0)));
+        assert_ne!(half::bf16::from_value(Value::Int(257)).unwrap().as_f64(), 257.0);
+        assert_eq!(f32::from_value(Value::Int(16_777_217)), Some(16_777_217i32 as f32));
+        assert_ne!(f32::from_value(Value::Int(16_777_217)).unwrap().as_f64(), 16_777_217.0);
+        assert_eq!(f64::from_value(Value::Int(1 << 60)), Some((1i64 << 60) as f64), "exact: a power of two");
+        for &ty in ElementType::ALL.iter().filter(|t| t.is_float()) {
+            dispatch_element!(ty, T => {
+                assert!(T::from_value(Value::Float(f64::NAN)).unwrap().as_f64().is_nan(), "{ty} takes a NaN");
+                assert_eq!(T::from_value(Value::Float(f64::INFINITY)).unwrap().as_f64(), f64::INFINITY, "{ty} takes an infinity");
+                assert_eq!(T::from_value(Value::Float(-0.0)).unwrap().as_f64().to_bits(), (-0.0f64).to_bits(), "{ty} keeps the sign of zero");
+                assert_eq!(T::from_value(Value::Float(1e300)).unwrap().as_f64().is_infinite(), ty != ElementType::F64, "{ty}: out of range saturates to an infinity");
+            });
+        }
     }
 
     #[test]

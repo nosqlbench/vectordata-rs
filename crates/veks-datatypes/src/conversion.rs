@@ -254,6 +254,107 @@ mod tests {
         );
     }
 
+    /// The bounds of each integer type, by its width and sign.
+    fn bounds(ty: ElementType) -> (i128, i128) {
+        let bits = 8 * ty.byte_width() as u32;
+        match ty.kind() {
+            crate::ElementKind::Unsigned => (0, (1i128 << bits) - 1),
+            crate::ElementKind::Signed => (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1),
+            crate::ElementKind::Float(_) => unreachable!("not an integer"),
+        }
+    }
+
+    /// **Every `CrossSign` pair of the table checks each value**: the
+    /// source's minimum or maximum (at least one of them) is outside
+    /// the target and is an `Overflow` naming the value and the target;
+    /// zero and one always convert; a value the target holds converts
+    /// to itself.
+    #[test]
+    fn every_cross_sign_pair_checks_each_value() {
+        let mut pairs = 0;
+        for &from in ElementType::ALL {
+            for &to in ElementType::ALL {
+                if from.conversion_to(to) != CrossSign {
+                    continue;
+                }
+                pairs += 1;
+                let (lo_n, hi_n) = bounds(from);
+                let (lo_t, hi_t) = bounds(to);
+                dispatch_element!(from, N => {
+                    dispatch_element!(to, T => {
+                        let at = |x: i128| N::from_value(Value::Int(x)).unwrap();
+                        let mut failed = 0;
+                        for x in [lo_n, hi_n] {
+                            let fits = (lo_t..=hi_t).contains(&x);
+                            match convert::<N, T>(at(x)) {
+                                Ok(v) => assert!(fits && v.to_value() == Value::Int(x), "{from}→{to}: {x}"),
+                                Err(e) => {
+                                    assert!(!fits, "{from}→{to}: {x} fits and was refused");
+                                    assert_eq!(e, Overflow { value: Value::Int(x), target: to }, "{from}→{to}");
+                                    failed += 1;
+                                }
+                            }
+                        }
+                        assert!(failed >= 1, "{from}→{to}: a cross-sign pair has an extreme the target does not hold");
+                        assert_eq!(convert::<N, T>(at(0)).map(|v| v.to_value()), Ok(Value::Int(0)), "{from}→{to}");
+                        assert_eq!(convert::<N, T>(at(1)).map(|v| v.to_value()), Ok(Value::Int(1)), "{from}→{to}");
+                    });
+                });
+            }
+        }
+        assert_eq!(pairs, 14, "the table has fourteen cross-sign pairs");
+    }
+
+    /// **Every `Widening` pair of the table is exact for every value
+    /// it can be exhaustive over**: the whole range of an 8- or 16-bit
+    /// integer source, the extremes and a mid value of a wider one, and
+    /// for a float source its extremes, a subnormal, both infinities
+    /// and a NaN.
+    #[test]
+    fn every_widening_pair_is_exact() {
+        let mut pairs = 0;
+        for &from in ElementType::ALL {
+            for &to in ElementType::ALL {
+                if from.conversion_to(to) != Widening {
+                    continue;
+                }
+                pairs += 1;
+                dispatch_element!(from, N => {
+                    dispatch_element!(to, T => {
+                        let values: Vec<N> = if from.is_integer() {
+                            let (lo, hi) = bounds(from);
+                            let picks: Vec<i128> = if from.byte_width() <= 2 { (lo..=hi).collect() } else { vec![lo, lo + 1, -1, 0, 1, hi / 3, hi - 1, hi] };
+                            picks.into_iter().filter_map(|x| N::from_value(Value::Int(x))).collect()
+                        } else {
+                            let bits = 8 * N::SIZE;
+                            let max_bits: u64 = match bits { 16 => 0x7bff, 32 => f32::MAX.to_bits() as u64, _ => f64::MAX.to_bits() };
+                            let max = if from == ElementType::BF16 { 0x7f7f } else { max_bits };
+                            [0u64, 1 << (bits - 1), max, max | (1 << (bits - 1)), 1, (max + 1), (max + 1) | (1 << (bits - 1)), (max + 1) | 1]
+                                .into_iter()
+                                .map(|b| {
+                                    let mut buf = [0u8; 8];
+                                    buf[..N::SIZE].copy_from_slice(&b.to_le_bytes()[..N::SIZE]);
+                                    <N as Element>::from_le_bytes(&buf[..N::SIZE])
+                                })
+                                .chain([N::from_value(Value::Float(1.0)).unwrap(), N::from_value(Value::Float(-1.5)).unwrap()])
+                                .collect()
+                        };
+                        assert!(values.len() >= 7, "{from}→{to}: enough samples (an unsigned source drops the -1)");
+                        for v in values {
+                            let got = convert::<N, T>(v).unwrap_or_else(|e| panic!("{from}→{to}: {e}"));
+                            let (a, b) = (v.as_f64(), got.as_f64());
+                            assert!(a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()), "{from}→{to}: {a} became {b}");
+                            if from.is_integer() {
+                                assert_eq!(got.to_value().to_string(), v.to_value().to_string(), "{from}→{to}");
+                            }
+                        }
+                    });
+                });
+            }
+        }
+        assert_eq!(pairs, 37, "the table has thirty-seven widening pairs");
+    }
+
     #[test]
     fn the_integer_to_float_boundary_is_the_significand() {
         use ElementType::*;

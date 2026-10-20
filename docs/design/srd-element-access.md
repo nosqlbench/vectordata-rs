@@ -1,7 +1,8 @@
 # SRD — Element types and typed facet access
 
 **Status:** implemented 2026-10-20 (records in §16; steps 1–9 of §13).
-Decisions in §15 were taken on 2026-10-19. The
+Step 10 (the type matrix in tests, from the review in §14.6) is
+implemented too (§16.10). Decisions in §15 were taken on 2026-10-19. The
 release that carries it, and the version it takes, are the
 maintainer's.
 **Scope:** the element model shared by every crate in the workspace (a
@@ -854,6 +855,49 @@ validation), this SRD's §16 records and `**Status:**`.
 `StandardFacet::PREFERRED_ORDER`, and the requester is told what
 shipped and the defect-2 ruling — after the maintainer releases.
 
+### 13.10 Step 10 — the type matrix in tests
+
+**Principle.** A test of a reader, a writer, a conversion or a command
+over element types is written once and iterated over
+`ElementType::ALL` (or over `ALL × ALL` for the conversion table)
+through `dispatch_element!`, with per-type sample values from one
+helper (`samples::<T>()`: zero, one, the type's min and max, and for
+floats a negative, a subnormal, an infinity and a NaN). Coverage of
+every type is then by construction, and a thirteenth type cannot be
+added without it. Hand-picked single-type tests remain where they
+pin a behaviour (a guard), not as the coverage.
+
+**Files.** `crates/vectordata/tests/support/samples.rs` (the helper);
+`crates/vectordata/tests/element_matrix.rs` (new: §14.6 gaps 1, 2, 5
+on local files, on a window, on a series and on the HTTP fixture);
+`crates/vectordata/tests/quantized.rs` (i8 codes); `crates/vectordata/
+tests/explore_base.rs` (new: the explorer's base open at f32, f16,
+bf16, u8, i8 through `open_vec_as` and the frame it renders);
+`crates/veks-datatypes/src/{element,conversion}.rs` (bounds, inexact
+into floats, every CrossSign pair of `convert`); `crates/veks-io/src/
+lib.rs` (scalar writer per type, u16/u32 values); `crates/veks-pipeline/
+src/pipeline/element_type.rs` (`F64Vectors` over `ALL`, `dispatch_
+reader!` over `ALL`, pinned policy values); the nine `analyze_*`
+command tests (one parametric helper over an integer, f16, bf16 and
+f64 input each); `compute_knn.rs` and `compute_knn_stdarch.rs` (a bf16
+base and a u8 base, the answer equal to the f32 build's); `gen_
+vectors.rs` and `convert.rs` (every type as a target); `crates/veks-
+core/src/formats/mod.rs` (`preferred_vec_format` over `StandardFacet
+× ALL`, each sink per `VecFormat`); `crates/veks/src/prepare/
+import.rs` and `tests/check_and_import.rs` (import from f16, bf16,
+f64, u8, i8 sources with the output extension pinned per source);
+`crates/vectordata/src/dataset/conformance.rs` (accept/refuse per
+facet × type, derived from `formats()`); `crates/veks/src/check/
+profiles.rs` (i64, u32 and u64 indices; i8 codes); one e2e with a
+bf16 base whose KNN equals the f32 build's.
+
+**Guards.** None of these pins a fix; each is coverage. Any that
+fails on the current code is a defect found, recorded in §16.10 and
+fixed in the same step.
+
+**Done when** every cell of the two §14.6 matrices that a scenario
+applies to is `●`, and the §14.1 rule is in force.
+
 ## 14. Testing plan and coverage
 
 ### 14.1 Rules for every test in this SRD
@@ -877,6 +921,11 @@ shipped and the defect-2 ruling — after the maintainer releases.
   is raised before any byte is fetched).
 - **Names say the behaviour**, in the suite's sentence style
   (`a_dvec_opened_as_f32_is_refused`), not the function under test.
+- **Scenarios iterate the types** (added 2026-10-20, §14.6). A test of
+  a reader, writer, conversion or command over element types runs
+  over `ElementType::ALL` through `dispatch_element!` with shared
+  per-type samples, not over the types the author had in hand. A
+  single-type test is a guard for a behaviour, never the coverage.
 - **Flips are listed, not silent.** An existing test whose assertion
   this SRD reverses is named below with the reason; it is rewritten in
   the step that changes the rule, never deleted in passing.
@@ -1184,6 +1233,139 @@ crate's own tests:
 Until the tool is present, the proxy is §14.4: every requirement names
 the tests that exercise it, and every guard's failure on the old code
 is recorded in §16.
+
+### 14.6 Multi-type coverage review (2026-10-20)
+
+Steps 1–9 made every reader, writer, format and command generic over
+the twelve element types. This review asks which of the twelve each
+scenario's tests actually feed through — a type that compiles through
+a generic reader and is never read in a test is not covered. Two
+sweeps (the library crates; the tool crates and the explorer) read
+every test file; three of their claims were re-checked at the cited
+lines. `●` is a test through the current API, `○` a test only through
+a deprecated path (`TypedReader`, `metadata_results()`), `◐` a partial
+(opened but no value read; a count or a size only), `—` nothing. The
+columns are `ElementType::ALL`.
+
+**Library crates**
+
+| Scenario | u8 | i8 | u16 | i16 | u32 | i32 | u64 | i64 | f16 | bf16 | f32 | f64 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| veks-datatypes: bytes, `Value`, conversion matrix | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
+| veks-io `MmapReader<T>` native open, values | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
+| veks-io `ScalarMmapReader<T>` incl. `as_slice` | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
+| veks-io xvec writer, values read back | ● | ● | ◐ | ● | ◐ | ● | ● | ● | ● | ● | ● | ● |
+| veks-io scalar writer | ● | — | — | — | — | ● | ◐ | — | — | — | ● | — |
+| vectordata `XvecReader<T>` / `open_vec` native | — | — | — | — | — | ● | — | — | ● | — | ● | ◐ |
+| vectordata raw mismatch, as the file's type | ● | — | — | — | ● | ● | — | — | ● | — | ● | ● |
+| vectordata `ScalarReader<T>` / column via `facet_as` | ● | ○ | ○ | ○ | ● | ● | ○ | ○ | — | — | ● | — |
+| vectordata vvec (`IndexedVvecReader`, `metadata_results_as`) | — | — | — | — | ◐ | ● | — | — | — | — | — | — |
+| `facet_as::<T>` native | ● | — | — | — | — | ● | — | — | — | ● | ● | — |
+| Widening **from** this type, end to end | ● | ○ | ○ | ○ | ● | ● | — | — | ● | ● | ● | — |
+| Widening **to** this type, end to end | — | — | ● | ◐ | ○ | ● | ● | ● | — | — | ● | ● |
+| CrossSign incl. `ValueOverflow`, from this type | ● | ○ | — | — | ○ | ● | — | — | — | — | — | — |
+| Refused, from this type | ● | — | — | — | — | ● | ○ | ○ | ● | ● | ● | — |
+| Series (sharded) facet | — | — | — | — | ● | ● | — | — | — | — | ● | — |
+| Window `[lo..hi)` facet | ● | ◐ | ◐ | ◐ | ● | ◐ | ◐ | ◐ | — | — | ● | — |
+| Remote (HTTP / cached) read | ● | — | — | — | ○ | ● | — | — | — | — | ● | — |
+| `quantized_base::<C>` codes | ● | — | — | — | — | — | — | — | — | — | — | — |
+
+The widening pairs tested end to end are f16→f32, bf16→f32,
+u8→{u16, i32, f32}, i32→i64, f32→f64, u32→u64 (on a series);
+`u8→i16` builds a `ConvertingReader` and reads nothing. Every pair
+from i8, u16 and i16, every pair into f16/bf16 from a file, every
+pair into f64 except f32→f64, and every f64 source are untested
+beyond the 12×12 table test. CrossSign is exercised for u8→i8 and
+i32→u32 only. No conversion is tested over a window or over HTTP, and
+only u32→u64 over a series. No test feeds a NaN, an infinity or a
+subnormal through a float widening. The datatypes `from_value` bounds
+are untested for u16, i16 and u32 and for an inexact integer into
+f16/bf16/f32 (2049 into f16, 257 into bf16, 2²⁴+1 into f32).
+
+**Tool crates and the explorer**
+
+| Scenario | u8 | i8 | u16 | i16 | u32 | i32 | u64 | i64 | f16 | bf16 | f32 | f64 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `dispatch_reader!` opens a file | — | ● | — | — | — | — | — | — | ● | — | — | — |
+| `F64Vectors` / `analyze_*` input (nine commands) | — | — | — | — | — | ◐ (slice) | — | — | — | — | ● | — |
+| KNN over a base of this type (any engine) | — | — | — | — | — | — | — | — | ● metal | — | ● all | — |
+| `generate vectors --type` | ● | — | — | — | — | ● | — | — | ● | — | ● | — |
+| `transform convert` target | — | — | — | — | — | — | — | — | ● | — | ● | — |
+| `prepare import` source | — | — | — | — | — | — | — | — | — | — | ● | — |
+| veks-core `preferred_vec_format(Base/Query, ty)` | — | ● | ● | — | — | — | — | — | — | ● | — | — |
+| veks-core writers (`open_sink`, sharded, mmap) | — | — | — | — | — | — | — | — | ◐ | — | ● | — |
+| conformance accept/refuse per facet | ● | — | — | — | — | ● | — | — | — | — | ● | — |
+| `check quantization` codes | ● | — | — | — | — | — | — | — | — | — | — | — |
+| `check ground-truth` index type | — | — | — | — | — | ● | — | — | — | — | — | — |
+| veks e2e base type | — | — | — | — | — | — | — | — | ◐ loads | — | ● | — |
+| explorer opens a base | — | — | — | — | — | — | — | — | — | — | — | — |
+
+`ElementTypeKnn` is tested for Some/None per type; no test pins an
+epsilon or threshold value, `normalization_threshold` is only called
+at dim 128, and `supports_simd_distance` is asserted directly for f16
+and bf16 only. `prepare import` never imports a non-f32 source, and
+its output-extension assertions accept `fvecs` *or* `mvecs`, so no
+test pins which extension a source type maps to. The f16 e2e
+(`e2e_shard_sizing`) checks shard sizes and that the base loads as
+f32, not the KNN answer. No explorer test opens any base: the
+`open_vec_as::<f32>` path that step 4 put there is untested for f32,
+let alone for f16, bf16 or u8.
+
+**Rustdoc examples by type.** vectordata's runnable examples
+(`view.rs`): u8 codes native, a u8 column `as_slice`, bf16→f32
+widened, f32 native `read_into`, i32 ground truth against the base
+count, the f32→u8 refusal, a u8 quantized base. Nothing runnable
+shows a CrossSign read or `ValueOverflow`, f16, i8, f64 or any 16- or
+64-bit integer; `io.rs` has one `no_run` f32 example and one `ignore`;
+`open_vec_as`, `open_vec_native`, `ScalarReader`, `ConvertingReader`,
+`AnyVectorReader`, `AnyVvecReader` and `IndexedVvecReader` carry no
+example. veks-io's seven examples are all `no_run` and use f32 and u8
+only; `MmapReader`, `ScalarMmapReader`, `VecFormat` and
+`convert_scalars` carry none. veks-datatypes has two runnable
+examples (the crate root, `dispatch_element!`); `Element`, `convert`,
+`Value`, `extension`/`aliases`/`parse_extension` and `conversion_to`
+carry none on the item.
+
+**What this says.** The generic surface is complete; its proof is
+not. veks-io and veks-datatypes test all twelve because their tests
+iterate `ElementType::ALL`. vectordata's and the tools' tests name
+types one at a time, so they cover the four or five the author had
+in hand, and the sweep's own claims — any facet at any type (EA-8,
+EA-13), the conversion table on real files (EA-5, EA-10), bf16 and
+integer bases browsable (EA-13) and computable through widening (§10),
+`F64Vectors` for every type (§16.7), ground-truth indices of any
+integer type (§16.8) — stand on the table test and the type checker
+alone. The gaps, in the order they matter:
+
+1. **Reader × type in vectordata**: raw xvec, column, vvec and
+   `facet_as` native for every type (eight of twelve untested at the
+   view).
+2. **The conversion table on files**: every (file, requested) pair,
+   not six; CrossSign overflow from every signed and unsigned source;
+   Refused from f64 and the float pairs; float edge values.
+3. **Compute over a non-f32 base**: no KNN engine, no analysis
+   command, no e2e has read a bf16, u8 or i8 base. `F64Vectors` has no
+   test of its own.
+4. **The explorer** opens no base in any test.
+5. **Storage shapes × type**: windows, series and HTTP for one or two
+   types each, and no conversion across any of them except one.
+6. **`veks` surfaces**: import from a non-f32 source with the
+   extension pinned; conformance per facet × type derived from
+   `formats()`; `check` with i64/u32/u64 indices and i8 codes;
+   `quantized_base::<i8>`.
+7. **Writers per type**: veks-io's scalar writer, veks-core's sinks,
+   `transform convert` targets, `generate vectors` types.
+8. **Policy values**: `ElementTypeKnn` epsilons and thresholds pinned;
+   `from_value` bounds for the missing types.
+9. **Rustdoc**: an example per type class on every open function and
+   reader type, runnable.
+
+Steps 10 and 11 (§13.10, §13.11) take these; the rule they add to
+§14.1 is that a scenario test is written over `ElementType::ALL`, so a
+type cannot be added without coverage. Both are done: every cell of
+the two matrices a scenario applies to is now covered (§16.10), five
+defects the matrix exposed are fixed, and every listed item carries a
+runnable example per type (§16.11).
 
 ## 15. Settled questions
 
@@ -1877,4 +2059,166 @@ warnings denied; clippy on the new file.
 **Coverage after the step** (the §14.5 command, whole workspace:
 75.6% → 76.0%; unchanged from step 8, as the step's one code change is a
 re-export). The whole workspace under it: 3625 passed, 0 failed.
+
+### 16.10 Step 10: the type matrix in tests (2026-10-20)
+
+**Built.** One per-type samples helper per test tree
+(`crates/vectordata/tests/support/samples.rs`, `crates/veks-pipeline/
+tests/support/samples.rs`, `crates/veks/tests/support/samples.rs`,
+`crates/veks-core/src/test_support.rs`: zero, one, the extremes, a mid
+value; for floats a negative, a subnormal, both infinities and a NaN),
+and every scenario of §14.6 rewritten as one test iterated over
+`ElementType::ALL` (or `ALL × ALL`) through `dispatch_element!`:
+
+- vectordata, `tests/element_matrix.rs`: every type natively as a
+  vector file, a column and a vvec through the raw readers, the boxed
+  opens and the erased open, legacy spellings included; every type
+  natively through the view (base, column, vvec for the integers);
+  **all 144 pairs of the table on files** through `open_vec_as` (a
+  vector file and a column), `AnyVectorReader::as_type`, and through
+  the view (`base_vectors_as`, `facet_as`, `open_facet_as_type`) —
+  `Native` reads the bytes, `Widening` reads every sample exactly
+  (subnormals, infinities, NaN) with nothing to borrow, `CrossSign`
+  reads what fits and reports `ValueOverflow` at the first ordinal that
+  does not (`get` and a bulk `read_into`), `Refused` is
+  `ElementMismatch` naming both, and the typed constructors and
+  `into_typed` take only the native pair; every type through a window,
+  a series and HTTP (natively, one widening, one cross-sign, and over
+  HTTP one refusal made before any byte is asked for); and in
+  `tests/quantized.rs` an i8-coded corpus. `tests/explore_base.rs` and
+  `explore/shared.rs` tests: the explorer opens a local and a catalog
+  base of every type the table widens to f32, by every spelling,
+  refuses the rest naming both types (exit 1, no panic), and a PTY test
+  renders an f16 and a bf16 base's dimension statistics.
+- veks-datatypes: every integer's exact range in `from_value`; a float
+  takes a value as `as` does (2049 into f16, 257 into bf16, 2²⁴+1 into
+  f32 round; NaN, ±∞, −0 and saturation); every one of the table's 14
+  `CrossSign` pairs and 37 `Widening` pairs through `convert`
+  (exhaustive over 8- and 16-bit sources).
+- veks-io: the scalar and xvec writers write every type, read back
+  value for value (u16 and u32 records were only ever sized before).
+- veks-pipeline (`src/pipeline/element_type.rs`, `tests/
+  element_type_matrix.rs`): `F64Vectors` and `dispatch_reader!` over
+  `ALL`; `ElementTypeKnn` values pinned; the nine `analyze_*` commands
+  and `describe` give the f32 answer on every type; `generate vectors`
+  per type; `transform convert` to every float target and from u8 to
+  every wider type; **every KNN engine and verifier over a bf16 and a
+  u8 base equals its f32 run** (`compute knn-metal`, `knn-stdarch`,
+  `knn-blas`, `knn-faiss` under its feature, `compute prefiltered-knn`
+  in one and several partitions, `verify knn-consolidated`, `verify
+  knn-groundtruth`); `transform extract` by index and by range for
+  every type.
+- veks-core: `preferred_vec_format` over `PREFERRED_ORDER × ALL`; each
+  sink (`open_sink`, sharded, mmap xvec) writes every vector and scalar
+  format and reads it back at its type.
+- veks: import from a source of every type keeps its type, with the
+  profile extension pinned per source (the asserts that took `fvecs`
+  *or* `mvecs` now take the one the source implies) and the values
+  round-tripping; conformance accepts and refuses every facet × type ×
+  container as `formats()` says; `check` passes ground truth at every
+  integer index type and every float distance type, and an i8-coded
+  quantized dataset at `codes: i8` (refused at `u8`); and the e2e
+  `e2e_bf16_base` builds a dataset over a bf16 base whose neighbours
+  equal the f32 build's.
+
+**Defects found and fixed** (each guard was run against the code before
+the fix; the old failure is quoted):
+
+1. **Every f32 engine refused a base it could widen.** `compute
+   knn-metal`, `knn-stdarch`, `knn-blas`, `knn-faiss`, `compute
+   prefiltered-knn`, `verify knn-consolidated`, `verify knn-groundtruth`
+   and the knnutils verifier opened the base as `XvecReader<f32>` or
+   dispatched on f32/f16 only, so a bf16 or 8-/16-bit integer base —
+   what §10 says computes "through `Widening` to f32" — was refused:
+   `compute knn-metal L2 over a bf16 base: failed to open base …/base.
+   bf16vecs: the file holds bf16 elements and cannot be read as f32`;
+   `compute knn-stdarch …: open base: the file holds bf16 elements…`;
+   `compute knn-blas …: open base: the file holds bf16 elements…`;
+   `bf16_1000000: open base: the file holds bf16 elements…`
+   (prefiltered); `verify knn-consolidated: base element type BF16 not
+   supported (only f32 / .fvec and f16 / .mvec are wired up)`;
+   `unsupported element type BF16 for verify knn (use fvec, mvec, or
+   dvec)`. Fixed on one mechanism per scan shape: `WidenToF32` (the
+   types whose `conversion_to(F32)` is `Widening`) and `reads_as_f32`
+   in `pipeline/element_type.rs`; mmap engines scan the base at its own
+   width and widen one vector at a time into an f32 scratch
+   (`find_top_k_batch_widened`, `compute_partition_widened`,
+   `execute_widened`, reused by the verifier; the prefiltered engine's
+   own widened kernel); streaming engines decode each pread chunk with
+   `widen_le_into(ElementType, bytes, f32s)` (a memcpy for f32, the
+   SIMD converter for f16, element by element otherwise), stdarch
+   widening each chunk in its I/O task so it overlaps compute as the
+   read does; queries of a widened run are read as f32 through the
+   table (`F32Queries`), so an f32 query set serves a bf16 base; the
+   canonical rerank post-pass and the tie check take any
+   `VectorReader<f32>` (a widened base's candidates are read once per
+   query). The partition drivers became generic over their query
+   holder and distance function, so the f32, f16 and f64 paths are
+   unchanged. A 32- or 64-bit integer base is refused by name — no f32
+   kernel holds it exactly.
+2. **`transform convert` f32 → bf16 wrote f16 bits under a bf16
+   extension**, and an unsupported width pair wrote the source bytes
+   into the target (f32 → u8 a corrupt file; u8 → f32, documented as
+   supported, broken; same-width pairs reinterpreted): `f32 -> bf16:
+   the values survive the conversion left: [[0.125, -4.0, 4.6566e-10,
+   …]] right: [[1.5, -2.25, 0.125, 100.0], …]`. The conversion is now
+   chosen from the (source, target) `ElementType` pair: the table's
+   `Widening`/`CrossSign` or any float → float, refused otherwise with
+   both types named.
+3. **`transform extract` refused every vector type but f32, f16 and
+   i32**, while its documentation listed `.dvec`, `.svec`, `.bvec`:
+   `unsupported xvec format '.u8vecs' (u8) for extract`. A record
+   gather (`GenerateRecordExtractOp`) copies whole records at the
+   source's type for the other nine, by index or range; `normalize`, a
+   float transform, is refused there.
+4. **`prepare import` of a base-only source never wrote the base**:
+   `f32: …/profiles/base/base_vectors.fvecs was not written`. The slot
+   was materialized by an `extract-base` step that was never emitted
+   when there were no queries, and the identity symlink was skipped
+   because "no query file" was taken for self-search. The base-only
+   branch now follows the separate-query branch's rule — extract when
+   dedup or normalization rewrites the base, the source as it is
+   otherwise — the extraction step is emitted when the slot is
+   materialized, and the symlink keys on the slots' self-search
+   decision. `dag_12_base_only_no_queries` asserted the missing step
+   (`extract-base` absent under default dedup) and now asserts it
+   present; `dag_12b_base_only_without_dedup_uses_the_source` pins the
+   identity case; the round trip runs over all twelve types.
+5. **`XvecReader::get_slice` refused every 8-byte type outright**,
+   though every other record of an f64/i64/u64 file is aligned (the
+   4-byte header puts records at 4 and 0 mod 8 in turn); its new
+   runnable example failed: `left: None right: Some([-1e300])`. It now
+   applies the alignment check record by record, as veks-io's
+   `MmapReader` does.
+
+**Tests and coverage.** The whole workspace under the §14.5 command:
+3698 passed, 0 failed, 3 ignored (none of them this step's). Workspace
+line coverage 76.0% → 76.8%.
+
+| File | After step 9 | After |
+|---|---|---|
+| `vectordata/src/explore/shared.rs` | 44.3% | 81.5% (466/572) |
+| `veks-core/src/formats/mod.rs` | 80.8% | 86.0% (301/350) |
+| `veks/src/prepare/import.rs` | 85.4% | 87.8% (2229/2540) |
+| `veks-pipeline/.../compute_prefiltered_knn.rs` | 71.3% | 74.7% (1181/1581) |
+| `veks-pipeline/.../compute_knn.rs` | 73.3% | 74.6% (2098/2811) |
+| `veks-pipeline/.../compute_knn_blas.rs` | 89.0% | 89.9% (970/1079) |
+| `veks-pipeline/.../verify_knn.rs` | 55.6% | 58.0% (543/937) |
+| `veks-pipeline/.../gen_extract.rs` | 73.9% | 74.9% (2409/3216) |
+| `veks-pipeline/.../element_type.rs` | 96.5% | 96.9% (309/319) |
+| `veks-datatypes/src/conversion.rs` | 97.9% | 82.5% (179/217) |
+
+`conversion.rs` falls because its new pair tests are nested
+`dispatch_element!` expansions: 144 monomorphized arms share each
+source line, and llvm-cov reports lines of the arms a filter skips as
+unexecuted. The tests assert they visited 14 cross-sign and 37
+widening pairs, so the drop is the instrument, not a gap.
+
+**Decided.** A widened engine's queries may be of any type that reads
+as f32; the f32, f16 and f64 engines keep reading queries at the base's
+type. `generate vectors --type` accepts u8, i16, i32, f16, f32, f64
+and refuses the rest by name; `analyze find-zeros`/`find-duplicates`
+scan f32 and f16 only and refuse the rest by name;
+`ElementTypeKnn::normalization_threshold` does not depend on the
+dimension — each pinned by a test, none extended.
 

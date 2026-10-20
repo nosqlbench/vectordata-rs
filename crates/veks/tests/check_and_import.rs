@@ -10,6 +10,12 @@ use std::path::{Path, PathBuf};
 
 use veks::check;
 use veks::prepare::import::{ImportArgs};
+use vectordata::typed_access::{Container, ElementType};
+
+#[path = "support/catalog_mirror.rs"]
+mod catalog_mirror;
+#[path = "support/samples.rs"]
+mod samples;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Test helpers
@@ -167,11 +173,113 @@ fn import_native_fvec_self_search() {
     assert!(yaml.contains("compute knn"), "should have KNN");
     assert!(yaml.contains("compute sort"), "should have sort/dedup step");
 
-    // Profile should reference the extracted vectors, not the source
-    assert!(yaml.contains("profiles/base/base_vectors.mvecs")
-        || yaml.contains("profiles/base/base_vectors.fvecs")
-        || yaml.contains(&fvec.to_string_lossy().to_string()),
-        "profile should reference vectors");
+    // Profile references the extracted vectors at the one extension an
+    // f32 source implies, not the source.
+    assert!(yaml.contains("profiles/base/base_vectors.fvecs"), "profile should reference vectors:\n{yaml}");
+    assert!(!yaml.contains("base_vectors.mvecs"), "an f32 source is not written as f16:\n{yaml}");
+}
+
+/// **Importing a uniform-vector source of every element type pins the
+/// profile's extension to the one the source type implies** (SRD
+/// element-access §13.10): `VecFormat::of(Vec, type).preferred_extension()`
+/// for the base and the query facets, and no other spelling of either
+/// facet anywhere in the emitted dataset.yaml.
+#[test]
+fn importing_a_source_of_every_element_type_pins_the_profile_extension() {
+    for &ty in ElementType::ALL {
+        let dir = tempfile::tempdir().unwrap();
+        let preferred = veks_core::formats::VecFormat::of(Container::Vec, ty).unwrap().preferred_extension();
+        let src = dir.path().join(format!("vectors.{}", ty.extension(Container::Vec)));
+        veks_datatypes::dispatch_element!(ty, T => {
+            let finite = samples::finite_samples::<T>();
+            samples::write_vectors::<T>(&src, 40, 3, |r, c| finite[(r + c) % finite.len()]);
+        });
+        let out = dir.path().join("dataset");
+        let mut args = default_args(&format!("{ty}-source"), &out);
+        args.base_vectors = Some(src);
+        args.query_count = 10;
+        veks::prepare::import::run(args);
+
+        let yaml = read_yaml(&out);
+        for facet in ["base_vectors", "query_vectors"] {
+            assert!(yaml.contains(&format!("profiles/base/{facet}.{preferred}")), "{ty}: {facet}.{preferred} in:\n{yaml}");
+            let other: Vec<&str> = yaml
+                .lines()
+                .filter(|l| l.contains(&format!("{facet}.")) && !l.contains(&format!("{facet}.{preferred}")))
+                .collect();
+            assert!(other.is_empty(), "{ty}: {facet} spelled otherwise than .{preferred}: {other:?}");
+        }
+    }
+}
+
+fn veks_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_veks"))
+}
+
+/// Run the pipeline the bootstrap wrote, as `veks run` does, and return
+/// whether it succeeded with its log.
+fn run_pipeline(dataset_yaml: &Path) -> (bool, String) {
+    catalog_mirror::mark_publishable(dataset_yaml.parent().expect("dataset.yaml has a directory"));
+    let out = std::process::Command::new(veks_bin())
+        .arg("run")
+        .arg("--output").arg("batch")
+        .arg("--threads").arg("2")
+        .arg(dataset_yaml)
+        .output()
+        .expect("failed to execute veks");
+    let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if out.status.success() {
+        catalog_mirror::assert_projections_mirror_dataset_yaml(dataset_yaml.parent().unwrap());
+    }
+    (out.status.success(), text)
+}
+
+/// **A base-only import keeps its source's type and values**, for every
+/// element type: with nothing to rewrite the base (no dedup, no
+/// normalization), the profile names the source itself, the pipeline
+/// completes, and the dataset reads every record back at the source's
+/// type bit for bit.
+///
+/// The zero and duplicate counts are asserted, so no scan reads the
+/// base: those scans take f32 and f16 only and refuse the rest by name.
+#[test]
+fn the_values_of_an_imported_source_round_trip_at_the_sources_type() {
+    use vectordata::TestDataViewExt;
+    for &ty in ElementType::ALL {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = ty.extension(Container::Vec);
+        let src = dir.path().join(format!("vectors.{ext}"));
+        let out = dir.path().join("dataset");
+        veks_datatypes::dispatch_element!(ty, T => {
+            let finite = samples::finite_samples::<T>();
+            let value = |r: usize, c: usize| finite[(r * 3 + c) % finite.len()];
+            samples::write_vectors::<T>(&src, 40, 3, value);
+
+            let mut args = default_args(&format!("{ty}-roundtrip"), &out);
+            args.base_vectors = Some(src.clone());
+            args.required_facets = Some("B".to_string());
+            args.no_dedup = true;
+            args.no_zero_check = true;
+            args.zero_count = Some(0);
+            args.duplicate_count = Some(0);
+            args.seed = 0;
+            args.force = true;
+            veks::prepare::import::run(args);
+            let (ok, log) = run_pipeline(&out.join("dataset.yaml"));
+            assert!(ok, "{ty}: pipeline failed:\n{log}");
+
+            let group = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap_or_else(|e| panic!("{ty}: {e}"));
+            let view = group.profile("default").unwrap_or_else(|| panic!("{ty}: no default profile"));
+            assert_eq!(view.facet_element_type("base_vectors").unwrap(), ty, "{ty}: the base keeps its type");
+            let reader = view.base_vectors_as::<T>().unwrap_or_else(|e| panic!("{ty}: {e}"));
+            assert_eq!((reader.dim(), reader.count()), (3, 40), "{ty}");
+            for r in 0..40 {
+                let got = reader.get(r).unwrap();
+                let want: Vec<T> = (0..3).map(|c| value(r, c)).collect();
+                assert!(samples::same_bits(&got, &want), "{ty}: record {r}: {got:?} != {want:?}");
+            }
+        });
+    }
 }
 
 #[test]
@@ -191,9 +299,10 @@ fn import_npy_dir_needs_import_step() {
 
     // Should have import step (npy is foreign format)
     assert!(yaml.contains("run: transform convert"), "npy dir should need import step");
-    // Probe of fake npy falls back to fvec; real npy dirs would get the correct extension
-    assert!(yaml.contains("${cache}/all_vectors.fvecs") || yaml.contains("${cache}/all_vectors.mvecs"),
-        "import output should go to cache");
+    // A container source states no element type, so the import lands as
+    // f32: exactly `fvecs`, never the f16 spelling.
+    assert!(yaml.contains("${cache}/all_vectors.fvecs"), "import output should go to cache as fvecs:\n{yaml}");
+    assert!(!yaml.contains("all_vectors.mvecs"), "a container source is not written as f16:\n{yaml}");
 }
 
 #[test]
