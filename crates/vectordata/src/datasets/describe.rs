@@ -235,8 +235,18 @@ fn render(entry: &CatalogEntry, profile_name: &str) {
             // report a stride **only when the lengths are uniform**
             // (SH-46) — a non-uniform series has no stride, and
             // printing one would be a number that does not exist.
-            let sources = view.sources();
-            println!("    shards        {}", sources.len().max(1));
+            //
+            // The shards are the files the shard model realizes, the
+            // planner's and `FacetDescriptor::shard_count`'s count: a
+            // `__NNNN` pattern is one declared source naming many files.
+            let files = match series_files(facet, view) {
+                Ok(files) => files,
+                Err(e) => {
+                    println!("    shards        (invalid declaration: {e})");
+                    continue;
+                }
+            };
+            println!("    shards        {}", files.len());
             if let Some(stride) = view.shard_stride {
                 println!("    shard_stride  {stride}");
             }
@@ -244,8 +254,13 @@ fn render(entry: &CatalogEntry, profile_name: &str) {
                 println!("    records       {}",
                     crate::dataset::source::format_count_with_suffix(n));
             }
-            for (i, src) in sources.iter().enumerate() {
-                println!("    [{i:>4}]        {src}");
+            if let [pattern] = view.declaration_sources().as_slice()
+                && crate::dataset::shards::has_shard_field(pattern)
+            {
+                println!("    pattern       {pattern}");
+            }
+            for (i, file) in files.iter().enumerate() {
+                println!("    [{i:>4}]        {file}");
             }
         } else {
             println!("    source        {}", view.source.path);
@@ -266,6 +281,23 @@ fn render(entry: &CatalogEntry, profile_name: &str) {
         if let Some(iv) = view.source.window.0.first() {
             println!("    source.window [{}..{})", iv.min_incl, iv.max_excl);
         }
+    }
+}
+
+/// The files a series view names, in ordinal order, as the shard
+/// model realizes its declaration: a uniform `__NNNN` series expands to
+/// its `shard_count` files with no file read. An explicit series is one
+/// file per listed entry; the model would size an entry with no declared
+/// count by opening it, which describing never does, so such a series is
+/// reported as listed. A uniform declaration the model refuses is the
+/// error.
+fn series_files(facet: &str, view: &crate::dataset::profile::DSView) -> Result<Vec<String>, String> {
+    let sources = view.declaration_sources();
+    let no_read = |_: &crate::dataset::source::DSSource| Err("describe opens no file".to_string());
+    match crate::dataset::shards::realize(facet, &view.declaration(&sources), &no_read) {
+        Ok(shards) => Ok(shards.entries().iter().map(|e| e.source.to_string()).collect()),
+        Err(e) if sources.first().is_some_and(|s| crate::dataset::shards::has_shard_field(s)) => Err(e.to_string()),
+        Err(_) => Ok(sources),
     }
 }
 

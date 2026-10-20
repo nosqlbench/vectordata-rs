@@ -3,7 +3,8 @@
 
 //! `datasets describe` (and `ping`'s lookup), run as the binary a user
 //! runs: a name two catalogs hold is reported as ambiguous, never as
-//! missing, which is the opposite of the truth.
+//! missing, which is the opposite of the truth; and a series is
+//! described by the files it spans, the count the planner fetches.
 
 mod support;
 
@@ -66,3 +67,35 @@ fn describe_and_ping_report_a_doubled_name_as_ambiguous() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// **A uniform series is described by its files, not its one pattern**:
+/// `shards` is the count `precache --plan` fetches and
+/// `FacetDescriptor::shard_count` holds, and each file is listed. It
+/// printed `shards 1` and the pattern, for any number of files.
+#[test]
+fn describe_counts_the_files_a_uniform_series_spans() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path());
+    let root = tmp.path().join("cat");
+    let ds = root.join("sharded");
+    std::fs::create_dir_all(&ds).unwrap();
+    for (i, records) in [4, 4, 2].iter().enumerate() {
+        write_fvec(&ds.join(format!("base__{i:04}.fvec")), *records, 4, i as f32);
+    }
+    std::fs::write(
+        ds.join("dataset.yaml"),
+        "format_version: 2\nname: sharded\nprofiles:\n  default:\n    base_vectors:\n      source: base__NNNN.fvec\n      \
+         shard_stride: 4\n      shard_count: 3\n      record_count: 10\n",
+    )
+    .unwrap();
+    write_catalogs(&root, &["sharded"]);
+
+    let out = vectordata(&home, &["datasets", "describe", "--at", &root.to_string_lossy(), "sharded"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+    let shards = text.lines().find(|l| l.trim_start().starts_with("shards ")).unwrap_or_else(|| panic!("{text}"));
+    assert_eq!(shards.split_whitespace().nth(1), Some("3"), "{text}");
+    for i in 0..3 {
+        assert!(text.contains(&format!("base__{i:04}.fvec")), "file {i} listed: {text}");
+    }
+    assert!(text.contains("pattern       base__NNNN.fvec"), "{text}");
+}
