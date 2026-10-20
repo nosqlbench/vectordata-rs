@@ -29,12 +29,11 @@ use crate::dataset::selector::DatasetSpec;
 #[cfg(feature = "cli")]
 #[derive(Debug, veks_completion_derive::VeksCli)]
 pub struct PingArgs {
-    /// Pin ping to a single catalog location (URL or path). When
-    /// omitted, every catalog configured under `<configdir>/
-    /// catalogs.yaml` plus any `--catalog` extras is in play, and
-    /// ping searches them all.
+    /// Catalogs to use *instead* of the configured ones, in order: each a URL, a path, a configured catalog's number, or the name of a configured or program catalog (repeatable). When omitted, every catalog configured under
+    /// `<configdir>/catalogs.yaml`, the program's, and any `--catalog`
+    /// extras are in play, and ping searches them all.
     #[arg(long = "at")]
-    pub at: Option<String>,
+    pub at: Vec<String>,
     /// Dataset name in the catalog, optionally with a selector:
     /// `name` or `name:<selector>` (PS-1). Ping probes every profile
     /// the selector names (PS-9); none means `default`.
@@ -50,7 +49,7 @@ pub fn run_args(args: PingArgs, program: &crate::catalog::CatalogSources, config
     // `--at` pins the command to the catalogs it names, numbered
     // shortcuts (`--at 2`) included, by the one assembly every
     // command uses.
-    let at: Vec<String> = args.at.iter().cloned().collect();
+    let at = args.at;
     let sources = super::build_sources(program, configdir, catalog, &at);
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");

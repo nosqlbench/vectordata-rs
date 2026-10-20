@@ -53,3 +53,33 @@ fn an_embedded_cli_finds_a_dataset_its_program_registered() {
         .collect();
     vectordata::shell::bin_main_with_catalogs("embedded", argv, program);
 }
+
+/// **`--at` names the program's catalog**, so a run can read it and
+/// nothing configured: `--at bench` finds the dataset only `bench`
+/// holds. It was taken for a path that does not exist, and the run
+/// found no catalog.
+#[test]
+fn at_names_the_programs_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("bench-ds");
+    std::fs::create_dir_all(&home).unwrap();
+    write_fvec(&home.join("b.fvec"));
+    let config = tmp.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    let description = DatasetConfig::builder("bench-ds")
+        .profile("default", |p| p.facet(StandardFacet::BaseVectors, "b.fvec"))
+        .build()
+        .unwrap();
+    let entry = CatalogEntry::builder("bench-ds")
+        .home(&Location::from_path(&home))
+        .dataset(description)
+        .build()
+        .unwrap();
+    let program = CatalogSources::new().with(CatalogBuilder::named("bench").entry(entry).build());
+    let argv: Vec<String> = ["datasets", "precache", "--at", "bench", "bench-ds:default", "--plan", "--configdir"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([config.to_string_lossy().into_owned()])
+        .collect();
+    vectordata::shell::bin_main_with_catalogs("embedded", argv, program);
+}

@@ -253,7 +253,8 @@ let catalog = Catalog::of(&sources);
   replaced with the rest by `--at`. `bin_main_as(invoked, argv)` is the
   same with none. `datasets::build_sources(program, configdir, catalog,
   at)` is the one assembly; `CatalogSources::extend` appends one set to
-  another.
+  another. The program set is the program's own catalogs only; the
+  configured ones are added there.
 - **`describe` on a path or URL:** `datasets describe` takes a head as
   `open_spec` does (`describe ./mydata`, `describe ./mydata:default`, a
   `dataset.yaml`, a URL), rendered as a catalog would list its
@@ -263,6 +264,13 @@ let catalog = Catalog::of(&sources);
   `datasets::describe::run_via_catalog` and `PrecacheRequest::catalog`
   render the listing, the description and the fetch without assembling
   catalogs; none ends the caller's process.
+- **`--at` values**, in order, replace every other catalog for a run.
+  Each is a URL or a path that exists; else a configured catalog's
+  number (`--at 2`); else the name of a configured or program catalog
+  (`--at fvec --at /mnt/stage` reads the program's `fvec` catalog, then
+  that directory, and nothing from `catalogs.yaml`); else a location.
+  A name two catalogs share is an error naming both
+  (`datasets::at_sources`, `CatalogSources::named`).
 
 `examples/register_catalog.rs` builds both kinds of catalog over a
 dataset it writes, and opens and reads from each.

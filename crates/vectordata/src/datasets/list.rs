@@ -35,7 +35,7 @@ pub struct ListArgs {
     #[arg(long)]
     pub catalog: Vec<String>,
 
-    /// Catalog URLs or paths to use *instead* of configured catalogs
+    /// Catalogs to use *instead* of the configured ones, in order: each a URL, a path, a configured catalog's number, or the name of a configured or program catalog (repeatable).
     #[arg(long = "at")]
     pub at: Vec<String>,
 

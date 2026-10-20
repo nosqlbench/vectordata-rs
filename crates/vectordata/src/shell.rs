@@ -90,7 +90,7 @@ enum Cmd {
         #[arg(long, global = true)]
         #[allow(dead_code)]
         catalog: Vec<String>,
-        /// (TUI-mode only) Catalog URLs or paths to use *instead* of configured catalogs.
+        /// (TUI-mode only) Catalogs to use *instead* of the configured ones, in order: each a URL, a path, a configured catalog's number, or the name of a configured or program catalog (repeatable).
         #[arg(long = "at", global = true)]
         #[allow(dead_code)]
         at: Vec<String>,
@@ -368,7 +368,7 @@ enum DatasetsCmd {
         /// Additional catalog directories, file paths, or HTTP URLs.
         #[arg(long)]
         catalog: Vec<String>,
-        /// Catalog URLs or paths to use *instead* of configured catalogs.
+        /// Catalogs to use *instead* of the configured ones, in order: each a URL, a path, a configured catalog's number, or the name of a configured or program catalog (repeatable).
         #[arg(long = "at")]
         at: Vec<String>,
     },
@@ -400,7 +400,7 @@ enum DatasetsCmd {
         /// Additional catalog directories, file paths, or HTTP URLs.
         #[arg(long)]
         catalog: Vec<String>,
-        /// Catalog URLs or paths to use *instead* of configured catalogs.
+        /// Catalogs to use *instead* of the configured ones, in order: each a URL, a path, a configured catalog's number, or the name of a configured or program catalog (repeatable).
         #[arg(long = "at")]
         at: Vec<String>,
         /// Fetch into this cache directory instead of the configured

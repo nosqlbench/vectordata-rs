@@ -202,6 +202,26 @@ impl CatalogSources {
         self
     }
 
+    /// The one catalog of this set named `name`, as a set of its own and
+    /// required: what `--at <name>` reads. `Ok(None)` when no catalog
+    /// has the name; an error naming each when several do, since a
+    /// choice between catalogs is never made by order.
+    pub fn named(&self, name: &str) -> Result<Option<CatalogSources>, String> {
+        let matches: Vec<&Slot> = self.sources.iter().filter(|slot| slot.source.name() == name).collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [slot] => Ok(Some(CatalogSources {
+                sources: vec![Slot { requirement: Requirement::Required, from_config: None, ..(*slot).clone() }],
+                ..CatalogSources::default()
+            })),
+            several => Err(format!(
+                "catalog name '{name}' names {} catalogs: {}",
+                several.len(),
+                several.iter().map(|s| s.source.origin().to_string()).collect::<Vec<_>>().join("; "),
+            )),
+        }
+    }
+
     /// The catalogs, in order, each with whether it must load.
     pub fn iter(&self) -> impl Iterator<Item = (&dyn CatalogSource, Requirement)> + '_ {
         self.sources.iter().map(|slot| (slot.source.as_ref(), slot.requirement))

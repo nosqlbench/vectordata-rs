@@ -22,11 +22,11 @@ use crate::dataset::CatalogEntry;
 #[cfg(feature = "cli")]
 #[derive(Debug, veks_completion_derive::VeksCli)]
 pub struct DescribeArgs {
-    /// Pin describe to a single catalog location (URL or path). When
-    /// omitted, every catalog configured under `<configdir>/
-    /// catalogs.yaml` plus any `--catalog` extras is in play.
+    /// Catalogs to use *instead* of the configured ones, in order: each a URL, a path, a configured catalog's number, or the name of a configured or program catalog (repeatable). When omitted, every catalog configured under
+    /// `<configdir>/catalogs.yaml`, the program's, and any `--catalog`
+    /// extras are in play.
     #[arg(long = "at")]
-    pub at: Option<String>,
+    pub at: Vec<String>,
     /// `<dataset>` or `<dataset>:<selector>` (PS-1). No selector means
     /// `default`; a selector must name exactly one profile, so
     /// `ds:size=10m,predicates=uniform-2` works where it is unique and
@@ -60,7 +60,7 @@ pub fn run_args(args: DescribeArgs, program: &crate::catalog::CatalogSources, co
     if opens_directly(&head) {
         return run_via_catalog(&Catalog::default(), &head, selector.as_deref());
     }
-    let at: Vec<String> = args.at.iter().cloned().collect();
+    let at = args.at;
     let sources = super::build_sources(program, configdir, catalog, &at);
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");

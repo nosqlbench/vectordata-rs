@@ -101,15 +101,22 @@ impl RunSources {
 /// Numbered catalog shortcuts (`--at 2`, `--catalog 1`) resolve
 /// against the configured list in every position — this seam is what
 /// makes the shortcuts work identically from every binary that
-/// dispatches into this module.
+/// dispatches into this module. An `--at` value may also name a
+/// configured or program catalog ([`at_sources`]), so any ordered list
+/// of catalogs is a list of `--at` values.
 pub fn build_sources(program: &CatalogSources, configdir: &str, extra_catalogs: &[String], at: &[String]) -> RunSources {
     let at = catalog_args(at);
     let extra_catalogs = catalog_args(extra_catalogs);
-    let (configured, named) = if at.is_empty() {
-        (CatalogSources::new().configure(configdir).extend(program.clone()), extra_catalogs)
-    } else {
-        (CatalogSources::new(), at)
-    };
+    let candidates = CatalogSources::new().configure(configdir).extend(program.clone());
+    if !at.is_empty() {
+        let sources = at_sources(&at, &candidates).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
+        let named = sources.iter().map(|(s, _)| s.name().to_string()).collect();
+        return RunSources { sources, named };
+    }
+    let (configured, named) = (candidates, extra_catalogs);
     let before: Vec<String> = configured.iter().map(|(s, _)| s.name().to_string()).collect();
     let sources = configured.add_catalogs(&named);
     let named = sources
@@ -118,6 +125,28 @@ pub fn build_sources(program: &CatalogSources, configdir: &str, extra_catalogs: 
         .filter(|name| !before.contains(name))
         .collect();
     RunSources { sources, named }
+}
+
+/// The catalogs a run's `--at` values name, in their order, in place of
+/// every other: each value is a location when it is a URL or a path
+/// that exists (a path that exists is a path, as in
+/// [`open_spec`](crate::catalog::Catalog::open_spec)); else the catalog
+/// of `candidates` (the configured ones and the program's) of that
+/// name; else a location, as before. A name two candidates share is an
+/// error naming both, never settled by order. Numbered shortcuts are
+/// resolved before this ([`catalog_args`]).
+pub fn at_sources(values: &[String], candidates: &CatalogSources) -> Result<CatalogSources, String> {
+    let mut sources = CatalogSources::new();
+    for value in values {
+        let is_location = value.contains("://")
+            || std::path::Path::new(&crate::catalog::sources::expand_tilde(value)).exists();
+        let named = if is_location { None } else { candidates.named(value)? };
+        sources = match named {
+            Some(named) => sources.extend(named),
+            None => sources.add_catalogs(std::slice::from_ref(value)),
+        };
+    }
+    Ok(sources)
 }
 
 /// Resolve `--at`/`--catalog` values, numbered shortcuts included,
@@ -224,6 +253,52 @@ mod tests {
 
         let run = build_sources(&CatalogSources::new(), &config, &[], &[]);
         assert_eq!(names(&run), ["lab"], "no program catalogs: the configured ones alone");
+    }
+
+    /// **`--at` takes catalog names as well as locations, in order**: a
+    /// program catalog and a location in the order given, with nothing
+    /// configured; a configured catalog by name; an existing path stays
+    /// a path whatever catalog shares its name; a name two catalogs hold
+    /// is refused naming both.
+    #[test]
+    fn at_names_a_program_or_configured_catalog_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_naming_a_missing_catalog(dir.path());
+        let program = CatalogSources::new().with(crate::catalog::CatalogBuilder::named("fvec").build());
+        let candidates = CatalogSources::new().configure(&config).extend(program.clone());
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("catalog.json"), "[]").unwrap();
+        let stage = stage.to_string_lossy().into_owned();
+        let names = |s: &CatalogSources| s.iter().map(|(c, _)| c.name().to_string()).collect::<Vec<_>>();
+
+        let picked = at_sources(&["fvec".to_string(), stage.clone()], &candidates).unwrap();
+        let got = names(&picked);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], "fvec", "the program's catalog first, as given: {got:?}");
+        assert!(!got.contains(&"lab".to_string()), "nothing configured unless named: {got:?}");
+        assert!(picked.iter().nth(1).unwrap().0.origin().to_string().contains("stage"), "then the location");
+
+        assert_eq!(names(&at_sources(&["lab".to_string()], &candidates).unwrap()), ["lab"], "a configured catalog by name");
+
+        // A path that exists is a path, even with a catalog of its name.
+        let shadow = dir.path().join("fvec");
+        std::fs::create_dir_all(&shadow).unwrap();
+        std::fs::write(shadow.join("catalog.json"), "[]").unwrap();
+        let shadow = shadow.to_string_lossy().into_owned();
+        let named_fvec = CatalogSources::new().with(crate::catalog::CatalogBuilder::named(shadow.clone()).build());
+        let picked = at_sources(std::slice::from_ref(&shadow), &named_fvec).unwrap();
+        let origins: Vec<_> = picked.iter().map(|(c, _)| c.origin()).collect();
+        assert_eq!(origins.len(), 1, "{origins:?}");
+        assert!(!matches!(origins[0], crate::catalog::CatalogOrigin::Registered { .. }), "read as a location: {origins:?}");
+
+        let twice = candidates.clone().extend(CatalogSources::new().with(crate::catalog::CatalogBuilder::named("fvec").build()));
+        let err = at_sources(&["fvec".to_string()], &twice).unwrap_err();
+        assert!(err.contains("'fvec'") && err.contains("2 catalogs"), "{err}");
+
+        // Through build_sources: the run reads only what --at names.
+        let run = build_sources(&program, &config, &[], &["fvec".to_string()]);
+        assert_eq!(names(run.sources()), ["fvec"]);
     }
 
     /// **A configured catalog that fails to load is reported, and the
