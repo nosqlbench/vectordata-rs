@@ -3,7 +3,7 @@
 
 [package]
 name = "vecd"
-version = "3.0.4"
+version = "4.0.0"
 edition = "2024"
 description = "vectordata endpoint daemon — an AAA gateway in front of object storage"
 license = "Apache-2.0"
@@ -35,8 +35,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # CLI + dynamic, DB-backed completions — the same idiom as the
 # `vectordata` binary.
-veks-completion = { path = "../veks-completion", version = "=3.0.4" }
-veks-completion-derive = { path = "../veks-completion-derive", version = "=3.0.4" }
+veks-completion = { path = "../veks-completion", version = "=4.0.0" }
+veks-completion-derive = { path = "../veks-completion-derive", version = "=4.0.0" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
@@ -58,7 +58,7 @@ libc = "0.2"
 # parser come straight from the client crate so server and client can
 # never drift. default-features = false drops the client's clap/explore
 # stack — vecd only needs the push core (binding/pushlog/checksums).
-vectordata = { path = "../vectordata", version = "=3.0.4", default-features = false }
+vectordata = { path = "../vectordata", version = "=4.0.0", default-features = false }
 
 # Blocking HTTP client for the `daemon status --wait` readiness probe — a
 # liveness self-check of vecd's own (often self-signed) loopback /healthz, so it
