@@ -61,6 +61,14 @@ replacement. The design is `docs/design/srd-element-access.md`.
 - **`veks-pipeline`'s `dispatch_reader!`** opens an `.i8vecs` as `i8`
   and a `.u16vecs` as `u16`; it opened them as the unsigned or signed
   type of the same width.
+- **Every KNN engine and verifier computes over a bf16 or 8-/16-bit
+  integer base** by widening it to f32 exactly: `compute knn-metal`,
+  `knn-stdarch`, `knn-blas`, `knn-faiss`, `compute prefiltered-knn`,
+  `verify knn-consolidated`, `verify knn-groundtruth` and `verify
+  dataset-knnutils`. The base is scanned at its own width and widened
+  one vector or one streamed chunk at a time, never copied as f32;
+  queries may be f32 or any type that widens to it. A 32- or 64-bit
+  integer base is refused by name.
 ### Upgrading from 3.0
 
 Each changed call, and what replaces it. The old spelling stays,

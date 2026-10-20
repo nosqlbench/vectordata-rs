@@ -41,20 +41,19 @@ use super::compute_knn::Neighbor;
 /// Type-erased holder for a base reader, kept alive only so its
 /// `madvise(SEQUENTIAL)` hint persists across the streaming pread
 /// scan. Reads themselves go through a separate `std::fs::File` so
-/// we never name the typed reader on the hot path. The variants
-/// match the type-dispatch arms in
-/// `VerifyKnnConsolidatedOp::execute` — adding a new base element
-/// type here means adding a new arm there.
-pub(super) enum BaseKeepalive {
-    F32(XvecReader<f32>),
-    F16(XvecReader<half::f16>),
-}
+/// we never name the typed reader on the hot path; the reader is the
+/// base's own type, whatever it is.
+pub(super) struct BaseKeepalive(#[allow(dead_code)] Box<dyn std::any::Any>);
 
 /// Format-agnostic float vector reader for verification.
 /// Provides f32 slices regardless of storage precision.
 pub(super) enum AnyFloatReader {
     F16(XvecReader<half::f16>),
     F32(XvecReader<f32>),
+    /// Any other type the conversion table widens to f32 (bf16, the 8-
+    /// and 16-bit integers), read through the widening reader: values
+    /// exact, no slice to borrow.
+    Widened(std::sync::Arc<dyn VectorReader<f32>>),
 }
 
 impl AnyFloatReader {
@@ -65,8 +64,11 @@ impl AnyFloatReader {
             ElementType::F16 => XvecReader::<half::f16>::open_path(path)
                 .map(AnyFloatReader::F16)
                 .map_err(|e| format!("open {}: {}", path.display(), e)),
-            _ => XvecReader::<f32>::open_path(path)
+            ElementType::F32 => XvecReader::<f32>::open_path(path)
                 .map(AnyFloatReader::F32)
+                .map_err(|e| format!("open {}: {}", path.display(), e)),
+            _ => vectordata::io::open_vec_as::<f32>(&path.to_string_lossy())
+                .map(AnyFloatReader::Widened)
                 .map_err(|e| format!("open {}: {}", path.display(), e)),
         }
     }
@@ -75,6 +77,7 @@ impl AnyFloatReader {
         match self {
             AnyFloatReader::F16(r) => VectorReader::<half::f16>::count(r),
             AnyFloatReader::F32(r) => VectorReader::<f32>::count(r),
+            AnyFloatReader::Widened(r) => r.count(),
         }
     }
 
@@ -82,6 +85,7 @@ impl AnyFloatReader {
         match self {
             AnyFloatReader::F16(r) => VectorReader::<half::f16>::dim(r),
             AnyFloatReader::F32(r) => VectorReader::<f32>::dim(r),
+            AnyFloatReader::Widened(r) => r.dim(),
         }
     }
 
@@ -94,6 +98,7 @@ impl AnyFloatReader {
             AnyFloatReader::F32(r) => {
                 r.get(index).unwrap_or_default()
             }
+            AnyFloatReader::Widened(r) => r.get(index).unwrap_or_default(),
         }
     }
 
@@ -101,7 +106,7 @@ impl AnyFloatReader {
     fn get_f16_slice(&self, index: usize) -> Option<&[half::f16]> {
         match self {
             AnyFloatReader::F16(r) => Some(r.get_slice(index)),
-            AnyFloatReader::F32(_) => None,
+            AnyFloatReader::F32(_) | AnyFloatReader::Widened(_) => None,
         }
     }
 
@@ -109,7 +114,7 @@ impl AnyFloatReader {
     fn get_f32_slice(&self, index: usize) -> Option<&[f32]> {
         match self {
             AnyFloatReader::F32(r) => Some(r.get_slice(index)),
-            AnyFloatReader::F16(_) => None,
+            AnyFloatReader::F16(_) | AnyFloatReader::Widened(_) => None,
         }
     }
 
@@ -128,6 +133,10 @@ impl AnyFloatReader {
             AnyFloatReader::F32(r) => {
                 let slice = r.get_slice(index);
                 buf[..slice.len()].copy_from_slice(slice);
+            }
+            AnyFloatReader::Widened(r) => {
+                let dim = r.dim();
+                let _ = r.read_into(index, &mut buf[..dim]);
             }
         }
     }
@@ -414,44 +423,28 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             Ok(t) => t,
             Err(e) => return error_result(format!("base extension: {e}"), start),
         };
-        let base_keepalive: BaseKeepalive;
-        let file_count: usize;
-        let dim: usize;
-        let elem_size: usize;
-        match base_etype {
-            ElementType::F32 => {
-                let r = match vectordata::io::XvecReader::<f32>::open_path(&base_path) {
-                    Ok(r) => r,
-                    Err(e) => return error_result(
-                        format!("failed to open base as f32: {}", e), start),
-                };
-                file_count = VectorReader::<f32>::count(&r);
-                dim = VectorReader::<f32>::dim(&r);
-                r.advise_sequential();
-                elem_size = 4;
-                base_keepalive = BaseKeepalive::F32(r);
-            }
-            ElementType::F16 => {
-                let r = match vectordata::io::XvecReader::<half::f16>::open_path(&base_path) {
-                    Ok(r) => r,
-                    Err(e) => return error_result(
-                        format!("failed to open base as f16: {}", e), start),
-                };
-                file_count = VectorReader::<half::f16>::count(&r);
-                dim = VectorReader::<half::f16>::dim(&r);
-                r.advise_sequential();
-                elem_size = 2;
-                base_keepalive = BaseKeepalive::F16(r);
-            }
-            other => return error_result(
+        // Any type that reads exactly as f32 scans: the sgemm unpack
+        // widens it (`widen_le_into`).
+        if !crate::pipeline::element_type::reads_as_f32(base_etype) {
+            return error_result(
                 format!(
-                    "verify knn-consolidated: base element type {:?} not supported \
-                     (only f32 / .fvec and f16 / .mvec are wired up)",
-                    other,
+                    "verify knn-consolidated: a base of {base_etype} elements is not exact as f32; the sgemm scan \
+                     reads f32 and the types that widen to it (f16, bf16, the 8- and 16-bit integers)"
                 ),
                 start,
-            ),
+            );
         }
+        let (base_keepalive, file_count, dim) = match veks_datatypes::dispatch_element!(base_etype, T => {
+            vectordata::io::XvecReader::<T>::open_path(&base_path).map(|r| {
+                r.advise_sequential();
+                let (n, d) = (VectorReader::<T>::count(&r), VectorReader::<T>::dim(&r));
+                (BaseKeepalive(Box::new(r)), n, d)
+            })
+        }) {
+            Ok(opened) => opened,
+            Err(e) => return error_result(format!("failed to open base as {base_etype}: {e}"), start),
+        };
+        let elem = base_etype;
         // Effective base count = inline window OR `range` option,
         // clamped to the file. Compute-knn uses the same resolution
         // (`source_window::resolve_window`), so verify and compute see
@@ -689,7 +682,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                     &base_file,
                     (base_offset + seg_start)..(base_offset + seg_end),
                     dim,
-                    elem_size,
+                    elem,
                     &queries_packed,
                     num_samples,
                     &query_norms_sq,

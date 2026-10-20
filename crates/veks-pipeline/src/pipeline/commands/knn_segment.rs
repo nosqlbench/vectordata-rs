@@ -773,8 +773,8 @@ where
 pub(super) fn rerank_output_post_pass(
     indices_path: &Path,
     distances_path: Option<&Path>,
-    base_reader: &vectordata::io::XvecReader<f32>,
-    query_reader: &vectordata::io::XvecReader<f32>,
+    base_reader: &dyn vectordata::VectorReader<f32>,
+    query_reader: &dyn vectordata::VectorReader<f32>,
     metric: Metric,
     k: usize,
     base_offset: usize,
@@ -782,7 +782,6 @@ pub(super) fn rerank_output_post_pass(
 ) -> Result<(), String> {
     use rayon::prelude::*;
     use std::io::{Read, Write};
-    use vectordata::VectorReader;
 
     // Read the existing indices file. Each row is `[k_header:i32,
     // i32 × k_header]`.
@@ -802,7 +801,7 @@ pub(super) fn rerank_output_post_pass(
         return Err(format!("indices file {} has unaligned size", indices_path.display()));
     }
     let n_rows = idx_bytes.len() / row_bytes;
-    let n_query = <vectordata::io::XvecReader<f32> as VectorReader<f32>>::count(query_reader);
+    let n_query = query_reader.count();
     if n_rows != n_query {
         return Err(format!(
             "indices file rows={} but query reader has count={}",
@@ -849,10 +848,27 @@ pub(super) fn rerank_output_post_pass(
     let reranked: Vec<Vec<super::compute_knn::Neighbor>> = rows.into_par_iter()
         .enumerate()
         .map(|(qi, cands)| {
-            let q = query_reader.get_slice(qi);
+            // A mapped f32 reader lends its records; a widening reader
+            // (a bf16 or integer base read as f32) has none to lend, so
+            // this query's candidates are read once into owned rows.
+            let q_owned;
+            let q: &[f32] = match query_reader.get_slice(qi) {
+                Some(s) => s,
+                None => {
+                    q_owned = query_reader.get(qi).unwrap_or_default();
+                    &q_owned
+                }
+            };
+            let owned: std::collections::HashMap<u32, Vec<f32>> = if base_reader.get_slice(base_offset).is_some() {
+                std::collections::HashMap::new()
+            } else {
+                cands.iter()
+                    .filter_map(|c| base_reader.get(base_offset + c.index as usize).ok().map(|v| (c.index, v)))
+                    .collect()
+            };
             let result = rerank_topk_f64(
                 q, &cands, k, metric,
-                |idx| Some(base_reader.get_slice(base_offset + idx as usize)),
+                |idx| base_reader.get_slice(base_offset + idx as usize).or_else(|| owned.get(&idx).map(Vec::as_slice)),
             );
             let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if done.is_multiple_of(progress_tick) || done == n_rows {

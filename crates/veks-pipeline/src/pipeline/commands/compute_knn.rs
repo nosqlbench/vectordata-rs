@@ -6,10 +6,13 @@
 //! Computes ground truth KNN for a set of query vectors against a base vector
 //! set. Outputs both neighbor indices (ivec) and distances (fvec).
 //!
-//! Supports both f32 (fvec) and f16 (mvec) input formats. The element type is
-//! detected from the file extension of the base vectors path. When mvec files
-//! are used, native f16 SIMD distance kernels operate directly on half-precision
-//! data without an explicit upcast to f32.
+//! The element type is detected from the file extension of the base vectors
+//! path. f32 (fvec), f16 (mvec) and f64 (dvec) have kernels of their own; the
+//! native f16 SIMD kernels operate directly on half-precision data. A base of
+//! bf16 or of an 8- or 16-bit integer — the types the conversion table widens
+//! to f32 exactly — is scanned at its own width and widened one vector at a
+//! time for the f32 kernels, with the queries read as f32. A 32- or 64-bit
+//! integer base is refused by name: no f32 kernel holds it exactly.
 //!
 //! Supports distance metrics: L2 (Euclidean), Cosine, DotProduct, L1 (Manhattan).
 //!
@@ -22,7 +25,7 @@
 //! final global top-K. Cached partitions are reusable across runs with different
 //! base-vector ranges.
 
-use crate::pipeline::element_type::ElementTypeExt;
+use crate::pipeline::element_type::{ElementTypeExt, WidenToF32};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::io::{BufReader, Cursor, Read, Write};
@@ -929,6 +932,205 @@ fn compute_partition_f16(
     results
 }
 
+// -- Widened KNN functions ----------------------------------------------------
+//
+// A base of a type the conversion table widens to f32 without a kernel
+// of its own (bf16, and the 8- and 16-bit integers) is scanned at its
+// own width: each base vector is widened into an f32 scratch once and
+// scored with the f32 kernels, and each query batch is widened once.
+// The corpus is never copied as f32, and the answer is the f32 answer
+// over the same values, since every such value is exact in f32.
+
+/// Push `dist` for base `idx` into query `qi`'s heap, keeping K.
+#[inline(always)]
+fn offer(heaps: &mut [BinaryHeap<Neighbor>], thresholds: &mut [f32], qi: usize, idx: u32, dist: f32, k: usize) {
+    if dist < thresholds[qi] {
+        heaps[qi].push(Neighbor { index: idx, distance: dist });
+        if heaps[qi].len() > k {
+            heaps[qi].pop();
+        }
+        if heaps[qi].len() == k {
+            thresholds[qi] = heaps[qi].peek().unwrap().distance;
+        }
+    }
+}
+
+/// Compute KNN for a batch of widened queries against base vectors
+/// `[start, end)` of `T`: the transposed f32 kernels when `batched_fn`
+/// is given, the pairwise f32 `dist_fn` otherwise.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn find_top_k_batch_widened<T: WidenToF32>(
+    queries: &[&[f32]],
+    base_reader: &XvecReader<T>,
+    start: usize,
+    end: usize,
+    k: usize,
+    dist_fn: fn(&[f32], &[f32]) -> f32,
+    batched_fn: Option<simd_distance::BatchedDistFnF32>,
+    metric: Metric,
+    dim: usize,
+    results: &mut [Vec<Neighbor>],
+    stride: usize,
+    base_progress: &AtomicU64,
+) {
+    use simd_distance::{SIMD_BATCH_WIDTH, PackedBatches, TransposedBatch};
+
+    let batch_size = queries.len();
+    let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size).map(|_| BinaryHeap::with_capacity(k + 1)).collect();
+    let mut thresholds = vec![f32::INFINITY; batch_size];
+    let mut base_f32 = vec![0.0f32; dim];
+
+    let packed = batched_fn
+        .filter(|_| simd_distance::metric_uses_packed_path(metric))
+        .map(|_| PackedBatches::from_f32(queries, dim));
+    let mut packed_out = vec![0.0f32; packed.as_ref().map_or(0, |p| p.n_batches() * SIMD_BATCH_WIDTH)];
+    let sub_batches: Vec<(usize, TransposedBatch)> = if batched_fn.is_some() && packed.is_none() {
+        (0..batch_size)
+            .step_by(SIMD_BATCH_WIDTH)
+            .map(|o| (o, TransposedBatch::from_f32(&queries[o..(o + SIMD_BATCH_WIDTH).min(batch_size)], dim)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut dist_buf = [0.0f32; SIMD_BATCH_WIDTH];
+
+    let mut i = start;
+    while i < end {
+        let stride_end = std::cmp::min(i + stride, end);
+        for j in i..stride_end {
+            T::widen_into(base_reader.get_slice(j), &mut base_f32);
+            let idx = j as u32;
+            if let Some(ref pk) = packed {
+                packed_out.iter_mut().for_each(|v| *v = 0.0);
+                (simd_distance::select_packed_neg_dot_f32())(&base_f32, pk, &mut packed_out);
+                for si in 0..pk.n_batches() {
+                    for qi in 0..pk.count(si) {
+                        let gqi = pk.offset(si) + qi;
+                        offer(&mut heaps, &mut thresholds, gqi, idx, packed_out[si * SIMD_BATCH_WIDTH + qi], k);
+                    }
+                }
+            } else if let Some(bfn) = batched_fn {
+                for (offset, batch) in &sub_batches {
+                    bfn(batch, &base_f32, &mut dist_buf);
+                    for qi in 0..batch.count() {
+                        offer(&mut heaps, &mut thresholds, offset + qi, idx, dist_buf[qi], k);
+                    }
+                }
+            } else {
+                for (qi, q) in queries.iter().enumerate() {
+                    offer(&mut heaps, &mut thresholds, qi, idx, dist_fn(q, &base_f32), k);
+                }
+            }
+        }
+        base_progress.fetch_add((stride_end - i) as u64, AtomicOrdering::Relaxed);
+        i = stride_end;
+    }
+
+    for (qi, heap) in heaps.into_iter().enumerate() {
+        let mut v: Vec<Neighbor> = heap.into_vec();
+        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal).then(a.index.cmp(&b.index)));
+        results[qi] = v;
+    }
+}
+
+/// The queries of a widened run, read once as f32: of any type the
+/// table widens to f32 (f32 itself included), whatever the base's type.
+/// Queries are few beside the base, so they are held whole.
+pub(super) struct F32Queries {
+    data: Vec<f32>,
+    pub(super) dim: usize,
+    pub(super) count: usize,
+}
+
+impl F32Queries {
+    /// Read every query of `path` as f32, through the conversion table.
+    pub(super) fn read(path: &Path) -> Result<Self, String> {
+        let reader = vectordata::io::open_vec_as::<f32>(&path.to_string_lossy()).map_err(|e| e.to_string())?;
+        let (count, dim) = (reader.count(), reader.dim());
+        let mut data = vec![0.0f32; count * dim];
+        let read = reader.read_into(0, &mut data).map_err(|e| e.to_string())?;
+        if read != count {
+            return Err(format!("read {read} of {count} queries"));
+        }
+        Ok(Self { data, dim, count })
+    }
+
+    /// Query `i`.
+    pub(super) fn row(&self, i: usize) -> &[f32] {
+        &self.data[i * self.dim..(i + 1) * self.dim]
+    }
+}
+
+/// Compute KNN for a single partition `[start, end)` of a base of `T`
+/// across all queries, widened to f32 — the partition function of
+/// [`execute_widened`], with the threading of [`compute_partition`].
+#[allow(clippy::too_many_arguments)]
+fn compute_partition_widened<T: WidenToF32>(
+    query_reader: &F32Queries,
+    query_count: usize,
+    base_reader: &Arc<XvecReader<T>>,
+    start: usize,
+    end: usize,
+    k: usize,
+    dist_fn: fn(&[f32], &[f32]) -> f32,
+    batched: bool,
+    metric: Metric,
+    dim: usize,
+    threads: usize,
+    pb: &ProgressHandle,
+) -> Vec<Vec<Neighbor>> {
+    let batched_fn = batched.then(|| simd_distance::select_batched_fn_f32(metric));
+    let base_count = end - start;
+    let stride = base_count.div_ceil(STRIDES_PER_THREAD);
+    let base_progress = Arc::new(AtomicU64::new(0));
+    let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
+
+    let effective_threads = threads.clamp(1, query_count.max(1));
+    let chunk_size = query_count.div_ceil(effective_threads).max(1);
+    let num_batches: u64 = results
+        .chunks(chunk_size)
+        .map(|c| c.len().div_ceil(QUERY_BATCH_SIZE) as u64)
+        .sum();
+    let total_base_scans = num_batches * base_count as u64;
+    pb.set_position(0);
+
+    std::thread::scope(|scope| {
+        for (ci, chunk) in results.chunks_mut(chunk_size).enumerate() {
+            let chunk_start = ci * chunk_size;
+            let base_ref = Arc::clone(base_reader);
+            let bp = Arc::clone(&base_progress);
+            scope.spawn(move || {
+                let mut offset = 0;
+                while offset < chunk.len() {
+                    let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, chunk.len());
+                    let queries: Vec<&[f32]> =
+                        (chunk_start + offset..chunk_start + batch_end).map(|q| query_reader.row(q)).collect();
+                    find_top_k_batch_widened(
+                        &queries, &base_ref, start, end, k, dist_fn, batched_fn, metric, dim,
+                        &mut chunk[offset..batch_end], stride, &bp,
+                    );
+                    offset = batch_end;
+                }
+            });
+        }
+        let nb = num_batches.max(1);
+        let bp = Arc::clone(&base_progress);
+        scope.spawn(move || {
+            loop {
+                let scanned = bp.load(AtomicOrdering::Relaxed);
+                pb.set_position(scanned / nb);
+                if scanned >= total_base_scans {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    });
+    pb.set_position(base_count as u64);
+    results
+}
+
 /// Compute KNN for a single partition `[start, end)` across all f64 queries.
 ///
 /// Pairwise only: f64 has no transposed batch kernels, so `batched` is
@@ -1392,10 +1594,15 @@ that the ground truth is meaningful.
 
 ### Input Formats
 
-Supports both f32 (fvec) and f16 (mvec) input formats. The element type is
-detected from the file extension of the base vectors path. When mvec files
-are used, native f16 SIMD distance kernels operate directly on half-precision
-data without an explicit upcast to f32.
+The element type is detected from the file extension of the base vectors
+path. f32 (fvec), f16 (mvec) and f64 (dvec) have kernels of their own; when
+mvec files are used, native f16 SIMD distance kernels operate directly on
+half-precision data without an explicit upcast to f32. A base of bf16
+(`.bf16vecs`) or of an 8- or 16-bit integer (`.bvecs`, `.i8vecs`,
+`.u16vecs`, `.svecs`) — the types that widen to f32 exactly — is scanned at
+its own width and each vector widened for the f32 kernels; its queries may
+be of any type that reads as f32. A 32- or 64-bit integer base is refused,
+naming its type.
 
 ### Memory-Partitioned Computation
 
@@ -1438,7 +1645,8 @@ compare an ANN index's approximate results against this exact ground truth.
 
 ## Notes
 
-- Element type (f32 vs f16) is auto-detected from the base file extension.
+- Element type is auto-detected from the base file extension; bf16 and the
+  8- and 16-bit integers are widened to f32, 32- and 64-bit integers refused.
 - Partition caching allows incremental and resumable computation.
 - Thread count of 0 uses the system default (all available cores).
 - This is typically the most expensive step in a pipeline; plan for hours on
@@ -1649,8 +1857,40 @@ compare an ANN index's approximate results against this exact ground truth.
                     start,
                 )
             }
-            // F32 — and any element type without a specialized arm —
-            // takes the generic f32 kernel.
+            // A type the table widens to f32, with no kernel of its own:
+            // scanned at its width, scored by the f32 kernels.
+            ElementType::BF16 | ElementType::U8 | ElementType::I8 | ElementType::U16 | ElementType::I16 => {
+                let dist_fn = match backend.distance_f32(kernel_metric) {
+                    Ok(f) => f,
+                    Err(e) => return error_result(e, start),
+                };
+                macro_rules! widened {
+                    ($t:ty) => {
+                        execute_widened::<$t>(
+                            &base_path, &query_path, &indices_path, distances_path.as_deref(), k,
+                            kernel_metric, display_metric, dist_fn, batched, engine, threads,
+                            partition_size, base_window, compress_cache, ctx, start,
+                        )
+                    };
+                }
+                match etype {
+                    ElementType::BF16 => widened!(half::bf16),
+                    ElementType::U8 => widened!(u8),
+                    ElementType::I8 => widened!(i8),
+                    ElementType::U16 => widened!(u16),
+                    _ => widened!(i16),
+                }
+            }
+            // A type no f32 kernel takes losslessly (the 32- and 64-bit
+            // integers): refused, naming the type, rather than rounded.
+            other if other != ElementType::F32 => error_result(
+                format!(
+                    "a base of {other} elements is not exact as f32 (conversion {:?}); compute knn scores f32, f16 and f64 \
+                     natively and widens bf16 and the 8- and 16-bit integers",
+                    other.conversion_to(ElementType::F32)
+                ),
+                start,
+            ),
             _ => {
                 let dist_fn = match backend.distance_f32(kernel_metric) {
                     Ok(f) => f,
@@ -1692,7 +1932,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Base vectors file (fvec, mvec, or dvec)".to_string(),
+                description: "Base vectors file: f32, f16, f64, or bf16 / 8- and 16-bit integers (widened to f32)".to_string(),
                 extended_description: None,
                 role: OptionRole::Input,
         },
@@ -1701,7 +1941,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Query vectors file (fvec, mvec, or dvec)".to_string(),
+                description: "Query vectors file: the base's type, or any type that reads as f32 for a widened base".to_string(),
                 extended_description: None,
                 role: OptionRole::Input,
         },
@@ -1971,7 +2211,7 @@ fn execute_f32(
         if let Some(m) = canonical_metric
             && let Err(e) = super::knn_segment::rerank_output_post_pass(
                 indices_path, distances_path,
-                &base_reader, &query_reader,
+                &*base_reader, &query_reader,
                 m, k, base_offset,
                 &ctx.ui,
             ) {
@@ -2096,6 +2336,123 @@ fn execute_f16(
     )
 }
 
+/// Execute KNN computation over a base of `T` that widens to f32
+/// without a kernel of its own (bf16, the 8- and 16-bit integers):
+/// scanned at its own width, scored by the f32 kernels.
+#[allow(clippy::too_many_arguments)]
+fn execute_widened<T: WidenToF32>(
+    base_path: &Path,
+    query_path: &Path,
+    indices_path: &Path,
+    distances_path: Option<&Path>,
+    k: usize,
+    metric: Metric,
+    display_metric: Metric,
+    dist_fn: fn(&[f32], &[f32]) -> f32,
+    batched: bool,
+    engine: &'static str,
+    threads: usize,
+    partition_size: usize,
+    base_window: Option<(usize, usize)>,
+    compress_cache: bool,
+    ctx: &mut StreamContext,
+    start: Instant,
+) -> CommandResult {
+    ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
+    let base_reader = match XvecReader::<T>::open_path(base_path) {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            return error_result(
+                format!("failed to open base {}: {}", base_path.display(), e),
+                start,
+            )
+        }
+    };
+    ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
+    let query_reader = match F32Queries::read(query_path) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_result(
+                format!("failed to open query {}: {}", query_path.display(), e),
+                start,
+            )
+        }
+    };
+
+    let file_count = <XvecReader<T> as VectorReader<T>>::count(&*base_reader);
+    let query_count = query_reader.count;
+    let base_dim = <XvecReader<T> as VectorReader<T>>::dim(&*base_reader);
+    let query_dim = query_reader.dim;
+
+    // Apply window to base vectors
+    let (base_offset, base_count) = match base_window {
+        Some((ws, we)) => {
+            let ws = ws.min(file_count);
+            let we = we.min(file_count);
+            (ws, we.saturating_sub(ws))
+        }
+        None => (0, file_count),
+    };
+
+    if base_dim != query_dim {
+        return error_result(
+            format!("dimension mismatch: base={}, query={}", base_dim, query_dim),
+            start,
+        );
+    }
+
+    let base_bytes = base_count as u64 * base_dim as u64 * T::SIZE as u64;
+    let query_bytes = query_count as u64 * query_dim as u64 * 4;
+    let batched_mode = if batched { "transposed 16-wide" } else { "pairwise" };
+    if base_offset > 0 {
+        ctx.ui.log(&format!(
+            "KNN: {} queries x {} base vectors ({}, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, engine={}, simd={}, batch={}",
+            format_count(query_count), format_count(base_count), T::TYPE.name(), base_dim,
+            format_count(base_offset), format_count(base_offset + base_count),
+            k, display_metric, threads, engine, simd_distance::simd_level(), batched_mode
+        ));
+    } else {
+        ctx.ui.log(&format!(
+            "KNN: {} queries x {} base vectors ({}, dim={}), k={}, metric={:?}, threads={}, engine={}, simd={}, batch={}",
+            format_count(query_count), format_count(base_count), T::TYPE.name(), base_dim,
+            k, display_metric, threads, engine, simd_distance::simd_level(), batched_mode
+        ));
+    }
+    ctx.ui.log(&format!(
+        "  base: {} ({})  query: {} ({})",
+        base_path.file_name().unwrap_or_default().to_string_lossy(),
+        format_bytes(base_bytes),
+        query_path.file_name().unwrap_or_default().to_string_lossy(),
+        format_bytes(query_bytes),
+    ));
+
+    execute_with_partitions(
+        &query_reader,
+        &base_reader,
+        base_offset,
+        base_count,
+        query_count,
+        base_dim,
+        indices_path,
+        distances_path,
+        k,
+        metric,
+        display_metric,
+        dist_fn,
+        batched,
+        engine,
+        threads,
+        partition_size,
+        base_path,
+        query_path,
+        compress_cache,
+        T::TYPE.name(),
+        ctx,
+        start,
+        compute_partition_widened::<T>,
+    )
+}
+
 /// Execute KNN computation using f64 vectors.
 #[allow(clippy::too_many_arguments)]
 fn execute_f64(
@@ -2206,14 +2563,18 @@ fn execute_f64(
 /// batched, metric, dim, threads, progress) -> per-query neighbors`.
 /// `batched` selects the transposed query-batch kernels over the
 /// pairwise `dist_fn` scan, where the element type has them.
-type PartitionComputeFn<T> = fn(
-    &XvecReader<T>, usize, &Arc<XvecReader<T>>, usize, usize, usize,
-    fn(&[T], &[T]) -> f32, bool, Metric, usize, usize, &ProgressHandle,
+/// `D` is the pairwise distance function the kernel scores with: over
+/// `T` for a type with kernels of its own, over f32 for a widened one.
+/// `Q` holds the queries: the reader of the base's own type, or the
+/// queries already widened to f32.
+type PartitionComputeFn<T, Q, D> = fn(
+    &Q, usize, &Arc<XvecReader<T>>, usize, usize, usize,
+    D, bool, Metric, usize, usize, &ProgressHandle,
 ) -> Vec<Vec<Neighbor>>;
 
 #[allow(clippy::too_many_arguments)]
-fn execute_with_partitions<T>(
-    query_reader: &XvecReader<T>,
+fn execute_with_partitions<T, Q, D>(
+    query_reader: &Q,
     base_reader: &Arc<XvecReader<T>>,
     base_offset: usize,
     base_count: usize,
@@ -2224,7 +2585,7 @@ fn execute_with_partitions<T>(
     k: usize,
     metric: Metric,
     display_metric: Metric,
-    dist_fn: fn(&[T], &[T]) -> f32,
+    dist_fn: D,
     batched: bool,
     engine: &'static str,
     threads: usize,
@@ -2235,10 +2596,12 @@ fn execute_with_partitions<T>(
     elem_label: &str,
     ctx: &mut StreamContext,
     start: Instant,
-    compute_fn: PartitionComputeFn<T>,
+    compute_fn: PartitionComputeFn<T, Q, D>,
 ) -> CommandResult
 where
     T: Send + Sync + 'static,
+    Q: Sync,
+    D: Copy,
 {
     // Auto-size partition when partition_size == 0 (no governor segmentsize).
     // The partition determines how many base vectors are mmap-resident

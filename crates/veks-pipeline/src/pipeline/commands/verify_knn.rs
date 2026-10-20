@@ -11,7 +11,7 @@
 //! Uses the same optimized SIMD distance infrastructure and batched
 //! parallel processing pattern as `compute knn`.
 
-use crate::pipeline::element_type::ElementTypeExt;
+use crate::pipeline::element_type::{ElementTypeExt, WidenToF32};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
@@ -391,6 +391,50 @@ fn verify_f32(
     pb.finish();
 
     // Compare recomputed results against ground truth
+    compare_results_generic(&recomputed, &queries_data, base_offset, k, phi)
+}
+
+/// Verify sampled queries over a base of `T` that widens to f32 without
+/// a kernel of its own (bf16, the 8- and 16-bit integers): the base is
+/// scanned at its width and widened per vector by
+/// [`compute_knn::find_top_k_batch_widened`](super::compute_knn), the
+/// queries read as f32.
+#[allow(clippy::too_many_arguments)]
+fn verify_widened<T: WidenToF32>(
+    base_reader: &XvecReader<T>,
+    queries: &super::compute_knn::F32Queries,
+    indices_reader: &XvecReader<i32>,
+    sampled_indices: &[usize],
+    base_offset: usize,
+    base_end: usize,
+    k: usize,
+    metric: Metric,
+    phi: f32,
+    ui: &veks_core::ui::UiHandle,
+) -> Vec<QueryVerification> {
+    let dim = queries.dim;
+    let pb = ui.bar_with_unit(sampled_indices.len() as u64, "verify", "queries");
+    let queries_data: Vec<(usize, Vec<i32>)> = sampled_indices
+        .iter()
+        .map(|&qi| (qi, indices_reader.get(qi).unwrap_or_default()))
+        .collect();
+    let mut found: Vec<Vec<super::compute_knn::Neighbor>> = (0..sampled_indices.len()).map(|_| Vec::new()).collect();
+    let batched_fn = Some(simd_distance::select_batched_fn_f32(metric));
+    let dist_fn = simd_distance::select_distance_fn(metric);
+    let stride = (base_end - base_offset).max(1);
+    let progress = std::sync::atomic::AtomicU64::new(0);
+    for (batch, out) in sampled_indices.chunks(QUERY_BATCH_SIZE).zip(found.chunks_mut(QUERY_BATCH_SIZE)) {
+        let rows: Vec<&[f32]> = batch.iter().map(|&qi| queries.row(qi)).collect();
+        super::compute_knn::find_top_k_batch_widened(
+            &rows, base_reader, base_offset, base_end, k, dist_fn, batched_fn, metric, dim, out, stride, &progress,
+        );
+        pb.inc(batch.len() as u64);
+    }
+    pb.finish();
+    let recomputed: Vec<Vec<Neighbor>> = found
+        .into_iter()
+        .map(|row| row.into_iter().map(|n| Neighbor { index: n.index, distance: n.distance }).collect())
+        .collect();
     compare_results_generic(&recomputed, &queries_data, base_offset, k, phi)
 }
 
@@ -1062,11 +1106,39 @@ impl CommandOp for VerifyKnnOp {
                     &ctx.ui,
                 )
             }
+            // A type the table widens to f32 with no kernel of its own.
+            ElementType::BF16 | ElementType::U8 | ElementType::I8 | ElementType::U16 | ElementType::I16 => {
+                let queries = match super::compute_knn::F32Queries::read(&query_path) {
+                    Ok(q) => q,
+                    Err(e) => return error_result(format!("failed to open query {}: {}", query_path.display(), e), start),
+                };
+                macro_rules! widened {
+                    ($t:ty) => {{
+                        let base_reader = match XvecReader::<$t>::open_path(&base_path) {
+                            Ok(r) => r,
+                            Err(e) => return error_result(format!("failed to open base {}: {}", base_path.display(), e), start),
+                        };
+                        let file_count = <XvecReader<$t> as VectorReader<$t>>::count(&base_reader);
+                        let (base_offset, base_end) = base_source.effective_range(file_count);
+                        verify_widened(
+                            &base_reader, &queries, &indices_reader, &sampled, base_offset, base_end,
+                            k, metric, phi, &ctx.ui,
+                        )
+                    }};
+                }
+                match etype {
+                    ElementType::BF16 => widened!(half::bf16),
+                    ElementType::U8 => widened!(u8),
+                    ElementType::I8 => widened!(i8),
+                    ElementType::U16 => widened!(u16),
+                    _ => widened!(i16),
+                }
+            }
             _ => {
                 return error_result(
                     format!(
-                        "unsupported element type {:?} for verify knn (use fvec, mvec, or dvec)",
-                        etype
+                        "a base of {etype} elements is not exact as f32 or f64 here; verify knn-groundtruth reads \
+                         f32, f16 and f64 natively and widens bf16 and the 8- and 16-bit integers"
                     ),
                     start,
                 )
@@ -1182,7 +1254,7 @@ impl CommandOp for VerifyKnnOp {
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Base vectors file (fvec, mvec, or dvec)".to_string(),
+                description: "Base vectors file: f32, f16, f64, or bf16 / 8- and 16-bit integers (widened to f32)".to_string(),
                 extended_description: None,
                 role: OptionRole::Input,
             },
@@ -1191,7 +1263,7 @@ impl CommandOp for VerifyKnnOp {
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Query vectors file (fvec, mvec, or dvec)".to_string(),
+                description: "Query vectors file: the base's type, or any type that reads as f32 for a widened base".to_string(),
                 extended_description: None,
                 role: OptionRole::Input,
             },

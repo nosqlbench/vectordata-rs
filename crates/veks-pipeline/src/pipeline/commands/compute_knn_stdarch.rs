@@ -18,8 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use vectordata::VectorReader;
-use vectordata::io::XvecReader;
+use crate::pipeline::element_type::{ElementType, ElementTypeExt, reads_as_f32, widen_le_into};
 
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -131,10 +130,12 @@ fn buf_bytes_mut(buf: &mut [f32]) -> &mut [u8] {
 /// Scan one chunk of base vectors against a thread's query subset,
 /// updating the thread's persistent heaps/thresholds in place.
 ///
-/// `chunk_buf` is the full chunk's raw f32 storage (entries as laid
-/// out in the fvec file, including 4-byte dim headers). `n_vecs` is
-/// the number of base vectors actually present in this chunk; the
-/// buffer may be larger (capacity-sized).
+/// `chunk_buf` is the chunk's f32 storage: the raw entries of an f32
+/// file in place (each a one-f32 dim header then `dim` elements, so
+/// `stride = 1 + dim`, `header = 1`), or a narrower base already
+/// widened and packed (`stride = dim`, `header = 0`). `n_vecs` is the
+/// number of base vectors actually present in this chunk; the buffer
+/// may be larger (capacity-sized).
 ///
 /// `chunk_first_idx` is the absolute base-vector index of the
 /// chunk's first vector, used to tag `Neighbor` records with the
@@ -145,6 +146,7 @@ fn scan_chunk_f32(
     n_vecs: usize,
     chunk_first_idx: usize,
     dim: usize,
+    (stride_f32, header): (usize, usize),
     sub_batches: &[TransposedBatch],
     sub_offsets: &[usize],
     k: usize,
@@ -152,11 +154,10 @@ fn scan_chunk_f32(
     heaps: &mut [BinaryHeap<Neighbor>],
     thresholds: &mut [f32],
 ) {
-    let stride_f32 = 1 + dim; // header (1 f32) + payload (dim f32s)
     let mut dist_buf = [0.0f32; BATCH_WIDTH];
 
     for j in 0..n_vecs {
-        let payload_off = j * stride_f32 + 1;
+        let payload_off = j * stride_f32 + header;
         let base_vec: &[f32] = &chunk_buf[payload_off..payload_off + dim];
         let idx = (chunk_first_idx + j) as u32;
 
@@ -294,17 +295,31 @@ are ever mapped into the process.
             }
         }
 
-        // Open readers. The mmap readers are used for metadata (dim,
-        // count) and for query slices. The base vectors are streamed
-        // through a separate pread(2) path during compute so no base
-        // bytes ever enter the process address space — see the scanner
-        // module above for rationale.
-        let base_reader = match XvecReader::<f32>::open_path(&base_path) {
-            Ok(r) => Arc::new(r), Err(e) => return error_result(format!("open base: {}", e), start),
+        // Open readers. The readers are used for metadata (dim, count),
+        // the queries and the rerank, all as f32 through the conversion
+        // table. The base vectors are streamed through a separate
+        // pread(2) path during compute so no base bytes ever enter the
+        // process address space — see the scanner module above for
+        // rationale — and a base of a type narrower than f32 is widened
+        // per chunk as it lands.
+        let base_elem = match ElementType::from_path(&base_path) {
+            Ok(t) if reads_as_f32(t) => t,
+            Ok(t) => return error_result(
+                format!("open base: {t} elements are not exact as f32; knn-stdarch scans f32 and the types that widen to it"),
+                start,
+            ),
+            Err(e) => return error_result(format!("open base: {e}"), start),
         };
-        let query_reader = match XvecReader::<f32>::open_path(&query_path) {
-            Ok(r) => Arc::new(r), Err(e) => return error_result(format!("open query: {}", e), start),
+        let base_reader = match vectordata::io::open_vec_as::<f32>(&base_path.to_string_lossy()) {
+            Ok(r) => r, Err(e) => return error_result(format!("open base: {}", e), start),
         };
+        let query_reader = match vectordata::io::open_vec_as::<f32>(&query_path.to_string_lossy()) {
+            Ok(r) => r, Err(e) => return error_result(format!("open query: {}", e), start),
+        };
+        // Queries are few beside the base: read once as f32 rows.
+        let query_rows: Vec<Vec<f32>> = (0..query_reader.count())
+            .map(|i| query_reader.get(i).unwrap_or_default())
+            .collect();
         // File handle used exclusively for pread-based streaming.
         // Opened once and shared across all segment scans.
         let base_file = match File::open(&base_path) {
@@ -312,9 +327,9 @@ are ever mapped into the process.
             Err(e) => return error_result(format!("open base for streaming: {}", e), start),
         };
 
-        let base_count = VectorReader::<f32>::count(base_reader.as_ref());
-        let query_count = VectorReader::<f32>::count(query_reader.as_ref());
-        let dim = VectorReader::<f32>::dim(base_reader.as_ref());
+        let base_count = base_reader.count();
+        let query_count = query_reader.count();
+        let dim = base_reader.dim();
 
         // Resolve the effective base window from BOTH the inline path
         // syntax (`base.fvec[0..N]`) and the injected `range` option
@@ -557,11 +572,36 @@ are ever mapped into the process.
         // buffers (not mmap). Two buffers alternate: while compute
         // threads scan chunk N, an I/O task preads chunk N+1 into
         // the other buffer. The scope join is the chunk barrier.
-        let entry_size = 4 + dim * 4;
+        //
+        // An f32 base is scanned in place in the pread buffer. A
+        // narrower base is pread into a byte buffer and widened into
+        // a packed f32 buffer by the same task, so the widening
+        // overlaps the previous chunk's compute as the I/O does.
+        let entry_size = 4 + dim * base_elem.byte_width();
         let vecs_per_chunk = (STREAM_CHUNK_BYTES / entry_size).max(1);
         let chunk_byte_cap = vecs_per_chunk * entry_size;
-        let mut buf_a = alloc_chunk_buf(chunk_byte_cap);
-        let mut buf_b = alloc_chunk_buf(chunk_byte_cap);
+        let in_place = base_elem == ElementType::F32;
+        let layout = if in_place { (1 + dim, 1) } else { (dim, 0) };
+        let (mut buf_a, mut buf_b) = if in_place {
+            (alloc_chunk_buf(chunk_byte_cap), alloc_chunk_buf(chunk_byte_cap))
+        } else {
+            (vec![0.0f32; vecs_per_chunk * dim], vec![0.0f32; vecs_per_chunk * dim])
+        };
+        let raw_cap = if in_place { 0 } else { chunk_byte_cap };
+        let (mut raw_a, mut raw_b) = (vec![0u8; raw_cap], vec![0u8; raw_cap]);
+        // Fill `packed` with `n` base vectors from byte offset `off`.
+        let fill = move |file: &File, raw: &mut [u8], packed: &mut [f32], off: u64, n: usize| -> std::io::Result<()> {
+            let bytes = n * entry_size;
+            if in_place {
+                return pread_exact(file, &mut buf_bytes_mut(packed)[..bytes], off);
+            }
+            pread_exact(file, &mut raw[..bytes], off)?;
+            for j in 0..n {
+                widen_le_into(base_elem, &raw[j * entry_size + 4..(j + 1) * entry_size], &mut packed[j * dim..(j + 1) * dim])
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            }
+            Ok(())
+        };
 
         let mut computed_count = 0usize;
         for seg_idx in 0..n_segments {
@@ -602,7 +642,7 @@ are ever mapped into the process.
                 let q_end = (q_start + chunk_size).min(query_count);
                 let q_len = q_end - q_start;
                 let queries: Vec<&[f32]> = (0..q_len)
-                    .map(|i| query_reader.get_slice(q_start + i))
+                    .map(|i| query_rows[q_start + i].as_slice())
                     .collect();
                 let mut sub_batches: Vec<TransposedBatch> = Vec::new();
                 let mut sub_offsets: Vec<usize> = Vec::new();
@@ -636,11 +676,8 @@ are ever mapped into the process.
             // overlap with yet. After this, every subsequent chunk's
             // I/O overlaps with the previous chunk's compute.
             let (c0_first, c0_n) = chunk_range(0);
-            let c0_bytes = c0_n * entry_size;
             let c0_off = (c0_first as u64) * (entry_size as u64);
-            if let Err(e) = pread_exact(
-                &base_file, &mut buf_bytes_mut(&mut buf_a)[..c0_bytes], c0_off,
-            ) {
+            if let Err(e) = fill(&base_file, &mut raw_a, &mut buf_a, c0_off, c0_n) {
                 return error_result(
                     format!("pread seg {} chunk 0: {}", seg_idx, e),
                     start,
@@ -660,19 +697,17 @@ are ever mapped into the process.
                 } else {
                     chunk_range(chunk_i + 1)
                 };
-                let next_bytes = next_n * entry_size;
                 let next_off = (next_first as u64) * (entry_size as u64);
 
                 std::thread::scope(|scope| {
                     // I/O task: fill buf_b with the next chunk.
                     if !is_last {
                         let rb: &mut Vec<f32> = &mut buf_b;
+                        let raw: &mut Vec<u8> = &mut raw_b;
                         let bf = Arc::clone(&base_file);
                         let err_slot = Arc::clone(&io_err);
                         scope.spawn(move || {
-                            if let Err(e) = pread_exact(
-                                &bf, &mut buf_bytes_mut(rb)[..next_bytes], next_off,
-                            ) {
+                            if let Err(e) = fill(&bf, raw, rb, next_off, next_n) {
                                 *err_slot.lock().unwrap() =
                                     Some(format!("pread chunk@{}: {}", next_first, e));
                             }
@@ -688,7 +723,7 @@ are ever mapped into the process.
                         let thr_ref: &mut [f32] = &mut tc.thresholds;
                         scope.spawn(move || {
                             scan_chunk_f32(
-                                sb, cur_n, cur_first, dim,
+                                sb, cur_n, cur_first, dim, layout,
                                 subs_ref, offs_ref,
                                 internal_k, batch_fn,
                                 heaps_ref, thr_ref,
@@ -709,6 +744,7 @@ are ever mapped into the process.
 
                 if !is_last {
                     std::mem::swap(&mut buf_a, &mut buf_b);
+                    std::mem::swap(&mut raw_a, &mut raw_b);
                 }
                 compute_progress += cur_n as u64;
                 pb.set_position(compute_progress);
@@ -840,8 +876,8 @@ are ever mapped into the process.
         if let Err(e) = super::knn_segment::rerank_output_post_pass(
             indices_path.as_path(),
             distances_path.as_deref(),
-            base_reader.as_ref(),
-            query_reader.as_ref(),
+            &*base_reader,
+            &*query_reader,
             kernel_metric, k, base_offset,
             &ctx.ui,
         ) {
@@ -917,6 +953,8 @@ are ever mapped into the process.
 mod tests {
     use super::*;
     use crate::pipeline::command::{Options, Status};
+    use vectordata::VectorReader;
+    use vectordata::io::XvecReader;
 
     fn make_ctx(workspace: &std::path::Path) -> StreamContext {
         StreamContext {

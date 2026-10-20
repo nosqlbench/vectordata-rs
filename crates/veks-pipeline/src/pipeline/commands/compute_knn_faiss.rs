@@ -24,9 +24,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use faiss::Index;
-use vectordata::VectorReader;
-use vectordata::io::XvecReader;
-
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     ResourceDesc, Status, StreamContext, render_options_table,
@@ -181,9 +178,12 @@ Only f32 (fvec) inputs are supported.
             }
         }
 
-        // -- Read vectors via mmap ---------------------------------------
+        // -- Read vectors as f32 ----------------------------------------
+        // A base or query of any type that widens to f32 exactly (f16,
+        // bf16, the 8- and 16-bit integers) reads through the
+        // conversion table; FAISS takes the f32 buffer either way.
         ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
-        let base_reader = match XvecReader::<f32>::open_path(&base_path) {
+        let base_reader = match vectordata::io::open_vec_as::<f32>(&base_path.to_string_lossy()) {
             Ok(r) => r,
             Err(e) => return error_result(
                 format!("failed to open base {}: {}", base_path.display(), e),
@@ -191,7 +191,7 @@ Only f32 (fvec) inputs are supported.
             ),
         };
         ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
-        let query_reader = match XvecReader::<f32>::open_path(&query_path) {
+        let query_reader = match vectordata::io::open_vec_as::<f32>(&query_path.to_string_lossy()) {
             Ok(r) => r,
             Err(e) => return error_result(
                 format!("failed to open query {}: {}", query_path.display(), e),
@@ -199,10 +199,10 @@ Only f32 (fvec) inputs are supported.
             ),
         };
 
-        let base_count = <XvecReader<f32> as VectorReader<f32>>::count(&base_reader);
-        let query_count = <XvecReader<f32> as VectorReader<f32>>::count(&query_reader);
-        let base_dim = <XvecReader<f32> as VectorReader<f32>>::dim(&base_reader);
-        let query_dim = <XvecReader<f32> as VectorReader<f32>>::dim(&query_reader);
+        let base_count = base_reader.count();
+        let query_count = query_reader.count();
+        let base_dim = base_reader.dim();
+        let query_dim = query_reader.dim();
 
         // Apply window to base vectors
         let (base_offset, base_n) = match base_source.window {
@@ -234,9 +234,9 @@ Only f32 (fvec) inputs are supported.
         let t0 = Instant::now();
         ctx.ui.log(&format!("  loading {} base vectors ({:.1} MiB)...",
             base_n, (base_n * base_dim * 4) as f64 / 1_048_576.0));
-        let mut base_data: Vec<f32> = Vec::with_capacity(base_n * base_dim);
-        for i in 0..base_n {
-            base_data.extend_from_slice(base_reader.get_slice(base_offset + i));
+        let mut base_data: Vec<f32> = vec![0.0; base_n * base_dim];
+        if let Err(e) = base_reader.read_into(base_offset, &mut base_data) {
+            return error_result(format!("read base {}: {}", base_path.display(), e), start);
         }
         ctx.ui.log(&format!("  loaded in {:.1}s", t0.elapsed().as_secs_f64()));
 
@@ -255,9 +255,9 @@ Only f32 (fvec) inputs are supported.
 
         // -- Load query vectors ------------------------------------------
         ctx.ui.log(&format!("  loading {} query vectors...", query_count));
-        let mut query_data: Vec<f32> = Vec::with_capacity(query_count * query_dim);
-        for i in 0..query_count {
-            query_data.extend_from_slice(query_reader.get_slice(i));
+        let mut query_data: Vec<f32> = vec![0.0; query_count * query_dim];
+        if let Err(e) = query_reader.read_into(0, &mut query_data) {
+            return error_result(format!("read query {}: {}", query_path.display(), e), start);
         }
 
         // -- Open output files before search -----------------------------
@@ -370,8 +370,8 @@ Only f32 (fvec) inputs are supported.
             if let Err(e) = super::knn_segment::rerank_output_post_pass(
                 &indices_path,
                 distances_path.as_deref(),
-                &base_reader,
-                &query_reader,
+                &*base_reader,
+                &*query_reader,
                 m,
                 k,
                 base_offset,
@@ -410,7 +410,7 @@ Only f32 (fvec) inputs are supported.
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Base vectors file (fvec only)".to_string(),
+                description: "Base vectors file: f32, or any type that widens to f32 (f16, bf16, 8- and 16-bit integers)".to_string(),
                 extended_description: None,
                 role: OptionRole::Input,
             },

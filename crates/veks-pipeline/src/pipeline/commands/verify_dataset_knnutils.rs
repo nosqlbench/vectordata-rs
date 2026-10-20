@@ -778,7 +778,7 @@ checks, in a single pipeline step.
         // below — same pattern as `verify knn-consolidated`, no
         // AnyFloatReader hidden in a hot loop.
         let base_etype = match ElementType::from_path(&base_path) {
-            Ok(et @ (ElementType::F32 | ElementType::F16)) => et,
+            Ok(et) if crate::pipeline::element_type::reads_as_f32(et) => et,
             Ok(et) => return error_result(format!(
                 "verify dataset-knnutils: unsupported base element type {:?} for {}",
                 et, base_path.display(),
@@ -788,7 +788,7 @@ checks, in a single pipeline step.
             ), start),
         };
         let query_etype = match ElementType::from_path(&query_path) {
-            Ok(et @ (ElementType::F32 | ElementType::F16)) => et,
+            Ok(et) if crate::pipeline::element_type::reads_as_f32(et) => et,
             Ok(et) => return error_result(format!(
                 "verify dataset-knnutils: unsupported query element type {:?} for {}",
                 et, query_path.display(),
@@ -821,11 +821,7 @@ checks, in a single pipeline step.
         // assumes pre-normalized inputs and is computed as inner
         // product. `proper_cosine = false` keeps that contract.
         let proper_cosine = false;
-        let elem_size: usize = match base_etype {
-            ElementType::F32 => 4,
-            ElementType::F16 => 2,
-            _ => unreachable!("base_etype was filtered to F32/F16 above"),
-        };
+        let elem = base_etype;
 
         // Generate deterministic sample indices.
         let mut sample_indices: Vec<usize> = Vec::with_capacity(actual_sample);
@@ -841,27 +837,17 @@ checks, in a single pipeline step.
         // Pack sampled queries flat (one row per query, dim wide). The
         // streaming scan reuses this packed buffer on every chunk.
         let mut queries_packed: Vec<f32> = Vec::with_capacity(actual_sample * dim);
-        match query_etype {
-            ElementType::F32 => {
-                let r = match XvecReader::<f32>::open_path(&query_path) {
-                    Ok(r) => r,
-                    Err(e) => return error_result(format!("reopen query: {}", e), start),
-                };
-                for &qi in &sample_indices {
-                    queries_packed.extend_from_slice(r.get_slice(qi));
-                }
+        // Any type that reads as f32 through the conversion table.
+        let _ = query_etype;
+        let r = match vectordata::io::open_vec_as::<f32>(&query_path.to_string_lossy()) {
+            Ok(r) => r,
+            Err(e) => return error_result(format!("reopen query: {}", e), start),
+        };
+        for &qi in &sample_indices {
+            match r.get(qi) {
+                Ok(v) => queries_packed.extend_from_slice(&v),
+                Err(e) => return error_result(format!("read query {qi}: {e}"), start),
             }
-            ElementType::F16 => {
-                let r = match XvecReader::<half::f16>::open_path(&query_path) {
-                    Ok(r) => r,
-                    Err(e) => return error_result(format!("reopen query: {}", e), start),
-                };
-                for &qi in &sample_indices {
-                    let s = r.get_slice(qi);
-                    for v in s { queries_packed.push(v.to_f32()); }
-                }
-            }
-            _ => unreachable!("query_etype was filtered to F32/F16 above"),
         }
         let query_norms_sq: Vec<f32> = (0..actual_sample).map(|qi| {
             let s = &queries_packed[qi * dim..(qi + 1) * dim];
@@ -869,8 +855,8 @@ checks, in a single pipeline step.
         }).collect();
 
         emit(ctx, &format!(
-            "  Streaming sgemm scan over {} base vectors ({} sample queries, elem={}B)",
-            n_base, actual_sample, elem_size,
+            "  Streaming sgemm scan over {} base vectors ({} sample queries, elem={})",
+            n_base, actual_sample, elem,
         ));
         // See `compute_knn_blas`: a series reads as one byte space.
         let base_file = match veks_core::formats::portable_io::SpanFile::open(&base_path) {
@@ -904,7 +890,7 @@ checks, in a single pipeline step.
                 &base_file,
                 0..n_base,
                 dim,
-                elem_size,
+                elem,
                 &queries_packed,
                 actual_sample,
                 &query_norms_sq,

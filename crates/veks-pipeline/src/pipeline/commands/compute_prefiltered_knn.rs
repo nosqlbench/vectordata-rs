@@ -38,8 +38,8 @@
 //! This gives the same sequential I/O, bounded memory, and resumability
 //! characteristics as unfiltered KNN.
 
-use crate::pipeline::element_type::ElementTypeKnn;
-use crate::pipeline::element_type::ElementTypeExt;
+use crate::pipeline::element_type::{ElementTypeExt, WidenToF32};
+use super::compute_knn::F32Queries;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::io::{BufReader, Read as _, Write};
@@ -879,6 +879,75 @@ fn compute_partition_filtered_f16(
     results
 }
 
+/// Find top-K neighbors from a filtered set of base vector ordinals,
+/// over a base of `T` that widens to f32: each candidate is widened
+/// into `scratch` and scored by the f32 `dist_fn`.
+fn find_top_k_filtered_widened<T: WidenToF32>(
+    query: &[f32],
+    base_reader: &XvecReader<T>,
+    ordinals: &[i32],
+    k: usize,
+    dist_fn: fn(&[f32], &[f32]) -> f32,
+    scratch: &mut [f32],
+) -> Vec<Neighbor> {
+    let mut heap: BinaryHeap<Neighbor> = BinaryHeap::with_capacity(k + 1);
+    let mut threshold = f32::INFINITY;
+    let base_count = <XvecReader<T> as VectorReader<T>>::count(base_reader);
+
+    for &ord in ordinals {
+        let idx = ord as usize;
+        if idx >= base_count { continue; }
+        T::widen_into(base_reader.get_slice(idx), scratch);
+        let dist = dist_fn(query, scratch);
+        if dist < threshold {
+            heap.push(Neighbor { index: ord as u32, distance: dist });
+            if heap.len() > k { heap.pop(); }
+            if heap.len() == k { threshold = heap.peek().unwrap().distance; }
+        }
+    }
+
+    let mut result: Vec<Neighbor> = heap.into_vec();
+    result.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+    result
+}
+
+/// Compute filtered KNN for a single base-vector partition `[start, end)`
+/// of a base of `T` that widens to f32, with queries read as f32.
+#[allow(clippy::too_many_arguments)]
+fn compute_partition_filtered_widened<T: WidenToF32>(
+    query_reader: &F32Queries,
+    query_count: usize,
+    base_reader: &Arc<XvecReader<T>>,
+    keys_reader: &PredicateIndices,
+    start: usize,
+    end: usize,
+    k: usize,
+    dist_fn: fn(&[f32], &[f32]) -> f32,
+    threads: usize,
+    pb: &ProgressHandle,
+) -> Vec<Vec<Neighbor>> {
+    let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
+    let dim = query_reader.dim;
+    let chunk_size = query_count.div_ceil(threads.clamp(1, query_count.max(1))).max(1);
+    std::thread::scope(|scope| {
+        for (ci, chunk) in results.chunks_mut(chunk_size).enumerate() {
+            let base_ref = Arc::clone(base_reader);
+            scope.spawn(move || {
+                let mut scratch = vec![0.0f32; dim];
+                for (qi, slot) in chunk.iter_mut().enumerate() {
+                    let global_qi = ci * chunk_size + qi;
+                    let filtered: Vec<i32> = keys_reader.ordinals_in_range(global_qi, start, end).unwrap_or_default();
+                    *slot = find_top_k_filtered_widened(
+                        query_reader.row(global_qi), &base_ref, &filtered, k, dist_fn, &mut scratch,
+                    );
+                    pb.inc(1);
+                }
+            });
+        }
+    });
+    results
+}
+
 // -- Element type detection ---------------------------------------------------
 
 use crate::pipeline::element_type::ElementType;
@@ -1082,15 +1151,26 @@ use the E facet produced by `compute postfiltered-knn`.
             Err(e) => return error_result(e, start),
         };
         match etype {
-            // F32 — and anything without SIMD support — takes the
-            // generic f32 kernel.
-            _ if !etype.supports_simd_distance() => {
+            // A type the table widens to f32, with no kernel of its own:
+            // scanned at its width, scored by the f32 kernel.
+            ElementType::BF16 | ElementType::U8 | ElementType::I8 | ElementType::U16 | ElementType::I16 => {
                 let dist_fn = simd_distance::select_distance_fn(metric);
-                execute_f32(
-                    &base_path, &query_path, &keys_reader, &indices_path,
-                    distances_path.as_deref(), k, metric, dist_fn, threads,
-                    partition_size, &step_id, base_window, compress_cache, ctx, start,
-                )
+                macro_rules! widened {
+                    ($t:ty) => {
+                        execute_widened::<$t>(
+                            &base_path, &query_path, &keys_reader, &indices_path,
+                            distances_path.as_deref(), k, metric, dist_fn, threads,
+                            partition_size, &step_id, base_window, compress_cache, ctx, start,
+                        )
+                    };
+                }
+                match etype {
+                    ElementType::BF16 => widened!(half::bf16),
+                    ElementType::U8 => widened!(u8),
+                    ElementType::I8 => widened!(i8),
+                    ElementType::U16 => widened!(u16),
+                    _ => widened!(i16),
+                }
             }
             ElementType::F16 => {
                 let dist_fn = simd_distance::select_distance_fn_f16(metric);
@@ -1108,7 +1188,7 @@ use the E facet produced by `compute postfiltered-knn`.
                     partition_size, &step_id, base_window, compress_cache, ctx, start,
                 )
             }
-            _ => {
+            ElementType::F32 => {
                 let dist_fn = simd_distance::select_distance_fn(metric);
                 execute_f32(
                     &base_path, &query_path, &keys_reader, &indices_path,
@@ -1116,13 +1196,22 @@ use the E facet produced by `compute postfiltered-knn`.
                     partition_size, &step_id, base_window, compress_cache, ctx, start,
                 )
             }
+            // A type no f32 kernel takes losslessly (the 32- and 64-bit
+            // integers): refused, naming the type, rather than rounded.
+            other => error_result(
+                format!(
+                    "a base of {other} elements is not exact as f32; compute prefiltered-knn scores f32, f16 and f64 \
+                     natively and widens bf16 and the 8- and 16-bit integers"
+                ),
+                start,
+            ),
         }
     }
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("base", "Path", true, None, "Base vectors file (fvec or mvec)", OptionRole::Input),
-            opt("query", "Path", true, None, "Query vectors file (fvec or mvec)", OptionRole::Input),
+            opt("base", "Path", true, None, "Base vectors file: f32, f16, f64, or bf16 / 8- and 16-bit integers (widened to f32)", OptionRole::Input),
+            opt("query", "Path", true, None, "Query vectors file: the base's type, or any type that reads as f32 for a widened base", OptionRole::Input),
             opt("metadata-indices", "Path", true, None, "Metadata-indices slab from compute predicates", OptionRole::Input),
             opt("indices", "Path", true, None, "Output neighbor indices (ivec)", OptionRole::Output),
             opt("distances", "Path", false, None, "Output neighbor distances (fvec)", OptionRole::Output),
@@ -1273,6 +1362,74 @@ fn execute_f16(
     )
 }
 
+// -- Execute (widened) --------------------------------------------------------
+
+/// Execute filtered KNN over a base of `T` that widens to f32 without a
+/// kernel of its own (bf16, the 8- and 16-bit integers): scanned at its
+/// own width, scored by the f32 kernels, with the queries read as f32.
+#[allow(clippy::too_many_arguments)]
+fn execute_widened<T: WidenToF32>(
+    base_path: &Path,
+    query_path: &Path,
+    keys_reader: &PredicateIndices,
+    indices_path: &Path,
+    distances_path: Option<&Path>,
+    k: usize,
+    metric: Metric,
+    dist_fn: fn(&[f32], &[f32]) -> f32,
+    threads: usize,
+    partition_size: usize,
+    step_id: &str,
+    base_window: Option<(usize, usize)>,
+    compress_cache: bool,
+    ctx: &mut StreamContext,
+    start: Instant,
+) -> CommandResult {
+    ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
+    let base_reader = match XvecReader::<T>::open_path(base_path) {
+        Ok(r) => Arc::new(r),
+        Err(e) => return error_result(format!("open base: {}", e), start),
+    };
+    ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
+    let query_reader = match F32Queries::read(query_path) {
+        Ok(r) => r,
+        Err(e) => return error_result(format!("open query: {}", e), start),
+    };
+
+    let file_count = <XvecReader<T> as VectorReader<T>>::count(&*base_reader);
+    let query_count = query_reader.count;
+    let keys_count = keys_reader.count();
+    let actual_count = query_count.min(keys_count);
+
+    // Apply window to base vectors
+    let (base_offset, base_count) = match base_window {
+        Some((ws, we)) => {
+            let ws = ws.min(file_count);
+            let we = we.min(file_count);
+            (ws, we.saturating_sub(ws))
+        }
+        None => (0, file_count),
+    };
+
+    let base_bytes = base_count as u64 * base_reader.entry_size() as u64;
+    ctx.ui.log(&format!(
+        "filtered KNN: {} queries x {} base vectors ({}), k={}, metric={:?}, threads={}",
+        format_count(actual_count), format_count(base_count), T::TYPE.name(), k, metric, threads,
+    ));
+    ctx.ui.log(&format!(
+        "  base: {} ({})  keys: {} records",
+        base_path.file_name().unwrap_or_default().to_string_lossy(),
+        format_bytes(base_bytes),
+        format_count(keys_count),
+    ));
+
+    execute_with_partitions(
+        &query_reader, &base_reader, keys_reader, base_offset, base_count, actual_count,
+        indices_path, distances_path, k, metric, dist_fn, threads, partition_size,
+        step_id, compress_cache, ctx, start, compute_partition_filtered_widened::<T>,
+    )
+}
+
 /// Execute filtered KNN using f64 vectors.
 #[allow(clippy::too_many_arguments)]
 fn execute_f64(
@@ -1348,14 +1505,18 @@ fn execute_f64(
 /// partition: `(query_reader, query_count, base_reader, keys_reader,
 /// base_offset, base_count, k, dist_fn, threads, progress) ->
 /// per-query neighbors`.
-type PartitionComputeFn<T> = fn(
-    &XvecReader<T>, usize, &Arc<XvecReader<T>>, &PredicateIndices,
-    usize, usize, usize, fn(&[T], &[T]) -> f32, usize, &ProgressHandle,
+///
+/// `Q` holds the queries (the base's own reader, or the queries read
+/// as f32 for a widened base) and `D` is the distance function, over
+/// `T` or over f32.
+type PartitionComputeFn<T, Q, D> = fn(
+    &Q, usize, &Arc<XvecReader<T>>, &PredicateIndices,
+    usize, usize, usize, D, usize, &ProgressHandle,
 ) -> Vec<Vec<Neighbor>>;
 
 #[allow(clippy::too_many_arguments)]
-fn execute_with_partitions<T: Send + Sync + 'static>(
-    query_reader: &XvecReader<T>,
+fn execute_with_partitions<T: Send + Sync + 'static, Q: Sync, D: Copy>(
+    query_reader: &Q,
     base_reader: &Arc<XvecReader<T>>,
     keys_reader: &PredicateIndices,
     base_offset: usize,
@@ -1365,14 +1526,14 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     distances_path: Option<&Path>,
     k: usize,
     metric: Metric,
-    dist_fn: fn(&[T], &[T]) -> f32,
+    dist_fn: D,
     threads: usize,
     partition_size: usize,
     step_id: &str,
     compress_cache: bool,
     ctx: &mut StreamContext,
     start: Instant,
-    compute_fn: PartitionComputeFn<T>,
+    compute_fn: PartitionComputeFn<T, Q, D>,
 ) -> CommandResult {
     // Single-partition fast path
     if base_count <= partition_size {
@@ -1815,6 +1976,92 @@ mod tests {
         }
         writer.finish().unwrap();
         path
+    }
+
+    /// Write `vectors` as an xvec of `T` (values chosen exact in every
+    /// widened type), under the canonical extension of `T`.
+    fn write_typed<T: crate::pipeline::element_type::Element>(dir: &std::path::Path, name: &str, vectors: &[Vec<f32>]) -> std::path::PathBuf {
+        use veks_datatypes::{Container, Value};
+        let path = dir.join(format!("{name}.{}", T::TYPE.extension(Container::Vec)));
+        let mut bytes = Vec::new();
+        let mut elem = vec![0u8; T::SIZE];
+        for v in vectors {
+            bytes.extend_from_slice(&(v.len() as i32).to_le_bytes());
+            for &x in v {
+                let value = if T::TYPE.is_integer() { Value::Int(x as i128) } else { Value::Float(x as f64) };
+                T::from_value(value).expect("exact in every widened type").write_le_bytes(&mut elem);
+                bytes.extend_from_slice(&elem);
+            }
+        }
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// Run prefiltered KNN and return its indices rows.
+    fn prefiltered_rows(ws: &std::path::Path, base: &std::path::Path, query: &std::path::Path, keys: &std::path::Path, partition: usize, tag: &str) -> Vec<Vec<i32>> {
+        let mut ctx = test_ctx(ws);
+        let indices_path = ws.join(format!("indices_{tag}.ivecs"));
+        let mut opts = Options::new();
+        opts.set("base", base.to_string_lossy().to_string());
+        opts.set("query", query.to_string_lossy().to_string());
+        opts.set("metadata-indices", keys.to_string_lossy().to_string());
+        opts.set("indices", indices_path.to_string_lossy().to_string());
+        opts.set("neighbors", "3".to_string());
+        opts.set("metric", "L2".to_string());
+        opts.set("partition_size", partition.to_string());
+        let result = ComputePrefilteredKnnOp.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Ok, "{tag}: {}", result.message);
+        let r = XvecReader::<i32>::open_path(&indices_path).unwrap();
+        (0..<XvecReader<i32> as VectorReader<i32>>::count(&r)).map(|i| r.get_slice(i).to_vec()).collect()
+    }
+
+    /// **A bf16 and a u8 base answer as the f32 base does** (SRD element
+    /// access §10): the same vectors, written at each type, filtered by
+    /// the same predicate results, give the same neighbors — in one
+    /// partition and across several — with the queries read as f32.
+    #[test]
+    fn a_bf16_and_a_u8_base_filter_to_the_f32_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let dim = 4;
+        let vectors: Vec<Vec<f32>> = (0..24).map(|i| (0..dim).map(|d| ((i * 7 + d * 3) % 32) as f32).collect()).collect();
+        let queries: Vec<Vec<f32>> = (0..4).map(|q| (0..dim).map(|d| ((q * 5 + d) % 32) as f32).collect()).collect();
+        let query = write_typed::<f32>(ws, "query", &queries);
+        let keys = create_keys_slab(ws, "keys.slab", &[
+            (0..24).step_by(2).collect(), (1..24).step_by(3).collect(), (0..24).collect(), vec![5, 17],
+        ]);
+        let base_f32 = write_typed::<f32>(ws, "base", &vectors);
+        for partition in [1_000_000, 7] {
+            let want = prefiltered_rows(ws, &base_f32, &query, &keys, partition, &format!("f32_{partition}"));
+            for (ty, base) in [
+                ("bf16", write_typed::<half::bf16>(ws, "base", &vectors)),
+                ("u8", write_typed::<u8>(ws, "base", &vectors)),
+            ] {
+                let got = prefiltered_rows(ws, &base, &query, &keys, partition, &format!("{ty}_{partition}"));
+                assert_eq!(got, want, "{ty} base, partition {partition}");
+            }
+        }
+    }
+
+    /// **A base no f32 kernel takes exactly is refused by name**, not
+    /// rounded: an i32 base names its type.
+    #[test]
+    fn an_i32_base_is_refused_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let base = write_typed::<i32>(ws, "base", &[vec![1.0, 2.0]]);
+        let query = write_typed::<f32>(ws, "query", &[vec![1.0, 2.0]]);
+        let keys = create_keys_slab(ws, "keys.slab", &[vec![0]]);
+        let mut ctx = test_ctx(ws);
+        let mut opts = Options::new();
+        opts.set("base", base.to_string_lossy().to_string());
+        opts.set("query", query.to_string_lossy().to_string());
+        opts.set("metadata-indices", keys.to_string_lossy().to_string());
+        opts.set("indices", ws.join("i.ivecs").to_string_lossy().to_string());
+        opts.set("neighbors", "1".to_string());
+        let result = ComputePrefilteredKnnOp.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Error);
+        assert!(result.message.contains("i32"), "{}", result.message);
     }
 
     #[test]
