@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+## 4.0.2 — 2026-10-20
+
+The `datasets` commands read a dataset however it is named — by
+catalog name, directory, `dataset.yaml` or URL — and a program that
+embeds them can hand them its own catalogs.
+
+### Highlights
+
+- **`datasets describe` takes a path or URL**, as `precache` does: a
+  directory, a `dataset.yaml` or a URL, each with an optional
+  `:profile` selector. Catalogs are read only for a name.
+  `describe::run_via_catalog` takes such a head too.
+- **`--at` names a catalog.** Each value, in order, is a URL or an
+  existing path; else a configured catalog's number; else the name of
+  a configured or program catalog; else a location. `--at fvec --at
+  /mnt/stage` reads the program's `fvec` catalog and the directory and
+  nothing from `catalogs.yaml`. `describe --at` and `ping --at` repeat
+  like the other commands'. `datasets::at_sources` and
+  `CatalogSources::named` are the pieces.
+- **`datasets::list::run_via_catalog`** lists a catalog the caller
+  already assembled, in every output format, with filters and
+  `--select`.
+
+### Fixes
+
+- **A name two catalogs hold is ambiguous**, not missing. `describe`
+  and `ping` reported it as not found in any catalog; they now list
+  each catalog that holds it and say to choose one with `--at`.
+  `cache status` says why it prints no profile summary for one.
+- **`describe` counts a series' files.** A uniform `__NNNN` series
+  printed `shards 1` with its pattern as the one file; it now prints
+  the expanded count, the pattern once and every file.
+- **`list --select` returns its exit code** instead of ending the
+  process, so a program calling it keeps running. The CLI's exit
+  status is unchanged.
+
+## 4.0.1 — 2026-10-20
+
+### Highlights
+
+- **`DistanceFunction`** (in `veks-datatypes`, re-exported as
+  `vectordata::DistanceFunction`): L2, Cosine, DotProduct, L1,
+  Hamming, Jaccard, with one table of spellings — `euclidean`, `cos`,
+  `angular`, `ip`, `inner_product`, `mips`, `manhattan`, `taxicab`
+  and the rest, case-insensitive, `-` or space as `_`. `distance()` on
+  `TestDataView`, `DatasetConfig` and `DatasetAttributes` returns it,
+  `None` when undeclared or unrecognised. `veks_simd::Metric` and
+  every pipeline metric option parse through it.
+- **`shell::bin_main_with_catalogs(invoked, argv, catalogs)`** runs
+  the embedded `vectordata` CLI over its program's catalogs: `datasets
+  list`, `describe`, `ping`, `precache`, `derive` and `explore` see
+  them after the configured ones and before `--catalog`'s; `--at`
+  replaces them all. `CatalogSources::extend` appends one set to
+  another.
+- **`TestDataGroup::name()`** returns the dataset's cache identity:
+  the catalog entry's name, a directory's last segment, or
+  `from_config`'s name; `None` at a server's root.
+
+### Fixes
+
+- **`veks prepare --metric angular`** emitted KNN steps without the
+  cosine strategy they require; every spelling of cosine now gets it.
+- **Publishing 4.0.0 failed**: `veks` and `veks-core` pinned
+  `veks-datatypes = "=3.0.4"` as a dev-dependency, which the version
+  bump did not rewrite. The dev-dependencies are path-only.
+- The 4.0.0 deprecations carry `since = "4.0.0"`, and the rustdoc
+  examples and sysref call the `*_as` forms; doctests in `vectordata`,
+  `veks-io` and `veks-datatypes` deny deprecated items.
+
+## 4.0.0 — 2026-10-20
+
 One element model for the workspace, and a typed facet access API on
 it. A new leaf crate, `veks-datatypes`, holds the twelve element
 types (`bf16` is new), the one extension table, the `Element` trait
