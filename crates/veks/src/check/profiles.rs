@@ -304,13 +304,14 @@ fn check_layers(
     }
 }
 
-/// EA-33: a ground truth has one row per query, its distances have one
-/// row per row of indices, and every index names a base vector — or,
-/// in a filtered truth, is the `-1` sentinel of a row shorter than K:
-/// a pre-filtered row when fewer than K base vectors pass the
-/// predicate, a post-filtered row whenever the intersection is short.
-/// The plain truth ranks every base vector and never holds one. The
-/// last check needs every index read, so the scan reports progress.
+/// EA-33: a profile's facets belong together — vectordata's
+/// verification (`TestDataViewExt::verify_report`, V1–V7): a ground
+/// truth has one row per query, its distances one row per row of
+/// indices and its width, every index names a base vector or, in a
+/// filtered truth, is the `-1` sentinel of a short row; the queries
+/// have the base's dimension; a declared base count is the base's.
+/// Facets not written yet are skipped, as a dataset being built has
+/// them. The index scan reports progress.
 fn check_ground_truth(
     config: &vectordata::dataset::DatasetConfig,
     ds_dir: &Path,
@@ -318,102 +319,30 @@ fn check_ground_truth(
     failures: &mut Vec<String>,
     sink: &mut dyn super::progress::ScanSink,
 ) {
-    let group = &config.profiles;
-    let relpath = |v: &vectordata::dataset::DSView| -> String {
-        vectordata::dataset::catalog::strip_window_suffix(&v.source.path)
-            .trim_start_matches("./")
-            .to_string()
+    use vectordata::TestDataViewExt;
+    let group = match vectordata::TestDataGroup::load(&ds_dir.to_string_lossy()) {
+        Ok(g) => g,
+        Err(e) => {
+            failures.push(format!("{ds_rel}: cannot open the dataset to verify its facets: {e} (EA-33)"));
+            return;
+        }
     };
-    let local = |rel: &str| -> Option<PathBuf> {
-        let path = ds_dir.join(rel);
-        (path.exists() && !rel.contains("NNNN")).then_some(path)
-    };
-    let count_of = |path: &Path| vectordata::io::open_vec_native(&path.to_string_lossy()).ok().map(|r| r.count());
-    const PAIRS: [(&str, &str, bool); 3] = [
-        ("neighbor_indices", "neighbor_distances", false),
-        ("prefiltered_neighbor_indices", "prefiltered_neighbor_distances", true),
-        ("postfiltered_neighbor_indices", "postfiltered_neighbor_distances", true),
-    ];
-    for name in group.profiles.keys() {
-        if group.layered && group.is_layer(name) {
+    let options = vectordata::verify::VerifyOptions { skip_absent: true, ..Default::default() };
+    for name in config.profiles.profiles.keys() {
+        if config.profiles.layered && config.profiles.is_layer(name) {
             continue;
         }
-        let facet_count = |key: &str| group.effective_view(name, key).map(relpath).and_then(|r| local(&r)).and_then(|p| count_of(&p));
-        let base_count = facet_count("base_vectors");
-        let query_count = facet_count("query_vectors");
-        for (idx_key, dist_key, sparse) in PAIRS {
-            let Some(view) = group.effective_view(name, idx_key) else { continue };
-            let rel = relpath(view);
-            let Some(path) = local(&rel) else { continue };
-            // Any integer type reads as i64; a u64 index is checked value
-            // by value, and one above i64::MAX surfaces as a read error
-            // the scan reports below rather than swallows.
-            let ids = match vectordata::io::open_vec_as::<i64>(&path.to_string_lossy()) {
-                Ok(r) => r,
-                Err(e) => {
-                    failures.push(format!("{ds_rel}: profile '{name}' {idx_key} {rel}: {e} (EA-33)"));
-                    continue;
-                }
-            };
-            let rows = ids.count();
-            if let Some(q) = query_count
-                && rows != q
-            {
-                failures.push(format!(
-                    "{ds_rel}: profile '{name}' {idx_key} {rel} holds {rows} rows for {q} queries (EA-33)"
-                ));
-            }
-            if let Some(dview) = group.effective_view(name, dist_key)
-                && let drel = relpath(dview)
-                && let Some(dpath) = local(&drel)
-                && let Some(drows) = count_of(&dpath)
-                && drows != rows
-            {
-                failures.push(format!(
-                    "{ds_rel}: profile '{name}' {dist_key} {drel} holds {drows} rows for the {rows} rows of \
-                     {idx_key} (EA-33)"
-                ));
-            }
-            let Some(base) = base_count else { continue };
-            let dim = ids.dim();
-            if dim == 0 || rows == 0 {
-                continue;
-            }
-            let label = format!("{ds_rel}: scanning {idx_key} of profile '{name}'");
-            let per_block = ((1usize << 16) / dim).max(1);
-            let mut block = vec![0i64; per_block * dim];
-            let mut done = 0usize;
-            sink.report(&label, 0, rows as u64);
-            while done < rows {
-                let got = match ids.read_into(done, &mut block) {
-                    Ok(0) => break,
-                    // A value the conversion to i64 refuses, or a short
-                    // read, is a failure of the facet, not an end of it.
-                    Err(e) => {
-                        failures.push(format!("{ds_rel}: profile '{name}' {idx_key} {rel}: {e} (EA-33)"));
-                        break;
-                    }
-                    Ok(n) => n,
-                };
-                let bad = block[..got * dim]
-                    .iter()
-                    .position(|&id| !((0..base as i64).contains(&id) || (sparse && id == -1)));
-                if let Some(k) = bad {
-                    let id = block[k];
-                    failures.push(format!(
-                        "{ds_rel}: profile '{name}' {idx_key} {rel} row {} column {} holds {id}, which names no \
-                         base vector of {base} base vectors{} (EA-33)",
-                        done + k / dim,
-                        k % dim,
-                        if sparse { "" } else { "; only a filtered truth may hold the -1 sentinel" }
-                    ));
-                    done += k / dim + 1;
-                    break;
-                }
-                done += got;
-                sink.report(&label, done as u64, rows as u64);
-            }
-            sink.report(&label, done.min(rows) as u64, rows as u64);
+        let Some(view) = group.profile(name) else { continue };
+        let mut progress = |label: &str, done: u64, total: u64| {
+            sink.report(&format!("{ds_rel}: {label} of profile '{name}'"), done, total)
+        };
+        for mut failure in view.verify_report(&options, &mut progress).failures {
+            // Named as the dataset names it: relative to its directory.
+            failure.file = failure.file.map(|f| match Path::new(&f).strip_prefix(ds_dir) {
+                Ok(rel) => rel.to_string_lossy().into_owned(),
+                Err(_) => f,
+            });
+            failures.push(format!("{ds_rel}: profile '{name}' {failure} (EA-33)"));
         }
     }
 }
@@ -655,6 +584,25 @@ mod tests {
         assert!(!r.passed, "{:?}", r.messages);
         assert!(
             r.messages.iter().any(|m| m.contains("neighbor_indices") && m.contains("row 1") && m.contains("10") && m.contains("base vectors")),
+            "{:?}", r.messages
+        );
+    }
+
+    /// **Queries of another dimension than the base are reported**
+    /// (V2): the check is vectordata's verification, which proves the
+    /// facets belong together, not only the ground truth's shape.
+    #[test]
+    fn queries_of_another_dimension_than_the_base_are_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = ground_truth_files(tmp.path(), 10, 3, 3, 4, 3, "neighbor_indices", "neighbor_distances",
+            |r, c| ((r + c) % 10) as i32);
+        let queries: Vec<u8> = (0..3).flat_map(|i| [3i32.to_le_bytes(), (i as f32).to_le_bytes(), 0f32.to_le_bytes(), 1f32.to_le_bytes()].concat()).collect();
+        std::fs::write(tmp.path().join("query_vectors.fvecs"), queries).unwrap();
+        let p = dataset(tmp.path(), &yaml);
+        let r = check(&[p]);
+        assert!(!r.passed, "{:?}", r.messages);
+        assert!(
+            r.messages.iter().any(|m| m.contains("query_vectors") && m.contains("has dimension 3; the base has 2")),
             "{:?}", r.messages
         );
     }

@@ -648,6 +648,12 @@ pub trait TestDataView: Send + Sync {
         None
     }
 
+    /// The dataset's name in the cache (`<cache_root>/<name>/`), when
+    /// it has one there.
+    fn cache_name(&self) -> Option<String> {
+        None
+    }
+
     /// The `quantization` attribute, when the profile or the dataset
     /// declares one: how the codes in `base_vectors` relate to the
     /// vectors they stand for. The profile's wins over the dataset's.
@@ -1523,6 +1529,82 @@ pub trait TestDataViewExt: TestDataView {
     /// ```
     fn quantized_base<C: Element>(&self) -> Result<QuantizedBase<C>> {
         QuantizedBase::open(self)
+    }
+
+    /// Whether the base is unit length, and on whose word: the declared
+    /// `is_normalized` (the dataset's or an overlay's) checked against a 1000-vector sample, or the sample
+    /// alone when nothing declares it ([`crate::verify::normalization`]).
+    /// The sample of a remote base is recorded by its content identity
+    /// and never re-taken; it fetches the chunks it touches when the
+    /// base is not here yet.
+    ///
+    /// ```
+    /// use vectordata::overlay::AttributeSource;
+    /// use vectordata::{TestDataGroup, TestDataViewExt};
+    /// # use std::io::Write;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let mut f = std::fs::File::create(dir.path().join("base.fvecs")).unwrap();
+    /// # for i in 0..10 { let a = i as f32 * 0.3; f.write_all(&2i32.to_le_bytes()).unwrap(); for x in [a.cos(), a.sin()] { f.write_all(&x.to_le_bytes()).unwrap(); } }
+    /// # std::fs::write(dir.path().join("dataset.yaml"), "name: n\nprofiles:\n  default:\n    base_vectors: base.fvecs\n").unwrap();
+    /// let view = TestDataGroup::load(dir.path().to_str().unwrap()).unwrap().profile("default").unwrap();
+    /// let n = view.normalization().unwrap();
+    /// assert!(n.value && !n.contradicted);
+    /// assert!(matches!(n.source, AttributeSource::Measured { .. }), "nothing declares it: the sample says");
+    /// assert_eq!(n.measured.sample, 10);
+    /// ```
+    fn normalization(&self) -> Result<crate::verify::Normalization> {
+        crate::verify::normalization(self)
+    }
+
+    /// Verify that the profile's facets belong together: the checks of
+    /// [`crate::verify`] (V1–V7), every failure listed. A profile that
+    /// passes is [`Ok`] with what was checked; one that does not is
+    /// [`Error::Verification`] naming each
+    /// check, what it found and the file. V5 reads every ground-truth
+    /// index and reports its progress to `progress`.
+    ///
+    /// ```
+    /// use vectordata::verify::{Check, NoProgress};
+    /// use vectordata::{TestDataGroup, TestDataViewExt};
+    /// # use std::io::Write;
+    /// # fn rows<T: Copy>(path: &std::path::Path, rows: &[&[T]], bytes: fn(T) -> Vec<u8>) {
+    /// #     let mut f = std::fs::File::create(path).unwrap();
+    /// #     for r in rows { f.write_all(&(r.len() as i32).to_le_bytes()).unwrap(); for &v in *r { f.write_all(&bytes(v)).unwrap(); } }
+    /// # }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # rows::<f32>(&dir.path().join("base.fvecs"), &[&[0.0, 1.0], &[1.0, 0.0], &[1.0, 1.0]], |v| v.to_le_bytes().to_vec());
+    /// # rows::<f32>(&dir.path().join("query.fvecs"), &[&[0.0, 0.9], &[0.9, 0.0]], |v| v.to_le_bytes().to_vec());
+    /// # rows::<i32>(&dir.path().join("good.ivecs"), &[&[0, 2], &[1, 2]], |v| v.to_le_bytes().to_vec());
+    /// # rows::<i32>(&dir.path().join("bad.ivecs"), &[&[0, 2], &[1, 3]], |v| v.to_le_bytes().to_vec());
+    /// # std::fs::write(dir.path().join("dataset.yaml"), "name: v\nprofiles:\n  default:\n    base_vectors: base.fvecs\n    query_vectors: query.fvecs\n    neighbor_indices: good.ivecs\n  stale:\n    base_vectors: base.fvecs\n    query_vectors: query.fvecs\n    neighbor_indices: bad.ivecs\n")?;
+    /// let group = TestDataGroup::load(dir.path().to_str().unwrap())?;
+    /// let good = group.profile("default").unwrap().verify(&mut NoProgress)?;
+    /// assert!(good.checked.contains(&Check::V5TruthIndices));
+    ///
+    /// // Index 3 names no vector of a 3-vector base: this truth was not computed against it.
+    /// let err = group.profile("stale").unwrap().verify(&mut NoProgress).unwrap_err();
+    /// assert!(err.to_string().contains("V5 neighbor_indices"), "{err}");
+    /// assert!(err.to_string().contains("row 1 column 1 holds 3, which names no base vector of 3 base vectors"), "{err}");
+    /// # Ok(()) }
+    /// ```
+    fn verify(&self, progress: &mut dyn crate::verify::VerifyProgress) -> Result<crate::verify::VerifyReport> {
+        let report = self.verify_report(&crate::verify::VerifyOptions::default(), progress);
+        if report.passed() {
+            Ok(report)
+        } else {
+            Err(crate::Error::Verification { failures: report.failures })
+        }
+    }
+
+    /// [`verify`](Self::verify) as a report, failures and all, never an
+    /// error: for a caller that lists every problem (`veks check`).
+    fn verify_report(
+        &self,
+        options: &crate::verify::VerifyOptions,
+        progress: &mut dyn crate::verify::VerifyProgress,
+    ) -> crate::verify::VerifyReport {
+        crate::verify::verify_view(self, options, progress)
     }
 }
 
@@ -4270,6 +4352,10 @@ impl TestDataView for GenericTestDataView {
             Some(source) => Some(source.clone()),
             None => self.attributes.contains_key(key).then_some(crate::overlay::AttributeSource::Dataset),
         }
+    }
+
+    fn cache_name(&self) -> Option<String> {
+        self.dataset_name.clone()
     }
 
     fn distance_function(&self) -> Option<String> {

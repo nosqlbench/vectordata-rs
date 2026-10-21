@@ -151,7 +151,7 @@ fn local_dataset(root: &Path, name: &str) {
 }
 
 /// **An overlay's count that the base contradicts is a warning, once,
-/// and stays in force** (OV-5).
+/// and stays in force** (OV-5); verification reports it as V7.
 #[test]
 fn a_contradicted_overlay_count_warns_once_and_stays_in_force() {
     capture();
@@ -169,6 +169,8 @@ fn a_contradicted_overlay_count_warns_once_and_stays_in_force() {
     assert_eq!(warned.len(), 1, "{warned:?}");
     assert!(warned[0].contains("states base_count: 12") && warned[0].contains("base_vectors holding 10") && warned[0].contains("in force"), "{warned:?}");
     assert_eq!(selection.group().attribute("base_count").and_then(|v| v.as_u64()), Some(12), "the overlay's value stays");
+    let err = view.verify(&mut vectordata::verify::NoProgress).unwrap_err().to_string();
+    assert!(err.contains("V7 base_vectors") && err.contains("base_count attribute states 12"), "{err}");
 }
 
 /// **An overlay's distance the dataset declares otherwise is a

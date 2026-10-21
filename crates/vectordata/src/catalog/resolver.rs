@@ -412,6 +412,28 @@ impl DatasetSelection {
             .collect()
     }
 
+    /// [Verify](crate::TestDataViewExt::verify) every selected profile:
+    /// each profile's report, by name, or
+    /// [`Error::Verification`](crate::Error::Verification) with every
+    /// failure, each prefixed by its profile.
+    pub fn verify(
+        &self,
+        progress: &mut dyn crate::verify::VerifyProgress,
+    ) -> crate::Result<Vec<(String, crate::verify::VerifyReport)>> {
+        use crate::view::TestDataViewExt;
+        let mut reports = Vec::new();
+        let mut failures = Vec::new();
+        for (name, view) in self.views()? {
+            let report = view.verify_report(&crate::verify::VerifyOptions::default(), progress);
+            failures.extend(report.failures.iter().cloned().map(|mut f| {
+                f.facet = format!("{name}:{}", f.facet);
+                f
+            }));
+            reports.push((name, report));
+        }
+        if failures.is_empty() { Ok(reports) } else { Err(crate::Error::Verification { failures }) }
+    }
+
     /// Fetch the selected profiles' facets — [`TestDataGroup::fetch`](crate::TestDataGroup::fetch)
     /// over [`profiles`](Self::profiles).
     pub fn fetch(

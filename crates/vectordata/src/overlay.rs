@@ -35,6 +35,8 @@
 //! claim about is opened, a disagreement — a `base_count` that is not
 //! the base's, a `maxk` that is not the ground truth's width — is a
 //! warning naming the file, the key and both values, once per process.
+//! [`TestDataViewExt::verify`](crate::TestDataViewExt::verify) reports
+//! it as a failed check.
 //!
 //! (`docs/design/srd-loose-files-overlays-integrity.md` §4.)
 
@@ -70,6 +72,13 @@ pub enum AttributeSource {
         /// Who stated it.
         kind: OverlayKind,
     },
+    /// Measured from the data, and recorded in this file
+    /// (`<cache_root>/<dataset>/measured.yaml`), or not recorded (a
+    /// local base, measured each time).
+    Measured {
+        /// The file the measurement is recorded in, when it is.
+        file: Option<String>,
+    },
 }
 
 impl fmt::Display for AttributeSource {
@@ -80,6 +89,8 @@ impl fmt::Display for AttributeSource {
             AttributeSource::Overlay { file, kind: OverlayKind::Program(name) } => {
                 write!(f, "program overlay '{name}' ({file})")
             }
+            AttributeSource::Measured { file: Some(file) } => write!(f, "measured, recorded in {file}"),
+            AttributeSource::Measured { file: None } => write!(f, "measured"),
         }
     }
 }

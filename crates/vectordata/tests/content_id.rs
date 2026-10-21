@@ -5,7 +5,7 @@
 //! a facet fetched from a server that publishes no `.mref` records a
 //! merkle tree as its chunks land, and its root is the root a `.mref`
 //! of the same bytes would have — and a local copy's computed root.
-//! A cached chunk changed since it landed is found.
+//! A cached chunk changed since it landed is found (V9).
 
 mod support;
 
@@ -14,7 +14,8 @@ use std::sync::LazyLock;
 
 use support::testserver::TestServer;
 use vectordata::merkle::{ContentIdKind, MerkleRef};
-use vectordata::TestDataGroup;
+use vectordata::verify::{Check, NoProgress, VerifyOptions};
+use vectordata::{TestDataGroup, TestDataViewExt};
 
 static CACHE: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
@@ -74,11 +75,15 @@ fn a_fetched_facet_without_a_reference_records_its_content_root() {
     let local_id = local.profile("default").unwrap().open_facet_storage("base_vectors").unwrap().content_id().unwrap().unwrap();
     assert_eq!((local_id.root, local_id.kind), (expected, ContentIdKind::Computed));
 
-    // The cache is what landed: nothing differs, then a flipped byte does.
-    assert_eq!(storage.verify_cached(&mut |_, _| {}).unwrap(), Some(vec![]));
+    // The cache is what landed: V9 passes, then finds a flipped byte.
+    let options = VerifyOptions { cached_chunks: true, ..Default::default() };
+    let report = view.verify_report(&options, &mut NoProgress);
+    assert!(report.passed() && report.checked.contains(&Check::V9CachedChunks), "{:?}", report);
     let cache_file = cached_file(CACHE.path(), "base.fvec").expect("the cache copy");
     let mut cached = std::fs::read(&cache_file).unwrap();
     cached[8 * 1024 * 1024 + 100] ^= 0xff;
     std::fs::write(&cache_file, &cached).unwrap();
-    assert_eq!(storage.verify_cached(&mut |_, _| {}).unwrap(), Some(vec![1]), "chunk 1 holds 8 MiB + 100");
+    let report = view.verify_report(&options, &mut NoProgress);
+    let failure = report.failures.iter().find(|f| f.check == Check::V9CachedChunks).expect("V9 fails");
+    assert!(failure.found.ends_with(": 1"), "chunk 1 holds 8 MiB + 100: {failure}");
 }

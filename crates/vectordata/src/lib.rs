@@ -273,6 +273,7 @@ pub mod access;
 pub mod metadata_schema;
 pub mod typed_access;
 pub mod view;
+pub mod verify;
 pub mod overlay;
 pub mod fetch;
 pub mod group;
@@ -465,6 +466,14 @@ pub enum Error {
         dataset: String,
         /// What is wrong with it.
         message: String,
+    },
+    /// A profile's facets do not belong together: each check that
+    /// failed, what it found and the file
+    /// ([`TestDataViewExt::verify`]).
+    #[error("{}", .failures.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; "))]
+    Verification {
+        /// Every check that failed, in the order they ran.
+        failures: Vec<crate::verify::VerifyFailure>,
     },
     /// Catch-all for errors that do not fit other variants.
     #[error("{0}")]
