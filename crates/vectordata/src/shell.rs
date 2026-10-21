@@ -462,6 +462,13 @@ enum ConfigCmd {
         #[command(subcommand)]
         command: CatalogCmd,
     },
+    /// State or correct a dataset's attributes on this host
+    /// (overlays.yaml): what its catalog does not say or says wrong,
+    /// read by every command and every program through vectordata.
+    Overlay {
+        #[command(subcommand)]
+        command: OverlayCmd,
+    },
     /// List writable mount points with available + total disk space, to help
     /// pick a cache dir for `config set cache`.
     Mounts {
@@ -503,6 +510,44 @@ enum CatalogCmd {
     },
     /// List configured catalog sources.
     List,
+}
+
+#[derive(veks_completion_derive::VeksCli)]
+enum OverlayCmd {
+    /// Set an attribute: `vectordata config overlay set ada002-100k distance_function DOT_PRODUCT`.
+    ///
+    /// The key is a dataset attribute (`distance_function`,
+    /// `is_normalized`, `model`, `base_count`, `maxk`, …) or a
+    /// consumer's own key with a `.` (`fvec.ncentroids`). The value is
+    /// read as YAML: `true`, `300` and `COSINE` are a boolean, a number
+    /// and a string.
+    Set {
+        /// The dataset, by name.
+        dataset: String,
+        /// The attribute.
+        key: String,
+        /// Its value.
+        value: String,
+        /// Only for the dataset of this name in this catalog.
+        #[arg(long)]
+        catalog: Option<String>,
+    },
+    /// Remove an attribute the overlay sets.
+    #[command(alias = "rm")]
+    Unset {
+        /// The dataset, by name.
+        dataset: String,
+        /// The attribute.
+        key: String,
+        /// The catalog block it was set in.
+        #[arg(long)]
+        catalog: Option<String>,
+    },
+    /// Show what the overlay states: for one dataset, or for all.
+    Show {
+        /// The dataset, by name; all when omitted.
+        dataset: Option<String>,
+    },
 }
 
 /// Tab-completion for `--to` (the push destination): the namespace names on the
@@ -866,6 +911,18 @@ pub fn bin_main_with_catalogs(invoked: &str, argv: Vec<String>, program: crate::
                     },
                     CatalogCmd::List => crate::config::list_catalogs(),
                 },
+                ConfigCmd::Overlay { command } => {
+                    let dir = crate::catalog::sources::config_dir();
+                    match command {
+                        OverlayCmd::Set { dataset, key, value, catalog } => {
+                            crate::config::overlay_set(std::path::Path::new(&dir), catalog.as_deref(), &dataset, &key, &value)
+                        }
+                        OverlayCmd::Unset { dataset, key, catalog } => {
+                            crate::config::overlay_unset(std::path::Path::new(&dir), catalog.as_deref(), &dataset, &key)
+                        }
+                        OverlayCmd::Show { dataset } => crate::config::overlay_show(std::path::Path::new(&dir), dataset.as_deref()),
+                    }
+                }
             };
             if code != 0 {
                 std::process::exit(code);

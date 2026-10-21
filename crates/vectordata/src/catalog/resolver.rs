@@ -30,6 +30,9 @@ pub struct Catalog {
     /// [`catalog_name`](CatalogEntry::catalog_name) can say where it
     /// came from.
     origins: Vec<(String, CatalogOrigin)>,
+    /// The overlays its entries were read through, for the datasets it
+    /// opens by path.
+    overlays: crate::overlay::Overlays,
 }
 
 impl Catalog {
@@ -54,6 +57,9 @@ impl Catalog {
                 // listings can group and filter by catalog.
                 Some(found) => entries.extend(found.into_iter().map(|mut e| {
                     e.set_catalog_name(source.name());
+                    // The one place an entry's attributes meet the
+                    // overlays, so every reader of the entry sees them.
+                    e.apply_overlay(sources.overlays().resolve(Some(source.name()), e.name()));
                     e
                 })),
                 None if requirement == Requirement::Required => {
@@ -70,7 +76,12 @@ impl Catalog {
         for d in &diagnostics {
             log::warn!("{d}");
         }
-        Catalog { entries, diagnostics, origins }
+        Catalog { entries, diagnostics, origins, overlays: sources.overlays().clone() }
+    }
+
+    /// The overlays the catalog reads datasets through.
+    pub fn overlays(&self) -> &crate::overlay::Overlays {
+        &self.overlays
     }
 
     /// Returns all dataset entries in the catalog.
@@ -251,7 +262,7 @@ impl Catalog {
             crate::Error::Other(format!("failed to open dataset '{label}': {e}"))
         };
         let (dataset, group) = if crate::transport::is_remote_url(head) || std::path::Path::new(head).exists() {
-            let group = crate::TestDataGroup::load(head).map_err(|e| opened(head, e))?;
+            let group = crate::TestDataGroup::load(head).map_err(|e| opened(head, e))?.with_overlays(&self.overlays);
             (head.to_string(), group)
         } else {
             let entry = self.lookup(head)?;

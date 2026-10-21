@@ -634,6 +634,20 @@ pub trait TestDataView: Send + Sync {
         self.distance_function().as_deref().and_then(crate::DistanceFunction::parse)
     }
 
+    /// One dataset-level attribute by name — a known one or a
+    /// consumer's namespaced key — with overlays merged in
+    /// ([`crate::overlay`]). `None` when the view does not carry
+    /// attributes, as the default does.
+    fn dataset_attribute(&self, _key: &str) -> Option<serde_yaml::Value> {
+        None
+    }
+
+    /// Where [`dataset_attribute`](Self::dataset_attribute)'s value for
+    /// `key` came from. `None` when the view does not know.
+    fn dataset_attribute_source(&self, _key: &str) -> Option<crate::overlay::AttributeSource> {
+        None
+    }
+
     /// The `quantization` attribute, when the profile or the dataset
     /// declares one: how the codes in `base_vectors` relate to the
     /// vectors they stand for. The profile's wins over the dataset's.
@@ -3481,6 +3495,12 @@ pub struct GenericTestDataView {
     /// Verified on subsequent opens; editable by the user when the
     /// catalog moves but the bytes are the same.
     catalog_source: Option<String>,
+    /// What overlays claim about this dataset's counts, checked as the
+    /// facets they concern open (OV-5).
+    overlay_claims: Option<Arc<crate::overlay::Claims>>,
+    /// Where each attribute that did not come from the dataset itself
+    /// came from: an overlay.
+    attribute_sources: Arc<HashMap<String, crate::overlay::AttributeSource>>,
 }
 
 impl GenericTestDataView {
@@ -3492,6 +3512,8 @@ impl GenericTestDataView {
             attributes: HashMap::new(),
             dataset_name: None,
             catalog_source: None,
+            overlay_claims: None,
+            attribute_sources: Arc::default(),
         }
     }
 
@@ -3507,6 +3529,42 @@ impl GenericTestDataView {
             attributes,
             dataset_name: None,
             catalog_source: None,
+            overlay_claims: None,
+            attribute_sources: Arc::default(),
+        }
+    }
+
+    /// Check what overlays claim about the dataset's counts against
+    /// each facet they concern as it opens, warning on a disagreement
+    /// (OV-5).
+    pub(crate) fn with_overlay_claims(mut self, claims: Option<Arc<crate::overlay::Claims>>) -> Self {
+        self.overlay_claims = claims;
+        self
+    }
+
+    /// Where the attributes that did not come from the dataset itself
+    /// came from.
+    pub(crate) fn with_attribute_sources(mut self, sources: HashMap<String, crate::overlay::AttributeSource>) -> Self {
+        self.attribute_sources = Arc::new(sources);
+        self
+    }
+
+    /// Warn about every overlay claim the facet `name`, just opened as
+    /// `count` records of `dim`, contradicts. The base's count is the
+    /// claim's only for the whole base: a sized profile's window over
+    /// it holds fewer records by design.
+    fn probe_overlay(&self, facet: &FacetConfig, name: &str, count: usize, dim: usize) {
+        let Some(claims) = &self.overlay_claims else { return };
+        let windowed = facet.window().is_some() || facet.source().is_some_and(|s| s.contains('['));
+        let whole_base = !windowed;
+        for (key, claimed, observed, source) in claims.contradictions(name, count, dim, whole_base) {
+            crate::overlay::warn_contradiction(
+                &claims.dataset,
+                key,
+                &claimed.to_string(),
+                &format!("{name} holding {observed}"),
+                &source,
+            );
         }
     }
 
@@ -3570,6 +3628,7 @@ impl GenericTestDataView {
     ) -> Result<crate::io::AnyVectorReader> {
         veks_datatypes::dispatch_element!(native, N => {
             let reader = self.open_native::<N>(facet, name)?;
+            self.probe_overlay(facet, name, reader.count(), reader.dim());
             Ok(<N as crate::io::AnyElement>::into_any(reader))
         })
     }
@@ -4145,6 +4204,17 @@ impl TestDataView for GenericTestDataView {
 
     fn base_count(&self) -> Option<u64> {
         self.config.base_count
+    }
+
+    fn dataset_attribute(&self, key: &str) -> Option<serde_yaml::Value> {
+        self.attributes.get(key).cloned()
+    }
+
+    fn dataset_attribute_source(&self, key: &str) -> Option<crate::overlay::AttributeSource> {
+        match self.attribute_sources.get(key) {
+            Some(source) => Some(source.clone()),
+            None => self.attributes.contains_key(key).then_some(crate::overlay::AttributeSource::Dataset),
+        }
     }
 
     fn distance_function(&self) -> Option<String> {

@@ -199,6 +199,7 @@ Each of these exists, is tested, and handles cases that are easy to miss.
 | `vectordata config get` | [`settings::setting_value`](crate::settings::setting_value), [`settings::cache_dir`](crate::settings::cache_dir) |
 | `vectordata config set` | [`settings::write_setting`](crate::settings::write_setting) |
 | `vectordata config catalog` | [`catalog::sources::named_catalog_entries`](crate::catalog::sources::named_catalog_entries) |
+| `vectordata config overlay` | [`overlay::Overlay`](crate::overlay::Overlay), [`CatalogSources::with_overlay`](crate::catalog::CatalogSources::with_overlay), [`CatalogEntry::attribute_source`](crate::dataset::CatalogEntry::attribute_source) |
 | `vectordata config mounts` | [`mounts`](crate::mounts) |
 | `vectordata login` | [`endpoint::login_password`](crate::endpoint::login_password), [`credentials`](crate::credentials) |
 | `vectordata logout` | [`credentials`](crate::credentials) |

@@ -109,10 +109,14 @@ pub fn build_sources(program: &CatalogSources, configdir: &str, extra_catalogs: 
     let extra_catalogs = catalog_args(extra_catalogs);
     let candidates = CatalogSources::new().configure(configdir).extend(program.clone());
     if !at.is_empty() {
-        let sources = at_sources(&at, &candidates).unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        });
+        // `--at` names which catalogs to read; what the user and the
+        // program know of datasets (their overlays) still applies.
+        let sources = at_sources(&at, &candidates)
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            })
+            .with_overlays_from(&candidates);
         let named = sources.iter().map(|(s, _)| s.name().to_string()).collect();
         return RunSources { sources, named };
     }

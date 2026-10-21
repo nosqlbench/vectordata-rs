@@ -105,6 +105,18 @@ pub struct CatalogEntry {
     description: EntryDescription,
     catalog_file: Option<String>,
     catalog_name: Option<String>,
+    /// What overlays state for this dataset, merged over its own
+    /// attributes. Never written to a catalog file: a listing says what
+    /// the catalog says.
+    overlay: Option<std::sync::Arc<AppliedOverlay>>,
+}
+
+/// An entry's attributes with the overlays that apply to it merged in,
+/// and what each overlay stated.
+#[derive(Debug, Clone)]
+pub(crate) struct AppliedOverlay {
+    attributes: DatasetAttributes,
+    stated: Vec<crate::overlay::Stated>,
 }
 
 /// A catalog entry as catalog files write it.
@@ -150,6 +162,15 @@ impl From<CatalogEntry> for EntryWire {
         };
         EntryWire { name: entry.name, path, dataset_type, layout }
     }
+}
+
+/// One attribute of `attributes` by name, known or not.
+fn attribute_of(attributes: &DatasetAttributes, key: &str) -> Option<serde_yaml::Value> {
+    if let Some(v) = attributes.other.get(key) {
+        return Some(v.clone());
+    }
+    let all = serde_yaml::to_value(attributes).ok()?;
+    all.get(key).filter(|v| !v.is_null()).cloned()
 }
 
 /// The parent directory of `path` as written, ending in `/`; `path`
@@ -262,12 +283,78 @@ impl CatalogEntry {
         }
     }
 
-    /// Dataset-level attributes (model, distance function, license, etc.).
+    /// Dataset-level attributes (model, distance function, license,
+    /// etc.), with what overlays state merged in
+    /// ([`crate::overlay`]); [`attribute_source`](Self::attribute_source)
+    /// says where each came from.
     pub fn attributes(&self) -> Option<&DatasetAttributes> {
+        match &self.overlay {
+            Some(o) => Some(&o.attributes),
+            None => self.own_attributes(),
+        }
+    }
+
+    /// The attributes the dataset itself declares, before overlays.
+    pub fn own_attributes(&self) -> Option<&DatasetAttributes> {
         match &self.description {
             EntryDescription::Embedded(d) => d.attributes.as_ref(),
             EntryDescription::Referenced { summary, .. } => summary.attributes.as_ref(),
         }
+    }
+
+    /// One attribute by name, a namespaced consumer key
+    /// (`fvec.ncentroids`) as much as a known one, overlays merged in.
+    pub fn attribute(&self, key: &str) -> Option<serde_yaml::Value> {
+        attribute_of(self.attributes()?, key)
+    }
+
+    /// Where attribute `key`'s value came from: an overlay, or the
+    /// dataset. `None` when nothing sets it.
+    pub fn attribute_source(&self, key: &str) -> Option<crate::overlay::AttributeSource> {
+        if let Some(stated) = self.overlay.as_ref().and_then(|o| o.stated.iter().find(|s| s.key == key)) {
+            return Some(stated.source.clone());
+        }
+        self.own_attributes()
+            .and_then(|a| attribute_of(a, key))
+            .map(|_| crate::overlay::AttributeSource::Dataset)
+    }
+
+    /// One consumer's keys (`fvec.` for namespace `fvec`) and their
+    /// values, overlays merged in.
+    pub fn attributes_in(&self, namespace: &str) -> Vec<(String, serde_yaml::Value)> {
+        let prefix = format!("{namespace}.");
+        self.attributes()
+            .map(|a| a.other.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// What overlays state for this entry: each key, its value and
+    /// its source. Empty when none applies.
+    pub fn overlaid(&self) -> &[crate::overlay::Stated] {
+        self.overlay.as_ref().map(|o| o.stated.as_slice()).unwrap_or(&[])
+    }
+
+    /// Merge `stated` over the entry's own attributes. A distance
+    /// function the dataset declares differently is a warning (OV-5):
+    /// the overlay's is in force.
+    pub(crate) fn apply_overlay(&mut self, stated: Vec<crate::overlay::Stated>) {
+        if stated.is_empty() {
+            return;
+        }
+        let own = self.own_attributes().cloned().unwrap_or_default();
+        let mut attributes = own.clone();
+        for s in &stated {
+            if s.key == "distance_function"
+                && let (Some(declared), Some(claimed)) = (own.distance(), s.value.as_str().and_then(crate::DistanceFunction::parse))
+                && declared != claimed
+            {
+                crate::overlay::warn_contradiction(&self.name, &s.key, claimed.name(), &format!("the dataset's own {}", declared.name()), &s.source);
+            }
+            if !attributes.set_known(&s.key, &s.value) {
+                attributes.other.insert(s.key.clone(), s.value.clone());
+            }
+        }
+        self.overlay = Some(std::sync::Arc::new(AppliedOverlay { attributes, stated }));
     }
 
     /// The profile tag schema (PS-19).
@@ -452,7 +539,7 @@ impl EntryBuilder {
                 return Err(format!("catalog entry '{name}': an embedded dataset needs a home"));
             }
         };
-        Ok(CatalogEntry { name, home, description, catalog_file: None, catalog_name: None })
+        Ok(CatalogEntry { name, home, description, catalog_file: None, catalog_name: None, overlay: None })
     }
 }
 

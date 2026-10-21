@@ -40,6 +40,10 @@ pub struct CatalogSources {
     configured: Vec<Configured>,
     /// Problems met resolving locations given directly.
     diagnostics: Vec<super::CatalogDiagnostic>,
+    /// The attribute overlays every entry and opened dataset is read
+    /// through: the program's, and the user's from a configured
+    /// directory (`crate::overlay`).
+    overlays: crate::overlay::Overlays,
 }
 
 /// One catalog in the set.
@@ -123,8 +127,19 @@ impl CatalogSources {
         self
     }
 
-    /// Read a `configure*` call's `catalogs.yaml` and add its catalogs.
+    /// Read a `configure*` call's `catalogs.yaml` and add its catalogs,
+    /// and its `overlays.yaml` as the user's overlay.
     fn add_configured(&mut self, mut configured: Configured) {
+        match crate::overlay::Overlay::load_user(Path::new(&configured.dir)) {
+            Some(Ok(overlay)) => {
+                for w in overlay.warnings() {
+                    configured.diagnostics.push(super::CatalogDiagnostic::warning(w.clone()));
+                }
+                self.overlays.set_user(Some(overlay));
+            }
+            Some(Err(e)) => configured.diagnostics.push(super::CatalogDiagnostic::warning(e)),
+            None => {}
+        }
         let index = self.configured.len();
         let absent = !Path::new(&configured.dir).join("catalogs.yaml").is_file();
         if !(absent && configured.quiet_if_absent) {
@@ -141,7 +156,9 @@ impl CatalogSources {
     /// where they stood, and every other catalog (a program's, or one
     /// given by location) is kept as it is.
     pub fn reload_configured(&self) -> Self {
-        let mut out = CatalogSources { diagnostics: self.diagnostics.clone(), ..CatalogSources::default() };
+        let mut overlays = self.overlays.clone();
+        overlays.set_user(None);
+        let mut out = CatalogSources { diagnostics: self.diagnostics.clone(), overlays, ..CatalogSources::default() };
         let mut reread = vec![false; self.configured.len()];
         for slot in &self.sources {
             match slot.from_config {
@@ -160,6 +177,39 @@ impl CatalogSources {
             }
         }
         out
+    }
+
+    /// An attribute overlay the program states ([`crate::overlay`]),
+    /// over the datasets' own attributes and under the user's. A key
+    /// another program overlay already sets for the same dataset is
+    /// refused, naming both.
+    ///
+    /// ```
+    /// use vectordata::catalog::{CatalogBuilder, CatalogSources};
+    /// use vectordata::overlay::Overlay;
+    /// let sources = CatalogSources::new()
+    ///     .with_overlay(Overlay::program("bench", "datasets:\n  ada002-100k:\n    distance_function: DOT_PRODUCT\n").unwrap())
+    ///     .unwrap();
+    /// assert!(sources
+    ///     .with_overlay(Overlay::program("other", "datasets:\n  ada002-100k:\n    distance_function: COSINE\n").unwrap())
+    ///     .is_err());
+    /// ```
+    pub fn with_overlay(mut self, overlay: crate::overlay::Overlay) -> Result<Self, String> {
+        self.overlays.add_program(overlay)?;
+        Ok(self)
+    }
+
+    /// The overlays in force.
+    pub fn overlays(&self) -> &crate::overlay::Overlays {
+        &self.overlays
+    }
+
+    /// The same set with `overlays` in force instead: what `--at`
+    /// keeps when it replaces the catalogs, as it names which catalogs
+    /// to read and not what a host knows of datasets.
+    pub fn with_overlays_from(mut self, other: &CatalogSources) -> Self {
+        self.overlays = other.overlays.clone();
+        self
     }
 
     /// A catalog the program supplies, required: one built with
@@ -199,6 +249,16 @@ impl CatalogSources {
             ..slot
         }));
         self.diagnostics.extend(other.diagnostics);
+        for overlay in other.overlays.iter() {
+            match overlay.kind() {
+                crate::overlay::OverlayKind::User => self.overlays.set_user(Some(overlay.clone())),
+                crate::overlay::OverlayKind::Program(_) => {
+                    if let Err(e) = self.overlays.add_program(overlay.clone()) {
+                        self.diagnostics.push(super::CatalogDiagnostic::error(e));
+                    }
+                }
+            }
+        }
         self
     }
 
@@ -212,6 +272,7 @@ impl CatalogSources {
             [] => Ok(None),
             [slot] => Ok(Some(CatalogSources {
                 sources: vec![Slot { requirement: Requirement::Required, from_config: None, ..(*slot).clone() }],
+                overlays: self.overlays.clone(),
                 ..CatalogSources::default()
             })),
             several => Err(format!(

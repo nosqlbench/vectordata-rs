@@ -126,6 +126,26 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&
     0
 }
 
+/// What the dataset's own declaration says against an overlay's value
+/// for `key`, when it says something else (OV-5): its distance
+/// function, or the profile's `base_count` or `maxk`. Read from the
+/// listing, so describing a dataset opens no file.
+fn contradiction(entry: &CatalogEntry, profile_name: &str, key: &str) -> Option<String> {
+    let stated = entry.overlaid().iter().find(|s| s.key == key)?;
+    let profile = entry.profiles().profile(profile_name);
+    let declared = match key {
+        "distance_function" => {
+            let own = entry.own_attributes()?.distance()?;
+            let claimed = stated.value.as_str().and_then(crate::DistanceFunction::parse)?;
+            return (own != claimed).then(|| format!("the dataset declares {}", own.name()));
+        }
+        "base_count" => profile?.base_count?,
+        "maxk" => profile?.maxk? as u64,
+        _ => return None,
+    };
+    (stated.value.as_u64() != Some(declared)).then(|| format!("the dataset declares {declared}"))
+}
+
 /// Render an attribute value for a terminal line.
 ///
 /// Scalars print bare; anything structured falls back to its YAML,
@@ -183,20 +203,39 @@ fn render(entry: &CatalogEntry, profile_name: &str) {
         let mut header = || {
             if !have_any { println!(); println!("Attributes:"); have_any = true; }
         };
+        // Each value with where it came from, when that is not the
+        // dataset itself: an overlay.
+        let sourced = |key: &str, value: &str| -> String {
+            let mut out = value.to_string();
+            match entry.attribute_source(key) {
+                Some(crate::overlay::AttributeSource::Dataset) | None => {}
+                Some(source) => out.push_str(&format!("  ({source})")),
+            }
+            if let Some(note) = contradiction(entry, profile_name, key) {
+                out.push_str(&format!("  (contradicted: {note})"));
+            }
+            out
+        };
         if let Some(v) = attrs.model.as_deref()
-            { header(); kv("model", v); }
+            { header(); kv("model", &sourced("model", v)); }
         if let Some(v) = attrs.distance_function.as_deref()
-            { header(); kv("distance", v); }
+            { header(); kv("distance", &sourced("distance_function", v)); }
         if let Some(v) = attrs.vendor.as_deref()
-            { header(); kv("vendor", v); }
+            { header(); kv("vendor", &sourced("vendor", v)); }
         if let Some(v) = attrs.license.as_deref()
-            { header(); kv("license", v); }
+            { header(); kv("license", &sourced("license", v)); }
         if let Some(v) = attrs.url.as_deref()
-            { header(); kv("upstream", v); }
+            { header(); kv("upstream", &sourced("url", v)); }
         if let Some(b) = attrs.is_normalized
-            { header(); kv("normalized", if b { "yes" } else { "no" }); }
+            { header(); kv("normalized", &sourced("is_normalized", if b { "yes" } else { "no" })); }
         if let Some(v) = attrs.notes.as_deref()
-            { header(); kv("notes", v); }
+            { header(); kv("notes", &sourced("notes", v)); }
+        // What only an overlay states: counts, and consumers' own keys.
+        const SHOWN: [&str; 7] = ["model", "distance_function", "vendor", "license", "url", "is_normalized", "notes"];
+        for stated in entry.overlaid().iter().filter(|s| !SHOWN.contains(&s.key.as_str())) {
+            header();
+            kv(&stated.key, &sourced(&stated.key, &render_attribute(&stated.value)));
+        }
     }
 
     let Some(profile) = entry.profiles().profile(profile_name) else {

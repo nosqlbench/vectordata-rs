@@ -877,6 +877,93 @@ pub fn add_catalog_ex(
     }
 }
 
+/// `vectordata config overlay set`: set `key: value` for `dataset` (in
+/// `catalog`, when given) in `<config_dir>/overlays.yaml`, keeping every
+/// comment and every other line. The value is read as YAML.
+pub fn overlay_set(config_dir: &Path, catalog: Option<&str>, dataset: &str, key: &str, value: &str) -> i32 {
+    let path = crate::overlay::user_overlay_path(config_dir);
+    let parsed: serde_yaml::Value = match serde_yaml::from_str(value) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: '{value}' is not a YAML value: {e}");
+            return 1;
+        }
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let edited = match crate::overlay::set_text(&text, catalog, dataset, key, &parsed) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(config_dir).and_then(|()| crate::atomic_file::replace_config(&path, edited.as_bytes(), false)) {
+        eprintln!("error: writing {}: {e}", path.display());
+        return 1;
+    }
+    let scope = catalog.map(|c| format!(" in catalog '{c}'")).unwrap_or_default();
+    println!("{dataset}{scope}: {key} = {value}  ({})", path.display());
+    0
+}
+
+/// `vectordata config overlay unset`: remove `key` for `dataset` from
+/// `<config_dir>/overlays.yaml`; 1 when the overlay does not set it.
+pub fn overlay_unset(config_dir: &Path, catalog: Option<&str>, dataset: &str, key: &str) -> i32 {
+    let path = crate::overlay::user_overlay_path(config_dir);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!("Not set: {} has no overlay file", config_dir.display());
+        return 1;
+    };
+    let (edited, removed) = crate::overlay::unset_text(&text, catalog, dataset, key);
+    if !removed {
+        eprintln!("Not set: {dataset} {key}");
+        return 1;
+    }
+    if let Err(e) = crate::atomic_file::replace_config(&path, edited.as_bytes(), false) {
+        eprintln!("error: writing {}: {e}", path.display());
+        return 1;
+    }
+    println!("Removed: {dataset} {key}");
+    0
+}
+
+/// `vectordata config overlay show`: what `<config_dir>/overlays.yaml`
+/// states, for `dataset` or for every dataset, with what reading it
+/// reported.
+pub fn overlay_show(config_dir: &Path, dataset: Option<&str>) -> i32 {
+    let path = crate::overlay::user_overlay_path(config_dir);
+    let overlay = match crate::overlay::Overlay::load_user(config_dir) {
+        None => {
+            println!("No overlay: {} does not exist.", path.display());
+            println!("  vectordata config overlay set <dataset> <key> <value>");
+            return 0;
+        }
+        Some(Err(e)) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+        Some(Ok(o)) => o,
+    };
+    println!("{}", path.display());
+    for w in overlay.warnings() {
+        println!("  warning: {w}");
+    }
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    match dataset {
+        Some(name) => {
+            let values = overlay.values_for(None, name);
+            if values.is_empty() {
+                println!("  {name}: nothing stated");
+            }
+            for (k, v) in values {
+                println!("  {name}: {k} = {}", crate::dataset::yaml_edit::render_scalar(&v).unwrap_or_else(|_| format!("{v:?}")));
+            }
+        }
+        None => print!("{text}"),
+    }
+    0
+}
+
 /// Non-printing removal of the `catalogs.yaml` entry whose name,
 /// URL/path (or, for legacy list entries, value) equals `target`,
 /// preserving every other byte. Returns whether a line was removed.

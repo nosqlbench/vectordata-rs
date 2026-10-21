@@ -273,6 +273,7 @@ pub mod access;
 pub mod metadata_schema;
 pub mod typed_access;
 pub mod view;
+pub mod overlay;
 pub mod fetch;
 pub mod group;
 pub mod location;

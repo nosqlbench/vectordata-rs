@@ -34,6 +34,9 @@ pub struct TestDataGroup {
     /// what `datasets describe` renders for a path or URL as it does
     /// for a catalog name.
     entry: crate::dataset::CatalogEntry,
+    /// The count claims overlays make, for the views to check as their
+    /// facets open (OV-5).
+    claims: Option<Arc<crate::overlay::Claims>>,
 }
 
 /// A dataset resolved for opening: what every route to a
@@ -305,7 +308,7 @@ impl TestDataGroup {
     /// The one constructor every open ends in (RC-7).
     fn from_handle(handle: DatasetHandle) -> Self {
         let DatasetHandle { name, home, origin, config, entry } = handle;
-        TestDataGroup { home, origin, name, config, entry }
+        TestDataGroup { home, origin, name, config, entry, claims: None }
     }
 
     /// The view of one profile, anchored to this dataset's cache
@@ -317,6 +320,17 @@ impl TestDataGroup {
             self.home.clone(),
             profile_config.clone(),
             self.config.attributes.clone(),
+        )
+        .with_overlay_claims(self.claims.clone())
+        .with_attribute_sources(
+            self.config
+                .attributes
+                .keys()
+                .filter_map(|k| match self.attribute_source(k) {
+                    Some(crate::overlay::AttributeSource::Dataset) | None => None,
+                    Some(source) => Some((k.clone(), source)),
+                })
+                .collect(),
         );
         Some(match &self.name {
             Some(dataset) => view.with_catalog_identity(dataset.clone(), self.origin.clone()),
@@ -402,6 +416,63 @@ impl TestDataGroup {
     /// Retrieves a top-level attribute from the dataset configuration.
     pub fn attribute(&self, name: &str) -> Option<&serde_yaml::Value> {
         self.config.attributes.get(name)
+    }
+
+    /// The same dataset read through `overlays` ([`crate::overlay`]):
+    /// what they state for it, by its name and its catalog, merged over
+    /// its attributes, so [`attribute`](Self::attribute), every view's
+    /// [`distance`](crate::TestDataView::distance) and `describe` see
+    /// it. A [`Catalog`](crate::catalog::Catalog) applies its overlays
+    /// to every dataset it opens; this is for a group opened by path
+    /// in code.
+    ///
+    /// ```
+    /// use vectordata::overlay::{AttributeSource, Overlay, Overlays};
+    /// use vectordata::{DistanceFunction, TestDataGroup};
+    /// # use std::io::Write;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let d = dir.path().join("ada002-100k");
+    /// # std::fs::create_dir(&d).unwrap();
+    /// # let mut f = std::fs::File::create(d.join("base_vectors.fvec")).unwrap();
+    /// # for _ in 0..4 { f.write_all(&2i32.to_le_bytes()).unwrap(); f.write_all(&1f32.to_le_bytes()).unwrap(); f.write_all(&0f32.to_le_bytes()).unwrap(); }
+    /// # std::fs::write(d.join("dataset.yaml"), "name: ada002-100k\nprofiles:\n  default:\n    base_vectors: base_vectors.fvec\n").unwrap();
+    /// let mut overlays = Overlays::new();
+    /// overlays.add_program(Overlay::program("bench", "datasets:\n  ada002-100k:\n    distance_function: DOT_PRODUCT\n    bench.ncentroids: 300\n").unwrap()).unwrap();
+    /// let group = TestDataGroup::load(d.to_str().unwrap()).unwrap().with_overlays(&overlays);
+    /// assert_eq!(group.profile("default").unwrap().distance(), Some(DistanceFunction::DotProduct));
+    /// assert_eq!(group.attribute("bench.ncentroids").and_then(|v| v.as_u64()), Some(300));
+    /// assert!(matches!(group.attribute_source("distance_function"), Some(AttributeSource::Overlay { .. })));
+    /// ```
+    pub fn with_overlays(mut self, overlays: &crate::overlay::Overlays) -> Self {
+        let catalog = self.entry.catalog_name().map(str::to_string);
+        let name = self.name.clone().unwrap_or_else(|| self.entry.name().to_string());
+        let stated = overlays.resolve(catalog.as_deref(), &name);
+        self.apply_stated(stated);
+        self
+    }
+
+    /// Merge what overlays stated over the attributes, the entry's and
+    /// the views'.
+    fn apply_stated(&mut self, stated: Vec<crate::overlay::Stated>) {
+        if stated.is_empty() {
+            return;
+        }
+        for s in &stated {
+            self.config.attributes.insert(s.key.clone(), s.value.clone());
+        }
+        let name = self.name.clone().unwrap_or_else(|| self.entry.name().to_string());
+        self.claims = crate::overlay::Claims::of(&name, &stated).map(Arc::new);
+        self.entry.apply_overlay(stated);
+    }
+
+    /// Where attribute `key`'s value came from: an overlay or the
+    /// dataset. `None` when nothing sets it.
+    pub fn attribute_source(&self, key: &str) -> Option<crate::overlay::AttributeSource> {
+        if let Some(s) = self.entry.overlaid().iter().find(|s| s.key == key) {
+            return Some(s.source.clone());
+        }
+        self.config.attributes.get(key)?;
+        Some(crate::overlay::AttributeSource::Dataset)
     }
 
     /// The dataset as a catalog lists it: the catalog's own entry for a
@@ -670,6 +741,12 @@ impl TestDataGroup {
             }
             crate::dataset::EntryDescription::Referenced { descriptor, .. } => Self::load(descriptor),
         }
+        .map(|mut group| {
+            // What the catalog's overlays stated for the entry, over the
+            // attributes the opened dataset reads.
+            group.apply_stated(entry.overlaid().to_vec());
+            group
+        })
     }
 }
 
