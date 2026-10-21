@@ -14,8 +14,14 @@
 //! [`ElementConversion`], [`Container`], [`struct@bf16`],
 //! [`struct@f16`]). The readers
 //! in this crate read a file at its own type only; the
-//! [`ElementMismatch`](MmapError::ElementMismatch) error is what a
+//! [`ElementMismatch`](IoError::ElementMismatch) error is what a
 //! wrong type gets.
+//!
+//! The random-access readers ([`XvecReader`], [`IndexedVvecReader`],
+//! [`ScalarReader`]) are the one implementation of each format in the
+//! workspace. Each is generic over a [`ByteSource`]: [`MappedFile`] for
+//! a local file, the default; `vectordata` reads remote, cached and
+//! multi-file facets through the same readers over its own source.
 //!
 //! ## Quick Start
 //!
@@ -50,14 +56,14 @@
 //! assert_eq!(sum, 21.0);
 //! ```
 //!
-//! ## Zero-Copy Mmap Access
+//! ## Zero-Copy Random Access
 //!
-//! For random access on xvec files, use the typed mmap reader at the
-//! file's own type. `get_slice` borrows from the mapping (zero-copy);
-//! `read_into` decodes into a caller's buffer (one copy).
+//! For random access on xvec files, use [`XvecReader`] at the file's
+//! own type. `get_slice` borrows from the mapping (zero-copy);
+//! `read_into` copies whole records into a caller's buffer (one copy).
 //!
 //! ```
-//! use veks_io::MmapReader;
+//! use veks_io::{VectorReader, XvecReader};
 //! # use std::io::Write;
 //! # let dir = tempfile::tempdir().unwrap();
 //! # let path = dir.path().join("base.fvecs");
@@ -68,8 +74,8 @@
 //! # }
 //! # drop(f);
 //!
-//! let reader = MmapReader::<f32>::open(&path).unwrap();
-//! let vec: &[f32] = reader.get_slice(1).unwrap(); // zero-copy
+//! let reader = XvecReader::<f32>::open_path(&path).unwrap();
+//! let vec: &[f32] = VectorReader::get_slice(&reader, 1).unwrap(); // zero-copy
 //! assert_eq!(vec, &[2.5, 3.5]);
 //!
 //! let mut rows = vec![0f32; reader.dim() * 2];
@@ -82,13 +88,13 @@
 //! (`.f32` here; `.u8`, `.i64`, `.bf16` and the rest work the same way):
 //!
 //! ```
-//! use veks_io::scalar::mmap::ScalarMmapReader;
+//! use veks_io::{ScalarReader, VectorReader};
 //! # let dir = tempfile::tempdir().unwrap();
 //! # let path = dir.path().join("quant_scale.f32");
 //! # let bytes: Vec<u8> = [0.25f32, 0.5, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
 //! # std::fs::write(&path, bytes).unwrap();
 //!
-//! let scale = ScalarMmapReader::<f32>::open(&path).unwrap();
+//! let scale = ScalarReader::<f32>::open_path(&path).unwrap();
 //! let all: &[f32] = scale.as_slice().unwrap(); // zero-copy, the whole column
 //! assert_eq!(all, &[0.25, 0.5, 1.0]);
 //! ```
@@ -106,14 +112,25 @@
 
 pub mod element;
 pub mod format;
+pub mod reader;
 pub mod scalar;
+pub mod source;
 pub mod traits;
 pub mod xvec;
 
-pub use element::{Container, Element, ElementConversion, ElementKind, ElementType, FloatFormat, MmapError, bf16, f16};
+#[allow(deprecated)]
+pub use element::MmapError;
+pub use element::{Container, Element, ElementConversion, ElementKind, ElementType, FloatFormat, bf16, f16};
 pub use format::VecFormat;
+pub use reader::{
+    AnyElement, AnyVectorReader, AnyVvecReader, ConvertingReader, DIM_UNDEFINED, IndexedVvecReader, IoError,
+    ScalarReader, StreamReclaim, VectorReader, VvecReader, XvecReader,
+};
+pub use reader::{open_vec, open_vec_as, open_vec_native, open_vvec, open_vvec_untyped};
+pub use source::{ByteSource, MappedFile, SourcePart};
 pub use traits::{SourceMeta, VecSink, VecSource};
 pub use traits::{VarlenRecord, VarlenSink, VarlenSource};
+#[allow(deprecated)]
 pub use xvec::mmap::MmapReader;
 
 use std::path::Path;
@@ -552,12 +569,12 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        let reader = MmapReader::<f32>::open(&path).unwrap();
+        let reader = XvecReader::<f32>::open_path(&path).unwrap();
         assert_eq!(reader.count(), 100);
         assert_eq!(reader.dim(), 3);
 
         for i in 0..100 {
-            let slice = reader.get_slice(i).unwrap();
+            let slice = VectorReader::get_slice(&reader, i).unwrap();
             assert_eq!(slice[0], i as f32);
             assert_eq!(slice[1], (i * 2) as f32);
             assert_eq!(slice[2], (i * 3) as f32);
@@ -713,7 +730,7 @@ mod tests {
             // Missing 2 more f32s — file size not a multiple of record size
         }
 
-        let result = MmapReader::<f32>::open(&path);
+        let result = XvecReader::<f32>::open_path(&path);
         assert!(result.is_err(), "truncated file should fail mmap open");
     }
 
@@ -747,10 +764,10 @@ mod tests {
         assert_eq!(v00, 0.0);
 
         // Also verify mmap
-        let mmap = MmapReader::<f32>::open(&path).unwrap();
+        let mmap = XvecReader::<f32>::open_path(&path).unwrap();
         assert_eq!(mmap.count(), 3);
-        assert_eq!(mmap.get_slice(0), Some(&[0.0f32, 1.0, 2.0, 3.0][..]));
-        assert_eq!(mmap.get_slice(2), Some(&[20.0f32, 21.0, 22.0, 23.0][..]));
+        assert_eq!(VectorReader::get_slice(&mmap, 0), Some(&[0.0f32, 1.0, 2.0, 3.0][..]));
+        assert_eq!(VectorReader::get_slice(&mmap, 2), Some(&[20.0f32, 21.0, 22.0, 23.0][..]));
     }
 
     // ── probe on all xvec formats ───────────────────────────────────

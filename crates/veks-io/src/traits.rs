@@ -35,6 +35,20 @@ pub trait VecSource: Send {
     /// Read the next record as raw bytes (element data only, no dim prefix).
     /// Returns `None` when exhausted.
     fn next_record(&mut self) -> Option<Vec<u8>>;
+
+    /// Read the next record's bytes into `buf`, replacing what it held,
+    /// and say whether there was one. The form for a scan: one buffer
+    /// for every record, where [`next_record`](Self::next_record)
+    /// allocates one per record.
+    fn read_record_into(&mut self, buf: &mut Vec<u8>) -> bool {
+        match self.next_record() {
+            Some(record) => {
+                *buf = record;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Streaming writer for vector data.

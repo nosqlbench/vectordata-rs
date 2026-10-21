@@ -8,13 +8,15 @@
 //! the dimension can vary from record to record.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, WriteBytesExt};
 
 use crate::format::VecFormat;
+use crate::source::{MappedFile, mapping};
 use crate::traits::{VarlenRecord, VarlenSink, VarlenSource};
+use crate::xvec::reader::RELEASE_WINDOW;
 
 const BUF_SIZE: usize = 4 << 20; // 4 MiB
 
@@ -29,20 +31,9 @@ pub fn open_reader(path: &Path, format: VecFormat) -> Result<Box<dyn VarlenSourc
         return Err(format!("{} is not an xvec format", format));
     }
 
-    let file = File::open(path)
-        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-    let file_size = file.metadata()
-        .map_err(|e| format!("metadata {}: {}", path.display(), e))?
-        .len();
-
-    let reader = BufReader::with_capacity(BUF_SIZE, file);
-
-    Ok(Box::new(XvecVarlenReader {
-        reader,
-        elem_size,
-        file_size,
-        bytes_read: 0,
-    }))
+    let file = MappedFile::map(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    mapping::advise_sequential_bytes(file.bytes());
+    Ok(Box::new(XvecVarlenReader { file, elem_size, offset: 0, released: 0 }))
 }
 
 /// Open an xvec file for variable-length writing.
@@ -54,16 +45,18 @@ pub fn open_writer(path: &Path) -> Result<Box<dyn VarlenSink>, String> {
         .map_err(|e| format!("create {}: {}", path.display(), e))?;
     let writer = BufWriter::with_capacity(BUF_SIZE, file);
 
-    Ok(Box::new(XvecVarlenWriter { writer }))
+    Ok(Box::new(XvecVarlenWriter { writer, error: None }))
 }
 
 // ── Reader ─────────────────────────────────────────────────────────────
 
 struct XvecVarlenReader {
-    reader: BufReader<File>,
+    file: MappedFile,
     elem_size: usize,
-    file_size: u64,
-    bytes_read: u64,
+    /// Where the next record starts.
+    offset: usize,
+    /// Bytes behind the cursor already released.
+    released: usize,
 }
 
 impl VarlenSource for XvecVarlenReader {
@@ -77,25 +70,19 @@ impl VarlenSource for XvecVarlenReader {
     }
 
     fn next_record(&mut self) -> Option<VarlenRecord> {
-        if self.bytes_read >= self.file_size {
-            return None;
-        }
-
-        // Read dimension header
-        let dim = match self.reader.read_i32::<LittleEndian>() {
-            Ok(d) if d > 0 => d as u32,
+        let bytes = self.file.bytes();
+        let header = bytes.get(self.offset..self.offset + 4)?;
+        let dim = match i32::from_le_bytes(header.try_into().expect("four bytes")) {
+            d if d > 0 => d as u32,
             _ => return None,
         };
-        self.bytes_read += 4;
-
-        // Read element data
-        let data_bytes = dim as usize * self.elem_size;
-        let mut data = vec![0u8; data_bytes];
-        if self.reader.read_exact(&mut data).is_err() {
-            return None;
+        let start = self.offset + 4;
+        let data = bytes.get(start..start + dim as usize * self.elem_size)?.to_vec();
+        self.offset = start + data.len();
+        if self.offset - self.released >= RELEASE_WINDOW as usize {
+            mapping::release_range_bytes(bytes, self.released as u64, self.offset as u64);
+            self.released = self.offset;
         }
-        self.bytes_read += data_bytes as u64;
-
         Some(VarlenRecord { dimension: dim, data })
     }
 }
@@ -104,15 +91,28 @@ impl VarlenSource for XvecVarlenReader {
 
 struct XvecVarlenWriter {
     writer: BufWriter<File>,
+    /// The first write that failed, returned by `finish`.
+    error: Option<std::io::Error>,
 }
 
 impl VarlenSink for XvecVarlenWriter {
     fn write_record(&mut self, dimension: u32, data: &[u8]) {
-        let _ = self.writer.write_i32::<LittleEndian>(dimension as i32);
-        let _ = self.writer.write_all(data);
+        if self.error.is_some() {
+            return;
+        }
+        let result = self
+            .writer
+            .write_i32::<LittleEndian>(dimension as i32)
+            .and_then(|()| self.writer.write_all(data));
+        if let Err(e) = result {
+            self.error = Some(e);
+        }
     }
 
     fn finish(mut self: Box<Self>) -> Result<(), String> {
+        if let Some(e) = self.error.take() {
+            return Err(format!("write: {e}"));
+        }
         self.writer.flush().map_err(|e| format!("flush: {}", e))
     }
 }

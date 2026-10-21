@@ -3,19 +3,23 @@
 
 //! Streaming xvec reader.
 //!
-//! Reads xvec files record-by-record with buffered I/O and periodic
-//! page cache release for large files.
+//! Reads xvec files record by record out of a read-only mapping,
+//! releasing the pages behind the cursor as it goes, so a scan of a
+//! file larger than memory keeps a bounded resident set.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::format::VecFormat;
+use crate::source::{MappedFile, mapping};
 use crate::traits::{SourceMeta, VecSource};
 
-const READ_BUF_SIZE: usize = 4 << 20; // 4 MiB
+/// Bytes scanned between releases of the pages behind the cursor:
+/// large enough that the `madvise` costs nothing, small enough that
+/// the resident set stays bounded.
+pub(crate) const RELEASE_WINDOW: u64 = 256 << 20;
 
 /// The shape of an xvec file from its first header and its size: the
 /// dimension, the record size, and the record count. The file must be
@@ -70,35 +74,19 @@ fn shape(path: &Path, dim: i32, file_size: u64, elem_size: usize) -> Result<(u32
 /// assert!(reader.next_record().is_none());
 /// ```
 pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-    let file_size = file.metadata()
-        .map_err(|e| format!("metadata {}: {}", path.display(), e))?
-        .len();
     let elem_size = format.element_size();
     if elem_size == 0 {
         return Err(format!("{} is not an xvec format", format));
     }
-
-    let mut reader = BufReader::with_capacity(READ_BUF_SIZE, file);
-
-    // Read dimension from first record header
-    let dim = reader.read_i32::<LittleEndian>()
-        .map_err(|e| format!("read dim: {}", e))?;
-    let (dim, _, total_records) = shape(path, dim, file_size, elem_size)?;
-
-    // Seek back to start
-    use std::io::Seek;
-    reader.seek(std::io::SeekFrom::Start(0))
-        .map_err(|e| format!("seek: {}", e))?;
-
-    Ok(Box::new(XvecReader {
-        reader,
-        dim,
-        elem_size,
-        total_records,
-        records_read: 0,
-    }))
+    let file = MappedFile::map(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+    let bytes = file.bytes();
+    if bytes.len() < 4 {
+        return Err(format!("read dim: {} bytes is too short for a record header", bytes.len()));
+    }
+    let dim = i32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
+    let (dim, record_bytes, total_records) = shape(path, dim, bytes.len() as u64, elem_size)?;
+    mapping::advise_sequential_bytes(bytes);
+    Ok(Box::new(XvecReader { file, dim, record_bytes, total_records, records_read: 0, released: 0 }))
 }
 
 /// Probe an xvec file for metadata without reading all data.
@@ -138,7 +126,7 @@ pub fn probe(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
         return Err(format!("{} is not an xvec format", format));
     }
 
-    let mut reader = BufReader::new(file);
+    let mut reader = file;
     let dim = reader.read_i32::<LittleEndian>()
         .map_err(|e| format!("read dim: {}", e))?;
     let (dim, _, count) = shape(path, dim, file_size, elem_size)?;
@@ -151,40 +139,56 @@ pub fn probe(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
 }
 
 struct XvecReader {
-    reader: BufReader<File>,
+    file: MappedFile,
     dim: u32,
-    elem_size: usize,
+    record_bytes: usize,
     total_records: u64,
     records_read: u64,
+    /// Bytes behind the cursor already released.
+    released: u64,
+}
+
+impl XvecReader {
+    /// The next record's element bytes, borrowed from the mapping, and
+    /// the cursor moved past it. `None` at the end, and at a record
+    /// whose dimension is not the file's.
+    fn next_slice(&mut self) -> Option<&[u8]> {
+        if self.records_read >= self.total_records {
+            return None;
+        }
+        let at = self.records_read as usize * self.record_bytes;
+        let bytes = self.file.bytes();
+        let dim = i32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+        if dim as u32 != self.dim {
+            return None; // dimension mismatch
+        }
+        self.records_read += 1;
+        let end = (at + self.record_bytes) as u64;
+        if end - self.released >= RELEASE_WINDOW {
+            mapping::release_range_bytes(bytes, self.released, end);
+            self.released = end;
+        }
+        Some(&self.file.bytes()[at + 4..at + self.record_bytes])
+    }
 }
 
 impl VecSource for XvecReader {
     fn dimension(&self) -> u32 { self.dim }
-    fn element_size(&self) -> usize { self.elem_size }
+    fn element_size(&self) -> usize { (self.record_bytes - 4) / self.dim as usize }
     fn record_count(&self) -> Option<u64> { Some(self.total_records) }
 
     fn next_record(&mut self) -> Option<Vec<u8>> {
-        if self.records_read >= self.total_records {
-            return None;
-        }
+        self.next_slice().map(<[u8]>::to_vec)
+    }
 
-        // Read and validate dimension header
-        let dim = match self.reader.read_i32::<LittleEndian>() {
-            Ok(d) => d as u32,
-            Err(_) => return None,
-        };
-        if dim != self.dim {
-            return None; // dimension mismatch
+    fn read_record_into(&mut self, buf: &mut Vec<u8>) -> bool {
+        match self.next_slice() {
+            Some(record) => {
+                buf.clear();
+                buf.extend_from_slice(record);
+                true
+            }
+            None => false,
         }
-
-        // Read element data
-        let data_bytes = self.dim as usize * self.elem_size;
-        let mut buf = vec![0u8; data_bytes];
-        if self.reader.read_exact(&mut buf).is_err() {
-            return None;
-        }
-
-        self.records_read += 1;
-        Some(buf)
     }
 }

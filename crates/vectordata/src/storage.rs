@@ -986,6 +986,16 @@ impl Storage {
         }
     }
 
+    /// Whether the bytes live on a server and the local file, if any, is
+    /// a copy of them: a cache file whose mtime moves as it fills.
+    pub(crate) fn is_remote(&self) -> bool {
+        match self {
+            Storage::Mmap { .. } => false,
+            Storage::Http { .. } | Storage::Cached { .. } => true,
+            Storage::Series { parts, .. } => parts.iter().any(|p| p.is_remote()),
+        }
+    }
+
     /// Whether reads avoid network round-trips.
     pub(crate) fn is_local(&self) -> bool {
         match self {
@@ -1173,23 +1183,17 @@ impl Storage {
     /// promotion). No-op on non-Unix targets — `memmap2::Mmap::advise`
     /// is Unix-only (mirrors the `release_range_bytes` pattern).
     pub(crate) fn advise_sequential(&self) {
-        #[cfg(unix)]
         if let Some(m) = self.promoted_mmap() {
-            let _ = m.advise(memmap2::Advice::Sequential);
+            veks_io::source::mapping::advise_sequential_bytes(m);
         }
-        #[cfg(not(unix))]
-        let _ = self;
     }
 
     /// Hint that the full mapping will be accessed in random order.
     /// No-op on non-Unix targets.
     pub(crate) fn advise_random(&self) {
-        #[cfg(unix)]
         if let Some(m) = self.promoted_mmap() {
-            let _ = m.advise(memmap2::Advice::Random);
+            veks_io::source::mapping::advise_random_bytes(m);
         }
-        #[cfg(not(unix))]
-        let _ = self;
     }
 
     /// Internal helper: borrow the promoted mmap, lazy-promoting
@@ -1214,20 +1218,8 @@ impl Storage {
     /// `madvise(WILLNEED)` over the byte range. Non-blocking hint.
     /// No-op on non-Unix targets — `Mmap::advise_range` is Unix-only.
     pub(crate) fn prefetch_range_bytes(&self, byte_start: u64, byte_end: u64) {
-        #[cfg(unix)]
-        {
-            let mmap = self.promoted_mmap();
-            if let Some(m) = mmap {
-                let start = byte_start as usize;
-                let end = (byte_end as usize).min(m.len());
-                if end > start {
-                    let _ = m.advise_range(memmap2::Advice::WillNeed, start, end - start);
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (self, byte_start, byte_end);
+        if let Some(m) = self.promoted_mmap() {
+            veks_io::source::mapping::prefetch_range_bytes(m, byte_start, byte_end);
         }
     }
 
@@ -1249,35 +1241,8 @@ impl Storage {
             }
             return;
         }
-        // `m` is bound only inside the `#[cfg(unix)]` block — leading
-        // underscore keeps the non-Unix build clean of "unused
-        // variable" warnings.
-        let Some(_m) = self.promoted_mmap() else {
-            return;
-        };
-        if byte_start >= byte_end {
-            return;
-        }
-
-        #[cfg(unix)]
-        unsafe {
-            let m = _m;
-            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-            if page == 0 {
-                return;
-            }
-            let start = byte_start as usize;
-            let end = (byte_end as usize).min(m.len());
-            let aligned_start = (start + page - 1) & !(page - 1);
-            let aligned_end = end & !(page - 1);
-            if aligned_end <= aligned_start {
-                return;
-            }
-            libc::madvise(
-                m.as_ptr().add(aligned_start) as *mut libc::c_void,
-                aligned_end - aligned_start,
-                libc::MADV_DONTNEED,
-            );
+        if let Some(m) = self.promoted_mmap() {
+            veks_io::source::mapping::release_range_bytes(m, byte_start, byte_end);
         }
     }
 
@@ -1301,28 +1266,8 @@ impl Storage {
             }
             return;
         }
-        let Some(m) = self.promoted_mmap() else {
-            return;
-        };
-        let start = byte_start as usize;
-        let end = (byte_end as usize).min(m.len());
-        if end <= start {
-            return;
-        }
-        #[cfg(unix)]
-        {
-            let _ = m.advise_range(memmap2::Advice::WillNeed, start, end - start);
-        }
-
-        let data = &m[start..end];
-        let page_size = 4096;
-        for offset in (0..data.len()).step_by(page_size) {
-            unsafe {
-                std::ptr::read_volatile(&data[offset]);
-            }
-            if let Some(counter) = bytes_paged {
-                counter.fetch_add(page_size as u64, std::sync::atomic::Ordering::Relaxed);
-            }
+        if let Some(m) = self.promoted_mmap() {
+            veks_io::source::mapping::prefetch_pages_bytes(m, byte_start, byte_end, bytes_paged);
         }
     }
 

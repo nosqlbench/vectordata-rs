@@ -1741,12 +1741,9 @@ fn materialize_uniform_xvec<F: FnMut(u64)>(
     }
     let mut dim_bytes = [0u8; 4];
     src_f.read_exact(&mut dim_bytes)?;
-    let dim = i32::from_le_bytes(dim_bytes) as u64;
-    if dim == 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData,
-            "first xvec record header reports dim=0"));
-    }
-    let record_size = 4 + dim * elem.byte_width() as u64;
+    let record_size = veks_io::reader::xvec_record_bytes(i32::from_le_bytes(dim_bytes), elem)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("first xvec record header: {e}")))?
+        as u64;
 
     let mut dst_f = fs::File::create(dest)?;
     if window.is_empty() {

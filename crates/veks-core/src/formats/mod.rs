@@ -530,8 +530,7 @@ mod type_matrix {
     use std::path::Path;
 
     use veks_datatypes::dispatch_element;
-    use veks_io::MmapReader;
-    use veks_io::scalar::mmap::ScalarMmapReader;
+    use veks_io::{ScalarReader, VectorReader, XvecReader};
 
     use super::*;
     use crate::formats::writer::mmap_xvec::MmapXvecWriter;
@@ -613,17 +612,17 @@ mod type_matrix {
     /// require every record, bit for bit, to be what was written.
     fn assert_reads_back<T: Element>(path: &Path, fmt: VecFormat, expected: &[Vec<T>]) {
         if fmt.is_scalar() {
-            let reader = ScalarMmapReader::<T>::open(path).unwrap_or_else(|e| panic!("{fmt}: {e}"));
+            let reader = ScalarReader::<T>::open_path(path).unwrap_or_else(|e| panic!("{fmt}: {e}"));
             assert_eq!(reader.count(), expected.len(), "{fmt}: count");
             for (i, rec) in expected.iter().enumerate() {
-                let got = reader.get(i).unwrap_or_else(|| panic!("{fmt}: record {i}"));
-                assert!(same_bits(&[got], rec), "{fmt}: record {i}");
+                let got = reader.get(i).unwrap_or_else(|e| panic!("{fmt}: record {i}: {e}"));
+                assert!(same_bits(&got, rec), "{fmt}: record {i}");
             }
         } else {
-            let reader = MmapReader::<T>::open(path).unwrap_or_else(|e| panic!("{fmt}: {e}"));
+            let reader = XvecReader::<T>::open_path(path).unwrap_or_else(|e| panic!("{fmt}: {e}"));
             assert_eq!((reader.dim(), reader.count()), (expected[0].len(), expected.len()), "{fmt}: shape");
             for (i, rec) in expected.iter().enumerate() {
-                let got = reader.get(i).unwrap_or_else(|| panic!("{fmt}: record {i}"));
+                let got = reader.get(i).unwrap_or_else(|e| panic!("{fmt}: record {i}: {e}"));
                 assert!(same_bits(&got, rec), "{fmt}: record {i}");
             }
         }

@@ -16,6 +16,9 @@ indexmap = { version = "2", features = ["serde"] }
 # conversion rules every reader applies. Shared with veks-io so the
 # two agree by construction.
 veks-datatypes = { path = "../veks-datatypes", version = "=4.0.2" }
+# The one implementation of the file formats: vectordata's readers are
+# veks-io's over its own storage (srd-loose-files-overlays-integrity §6.1).
+veks-io = { path = "../veks-io", version = "=4.0.2" }
 veks-anode = { path = "../veks-anode", version = "=4.0.2" }
 slabtastic = { path = "../slabtastic", version = "=4.0.2" }
 regex = "1"
@@ -94,6 +97,9 @@ path = "src/bin/vectordata.rs"
 
 [dev-dependencies]
 axum = "0.8"
+# The reader bench compares vectordata's readers with veks-io's on the
+# same files (srd-loose-files-overlays-integrity.md, IO-4).
+criterion = { version = "0.5", features = ["html_reports"] }
 hex = "0.4"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
@@ -105,6 +111,10 @@ shadow-terminal = "0.2"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
 url = "2.5"
+
+[[bench]]
+name = "readers"
+harness = false
 
 [lints]
 workspace = true

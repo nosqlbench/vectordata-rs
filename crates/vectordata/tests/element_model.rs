@@ -173,10 +173,10 @@ fn the_mismatch_error_names_both_types_and_the_reason() {
     let err = XvecReader::<i8>::open_path(&path).expect_err("a u8 file is not an i8 file");
     assert_eq!(
         err.to_string(),
-        "the file holds u8 elements and cannot be read as i8: a raw reader reads a file at its own type; open it through a dataset view to check each value"
+        "the file holds u8 elements and cannot be read as i8: a raw reader reads a file at its own type; open it through a dataset view or a converting reader to check each value"
     );
     let err = XvecReader::<f64>::open_path(&path).expect_err("a u8 file is not an f64 file");
-    assert!(err.to_string().ends_with("open it through a dataset view to widen"), "{err}");
+    assert!(err.to_string().ends_with("open it through a dataset view or a converting reader to widen"), "{err}");
     let err = XvecReader::<u8>::open_path(&dir.path().join("codes.xyz")).expect_err("unknown");
     assert!(err.to_string().contains("cannot infer element type from extension '.xyz'"), "{err}");
 }

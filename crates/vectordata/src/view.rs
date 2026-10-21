@@ -99,7 +99,7 @@ fn single_source<'a>(facet: &'a FacetConfig, what: &str) -> Result<&'a str> {
 /// Consulted only for a bare series entry, whose length the declaration
 /// does not state (SH-63). `None` when the format offers no answer from
 /// the file alone.
-pub(crate) fn records_in(path: &str, storage: &crate::storage::Storage) -> Option<u64> {
+pub(crate) fn records_in(path: &str, storage: &std::sync::Arc<crate::storage::Storage>) -> Option<u64> {
     let ext = path.rsplit('.').next().unwrap_or("");
     let elem_size = crate::io::infer_elem_size(ext);
     if elem_size == 0 {
@@ -3185,13 +3185,13 @@ impl<T, R> std::fmt::Debug for ShardedReader<T, R> {
 
 impl<T: Element> ShardedXvecReader<T> {
     fn open_xvec(series: std::sync::Arc<Series>) -> Result<Self> {
-        Self::open(series, crate::io::XvecReader::<T>::from_storage)
+        Self::open(series, crate::io::xvec_from_storage::<T>)
     }
 }
 
 impl<T: Element> ShardedScalarReader<T> {
     fn open_scalar(series: std::sync::Arc<Series>) -> Result<Self> {
-        Self::open(series, crate::io::ScalarReader::<T>::from_storage)
+        Self::open(series, crate::io::scalar_from_storage::<T>)
     }
 }
 
@@ -3401,7 +3401,7 @@ impl<T: Element> ShardedVvecReader<T> {
             return Ok(r);
         }
         let storage = self.series.file(i)?.clone();
-        let opened = crate::io::IndexedVvecReader::<T>::from_storage(
+        let opened = crate::io::vvec_from_storage::<T>(
             storage,
             &self.sources[i],
             self.elem_size,
@@ -3647,9 +3647,9 @@ impl GenericTestDataView {
         let storage = self.open_facet_storage(name)?;
         let reader: Box<dyn VectorReader<N>> = match container {
             crate::typed_access::Container::Scalar => {
-                Box::new(io::ScalarReader::<N>::from_storage(storage.storage_handle())?)
+                Box::new(io::scalar_from_storage::<N>(storage.storage_handle())?)
             }
-            _ => Box::new(io::XvecReader::<N>::from_storage(storage.storage_handle())?),
+            _ => Box::new(io::xvec_from_storage::<N>(storage.storage_handle())?),
         };
 
         let window = window_from_suffix.or_else(|| facet.window().and_then(parse_window_first));
@@ -3704,7 +3704,7 @@ impl GenericTestDataView {
         let path_or_url = self.resolve_as_string(facet)?;
         io::IndexedVvecReader::<T>::validate_source(&path_or_url)?;
         let storage = self.open_facet_storage(name)?;
-        Ok(Arc::new(io::IndexedVvecReader::<T>::from_storage(
+        Ok(Arc::new(io::vvec_from_storage::<T>(
             storage.storage_handle(),
             &path_or_url,
             T::SIZE,

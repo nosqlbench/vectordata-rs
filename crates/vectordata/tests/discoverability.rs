@@ -232,14 +232,19 @@ fn every_common_task_links_its_call_and_its_example_exists() {
 /// whether it is a deprecated duplicate of `fetch` (DX-30). Adding a
 /// new one means adding it here — which is the moment to ask whether
 /// it is a tenth way to do the same thing.
+///
+/// The readers' own page-cache methods (`prefetch_range`,
+/// `prefetch_pages`, `release_range`) are veks-io's, which implements
+/// the readers; what is here is what vectordata defines.
 const FETCH_BUDGET: &[(&str, &str, bool)] = &[
     ("fetch", "the canonical call: view, group, catalog, selection", false),
     ("plan_fetch", "the planning half of fetch", false),
     ("prefetch_in_background", "the background form, with a handle", false),
     ("prefetch_plan", "low-level: one facet's plan", false),
     ("prefetch_plan_on", "low-level: one facet's plan on an open handle", false),
-    ("prefetch_range", "page-cache hint on a mapped file; no network", false),
-    ("prefetch_pages", "page-cache fill on a mapped file; no network", false),
+    ("prefetch_range_bytes", "ByteSource: the page-cache hint over a byte range; no network", false),
+    ("prefetch_pages_bytes", "ByteSource: the page-cache fill over a byte range; no network", false),
+    ("fetch_sibling", "ByteSource: a sidecar published beside a file, for the vvec offset index", false),
     ("precache", "low-level: one file or facet, whole", false),
     ("prebuffer_with_progress", "low-level: one file or facet, whole, with transport progress", false),
     ("prebuffer_range_with_progress", "low-level: a byte range of one facet", false),

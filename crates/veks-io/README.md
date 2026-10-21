@@ -56,14 +56,20 @@ writer.finish()?;
 
 ## Zero-Copy Random Access
 
-For random-access on xvec files, use memory-mapped readers:
+For random access on xvec files, use `XvecReader` at the file's own
+type (`ScalarReader` for a header-free column, `IndexedVvecReader` for
+variable-length records). Each reads a local file through a memory
+mapping by default, and any other `ByteSource` you supply:
 
 ```rust
-use veks_io::xvec::mmap::MmapReader;
+use veks_io::{VectorReader, XvecReader};
 
-let reader = MmapReader::<f32>::open("base.fvecs".as_ref())?;
-let vec: Option<&[f32]> = reader.get_slice(42);  // zero-copy, no allocation
+let reader = XvecReader::<f32>::open_path("base.fvecs".as_ref())?;
+let vec: Option<&[f32]> = VectorReader::get_slice(&reader, 42);  // zero-copy, no allocation
 ```
+
+These are the readers `vectordata` uses for every dataset it opens,
+over its own source for remote and cached files.
 
 ## Variable-Length Vectors
 

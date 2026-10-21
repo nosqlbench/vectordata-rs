@@ -6407,6 +6407,7 @@ dependencies = [
  "anyhow",
  "axum",
  "byteorder",
+ "criterion",
  "crossterm",
  "filetime",
  "half",
@@ -6443,6 +6444,7 @@ dependencies = [
  "veks-completion",
  "veks-completion-derive",
  "veks-datatypes",
+ "veks-io",
  "veks-simd",
 ]
 
@@ -6575,6 +6577,7 @@ dependencies = [
  "parquet",
  "slabtastic",
  "tempfile",
+ "thiserror 2.0.21",
  "veks-datatypes",
 ]
 
