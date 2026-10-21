@@ -342,6 +342,19 @@ mod shared_client_tests {
     }
 }
 
+/// A small remote file as text, with read-side auth: what
+/// [`crate::fetch::fetch_text`] answers. Not for dataset bytes, which
+/// land in the cache through storage.
+pub(crate) fn fetch_text(url: &str) -> io::Result<String> {
+    let parsed = url::Url::parse(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{url}: {e}")))?;
+    let client = shared_client_for(url);
+    let resp = apply_read_auth(client.get(parsed.clone()), Some(&parsed)).send().map_err(io::Error::other)?;
+    if !resp.status().is_success() {
+        return Err(io::Error::other(format!("HTTP {} fetching {url}", resp.status())));
+    }
+    resp.text().map_err(io::Error::other)
+}
+
 /// Fetch a small remote file to a local path, preserving the remote
 /// `Last-Modified` timestamp as the local mtime.
 ///

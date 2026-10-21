@@ -744,3 +744,25 @@ pub(crate) fn fetch_planned(
     }
     Ok(Fetched { ranges, bytes: done })
 }
+
+/// Fetch a small remote file — a catalog, a list, a manifest — as text,
+/// with the read-side auth and the client every dataset fetch uses. In
+/// offline mode it is an error saying so; an answer that is not a
+/// success is an error naming its status.
+///
+/// For a dataset's facets use [`fetch`](crate::TestDataView::fetch):
+/// this is for the small files a program reads beside them.
+pub fn fetch_text(url: &str) -> std::io::Result<String> {
+    crate::transport::ensure_online(url)?;
+    crate::transport::fetch_text(url)
+}
+
+/// Keep `local_path` a copy of the small remote file at `url`: fetched
+/// when there is no copy or the server's `Last-Modified` is newer than
+/// it, left alone otherwise. `Ok(true)` when it was fetched. The copy's
+/// mtime is the server's `Last-Modified`, so the next call compares
+/// like with like. Same auth and client as [`fetch_text`].
+pub fn fetch_if_modified(url: &str, local_path: &std::path::Path) -> std::io::Result<bool> {
+    crate::transport::ensure_online(url)?;
+    crate::transport::fetch_if_modified(url, local_path)
+}

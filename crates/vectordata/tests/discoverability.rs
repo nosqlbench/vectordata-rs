@@ -245,6 +245,8 @@ const FETCH_BUDGET: &[(&str, &str, bool)] = &[
     ("prefetch_range_bytes", "ByteSource: the page-cache hint over a byte range; no network", false),
     ("prefetch_pages_bytes", "ByteSource: the page-cache fill over a byte range; no network", false),
     ("fetch_sibling", "ByteSource: a sidecar published beside a file, for the vvec offset index", false),
+    ("fetch_text", "a small remote file (a catalog, a list) as text, with the fetch path's auth", false),
+    ("fetch_if_modified", "keep a local copy of a small remote file current", false),
     ("precache", "low-level: one file or facet, whole", false),
     ("prebuffer_with_progress", "low-level: one file or facet, whole, with transport progress", false),
     ("prebuffer_range_with_progress", "low-level: a byte range of one facet", false),
