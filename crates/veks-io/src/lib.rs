@@ -116,6 +116,7 @@ pub mod reader;
 pub mod scalar;
 pub mod source;
 pub mod traits;
+pub mod writer;
 pub mod xvec;
 
 #[allow(deprecated)]
@@ -128,6 +129,7 @@ pub use reader::{
 };
 pub use reader::{open_vec, open_vec_as, open_vec_native, open_vvec, open_vvec_untyped};
 pub use source::{ByteSource, MappedFile, SourcePart};
+pub use writer::{ScalarWriter, VvecWriter, XvecWriter};
 pub use traits::{SourceMeta, VecSink, VecSource};
 pub use traits::{VarlenRecord, VarlenSink, VarlenSource};
 #[allow(deprecated)]

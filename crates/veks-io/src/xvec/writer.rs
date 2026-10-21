@@ -64,6 +64,7 @@ pub fn open(path: &Path, dimension: u32) -> Result<Box<dyn VecSink>, String> {
         // path. Grows on demand and is reused across batches so the steady
         // state has zero allocations in the hot loop.
         scratch: Vec::new(),
+        error: None,
     }))
 }
 
@@ -71,12 +72,30 @@ struct XvecWriter {
     writer: BufWriter<File>,
     dim_prefix: [u8; 4],
     scratch: Vec<u8>,
+    /// The first write that failed: kept, and returned by `finish`, so a
+    /// full disk is an error rather than a short file.
+    error: Option<std::io::Error>,
+}
+
+impl XvecWriter {
+    fn keep(&mut self, result: std::io::Result<()>) {
+        if let Err(e) = result
+            && self.error.is_none()
+        {
+            self.error = Some(e);
+        }
+    }
 }
 
 impl VecSink for XvecWriter {
     fn write_record(&mut self, _ordinal: i64, data: &[u8]) {
-        let _ = self.writer.write_all(&self.dim_prefix);
-        let _ = self.writer.write_all(data);
+        if self.error.is_some() {
+            return;
+        }
+        let header = self.writer.write_all(&self.dim_prefix);
+        self.keep(header);
+        let body = self.writer.write_all(data);
+        self.keep(body);
     }
 
     /// Write `count` fixed-dim records from a contiguous packed buffer of
@@ -119,10 +138,16 @@ impl VecSink for XvecWriter {
             dst += stride;
             src += record_size;
         }
-        let _ = self.writer.write_all(&self.scratch);
+        if self.error.is_none() {
+            let result = self.writer.write_all(&self.scratch);
+            self.keep(result);
+        }
     }
 
     fn finish(mut self: Box<Self>) -> Result<(), String> {
+        if let Some(e) = self.error.take() {
+            return Err(format!("write: {e}"));
+        }
         self.writer.flush().map_err(|e| format!("flush: {}", e))
     }
 }

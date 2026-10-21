@@ -375,6 +375,12 @@ fn write_index(index_path: &Path, offsets: &[u64], file_size: u64) -> Result<(),
     Ok(())
 }
 
+/// Write the `IDXFOR__` index of the variable-length file `data_path`,
+/// `file_size` bytes whose records start at `offsets`, beside it.
+pub(crate) fn write_offset_index(data_path: &Path, offsets: &[u64], file_size: u64) -> Result<(), IoError> {
+    write_index(&index_path_for(data_path, file_size), offsets, file_size)
+}
+
 /// Remove any `IDXFOR__` index beside a data file, before rewriting it,
 /// so a stale index is not read. The next open rebuilds it.
 pub fn remove_vvec_index(data_path: &Path) {

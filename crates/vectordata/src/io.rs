@@ -36,6 +36,7 @@ pub use veks_io::reader::{
     remove_vvec_index,
 };
 pub use veks_io::source::ByteSource;
+pub use veks_io::writer::{ScalarWriter, VvecWriter, XvecWriter};
 
 pub(crate) use veks_io::reader::{
     AnyElement, ext_of, infer_elem_size, is_scalar_ext, is_vvec_ext, records_to_read, require_native,

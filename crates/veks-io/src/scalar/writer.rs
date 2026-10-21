@@ -26,12 +26,15 @@ pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSink>, String> 
     Ok(Box::new(ScalarWriter {
         writer: BufWriter::with_capacity(4 * 1024 * 1024, file),
         element_size: elem_size,
+        error: None,
     }))
 }
 
 struct ScalarWriter {
     writer: BufWriter<std::fs::File>,
     element_size: usize,
+    /// The first write that failed, returned by `finish`.
+    error: Option<std::io::Error>,
 }
 
 impl VecSink for ScalarWriter {
@@ -39,11 +42,18 @@ impl VecSink for ScalarWriter {
         // Write raw element bytes — no dimension header
         debug_assert!(data.len() == self.element_size,
             "scalar write: expected {} bytes, got {}", self.element_size, data.len());
-        let _ = self.writer.write_all(data);
+        if self.error.is_none()
+            && let Err(e) = self.writer.write_all(data)
+        {
+            self.error = Some(e);
+        }
     }
 
     fn finish(self: Box<Self>) -> Result<(), String> {
         let mut inner = self;
+        if let Some(e) = inner.error.take() {
+            return Err(format!("write error: {e}"));
+        }
         inner.writer.flush()
             .map_err(|e| format!("flush error: {}", e))
     }
