@@ -89,6 +89,58 @@ let matches = catalog.match_glob("my-vectors*");
 
 ---
 
+## 3.1a Attribute overlays
+
+A host states or corrects a dataset's attributes in an overlay, and
+every reader of the dataset sees the result: the catalog entry
+(`entry.attributes()`, `entry.attribute(key)`), the opened group and
+its views (`view.distance()`), `datasets describe`, `list` and
+`explore`. `describe` prints each value with its source.
+
+```yaml
+# <config_dir>/overlays.yaml
+datasets:
+  ada002-100k:                  # any dataset of this name
+    distance_function: DOT_PRODUCT
+    is_normalized: true
+    fvec.ncentroids: 300        # a consumer's own key: namespaced, opaque
+catalogs:
+  bench:                        # only the entry in catalog `bench`
+    ada002-100k:
+      base_count: 99287
+```
+
+A key is a dataset attribute (`distance_function`, `is_normalized`,
+`model`, `license`, …), a stated count (`base_count`, `dimension`,
+`maxk`), or a consumer's key holding a `.`; any other key is warned
+about and ignored. Lowest to highest: the dataset's own attributes,
+those inferred from loose files' names, program overlays
+(`CatalogSources::with_overlay(Overlay::program(name, yaml)?)?`, in
+order — two setting one key for one dataset are refused), and the
+user's `overlays.yaml`, read from each configured directory. A
+`catalogs.<c>.<name>` block wins over `datasets.<name>` for catalog
+`c`. `--at` changes which catalogs are read, not the overlays.
+
+An overlay is believed and checked: a `base_count`, `dimension` or
+`maxk` the opened base or ground truth contradicts, and a
+`distance_function` the dataset declares otherwise, are each a warning
+once per process, naming the file, the key and both values; the
+overlay's value stays in force. `describe` marks such a value
+`(contradicted: …)` where the listing shows it, and `view.verify()`
+reports a contradicted count as V7.
+
+```bash
+vectordata config overlay set ada002-100k distance_function DOT_PRODUCT
+vectordata config overlay set ada002-100k base_count 99287 --catalog bench
+vectordata config overlay unset ada002-100k base_count --catalog bench
+vectordata config overlay show [ada002-100k]
+```
+
+Edits are line edits that keep every comment. `TestDataGroup::load` on
+a path reads no configuration; a program opening by path applies
+overlays with `group.with_overlays(&overlays)`, as a `Catalog` does for
+every dataset it opens.
+
 ## 3.2 Dataset Publishing
 
 Publishing uploads a prepared dataset to a static HTTP server (S3 or

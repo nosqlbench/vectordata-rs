@@ -1,7 +1,10 @@
 # SRD — Loose files, attribute overlays and dataset integrity
 
-**Status:** proposed 2026-10-21. The decisions in §9 were taken on
-2026-10-21. The release that
+**Status:** implemented 2026-10-21 (records in §11; steps 1–10 of
+§10, step 11 being these records and the docs). The decisions in §9
+were taken on 2026-10-21; where implementation settled something
+differently, §11 says so (OV-3's `load`, IN-5's local base, IN-7's
+legacy sidecar, the LF-5 format case). The release that
 carries it, and the version it takes, are the maintainer's.
 **Scope:** `vectordata` and `veks-io`. veks-io becomes the one
 implementation of every file format, which vectordata reads and writes
@@ -125,7 +128,7 @@ general: any reader of a dataset should see one answer.
 |---|------|
 | **LF-3 (I1)** | **Candidates.** Regular files in the directory (not recursive except as LF-10 says) whose extension `FacetFormat::from_extension` knows. Skipped: hidden files, `IDXFOR__*` sidecars, `*.chunks`, `*.mrkl`, `*.mref`, names containing `#`, and `*.provenance.json`. |
 | **LF-4 (I2)** | **Canonical name.** `StandardFacet::classify(file)` as it stands: `base_vectors.fvec`, `neighbor_indices.ivecs`, `metadata_content.slab`, and so on, plus a `__NNNN` series. Every standard facet is reachable this way. |
-| **LF-5 (I3)** | **Role token.** For a file LF-4 left unclassified, split the stem on `_` and `-`. Exactly one token, or one adjacent token pair (for `ground_truth`), must be a role alias. The aliases are `base`, `train` → base; `query`, `queries`, `test` → query; `gt`, `groundtruth`, `ground`+`truth`, `neighbors`, `indices` → neighbor_indices; `distances` → neighbor_distances. The vocabulary is `StandardFacet::from_alias`, restricted to these four facets. The format must be one that facet accepts, so `*_query_*.ivecs` is refused rather than reinterpreted. Two role tokens in one stem leave the file unclassified, and it is listed in the notes. |
+| **LF-5 (I3)** | **Role token.** For a file LF-4 left unclassified, split the stem on `_` and `-`. Exactly one token, or one adjacent token pair (for `ground_truth`), must be a role alias. The aliases are `base`, `train` → base; `query`, `queries`, `test` → query; `gt`, `groundtruth`, `ground`+`truth`, `neighbors`, `indices` → neighbor_indices; `distances` → neighbor_distances. The vocabulary is `StandardFacet::from_alias`, restricted to these four facets. The format must be one that facet accepts in the facet spec, so `*_gt_*.fvecs` is refused rather than reinterpreted (indices are integers), while `*_query_*.ivecs` is queries (the spec takes integer, quantized queries). Two role tokens in one stem leave the file unclassified, and it is listed in the notes. |
 | **LF-6 (I4)** | **Shape, only to finish.** If LF-4 and LF-5 leave a role of the minimum set (LF-8) unfilled, the remaining candidates are classified by their headers. An integer xvec whose record count equals one float xvec's count is the ground truth, and that float xvec is the queries. The remaining float xvec with the most records is the base. This applies only when it yields exactly one candidate per unfilled role, and the base must have more records than the queries. Otherwise the inference is refused with every leftover file's dim and count listed. A file classified by name is never reclassified by shape. |
 | **LF-7 (I5)** | **One file per role.** Two candidates for one facet is a refusal naming both, and the rule that matched each. A `__NNNN` series is one candidate. It must be contiguous from `0000`, and its first gap is named. |
 | **LF-8 (I6)** | **Minimum set.** base, query and neighbor_indices are required. neighbor_distances is taken when present. Every other facet (metadata, filtered, quantization) is taken only by LF-4. A missing role is a refusal naming the role and listing the unclassified files. |
@@ -145,7 +148,8 @@ Worked cases (each a test):
 | a 10m-row gt beside a 1m-row base | LF-9 refuses with the first bad row and column |
 | `glove_25_angular_base.fvecs, …_query.fvecs, …_gt_ip_100.ivecs` | opens, metric undeclared, with a note |
 | `profiles/base/base_vectors.fvec, profiles/default/{query_vectors,neighbor_indices}` | LF-10 |
-| `x_query.ivecs` | LF-5 refuses the format, and the file is listed unclassified |
+| `x_gt.fvecs` (with base and queries) | LF-5 refuses the format (indices are integers), the note says why, and LF-6 finds no integer file for the truth |
+| `codes_query.ivecs` | queries: the facet spec takes integer (quantized) queries, so a role token in an integer vector file is not a refusal |
 
 ### 3.3 Where it lives
 
@@ -199,10 +203,14 @@ dataset.yaml" error, and `DatasetHandle` records
   merged `DatasetAttributes`, so `list`, its filters, `explore` and
   `describe` see it. For a path or URL open, `open_spec` and
   `open_selection` apply the catalog's overlays to the group by its
-  name (`TestDataGroup::name()`). `TestDataGroup::load` alone applies
-  the user overlay. `TestDataGroup::attribute`, `view.distance()`,
-  `view.distance_function()` and `TestDataView::attributes()` read the
-  merged values.
+  name (`TestDataGroup::name()`). `TestDataGroup::load` reads no
+  configuration (no catalogs, no overlay), so a test or a program that
+  opens a path in code is not changed by a file in someone's home; it
+  applies overlays with `group.with_overlays(&overlays)`.
+  `TestDataGroup::attribute`, `view.distance()`,
+  `view.distance_function()` and `view.dataset_attribute(key)` read the
+  merged values. (Settled in implementation, 2026-10-21: the SRD first
+  had `load` read the user overlay.)
 - **OV-4. Access and provenance.** `CatalogEntry::attribute_source(key)
   -> Option<AttributeSource>` and the same on `TestDataGroup`.
   `AttributeSource` is `Dataset | Inferred { file, token } | Overlay {
@@ -348,10 +356,15 @@ dataset.yaml" error, and `DatasetHandle` records
   `write_all(rows)` and `finish() -> io::Result<u64>`. It refuses an
   extension whose element type is not `T`, and it propagates every
   I/O error. `ScalarWriter<T>` and `VvecWriter<T>` follow the same
-  shape. vectordata re-exports them from `vectordata::io` (D3), and its
-  private writers in `derive` and `shard_writer` move onto them. The
+  shape. vectordata re-exports them from `vectordata::io` (D3). The
   byte-level `xvec::writer::open` stays for the pipeline, but stops
   discarding errors: they are kept and returned by `finish()`.
+  vectordata's `derive` and `shard_writer` are not encoders — one
+  copies byte ranges of an existing file, the other writes the
+  record bytes it is given and owns shard rollover and the atomic
+  rename — so they stay copies; the one piece of format knowledge in
+  them, a uniform record's size from its first header, is veks-io's
+  `reader::xvec_record_bytes`, which the reader uses too.
 - **LS-4 (C3).** `LogMeter::quiet_when_resident(self, bool) -> Self`.
   When set, a plan whose files are all resident emits nothing, neither
   `PlanBegin` nor `PlanEnd`. A plan with anything to fetch reports as
@@ -425,6 +438,70 @@ one (D3).
   `XvecReader<T>` opens resolve to the same veks-io type through
   vectordata's re-export. No pipeline reader changes beyond the import
   path.
+
+### 6.2 IO-4 results before the move (2026-10-21)
+
+Run as `taskset -c 2 cargo bench -p vectordata --bench readers` on an
+Intel Xeon Platinum 8375C, warm page cache, 1 GiB uniform files (f32
+dim 128, u8 dim 128, i32 dim 100), a 1M-record ragged i32 file (dims
+1–64), and 1 GiB columns (4 GiB for u8). Median of criterion's
+estimate; the faster column is the technique veks-io keeps.
+
+| Case | vectordata | veks-io | Faster, and why |
+|------|-----------:|--------:|-----------------|
+| seq `read_into` f32 | 8.49 GiB/s | 8.46 GiB/s | tie: both one `memcpy` per record |
+| seq `read_into` u8 | 10.30 GiB/s | 10.23 GiB/s | tie |
+| seq `read_into` i32 | 8.44 GiB/s | 8.42 GiB/s | tie |
+| seq streaming `next_record` f32 / u8 / i32 | — | 2.56 / 1.36 / 2.81 GiB/s | veks-io's streaming reader allocates a `Vec` per record through a `BufReader`: 3–7× slower than either mapped reader; it reads its records into a reused buffer instead (IO-6) |
+| random `get` f32, 1M | 3.31 M/s | **7.79 M/s** | veks-io, 2.4×. Both decode element by element (`chunks_exact().map(from_le_bytes).collect()`); `perf` puts 87% of vectordata's time in that `from_iter` as an out-of-line function (~3.7× the instructions per get), while veks-io's inherent `get` inlined it into the caller. The moved `get` is one bulk copy into the new `Vec`, so it no longer depends on inlining |
+| random `get_slice` f32, 1M | 53.0 M/s | **69.3 M/s** | veks-io, 1.3×: indexes its mapping directly; vectordata matches the `Storage` enum on every call. Hence readers generic over a monomorphized source (IO-2), never a `dyn` source on the hot path |
+| vvec scan i32 | 1.57 GiB/s | 1.50 GiB/s (stream) | tie within 5% |
+| vvec random `get` i32, 1M | 4.55 M/s | — | baseline: veks-io has no indexed vvec reader yet |
+| scalar `as_slice` sum i32 / u8 | 3.15 GiB/s / 831 MiB/s | 3.15 GiB/s / 831 MiB/s | tie: the same slice; the loop bounds it |
+| scalar `as_slice` sum f32 | 2.76 GiB/s | 2.52 GiB/s | the same slice and loop; codegen of the two monomorphized loops, rechecked after the move |
+| scalar `read_into` i32 / f32 / u8 | 9.08 / 9.06 / 12.69 GiB/s | 9.07 / 9.12 / 12.71 GiB/s | tie |
+
+The raw log is reproduced by the command above; the bench is
+`crates/vectordata/benches/readers.rs`.
+
+### 6.3 IO-4 results after the move (2026-10-21)
+
+The same command and files. `vectordata` is now veks-io's reader over
+`StorageSource`, `veks-io` the same reader over `MappedFile`. The
+"best before" column is the faster of the two in §6.2.
+
+| Case | vectordata | veks-io | Best before | |
+|------|-----------:|--------:|------------:|--|
+| seq `read_into` f32 / u8 / i32 | 8.48 / 10.36 / 8.46 GiB/s | 8.39 / 10.32 / 8.45 GiB/s | 8.49 / 10.30 / 8.44 | tie |
+| seq streaming `next_record` f32 / u8 / i32 | — | 5.00 / 3.39 / 5.30 GiB/s | 2.56 / 1.36 / 2.81 | 1.9–2.5× (IO-6: read from the mapping) |
+| seq streaming `read_record_into` f32 / u8 / i32 | — | 6.05 / 5.49 / 6.60 GiB/s | — | new: one buffer per scan |
+| random `get` f32 | 9.09 M/s | 9.01 M/s | 7.79 | 1.17× (bulk copy from the kept base) |
+| random `get_slice` f32 | 70.4 M/s | 70.6 M/s | 69.3 | tie, at veks-io's speed over either source |
+| vvec scan i32 | 3.88 GiB/s | 3.51 GiB/s (stream) | 1.57 | 2.5× (bulk copy of the borrowed record) |
+| vvec random `get` i32 | 7.56 M/s | — | 4.55 | 1.66× |
+| scalar `as_slice` sum i32 / u8 | 3.15 GiB/s / 831 MiB/s | 3.15 GiB/s / 830 MiB/s | 3.15 / 831 | tie |
+| scalar `as_slice` sum f32 | 2.14 GiB/s | 2.14 GiB/s | 2.76 | not the reader: see below |
+| scalar `read_into` i32 / f32 / u8 | 9.09 / 9.12 / 12.56 GiB/s | 9.09 / 9.12 / 12.57 GiB/s | 9.08 / 9.12 / 12.71 | tie |
+
+The random `get` row is from a re-run of that case after `get` was
+changed to read from the kept base; the first after-run measured
+6.45 M/s, below the best before, and that was fixed rather than
+recorded.
+
+The f32 column sum is the bench's own loop. `as_slice` returns the
+same borrowed slice in O(1) either way, and `perf` puts all the time
+in the bench closure: 57% in the per-element `widen` call through a
+function pointer, the rest in the loop. That number changes with how
+the bench binary is compiled and not with the reader: 2.76 and 2.52
+for the two readers before, 2.14 for both in the after-run, and 2.55
+for both in a later rebuild with no reader change. It is reported
+as measured, not as a regression or a gain.
+
+- **IO-6.** veks-io's streaming readers (`open`, `open_varlen`) stop
+  allocating per record: `next_record` keeps its trait shape, and a
+  `read_record_into(&mut Vec<u8>) -> bool` reuses the caller's
+  buffer. Mapped files are read through the mapped reader rather than
+  a `BufReader` copy. The bench's streaming cases measure both.
 
 ## 7. Non-goals
 
@@ -524,3 +601,252 @@ Each step is one themed commit when the maintainer asks.
    APIs), `AGENTS.md` (`datasets init`, `config overlay`), and the
    CHANGELOG under Unreleased. The SRD status is updated with records.
    Fastervector is told what shipped once the maintainer says so.
+
+## 11. Implementation
+
+### 11.1 Step 1: `catalog add .` (2026-10-21)
+
+- `config::saved_location(source, cwd)`: a URL as written; a path made
+  absolute against the working directory with `.` and `..` removed
+  lexically (symlinks kept). The name follows from it.
+- `add_catalog_ex`, `try_add_catalog` and `force_add_catalog` save
+  that form; `remove` matches the spelling given, then the saved form.
+- Guard: `tests/cli_config_catalog.rs`, failing on the old code with
+  `0: .`.
+
+### 11.2 Step 2: the reader bench (2026-10-21)
+
+- `crates/vectordata/benches/readers.rs`, results in §6.2.
+
+### 11.3 Step 3: veks-io is the format layer (2026-10-21)
+
+- veks-io `source`: `ByteSource` (with `SourcePart`), `MappedFile`,
+  and `source::mapping`, the one implementation of `madvise` use;
+  vectordata's `Storage` advises through it.
+- veks-io `reader`: `IoError`, `VectorReader`, `VvecReader`,
+  `XvecReader<T, S = MappedFile>`, `IndexedVvecReader<T, S>` with the
+  `IDXFOR__` index (`load_offsets`, one path for local and remote:
+  sidecar beside the local file or copy, published sidecar via
+  `ByteSource::fetch_sibling`, walk when complete, refusal otherwise),
+  `ScalarReader<T, S>`, `StreamReclaim`, `ConvertingReader`,
+  `AnyVectorReader`/`AnyVvecReader`/`AnyElement`, the extension
+  helpers, and `open_vec*`/`open_vvec*` with `_with::<S>` forms.
+- vectordata `io`: re-exports, `StorageSource` (the `ByteSource` over
+  `Storage`), the aliases `XvecReader<T>` = `veks_io::XvecReader<T,
+  StorageSource>` and likewise, the `*_from_storage` constructors the
+  view uses, and the open functions over storage. Its format code is
+  gone; vectordata depends on veks-io.
+- `IoError::Http(reqwest::Error)` is `IoError::Transport(Box<dyn
+  Error + Send + Sync>)`: veks-io does not depend on an HTTP client.
+- Semantics settled where the two differed: an empty file is zero
+  records (vectordata's rule; veks-io refused it); the dimension check
+  uses checked arithmetic and says "dimension N is not positive"
+  (veks-io's); a uniform reader refuses a variable-length extension
+  (veks-io's; vectordata opened one whose records happened to be one
+  stride).
+- veks-io `MmapReader<T>`, `ScalarMmapReader<T>` and `MmapError` are
+  deprecated aliases of the new types; the per-type constructors stay
+  deprecated on them.
+- The techniques kept for speed: `get` copies a record in bulk
+  (`decode_vec`), and a uniform reader keeps its source's mapped base
+  after the first answer, for `get` and both `get_slice` forms. Guards in `veks-io/tests/reader_hot_paths.rs`:
+  with each technique switched off, 100 records of 64 elements decoded
+  6400 elements one by one, and 3000 reads asked the source 2000
+  times (1001 with only `get` reverted); both pass with them.
+- The bench after the move is §6.3.
+- IO-6: the streaming readers (`open`, `open_varlen`) read from a
+  mapping, release the pages behind the cursor every 256 MiB, and
+  `VecSource::read_record_into` reuses the caller's buffer.
+- Tests moved with the code: the sidecar layouts and the atomic index
+  write (to `reader/vvec.rs`), the scalar extension table (to
+  `reader/mod.rs`); veks-io's element-model guards ported to the new
+  types; the doc-example coverage lists in both crates follow the
+  items.
+
+### 11.4 Step 4: typed writers (2026-10-21)
+
+- veks-io `writer`: `XvecWriter<T>` (`create(path, dim)`, `write`,
+  `write_all`, `write_packed`, `finish`), `ScalarWriter<T>`,
+  `VvecWriter<T>` (writes its `IDXFOR__` index on `finish`, and removes
+  a stale one on `create`). Errors are `IoError`, the readers' type, so
+  a refused extension is the same `ElementMismatch`. Re-exported at the
+  veks-io root and from `vectordata::io`.
+- The byte-level xvec, scalar and varlen sinks keep their first write
+  error and return it from `finish`.
+- `reader::xvec_record_bytes`, used by `XvecReader::from_source` and
+  `derive`'s window copy (which accepted a negative dimension as a
+  huge one).
+- Guards in `veks-io/tests/writers.rs`: every element type through the
+  three writers and back; the refusals; a rewritten vvec read by its
+  own index; a full disk (`/dev/full`) an error from every writer —
+  failing on the old byte writer with "reported success".
+
+### 11.5 Step 5: verification (2026-10-21)
+
+- `vectordata::verify`: `Check` (V1–V7), `VerifyFailure`,
+  `VerifyReport`, `VerifyOptions { skip_absent }`, `VerifyProgress`
+  (any `FnMut(&str, u64, u64)`), `NoProgress`.
+  `TestDataViewExt::verify` (erring with `Error::Verification`) and
+  `verify_report` (listing); `DatasetSelection::verify`, failures
+  prefixed by profile.
+- V8 (normalization) waits for step 9; V7 checks the dataset's own
+  `base_count` until overlays (step 7) add theirs.
+- `veks check`'s EA-33 is `verify_report` per non-layer profile, with
+  `skip_absent` and files named relative to the dataset; its messages
+  and progress label are unchanged.
+- Guards: `vectordata/tests/verify.rs` (each check failing, a passing
+  profile, the sentinel rule, skip-absent, progress from 0 to every
+  row, a selection); `veks check` reporting queries of another
+  dimension, failing with the old EA-33 body.
+
+### 11.6 Step 6: loose files (2026-10-21)
+
+- `dataset::infer`: `infer_dir(&Path) -> Result<Inferred, InferError>`
+  (LF-3 to LF-12), `Inferred { yaml, config, classified, notes }` with
+  `summary()`, `Classified { profile, facet, source, rule }`, `Rule`,
+  `InferError` (each variant naming its candidates),
+  `has_loose_files`.
+- The descriptor is built as `dataset.yaml` text and parsed back, so
+  the in-memory one and the one `datasets init` writes are the same;
+  a series carries `shard_stride`, `shard_count` and `record_count`,
+  and `format_version: 2`.
+- `TestDataGroup::load_from_path`: `dataset.yaml`, then
+  `knn_entries.yaml`, then — when the directory has candidates — the
+  inference, logged once per process per directory with its notes;
+  an empty directory is still `ConfigIo` (no descriptor).
+  `TestDataGroup::inferred()` and `datasets describe` (`Type: inferred
+  from its files`, `Read as: …`).
+- `datasets init <dir> [--force]` (`datasets::init::init`): refuses an
+  existing `dataset.yaml` without `--force`, and a `knn_entries.yaml`.
+- LF-12's normalization claim uses `verify::measure_normalization`
+  (IN-4's sample, here unrecorded; step 9 records it).
+- Settled against the facet spec: integer queries are queries, so a
+  `_query_` token in an `.ivecs` file classifies it; the example of a
+  refused format is a `_gt_` `.fvecs`.
+- Guards: `tests/loose_files.rs`, one per §3.2 case, a series and its
+  gap, the normalization claim, `init`, and `datasets describe <dir>`
+  through the binary, which on the old binary fails with "Failed to
+  read dataset configuration: No such file or directory".
+
+### 11.7 Step 7: overlays (2026-10-21)
+
+- `vectordata::overlay`: `Overlay` (`parse`, `program`, `load_user`,
+  `values_for`, `warnings`), `Overlays` (`add_program` refusing a key
+  two programs set, `set_user`, `resolve`), `Stated`,
+  `AttributeSource` (`Dataset`, `Inferred`, `Overlay { file, kind }`),
+  `OverlayKind`, `Claims`, `KNOWN_KEYS`, `is_settable`, and the line
+  editor `set_text` / `unset_text`.
+- `CatalogSources`: `overlays` beside the catalogs; `configure*` reads
+  `<dir>/overlays.yaml` as the user's; `with_overlay`, `overlays`,
+  `with_overlays_from` (what `--at` keeps); `extend`, `named` and
+  `reload_configured` carry them.
+- `Catalog::of` applies them to every entry; `Catalog::overlays`.
+  `CatalogEntry`: `attributes()` merged, `own_attributes()`,
+  `attribute(key)`, `attribute_source(key)`, `attributes_in(ns)`,
+  `overlaid()`. The listing written to a catalog file is the
+  catalog's own; an overlay is never written into one.
+- `TestDataGroup`: `with_overlays`, `attribute_source`; an entry
+  opened from a catalog carries its overlay into the group's
+  attributes. `open_selection` applies the catalog's overlays to a
+  path it opens.
+- OV-5: `GenericTestDataView::probe_overlay` at `open_any_native` (the
+  one place every typed open passes), for the whole base only;
+  `CatalogEntry::apply_overlay` for a distance the dataset declares
+  otherwise; `warn_contradiction` once per (dataset, key). `verify`
+  V7 compares the stated `base_count`, `dimension` and `maxk`
+  (`TestDataView::dataset_attribute`). `describe` marks a value its
+  listing contradicts.
+- `vectordata config overlay set | unset | show`
+  (`config::overlay_set` / `overlay_unset` / `overlay_show`, each
+  taking the configuration directory).
+- Guards: `overlay.rs` unit tests (the editor keeps comments, the
+  precedence, the program conflict, the unknown key);
+  `tests/overlays.rs` (a knn_entries dataset's metric through the
+  entry and the view; precedence across overlays and catalogs;
+  namespaced keys; a contradicted count warned once, in force, V7; a
+  contradicted metric warned; `config overlay` and `describe` through
+  the binary, with and without `--at`). The old binary describes the
+  same knn dataset with "no attributes recorded".
+
+### 11.8 Step 8: content identity (2026-10-21)
+
+- `merkle::ContentId { root, kind }`, `ContentIdKind` (`Published`,
+  `Recorded`, `Computed`); `FacetStorage::content_id`,
+  `content_id_with_progress`, `verify_cached`; `Storage::content_id`
+  and `verify_cached`; `CachedChannel::verify_cached`. A series has no
+  content identity (`None`): it is no one tree.
+- `MerkleRef::from_leaves`: the one tree builder, used by
+  `from_content`, `from_path_with_progress` and the recorded tree.
+- `ChunkStore`: leaves recorded as chunks land (and hashed back from
+  the cache file after a whole-file transfer); `.chunks` in the
+  `.mrkl` format; `persist_leaf` writes one leaf and merges the bitset
+  per chunk (`MerkleState::checkpoint`), the whole tree only when the
+  sidecar is created and on completion; `content_root` hashes the
+  leaves a legacy sidecar lacks, once, with progress; `verify_recorded`.
+- `read_sidecar` reads both formats (the footer's length marker, 45,
+  against a bitmap's 0/1 bytes), and is what `complete_size_on_disk`
+  and the explorer's cache survey use. A sidecar whose chunk count is
+  not the file's is not read, as `ChunkStore::open` never read one;
+  the picker's fixture that had a two-chunk bitmap for a one-chunk file
+  was corrected.
+- Changed from §5.3 as written: a legacy sidecar is not upgraded at
+  open (a TB-scale base would be hashed inside an open); its leaves are
+  hashed on the first `content_id`.
+- V9 (`VerifyOptions::cached_chunks`, opt-in: it reads every cached
+  byte).
+- Guards: `a_recorded_chunk_writes_its_leaf_and_bits_not_the_tree`
+  (200 chunks of a 512 GiB file's 4 MiB tree: 840 MB written with a
+  whole-tree rewrite per chunk, within the 1.7 MB limit without);
+  `a_legacy_complete_file_is_hashed_once_for_its_content_root`;
+  `a_legacy_bitmap_sidecar_reads_and_rewrites_in_the_tree_format`;
+  `tests/content_id.rs` (a served file without a `.mref`: no root while
+  partial, then the root a `.mref` of the same bytes has, equal to the
+  local copy's computed root; V9 passing, then naming the chunk a
+  flipped byte is in). The content-identity API is new, so it has no
+  old-code form to fail; the old store's sidecar held no hashes.
+
+### 11.9 Step 9: measured normalization (2026-10-21)
+
+- `verify::measure_normalization` (step 6), `recorded_normalization`,
+  `normalization`, `Normalization { value, source, measured,
+  contradicted }`, `MEASURED_FILE`; `TestDataViewExt::normalization`;
+  `AttributeSource::Measured { file }`; V8 in `verify` when the base is
+  resident, so verification never fetches a sample.
+- `TestDataView::dataset_attribute_source` and `cache_name` (provided;
+  the generic view carries the group's attribute sources); 
+  `FacetStorage::known_content_id` and `Storage::known_content_id`,
+  the identity the cache knows without reading the file.
+- Settled in implementation against D2: a measurement is recorded by
+  the identity the cache already knows (a published root, or a
+  recorded one once a fetch completes). A local base is not recorded
+  — its identity is a read of the whole file, a TB-scale cost to key a
+  1000-row sample, and the storage layer deliberately creates no cache
+  directory for a local dataset — and is measured each time, which
+  costs 1000 local reads. A partly fetched base is measured and not
+  recorded.
+- Guards: `tests/normalization.rs` (a contradicted dataset declaration
+  is V8; an overlay's warned once; a local base measured with nothing
+  written; a remote base's measurement recorded by content id and
+  read back after its cached bytes are corrupted — failing with the
+  record lookup off; an inferred claim sourced `Inferred`).
+
+### 11.10 Step 10: library surface (2026-10-21)
+
+- LS-2: `fetch::fetch_text` and `fetch::fetch_if_modified` (offline:
+  an error); the request lives in `transport`, the one network entry
+  point, which the discoverability guard holds; both budgeted in
+  `FETCH_BUDGET`.
+- LS-4: `LogMeter::quiet_when_resident` (the `planning` line deferred
+  to the plan's result, nothing for a resident plan or a run that
+  fetches nothing, the stall watchdog unchanged) and
+  `TextMeter::quiet_when_resident` (the planning ticker still moves; a
+  resident plan's line is erased, `Ticker::dismiss`).
+- LS-5: `shell::completion_node`, `shell::complete` (the completer's
+  first word is the command's own name, which `complete` supplies),
+  and `completions` under an embedding name explaining how and exiting
+  1.
+- Guards: the two quiet-meter unit tests (a resident plan silent, one
+  with bytes to fetch reported with its planning line, a silent run;
+  the terminal meter's line erased); `tests/fetch_text.rs` against the
+  test server; `a_host_completes_the_embedded_cli_from_its_own_tree`
+  grafting the node under a host tree.

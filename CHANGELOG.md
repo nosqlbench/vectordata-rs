@@ -2,8 +2,126 @@
 
 ## Unreleased
 
+One implementation of every file format. veks-io's readers are now
+the readers: vectordata's `XvecReader`, `IndexedVvecReader` and
+`ScalarReader` are veks-io's, over vectordata's storage, and its own
+copies are gone. The faster technique of each won, measured: random
+`get` is 2.7× vectordata's before and the vvec scan 2.5×, and
+veks-io's streaming readers are 2–2.5× faster. The design and the
+measurements are `docs/design/srd-loose-files-overlays-integrity.md`
+§6.
+
+### Highlights
+
+- **veks-io's readers take any byte source.** `XvecReader<T, S>`,
+  `IndexedVvecReader<T, S>`, `ScalarReader<T, S>` and `StreamReclaim`
+  are generic over a `ByteSource`, defaulting to `MappedFile`, a local
+  file. `open_vec`, `open_vec_as`, `open_vec_native`, `open_vvec`,
+  `ConvertingReader` and `AnyVectorReader` are veks-io's too. A program
+  reading its own local files needs only veks-io.
+- **`vectordata::io` is veks-io over vectordata's storage.** Every path
+  in it stays: `XvecReader<T>` is `veks_io::XvecReader<T,
+  StorageSource>`, and so on. vectordata depends on veks-io.
+- **Typed writers: `XvecWriter<T>`, `ScalarWriter<T>`,
+  `VvecWriter<T>`** in veks-io, re-exported from `vectordata::io`: rows
+  of `T` into the layout the extension names, refusing another type
+  or a row of the wrong length, returning every I/O error.
+  `VvecWriter` writes the `IDXFOR__` index as it finishes.
+- **`view.normalization()`: whether the base is unit length, and on
+  whose word** — the declared `is_normalized` checked against a
+  1000-vector sample, or the sample when nothing declares it. A remote
+  base's sample is recorded in its cache directory by content identity
+  and not re-taken; a contradicted declaration is marked, an
+  overlay's warned about, and `verify()` reports it as V8.
+- **Every facet has a content identity: `FacetStorage::content_id()`**,
+  the root of a merkle tree over its bytes — the publisher's `.mref`
+  root, the root recorded as the chunks of a file published without
+  one were fetched, or a local file's, computed once per process.
+  Equal bytes have equal roots, so a run can fingerprint its inputs
+  exactly. A facet fetched without a `.mref` now records that tree in
+  its `.chunks` sidecar as it lands (the `.mrkl` format; one leaf and
+  the bitset per chunk, never the whole tree); a sidecar of the
+  earlier format is read as before, and its leaves are hashed once
+  when an identity is asked for. `verify_cached` and the opt-in V9
+  check find cached chunks changed since they landed.
+- **Attribute overlays: state or correct a dataset's attributes on a
+  host.** `<config_dir>/overlays.yaml` (edited with `vectordata config
+  overlay set | unset | show`, comments kept) and program overlays
+  (`CatalogSources::with_overlay`) are merged over a dataset's own
+  attributes, so the catalog entry, `view.distance()`, `describe`,
+  `list` and `explore` all read one answer — a `knn_entries.yaml`
+  dataset gets the metric its catalog never states. Consumers'
+  namespaced keys (`fvec.ncentroids`) read back through
+  `attribute(key)` and `attributes_in(namespace)`.
+  `attribute_source(key)` and `describe` say where each value came
+  from. A count an opened facet contradicts, or a metric the dataset
+  declares otherwise, is a warning once per process; the overlay
+  stays in force, and `verify()` reports the count as V7.
+- **A directory of loose files is a dataset.** A local directory with
+  three vector files and no `dataset.yaml` opens as the descriptor its
+  files imply — canonical facet names, else one role token per name
+  (`base`, `query`, `gt`, …), else the files' shapes — verified before
+  use, every ambiguity refused naming the candidates. `datasets
+  describe <dir>` says it was inferred and what each file was read as.
+  `vectordata datasets init <dir>` writes that `dataset.yaml`;
+  `dataset::infer::infer_dir` is the library form. A metric token in
+  the names (`ip`, `angular`, `l2`, …) declares the distance function
+  when they agree. The rules are in sysref 01 §1.5.
+- **`view.verify(&mut progress)` proves a profile's facets belong
+  together** (`TestDataViewExt`; `DatasetSelection::verify` for every
+  selected profile): every facet opens, the queries have the base's
+  dimension, a ground truth has one row per query, every index names a
+  base vector (or is a filtered truth's `-1`), the distances match the
+  truth, a declared `base_count` is the base's. A failure is
+  `Error::Verification`, naming the check, the facet, the file and
+  what it found. The index scan reports progress. `veks check` makes
+  its ground-truth checks through it, and so now also reports queries
+  of another dimension and a wrong `base_count`.
+- **`vectordata::fetch::fetch_text(url)` and `fetch_if_modified(url,
+  path)`**: the small files a program reads beside a dataset — a
+  catalog, a list — fetched with the client, auth and offline rule the
+  dataset fetches use, so a program needs no HTTP client of its own.
+- **`LogMeter::quiet_when_resident` and `TextMeter::quiet_when_resident`**:
+  nothing for a facet whose plan has nothing to fetch, nor for a run
+  that fetches nothing; a remote facet still reports what it costs.
+- **Completion for an embedded CLI**: `shell::completion_node()` grafts
+  under a host's own `vectordata` subcommand, and `shell::complete(words)`
+  answers for a host not built on veks-completion. `completions` under
+  an embedding name says how, instead of printing a script bound to the
+  `vectordata` executable.
+- **`VecSource::read_record_into(&mut Vec<u8>)`** streams a file into
+  one buffer instead of a new `Vec` per record. The streaming readers
+  read from a mapping and release the pages behind the cursor.
+
+### Breaking
+
+- `vectordata::io::IoError::Http(reqwest::Error)` is
+  `IoError::Transport(Box<dyn Error + Send + Sync>)`: the error type
+  is veks-io's, which has no HTTP client.
+- veks-io: `MmapReader<T>` and `ScalarMmapReader<T>` are deprecated
+  aliases of `XvecReader<T>` and `ScalarReader<T>`, and `MmapError` of
+  `IoError`. `open(&Path)` is `open_path(&Path)`; `get(i)` returns
+  `Result`; the bounds-checked `get_slice` is
+  `VectorReader::get_slice`, and the inherent one is the unchecked
+  inner-loop form.
+- veks-io's readers read an empty file as zero records, as
+  vectordata's did, where they refused it.
+- A uniform reader refuses a variable-length extension (`.fvvecs`)
+  and names `IndexedVvecReader`; vectordata's opened one whose records
+  happened to be one length.
+- The refusal of a convertible type now reads "open it through a
+  dataset view or a converting reader to widen" (or "to check each
+  value").
+
 ### Fixes
 
+- **veks-io's byte-level writers reported a full disk as success.**
+  `xvec::writer`, `scalar::writer` and the varlen writer discarded
+  every write error, so a batch larger than their buffer, written
+  straight to the file, could fail and `finish` still return `Ok`.
+  They keep the first error and `finish` returns it.
+- **`datasets derive` read a negative dimension as a huge one** when
+  copying a window of a uniform file; it is refused.
 - **`config catalog add .` saves the directory, absolute, under its
   name.** It saved `0: .`: relative, so it resolved only from that
   working directory, and named by index, so `config catalog remove`

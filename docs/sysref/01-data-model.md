@@ -286,6 +286,33 @@ The pipeline infers which facets to produce from the inputs provided:
 | B + Q + GT + synthesize | B Q G M P R F E |
 | above + `+O` | B Q G M P R F E O (O must be explicit, partitions get BQG) |
 
+### A directory of loose files
+
+A local directory with neither `dataset.yaml` nor `knn_entries.yaml`,
+holding vector files vectordata did not produce, opens as the
+descriptor its files imply; `vectordata datasets init <dir>` writes
+that descriptor beside them, after which opens are declared. The rules
+apply in order, and every ambiguity is a refusal naming the candidates
+(`dataset::infer`; `docs/design/srd-loose-files-overlays-integrity.md`
+§3):
+
+| Rule | |
+|------|-|
+| LF-3 | Candidates: regular files whose extension a facet format knows; not hidden files, `IDXFOR__` sidecars, `.chunks`, `.mrkl`, `.mref`, `.provenance.json`, or names holding `#` |
+| LF-4 | A canonical facet name classifies a file (`base_vectors.fvec`), or a `__NNNN` series of them |
+| LF-5 | Else one role token in the `_`/`-`-split stem: `base`/`train`; `query`/`queries`/`test`; `gt`/`groundtruth`/`ground_truth`/`neighbors`/`indices`; `distances` — in a format the facet takes (a `_gt_` `.fvecs` is not a ground truth; a `_query_` `.ivecs` is quantized queries). Two roles in one stem classify nothing |
+| LF-6 | Else, to fill the base, queries or ground truth, the shapes: an integer file with a float file's record count is the truth and that float file the queries; the float file with the most records is the base. One candidate per role, or a refusal listing every file's shape |
+| LF-7 | One file per facet; a series runs from `0000` with no gap |
+| LF-8 | Base, queries and ground truth are required; distances are taken when present; other facets only by canonical name |
+| LF-9 | Verified (V1–V7, §2.7 of 02-api) before use |
+| LF-10 | `profiles/<p>/` with no descriptor: a veks dataset that lost it — each a profile by canonical names, `profiles/base/` lending its facets |
+| LF-11 | Named after the directory, profile `default`, `maxk` the truth's width, `base_count` the base's count |
+| LF-12 | `angular`/`cosine`/`cos`, `euclidean`/`l2`, `dot`/`ip`/`mips` in the directory or file names declare the metric when all agree; `norm`/`normalized` declares a normalized base when a 1000-vector sample is unit length |
+
+A URL is never inferred (a server directory cannot be listed), nor is a
+catalog name. An empty directory is a missing `dataset.yaml`, as
+before.
+
 ---
 
 ## 1.6 Dataset Layout

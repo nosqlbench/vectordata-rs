@@ -435,6 +435,18 @@ let dim: usize = r.dim_at(42)?;
 
 ## 2.5 Traits and concrete types
 
+The readers and their traits are veks-io's: veks-io is the one
+implementation of every file format in the workspace, and
+`vectordata::io` re-exports it. Each reader is generic over a
+`ByteSource` (where the bytes come from): veks-io's `MappedFile` for a
+local file, and vectordata's `StorageSource` for everything a dataset
+reads — local, remote and cached, fetched on demand, or a series of
+files read as one. `vectordata::io::XvecReader<T>` is
+`veks_io::XvecReader<T, StorageSource>`, and likewise
+`IndexedVvecReader<T>`, `ScalarReader<T>` and `StreamReclaim<'a, T>`; a
+program reading only its own local files can use veks-io alone, with
+the same types over `MappedFile`.
+
 ### `VectorReader<T>` — uniform vectors
 
 ```rust
@@ -460,8 +472,8 @@ pub trait VectorReader<T>: Send + Sync {
     // the element type the file holds, when the reader knows it
     fn native_element_type(&self) -> Option<ElementType> { None }
 
-    // drive underlying storage to fully resident; no-op for local/direct-HTTP
-    fn prebuffer(&self) -> std::io::Result<()> { Ok(()) }
+    // bring the whole file here, so later reads are zero-copy; no-op for local
+    fn precache(&self) -> std::io::Result<()> { Ok(()) }
 
     // true for local; true for cached once every chunk is verified; false for direct-HTTP
     fn is_complete(&self) -> bool { true }
@@ -475,7 +487,10 @@ The concrete implementations, each generic over `T: Element`:
   unchecked `get_slice(index) -> &[T]` (panics if the storage is not
   mmap-backed; intended for KNN inner loops), plus `advise_sequential`
   / `advise_random`, `prefetch_range`, `release_range`, and
-  `prefetch_pages` (madvise hints; no-op when not mmap-backed).
+  `prefetch_pages` (madvise hints; no-op when not mmap-backed). An
+  empty file is zero records with `dim() == DIM_UNDEFINED`; a column
+  (`.u8`) or a variable-length file (`.ivvecs`) is refused, naming the
+  reader to use.
 - `ScalarReader<T>` — a header-free column (`.u8`, `.f32`, …): `dim()
   == 1`, `count = size / T::SIZE` (a remainder is `InvalidFormat`),
   `get`/`get_slice` at `i × SIZE`, and `as_slice()` is the whole
@@ -492,6 +507,26 @@ The concrete implementations, each generic over `T: Element`:
   (native only, else `ElementMismatch`), `as_type::<T>()` (through the
   conversion table). `AnyVvecReader` is the same over `VvecReader`.
 
+### Writers
+
+`XvecWriter<T>`, `ScalarWriter<T>` and `VvecWriter<T>` (veks-io's,
+re-exported from `vectordata::io`) write rows of `T` into the layout
+the extension names: `create` refuses an extension of another type or
+layout, `write` refuses a row of the wrong length, and every I/O error
+is returned, from the call or from `finish`, which returns the record
+count. `VvecWriter::finish` writes the `IDXFOR__` index beside the file
+(§2.10).
+
+```rust
+use vectordata::io::XvecWriter;
+
+let mut base = XvecWriter::<f32>::create("base.fvecs".as_ref(), 128)?;
+for row in rows {
+    base.write(&row)?;          // exactly 128 elements
+}
+let written = base.finish()?;   // record count
+```
+
 ### `VvecReader<T>` — variable-length vectors
 
 ```rust
@@ -500,7 +535,7 @@ pub trait VvecReader<T: Element>: Send + Sync {
     fn dim_at(&self, index: usize) -> Result<usize, IoError>;
     fn get_bytes(&self, index: usize) -> Result<Vec<u8>, IoError>;
     fn get(&self, index: usize) -> Result<Vec<T>, IoError>;        // default impl
-    fn prebuffer(&self) -> std::io::Result<()>;
+    fn precache(&self) -> std::io::Result<()>;
     fn is_complete(&self) -> bool;
 }
 ```
@@ -738,6 +773,47 @@ match view.open_facet_native("base_vectors")? {
     other => { let as_f64 = other.as_type::<f64>()?; /* or widen to f64, which every ≤32-bit type is */ }
 }
 ```
+
+### Verifying a profile
+
+`view.verify(&mut progress)` (`TestDataViewExt`) proves a profile's
+facets belong together before a vector of it is used, and
+`selection.verify(&mut progress)` does it for every selected profile:
+
+| Check | What it proves |
+|-------|----------------|
+| V1 | every facet opens: a positive dimension, a whole number of records |
+| V2 | the queries have the base's dimension |
+| V3 | a ground truth has one row per query (equal, not at least) |
+| V4 | a ground truth's rows are not empty |
+| V5 | every index names a base vector (`0..base count`); a filtered truth may hold `-1` in a short row |
+| V6 | the distances have the ground truth's rows and width |
+| V7 | a declared `base_count` is the base's record count |
+
+A failure is `Error::Verification { failures }`, each naming its check,
+facet, file and what it found (`V5 neighbor_indices gt.ivecs row 4127
+column 3 holds 1000412, which names no base vector of 1000000 base
+vectors`). `verify_report(&options, &mut progress)` returns every
+failure without erring; `VerifyOptions { skip_absent: true }` skips
+facets whose files are not written yet. V5 reads every index, at any
+integer type, and reports `scanning <facet>` progress; the others read
+headers only. Opening a view never verifies it. `veks check` reports
+these failures as EA-33.
+
+### Whether a base is normalized
+
+`view.normalization()` answers whether the base is unit length and on
+whose word: a declared `is_normalized` (the dataset's, an overlay's,
+or one inferred from loose files' names) checked against a sample of
+1000 vectors a stride apart across the whole base (`|‖v‖ − 1| ≤
+1e-3`), or the sample alone when nothing declares it
+(`AttributeSource::Measured`). A contradicted declaration is kept and
+marked `contradicted`; an overlay's is also a warning, once, and
+`verify()` reports it as V8 whenever the base is resident. A remote
+base's sample is recorded in `<cache>/<dataset>/measured.yaml` by the
+base's content identity (the published root, or the one recorded on
+fetch) and never re-taken for those bytes; a local base is measured
+each time, and nothing is written to the cache for it.
 
 ### Quantized corpora
 
@@ -1068,12 +1144,33 @@ It is created automatically:
 - By the `generate vvec-index` pipeline step before publishing.
 - By `evaluate-predicates` immediately after writing vvec output.
 
-For remote access, the reader fetches the sidecar from the same URL
-prefix. If the sidecar is absent, the reader walks the file
-through the storage layer to rebuild the index (slow first time but
-correct; the rebuilt index is not persisted to the remote source).
+For remote access, the reader looks for the sidecar in this order: a
+copy kept beside the cache file by an earlier open; the sidecar the
+server publishes beside the file (fetched with the same auth as the
+data, and kept beside the cache file); and a walk of the cache copy
+when every byte of it is here. A remote file with none of those is
+refused with `IoError::OffsetIndexUnavailable`, rather than downloaded
+whole behind the open: fetch the facet first. The rebuilt index is
+never written to the remote source.
 
 ---
+
+## 2.10a Small remote files, meters, and an embedded CLI's completion
+
+- `vectordata::fetch::fetch_text(url)` reads a small remote file (a
+  catalog, a list) as text, and `fetch_if_modified(url, path)` keeps a
+  local copy of one current by its `Last-Modified`; both use the client,
+  read-side auth and offline rule of the dataset fetches. Dataset bytes
+  go through `fetch` and the cache, never these.
+- `LogMeter::to_log(title).quiet_when_resident(true)` (and `TextMeter`'s) reports
+  nothing for a facet whose plan is already resident and nothing for a
+  run that fetches nothing; a facet with bytes to fetch still reports
+  its plan and its progress, and a stalled plan is still warned about.
+- A program that embeds the CLI (`shell::bin_main_with_catalogs`) and
+  answers its own completion protocol grafts `shell::completion_node()`
+  under its `vectordata` subcommand, or answers with
+  `shell::complete(words)` (the words after the embedding command).
+  `completions` run under an embedding name explains this and exits 1.
 
 ## 2.11 Error handling
 
@@ -1083,7 +1180,7 @@ use vectordata::io::IoError;
 match open_vec::<f32>("data.fvecs") {
     Ok(reader) => { /* use reader */ }
     Err(IoError::Io(e)) => eprintln!("I/O error: {e}"),
-    Err(IoError::Http(e)) => eprintln!("HTTP error: {e}"),
+    Err(IoError::Transport(e)) => eprintln!("transport error: {e}"),
     Err(IoError::InvalidFormat(msg)) => eprintln!("bad format: {msg}"),
     Err(IoError::OutOfBounds(idx)) => eprintln!("index {idx} out of range"),
     Err(IoError::VariableLengthRecords(msg)) => {
@@ -1422,6 +1519,30 @@ let first: &[f32] = base.get_slice(0).expect("mapped once fetched");
 ```
 
 ### How chunked verification works
+
+A file published without a `.mref` is fetched in 8 MiB chunks, trusted
+as the TLS transport delivers it, and its `<file>.chunks` sidecar
+records a merkle tree as the chunks land: each chunk's SHA-256 leaf
+and the validity bits, in the `.mrkl` file format, under the `.chunks`
+name (so `.mrkl` keeps meaning "verified against a published `.mref`").
+Each chunk writes its 32-byte leaf and merges the bitset, never the
+whole tree; the tree is written whole only when the sidecar is created
+and once more on completion, with its root. A sidecar of the earlier
+format (one byte per chunk) is read as it was; the leaves it lacks are
+hashed from the cache file the first time a content identity is asked
+for, with progress, and recorded.
+
+`facet_storage.content_id()` is a facet's content identity: the root
+of a merkle tree over its bytes at the 8 MiB chunk size —
+`Published` (the publisher's `.mref`), `Recorded` (the tree above,
+once every chunk is here; `None` before), or `Computed` (a local
+file's, once per process). Equal bytes have equal roots whichever way
+they were obtained. `facet_storage.verify_cached(progress)` and
+`VerifyOptions { cached_chunks: true, .. }` (V9) check every cached
+chunk against the hash it was verified or recorded as when it landed,
+naming the chunks that no longer match.
+
+For a file with a published `.mref`:
 
 1. **`.mref` file** (published) — precomputed Merkle tree with
    SHA-256 hashes for all fixed-size data chunks (1 MiB by
