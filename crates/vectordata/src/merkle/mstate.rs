@@ -74,7 +74,7 @@ impl MerkleState {
     }
 
     /// Bitset size in bytes (for serialization).
-    fn bitset_byte_size(&self) -> usize {
+    pub(crate) fn bitset_byte_size(&self) -> usize {
         self.valid_words.len() * 8
     }
 

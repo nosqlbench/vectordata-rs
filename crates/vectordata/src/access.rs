@@ -23,7 +23,7 @@
 //! |------------------|-------------------|----------------------|---------------------|
 //! | `Local`          | `Storage::Mmap`   | (none)               | n/a — local         |
 //! | `MerkleHashed`   | `Storage::Cached` | `<file>.mrkl`        | per-chunk merkle    |
-//! | `MerkleChunked`  | `Storage::Http`   | `<file>.chunks`      | TLS only            |
+//! | `MerkleChunked`  | `Storage::Http`   | `<file>.chunks`      | TLS; a tree recorded on fetch |
 //! | `FullTransfer`   | (forced full DL)  | (none)               | TLS only            |
 
 use std::path::Path;

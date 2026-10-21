@@ -2673,6 +2673,61 @@ impl FacetStorage {
         let len = len.min(self.total_size());
         self.storage.read_bytes(0, len)
     }
+    /// The facet's content identity ([`ContentId`](crate::merkle::ContentId)):
+    /// the root of a merkle tree over its bytes at the 8 MiB chunk
+    /// size — the publisher's for a facet with a `.mref`, the one
+    /// recorded as its chunks were fetched for one without (`None`
+    /// until every chunk is here), a local file's computed once per
+    /// process. Equal bytes have equal roots, whichever way. `None`
+    /// for a series. [`content_id_with_progress`](Self::content_id_with_progress)
+    /// reports any hashing it takes.
+    pub fn content_id(&self) -> std::io::Result<Option<crate::merkle::ContentId>> {
+        self.content_id_with_progress(&mut |_, _| {})
+    }
+
+    /// [`content_id`](Self::content_id), hearing `(done, total)` bytes
+    /// of any hashing.
+    pub fn content_id_with_progress(
+        &self,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> std::io::Result<Option<crate::merkle::ContentId>> {
+        match &self.series {
+            None => self.storage.content_id(progress),
+            Some(_) => Ok(None),
+        }
+    }
+
+    /// The content identity the cache already knows, reading nothing
+    /// (a published root, or a recorded one once fetched): what
+    /// [`content_id`](Self::content_id) answers without hashing. `None`
+    /// for a local file and a series.
+    pub fn known_content_id(&self) -> Option<crate::merkle::ContentId> {
+        match &self.series {
+            None => self.storage.known_content_id(),
+            Some(_) => None,
+        }
+    }
+
+    /// Check the cached chunks against what they were verified or
+    /// recorded as when they landed: the chunk numbers whose bytes no
+    /// longer match (local corruption), `None` for a local file.
+    pub fn verify_cached(&self, progress: &mut dyn FnMut(u64, u64)) -> std::io::Result<Option<Vec<u32>>> {
+        match &self.series {
+            None => self.storage.verify_cached(progress),
+            Some(series) => {
+                let mut bad = Vec::new();
+                let mut any = false;
+                for i in 0..series.file_count() {
+                    if let Some(b) = series.file(i).map_err(std::io::Error::other)?.verify_cached(progress)? {
+                        any = true;
+                        bad.extend(b);
+                    }
+                }
+                Ok(any.then_some(bad))
+            }
+        }
+    }
+
     /// Low-level: download everything this facet can address. Most
     /// callers want [`TestDataView::fetch`], which plans, checks cache
     /// space and reports progress.

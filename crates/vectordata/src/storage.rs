@@ -120,6 +120,23 @@ pub(crate) enum Storage {
     },
 }
 
+/// A local file's merkle root at the 8 MiB chunk size, computed once
+/// per process for each (path, size, mtime) and kept.
+fn local_root(path: &Path, len: u64, progress: &mut dyn FnMut(u64, u64)) -> io::Result<[u8; 32]> {
+    static ROOTS: std::sync::Mutex<Vec<((std::path::PathBuf, u64, Option<std::time::SystemTime>), [u8; 32])>> =
+        std::sync::Mutex::new(Vec::new());
+    let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+    let key = (path.to_path_buf(), len, mtime);
+    if let Some((_, root)) = ROOTS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
+        return Ok(*root);
+    }
+    progress(0, len);
+    let tree = crate::merkle::MerkleRef::from_path_with_progress(path, crate::chunked_http::DEFAULT_CHUNK_SIZE, |done| progress(done, len))?;
+    let root = *tree.root_hash();
+    ROOTS.lock().unwrap_or_else(|e| e.into_inner()).push((key, root));
+    Ok(root)
+}
+
 /// Process-wide registry of `Storage` instances keyed on the
 /// canonical source identity (URL string for remote, absolute
 /// canonicalised path for local). Multiple opens against the same
@@ -984,6 +1001,59 @@ impl Storage {
                 mmap.get().is_some() || channel.is_complete()
             }
         }
+    }
+
+    /// The content identity of the bytes (IN-6): the publisher's root
+    /// for a merkle-cached file; the recorded root for a file fetched
+    /// without a reference, once every chunk is here (`None` before);
+    /// a local file's root, computed once per process and kept. `None`
+    /// for a series, which has no one tree. `progress` hears `(done,
+    /// total)` bytes of any hashing this takes.
+    pub(crate) fn content_id(&self, progress: &mut dyn FnMut(u64, u64)) -> io::Result<Option<crate::merkle::ContentId>> {
+        use crate::merkle::{ContentId, ContentIdKind};
+        Ok(match self {
+            Storage::Cached { channel, .. } => {
+                Some(ContentId { root: *channel.reference().root_hash(), kind: ContentIdKind::Published })
+            }
+            Storage::Http { chunks, .. } => chunks.content_root(progress)?.map(|root| ContentId { root, kind: ContentIdKind::Recorded }),
+            Storage::Mmap { path, mmap } => Some(ContentId { root: local_root(path, mmap.len() as u64, progress)?, kind: ContentIdKind::Computed }),
+            Storage::Series { .. } => None,
+        })
+    }
+
+    /// The content identity the cache already knows, reading nothing:
+    /// a published root, or a recorded one once the fetch is complete.
+    /// `None` for a local file (whose identity is a read of it) and a
+    /// series.
+    pub(crate) fn known_content_id(&self) -> Option<crate::merkle::ContentId> {
+        use crate::merkle::{ContentId, ContentIdKind};
+        match self {
+            Storage::Cached { channel, .. } => Some(ContentId { root: *channel.reference().root_hash(), kind: ContentIdKind::Published }),
+            Storage::Http { chunks, .. } => chunks.recorded_root().map(|root| ContentId { root, kind: ContentIdKind::Recorded }),
+            Storage::Mmap { .. } | Storage::Series { .. } => None,
+        }
+    }
+
+    /// Check the cached chunks against what they were verified or
+    /// recorded as, returning the chunks that no longer match: `None`
+    /// for a local file, which has nothing to check against.
+    pub(crate) fn verify_cached(&self, progress: &mut dyn FnMut(u64, u64)) -> io::Result<Option<Vec<u32>>> {
+        Ok(match self {
+            Storage::Cached { channel, .. } => Some(channel.verify_cached(progress)?),
+            Storage::Http { chunks, .. } => Some(chunks.verify_recorded(progress)?),
+            Storage::Mmap { .. } => None,
+            Storage::Series { parts, .. } => {
+                let mut bad = Vec::new();
+                let mut any = false;
+                for p in parts {
+                    if let Some(b) = p.verify_cached(progress)? {
+                        any = true;
+                        bad.extend(b);
+                    }
+                }
+                any.then_some(bad)
+            }
+        })
     }
 
     /// Whether the bytes live on a server and the local file, if any, is

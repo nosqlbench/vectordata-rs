@@ -105,39 +105,44 @@ impl MerkleRef {
         let mut file = fs::File::open(path)?;
         let total_size = file.metadata()?.len();
         let shape = MerkleShape::for_content(chunk_size, total_size);
-        let mut hashes = vec![[0u8; 32]; shape.node_count as usize];
 
         // Hash leaves in chunk-index order by streaming the file
         // sequentially — no random seeks, no full-file buffer.
         let mut buf = vec![0u8; chunk_size as usize];
         let mut hashed: u64 = 0;
+        let mut leaves = Vec::with_capacity(shape.total_chunks as usize);
         for i in 0..shape.total_chunks {
             let len = shape.chunk_len(i) as usize;
             file.read_exact(&mut buf[..len])?;
-            hashes[shape.leaf_node_index(i) as usize] = sha256(&buf[..len]);
+            leaves.push(sha256(&buf[..len]));
             hashed += len as u64;
             on_progress(hashed);
         }
+        Ok(Self::from_leaves(shape, &leaves))
+    }
 
-        // Unused leaf slots get hash of empty (matches the Java
-        // implementation; preserves bit-for-bit compatibility).
+    /// The tree over `leaves`, one hash per chunk of `shape`: the
+    /// padding leaves are SHA-256 of nothing (matching the Java
+    /// implementation bit for bit) and the internal nodes are built
+    /// bottom up. What every tree here is built by: from a file, from
+    /// bytes, or from hashes recorded as chunks were fetched.
+    pub fn from_leaves(shape: MerkleShape, leaves: &[[u8; 32]]) -> Self {
+        debug_assert_eq!(leaves.len(), shape.total_chunks as usize);
+        let mut hashes = vec![[0u8; 32]; shape.node_count as usize];
+        for (i, leaf) in leaves.iter().enumerate() {
+            hashes[shape.leaf_node_index(i as u32) as usize] = *leaf;
+        }
         let empty_hash = sha256(b"");
         for i in shape.total_chunks..shape.leaf_count {
             hashes[shape.leaf_node_index(i) as usize] = empty_hash;
         }
-
-        // Internal nodes bottom-up — pure CPU, no I/O. Don't tick
-        // progress here; for files large enough to need a meter,
-        // internal-node work is dwarfed by leaf hashing.
-        if shape.internal_node_count > 0 {
-            for i in (0..shape.internal_node_count).rev() {
-                let left = shape.left_child(i) as usize;
-                let right = shape.right_child(i) as usize;
-                hashes[i as usize] = super::sha256_pair(&hashes[left], &hashes[right]);
-            }
+        // Internal nodes bottom-up — pure CPU, no I/O.
+        for i in (0..shape.internal_node_count).rev() {
+            let left = shape.left_child(i) as usize;
+            let right = shape.right_child(i) as usize;
+            hashes[i as usize] = super::sha256_pair(&hashes[left], &hashes[right]);
         }
-
-        Ok(MerkleRef { shape, hashes })
+        MerkleRef { shape, hashes }
     }
 
     /// Build a reference tree from raw content by computing all hashes.
@@ -145,33 +150,13 @@ impl MerkleRef {
     /// This is used to generate `.mref` files from content data.
     pub fn from_content(content: &[u8], chunk_size: u64) -> Self {
         let shape = MerkleShape::for_content(chunk_size, content.len() as u64);
-        let mut hashes = vec![[0u8; 32]; shape.node_count as usize];
-
-        // Compute leaf hashes
-        for i in 0..shape.total_chunks {
-            let start = shape.chunk_start(i) as usize;
-            let len = shape.chunk_len(i) as usize;
-            let chunk_data = &content[start..start + len];
-            hashes[shape.leaf_node_index(i) as usize] = sha256(chunk_data);
-        }
-
-        // Unused leaf slots (padding) get hash of empty = all zeros left as-is.
-        // The Java implementation hashes them as SHA-256(empty), so match that.
-        let empty_hash = sha256(b"");
-        for i in shape.total_chunks..shape.leaf_count {
-            hashes[shape.leaf_node_index(i) as usize] = empty_hash;
-        }
-
-        // Compute internal node hashes bottom-up
-        if shape.internal_node_count > 0 {
-            for i in (0..shape.internal_node_count).rev() {
-                let left = shape.left_child(i) as usize;
-                let right = shape.right_child(i) as usize;
-                hashes[i as usize] = super::sha256_pair(&hashes[left], &hashes[right]);
-            }
-        }
-
-        MerkleRef { shape, hashes }
+        let leaves: Vec<[u8; 32]> = (0..shape.total_chunks)
+            .map(|i| {
+                let start = shape.chunk_start(i) as usize;
+                sha256(&content[start..start + shape.chunk_len(i) as usize])
+            })
+            .collect();
+        Self::from_leaves(shape, &leaves)
     }
 
     /// Write this reference tree as a `.mref` file.

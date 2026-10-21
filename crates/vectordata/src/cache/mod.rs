@@ -998,6 +998,28 @@ impl CachedChannel {
     }
 
     /// The merkle reference tree.
+    /// Check every verified chunk in the cache file against the
+    /// reference again, returning those whose bytes no longer match:
+    /// local corruption since they were verified. Reports `(done,
+    /// total)` bytes to `progress`.
+    pub(crate) fn verify_cached(&self, progress: &mut dyn FnMut(u64, u64)) -> io::Result<Vec<u32>> {
+        let shape = self.reference.shape().clone();
+        let check: Vec<u32> = (0..shape.total_chunks).filter(|&i| self.state.is_valid(i)).collect();
+        let total: u64 = check.iter().map(|&i| shape.chunk_len(i)).sum();
+        let (mut done, mut bad, mut buf) = (0, Vec::new(), Vec::new());
+        progress(0, total);
+        for i in check {
+            buf.resize(shape.chunk_len(i) as usize, 0);
+            self.cache_file.read_exact_at(&mut buf, shape.chunk_start(i))?;
+            if !self.reference.verify_chunk(i, &buf) {
+                bad.push(i);
+            }
+            done += shape.chunk_len(i);
+            progress(done, total);
+        }
+        Ok(bad)
+    }
+
     pub fn reference(&self) -> &MerkleRef {
         &self.reference
     }

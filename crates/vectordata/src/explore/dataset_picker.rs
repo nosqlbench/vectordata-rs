@@ -1105,29 +1105,21 @@ fn walk_sidecars(
                     cache_file_path: cache_file_path.clone(),
                 }
             }),
-            "chunks" => std::fs::read(&path).ok().map(|bytes| {
-                // The `.chunks` sidecar carries one byte per chunk —
-                // non-zero means valid. We don't have a shape sidecar
-                // alongside it; chunk_size and total_size come from
-                // the cache file itself (the chunk size used by
-                // `ChunkStore` is fixed at the storage layer; we
-                // approximate total_size from the file metadata so
-                // windowed coverage still works).
-                let total = bytes.len() as u32;
-                let valid_bits: Vec<bool> = bytes.iter().map(|&b| b != 0).collect();
+            "chunks" => {
+                // The chunk store's sidecar, in either of its formats,
+                // read by the store's own reader. The chunk size is the
+                // store's fixed one; the size is the cache file's.
                 let chunk_size = crate::chunked_http::DEFAULT_CHUNK_SIZE;
-                let total_size = std::fs::metadata(&cache_file_path)
-                    .ok()
-                    .map(|m| m.len())
-                    .unwrap_or((total as u64) * chunk_size);
-                FacetCacheView {
-                    chunk_size,
-                    total_chunks: total,
-                    total_size,
-                    valid_bits,
-                    cache_file_path: cache_file_path.clone(),
-                }
-            }),
+                std::fs::metadata(&cache_file_path).ok().map(|m| m.len()).and_then(|total_size| {
+                    crate::chunked_http::read_sidecar(&path, total_size).map(|sidecar| FacetCacheView {
+                        chunk_size,
+                        total_chunks: sidecar.valid.len() as u32,
+                        total_size,
+                        valid_bits: sidecar.valid,
+                        cache_file_path: cache_file_path.clone(),
+                    })
+                })
+            }
             _ => None,
         };
         let Some(view) = view else { continue; };
@@ -4933,15 +4925,16 @@ mod tests {
         let entry = knn_entry("ds-a", "https://h/cat");
         let profile = profile_with_base("https://h/cat/ds-a/base.fvecs");
 
-        // Chunk-store copy, every chunk valid → local.
-        std::fs::write(ds.join("base.fvecs.chunks"), [1u8, 1]).unwrap();
+        // Chunk-store copy, every chunk valid → local. A 4-byte file
+        // is one chunk: its bitmap is one byte.
+        std::fs::write(ds.join("base.fvecs.chunks"), [1u8]).unwrap();
         let survey = super::survey_cache_state(cache);
         assert_eq!(
             super::profile_access_mode(&entry, &ds, Some(&profile), &survey),
             AccessMode::Local);
 
-        // One chunk missing → still sparse remote access.
-        std::fs::write(ds.join("base.fvecs.chunks"), [1u8, 0]).unwrap();
+        // Its one chunk missing → still sparse remote access.
+        std::fs::write(ds.join("base.fvecs.chunks"), [0u8]).unwrap();
         let survey = super::survey_cache_state(cache);
         assert_eq!(
             super::profile_access_mode(&entry, &ds, Some(&profile), &survey),
