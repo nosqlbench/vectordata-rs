@@ -83,3 +83,19 @@ fn at_names_the_programs_catalog() {
         .collect();
     vectordata::shell::bin_main_with_catalogs("embedded", argv, program);
 }
+
+/// **A host completes the embedded CLI through its own tree**: the
+/// node grafted under its `vectordata` subcommand answers the commands
+/// beneath it, and `shell::complete` answers the same words for a host
+/// not built on veks-completion (LS-5).
+#[test]
+fn a_host_completes_the_embedded_cli_from_its_own_tree() {
+    let mut host = veks_completion::CommandTree::new("fvec");
+    host.root = veks_completion::Node::group(vec![("bench", veks_completion::Node::empty_group())])
+        .with_child("vectordata", vectordata::shell::completion_node());
+    // The completer's first word is the host's own name.
+    let through_host = veks_completion::complete(&host, &["fvec", "vectordata", "datasets", "desc"]);
+    assert!(through_host.iter().any(|c| c == "describe"), "{through_host:?}");
+    let direct = vectordata::shell::complete(&["datasets", "desc"]);
+    assert!(direct.iter().any(|c| c == "describe"), "{direct:?}");
+}

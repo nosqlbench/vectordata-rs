@@ -939,7 +939,12 @@ pub fn bin_main_with_catalogs(invoked: &str, argv: Vec<String>, program: crate::
                 std::process::exit(code);
             }
         }
-        Cmd::Completions { shell } => cmd_completions(shell),
+        Cmd::Completions { shell } => {
+            if invoked != "vectordata" {
+                std::process::exit(embedded_completions_help(invoked));
+            }
+            cmd_completions(shell)
+        }
         Cmd::Login {
             url,
             user,
@@ -1082,6 +1087,46 @@ fn cmd_completions(shell: Option<String>) {
         },
         None => veks_completion::print_indirect_wrapper("vectordata"),
     }
+}
+
+/// The CLI's completion tree, as a node: for a program that embeds the
+/// CLI under a subcommand of its own (`fvec bench vectordata …`) and
+/// answers its own completion protocol, to graft under that
+/// subcommand — `host.with_child("vectordata", completion_node())` —
+/// so completing the embedded commands needs nothing from the
+/// `vectordata` executable.
+///
+/// ```
+/// let node = vectordata::shell::completion_node();
+/// assert!(node.child_names().contains(&"datasets"));
+/// ```
+pub fn completion_node() -> veks_completion::Node {
+    vcli::build_completion_tree(&Cli::veks_command_spec("vectordata"), &completion_resolvers()).root
+}
+
+/// Completion candidates for `words`, the words after the embedding
+/// command (`["datasets", "desc"]` for `fvec bench vectordata datasets
+/// desc<TAB>`): for a host that is not built on veks-completion and
+/// answers its shell's completion protocol itself.
+///
+/// ```
+/// assert!(vectordata::shell::complete(&["datasets", "desc"]).iter().any(|c| c == "describe"));
+/// ```
+pub fn complete(words: &[&str]) -> Vec<String> {
+    let tree = vcli::build_completion_tree(&Cli::veks_command_spec("vectordata"), &completion_resolvers());
+    // The completer's first word is the command's own name.
+    let line: Vec<&str> = std::iter::once("vectordata").chain(words.iter().copied()).collect();
+    veks_completion::complete(&tree, &line)
+}
+
+/// `completions` under an embedding program's name: a script bound to
+/// the `vectordata` executable would complete the wrong command, so
+/// this says how the host wires completion in, and fails.
+fn embedded_completions_help(invoked: &str) -> i32 {
+    eprintln!("{invoked}: completion for an embedded vectordata CLI is the host program's to answer:");
+    eprintln!("  graft vectordata::shell::completion_node() under its own `vectordata` subcommand, or");
+    eprintln!("  answer with vectordata::shell::complete(words), the words after `{invoked}`.");
+    1
 }
 
 /// Resolve the cache root: caller override > settings.yaml. Exits
