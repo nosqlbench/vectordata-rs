@@ -54,6 +54,14 @@ veks datasets config catalog list
 veks datasets config catalog remove --index 2
 ```
 
+A URL is saved as written. A path is saved absolute, resolved against
+the working directory with `.` and `..` removed and symlinks kept as
+named. It is named after the directory it ends in, unless `--name` is
+given: `config catalog add .` in `/data/stage` saves `stage:
+/data/stage`. `remove` finds a path by the spelling it was added by as
+well as the one it was saved as. Entries saved relative by an earlier
+release are left as written.
+
 ### Programmatic access
 
 ```rust

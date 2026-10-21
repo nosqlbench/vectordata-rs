@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixes
+
+- **`config catalog add .` saves the directory, absolute, under its
+  name.** It saved `0: .`: relative, so it resolved only from that
+  working directory, and named by index, so `config catalog remove`
+  could not find it by name or path. A path is now saved absolute and
+  named after its directory (`stage: /data/stage`), and `remove` finds
+  it by either spelling. A URL is saved as written.
+
 ## 4.0.2 — 2026-10-20
 
 The `datasets` commands read a dataset however it is named — by

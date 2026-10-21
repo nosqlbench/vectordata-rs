@@ -492,16 +492,52 @@ fn append_catalog_entry_at(path: &Path, name: &str, source: &str) -> Result<Path
     Ok(path.to_path_buf())
 }
 
-fn remove_catalog_entry(source: &str) -> Result<bool, String> {
-    remove_catalog_entry_at(&catalogs_path(), source)
+/// The location a catalog source is saved as: a URL as written; a
+/// path made absolute against `cwd`, with `.` and `..` resolved
+/// lexically (symlinks are kept as named), so the saved entry resolves
+/// from any working directory and names the directory it is in.
+fn saved_location(source: &str, cwd: &Path) -> String {
+    if source.contains("://") {
+        return source.to_string();
+    }
+    let mut out = PathBuf::new();
+    for part in cwd.join(source).components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out.to_string_lossy().into_owned()
 }
 
-/// [`remove_catalog_entry`] on the `catalogs.yaml` at `path`.
-fn remove_catalog_entry_at(path: &Path, source: &str) -> Result<bool, String> {
+/// [`saved_location`] against the process's working directory; the
+/// source as written when there is none to read.
+fn saved_location_here(source: &str) -> String {
+    match std::env::current_dir() {
+        Ok(cwd) => saved_location(source, &cwd),
+        Err(_) => source.to_string(),
+    }
+}
+
+fn remove_catalog_entry(source: &str) -> Result<bool, String> {
+    remove_catalog_entry_at(&catalogs_path(), source, &saved_location_here(source))
+}
+
+/// [`remove_catalog_entry`] on the `catalogs.yaml` at `path`: the entry
+/// whose name or location is `source` as given, else the one saved as
+/// `saved` (the location `source` is saved as), so a path is found by
+/// the spelling it was added by as well as the one it was saved as.
+fn remove_catalog_entry_at(path: &Path, source: &str, saved: &str) -> Result<bool, String> {
     if !path.is_file() { return Ok(false); }
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let (new_content, removed) = remove_entry_text(&content, source);
+    let (mut new_content, mut removed) = remove_entry_text(&content, source);
+    if !removed && saved != source {
+        (new_content, removed) = remove_entry_text(&content, saved);
+    }
     if removed {
         crate::atomic_file::replace_config(path, new_content.as_bytes(), false)
             .map_err(|e| format!("writing {}: {e}", path.display()))?;
@@ -706,6 +742,8 @@ pub enum AddCatalogOutcome {
 /// saved. Shared by the CLI wrapper and the explorer's catalog editor
 /// so both surfaces apply the identical verify-then-save contract.
 pub fn try_add_catalog(source: &str, name: Option<&str>) -> Result<AddCatalogOutcome, String> {
+    let source = saved_location_here(source);
+    let source = source.as_str();
     let entries = load_catalog_entries();
     if entries.iter().any(|e| e.location == source) {
         return Ok(AddCatalogOutcome::AlreadyConfigured);
@@ -735,6 +773,8 @@ pub fn try_add_catalog(source: &str, name: Option<&str>) -> Result<AddCatalogOut
 /// the name (non-empty, unique) and refuses an already-configured
 /// location, but performs no parse/ping. Returns the saved name.
 pub fn force_add_catalog(name: &str, source: &str) -> Result<String, String> {
+    let source = saved_location_here(source);
+    let source = source.as_str();
     let entries = load_catalog_entries();
     if entries.iter().any(|e| e.location == source) {
         return Err(format!("already configured: {source}"));
@@ -754,6 +794,10 @@ pub fn force_add_catalog(name: &str, source: &str) -> Result<String, String> {
 /// [`verify_catalog_source`] — parse to at least one dataset AND
 /// answer a catalog ping — before anything is recorded. Returns 1
 /// if verification fails; nothing is saved in that case.
+///
+/// A path is saved absolute, against the working directory, and named
+/// after the directory it ends in unless `name` is given: `add .` in
+/// `/data/stage` saves `stage: /data/stage`. A URL is saved as written.
 pub fn add_catalog(source: &str, name: Option<&str>) -> i32 {
     add_catalog_ex(source, name, false, false)
 }
@@ -779,6 +823,9 @@ pub fn add_catalog_ex(
     no_verify: bool,
     trust_self_signed: bool,
 ) -> i32 {
+    // A path is saved absolute, so every message names what is saved.
+    let source = saved_location_here(source);
+    let source = source.as_str();
     if trust_self_signed {
         match crate::credentials::origin_of_str(source) {
             Some(origin) => match crate::settings::add_trust_self_signed(&origin) {
@@ -952,7 +999,7 @@ mod tests {
         std::fs::write(&path, "- /a/catalog\n").unwrap();
         reads_old(&|p| assert_eq!(convert_catalogs_to_map_at(p).unwrap(), 1));
         reads_old(&|p| { append_catalog_entry_at(p, "b", "/b/catalog").unwrap(); });
-        reads_old(&|p| assert!(remove_catalog_entry_at(p, "/b/catalog").unwrap()));
+        reads_old(&|p| assert!(remove_catalog_entry_at(p, "/b/catalog", "/b/catalog").unwrap()));
     }
 
     /// `config get offline` names the environment variable only when it
@@ -1043,6 +1090,30 @@ mod tests {
         let (out2, removed2) = remove_entry_text(content, "https://b/");
         assert!(removed2);
         assert!(out2.contains("prot:") && !out2.contains("lab"));
+    }
+
+    #[test]
+    fn saved_location_makes_a_path_absolute_and_keeps_a_url() {
+        let cwd = Path::new("/data/stage");
+        assert_eq!(saved_location(".", cwd), "/data/stage");
+        assert_eq!(saved_location("./", cwd), "/data/stage");
+        assert_eq!(saved_location("..", cwd), "/data");
+        assert_eq!(saved_location("sub/../cat.yaml", cwd), "/data/stage/cat.yaml");
+        assert_eq!(saved_location("/abs/./x/", cwd), "/abs/x");
+        assert_eq!(saved_location("https://h/x/../catalog.json", cwd), "https://h/x/../catalog.json");
+        // The name follows from the saved form.
+        assert_eq!(derive_catalog_name(&saved_location(".", cwd), &[]), "stage");
+    }
+
+    #[test]
+    fn remove_matches_the_saved_spelling_when_the_given_one_is_absent() {
+        let text = "stage: /data/stage\nother: /x\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalogs.yaml");
+        std::fs::write(&path, text).unwrap();
+        assert!(remove_catalog_entry_at(&path, ".", "/data/stage").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "other: /x\n");
+        assert!(!remove_catalog_entry_at(&path, ".", "/data/stage").unwrap());
     }
 
     #[test]
