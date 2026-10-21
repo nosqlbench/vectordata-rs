@@ -187,7 +187,7 @@ pub fn measure_normalization<V: TestDataView + ?Sized>(view: &V) -> crate::Resul
 }
 
 /// What a dataset's base is, as to unit length: the declared value (the
-/// dataset's or an overlay's) checked
+/// dataset's, an overlay's, or one inferred from file names) checked
 /// against a sample, or the sample alone when nothing declares it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Normalization {

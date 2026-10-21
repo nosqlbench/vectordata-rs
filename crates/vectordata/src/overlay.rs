@@ -24,7 +24,8 @@
 //!       base_count: 99287
 //! ```
 //!
-//! Lowest to highest: the dataset's own attributes, program overlays (registered with
+//! Lowest to highest: the dataset's own attributes, those inferred from
+//! loose files' names, program overlays (registered with
 //! [`CatalogSources::with_overlay`](crate::catalog::CatalogSources::with_overlay),
 //! in order; two setting one key is refused), and the user's
 //! `<config_dir>/overlays.yaml`. Within a file, a `catalogs.<c>.<name>`
@@ -64,6 +65,8 @@ pub enum OverlayKind {
 pub enum AttributeSource {
     /// The dataset's own descriptor or catalog listing.
     Dataset,
+    /// Its loose files' names (`dataset::infer`, LF-12).
+    Inferred,
     /// An overlay.
     Overlay {
         /// The overlay's file, or the program's name for one built in
@@ -85,6 +88,7 @@ impl fmt::Display for AttributeSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AttributeSource::Dataset => write!(f, "dataset"),
+            AttributeSource::Inferred => write!(f, "inferred from file names"),
             AttributeSource::Overlay { file, kind: OverlayKind::User } => write!(f, "overlay {file}"),
             AttributeSource::Overlay { file, kind: OverlayKind::Program(name) } => {
                 write!(f, "program overlay '{name}' ({file})")

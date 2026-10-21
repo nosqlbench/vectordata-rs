@@ -16,7 +16,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 use support::testserver::TestServer;
 use vectordata::overlay::{AttributeSource, Overlay, Overlays};
-use vectordata::verify::NoProgress;
+use vectordata::verify::{Check, NoProgress};
 use vectordata::{TestDataGroup, TestDataViewExt};
 
 static CACHE: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
@@ -153,4 +153,25 @@ fn a_remote_measurement_is_recorded_by_content_id_and_reused() {
     std::fs::write(&cached, &bytes).unwrap();
     let again = view.normalization().unwrap();
     assert_eq!((again.value, again.measured.worst_deviation), (first.value, first.measured.worst_deviation), "read from the record, not re-sampled");
+}
+
+/// **A `norm` token's claim is the inferred source.**
+#[test]
+fn an_inferred_normalization_is_sourced_to_the_names() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("emb_norm");
+    std::fs::create_dir(&dir).unwrap();
+    base(&dir.join("base.fvecs"), 20, 1.0);
+    base(&dir.join("query.fvecs"), 3, 1.0);
+    let mut f = std::fs::File::create(dir.join("gt.ivecs")).unwrap();
+    for r in 0..3i32 {
+        f.write_all(&1i32.to_le_bytes()).unwrap();
+        f.write_all(&r.to_le_bytes()).unwrap();
+    }
+    drop(f);
+    let view = TestDataGroup::load(dir.to_str().unwrap()).unwrap().profile("default").unwrap();
+    let n = view.normalization().unwrap();
+    assert!(n.value && !n.contradicted);
+    assert_eq!(n.source, AttributeSource::Inferred);
+    assert!(view.verify(&mut NoProgress).unwrap().checked.contains(&Check::V8Normalized));
 }

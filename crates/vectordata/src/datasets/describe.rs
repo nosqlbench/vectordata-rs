@@ -97,6 +97,7 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&
     // `lookup`, not `find_exact`: a name two catalogs hold is ambiguous,
     // and saying so is the opposite of saying it is nowhere.
     let opened;
+    let mut inferred_note = None;
     let entry = if opens_directly(dataset_name) {
         opened = match crate::TestDataGroup::load(dataset_name) {
             Ok(group) => group,
@@ -105,6 +106,9 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&
                 return 1;
             }
         };
+        if let Some(summary) = opened.inferred() {
+            inferred_note = Some(summary.to_string());
+        }
         opened.catalog_entry()
     } else {
         match catalog.lookup(dataset_name) {
@@ -122,7 +126,7 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&
             return 1;
         }
     };
-    render(entry, &profile_name);
+    render(entry, &profile_name, inferred_note.as_deref());
     0
 }
 
@@ -192,11 +196,17 @@ fn varying_attributes(
     keys
 }
 
-fn render(entry: &CatalogEntry, profile_name: &str) {
+fn render(entry: &CatalogEntry, profile_name: &str, inferred: Option<&str>) {
     println!("Dataset: {}", entry.name());
     println!("Profile: {profile_name}");
     println!("Path:    {}", entry.location());
-    println!("Type:    {}", entry.dataset_type());
+    match inferred {
+        Some(files) => {
+            println!("Type:    inferred from its files: no dataset.yaml (`vectordata datasets init` writes one)");
+            println!("Read as: {files}");
+        }
+        None => println!("Type:    {}", entry.dataset_type()),
+    }
 
     if let Some(attrs) = entry.attributes() {
         let mut have_any = false;
@@ -204,10 +214,15 @@ fn render(entry: &CatalogEntry, profile_name: &str) {
             if !have_any { println!(); println!("Attributes:"); have_any = true; }
         };
         // Each value with where it came from, when that is not the
-        // dataset itself: an overlay.
+        // dataset itself: an overlay, or the names of loose files.
         let sourced = |key: &str, value: &str| -> String {
             let mut out = value.to_string();
             match entry.attribute_source(key) {
+                Some(crate::overlay::AttributeSource::Dataset) | None if inferred.is_some()
+                    && matches!(key, "distance_function" | "is_normalized") =>
+                {
+                    out.push_str("  (inferred from file names)");
+                }
                 Some(crate::overlay::AttributeSource::Dataset) | None => {}
                 Some(source) => out.push_str(&format!("  ({source})")),
             }

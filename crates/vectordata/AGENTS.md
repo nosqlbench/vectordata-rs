@@ -192,6 +192,7 @@ Each of these exists, is tested, and handles cases that are easy to miss.
 | `vectordata datasets ping` | [`Catalog::open_spec`](crate::catalog::Catalog::open_spec), then a reader per facet ([`TestDataView::facet`](crate::TestDataView::facet)) |
 | `vectordata datasets push` | [`push::execute`](crate::push::execute) |
 | `vectordata datasets derive` | none — a command that writes a new dataset directory |
+| `vectordata datasets init` | [`dataset::infer::infer_dir`](crate::dataset::infer::infer_dir) — writes its `yaml`; `TestDataGroup::load` on the directory reads the same descriptor |
 | `vectordata datasets curlify` | none — a command that writes a download script |
 | `vectordata cache list` | [`cache_admin::list_entries`](crate::cache_admin::list_entries) |
 | `vectordata cache prune` | [`cache_admin::prune_by_filter`](crate::cache_admin::prune_by_filter) |

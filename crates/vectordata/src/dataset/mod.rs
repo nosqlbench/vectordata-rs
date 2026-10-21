@@ -24,6 +24,7 @@ pub mod conformance;
 pub mod config;
 pub mod expansion;
 pub mod facet;
+pub mod infer;
 pub mod parents;
 pub mod layout;
 pub mod pipeline;

@@ -34,6 +34,9 @@ pub struct TestDataGroup {
     /// what `datasets describe` renders for a path or URL as it does
     /// for a catalog name.
     entry: crate::dataset::CatalogEntry,
+    /// What each file was read as, when the directory had no
+    /// descriptor and its files implied one (`dataset::infer`).
+    inferred: Option<String>,
     /// The count claims overlays make, for the views to check as their
     /// facets open (OV-5).
     claims: Option<Arc<crate::overlay::Claims>>,
@@ -54,6 +57,7 @@ struct DatasetHandle {
     origin: String,
     config: DatasetConfig,
     entry: crate::dataset::CatalogEntry,
+    inferred: Option<String>,
 }
 
 /// The embedded catalog entry for `description` at `home`, named `name`.
@@ -78,6 +82,7 @@ impl DatasetHandle {
             home,
             config: DatasetConfig::opened(description),
             entry,
+            inferred: None,
         }
     }
 
@@ -156,6 +161,23 @@ impl DatasetHandle {
     }
 }
 
+/// Say, once per process for each directory, what a directory without
+/// a descriptor was read as (LF-2), through `log`, so a library user
+/// sees it where they see the crate's other notices.
+fn announce_inferred(dir: &Path, inferred: &crate::dataset::infer::Inferred) {
+    static SAID: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.contains(&key) {
+        return;
+    }
+    said.push(key);
+    log::info!("inferred dataset.yaml for {}: {}", dir.display(), inferred.summary());
+    for note in &inferred.notes {
+        log::info!("{}: {note}", dir.display());
+    }
+}
+
 impl TestDataGroup {
     /// Loads a TestDataGroup from a path string which can be a file path or URL.
     ///
@@ -203,13 +225,22 @@ impl TestDataGroup {
             return Ok(Self::from_handle(handle));
         }
 
-        // Directory cascade. With neither file present, the error is
-        // the missing dataset.yaml.
+        // Directory cascade: dataset.yaml, then knn_entries.yaml, then —
+        // for a directory with neither — the descriptor its files imply
+        // (`dataset::infer`, LF-1), said once per process.
         let home = Location::from_path(path);
         let knn_path = path.join("knn_entries.yaml");
         let dataset_path = path.join("dataset.yaml");
-        let handle = if !dataset_path.exists() && knn_path.exists() {
+        let handle = if dataset_path.exists() {
+            DatasetHandle::of_dataset_yaml(home, &Location::from_path(&dataset_path), &read(&dataset_path)?)?
+        } else if knn_path.exists() {
             DatasetHandle::of_knn_entries(home, &read(&knn_path)?)?
+        } else if path.is_dir() && crate::dataset::infer::has_loose_files(path) {
+            let inferred = crate::dataset::infer::infer_dir(path).map_err(|e| {
+                Error::Other(format!("{}: no dataset.yaml or knn_entries.yaml, and its files make no dataset: {e}", path.display()))
+            })?;
+            announce_inferred(path, &inferred);
+            DatasetHandle { inferred: Some(inferred.summary()), ..DatasetHandle::at(home, inferred.config) }
         } else {
             DatasetHandle::of_dataset_yaml(home, &Location::from_path(&dataset_path), &read(&dataset_path)?)?
         };
@@ -307,8 +338,8 @@ impl TestDataGroup {
 
     /// The one constructor every open ends in (RC-7).
     fn from_handle(handle: DatasetHandle) -> Self {
-        let DatasetHandle { name, home, origin, config, entry } = handle;
-        TestDataGroup { home, origin, name, config, entry, claims: None }
+        let DatasetHandle { name, home, origin, config, entry, inferred } = handle;
+        TestDataGroup { home, origin, name, config, entry, inferred, claims: None }
     }
 
     /// The view of one profile, anchored to this dataset's cache
@@ -465,14 +496,27 @@ impl TestDataGroup {
         self.entry.apply_overlay(stated);
     }
 
-    /// Where attribute `key`'s value came from: an overlay or the
-    /// dataset. `None` when nothing sets it.
+    /// Where attribute `key`'s value came from: an overlay, the names of
+    /// loose files (`dataset::infer`), or the dataset. `None` when
+    /// nothing sets it.
     pub fn attribute_source(&self, key: &str) -> Option<crate::overlay::AttributeSource> {
         if let Some(s) = self.entry.overlaid().iter().find(|s| s.key == key) {
             return Some(s.source.clone());
         }
         self.config.attributes.get(key)?;
-        Some(crate::overlay::AttributeSource::Dataset)
+        Some(if self.inferred.is_some() && matches!(key, "distance_function" | "is_normalized") {
+            crate::overlay::AttributeSource::Inferred
+        } else {
+            crate::overlay::AttributeSource::Dataset
+        })
+    }
+
+    /// What each file was read as, when the dataset is a directory with
+    /// no descriptor read by the rules of [`crate::dataset::infer`]:
+    /// `base_vectors=base.fvecs, query_vectors=…`. `None` for a
+    /// declared dataset.
+    pub fn inferred(&self) -> Option<&str> {
+        self.inferred.as_deref()
     }
 
     /// The dataset as a catalog lists it: the catalog's own entry for a
@@ -737,6 +781,7 @@ impl TestDataGroup {
                     origin,
                     config: DatasetConfig::opened((**description).clone()),
                     entry: entry.clone(),
+                    inferred: None,
                 }))
             }
             crate::dataset::EntryDescription::Referenced { descriptor, .. } => Self::load(descriptor),

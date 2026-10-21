@@ -1532,7 +1532,8 @@ pub trait TestDataViewExt: TestDataView {
     }
 
     /// Whether the base is unit length, and on whose word: the declared
-    /// `is_normalized` (the dataset's or an overlay's) checked against a 1000-vector sample, or the sample
+    /// `is_normalized` (the dataset's, an overlay's, or inferred from
+    /// file names) checked against a 1000-vector sample, or the sample
     /// alone when nothing declares it ([`crate::verify::normalization`]).
     /// The sample of a remote base is recorded by its content identity
     /// and never re-taken; it fetches the chunks it touches when the
@@ -3636,7 +3637,7 @@ pub struct GenericTestDataView {
     /// facets they concern open (OV-5).
     overlay_claims: Option<Arc<crate::overlay::Claims>>,
     /// Where each attribute that did not come from the dataset itself
-    /// came from: an overlay.
+    /// came from: an overlay, or loose files' names.
     attribute_sources: Arc<HashMap<String, crate::overlay::AttributeSource>>,
 }
 

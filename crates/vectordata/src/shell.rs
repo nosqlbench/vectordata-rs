@@ -305,6 +305,16 @@ enum DatasetsCmd {
         catalog: Vec<String>,
     },
 
+    /// Write the dataset.yaml a directory of loose files implies.
+    ///
+    /// Reads the files the way an open of a directory with no
+    /// descriptor does — canonical facet names, then one role token per
+    /// name (`base`, `query`, `gt`, …), then shapes — verifies they
+    /// belong together, and writes the result as `<dir>/dataset.yaml`,
+    /// so later opens are declared rather than inferred. Prints what
+    /// it decided and why.
+    Init(crate::datasets::init::InitArgs),
+
     /// Generate a curl download script for a dataset's published files.
     Curlify(crate::datasets::curlify::CurlifyArgs),
 
@@ -792,6 +802,7 @@ pub fn bin_main_with_catalogs(invoked: &str, argv: Vec<String>, program: crate::
                     configdir,
                     catalog,
                 } => crate::datasets::describe::run_args(args, &program, &configdir, &catalog),
+                DatasetsCmd::Init(args) => crate::datasets::init::run(&args),
                 DatasetsCmd::Curlify(args) => crate::datasets::curlify::run_args(args),
                 DatasetsCmd::Push(args) => crate::push::run(args),
                 DatasetsCmd::Derive {

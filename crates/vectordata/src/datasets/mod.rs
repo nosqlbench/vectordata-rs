@@ -32,6 +32,7 @@ pub mod describe;
 pub mod drop_cache;
 #[cfg(feature = "cli")]
 pub mod dyncomp;
+pub mod init;
 pub mod filter;
 pub mod list;
 pub mod precache;
