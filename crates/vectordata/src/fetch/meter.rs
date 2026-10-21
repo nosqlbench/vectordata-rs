@@ -39,6 +39,9 @@ pub struct TextMeter {
     out: Out,
     ticker: Option<Ticker>,
     live: Option<Live>,
+    /// Say nothing for a facet whose plan has nothing to fetch, nor for
+    /// a run that has nothing to fetch.
+    quiet_when_resident: bool,
 }
 
 impl TextMeter {
@@ -54,6 +57,7 @@ impl TextMeter {
             out: Arc::new(Mutex::new(out)),
             ticker: None,
             live: None,
+            quiet_when_resident: false,
         }
     }
 
@@ -67,6 +71,18 @@ impl TextMeter {
         if let Some(t) = self.ticker.take() {
             t.stop();
         }
+    }
+}
+
+impl TextMeter {
+    /// Say nothing for a facet whose plan has nothing to fetch, and
+    /// nothing for a run that fetches nothing: a plan over a cached
+    /// dataset is silent, and a remote one still reports what each
+    /// facet costs. While a facet is planned the status line still
+    /// moves; a resident one's is erased rather than closed.
+    pub fn quiet_when_resident(mut self, quiet: bool) -> Self {
+        self.quiet_when_resident = quiet;
+        self
     }
 }
 
@@ -92,12 +108,17 @@ impl FetchProgress for TextMeter {
                     format!("{} to fetch", fmt_bytes(plan.bytes_to_fetch()))
                 };
                 if let Some(t) = &self.ticker {
-                    t.end(format!("{facet}: {outcome}"));
+                    if self.quiet_when_resident && plan.is_resident() && !plan.degrades_to_full_download {
+                        t.dismiss();
+                    } else {
+                        t.end(format!("{facet}: {outcome}"));
+                    }
                 }
             }
             FetchEvent::Begin { facets, bytes } => {
                 self.stop_ticker();
-                self.live = Some(Live::new(*facets, *bytes));
+                // A run with nothing to fetch says nothing, quiet.
+                self.live = (!(self.quiet_when_resident && *bytes == 0)).then(|| Live::new(*facets, *bytes));
             }
             FetchEvent::FacetBegin { index, facet, bytes, resident, .. } => {
                 if let Some(live) = &mut self.live {
@@ -223,6 +244,14 @@ impl Ticker {
         let mut st = self.state.lock().expect("ticker state");
         st.write(&format!("\r  {label}\u{2026}\u{1b}[K"));
         st.current = Some((label, Instant::now()));
+    }
+
+    /// Close the current step leaving nothing on screen: the line it
+    /// painted is erased.
+    fn dismiss(&self) {
+        let mut st = self.state.lock().expect("ticker state");
+        st.current = None;
+        st.write("\r\u{1b}[K");
     }
 
     /// Close the current step with its result, on its own line.
@@ -557,6 +586,9 @@ impl LogMeter {
                     reported_step: 0,
                     reported_bytes: None,
                     stop: false,
+                    quiet_when_resident: false,
+                    planning_said: false,
+                    silent_run: false,
                 }),
                 wake: std::sync::Condvar::new(),
             }),
@@ -584,6 +616,34 @@ impl LogMeter {
     /// and again each `after` the stall lasts.
     pub fn stall_warning(self, after: Duration) -> Self {
         self.lock().stall_after = after;
+        self
+    }
+
+    /// Say nothing for a facet whose plan has nothing to fetch, and
+    /// nothing for a run that fetches nothing: a plan over a cached
+    /// dataset is silent, and a remote one still reports what each
+    /// facet costs, its `planning` line written with its result. A plan
+    /// that stalls is still warned about.
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    /// use vectordata::fetch::{FetchRequest, LogMeter};
+    /// use vectordata::{TestDataGroup, TestDataView};
+    /// # use std::io::Write;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let mut f = std::fs::File::create(dir.path().join("base.fvecs")).unwrap();
+    /// # for _ in 0..4 { f.write_all(&1i32.to_le_bytes()).unwrap(); f.write_all(&1f32.to_le_bytes()).unwrap(); }
+    /// # std::fs::write(dir.path().join("dataset.yaml"), "name: q\nprofiles:\n  default:\n    base_vectors: base.fvecs\n").unwrap();
+    /// let lines = Arc::new(Mutex::new(Vec::new()));
+    /// let seen = lines.clone();
+    /// let mut meter = LogMeter::to_lines("Fetch", move |_, l| seen.lock().unwrap().push(l.to_string()))
+    ///     .quiet_when_resident(true);
+    /// let view = TestDataGroup::load(dir.path().to_str().unwrap()).unwrap().profile("default").unwrap();
+    /// view.fetch(&FetchRequest::all(), &mut meter).unwrap(); // a local file: already resident
+    /// assert!(lines.lock().unwrap().is_empty(), "{:?}", lines.lock().unwrap());
+    /// ```
+    pub fn quiet_when_resident(self, quiet: bool) -> Self {
+        self.lock().quiet_when_resident = quiet;
         self
     }
 
@@ -674,6 +734,13 @@ struct LogState {
     /// The run's total bytes the last progress line showed.
     reported_bytes: Option<u64>,
     stop: bool,
+    /// Say nothing for a facet whose plan has nothing to fetch, nor for
+    /// a run that fetches nothing.
+    quiet_when_resident: bool,
+    /// Whether the current facet's `planning` line was written.
+    planning_said: bool,
+    /// Whether the current run fetches nothing and says so with nothing.
+    silent_run: bool,
 }
 
 impl LogState {
@@ -709,6 +776,9 @@ impl LogState {
     /// Write a progress line at `aggregate` bytes of the run, and note
     /// it as reported.
     fn report(&mut self, facet_bytes: u64, aggregate: u64, step: u64) {
+        if self.silent_run {
+            return;
+        }
         let LogPhase::Fetching(live) = &self.phase else { return };
         let body = live.status(facet_bytes, aggregate);
         self.emit(log::Level::Info, &body);
@@ -725,7 +795,12 @@ impl LogState {
                     _ => String::new(),
                 };
                 let label = format!("[{index}/{count}] {facet}{span}");
-                self.emit(log::Level::Info, &format!("planning {label}"));
+                // Quiet, the line waits for the plan: a resident one
+                // says nothing.
+                self.planning_said = !self.quiet_when_resident;
+                if self.planning_said {
+                    self.emit(log::Level::Info, &format!("planning {label}"));
+                }
                 self.phase = LogPhase::Planning(label);
                 self.advance();
             }
@@ -741,11 +816,20 @@ impl LogState {
                     LogPhase::Planning(label) => label,
                     _ => facet.to_string(),
                 };
-                self.emit(log::Level::Info, &format!("planned {label}: {outcome}"));
                 self.advance();
+                if self.quiet_when_resident && plan.is_resident() && !plan.degrades_to_full_download {
+                    return;
+                }
+                if !self.planning_said {
+                    self.emit(log::Level::Info, &format!("planning {label}"));
+                }
+                self.emit(log::Level::Info, &format!("planned {label}: {outcome}"));
             }
             FetchEvent::Begin { facets, bytes } => {
-                self.emit(log::Level::Info, &format!("fetching {facets} facet(s), {}", fmt_bytes(*bytes)));
+                self.silent_run = self.quiet_when_resident && *bytes == 0;
+                if !self.silent_run {
+                    self.emit(log::Level::Info, &format!("fetching {facets} facet(s), {}", fmt_bytes(*bytes)));
+                }
                 self.phase = LogPhase::Fetching(Live::new(*facets, *bytes));
                 self.reported_step = 0;
                 self.reported_bytes = None;
@@ -793,10 +877,17 @@ impl LogState {
                     format!("done, {}", fmt_bytes(*bytes))
                 };
                 let body = format!("[{}/{}] {}: {what}", live.index, live.count, live.facet);
-                self.emit(log::Level::Info, &body);
+                let quiet = self.quiet_when_resident && live.resident;
+                if !quiet {
+                    self.emit(log::Level::Info, &body);
+                }
                 self.advance();
             }
             FetchEvent::End { report } => {
+                if self.silent_run {
+                    self.phase = LogPhase::Idle;
+                    return;
+                }
                 let LogPhase::Fetching(live) = &self.phase else { return };
                 let (total, facet_total, count, secs) =
                     (live.total, live.facet_total, live.count, live.started.elapsed().as_secs_f64());
@@ -1021,6 +1112,72 @@ mod tests {
 
     fn progress(meter: &mut LogMeter, facet: &FacetId, bytes: u64, total: u64) {
         meter.on_event(&FetchEvent::Progress { facet, bytes, total, chunks: 0 });
+    }
+
+    /// A plan with one chunk to fetch.
+    fn plan_to_fetch() -> PrefetchPlan {
+        PrefetchPlan {
+            fills: vec![crate::view::RangeFill {
+                first_chunk: 0,
+                last_chunk: 0,
+                chunk_size: 1 << 23,
+                chunks: 1,
+                chunks_resident: 0,
+                resident_bytes: 0,
+                aligned_start: 0,
+                aligned_end: 1 << 23,
+            }],
+            ..PrefetchPlan::default()
+        }
+    }
+
+    /// **Quiet, a plan over resident data says nothing; one with
+    /// something to fetch still says what it costs** — its planning line
+    /// with its result — and a run that fetches nothing says nothing.
+    #[test]
+    fn a_quiet_log_meter_reports_only_what_costs_a_fetch() {
+        let (a, b) = (id("a"), id("b"));
+        let report = FetchReport { facets: vec![], elapsed: Duration::ZERO };
+        let (meter, lines) = log_meter("Fetch");
+        let mut meter = meter.quiet_when_resident(true);
+        meter.on_event(&FetchEvent::PlanBegin { index: 1, count: 2, facet: &a, files: None });
+        meter.on_event(&FetchEvent::PlanEnd { facet: &a, plan: &PrefetchPlan::default() });
+        assert!(texts(&lines).is_empty(), "{:?}", texts(&lines));
+        meter.on_event(&FetchEvent::PlanBegin { index: 2, count: 2, facet: &b, files: None });
+        meter.on_event(&FetchEvent::PlanEnd { facet: &b, plan: &plan_to_fetch() });
+        assert_eq!(texts(&lines), ["Fetch: planning [2/2] b", "Fetch: planned [2/2] b: 8.0 MiB to fetch"]);
+
+        let (meter, lines) = log_meter("Fetch");
+        let mut meter = meter.quiet_when_resident(true);
+        meter.on_event(&FetchEvent::Begin { facets: 1, bytes: 0 });
+        meter.on_event(&FetchEvent::FacetBegin { index: 1, count: 1, facet: &a, bytes: 0, chunks: 0, resident: true });
+        progress(&mut meter, &a, 0, 0);
+        meter.on_event(&FetchEvent::FacetEnd { facet: &a, bytes: 0 });
+        meter.on_event(&FetchEvent::End { report: &report });
+        assert!(texts(&lines).is_empty(), "a run that fetches nothing: {:?}", texts(&lines));
+
+        // Not quiet, the same resident plan is reported, as before.
+        let (mut meter, lines) = log_meter("Fetch");
+        meter.on_event(&FetchEvent::PlanBegin { index: 1, count: 1, facet: &a, files: None });
+        meter.on_event(&FetchEvent::PlanEnd { facet: &a, plan: &PrefetchPlan::default() });
+        assert_eq!(texts(&lines).len(), 2);
+    }
+
+    /// **The terminal meter, quiet, erases a resident plan's line** and
+    /// draws nothing for a run that fetches nothing.
+    #[test]
+    fn a_quiet_text_meter_erases_a_resident_plan() {
+        let a = id("a");
+        let cap = Capture::default();
+        let mut meter = TextMeter::to_writer("Fetch", Box::new(cap.clone())).quiet_when_resident(true);
+        meter.on_event(&FetchEvent::PlanBegin { index: 1, count: 1, facet: &a, files: None });
+        meter.on_event(&FetchEvent::PlanEnd { facet: &a, plan: &PrefetchPlan::default() });
+        meter.on_event(&FetchEvent::Begin { facets: 1, bytes: 0 });
+        meter.on_event(&FetchEvent::FacetBegin { index: 1, count: 1, facet: &a, bytes: 0, chunks: 0, resident: true });
+        meter.on_event(&FetchEvent::FacetEnd { facet: &a, bytes: 0 });
+        meter.on_event(&FetchEvent::End { report: &FetchReport { facets: vec![], elapsed: Duration::ZERO } });
+        let text = cap.text();
+        assert!(!text.contains("resident") && !text.contains("done") && !text.contains('\n'), "{text:?}");
     }
 
     /// **Log lines are whole and plain.** No carriage returns, no
