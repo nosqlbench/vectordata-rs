@@ -303,6 +303,7 @@ impl<T: Element, S: ByteSource> XvecReader<T, S> {
     /// within that part: the file's base and `index` for one file, one
     /// division and an index for a series.
     #[inline]
+    #[allow(clippy::expect_used, reason = "the documented panic of the unchecked `get_slice`")]
     fn slice_base(&self, index: usize) -> (*const u8, usize) {
         if self.part_bases.is_empty() {
             let base = self.resident_base().expect("XvecReader::get_slice requires mapped bytes");

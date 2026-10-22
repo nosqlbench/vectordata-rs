@@ -72,11 +72,7 @@ impl VarlenSource for XvecVarlenReader {
 
     fn next_record(&mut self) -> Option<VarlenRecord> {
         let bytes = self.file.bytes();
-        let header = bytes.get(self.offset..self.offset + 4)?;
-        let dim = match i32::from_le_bytes(header.try_into().expect("four bytes")) {
-            d if d > 0 => d as u32,
-            _ => return None,
-        };
+        let dim = crate::xvec::record::record_dim(bytes.get(self.offset..)?)? as u32;
         let start = self.offset + 4;
         let data = bytes.get(start..start + dim as usize * self.elem_size)?.to_vec();
         self.offset = start + data.len();

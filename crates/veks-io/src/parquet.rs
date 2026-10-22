@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 
 use arrow::array::{Array, ListArray};
@@ -313,9 +313,9 @@ impl ParquetDirReader {
                     // consume all in-flight slots while the needed file's
                     // worker is stuck behind backpressure.
                     {
-                        let mut in_flight = gate.in_flight.lock().unwrap();
+                        let mut in_flight = gate.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
                         while *in_flight >= gate.allowed.load(Ordering::Relaxed) {
-                            in_flight = gate.can_send.wait(in_flight).unwrap();
+                            in_flight = gate.can_send.wait(in_flight).unwrap_or_else(PoisonError::into_inner);
                         }
                         *in_flight += 1;
                     }
@@ -324,7 +324,7 @@ impl ParquetDirReader {
                     // unclaimed index since all workers gate before claiming.
                     let Some((idx, path)) = queue.next_job() else {
                         // No more files — release the slot we just acquired
-                        let mut in_flight = gate.in_flight.lock().unwrap();
+                        let mut in_flight = gate.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
                         *in_flight -= 1;
                         gate.can_send.notify_one();
                         break;
@@ -338,7 +338,7 @@ impl ParquetDirReader {
                         }
                         Err(e) => {
                             log::info!("Warning: failed to load {}: {}", path.display(), e);
-                            let mut in_flight = gate.in_flight.lock().unwrap();
+                            let mut in_flight = gate.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
                             *in_flight -= 1;
                             gate.can_send.notify_one();
                         }
@@ -368,7 +368,7 @@ impl ParquetDirReader {
 
     /// Release one in-flight slot and wake one worker.
     fn release_in_flight(&self) {
-        let mut in_flight = self.gate.in_flight.lock().unwrap();
+        let mut in_flight = self.gate.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
         *in_flight = in_flight.saturating_sub(1);
         self.gate.can_send.notify_one();
     }

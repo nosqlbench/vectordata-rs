@@ -177,7 +177,7 @@ impl SlabReader {
         let first_ordinal = entries
             .iter()
             .min_by_key(|e| e.start_ordinal)
-            .unwrap()
+            .ok_or_else(|| format!("{}: a slab with pages lists no page entry", path.display()))?
             .start_ordinal;
         let first_record = reader
             .get(first_ordinal)

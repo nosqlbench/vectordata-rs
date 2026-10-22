@@ -106,6 +106,9 @@
 //! - `slab` — Slab format read/write (adds slabtastic dependency)
 
 #![warn(missing_docs)]
+// No failure becomes a panic in production code (srd-crate-boundaries.md PR-8).
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 // An example that calls a deprecated item teaches the old API; only a
 // deprecated item's own example may, and it says so with an allow.
 #![doc(test(attr(deny(deprecated))))]
