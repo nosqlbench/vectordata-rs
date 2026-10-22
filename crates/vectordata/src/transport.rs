@@ -97,6 +97,7 @@ pub fn config_from(offline_setting: Option<&str>, tls: TlsTrust, env: &Transport
         user_agent: concat!("vectordata/", env!("CARGO_PKG_VERSION")).to_string(),
         timeouts: Timeouts::default(),
         redirects: 10,
+        resolve: Vec::new(),
         parallel_streams: count(&env.http_runtimes),
         download_concurrency: count(&env.download_concurrency),
         s3_region: env

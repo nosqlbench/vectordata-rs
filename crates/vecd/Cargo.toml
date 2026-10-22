@@ -27,6 +27,16 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 # Self-signed cert generation for `vecd tls generate` (ring crypto, matching
 # the rustls/ring backend already in the tree — no C toolchain needed).
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# Read the names vecd's own certificate was issued for (its subject alt
+# names), so the `daemon status --wait` readiness probe verifies the
+# certificate for one of them while connecting to loopback
+# (docs/design/srd-crate-boundaries.md TR-11, §10 Q9). Both are already
+# in the build graph under rustls — the TLS stack's own certificate
+# parser and PEM reader — so they add no new crates; nothing else in the
+# tree exposes a certificate's names (rcgen parses only behind its
+# x509-parser feature, which would add crates).
+rustls-pki-types = { version = "1.15", features = ["std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 
 # Control-plane store. `bundled` matches the workspace's established
 # rusqlite choice (veks-pipeline). The DB is the CAS authority + the

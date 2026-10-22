@@ -677,6 +677,7 @@ with trust for its own origin (TR-11), so reqwest leaves vecd's
 `[dependencies]`. The alternative keeps its own client and an entry in
 CB-2's allow-list.
 **Decided 2026-10-22:** through the transport, trusting only vecd's own origin and certificate.
+**Decided 2026-10-22 (follow-up):** the probe stays cert-pinned but names the host the certificate was issued for, pinned to the loopback listener (`TransportConfig::resolve`): the connected address when the certificate has it, else `localhost`, else its first DNS name. A certificate issued for a `--host` name, or a CA-issued one for a public name, is then reached on loopback and still verified.
 
 **Q10 — `veks-datatypes` and `veks-apicore`: two crates or one?**
 The element model (`ElementType`, `Element`, the conversion rules) is

@@ -39,6 +39,7 @@
 //! ```
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,6 +101,14 @@ pub struct TransportConfig {
     pub timeouts: Timeouts,
     /// How many redirects a request follows; `0` follows none.
     pub redirects: usize,
+    /// Host names pinned to an address, as `(name, addr)`: a request to
+    /// `name` connects to `addr` without consulting DNS, and its TLS
+    /// certificate is still verified for `name`. The URL's port wins
+    /// over `addr`'s. This is how a client reaches a server by the name
+    /// its certificate was issued for at an address that name does not
+    /// resolve to (vecd's readiness probe of its own loopback listener);
+    /// empty by default, so every name resolves normally.
+    pub resolve: Vec<(String, SocketAddr)>,
     /// Independent HTTP clients, each with its own runtime thread, that
     /// requests are spread over, so many parallel streams decrypt on
     /// many cores.
@@ -116,8 +125,9 @@ pub struct TransportConfig {
 pub const DEFAULT_PARALLEL_STREAMS: usize = 32;
 
 impl Default for TransportConfig {
-    /// Online, the system roots, ten redirects, the default timeouts,
-    /// [`DEFAULT_PARALLEL_STREAMS`] streams and workers, `us-east-1`.
+    /// Online, the system roots, ten redirects, no pinned names, the
+    /// default timeouts, [`DEFAULT_PARALLEL_STREAMS`] streams and
+    /// workers, `us-east-1`.
     fn default() -> Self {
         TransportConfig {
             offline: false,
@@ -126,6 +136,7 @@ impl Default for TransportConfig {
             user_agent: concat!("veks-transport/", env!("CARGO_PKG_VERSION")).to_string(),
             timeouts: Timeouts::default(),
             redirects: 10,
+            resolve: Vec::new(),
             parallel_streams: DEFAULT_PARALLEL_STREAMS,
             download_concurrency: DEFAULT_PARALLEL_STREAMS,
             s3_region: "us-east-1".to_string(),

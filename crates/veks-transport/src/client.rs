@@ -298,6 +298,11 @@ impl Transport {
             .redirect(redirects)
             .timeout(config.timeouts.request)
             .connect_timeout(config.timeouts.connect);
+        // Pinned names connect to their address; TLS is still verified
+        // for the name (`TransportConfig::resolve`).
+        for (name, addr) in &config.resolve {
+            b = b.resolve(name, *addr);
+        }
         // Augment the system roots with the configured CA/leaf certs (e.g.
         // a private vecd's exported cert). Verification stays on: this is
         // the secure way to trust a self-signed deployment.
@@ -693,5 +698,33 @@ mod tests {
         assert!(err.is_unreachable(), "{err:?}");
         let refused = t.send(Request::get("http://127.0.0.1:9/x")).unwrap_err();
         assert!(refused.is_unreachable(), "{refused:?}");
+    }
+
+    /// **A pinned name connects to its address**: `pinned.invalid` (a
+    /// name DNS never resolves) reaches a loopback server through
+    /// `TransportConfig::resolve`, on the URL's port, and the same name
+    /// unpinned does not.
+    #[test]
+    fn a_pinned_name_connects_to_its_address() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+            }
+        });
+        let url = format!("http://pinned.invalid:{port}/healthz");
+        // Port 1 in the pin: the URL's port is the one connected to.
+        let pinned = Transport::new(TransportConfig {
+            resolve: vec![("pinned.invalid".to_string(), "127.0.0.1:1".parse().unwrap())],
+            ..TransportConfig::default()
+        });
+        let resp = pinned.send(Request::get(url.as_str())).unwrap();
+        assert!(resp.is_success(), "{}", resp.status_line());
+        let unpinned = Transport::new(TransportConfig::default());
+        assert!(unpinned.send(Request::get(url.as_str())).is_err(), "pinned.invalid resolves only when pinned");
     }
 }

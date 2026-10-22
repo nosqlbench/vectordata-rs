@@ -1741,13 +1741,15 @@ fn cmd_serve(data_dir: &std::path::Path, cfg: &config::Config, a: &ServeArgs) ->
     })
 }
 
-/// The `GET /healthz` URL to probe for readiness, resolved the same way
-/// `cmd_serve` resolves its listener: the plain-HTTP path publishes its real
-/// bound address (including an ephemeral `:0` port) to `<data_dir>/vecd.addr`,
-/// so prefer that; otherwise fall back to the configured bind + TLS scheme.
-/// A wildcard bind (`0.0.0.0` / `[::]`) isn't a connectable client address, so
-/// probe loopback instead.
-fn health_probe_url(data_dir: &std::path::Path, cfg: &config::Config) -> Result<String, VecdError> {
+/// Where the readiness probe connects, resolved the same way `cmd_serve`
+/// resolves its listener: the plain-HTTP path publishes its real bound
+/// address (including an ephemeral `:0` port) to `<data_dir>/vecd.addr`,
+/// so prefer that; otherwise fall back to the configured bind + TLS
+/// scheme. The address is [`connectable`].
+fn health_probe_endpoint(
+    data_dir: &std::path::Path,
+    cfg: &config::Config,
+) -> Result<(&'static str, SocketAddr), VecdError> {
     let from_file = std::fs::read_to_string(data_dir.join("vecd.addr"))
         .ok()
         .and_then(|s| s.trim().parse::<SocketAddr>().ok())
@@ -1763,19 +1765,90 @@ fn health_probe_url(data_dir: &std::path::Path, cfg: &config::Config) -> Result<
             (if tls { "https" } else { "http" }, addr)
         }
     };
-    Ok(format_health_url(scheme, addr))
+    Ok((scheme, connectable(addr)))
 }
 
-/// Format the `/healthz` URL for a resolved scheme + bound address. A wildcard
-/// bind (`0.0.0.0` / `[::]`) isn't a connectable client address, so it maps to
-/// loopback; IPv6 hosts are bracketed.
-fn format_health_url(scheme: &str, addr: SocketAddr) -> String {
-    use std::net::IpAddr;
-    let host = match addr.ip() {
-        IpAddr::V4(v4) if v4.is_unspecified() => "127.0.0.1".to_string(),
-        IpAddr::V6(v6) if v6.is_unspecified() => "[::1]".to_string(),
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => format!("[{v6}]"),
+/// A listener address as a client connects to it: a wildcard bind
+/// (`0.0.0.0` / `[::]`) isn't a connectable client address, so it maps
+/// to loopback of the same family; a concrete address passes through.
+fn connectable(addr: SocketAddr) -> SocketAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match addr.ip() {
+        IpAddr::V4(v4) if v4.is_unspecified() => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port()),
+        IpAddr::V6(v6) if v6.is_unspecified() => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), addr.port()),
+        _ => addr,
+    }
+}
+
+/// The host an HTTPS readiness probe names, and so verifies the
+/// certificate for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeHost {
+    /// The connected address itself, as an IP literal: the certificate
+    /// names that address, or no usable name could be read from it.
+    Address,
+    /// A name the certificate was issued for, pinned to the connected
+    /// address (`TransportConfig::resolve`), so the probe reaches
+    /// vecd's own listener and verifies the certificate for this name.
+    Name(String),
+}
+
+/// The label a wildcard DNS name (`*.example.com`) is instantiated with
+/// to probe it (`vecd.example.com`).
+const WILDCARD_PROBE_LABEL: &str = "vecd";
+
+/// Which host the readiness probe names for a server presenting `cert`
+/// at `ip` (pure; `docs/design/srd-crate-boundaries.md` TR-11, §10 Q9):
+/// `ip` itself when the certificate has it as a subject alt name, else
+/// `localhost` when it has that, else its first DNS name — the first
+/// one that is not a wildcard, or the first wildcard instantiated with
+/// [`WILDCARD_PROBE_LABEL`] when it has only wildcards. A certificate
+/// that cannot be parsed, or names nothing usable, is probed by
+/// [`ProbeHost::Address`], where verification then fails and says why.
+///
+/// The names are only chosen here; the TLS handshake still verifies
+/// the certificate for the chosen one.
+fn probe_host(cert: &rustls_pki_types::CertificateDer<'_>, ip: std::net::IpAddr) -> ProbeHost {
+    use rustls_pki_types::{DnsName, ServerName};
+    let Ok(ee) = webpki::EndEntityCert::try_from(cert) else {
+        return ProbeHost::Address;
+    };
+    if ee.verify_is_valid_for_subject_name(&ServerName::IpAddress(ip.into())).is_ok() {
+        return ProbeHost::Address;
+    }
+    let localhost = ServerName::DnsName(DnsName::try_from("localhost").expect("localhost is a DNS name"));
+    if ee.verify_is_valid_for_subject_name(&localhost).is_ok() {
+        return ProbeHost::Name("localhost".to_string());
+    }
+    let names: Vec<&str> = ee.valid_dns_names().collect();
+    names
+        .iter()
+        .find(|n| !n.starts_with("*."))
+        .map(|n| n.to_string())
+        .or_else(|| names.first().map(|w| format!("{WILDCARD_PROBE_LABEL}{}", &w[1..])))
+        .map_or(ProbeHost::Address, ProbeHost::Name)
+}
+
+/// [`probe_host`] for vecd's own certificate file (its first PEM
+/// certificate); [`ProbeHost::Address`] when it cannot be read.
+fn own_cert_probe_host(own_cert: &std::path::Path, ip: std::net::IpAddr) -> ProbeHost {
+    use rustls_pki_types::pem::PemObject;
+    match rustls_pki_types::CertificateDer::from_pem_file(own_cert) {
+        Ok(cert) => probe_host(&cert, ip),
+        Err(e) => {
+            log::warn!("tls_cert: cannot read a certificate from {}: {e}", own_cert.display());
+            ProbeHost::Address
+        }
+    }
+}
+
+/// Format the `/healthz` URL for a scheme, the host it names and the
+/// connected address (pure). IPv6 address hosts are bracketed.
+fn format_health_url(scheme: &str, host: &ProbeHost, addr: SocketAddr) -> String {
+    let host = match (host, addr) {
+        (ProbeHost::Name(name), _) => name.clone(),
+        (ProbeHost::Address, SocketAddr::V4(a)) => a.ip().to_string(),
+        (ProbeHost::Address, SocketAddr::V6(a)) => format!("[{}]", a.ip()),
     };
     format!("{scheme}://{host}:{}/healthz", addr.port())
 }
@@ -1788,19 +1861,53 @@ const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// added to the trusted roots and no origin trusted without verification,
 /// so the probe accepts its own server and refuses any other — a
 /// different self-signed server at the probed address or anywhere else
-/// (`docs/design/srd-crate-boundaries.md` TR-11, §10 Q9). A plain-HTTP
-/// probe uses no TLS. Two-second ceilings, no redirects, one client.
-fn health_probe_config(own_cert: Option<PathBuf>) -> vectordata::transport::TransportConfig {
+/// (`docs/design/srd-crate-boundaries.md` TR-11, §10 Q9). A
+/// [`ProbeHost::Name`] is pinned to `addr`, the listener connected to,
+/// and nothing else is. A plain-HTTP probe uses no TLS. Two-second
+/// ceilings, no redirects, one client.
+fn health_probe_config(
+    own_cert: Option<PathBuf>,
+    host: &ProbeHost,
+    addr: SocketAddr,
+) -> vectordata::transport::TransportConfig {
     use vectordata::transport::{Timeouts, TlsTrust, TransportConfig};
     TransportConfig {
         tls: TlsTrust { trusted_ca_certs: own_cert.into_iter().collect(), trust_self_signed: Vec::new() },
         user_agent: concat!("vecd/", env!("CARGO_PKG_VERSION")).to_string(),
         timeouts: Timeouts { request: HEALTH_PROBE_TIMEOUT, connect: HEALTH_PROBE_TIMEOUT },
         redirects: 0,
+        resolve: match host {
+            ProbeHost::Name(name) => vec![(name.clone(), addr)],
+            ProbeHost::Address => Vec::new(),
+        },
         parallel_streams: 1,
         download_concurrency: 1,
         ..TransportConfig::default()
     }
+}
+
+/// One readiness probe to make: the URL and the transport configuration
+/// to send it with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealthProbe {
+    /// The `GET /healthz` URL.
+    url: String,
+    /// The transport it goes through ([`health_probe_config`]).
+    config: vectordata::transport::TransportConfig,
+}
+
+/// The readiness probe for the daemon at [`health_probe_endpoint`]: over
+/// HTTPS it names the host [`own_cert_probe_host`] picks from vecd's own
+/// certificate and connects to the listener's address; over plain HTTP
+/// it names the address.
+fn health_probe(data_dir: &std::path::Path, cfg: &config::Config) -> Result<HealthProbe, VecdError> {
+    let (scheme, addr) = health_probe_endpoint(data_dir, cfg)?;
+    let own_cert = cfg.get("tls_cert").map(PathBuf::from);
+    let host = match (scheme, &own_cert) {
+        ("https", Some(cert)) => own_cert_probe_host(cert, addr.ip()),
+        _ => ProbeHost::Address,
+    };
+    Ok(HealthProbe { url: format_health_url(scheme, &host, addr), config: health_probe_config(own_cert, &host, addr) })
 }
 
 /// One readiness probe of `url`: `Ok` on a 2xx answer, else why not. The
@@ -1818,26 +1925,35 @@ fn probe_health(transport: &vectordata::transport::Transport, url: &str) -> Resu
 
 /// Poll `GET /healthz` until it answers 2xx or `timeout_secs` elapses — the
 /// readiness wait behind `vecd daemon status --wait`. Over HTTPS the probe
-/// trusts vecd's own configured certificate and nothing else
-/// ([`health_probe_config`]). The URL is re-resolved each iteration so an
+/// trusts vecd's own configured certificate and nothing else, and verifies
+/// it for a name it was issued for while connecting to vecd's listener
+/// ([`health_probe`]). The probe is re-resolved each iteration so an
 /// ephemeral-port plain-HTTP serve is picked up once it publishes
-/// `vecd.addr`.
+/// `vecd.addr`; the transport is rebuilt only when its configuration
+/// changes.
 fn wait_for_health(
     data_dir: &std::path::Path,
     cfg: &config::Config,
     timeout_secs: u64,
 ) -> Result<(), VecdError> {
     use std::time::{Duration, Instant};
-    let transport = vectordata::transport::Transport::new(health_probe_config(cfg.get("tls_cert").map(PathBuf::from)));
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut transport: Option<(vectordata::transport::TransportConfig, vectordata::transport::Transport)> = None;
     loop {
         // Every arm but the 2xx success (which returns) records why this
         // attempt failed, for the timeout message.
-        let last = match health_probe_url(data_dir, cfg) {
-            Ok(url) => match probe_health(&transport, &url) {
-                Ok(()) => return Ok(()),
-                Err(why) => why,
-            },
+        let last = match health_probe(data_dir, cfg) {
+            Ok(probe) => {
+                if transport.as_ref().is_none_or(|(config, _)| *config != probe.config) {
+                    let built = vectordata::transport::Transport::new(probe.config.clone());
+                    transport = Some((probe.config, built));
+                }
+                let (_, t) = transport.as_ref().expect("built above");
+                match probe_health(t, &probe.url) {
+                    Ok(()) => return Ok(()),
+                    Err(why) => why,
+                }
+            }
             Err(e) => e.to_string(),
         };
         if Instant::now() >= deadline {
@@ -2477,54 +2593,105 @@ mod tests {
     use super::*;
 
     /// The probe's trust is vecd's own certificate, verified, and no
-    /// origin accepted unverified; no redirects, two-second ceilings.
+    /// origin accepted unverified; no redirects, two-second ceilings; a
+    /// name is pinned to the connected listener and an address pins
+    /// nothing.
     #[test]
     fn the_health_probe_trusts_only_its_own_certificate() {
-        let c = health_probe_config(Some(PathBuf::from("/etc/vecd/tls-cert.pem")));
+        let addr: SocketAddr = "127.0.0.1:18443".parse().unwrap();
+        let named = ProbeHost::Name("vecd.test".to_string());
+        let c = health_probe_config(Some(PathBuf::from("/etc/vecd/tls-cert.pem")), &named, addr);
         assert_eq!(c.tls.trusted_ca_certs, vec![PathBuf::from("/etc/vecd/tls-cert.pem")]);
         assert!(c.tls.trust_self_signed.is_empty(), "no origin is trusted unverified");
         assert_eq!(c.redirects, 0);
+        assert_eq!(c.resolve, vec![("vecd.test".to_string(), addr)]);
         assert_eq!((c.timeouts.request, c.timeouts.connect), (HEALTH_PROBE_TIMEOUT, HEALTH_PROBE_TIMEOUT));
         assert_eq!(HEALTH_PROBE_TIMEOUT, std::time::Duration::from_secs(2));
-        let plain = health_probe_config(None);
+        let plain = health_probe_config(None, &ProbeHost::Address, addr);
         assert!(plain.tls.trusted_ca_certs.is_empty() && plain.tls.trust_self_signed.is_empty());
+        assert!(plain.resolve.is_empty(), "an address probe pins no name");
+    }
+
+    /// A self-signed certificate whose subject alt names are `names`, as DER.
+    fn cert_for(names: &[&str]) -> rustls_pki_types::CertificateDer<'static> {
+        let ck = rcgen::generate_simple_self_signed(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
+        ck.cert.der().clone()
+    }
+
+    /// The probed host: the connected address when the certificate names
+    /// it, else `localhost`, else the first non-wildcard DNS name, else
+    /// the first wildcard instantiated; the address when nothing fits.
+    #[test]
+    fn the_probe_names_the_host_its_certificate_was_issued_for() {
+        let v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: std::net::IpAddr = "::1".parse().unwrap();
+        let name = |n: &str| ProbeHost::Name(n.to_string());
+        assert_eq!(probe_host(&cert_for(&["127.0.0.1", "localhost"]), v4), ProbeHost::Address);
+        assert_eq!(probe_host(&cert_for(&["vecd.test", "::1"]), v6), ProbeHost::Address);
+        // 127.0.0.1 does not cover a listener on ::1.
+        assert_eq!(probe_host(&cert_for(&["127.0.0.1", "localhost"]), v6), name("localhost"));
+        assert_eq!(probe_host(&cert_for(&["vecd.test", "localhost"]), v4), name("localhost"));
+        assert_eq!(probe_host(&cert_for(&["vecd.test", "other.test"]), v4), name("vecd.test"));
+        assert_eq!(probe_host(&cert_for(&["*.example.com", "data.example.com"]), v4), name("data.example.com"));
+        assert_eq!(probe_host(&cert_for(&["*.example.com"]), v4), name("vecd.example.com"));
+        assert_eq!(probe_host(&cert_for(&["10.0.0.7"]), v4), ProbeHost::Address);
+        assert_eq!(
+            probe_host(&rustls_pki_types::CertificateDer::from(b"not a certificate".to_vec()), v4),
+            ProbeHost::Address
+        );
     }
 
     #[test]
-    fn format_health_url_normalizes_host_and_scheme() {
-        let p = |s: &str, a: &str| format_health_url(s, a.parse().unwrap());
-        // Wildcard binds → loopback (not connectable as a client address).
-        assert_eq!(p("https", "0.0.0.0:18443"), "https://127.0.0.1:18443/healthz");
-        assert_eq!(p("http", "[::]:8443"), "http://[::1]:8443/healthz");
-        // Concrete hosts pass through; IPv6 is bracketed.
-        assert_eq!(p("https", "127.0.0.1:443"), "https://127.0.0.1:443/healthz");
-        assert_eq!(p("http", "[2001:db8::1]:80"), "http://[2001:db8::1]:80/healthz");
+    fn connectable_maps_wildcards_to_loopback() {
+        let c = |a: &str| connectable(a.parse().unwrap()).to_string();
+        assert_eq!(c("0.0.0.0:18443"), "127.0.0.1:18443");
+        assert_eq!(c("[::]:8443"), "[::1]:8443");
+        assert_eq!(c("10.0.0.1:443"), "10.0.0.1:443");
+        assert_eq!(c("[2001:db8::1]:80"), "[2001:db8::1]:80");
     }
 
     #[test]
-    fn health_probe_url_prefers_addr_file_then_config_tls() {
+    fn format_health_url_names_the_host_or_the_address() {
+        let p = |s: &str, h: &ProbeHost, a: &str| format_health_url(s, h, a.parse().unwrap());
+        assert_eq!(p("https", &ProbeHost::Address, "127.0.0.1:443"), "https://127.0.0.1:443/healthz");
+        assert_eq!(p("http", &ProbeHost::Address, "[2001:db8::1]:80"), "http://[2001:db8::1]:80/healthz");
+        let named = ProbeHost::Name("vecd.test".to_string());
+        assert_eq!(p("https", &named, "[::1]:8443"), "https://vecd.test:8443/healthz");
+    }
+
+    #[test]
+    fn health_probe_prefers_addr_file_then_config_tls() {
         let dir = tempfile::tempdir().unwrap();
-        // No addr file → resolve scheme from config TLS keys + the bind.
+        // No addr file → resolve scheme from config TLS keys + the bind. An
+        // unreadable certificate is probed by address and pins nothing.
         let tls = config::Config::parse(
             "bind = 0.0.0.0:18443\ntls_cert = /c.pem\ntls_key = /k.pem",
         )
         .unwrap();
-        assert_eq!(
-            health_probe_url(dir.path(), &tls).unwrap(),
-            "https://127.0.0.1:18443/healthz"
-        );
+        let probe = health_probe(dir.path(), &tls).unwrap();
+        assert_eq!(probe.url, "https://127.0.0.1:18443/healthz");
+        assert!(probe.config.resolve.is_empty());
         let plain = config::Config::parse("bind = 127.0.0.1:9000").unwrap();
-        assert_eq!(
-            health_probe_url(dir.path(), &plain).unwrap(),
-            "http://127.0.0.1:9000/healthz"
-        );
+        assert_eq!(health_probe(dir.path(), &plain).unwrap().url, "http://127.0.0.1:9000/healthz");
+        // A certificate issued only for a name → that name, pinned to the
+        // bind's loopback.
+        let ck = rcgen::generate_simple_self_signed(vec!["vecd.test".to_string()]).unwrap();
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(&cert, ck.cert.pem()).unwrap();
+        let named = config::Config::parse(&format!(
+            "bind = 0.0.0.0:18443\ntls_cert = {}\ntls_key = /k.pem",
+            cert.display()
+        ))
+        .unwrap();
+        let probe = health_probe(dir.path(), &named).unwrap();
+        assert_eq!(probe.url, "https://vecd.test:18443/healthz");
+        assert_eq!(probe.config.resolve, vec![("vecd.test".to_string(), "127.0.0.1:18443".parse().unwrap())]);
         // A published vecd.addr (plain-HTTP ephemeral port) takes precedence and
         // is always http, regardless of the configured bind/TLS.
         std::fs::write(dir.path().join("vecd.addr"), "127.0.0.1:54321\n").unwrap();
-        assert_eq!(
-            health_probe_url(dir.path(), &tls).unwrap(),
-            "http://127.0.0.1:54321/healthz"
-        );
+        let probe = health_probe(dir.path(), &named).unwrap();
+        assert_eq!(probe.url, "http://127.0.0.1:54321/healthz");
+        assert!(probe.config.resolve.is_empty());
     }
 
     #[test]

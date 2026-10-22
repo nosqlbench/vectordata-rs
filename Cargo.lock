@@ -6386,6 +6386,8 @@ dependencies = [
  "rcgen",
  "reqwest 0.13.5",
  "rusqlite",
+ "rustls-pki-types",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "serde_yaml",

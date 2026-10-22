@@ -8,16 +8,29 @@
 //! origin. Before the probe went through the transport it accepted every
 //! certificate.
 //!
+//! The probe connects to loopback but verifies the name the certificate
+//! was issued for, so a certificate whose subject alt names leave out
+//! `127.0.0.1` and `localhost` (one issued for a `--host` name, or a
+//! CA-issued one for a public name) is reached too.
+//!
 //! Driven through the compiled binary, with a config directory of the
 //! test's own (`$VECD_CONFIG` on the child only).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A self-signed certificate for `127.0.0.1`, written as PEM files under
-/// `dir` with `stem`; returns (certificate, key) paths and their PEMs.
+/// A self-signed certificate for `127.0.0.1` and `localhost`, written as
+/// PEM files under `dir` with `stem`; returns (certificate, key) paths
+/// and their PEMs.
 fn self_signed(dir: &Path, stem: &str) -> (PathBuf, PathBuf, Vec<u8>, Vec<u8>) {
-    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()]).unwrap();
+    self_signed_for(dir, stem, &["127.0.0.1", "localhost"])
+}
+
+/// A self-signed certificate whose subject alt names are exactly
+/// `names`, written as PEM files under `dir` with `stem`; returns
+/// (certificate, key) paths and their PEMs.
+fn self_signed_for(dir: &Path, stem: &str, names: &[&str]) -> (PathBuf, PathBuf, Vec<u8>, Vec<u8>) {
+    let ck = rcgen::generate_simple_self_signed(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
     let (cert_pem, key_pem) = (ck.cert.pem().into_bytes(), ck.key_pair.serialize_pem().into_bytes());
     let (cert, key) = (dir.join(format!("{stem}-cert.pem")), dir.join(format!("{stem}-key.pem")));
     std::fs::write(&cert, &cert_pem).unwrap();
@@ -112,5 +125,39 @@ fn the_readiness_probe_trusts_its_own_certificate_and_refuses_another_origin() {
         !refused.status.success(),
         "the probe accepted a self-signed certificate that is not vecd's own, at another origin"
     );
+    assert!(stderr.contains("did not answer /healthz"), "{stderr}");
+}
+
+/// **A certificate issued only for a DNS name is reached on loopback**:
+/// vecd's own certificate names `vecd.test` and no IP address, the
+/// server listens on `127.0.0.1`, and the probe verifies `vecd.test`
+/// against vecd's own certificate while connecting to loopback.
+#[test]
+fn the_readiness_probe_reaches_a_certificate_issued_only_for_a_dns_name() {
+    let work = tempfile::tempdir().unwrap();
+    let (cert, key, cert_pem, key_pem) = self_signed_for(work.path(), "named", &["vecd.test"]);
+    let server = HealthServer::start(cert_pem, key_pem);
+
+    let reached = status_wait(work.path(), server.port, &cert, &key);
+    assert!(
+        reached.status.success(),
+        "the probe refused vecd's own certificate issued for vecd.test:\n{}",
+        String::from_utf8_lossy(&reached.stderr)
+    );
+}
+
+/// **A name-only certificate that is not vecd's own is still refused**:
+/// vecd's certificate and the server's both name `vecd.test`, but the
+/// server's is a different self-signed certificate.
+#[test]
+fn the_readiness_probe_refuses_another_certificate_for_the_same_name() {
+    let work = tempfile::tempdir().unwrap();
+    let (own_cert, own_key, _, _) = self_signed_for(work.path(), "own", &["vecd.test"]);
+    let (_, _, other_cert_pem, other_key_pem) = self_signed_for(work.path(), "other", &["vecd.test"]);
+    let other = HealthServer::start(other_cert_pem, other_key_pem);
+
+    let refused = status_wait(work.path(), other.port, &own_cert, &own_key);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "the probe accepted a certificate for vecd.test that is not vecd's own");
     assert!(stderr.contains("did not answer /healthz"), "{stderr}");
 }
