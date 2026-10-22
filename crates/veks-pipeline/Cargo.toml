@@ -70,7 +70,6 @@ rand_distr = "0.5"
 rand_xoshiro = "0.7"
 rayon = "1"
 regex = "1"
-reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "rustls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -86,7 +85,6 @@ veks-simd = { path = "../veks-simd", version = "=4.0.2" }
 # scans; `x86-v4` turns on its AVX-512 kernels.
 gemm = { version = "0.19", default-features = false, features = ["std", "rayon", "x86-v4"] }
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
 vectordata = { path = "../vectordata", version = "=4.0.2" }
 veks-datatypes = { path = "../veks-datatypes", version = "=4.0.2" }
 veks-core = { path = "../veks-core", version = "=4.0.2" }
@@ -105,6 +103,7 @@ tempfile = "3"
 axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros"] }
 
 [[bench]]
 name = "simd_distance"
