@@ -166,7 +166,7 @@ impl FacetShape {
     /// tell a caller where to go rather than only what went wrong.
     pub fn reader(self) -> &'static str {
         match self {
-            Self::Elements => "facet() / open_facet_typed()",
+            Self::Elements => "facet_as() / open_facet_native()",
             Self::Records => "open_facet_records()",
         }
     }

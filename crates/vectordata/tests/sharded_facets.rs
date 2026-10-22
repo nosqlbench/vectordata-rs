@@ -9,10 +9,6 @@
 //!
 //! See `docs/design/srd-multifile-facet-shards.md`.
 
-// The typed reader and the group's prebuffer forms are deprecated;
-// this suite still covers the ones it calls.
-#![allow(deprecated)]
-
 mod support;
 
 use std::io::Write;
@@ -406,7 +402,7 @@ fn a_series_with_a_disagreeing_shard_is_refused() {
     );
 }
 
-/// **Typed access reads a scalar series** — the same values the single
+/// **`facet_as` reads a scalar series** — the same values the single
 /// file would serve, at the same ordinals.
 #[test]
 fn typed_access_reads_a_scalar_series() {
@@ -425,17 +421,16 @@ fn typed_access_reads_a_scalar_series() {
 
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    let r: vectordata::TypedReader<u32> =
-        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
+    let r = view.facet_as::<u32>("metadata_layout").unwrap();
 
     assert_eq!(r.count(), 175, "the count spans the series");
     for o in [0usize, 1, 99, 100, 101, 174] {
-        assert_eq!(r.get_value(o).unwrap(), o as u32, "value at ordinal {o}");
+        assert_eq!(r.get(o).unwrap()[0], o as u32, "value at ordinal {o}");
     }
-    assert!(r.get_value(175).is_err(), "one past the end must fail");
+    assert!(r.get(175).is_err(), "one past the end must fail");
 }
 
-/// A typed reader over a *sliced* series reads the windowed records,
+/// `facet_as` over a *sliced* series reads the windowed records,
 /// mapping facet ordinals to file ordinals through the entry window
 /// (SH-64).
 #[test]
@@ -453,17 +448,16 @@ fn typed_access_reads_a_sliced_series() {
 
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    let r: vectordata::TypedReader<u32> =
-        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
+    let r = view.facet_as::<u32>("metadata_layout").unwrap();
 
     assert_eq!(r.count(), 20);
     // First shard: facet ordinals 0..10 are file ordinals 0..10.
-    assert_eq!(r.get_value(0).unwrap(), 0);
-    assert_eq!(r.get_value(9).unwrap(), 9);
+    assert_eq!(r.get(0).unwrap()[0], 0);
+    assert_eq!(r.get(9).unwrap()[0], 9);
     // Second shard: facet ordinal 10 is file ordinal 990.
-    assert_eq!(r.get_value(10).unwrap(), 990);
-    assert_eq!(r.get_value(19).unwrap(), 999);
-    assert!(r.get_value(20).is_err());
+    assert_eq!(r.get(10).unwrap()[0], 990);
+    assert_eq!(r.get(19).unwrap()[0], 999);
+    assert!(r.get(20).is_err());
 }
 
 /// Write an ivvec of ragged records and its `IDXFOR__` sidecar.
@@ -1093,11 +1087,10 @@ fn a_sliced_facet_is_complete_when_its_window_is() {
         "precache asks for the window, not the file"
     );
 
-    let r: vectordata::TypedReader<u32> =
-        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
+    let r = view.facet_as::<u32>("metadata_layout").unwrap();
     assert_eq!(r.count(), 20);
-    assert_eq!(r.get_value(0).unwrap(), 0);
-    assert_eq!(r.get_value(10).unwrap(), 9990);
+    assert_eq!(r.get(0).unwrap()[0], 0);
+    assert_eq!(r.get(10).unwrap()[0], 9990);
 }
 
 // ─── Format version ────────────────────────────────────────────────

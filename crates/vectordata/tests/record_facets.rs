@@ -539,7 +539,7 @@ fn opening_an_element_facet_as_records_points_back() {
     match view.open_facet_records("base_vectors") {
         Err(vectordata::records::RecordError::WrongShape { facet, reader }) => {
             assert_eq!(facet, "base_vectors");
-            assert!(reader.contains("facet()"), "{reader}");
+            assert!(reader.contains("facet_as()"), "{reader}");
         }
         other => panic!("expected a shape mismatch, got {other:?}"),
     }

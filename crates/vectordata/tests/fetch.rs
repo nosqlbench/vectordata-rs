@@ -4,10 +4,6 @@
 //! The library fetch, end to end against a served dataset: the
 //! acceptance cases of `docs/design/srd-api-discoverability.md` §9.
 
-// The typed reader and the group's prebuffer forms are deprecated;
-// this suite still covers the ones it calls.
-#![allow(deprecated)]
-
 mod support;
 
 use std::path::Path;
@@ -559,10 +555,9 @@ fn read_the_fetched_facets_in_a_child() {
     let results = view.metadata_results_as::<i32>().unwrap();
     assert!(results.is_complete(), "the variable-length reader sees them too");
     assert_eq!(results.get(299).unwrap(), vec![12_000_299]);
-    let typed: vectordata::TypedReader<u8> =
-        vectordata::open_facet_typed(&*view, "metadata_content").unwrap();
-    assert!(typed.is_complete(), "and so does the typed reader");
-    assert_eq!(typed.get_native(300).unwrap(), (300 % 251) as u8);
+    let labels = view.facet_as::<u8>("metadata_content").unwrap();
+    assert!(labels.is_complete(), "and so does the scalar reader");
+    assert_eq!(labels.get(300).unwrap()[0], (300 % 251) as u8);
 }
 
 /// Bytes free on the filesystem holding `path`, as the cache check

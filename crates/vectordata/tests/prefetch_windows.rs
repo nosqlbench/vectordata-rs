@@ -10,10 +10,6 @@
 //! the ad-hoc path exists, resolves to the same bytes the profile path
 //! would, and reports its cost before spending it.
 
-// The typed reader and the group's prebuffer forms are deprecated;
-// this suite still covers the ones it calls.
-#![allow(deprecated)]
-
 use std::io::Write;
 use vectordata::WholeFacetFallback;
 use vectordata::TestDataViewExt;
@@ -1986,7 +1982,7 @@ fn scalar_dataset(dir: &std::path::Path) -> vectordata::TestDataGroup {
 /// **A scalar facet has no dimension header, so it must not be read as
 /// if it had one.**
 ///
-/// `TypedReader` addresses a scalar facet at `ordinal * elem_size`.
+/// A scalar reader addresses a scalar facet at `ordinal * elem_size`.
 /// Routing it through the uniform-xvec branch instead takes the first
 /// four bytes as a dimension and derives a stride of
 /// `4 + dim * elem_size` — here `4 + 7*4 = 32` rather than `4`, so
@@ -2113,7 +2109,7 @@ fn every_scalar_width_maps_at_its_own_stride() {
 ///
 /// The other scalar tests assert byte ranges against arithmetic done in
 /// the test. This one closes the loop against the *reader*: whatever
-/// `TypedReader` addresses for those ordinals must be what the prefetch
+/// `facet_as` addresses for those ordinals must be what the prefetch
 /// warmed — no more (wasted transfer) and no less (a read that faults
 /// past the window). It is the invariant the mapping exists to hold.
 #[test]
@@ -2139,10 +2135,9 @@ fn a_scalar_window_covers_exactly_what_the_reader_reads() {
         .collect();
 
     // ...and against what the reader returns for the same ordinals.
-    let reader: vectordata::TypedReader<u32> =
-        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
+    let reader = view.facet_as::<u32>("metadata_layout").unwrap();
     let read: Vec<u32> = (lo..hi)
-        .map(|o| reader.get_value(o as usize).unwrap())
+        .map(|o| reader.get(o as usize).unwrap()[0])
         .collect();
 
     assert_eq!(
@@ -2219,10 +2214,9 @@ fn a_remote_scalar_window_fetches_only_its_chunks() {
         .prefetch_plan("metadata_layout", &parse_window("5000..6000").unwrap())
         .unwrap();
     assert!(after.is_resident(), "the window's chunks are in the cache");
-    let reader: vectordata::TypedReader<u32> =
-        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
+    let reader = view.facet_as::<u32>("metadata_layout").unwrap();
     for o in [5000usize, 5500, 5999] {
-        assert_eq!(reader.get_value(o).unwrap(), vals[o], "value at {o}");
+        assert_eq!(reader.get(o).unwrap()[0], vals[o], "value at {o}");
     }
 }
 

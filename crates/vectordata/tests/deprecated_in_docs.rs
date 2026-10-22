@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
-/// The deprecated calls, and what replaces each.
+/// The deprecated calls — and the removed ones, which a document must
+/// not teach either — and what replaces each.
 const DEPRECATED: &[(&str, &str)] = &[
     (
         r"\.(base_vectors|query_vectors|neighbor_indices|neighbor_distances|prefiltered_neighbor_indices|prefiltered_neighbor_distances|postfiltered_neighbor_indices|postfiltered_neighbor_distances|metadata_results)\(\)",

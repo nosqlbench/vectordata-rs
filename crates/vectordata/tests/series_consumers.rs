@@ -15,10 +15,6 @@
 //!
 //! See `docs/design/srd-multifile-facet-shards.md`.
 
-// The typed reader and the group's prebuffer forms are deprecated;
-// this suite still covers the ones it calls.
-#![allow(deprecated)]
-
 use std::io::Write as _;
 use vectordata::dataset::Sharding;
 use vectordata::TestDataViewExt;
@@ -248,11 +244,11 @@ fn deriving_a_windowed_series_slices_the_series() {
 
 /// **Both entry points to a typed reader answer the same** (SH-79).
 ///
-/// `open_facet_typed` exists as a free function over the trait and as
-/// a method on the concrete view. The free one grew series support;
-/// the method resolved a single source and errored. Two spellings of
-/// one operation must not disagree about whether a dataset is
-/// readable.
+/// `facet_as` is reached through the trait object a group hands out
+/// and through the concrete view. The typed reader this replaced once
+/// grew series support on one of its two spellings and errored on the
+/// other. Two spellings of one operation must not disagree about
+/// whether a dataset is readable.
 #[test]
 fn the_typed_reader_reads_a_series_from_either_entry_point() {
     let tmp = tempfile::tempdir().unwrap();
@@ -271,20 +267,20 @@ fn the_typed_reader_reads_a_series_from_either_entry_point() {
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
 
-    let by_fn: vectordata::TypedReader<u32> =
-        vectordata::open_facet_typed(&*view, "metadata_layout")
-            .expect("the free function reads a series");
-    assert_eq!(by_fn.count(), 175);
+    let by_dyn = view
+        .facet_as::<u32>("metadata_layout")
+        .expect("the trait object reads a series");
+    assert_eq!(by_dyn.count(), 175);
 
     let concrete = g.generic_view("default").unwrap();
-    let by_method: vectordata::TypedReader<u32> = concrete
-        .open_facet_typed("metadata_layout")
+    let by_concrete = concrete
+        .facet_as::<u32>("metadata_layout")
         .expect("the concrete view reads a series too");
-    assert_eq!(by_method.count(), by_fn.count());
+    assert_eq!(by_concrete.count(), by_dyn.count());
     for o in [0usize, 99, 100, 174] {
         assert_eq!(
-            by_method.get_value(o).unwrap(),
-            by_fn.get_value(o).unwrap(),
+            by_concrete.get(o).unwrap(),
+            by_dyn.get(o).unwrap(),
             "ordinal {o}"
         );
     }
@@ -632,11 +628,13 @@ fn a_slab_facet_survives_derive_by_either_plan_builder() {
 
 /// **A native read on a series reads the shard that holds the ordinal.**
 ///
-/// `get_native` had a zero-copy fast path that offset into the *first*
-/// shard's mapping with the facet-wide ordinal. Wherever that offset
-/// still landed inside the first file — here, a first shard holding
-/// more records than the series takes from it — it returned that file's
-/// bytes for a record that lives in the second.
+/// The typed reader `facet_as` replaced had a zero-copy fast path
+/// (`get_native`) that offset into the *first* shard's mapping with
+/// the facet-wide ordinal. Wherever that offset still landed inside
+/// the first file — here, a first shard holding more records than the
+/// series takes from it — it returned that file's bytes for a record
+/// that lives in the second. Every read path of the reader that
+/// replaced it — copying, borrowing, bulk — must land in the second.
 #[test]
 fn a_native_read_on_a_series_reads_the_shard_holding_the_ordinal() {
     let tmp = tempfile::tempdir().unwrap();
@@ -657,10 +655,14 @@ fn a_native_read_on_a_series_reads_the_shard_holding_the_ordinal() {
     .unwrap();
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    let r: vectordata::TypedReader<i32> =
-        vectordata::open_facet_typed(&*view, "metadata_layout").unwrap();
+    let r = view.facet_as::<i32>("metadata_layout").unwrap();
 
-    assert_eq!(r.get_value(120).unwrap(), 1020, "the slow path is right");
-    assert_eq!(r.get_native(120).unwrap(), 1020, "and the native path agrees");
-    assert_eq!(r.get_native(5).unwrap(), 5);
+    assert_eq!(r.get(120).unwrap(), vec![1020], "the copying path is right");
+    if let Some(borrowed) = r.get_slice(120) {
+        assert_eq!(borrowed, &[1020], "and the borrowing path agrees");
+    }
+    let mut window = [0i32; 10];
+    assert_eq!(r.read_into(115, &mut window).unwrap(), 10);
+    assert_eq!(window, [1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024], "and the bulk path");
+    assert_eq!(r.get(5).unwrap(), vec![5]);
 }

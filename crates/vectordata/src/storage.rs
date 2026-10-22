@@ -6,7 +6,7 @@
 //! `Storage` hides the transport choice (local mmap, direct HTTP RANGE,
 //! merkle-cached HTTP-with-mmap-promotion) behind a single byte-oriented
 //! interface. Shape adapters (`XvecReader`, `ScalarReader`,
-//! `IndexedVvecReader`, the deprecated `TypedReader`) are parameterised on `Arc<Storage>` so they share one
+//! `IndexedVvecReader`) are parameterised on `Arc<Storage>` so they share one
 //! transport implementation regardless of data shape.
 //!
 //! This module is `pub(crate)` on purpose: callers outside the crate
@@ -555,11 +555,6 @@ impl Storage {
         })
     }
 
-    /// Open a remote URL via the shared registry.
-    pub(crate) fn open_url(url: Url) -> io::Result<Arc<Self>> {
-        Self::open(url.as_str())
-    }
-
     /// Crate-internal: open a fresh URL-backed `Storage` (no
     /// registry lookup). Tries `.mref`-cached first, falls back to
     /// direct HTTP. Used by `Storage::open` after a registry miss.
@@ -708,7 +703,7 @@ impl Storage {
 
     /// Open a remote URL through the merkle-cache path. Requires a
     /// published `.mref`. Crate-internal; callers go through
-    /// `open_url` so the fallback path runs uniformly.
+    /// `open_url_uncached` so the fallback path runs uniformly.
     pub(crate) fn open_url_cached(url: Url, layout: &LayoutChoice) -> io::Result<Self> {
         crate::transport::ensure_online(url.as_str())?;
         let client = crate::transport::shared_client_for(url.as_str());
@@ -762,7 +757,7 @@ impl Storage {
     }
 
     /// Open a remote URL via direct HTTP RANGE. Crate-internal; the
-    /// fallback path of `open_url` (used when no `.mref` is
+    /// fallback path of `open_url_uncached` (used when no `.mref` is
     /// published). Per-read fetches go over HTTP until the caller
     /// runs [`precache`], which downloads the whole file into
     /// `<dataset_dir>/<file_relpath>` (per the natural layout) and

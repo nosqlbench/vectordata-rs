@@ -5,16 +5,13 @@
 //! §14.3 step 3): the guards that failed on the code before it, and
 //! the behaviour of the shared model's tables as this crate uses them.
 
-// The typed reader is deprecated in favour of `TestDataViewExt::facet_as`;
-// the float guard here is about that reader.
-#![allow(deprecated)]
-
 use std::io::Write;
 use std::path::Path;
 
 use vectordata::dataset::facet::FacetFormat;
-use vectordata::io::{IndexedVvecReader, IoError, XvecReader, open_vec};
-use vectordata::typed_access::{Container, ElementType, TypedReader};
+use vectordata::VectorReader;
+use vectordata::io::{IndexedVvecReader, IoError, ScalarReader, XvecReader, open_vec, open_vec_as};
+use vectordata::typed_access::{Container, ElementType};
 
 fn tmp() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
@@ -85,17 +82,18 @@ fn a_u32vvec_does_not_open_as_i32() {
 }
 
 #[test]
-fn a_float_file_is_refused_by_the_typed_reader() {
+fn a_float_file_is_refused_as_an_integer() {
     let dir = tmp();
     let path = dir.path().join("base.fvec");
     write_records(&path, 2, &[f32s(&[1.5, 2.5])]);
-    let err = TypedReader::<i32>::open(&path).expect_err("an f32 file read as i32 is not zeros");
-    assert!(err.to_string().contains("cannot open f32 file as i32"), "{err}");
+    let src = path.to_str().unwrap();
+    let err = open_vec_as::<i32>(src).err().expect("an f32 file read as i32 is not zeros");
+    assert_eq!(mismatch(&err), Some((ElementType::F32, ElementType::I32)), "{err}");
     // At its own type, and widened to f64, the values are the values.
-    let native = TypedReader::<f32>::open(&path).unwrap();
-    assert_eq!(native.get_record(0).unwrap(), vec![1.5, 2.5]);
-    let wide = TypedReader::<f64>::open(&path).unwrap();
-    assert_eq!(wide.get_record(0).unwrap(), vec![1.5, 2.5]);
+    let native = open_vec_as::<f32>(src).unwrap();
+    assert_eq!(native.get(0).unwrap(), vec![1.5, 2.5]);
+    let wide = open_vec_as::<f64>(src).unwrap();
+    assert_eq!(wide.get(0).unwrap(), vec![1.5, 2.5]);
 }
 
 #[test]
@@ -122,10 +120,10 @@ fn open_vec_refuses_a_column() {
     };
     assert!(matches!(err, IoError::InvalidFormat(_)), "{err}");
     assert!(err.to_string().contains("column"), "{err}");
-    // A column reads through the typed reader at its own type.
-    let column = TypedReader::<f32>::open(&path).unwrap();
+    // A column reads through the scalar reader at its own type.
+    let column = ScalarReader::<f32>::open(path.to_str().unwrap()).unwrap();
     assert_eq!((column.count(), column.dim()), (2, 1));
-    assert_eq!(column.get_value(1).unwrap(), 0.25);
+    assert_eq!(column.get(1).unwrap()[0], 0.25);
 }
 
 #[test]
@@ -140,7 +138,7 @@ fn a_float_file_opens_as_itself_only_through_the_raw_readers() {
     assert_eq!(mismatch(&err), Some((ElementType::F16, ElementType::F32)));
     assert!(err.to_string().contains("dataset view"), "{err}");
     let native = XvecReader::<vectordata::typed_access::f16>::open_path(&path).unwrap();
-    assert_eq!(vectordata::VectorReader::get(&native, 0).unwrap()[1].to_f32(), -2.0);
+    assert_eq!(native.get(0).unwrap()[1].to_f32(), -2.0);
 }
 
 #[test]

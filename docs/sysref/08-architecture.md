@@ -37,7 +37,7 @@ vectordata-rs/
 │   ├── io.rs          VectorReader/VvecReader traits + XvecReader/ScalarReader/IndexedVvecReader, AnyVectorReader, open_vec, open_vec_as, open_vvec
 │   ├── view.rs        TestDataView trait (fetch, plan_fetch), TestDataViewExt (facet_as, quantized_base), FacetStorage
 │   ├── fetch.rs       FetchRequest, FetchPlan, FetchReport, FetchProgress sinks, TextMeter
-│   ├── typed_access.rs  ElementType re-exports and ElementTypeExt; the deprecated TypedReader<T>
+│   ├── typed_access.rs  the element model: ElementType/Element/Value re-exports and ElementTypeExt
 │   ├── settings.rs    cache_dir resolution (single source of truth, strict — no silent fallback)
 │   ├── storage.rs     pub(crate) Storage enum (Mmap | Http | Cached) — hidden from consumers
 │   ├── dataset/       dataset.yaml parsing, profiles, catalogs

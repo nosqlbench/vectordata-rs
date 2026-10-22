@@ -35,7 +35,7 @@
 //! | Borrow a whole column (quantization parameters, labels) with no copy | [`VectorReader::as_slice`] on a scalar facet | [`TestDataViewExt::facet_as`] |
 //! | Open a facet without knowing its type | [`TestDataView::open_facet_native`] → [`AnyVectorReader`] | — |
 //! | Read ground truth | [`TestDataViewExt::neighbor_indices_as`], [`TestDataViewExt::neighbor_distances_as`] | [`TestDataViewExt::neighbor_indices_as`] |
-//! | Read a metadata or scalar facet | [`TestDataViewExt::facet_as`] (`open_facet_typed` is deprecated) | below |
+//! | Read a metadata or scalar facet | [`TestDataViewExt::facet_as`] | below |
 //! | Read a record (slab) facet | [`TestDataView::open_facet_records`] | — |
 //! | List profiles and facets | [`TestDataGroup::profile_names`], [`TestDataView::facet_manifest`] | below |
 //! | Find datasets by pattern | [`Catalog::match_glob`](catalog::Catalog::match_glob), [`Catalog::datasets`](catalog::Catalog::datasets) | — |
@@ -318,8 +318,6 @@ pub use veks_apicore::{
     PrefetchReport, ProgressSink, QuantizedBase, RangeFill, ShardRange, TestDataView, TestDataViewExt,
     WholeFacetFallback,
 };
-#[allow(deprecated)]
-pub use view::open_facet_typed;
 pub use io::{
     AnyVectorReader, AnyVvecReader, ConvertingReader, IndexedVvecReader, IoError, ScalarReader,
     VectorReader, VvecReader, XvecReader, open_vec_as, open_vec_native,
@@ -328,8 +326,6 @@ pub use veks_apicore::InsufficientCacheSpace;
 pub use access::AccessMode;
 pub use typed_access::{Container, Element, ElementConversion, ElementType, ElementTypeExt};
 pub use veks_datatypes::{DistanceFunction, UnknownDistanceFunction};
-#[allow(deprecated)]
-pub use typed_access::{TypedAccessError, TypedReader};
 /// Re-exported so external callers of
 /// [`FacetStorage::prebuffer_with_progress`] can name the
 /// progress type their callback receives.

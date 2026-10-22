@@ -4,25 +4,32 @@
 //! Integration tests for typed data access.
 //!
 //! Tests the full access path: write files in various formats → create
-//! dataset.yaml → load via TestDataGroup → access facets via TypedReader
+//! dataset.yaml → load via TestDataGroup → access facets via
+//! `TestDataViewExt::facet_as`, and raw files via `io::open_vec_as`,
 //! with native, widening, and cross-sign conversions.
-
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
-#![allow(deprecated)]
 
 mod support;
 
 use std::io::Write;
 use std::path::Path;
 
-use vectordata::typed_access::{ElementType, TypedReader};
-use vectordata::TestDataView; // trait import for facet_element_type()
+use vectordata::io::open_vec_as;
+use vectordata::typed_access::{ElementConversion, ElementType};
+use vectordata::{IoError, TestDataViewExt, VectorReader};
 
 fn make_tmp() -> tempfile::TempDir {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
     std::fs::create_dir_all(&base).unwrap();
     tempfile::tempdir_in(&base).unwrap()
+}
+
+fn src(path: &Path) -> &str {
+    path.to_str().unwrap()
+}
+
+/// The value at `i` of a scalar reader, through its checked conversion.
+fn value<T: Clone>(r: &dyn VectorReader<T>, i: usize) -> Result<T, IoError> {
+    Ok(r.get(i)?[0].clone())
 }
 
 // ── File writers for each format ───────────────────────────────────
@@ -83,7 +90,7 @@ fn write_fvec(path: &Path, dim: u32, records: &[Vec<f32>]) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Scalar format tests — standalone TypedReader
+// Scalar format tests — standalone open_vec_as
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
@@ -92,14 +99,14 @@ fn scalar_u8_native_access() {
     let path = tmp.path().join("meta.u8");
     write_scalar_u8(&path, &[0, 42, 127, 200, 255]);
 
-    let r = TypedReader::<u8>::open(&path).unwrap();
-    assert_eq!(r.native_type(), ElementType::U8);
-    assert!(r.is_native());
+    let r = open_vec_as::<u8>(src(&path)).unwrap();
+    assert_eq!(r.native_element_type(), Some(ElementType::U8));
+    assert_eq!(r.conversion(), ElementConversion::Native);
     assert_eq!(r.count(), 5);
     assert_eq!(r.dim(), 1);
-    assert_eq!(r.get_native(0).unwrap(), 0);
-    assert_eq!(r.get_native(2).unwrap(), 127);
-    assert_eq!(r.get_native(4).unwrap(), 255);
+    assert_eq!(r.as_slice().expect("a native local column borrows")[0], 0);
+    assert_eq!(r.as_slice().expect("a native local column borrows")[2], 127);
+    assert_eq!(r.as_slice().expect("a native local column borrows")[4], 255);
 }
 
 #[test]
@@ -108,11 +115,11 @@ fn scalar_i8_native_access() {
     let path = tmp.path().join("meta.i8");
     write_scalar_i8(&path, &[-128, -1, 0, 1, 127]);
 
-    let r = TypedReader::<i8>::open(&path).unwrap();
+    let r = open_vec_as::<i8>(src(&path)).unwrap();
     assert_eq!(r.count(), 5);
-    assert_eq!(r.get_value(0).unwrap(), -128i8);
-    assert_eq!(r.get_value(1).unwrap(), -1i8);
-    assert_eq!(r.get_value(4).unwrap(), 127i8);
+    assert_eq!(value(&*r, 0).unwrap(), -128i8);
+    assert_eq!(value(&*r, 1).unwrap(), -1i8);
+    assert_eq!(value(&*r, 4).unwrap(), 127i8);
 }
 
 #[test]
@@ -121,9 +128,9 @@ fn scalar_u16_native_access() {
     let path = tmp.path().join("data.u16");
     write_scalar_u16(&path, &[0, 1000, 65535]);
 
-    let r = TypedReader::<u16>::open(&path).unwrap();
+    let r = open_vec_as::<u16>(src(&path)).unwrap();
     assert_eq!(r.count(), 3);
-    assert_eq!(r.get_value(2).unwrap(), 65535u16);
+    assert_eq!(value(&*r, 2).unwrap(), 65535u16);
 }
 
 #[test]
@@ -132,10 +139,10 @@ fn scalar_i32_native_access() {
     let path = tmp.path().join("data.i32");
     write_scalar_i32(&path, &[i32::MIN, -1, 0, 1, i32::MAX]);
 
-    let r = TypedReader::<i32>::open(&path).unwrap();
+    let r = open_vec_as::<i32>(src(&path)).unwrap();
     assert_eq!(r.count(), 5);
-    assert_eq!(r.get_native(0).unwrap(), i32::MIN);
-    assert_eq!(r.get_native(4).unwrap(), i32::MAX);
+    assert_eq!(r.as_slice().expect("a native local column borrows")[0], i32::MIN);
+    assert_eq!(r.as_slice().expect("a native local column borrows")[4], i32::MAX);
 }
 
 #[test]
@@ -144,9 +151,9 @@ fn scalar_u64_native_access() {
     let path = tmp.path().join("data.u64");
     write_scalar_u64(&path, &[0, u64::MAX]);
 
-    let r = TypedReader::<u64>::open(&path).unwrap();
+    let r = open_vec_as::<u64>(src(&path)).unwrap();
     assert_eq!(r.count(), 2);
-    assert_eq!(r.get_value(1).unwrap(), u64::MAX);
+    assert_eq!(value(&*r, 1).unwrap(), u64::MAX);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -159,9 +166,9 @@ fn widen_u8_to_i16() {
     let path = tmp.path().join("data.u8");
     write_scalar_u8(&path, &[0, 255]);
 
-    let r = TypedReader::<i16>::open(&path).unwrap();
-    assert_eq!(r.get_value(0).unwrap(), 0i16);
-    assert_eq!(r.get_value(1).unwrap(), 255i16);
+    let r = open_vec_as::<i16>(src(&path)).unwrap();
+    assert_eq!(value(&*r, 0).unwrap(), 0i16);
+    assert_eq!(value(&*r, 1).unwrap(), 255i16);
 }
 
 #[test]
@@ -170,8 +177,8 @@ fn widen_u8_to_i32() {
     let path = tmp.path().join("data.u8");
     write_scalar_u8(&path, &[255]);
 
-    let r = TypedReader::<i32>::open(&path).unwrap();
-    assert_eq!(r.get_value(0).unwrap(), 255i32);
+    let r = open_vec_as::<i32>(src(&path)).unwrap();
+    assert_eq!(value(&*r, 0).unwrap(), 255i32);
 }
 
 #[test]
@@ -180,8 +187,8 @@ fn widen_u8_to_u64() {
     let path = tmp.path().join("data.u8");
     write_scalar_u8(&path, &[255]);
 
-    let r = TypedReader::<u64>::open(&path).unwrap();
-    assert_eq!(r.get_value(0).unwrap(), 255u64);
+    let r = open_vec_as::<u64>(src(&path)).unwrap();
+    assert_eq!(value(&*r, 0).unwrap(), 255u64);
 }
 
 #[test]
@@ -190,9 +197,9 @@ fn widen_i8_to_i64() {
     let path = tmp.path().join("data.i8");
     write_scalar_i8(&path, &[-128, 127]);
 
-    let r = TypedReader::<i64>::open(&path).unwrap();
-    assert_eq!(r.get_value(0).unwrap(), -128i64);
-    assert_eq!(r.get_value(1).unwrap(), 127i64);
+    let r = open_vec_as::<i64>(src(&path)).unwrap();
+    assert_eq!(value(&*r, 0).unwrap(), -128i64);
+    assert_eq!(value(&*r, 1).unwrap(), 127i64);
 }
 
 #[test]
@@ -201,8 +208,8 @@ fn widen_u16_to_u32() {
     let path = tmp.path().join("data.u16");
     write_scalar_u16(&path, &[65535]);
 
-    let r = TypedReader::<u32>::open(&path).unwrap();
-    assert_eq!(r.get_value(0).unwrap(), 65535u32);
+    let r = open_vec_as::<u32>(src(&path)).unwrap();
+    assert_eq!(value(&*r, 0).unwrap(), 65535u32);
 }
 
 #[test]
@@ -211,9 +218,9 @@ fn widen_i16_to_i32() {
     let path = tmp.path().join("data.i16");
     write_scalar_i16(&path, &[-32768, 32767]);
 
-    let r = TypedReader::<i32>::open(&path).unwrap();
-    assert_eq!(r.get_value(0).unwrap(), -32768i32);
-    assert_eq!(r.get_value(1).unwrap(), 32767i32);
+    let r = open_vec_as::<i32>(src(&path)).unwrap();
+    assert_eq!(value(&*r, 0).unwrap(), -32768i32);
+    assert_eq!(value(&*r, 1).unwrap(), 32767i32);
 }
 
 #[test]
@@ -222,9 +229,9 @@ fn widen_i32_to_i64() {
     let path = tmp.path().join("data.i32");
     write_scalar_i32(&path, &[i32::MIN, i32::MAX]);
 
-    let r = TypedReader::<i64>::open(&path).unwrap();
-    assert_eq!(r.get_value(0).unwrap(), i32::MIN as i64);
-    assert_eq!(r.get_value(1).unwrap(), i32::MAX as i64);
+    let r = open_vec_as::<i64>(src(&path)).unwrap();
+    assert_eq!(value(&*r, 0).unwrap(), i32::MIN as i64);
+    assert_eq!(value(&*r, 1).unwrap(), i32::MAX as i64);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -237,10 +244,10 @@ fn cross_sign_u8_to_i8_ok() {
     let path = tmp.path().join("data.u8");
     write_scalar_u8(&path, &[0, 42, 127]);
 
-    let r = TypedReader::<i8>::open(&path).unwrap();
-    assert_eq!(r.get_value(0).unwrap(), 0i8);
-    assert_eq!(r.get_value(1).unwrap(), 42i8);
-    assert_eq!(r.get_value(2).unwrap(), 127i8);
+    let r = open_vec_as::<i8>(src(&path)).unwrap();
+    assert_eq!(value(&*r, 0).unwrap(), 0i8);
+    assert_eq!(value(&*r, 1).unwrap(), 42i8);
+    assert_eq!(value(&*r, 2).unwrap(), 127i8);
 }
 
 #[test]
@@ -249,9 +256,9 @@ fn cross_sign_u8_to_i8_overflow() {
     let path = tmp.path().join("data.u8");
     write_scalar_u8(&path, &[128]);
 
-    let r = TypedReader::<i8>::open(&path).unwrap();
-    let err = r.get_value(0).unwrap_err();
-    assert!(matches!(err, vectordata::typed_access::TypedAccessError::ValueOverflow { .. }));
+    let r = open_vec_as::<i8>(src(&path)).unwrap();
+    let err = value(&*r, 0).unwrap_err();
+    assert!(matches!(err, IoError::ValueOverflow { index: 0, target: ElementType::I8, .. }));
 }
 
 #[test]
@@ -260,9 +267,9 @@ fn cross_sign_i8_to_u8_ok() {
     let path = tmp.path().join("data.i8");
     write_scalar_i8(&path, &[0, 127]);
 
-    let r = TypedReader::<u8>::open(&path).unwrap();
-    assert_eq!(r.get_value(0).unwrap(), 0u8);
-    assert_eq!(r.get_value(1).unwrap(), 127u8);
+    let r = open_vec_as::<u8>(src(&path)).unwrap();
+    assert_eq!(value(&*r, 0).unwrap(), 0u8);
+    assert_eq!(value(&*r, 1).unwrap(), 127u8);
 }
 
 #[test]
@@ -271,8 +278,8 @@ fn cross_sign_i8_to_u8_negative_fails() {
     let path = tmp.path().join("data.i8");
     write_scalar_i8(&path, &[-1]);
 
-    let r = TypedReader::<u8>::open(&path).unwrap();
-    assert!(r.get_value(0).is_err());
+    let r = open_vec_as::<u8>(src(&path)).unwrap();
+    assert!(value(&*r, 0).is_err());
 }
 
 #[test]
@@ -281,8 +288,8 @@ fn cross_sign_u32_to_i32_ok() {
     let path = tmp.path().join("data.u32");
     write_scalar_u32(&path, &[0, 42, i32::MAX as u32]);
 
-    let r = TypedReader::<i32>::open(&path).unwrap();
-    assert_eq!(r.get_value(2).unwrap(), i32::MAX);
+    let r = open_vec_as::<i32>(src(&path)).unwrap();
+    assert_eq!(value(&*r, 2).unwrap(), i32::MAX);
 }
 
 #[test]
@@ -291,8 +298,8 @@ fn cross_sign_u32_to_i32_overflow() {
     let path = tmp.path().join("data.u32");
     write_scalar_u32(&path, &[u32::MAX]);
 
-    let r = TypedReader::<i32>::open(&path).unwrap();
-    assert!(r.get_value(0).is_err());
+    let r = open_vec_as::<i32>(src(&path)).unwrap();
+    assert!(value(&*r, 0).is_err());
 }
 
 #[test]
@@ -301,8 +308,8 @@ fn cross_sign_i32_to_u32_negative_fails() {
     let path = tmp.path().join("data.i32");
     write_scalar_i32(&path, &[-1]);
 
-    let r = TypedReader::<u32>::open(&path).unwrap();
-    assert!(r.get_value(0).is_err());
+    let r = open_vec_as::<u32>(src(&path)).unwrap();
+    assert!(value(&*r, 0).is_err());
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -314,7 +321,7 @@ fn narrowing_i32_to_u8_rejected() {
     let tmp = make_tmp();
     let path = tmp.path().join("data.i32");
     write_scalar_i32(&path, &[42]);
-    assert!(TypedReader::<u8>::open(&path).is_err());
+    assert!(matches!(open_vec_as::<u8>(src(&path)), Err(IoError::ElementMismatch { .. })));
 }
 
 #[test]
@@ -322,7 +329,7 @@ fn narrowing_i32_to_i16_rejected() {
     let tmp = make_tmp();
     let path = tmp.path().join("data.i32");
     write_scalar_i32(&path, &[42]);
-    assert!(TypedReader::<i16>::open(&path).is_err());
+    assert!(matches!(open_vec_as::<i16>(src(&path)), Err(IoError::ElementMismatch { .. })));
 }
 
 #[test]
@@ -330,7 +337,7 @@ fn narrowing_u64_to_u32_rejected() {
     let tmp = make_tmp();
     let path = tmp.path().join("data.u64");
     write_scalar_u64(&path, &[42]);
-    assert!(TypedReader::<u32>::open(&path).is_err());
+    assert!(matches!(open_vec_as::<u32>(src(&path)), Err(IoError::ElementMismatch { .. })));
 }
 
 #[test]
@@ -338,7 +345,7 @@ fn narrowing_i64_to_i8_rejected() {
     let tmp = make_tmp();
     let path = tmp.path().join("data.i64");
     write_scalar_i64(&path, &[42]);
-    assert!(TypedReader::<i8>::open(&path).is_err());
+    assert!(matches!(open_vec_as::<i8>(src(&path)), Err(IoError::ElementMismatch { .. })));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -351,11 +358,11 @@ fn ivec_native_record_access() {
     let path = tmp.path().join("data.ivec");
     write_ivec(&path, 3, &[vec![10, 20, 30], vec![40, 50, 60]]);
 
-    let r = TypedReader::<i32>::open(&path).unwrap();
+    let r = open_vec_as::<i32>(src(&path)).unwrap();
     assert_eq!(r.count(), 2);
     assert_eq!(r.dim(), 3);
-    assert_eq!(r.get_record(0).unwrap(), vec![10, 20, 30]);
-    assert_eq!(r.get_record(1).unwrap(), vec![40, 50, 60]);
+    assert_eq!(r.get(0).unwrap(), vec![10, 20, 30]);
+    assert_eq!(r.get(1).unwrap(), vec![40, 50, 60]);
 }
 
 #[test]
@@ -364,8 +371,8 @@ fn ivec_as_i64_widening() {
     let path = tmp.path().join("data.ivec");
     write_ivec(&path, 2, &[vec![-1, i32::MAX]]);
 
-    let r = TypedReader::<i64>::open(&path).unwrap();
-    let rec = r.get_record(0).unwrap();
+    let r = open_vec_as::<i64>(src(&path)).unwrap();
+    let rec = r.get(0).unwrap();
     assert_eq!(rec, vec![-1i64, i32::MAX as i64]);
 }
 
@@ -375,8 +382,8 @@ fn ivec_as_u32_cross_sign_ok() {
     let path = tmp.path().join("data.ivec");
     write_ivec(&path, 2, &[vec![0, 100]]);
 
-    let r = TypedReader::<u32>::open(&path).unwrap();
-    let rec = r.get_record(0).unwrap();
+    let r = open_vec_as::<u32>(src(&path)).unwrap();
+    let rec = r.get(0).unwrap();
     assert_eq!(rec, vec![0u32, 100]);
 }
 
@@ -386,8 +393,8 @@ fn ivec_as_u32_negative_fails() {
     let path = tmp.path().join("data.ivec");
     write_ivec(&path, 1, &[vec![-1]]);
 
-    let r = TypedReader::<u32>::open(&path).unwrap();
-    assert!(r.get_record(0).is_err());
+    let r = open_vec_as::<u32>(src(&path)).unwrap();
+    assert!(r.get(0).is_err());
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -438,7 +445,7 @@ profiles:
 }
 
 #[test]
-fn dataset_open_facet_typed_native() {
+fn dataset_facet_as_native() {
     let tmp = make_tmp();
     let ds = tmp.path().join("ds");
     std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
@@ -454,18 +461,17 @@ profiles:
     std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
 
     let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-    // GenericTestDataView has open_facet_typed
-    let view = group.generic_view("default").unwrap();
+    let view = group.profile("default").unwrap();
 
-    let reader = view.open_facet_typed::<u8>("metadata_content").unwrap();
-    assert!(reader.is_native());
+    let reader = view.facet_as::<u8>("metadata_content").unwrap();
+    assert_eq!(reader.conversion(), ElementConversion::Native);
     assert_eq!(reader.count(), 5);
-    assert_eq!(reader.get_native(0).unwrap(), 7);
-    assert_eq!(reader.get_native(3).unwrap(), 0);
+    assert_eq!(reader.as_slice().expect("a native local column borrows")[0], 7);
+    assert_eq!(reader.as_slice().expect("a native local column borrows")[3], 0);
 }
 
 #[test]
-fn dataset_open_facet_typed_widening() {
+fn dataset_facet_as_widening() {
     let tmp = make_tmp();
     let ds = tmp.path().join("ds");
     std::fs::create_dir_all(ds.join("profiles/default")).unwrap();
@@ -481,13 +487,13 @@ profiles:
     std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
 
     let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-    let view = group.generic_view("default").unwrap();
+    let view = group.profile("default").unwrap();
 
     // Open u8 file as i32 — widening
-    let reader = view.open_facet_typed::<i32>("metadata_content").unwrap();
-    assert!(!reader.is_native());
-    assert_eq!(reader.get_value(0).unwrap(), 255i32);
-    assert_eq!(reader.get_value(2).unwrap(), 42i32);
+    let reader = view.facet_as::<i32>("metadata_content").unwrap();
+    assert_eq!(reader.conversion(), ElementConversion::Widening);
+    assert_eq!(value(&*reader, 0).unwrap(), 255i32);
+    assert_eq!(value(&*reader, 2).unwrap(), 42i32);
 }
 
 #[test]
@@ -507,18 +513,18 @@ profiles:
     std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
 
     let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-    let view = group.generic_view("default").unwrap();
+    let view = group.profile("default").unwrap();
 
     // Runtime dispatch: check type, then open with native arms
     let etype = view.facet_element_type("metadata_content").unwrap();
     let sum: i64 = match etype {
         ElementType::U8 => {
-            let r = view.open_facet_typed::<u8>("metadata_content").unwrap();
-            (0..r.count()).map(|i| r.get_native(i).unwrap() as i64).sum()
+            let r = view.facet_as::<u8>("metadata_content").unwrap();
+            (0..r.count()).map(|i| r.as_slice().expect("a native local column borrows")[i] as i64).sum()
         }
         ElementType::I32 => {
-            let r = view.open_facet_typed::<i32>("metadata_content").unwrap();
-            (0..r.count()).map(|i| r.get_native(i).unwrap() as i64).sum()
+            let r = view.facet_as::<i32>("metadata_content").unwrap();
+            (0..r.count()).map(|i| r.as_slice().expect("a native local column borrows")[i] as i64).sum()
         }
         _ => panic!("unexpected type"),
     };
@@ -557,7 +563,7 @@ profiles:
     std::fs::write(ds.join("dataset.yaml"), yaml).unwrap();
 
     let group = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-    let view = group.generic_view("default").unwrap();
+    let view = group.profile("default").unwrap();
 
     // Each facet has a different type
     assert_eq!(view.facet_element_type("base_vectors").unwrap(), ElementType::F32);
@@ -566,16 +572,16 @@ profiles:
     assert_eq!(view.facet_element_type("metadata_results").unwrap(), ElementType::I32);
 
     // Access metadata as native u8
-    let meta = view.open_facet_typed::<u8>("metadata_content").unwrap();
-    assert_eq!(meta.get_native(0).unwrap(), 5);
-    assert_eq!(meta.get_native(1).unwrap(), 10);
+    let meta = view.facet_as::<u8>("metadata_content").unwrap();
+    assert_eq!(meta.as_slice().expect("a native local column borrows")[0], 5);
+    assert_eq!(meta.as_slice().expect("a native local column borrows")[1], 10);
 
     // Access predicates as wider i32
-    let pred = view.open_facet_typed::<i32>("metadata_predicates").unwrap();
-    assert_eq!(pred.get_value(0).unwrap(), 5i32);
+    let pred = view.facet_as::<i32>("metadata_predicates").unwrap();
+    assert_eq!(value(&*pred, 0).unwrap(), 5i32);
 
     // Access results as native i32
-    let results = view.open_facet_typed::<i32>("metadata_results").unwrap();
+    let results = view.facet_as::<i32>("metadata_results").unwrap();
     assert_eq!(results.dim(), 1);
-    assert_eq!(results.get_record(0).unwrap(), vec![0i32]);
+    assert_eq!(results.get(0).unwrap(), vec![0i32]);
 }

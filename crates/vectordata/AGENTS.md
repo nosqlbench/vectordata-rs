@@ -227,10 +227,10 @@ Each of these exists, is tested, and handles cases that are easy to miss.
   `VECTORDATA_OFFLINE=1` (or `vectordata config set offline on`) makes
   no request at all; what was never fetched is then an error saying so.
 - **Open remote datasets by catalog or `TestDataGroup`, not by file
-  URL.** `XvecReader::open_url` and `TypedReader::open_url` are
-  deprecated; a file URL opened with the path-or-URL constructors lands
-  in its dataset's cache directory when one covers it, but has no
-  fetch, profiles or windows around it.
+  URL.** A file URL opened with the path-or-URL constructors
+  (`XvecReader::open`, `io::open_vec_as`) lands in its dataset's cache
+  directory when one covers it, but has no fetch, profiles or windows
+  around it.
 - **Opening a reader does not fetch the facet.** Reads fetch the chunks
   they touch, one at a time. For a scan, `fetch` first and read locally.
 - **A remote variable-length facet with no published offset index

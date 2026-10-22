@@ -4,10 +4,6 @@
 //! A fetched dataset opens and reads with no network, and a changed
 //! upstream is still caught where the network is meant to be used.
 
-// The typed reader and the group's prebuffer forms are deprecated;
-// this suite still covers the ones it calls.
-#![allow(deprecated)]
-
 mod support;
 
 use std::path::Path;
@@ -133,9 +129,8 @@ fn read_offline_in_a_child() {
     assert_eq!(query.get(49).unwrap()[0], fvec_value(seed + 0.5, 8, 49, 0));
     let results = view.metadata_results_as::<i32>().expect("the kept offset index opens offline");
     assert_eq!(results.get(299).unwrap(), vec![seed as i32 + 299]);
-    let labels: vectordata::TypedReader<u8> =
-        vectordata::open_facet_typed(&*view, "metadata_content").unwrap();
-    assert_eq!(labels.get_native(300).unwrap(), (300 % 251) as u8);
+    let labels = view.facet_as::<u8>("metadata_content").unwrap();
+    assert_eq!(labels.get(300).unwrap()[0], (300 % 251) as u8);
 
     let report = view.fetch(&FetchRequest::all(), &mut Silent).expect("a warm fetch works offline");
     assert!(report.facets.iter().all(|f| f.complete && !f.upstream_checked), "{report:?}");
@@ -243,9 +238,8 @@ fn read_strictly_offline_in_a_child() {
     let view = catalog.open_profile("strict", "default").expect("the dataset opens by name");
     assert_eq!(view.base_vectors_as::<f32>().unwrap().get(5).unwrap()[0], fvec_value(seed, 8, 5, 0));
     assert_eq!(view.metadata_results_as::<i32>().unwrap().get(7).unwrap(), vec![seed as i32 + 7]);
-    let labels: vectordata::TypedReader<u8> =
-        vectordata::open_facet_typed(&*view, "metadata_content").unwrap();
-    assert_eq!(labels.get_native(9).unwrap(), 9);
+    let labels = view.facet_as::<u8>("metadata_content").unwrap();
+    assert_eq!(labels.get(9).unwrap()[0], 9);
 
     let refused = match view.query_vectors_as::<f32>() {
         Ok(_) => panic!("a facet never fetched cannot be read offline"),

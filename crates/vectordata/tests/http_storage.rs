@@ -30,10 +30,6 @@
 //! - `cache_stats`: `FacetStorage::cache_stats` reports
 //!   valid/total/complete during partial fill.
 
-// The typed reader and the group's prebuffer forms are deprecated;
-// this suite still covers the ones it calls.
-#![allow(deprecated)]
-
 mod support;
 
 use std::path::Path;
@@ -42,9 +38,9 @@ use std::sync::{Arc, LazyLock};
 use byteorder::{LittleEndian, WriteBytesExt};
 
 use vectordata::{
-    CacheStats, ElementType, IndexedVvecReader, TestDataGroup,
-    TypedReader, VectorReader, VvecReader, XvecReader,
-    io::{open_vec, open_vvec},
+    CacheStats, ElementConversion, ElementType, IndexedVvecReader, IoError, TestDataGroup,
+    VectorReader, VvecReader, XvecReader,
+    io::{open_vec, open_vec_as, open_vvec},
 };
 use vectordata::merkle::MerkleRef;
 use vectordata::TestDataViewExt;
@@ -406,11 +402,11 @@ fn open_vvec_dispatches_through_http() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// typed_reader_remote — TypedReader::open_url scalar + vector
+// typed_reader_remote — io::open_vec_as on a URL, scalar + vector
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn typed_reader_open_url_scalar_u8_native() {
+fn open_vec_as_url_scalar_u8_native() {
     let tmp = make_tmp();
     let path = tmp.path().join("metadata.u8");
     write_scalar_u8(&path, 256);
@@ -418,17 +414,17 @@ fn typed_reader_open_url_scalar_u8_native() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
-    let r = TypedReader::<u8>::open_auto(url.as_str(), ElementType::U8).unwrap();
+    let r = open_vec_as::<u8>(url.as_str()).unwrap();
     assert_eq!(r.count(), 256);
     assert_eq!(r.dim(), 1);
-    assert!(r.is_native());
-    assert_eq!(r.get_value(0).unwrap(), 0);
-    assert_eq!(r.get_value(42).unwrap(), 42);
-    assert_eq!(r.get_value(255).unwrap(), 255);
+    assert_eq!(r.conversion(), ElementConversion::Native);
+    assert_eq!(r.get(0).unwrap()[0], 0);
+    assert_eq!(r.get(42).unwrap()[0], 42);
+    assert_eq!(r.get(255).unwrap()[0], 255);
 }
 
 #[test]
-fn typed_reader_open_url_widening_u8_to_i32() {
+fn open_vec_as_url_widening_u8_to_i32() {
     let tmp = make_tmp();
     let path = tmp.path().join("metadata.u8");
     write_scalar_u8(&path, 100);
@@ -436,14 +432,14 @@ fn typed_reader_open_url_widening_u8_to_i32() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
-    let r = TypedReader::<i32>::open_auto(url.as_str(), ElementType::U8).unwrap();
-    assert!(!r.is_native());
-    assert_eq!(r.get_value(0).unwrap(), 0i32);
-    assert_eq!(r.get_value(42).unwrap(), 42i32);
+    let r = open_vec_as::<i32>(url.as_str()).unwrap();
+    assert_eq!(r.conversion(), ElementConversion::Widening);
+    assert_eq!(r.get(0).unwrap()[0], 0i32);
+    assert_eq!(r.get(42).unwrap()[0], 42i32);
 }
 
 #[test]
-fn typed_reader_open_url_narrowing_rejected() {
+fn open_vec_as_url_narrowing_rejected() {
     let tmp = make_tmp();
     let path = tmp.path().join("metadata.i32");
     let mut f = std::fs::File::create(&path).unwrap();
@@ -453,13 +449,16 @@ fn typed_reader_open_url_narrowing_rejected() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.i32", server.base_url())).unwrap();
 
-    let result = TypedReader::<u8>::open_auto(url.as_str(), ElementType::I32);
-    assert!(result.is_err(), "narrowing must be rejected at open time");
+    let result = open_vec_as::<u8>(url.as_str());
+    assert!(
+        matches!(result, Err(IoError::ElementMismatch { file: ElementType::I32, requested: ElementType::U8, .. })),
+        "narrowing must be rejected at open time"
+    );
 }
 
 #[test]
-fn typed_reader_open_url_no_mref_still_works() {
-    // No .mref → Storage::open_url falls back to the chunked
+fn open_vec_as_url_no_mref_still_works() {
+    // No .mref → the storage open falls back to the chunked
     // Http variant. Tiny files complete after the first read
     // (single chunk covers the whole file) — but the
     // user-visible contract is "reads return correct bytes
@@ -471,13 +470,13 @@ fn typed_reader_open_url_no_mref_still_works() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
-    let r = TypedReader::<u8>::open_auto(url.as_str(), ElementType::U8).unwrap();
+    let r = open_vec_as::<u8>(url.as_str()).unwrap();
     assert_eq!(r.count(), 64);
-    assert_eq!(r.get_value(7).unwrap(), 7);
+    assert_eq!(r.get(7).unwrap()[0], 7);
 }
 
 #[test]
-fn typed_reader_open_url_ivec_record() {
+fn open_vec_as_url_ivec_record() {
     let tmp = make_tmp();
     let path = tmp.path().join("data.ivec");
     write_ivec(&path, 5, 3);
@@ -485,15 +484,15 @@ fn typed_reader_open_url_ivec_record() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}data.ivec", server.base_url())).unwrap();
 
-    let r = TypedReader::<i32>::open_auto(url.as_str(), ElementType::I32).unwrap();
+    let r = open_vec_as::<i32>(url.as_str()).unwrap();
     assert_eq!(r.count(), 5);
     assert_eq!(r.dim(), 3);
-    let rec = r.get_record(2).unwrap();
+    let rec = r.get(2).unwrap();
     assert_eq!(rec, vec![2000, 2001, 2002]);
 }
 
 #[test]
-fn typed_reader_open_auto_dispatches_url() {
+fn open_vec_as_dispatches_a_url_string() {
     let tmp = make_tmp();
     let path = tmp.path().join("metadata.u8");
     write_scalar_u8(&path, 50);
@@ -501,9 +500,9 @@ fn typed_reader_open_auto_dispatches_url() {
     init_test_cache();
     let url_str = format!("{}metadata.u8", server.base_url());
 
-    let r = TypedReader::<u8>::open_auto(&url_str, ElementType::U8).unwrap();
+    let r = open_vec_as::<u8>(&url_str).unwrap();
     assert_eq!(r.count(), 50);
-    assert_eq!(r.get_value(0).unwrap(), 0);
+    assert_eq!(r.get(0).unwrap()[0], 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -599,7 +598,7 @@ fn view_round_trip_over_http() {
 }
 
 #[test]
-fn view_open_facet_typed_over_http() {
+fn view_facet_as_over_http() {
     let tmp = make_tmp();
     make_remote_dataset_files(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
@@ -607,19 +606,22 @@ fn view_open_facet_typed_over_http() {
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
-    // Typed scalar metadata via the view trait — NOT TypedReader::open_url.
+    // Typed scalar metadata via the view trait — not a raw URL open.
     // Confirms the trait method routes through the same cache-first
     // storage as a directly-opened reader.
     let elem = view.facet_element_type("metadata_content").unwrap();
     assert_eq!(elem, ElementType::U8);
-
-    // Note: open_facet_typed lives on the concrete GenericTestDataView
-    // via the TestDataView impl; the public surface for downstream
-    // crates is open_facet_storage + dedicated reader ctors. We rely
-    // on facet() for the polymorphic path and assert the manifest
-    // covers metadata_content (TypedReader access is exercised
-    // separately above through TypedReader::open_url).
     assert!(view.facet_manifest().contains_key("metadata_content"));
+
+    // Read at its own type and widened, through the dataset's storage.
+    let native = view.facet_as::<u8>("metadata_content").unwrap();
+    assert_eq!(native.conversion(), ElementConversion::Native);
+    let wide = view.facet_as::<i32>("metadata_content").unwrap();
+    assert_eq!(wide.conversion(), ElementConversion::Widening);
+    assert_eq!(native.count(), wide.count());
+    for i in [0, native.count() / 2, native.count() - 1] {
+        assert_eq!(wide.get(i).unwrap()[0], native.get(i).unwrap()[0] as i32, "ordinal {i}");
+    }
 }
 
 /// dataset.yaml with a `sized` profile that windows base_vectors to
@@ -1006,9 +1008,9 @@ fn prebuffer_via_view_promotes_other_open_readers() {
 }
 
 #[test]
-fn prebuffer_propagates_failure_for_typed_reader_too() {
-    // Same lazy-promotion behaviour for TypedReader (the API the
-    // typed scalar metadata facets go through).
+fn prebuffer_propagates_failure_for_scalar_reader_too() {
+    // Same lazy-promotion behaviour for a scalar reader (the shape
+    // typed scalar metadata facets are read through).
     let tmp = make_tmp();
     let path = tmp.path().join("metadata.u8");
     write_scalar_u8(&path, 200_000);  // ~50 chunks at TEST_CHUNK=4KiB
@@ -1017,19 +1019,19 @@ fn prebuffer_propagates_failure_for_typed_reader_too() {
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
-    let early = TypedReader::<u8>::open_auto(url.as_str(), ElementType::U8).unwrap();
+    let early = open_vec_as::<u8>(url.as_str()).unwrap();
     assert!(!early.is_complete());
 
-    // Precache on a separate TypedReader.
-    let pb = TypedReader::<u8>::open_auto(url.as_str(), ElementType::U8).unwrap();
+    // Precache on a separate reader.
+    let pb = open_vec_as::<u8>(url.as_str()).unwrap();
     pb.precache().unwrap();
 
     // Early reader picks up promotion on next access.
     assert!(early.is_complete(),
-        "TypedReader must lazy-promote when sibling Storage finishes precache");
-    // get_native_slice exercises mmap_slice — should now succeed.
-    let slice = early.get_native_slice(0);
-    assert!(slice.is_some(), "after precache, get_native_slice must return Some");
+        "a scalar reader must lazy-promote when sibling Storage finishes precache");
+    // get_slice borrows from the mapping — should now succeed.
+    let slice = early.get_slice(0);
+    assert!(slice.is_some(), "after precache, get_slice must return Some");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

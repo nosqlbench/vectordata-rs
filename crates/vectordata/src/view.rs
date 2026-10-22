@@ -230,7 +230,7 @@ fn map_in_file(
 
     if crate::io::is_scalar_ext(ext) {
         // Scalar facets are raw packed values with no per-record
-        // header — `TypedReader` addresses them at `ordinal *
+        // header — `ScalarReader` addresses them at `ordinal *
         // elem_size`. Falling through to the xvec path below would
         // read the first *value* as a dimension: a needless degrade
         // when it fails the sanity check, and silently wrong byte
@@ -416,90 +416,6 @@ pub(crate) fn prebuffer_progress_adapter<'c>(
     }
 }
 
-
-/// Open a typed reader for a named facet on any [`TestDataView`].
-///
-/// This is the dyn-compatible companion to
-/// [`GenericTestDataView::open_facet_typed`] — `Arc<dyn TestDataView>`
-/// from `Catalog::open_profile` works directly:
-///
-/// ```no_run
-/// # #![allow(deprecated)] // this item's own example
-/// # use std::sync::Arc;
-/// use vectordata::{open_facet_typed, TypedReader, TestDataView};
-/// # fn demo(view: Arc<dyn TestDataView>) -> Result<(), Box<dyn std::error::Error>> {
-/// let meta: TypedReader<i32> = open_facet_typed(&*view, "metadata_content")?;
-/// let label = meta.get_value(42)?;
-/// # let _ = label; Ok(())
-/// # }
-/// ```
-///
-/// The native element type is inferred from the facet's source
-/// extension via [`TestDataView::facet_element_type`]; the transport
-/// is inferred from the source string via [`TypedReader::open_auto`](crate::typed_access::TypedReader::open_auto).
-#[deprecated(since = "4.0.0", note = "use `TestDataViewExt::facet_as::<T>(name)`: `get_value(i)` becomes `get(i)?[0]` or `as_slice()?[i]`, `get_native_slice(i)` becomes `get_slice(i)`, `is_native()` becomes `conversion() == Native`")]
-#[allow(deprecated)]
-pub fn open_facet_typed<T: crate::typed_access::Element>(
-    view: &dyn TestDataView,
-    facet_name: &str,
-) -> std::result::Result<crate::typed_access::TypedReader<T>, crate::typed_access::TypedAccessError>
-{
-    let native = view
-        .facet_element_type(facet_name)
-        .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
-
-    if native.conversion_to(T::TYPE) == crate::typed_access::ElementConversion::Refused {
-        return Err(crate::typed_access::TypedAccessError::Narrowing {
-            native,
-            target: T::TYPE.name(),
-        });
-    }
-    if !view.facet_manifest().contains_key(facet_name) {
-        return Err(crate::typed_access::TypedAccessError::Io(format!(
-            "facet '{facet_name}' not declared by this view"
-        )));
-    }
-    // Built on the facet's own storage — the dataset-anchored open a
-    // fetch fills — never on its resolved URL, which would key a second
-    // cache entry and read past everything the fetch brought in.
-    let opened = view
-        .open_facet_storage(facet_name)
-        .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
-    let storage = opened.as_any().downcast_ref::<FacetStorage>().ok_or_else(|| {
-        crate::typed_access::TypedAccessError::Io(format!("facet '{facet_name}': not a vectordata view's facet"))
-    })?;
-    if let Some(source) = view.facet_source(facet_name) {
-        let is_scalar = crate::io::is_scalar_ext(
-            crate::dataset::source::parse_source_string(&source)
-                .map(|p| p.path)
-                .unwrap_or(source)
-                .rsplit('.')
-                .next()
-                .unwrap_or(""),
-        );
-        return crate::typed_access::TypedReader::<T>::from_storage(
-            storage.storage_handle(),
-            native,
-            is_scalar,
-        );
-    }
-    // A series has no single source; it reads through the shard model.
-    // Every shard shares the element type and scalar-ness (SRD
-    // invariant 4), so both come from the facet as a whole.
-    let series = storage
-        .series_ref()
-        .ok_or_else(|| {
-            crate::typed_access::TypedAccessError::Io(format!(
-                "facet '{facet_name}' has no single source and no series"
-            ))
-        })?
-        .clone();
-    let is_scalar =
-        series.shards().entries().first().is_some_and(|e| {
-            crate::io::is_scalar_ext(e.source.path.rsplit('.').next().unwrap_or(""))
-        });
-    crate::typed_access::TypedReader::<T>::from_series(series, native, is_scalar)
-}
 
 /// Snapshot of one facet's progress, as the deprecated
 /// `prebuffer_*_with_progress` callbacks receive it. New code reads
@@ -2461,35 +2377,6 @@ impl GenericTestDataView {
             "quant_sum" => self.config.quant_sum.as_ref(),
             _ => None,
         }
-    }
-
-    /// Open a named facet as a typed reader.
-    ///
-    /// Fails at open time if T is narrower than the native element type.
-    /// Same-width cross-sign (e.g., u8↔i8) is allowed but checked per-value.
-    ///
-    /// ```rust,ignore
-    /// // Open with native type — zero-copy access
-    /// let r = view.open_facet_typed::<u8>("metadata_content")?;
-    ///
-    /// // Open with wider type — always succeeds
-    /// let r = view.open_facet_typed::<i32>("metadata_content")?;
-    /// ```
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::facet_as::<T>(name)`")]
-    #[allow(deprecated)]
-    pub fn open_facet_typed<T: crate::typed_access::Element>(
-        &self,
-        name: &str,
-    ) -> std::result::Result<
-        crate::typed_access::TypedReader<T>,
-        crate::typed_access::TypedAccessError,
-    > {
-        self.require_facet_shape(name, crate::dataset::facet::FacetShape::Elements)
-            .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
-        // One implementation for both entry points, so they cannot
-        // disagree about whether a facet is readable (SH-79) or about
-        // which cache entry it reads.
-        open_facet_typed::<T>(self, name)
     }
 }
 

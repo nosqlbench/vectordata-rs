@@ -572,9 +572,10 @@ pub trait Element: Copy + Send + Sync + 'static {
 
 Defined in `veks-datatypes` and implemented for the twelve types of
 §2.3; `vectordata::{Element, ElementType, ElementConversion,
-Container}` re-export it. `VvecElement` and `TypedElement` remain as
-deprecated blanket traits over `Element`, so an existing `T:
-VvecElement` bound compiles with a warning; write `T: Element`.
+Container}` re-export it. `VvecElement` remains as a deprecated
+blanket trait over `Element`, so an existing `T: VvecElement` bound
+compiles with a warning; write `T: Element`. `TypedElement` is
+removed.
 
 ---
 
@@ -857,9 +858,11 @@ when it does not).
 ### Migrating from `TypedReader`
 
 `open_facet_typed`, `TypedReader<T>`, `TypedElement`,
-`TypedAccessError` and `dispatch_typed!` are deprecated and will be
-removed; they covered integer scalars only and read every float as
-zero.
+`TypedAccessError` and `dispatch_typed!` are removed (deprecated since
+4.0.0); they covered integer scalars only and read every float as
+zero. `vectordata::typed_access` remains, as the path of the element
+model (`ElementType`, `Element`, `Value`, `ElementTypeExt`, …). Each
+removed call has a replacement:
 
 | 3.0 | now |
 |---|---|
@@ -870,6 +873,8 @@ zero.
 | `r.is_native()` | `r.conversion() == ElementConversion::Native` |
 | `TypedReader::<T>::open(path)` | `ScalarReader::<T>::open_path(path)` (native) or `open_vec_as::<T>(path)` |
 | `TypedReader::<T>::open_url(url, native)` / `open_auto` | `open_vec_as::<T>(url)` — the native type comes from the extension |
+| `TypedAccessError::Narrowing` / `ValueOverflow` | `IoError::ElementMismatch` / `IoError::ValueOverflow` |
+| `T: TypedElement` | `T: Element` |
 | `dispatch_typed!(etype, T => …)` | `veks_datatypes::dispatch_element!(etype, T => …)` |
 
 ---
@@ -1483,8 +1488,9 @@ A file URL opened with no catalog context (`XvecReader::open(url)`,
 `io::open_vec(url)`, `io::open_vec_as::<T>(url)`) lands in the cache
 directory of the dataset whose recorded origin covers it, so it shares
 the copy a fetch filled instead of keying a second one.
-`XvecReader::open_url` and `TypedReader::open_url` are deprecated in
-favour of opening the dataset by catalog or `TestDataGroup`.
+Opening the dataset by catalog or `TestDataGroup` is still the way to
+read a remote facet: a file URL has no fetch, profiles or windows
+around it.
 
 #### Offline mode
 
