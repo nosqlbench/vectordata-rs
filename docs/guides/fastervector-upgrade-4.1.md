@@ -37,8 +37,10 @@ Most paths a program uses are unchanged: `vectordata::TestDataView`,
 `vectordata::dataset::*`, `vectordata::io::*`, `vectordata::merkle`,
 `vectordata::metadata_schema`, `vectordata::DownloadProgress`,
 `vectordata::catalog::{CatalogSource, CatalogOrigin, Severity}`. Of the
-316 items the API comparison listed as missing from vectordata,
-veks-io and veks-core, 248 still resolve at their old paths.
+343 items the API comparison listed as missing from the published
+crates, 281 still resolve at their old paths in 4.1.0, and 283 since
+4.1.1 restored the two `catalog::source` paths (`cargo run -p tools
+--bin api-paths -- --baseline v4.0.2` reproduces the count).
 
 vectordata no longer depends on reqwest. `vectordata::transport` is
 public and is veks-transport's client API.
