@@ -277,10 +277,14 @@ what a caller decides on — HTTP status, permanent or transient, the
 URL — so retry and offline behaviour are decided on the same facts as
 today (`is_permanent`).
 
-**PR-7 — Credentials are resolved once per origin.** A `Credentials`
-call is not made per range request: the transport resolves a token
-per origin and request kind, and keeps it for the connection pool's
-life, as `apply_read_auth` effectively does now.
+**PR-7 — A read token is one in-memory lookup per request, never
+I/O.** Credentials are keyed by URL prefix, so two paths on one origin
+can carry different tokens, and `reload_credentials` replaces them
+mid-session; a token cached per origin would be the wrong one. The
+store is read once per process and on reload, and each request
+resolves its token by longest prefix in memory, as `apply_read_auth`
+did. *(Amended 2026-10-22: it read "resolved once per origin", which
+the code before the move never did; see §12.7.)*
 
 **PR-8 — No failure becomes quieter.** Every error that reaches a
 caller at 13577a2 still reaches it after the move, with the same
