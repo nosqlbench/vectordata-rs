@@ -341,6 +341,15 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
   roles:" and an empty list. Links are followed, for files and for
   `profiles/` directories; a link to nothing is refused, naming it; and
   a directory with no vector file says so.
+- **`config catalog add .` saved the resolved directory, not the one
+  the user was in.** A directory reached through a link (every temp
+  directory on macOS, through `/var` → `/private/var`) was saved by its
+  resolved path, so `remove` by the path the user saw could not find
+  it. The shell's `$PWD` is used when it names the same directory.
+- **Windows paths in catalogs.** A catalog file named by a Windows path
+  gave its datasets an empty home, and `config catalog add` named a
+  catalog after the whole path (`c-data-stage`); a `\` now separates a
+  local path's parts there, as `/` does.
 - **A directory of npy or parquet files that held a corrupt file
   ended early, quietly.** The loaders logged the file at info level
   and skipped it, so the stream stopped with fewer records than its

@@ -191,12 +191,20 @@ pub fn dir_form(text: &str) -> String {
 
 /// The directory part of `text`, ending in `/`, with no other change:
 /// `https://h/a/catalog.yaml` gives `https://h/a/`. Text with no `/`
-/// gives the empty string.
+/// gives the empty string. On Windows a `\` separates a local path's
+/// parts too, so `C:\data\catalog.yaml` gives `C:\data/`: the form
+/// [`dir_form`] gives the directory's own path.
 pub fn parent_form(text: &str) -> String {
-    match text.rfind('/') {
-        Some(cut) => text[..=cut].to_string(),
+    match text.rfind(is_path_separator) {
+        Some(cut) => format!("{}/", &text[..cut]),
         None => String::new(),
     }
+}
+
+/// Whether `c` separates the parts of a location: `/` everywhere, and
+/// `\` in a Windows path.
+pub fn is_path_separator(c: char) -> bool {
+    c == '/' || (cfg!(windows) && c == '\\')
 }
 
 /// `base` (a directory, ending in `/`) followed by `relative`, as

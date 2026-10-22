@@ -438,14 +438,9 @@ fn list_to_map_text(content: &str) -> Result<(String, usize), String> {
 /// when nothing usable remains — the caller falls back to the
 /// made-up enumeration.
 fn derive_catalog_name(location: &str, taken: &[String]) -> String {
-    let stem = location
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .rsplit_once('.')
-        .map(|(s, _)| s)
-        .unwrap_or_else(|| location.trim_end_matches('/').rsplit('/').next().unwrap_or(""));
+    let sep = crate::location::is_path_separator;
+    let last = location.trim_end_matches(sep).rsplit(sep).next().unwrap_or("");
+    let stem = last.rsplit_once('.').map(|(s, _)| s).unwrap_or(last);
     let slug: String = stem.to_lowercase().chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>()
@@ -517,8 +512,25 @@ fn saved_location(source: &str, cwd: &Path) -> String {
 /// source as written when there is none to read.
 fn saved_location_here(source: &str) -> String {
     match std::env::current_dir() {
-        Ok(cwd) => saved_location(source, &cwd),
+        Ok(cwd) => saved_location(source, &logical_cwd(std::env::var_os("PWD").as_deref().map(Path::new), cwd)),
         Err(_) => source.to_string(),
+    }
+}
+
+/// The working directory as the user named it: the shell's `$PWD` when
+/// it is the same directory as `physical` (the OS's answer, with
+/// symlinks resolved: `/private/var/…` for a `/var/…` on macOS), else
+/// `physical`. So `catalog add .` saves the spelling the user is in,
+/// as LF's "symlinks are kept as named" asks.
+fn logical_cwd(pwd: Option<&Path>, physical: PathBuf) -> PathBuf {
+    match pwd {
+        Some(pwd)
+            if pwd.is_absolute()
+                && std::fs::canonicalize(pwd).ok().is_some_and(|p| Some(p) == std::fs::canonicalize(&physical).ok()) =>
+        {
+            pwd.to_path_buf()
+        }
+        _ => physical,
     }
 }
 
@@ -1181,15 +1193,39 @@ mod tests {
 
     #[test]
     fn saved_location_makes_a_path_absolute_and_keeps_a_url() {
-        let cwd = Path::new("/data/stage");
-        assert_eq!(saved_location(".", cwd), "/data/stage");
-        assert_eq!(saved_location("./", cwd), "/data/stage");
-        assert_eq!(saved_location("..", cwd), "/data");
-        assert_eq!(saved_location("sub/../cat.yaml", cwd), "/data/stage/cat.yaml");
-        assert_eq!(saved_location("/abs/./x/", cwd), "/abs/x");
-        assert_eq!(saved_location("https://h/x/../catalog.json", cwd), "https://h/x/../catalog.json");
+        // An absolute root for this platform, and the path it gives.
+        let root = if cfg!(windows) { r"C:\" } else { "/" };
+        let path = |parts: &[&str]| -> String {
+            parts.iter().fold(PathBuf::from(root), |p, part| p.join(part)).to_string_lossy().into_owned()
+        };
+        let cwd = PathBuf::from(path(&["data", "stage"]));
+        assert_eq!(saved_location(".", &cwd), path(&["data", "stage"]));
+        assert_eq!(saved_location("./", &cwd), path(&["data", "stage"]));
+        assert_eq!(saved_location("..", &cwd), path(&["data"]));
+        assert_eq!(saved_location("sub/../cat.yaml", &cwd), path(&["data", "stage", "cat.yaml"]));
+        assert_eq!(saved_location(&format!("{}/./x/", path(&["abs"])), &cwd), path(&["abs", "x"]));
+        assert_eq!(saved_location("https://h/x/../catalog.json", &cwd), "https://h/x/../catalog.json");
         // The name follows from the saved form.
-        assert_eq!(derive_catalog_name(&saved_location(".", cwd), &[]), "stage");
+        assert_eq!(derive_catalog_name(&saved_location(".", &cwd), &[]), "stage");
+    }
+
+    /// **`.` is saved as the directory the user is in, by its name**:
+    /// the shell's `$PWD` when it is the same directory as the OS's
+    /// resolved one, else the resolved one.
+    #[cfg(unix)]
+    #[test]
+    fn the_working_directory_keeps_the_name_it_was_entered_by() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let physical = std::fs::canonicalize(&real).unwrap();
+        assert_eq!(logical_cwd(Some(&link), physical.clone()), link);
+        assert_eq!(logical_cwd(None, physical.clone()), physical);
+        // A $PWD naming another directory is stale, and not used.
+        assert_eq!(logical_cwd(Some(tmp.path()), physical.clone()), physical);
+        assert_eq!(logical_cwd(Some(Path::new("relative")), physical.clone()), physical);
     }
 
     #[test]

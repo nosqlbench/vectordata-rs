@@ -35,6 +35,9 @@ fn vectordata(home: &Path, cwd: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_vectordata"))
         .args(args)
         .current_dir(cwd)
+        // A shell names the directory it is in; on macOS the temp
+        // directory is reached through the `/var` → `/private/var` link.
+        .env("PWD", cwd)
         .env("VECTORDATA_HOME", home)
         .env_remove(vectordata::settings::OFFLINE_ENV)
         .env("VECTORDATA_NO_UPDATE_CHECK", "1")
@@ -91,4 +94,27 @@ fn remove_finds_a_path_by_its_relative_or_absolute_spelling() {
         assert!(out.status.success(), "remove {remove_by}: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(catalogs_yaml(&home).trim(), "", "remove {remove_by}");
     }
+}
+
+/// **`.` is saved by the name the user entered the directory by**, not
+/// the OS's resolved one: on macOS every temp directory is reached
+/// through `/var` → `/private/var`, and a remove by the spelling the
+/// user sees must find it.
+#[cfg(unix)]
+#[test]
+fn add_saves_a_directory_reached_through_a_link_by_that_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = home(tmp.path());
+    std::fs::create_dir(tmp.path().join("real")).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("link")).unwrap();
+    let stage = tmp.path().join("link").join("stage");
+    catalog_with(&stage, "demo");
+    let named = stage.to_string_lossy().into_owned();
+
+    let out = vectordata(&home, &stage, &["config", "catalog", "add", "."]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(catalogs_yaml(&home).trim(), format!("stage: {named}"));
+    let out = vectordata(&home, &stage, &["config", "catalog", "remove", &named]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(catalogs_yaml(&home).trim(), "");
 }

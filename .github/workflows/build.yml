@@ -243,7 +243,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/test-tmp
-          cargo test --release -p vectordata \
+          # Every test binary runs even after one fails, so a platform's
+          # failures are all reported in one run, not one binary at a time.
+          cargo test --release -p vectordata --no-fail-fast \
             --target ${{ matrix.target }} \
             --features cli
 
@@ -392,6 +394,17 @@ jobs:
           set -euo pipefail
           rustup toolchain install
           rustc --version
+
+      # ─── `.cargo/config.toml` links every Linux build with `mold`,
+      # so this job needs it as the build matrix does (its Linux deps
+      # step); without it the tool itself fails to link ("cannot find
+      # 'ld'"). `clang` and `pkg-config` are for the C the probe's
+      # dependencies compile.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential mold clang pkg-config ca-certificates
 
       # ─── Pinned: each cargo-semver-checks release reads a fixed
       # range of rustdoc JSON formats, so its version moves with the
