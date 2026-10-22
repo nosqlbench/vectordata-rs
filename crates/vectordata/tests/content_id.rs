@@ -82,7 +82,9 @@ fn a_fetched_facet_without_a_reference_records_its_content_root() {
     let cache_file = cached_file(CACHE.path(), "base.fvec").expect("the cache copy");
     let mut cached = std::fs::read(&cache_file).unwrap();
     cached[8 * 1024 * 1024 + 100] ^= 0xff;
-    std::fs::write(&cache_file, &cached).unwrap();
+    // In place, not by truncating: the view still maps the file, and
+    // Windows refuses to truncate a mapped file.
+    std::io::Write::write_all(&mut std::fs::OpenOptions::new().write(true).open(&cache_file).unwrap(), &cached).unwrap();
     let report = view.verify_report(&options, &mut NoProgress);
     let failure = report.failures.iter().find(|f| f.check == Check::V9CachedChunks).expect("V9 fails");
     assert!(failure.found.ends_with(": 1"), "chunk 1 holds 8 MiB + 100: {failure}");

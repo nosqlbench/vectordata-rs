@@ -150,7 +150,9 @@ fn a_remote_measurement_is_recorded_by_content_id_and_reused() {
     for rec in 0..1500 {
         bytes[rec * 12 + 4..rec * 12 + 8].copy_from_slice(&9.0f32.to_le_bytes());
     }
-    std::fs::write(&cached, &bytes).unwrap();
+    // In place, not by truncating: the view still maps the file, and
+    // Windows refuses to truncate a mapped file.
+    std::io::Write::write_all(&mut std::fs::OpenOptions::new().write(true).open(&cached).unwrap(), &bytes).unwrap();
     let again = view.normalization().unwrap();
     assert_eq!((again.value, again.measured.worst_deviation), (first.value, first.measured.worst_deviation), "read from the record, not re-sampled");
 }
@@ -199,7 +201,9 @@ fn a_completed_fetch_without_a_reference_knows_its_root_and_records_the_measurem
     for rec in 0..rows {
         bytes[rec * 12 + 4..rec * 12 + 8].copy_from_slice(&9.0f32.to_le_bytes());
     }
-    std::fs::write(&cached, &bytes).unwrap();
+    // In place, not by truncating: the view still maps the file, and
+    // Windows refuses to truncate a mapped file.
+    std::io::Write::write_all(&mut std::fs::OpenOptions::new().write(true).open(&cached).unwrap(), &bytes).unwrap();
     let view = TestDataGroup::load(&url).unwrap().profile("default").unwrap();
     let again = view.normalization().unwrap();
     assert!(again.value, "read from the record, not re-sampled");
