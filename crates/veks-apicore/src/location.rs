@@ -75,7 +75,7 @@ impl Location {
     /// an `http`, `https` or `s3` URL.
     pub fn is_remote(&self) -> bool {
         match self {
-            Location::Url(url) => crate::transport::is_remote_url(url.as_str()),
+            Location::Url(url) => is_remote_url(url.as_str()),
             Location::Path(_) => false,
         }
     }
@@ -217,7 +217,7 @@ pub fn concat_form(base: &str, relative: &str) -> String {
 /// followed by letters, digits, `+`, `-` or `.` (RFC 3986). A Windows
 /// drive path (`C:\x`, `C:/x`) has no `//` after its colon, so it is
 /// not taken for a URL.
-pub(crate) fn has_scheme(text: &str) -> bool {
+pub fn has_scheme(text: &str) -> bool {
     let Some(end) = text.find("://") else { return false };
     let scheme = &text[..end];
     let mut chars = scheme.chars();
@@ -230,7 +230,7 @@ pub(crate) fn has_scheme(text: &str) -> bool {
 /// gives `C:\x`, all decoded as a URI is. A URI the platform cannot
 /// read as a local path (another host) keeps the path after the host;
 /// `file://abs` gives `/abs`. Text without the prefix passes through.
-pub(crate) fn file_uri_path(text: &str) -> std::borrow::Cow<'_, str> {
+pub fn file_uri_path(text: &str) -> std::borrow::Cow<'_, str> {
     let Some(rest) = text.strip_prefix("file://") else {
         return std::borrow::Cow::Borrowed(text);
     };
@@ -249,6 +249,13 @@ pub(crate) fn file_uri_path(text: &str) -> std::borrow::Cow<'_, str> {
         Some(slash) => std::borrow::Cow::Borrowed(&rest[slash..]),
         None => std::borrow::Cow::Owned(format!("/{rest}")),
     }
+}
+
+/// Whether `s` names a remote resource the transport fetches: an
+/// `http://`, `https://` or `s3://` URL. `file://` and paths are local.
+#[inline]
+pub fn is_remote_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://") || s.starts_with("s3://")
 }
 
 #[cfg(test)]

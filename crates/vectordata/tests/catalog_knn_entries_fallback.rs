@@ -9,8 +9,8 @@
 //! `knn_entries.yaml` (but no `catalog.json` / `catalog.yaml` /
 //! `dataset.yaml`) and synthesizes the canonical view.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 mod support;
@@ -18,6 +18,7 @@ mod support;
 use std::sync::LazyLock;
 
 use vectordata::catalog::{Catalog, CatalogSources};
+use vectordata::TestDataViewExt;
 
 use support::testserver::TestServer;
 
@@ -620,7 +621,7 @@ fn local_knn_entries_relative_paths_open_and_read_correctly() {
 
     // 1. base_vectors — reads through the view trait's
     //    `base_vectors()` accessor.
-    let base = view.base_vectors().expect("base_vectors opens");
+    let base = view.base_vectors_as::<f32>().expect("base_vectors opens");
     assert_eq!(base.count(), 16);
     assert_eq!(base.dim(), 4);
     for i in 0..base.count() {
@@ -635,7 +636,7 @@ fn local_knn_entries_relative_paths_open_and_read_correctly() {
 
     // 2. query_vectors — exercises a different facet so the
     //    resolution isn't accidentally hardcoded to one slot.
-    let query = view.query_vectors().expect("query_vectors opens");
+    let query = view.query_vectors_as::<f32>().expect("query_vectors opens");
     assert_eq!(query.count(), 8);
     for i in 0..query.count() {
         assert_eq!(query.get(i).unwrap(), vec![
@@ -649,7 +650,7 @@ fn local_knn_entries_relative_paths_open_and_read_correctly() {
     // 3. neighbor_indices — verifies the `gt` → `neighbor_indices`
     //    facet alias mapping carries through to a working
     //    integer reader.
-    let nbrs = view.neighbor_indices().expect("neighbor_indices opens");
+    let nbrs = view.neighbor_indices_as::<i32>().expect("neighbor_indices opens");
     assert_eq!(nbrs.count(), 8);
     assert_eq!(nbrs.dim(), 3);
     let row = nbrs.get(4).unwrap();
@@ -698,7 +699,7 @@ fn local_knn_entries_via_catalog_open_reads_correctly() {
     let catalog = Catalog::of(&sources);
     let group = catalog.open("d").expect("d resolves through Catalog::open");
     let view = group.profile("default").expect("default profile");
-    let base = view.base_vectors().expect("base_vectors opens");
+    let base = view.base_vectors_as::<f32>().expect("base_vectors opens");
     assert_eq!(base.count(), 8);
     let v = base.get(3).unwrap();
     assert_eq!(v, vec![3.0f32, 4.0]);

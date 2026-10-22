@@ -639,7 +639,6 @@ pub fn infer_dir(dir: &Path) -> Result<Inferred, InferError> {
     let mut failures = Vec::new();
     for (name, _) in &profiles {
         let Some(view) = group.profile(name) else { continue };
-        use crate::view::TestDataViewExt;
         let report = view.verify_report(&crate::verify::VerifyOptions::default(), &mut crate::verify::NoProgress);
         failures.extend(report.failures);
         if normalized_token

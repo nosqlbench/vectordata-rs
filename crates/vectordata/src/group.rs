@@ -493,7 +493,7 @@ impl TestDataGroup {
         }
         let name = self.name.clone().unwrap_or_else(|| self.entry.name().to_string());
         self.claims = crate::overlay::Claims::of(&name, &stated).map(Arc::new);
-        self.entry.apply_overlay(stated);
+        crate::overlay::warn_contradictions(self.entry.apply_overlay(stated));
     }
 
     /// Where attribute `key`'s value came from: an overlay, the names of
@@ -572,7 +572,11 @@ impl TestDataGroup {
             })?;
             crate::fetch::plan_view(&*view, Some(name), request, progress, &mut facets)?;
         }
-        Ok(crate::fetch::plan_from(facets, request))
+        Ok(crate::fetch::plan_from(
+            facets,
+            request,
+            crate::fetch::CapacityCheck::new(|bytes| Ok(crate::cache::ensure_cache_capacity(bytes)?)),
+        ))
     }
 
     /// Deprecated: use [`fetch`](Self::fetch) over
@@ -668,7 +672,7 @@ fn fetch_descriptor(
     let resp = crate::transport::apply_read_auth(client.get(wire.as_ref()), Some(url)).send();
     match resp {
         Ok(r) if r.status().is_success() => {
-            let text = r.text()?;
+            let text = r.text().map_err(crate::transport::transport_error)?;
             if let Some(path) = kept_descriptor_path(url, base_url) {
                 // Best effort: a cache directory that cannot be written
                 // only costs the offline fallback.
@@ -684,9 +688,9 @@ fn fetch_descriptor(
                 log::warn!("{url} is unreachable ({e}); using the copy kept at {}", path.display());
                 read_kept(path)
             }
-            None => Ok(Descriptor::Unavailable(Error::Http(e))),
+            None => Ok(Descriptor::Unavailable(Error::Transport(crate::transport::transport_error(e)))),
         },
-        Err(e) => Err(Error::Http(e)),
+        Err(e) => Err(Error::Transport(crate::transport::transport_error(e))),
     }
 }
 

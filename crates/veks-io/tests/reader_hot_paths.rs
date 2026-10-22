@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use veks_io::{ByteSource, ElementType, IoError, MappedFile, VectorReader, XvecReader};
+use veks_io::{ByteSource, ElementType, IoError, MappedFile, OpenSource, VectorReader, XvecReader};
 
 fn write_fvecs(path: &Path, rows: usize, dim: usize) {
     let mut f = std::fs::File::create(path).unwrap();
@@ -35,15 +35,16 @@ struct CountingSource {
     asks: Arc<AtomicUsize>,
 }
 
-impl ByteSource for CountingSource {
-    type Progress = ();
-
+impl OpenSource for CountingSource {
     fn open(source: &str) -> Result<Self, IoError> {
         Self::open_path(Path::new(source))
     }
     fn open_path(path: &Path) -> Result<Self, IoError> {
         Ok(Self { inner: MappedFile::open_path(path)?, asks: Arc::new(AtomicUsize::new(0)) })
     }
+}
+
+impl ByteSource for CountingSource {
     fn total_size(&self) -> u64 {
         self.inner.total_size()
     }

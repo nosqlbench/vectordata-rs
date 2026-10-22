@@ -24,19 +24,19 @@ const DOCUMENTED_ITEMS: &[(&str, &str)] = &[
     ("src/io.rs", "pub type XvecReader<"),
     ("src/io.rs", "pub type ScalarReader<"),
     ("src/io.rs", "pub type IndexedVvecReader<"),
-    ("src/view.rs", "pub trait TestDataViewExt"),
-    ("src/view.rs", "fn facet_as<"),
-    ("src/view.rs", "fn base_vectors_as<"),
-    ("src/view.rs", "fn neighbor_indices_as<"),
-    ("src/view.rs", "fn neighbor_distances_as<"),
-    ("src/view.rs", "fn metadata_results_as<"),
-    ("src/view.rs", "fn quantized_base<"),
-    ("src/view.rs", "fn open_facet_native("),
-    ("src/view.rs", "fn open_facet_as_type("),
+    ("../veks-apicore/src/view.rs", "pub trait TestDataViewExt"),
+    ("../veks-apicore/src/view.rs", "fn facet_as<"),
+    ("../veks-apicore/src/view.rs", "fn base_vectors_as<"),
+    ("../veks-apicore/src/view.rs", "fn neighbor_indices_as<"),
+    ("../veks-apicore/src/view.rs", "fn neighbor_distances_as<"),
+    ("../veks-apicore/src/view.rs", "fn metadata_results_as<"),
+    ("../veks-apicore/src/view.rs", "fn quantized_base<"),
+    ("../veks-apicore/src/view.rs", "fn open_facet_native("),
+    ("../veks-apicore/src/view.rs", "fn open_facet_as_type("),
 ];
 
 /// The modules whose runnable examples, together, must name every type.
-const ELEMENT_MODULES: &[&str] = &["src/io.rs", "src/view.rs"];
+const ELEMENT_MODULES: &[&str] = &["src/io.rs", "../veks-apicore/src/view.rs"];
 
 /// The extension suffixes under which a type name still names the type.
 const EXTENSION_SUFFIXES: &[&str] = &["vecs", "vec", "vvecs", "vvec"];

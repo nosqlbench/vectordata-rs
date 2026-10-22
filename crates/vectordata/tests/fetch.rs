@@ -4,8 +4,8 @@
 //! The library fetch, end to end against a served dataset: the
 //! acceptance cases of `docs/design/srd-api-discoverability.md` §9.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 mod support;
@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use vectordata::catalog::Catalog;
+use vectordata::TestDataViewExt;
 use vectordata::fetch::{FetchEvent, FetchRequest, Silent};
 use vectordata::merkle::MerkleRef;
 use vectordata::{TestDataGroup, TestDataView};
@@ -114,7 +115,7 @@ fn fetching_a_subset_fetches_exactly_that_subset() {
         assert!(row.complete, "{} fetched whole", row.id);
     }
     // Fetched whole, the readers serve zero-copy slices.
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(base.get_slice(7).unwrap(), base.get(7).unwrap().as_slice());
     assert!(
         total.unwrap() >= report.bytes_fetched(),
@@ -356,7 +357,7 @@ fn a_fetched_series_is_read_zero_copy_through_its_reader() {
     let view = group.profile("default").unwrap();
     let report = view.fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent).unwrap();
     assert!(report.facet("base_vectors").unwrap().complete);
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(base.count(), 200);
     for i in [0usize, 99, 100, 199] {
         let slice = base.get_slice(i).expect("zero-copy across shards once fetched");
@@ -411,7 +412,7 @@ fn read_into_fills_a_buffer_across_shards() {
     )
     .unwrap();
     let group = TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
-    let base = group.profile("default").unwrap().base_vectors().unwrap();
+    let base = group.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
 
     // 30 records straddling the seam at 100.
     let mut out = vec![0f32; 30 * 4];
@@ -430,7 +431,7 @@ fn read_into_fills_a_buffer_across_shards() {
     assert!(base.read_into(0, &mut [0f32; 6]).is_err());
 
     // A windowed profile reads in its own ordinals.
-    let windowed = group.profile("window").unwrap().base_vectors().unwrap();
+    let windowed = group.profile("window").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(windowed.count(), 50);
     let mut out = vec![0f32; 2 * 4];
     assert_eq!(windowed.read_into(0, &mut out).unwrap(), 2);
@@ -445,7 +446,7 @@ fn read_into_matches_per_record_reads_over_http() {
     let (_tmp, server) = served(1.1e7);
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     let mut out = vec![0f32; 300 * 8];
     assert_eq!(base.read_into(500, &mut out).unwrap(), 300);
     for k in [0usize, 1, 150, 299] {
@@ -552,10 +553,10 @@ fn read_the_fetched_facets_in_a_child() {
     let catalog = Catalog::of(&vectordata::catalog::CatalogSources::new().add_catalogs(&[catalog_url]));
     let view = catalog.open_profile("anchored", "default").unwrap();
 
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     assert!(base.is_complete(), "the vector reader sees the fetched bytes");
     assert!(base.get_slice(1999).is_some(), "and borrows them from the mapping");
-    let results = view.metadata_results().unwrap();
+    let results = view.metadata_results_as::<i32>().unwrap();
     assert!(results.is_complete(), "the variable-length reader sees them too");
     assert_eq!(results.get(299).unwrap(), vec![12_000_299]);
     let typed: vectordata::TypedReader<u8> =
@@ -662,7 +663,7 @@ fn a_selection_of_several_profiles_refuses_a_single_view() {
     assert!(names.contains(&"default") && names.contains(&"small"), "{names:?}");
 
     let one = catalog.open_spec(&format!("{spec}:small")).unwrap();
-    assert_eq!(one.view().unwrap().base_vectors().unwrap().count(), 10);
+    assert_eq!(one.view().unwrap().base_vectors_as::<f32>().unwrap().count(), 10);
 }
 
 /// **Problems met reading the sources reach the catalog's diagnostics**,
@@ -708,8 +709,8 @@ fn a_read_answered_with_404_is_not_retried() {
     init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
-    let base = view.base_vectors().unwrap();
-    let query = view.query_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
+    let query = view.query_vectors_as::<f32>().unwrap();
 
     std::fs::remove_file(tmp.path().join("base.fvec")).unwrap();
     std::fs::remove_file(tmp.path().join("query.fvec")).unwrap();

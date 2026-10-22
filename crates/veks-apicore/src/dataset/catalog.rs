@@ -114,7 +114,7 @@ pub struct CatalogEntry {
 /// An entry's attributes with the overlays that apply to it merged in,
 /// and what each overlay stated.
 #[derive(Debug, Clone)]
-pub(crate) struct AppliedOverlay {
+pub struct AppliedOverlay {
     attributes: DatasetAttributes,
     stated: Vec<crate::overlay::Stated>,
 }
@@ -230,7 +230,7 @@ impl CatalogEntry {
     /// base, with no dataset segment, so its home is the base and its
     /// name, and its layout is its whole description. Any other entry's
     /// `path` is its descriptor, whose directory is its home.
-    pub(crate) fn from_listing(
+    pub fn from_listing(
         name: String,
         path: String,
         dataset_type: String,
@@ -334,12 +334,14 @@ impl CatalogEntry {
         self.overlay.as_ref().map(|o| o.stated.as_slice()).unwrap_or(&[])
     }
 
-    /// Merge `stated` over the entry's own attributes. A distance
-    /// function the dataset declares differently is a warning (OV-5):
-    /// the overlay's is in force.
-    pub(crate) fn apply_overlay(&mut self, stated: Vec<crate::overlay::Stated>) {
+    /// Merge `stated` over the entry's own attributes, returning what
+    /// the dataset's own declaration says otherwise: a distance function
+    /// it declares differently (OV-5). The overlay's value is in force
+    /// either way; the caller says so.
+    pub fn apply_overlay(&mut self, stated: Vec<crate::overlay::Stated>) -> Vec<crate::overlay::Contradiction> {
+        let mut contradictions = Vec::new();
         if stated.is_empty() {
-            return;
+            return contradictions;
         }
         let own = self.own_attributes().cloned().unwrap_or_default();
         let mut attributes = own.clone();
@@ -348,13 +350,20 @@ impl CatalogEntry {
                 && let (Some(declared), Some(claimed)) = (own.distance(), s.value.as_str().and_then(crate::DistanceFunction::parse))
                 && declared != claimed
             {
-                crate::overlay::warn_contradiction(&self.name, &s.key, claimed.name(), &format!("the dataset's own {}", declared.name()), &s.source);
+                contradictions.push(crate::overlay::Contradiction {
+                    dataset: self.name.clone(),
+                    key: s.key.clone(),
+                    claimed: claimed.name().to_string(),
+                    observed: format!("the dataset's own {}", declared.name()),
+                    source: s.source.clone(),
+                });
             }
             if !attributes.set_known(&s.key, &s.value) {
                 attributes.other.insert(s.key.clone(), s.value.clone());
             }
         }
         self.overlay = Some(std::sync::Arc::new(AppliedOverlay { attributes, stated }));
+        contradictions
     }
 
     /// The profile tag schema (PS-19).
@@ -405,12 +414,12 @@ impl CatalogEntry {
 
     /// Record which catalog document the entry was read from. Set by
     /// the loader that reads the document.
-    pub(crate) fn set_catalog_file(&mut self, file: impl Into<String>) {
+    pub fn set_catalog_file(&mut self, file: impl Into<String>) {
         self.catalog_file = Some(file.into());
     }
 
     /// Record which configured catalog adopted the entry.
-    pub(crate) fn set_catalog_name(&mut self, name: impl Into<String>) {
+    pub fn set_catalog_name(&mut self, name: impl Into<String>) {
         self.catalog_name = Some(name.into());
     }
 
@@ -491,7 +500,7 @@ impl EntryBuilder {
 
     /// The home as a catalog wrote it: kept as written, because it is
     /// the identity the dataset's cache records.
-    pub(crate) fn home_as_written(mut self, home: impl Into<String>) -> Self {
+    pub fn home_as_written(mut self, home: impl Into<String>) -> Self {
         self.home = Some(crate::location::dir_form(&home.into()));
         self
     }
@@ -511,7 +520,7 @@ impl EntryBuilder {
 
     /// The descriptor as a catalog wrote it, and the catalog's type for
     /// it.
-    pub(crate) fn descriptor_as_written(
+    pub fn descriptor_as_written(
         mut self,
         descriptor: impl Into<String>,
         dataset_type: impl Into<String>,

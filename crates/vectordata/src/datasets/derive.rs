@@ -44,6 +44,7 @@ use std::path::Path;
 use super::build_sources;
 use crate::catalog::resolver::Catalog;
 use crate::dataset::config::DatasetConfig as RichDatasetConfig;
+use crate::dataset::DatasetConfigIo;
 use crate::dataset::source::DSWindow;
 use crate::dataset::Sharding;
 use crate::merkle::MerkleRef;

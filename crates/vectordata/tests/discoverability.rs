@@ -28,6 +28,19 @@ fn src() -> PathBuf {
 /// Every `.rs` file under `src/` except the binary shim and test
 /// modules, with its path relative to `src/`.
 fn source_files() -> Vec<(String, String)> {
+    source_files_under(&src())
+}
+
+/// The API core's sources, relative to its `src/` and prefixed
+/// `veks-apicore/`: every module of it is the API, so the fetch
+/// surface it defines is budgeted with vectordata's.
+fn api_core_files() -> Vec<(String, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../veks-apicore/src");
+    source_files_under(&root).into_iter().map(|(rel, text)| (format!("veks-apicore/{rel}"), text)).collect()
+}
+
+/// [`source_files`] under `root`.
+fn source_files_under(root: &Path) -> Vec<(String, String)> {
     fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
         for e in std::fs::read_dir(dir).unwrap().flatten() {
             let p = e.path();
@@ -44,7 +57,7 @@ fn source_files() -> Vec<(String, String)> {
         }
     }
     let mut out = Vec::new();
-    walk(&src(), &src(), &mut out);
+    walk(root, root, &mut out);
     out.sort();
     out
 }
@@ -250,10 +263,8 @@ const FETCH_BUDGET: &[(&str, &str, bool)] = &[
     ("precache", "low-level: one file or facet, whole", false),
     ("prebuffer_with_progress", "low-level: one file or facet, whole, with transport progress", false),
     ("prebuffer_range_with_progress", "low-level: a byte range of one facet", false),
-    ("prebuffer_all", "duplicate of fetch(all)", true),
-    ("prebuffer_all_with_progress", "duplicate of fetch(all) with a sink", true),
-    ("prefetch", "duplicate of fetch(facet, window)", true),
-    ("prefetch_with_progress", "duplicate of fetch(facet, window) with a sink", true),
+    ("prebuffer_parts", "FacetBytes: one facet file by file, what fetch execution drives", false),
+    ("prebuffer_shard_range", "FacetBytes: a byte range of one file of a series, what fetch execution drives", false),
     ("prebuffer_all_profiles", "duplicate of group fetch", true),
     ("prebuffer_all_profiles_with_progress", "duplicate of group fetch with a sink", true),
     ("prebuffer_profiles_with_progress", "duplicate of group fetch with a sink", true),
@@ -263,7 +274,8 @@ const FETCH_BUDGET: &[(&str, &str, bool)] = &[
 /// duplicates are deprecated** (DX-17, DX-30).
 #[test]
 fn the_fetch_surface_is_the_budgeted_one() {
-    let files = source_files();
+    let mut files = source_files();
+    files.extend(api_core_files());
     let fetchlike = |name: &str| {
         let n = name.strip_prefix("plan_").unwrap_or(name);
         ["fetch", "prefetch", "precache", "prebuffer", "download"]
@@ -272,7 +284,7 @@ fn the_fetch_surface_is_the_budgeted_one() {
     };
     let mut seen: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for (rel, text) in &files {
-        if layer_of(rel, &files) != Some("Library API.") {
+        if !rel.starts_with("veks-apicore/") && layer_of(rel, &files) != Some("Library API.") {
             continue;
         }
         let code = shipped_code(text);

@@ -24,12 +24,13 @@
 //! See `docs/design/srd-multifile-facet-shards.md` and
 //! `docs/design/srd-dataset-format-version.md`.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 use serde::Deserialize;
 use vectordata::dataset::Sharding;
+use vectordata::TestDataViewExt;
 
 /// The pre-sharding facet declaration, verbatim: an untagged pair of a
 /// bare filename and a `{source, window}` object. No shard fields, and
@@ -288,18 +289,18 @@ fn every_pre_sharding_facet_spelling_still_reads() {
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
 
-    let bare = view.base_vectors().unwrap();
+    let bare = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(bare.count(), 100);
     assert_eq!(bare.get(0).unwrap()[0], 0.0);
 
-    let object = view.facet("query_vectors").unwrap();
+    let object = view.facet_as::<f32>("query_vectors").unwrap();
     assert_eq!(object.count(), 100);
 
-    let windowed = view.facet("query_terms").unwrap();
+    let windowed = view.facet_as::<f32>("query_terms").unwrap();
     assert_eq!(windowed.count(), 30, "an explicit window field clips");
     assert_eq!(windowed.get(0).unwrap()[0], 10.0);
 
-    let suffixed = view.facet("query_filters").unwrap();
+    let suffixed = view.facet_as::<f32>("query_filters").unwrap();
     assert_eq!(suffixed.count(), 30, "a source suffix clips");
     assert_eq!(suffixed.get(0).unwrap()[0], 20.0);
 }

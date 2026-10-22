@@ -21,47 +21,7 @@ mod mstate;
 pub use mref::MerkleRef;
 pub use mstate::MerkleState;
 
-/// A facet's content identity: the root of a merkle tree over its
-/// bytes at the 8 MiB chunk size, so the same bytes have the same root
-/// however it was obtained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ContentId {
-    /// The tree's root.
-    pub root: [u8; 32],
-    /// How the tree was obtained.
-    pub kind: ContentIdKind,
-}
-
-/// How a [`ContentId`]'s tree was obtained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ContentIdKind {
-    /// The publisher's `.mref`, against which every fetched chunk is
-    /// verified.
-    Published,
-    /// Recorded as the chunks of a file published without one were
-    /// fetched (the `.chunks` sidecar).
-    Recorded,
-    /// Computed from a local file.
-    Computed,
-}
-
-impl ContentId {
-    /// The root as lowercase hex.
-    pub fn hex(&self) -> String {
-        self.root.iter().map(|b| format!("{b:02x}")).collect()
-    }
-}
-
-impl std::fmt::Display for ContentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let kind = match self.kind {
-            ContentIdKind::Published => "published",
-            ContentIdKind::Recorded => "recorded",
-            ContentIdKind::Computed => "computed",
-        };
-        write!(f, "merkle:{} ({kind})", self.hex())
-    }
-}
+pub use veks_apicore::{ContentId, ContentIdKind};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Cursor, Read, Write};

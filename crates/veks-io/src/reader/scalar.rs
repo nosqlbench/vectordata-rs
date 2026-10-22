@@ -10,7 +10,7 @@ use std::path::Path;
 use veks_datatypes::{Container, Element, ElementType};
 
 use super::{IoError, VectorReader, aligned_for, copy_elements, ext_of, records_to_read, require_native};
-use crate::source::{ByteSource, MappedFile};
+use crate::source::{ByteSource, MappedFile, OpenSource};
 
 /// A header-free column: `T` after `T`, nothing else. The reader for a
 /// scalar file (`.u8`, `.i32`, `.f32`, `.bf16`, …), with `dim() == 1`
@@ -44,13 +44,19 @@ pub struct ScalarReader<T, S: ByteSource = MappedFile> {
 impl<T: Element, S: ByteSource> ScalarReader<T, S> {
     /// Open the column `source` names, whose extension names `T` in
     /// the column layout.
-    pub fn open(source: &str) -> Result<Self, IoError> {
+    pub fn open(source: &str) -> Result<Self, IoError>
+    where
+        S: OpenSource,
+    {
         Self::require_column(source)?;
         Self::from_source(S::open(source)?)
     }
 
     /// Open a local column file.
-    pub fn open_path(path: &Path) -> Result<Self, IoError> {
+    pub fn open_path(path: &Path) -> Result<Self, IoError>
+    where
+        S: OpenSource,
+    {
         Self::require_column(&path.to_string_lossy())?;
         Self::from_source(S::open_path(path)?)
     }

@@ -168,6 +168,8 @@ impl FetchProgress for TextMeter {
                     self.write(&line);
                 }
             }
+            // A later kind of event this meter does not draw.
+            _ => {}
         }
     }
 }
@@ -914,6 +916,8 @@ impl LogState {
                     self.emit(log::Level::Error, &body);
                 }
             }
+            // A later kind of event this meter does not draw.
+            _ => {}
         }
     }
 }

@@ -17,7 +17,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use super::source::{CatalogSource, LocatedCatalog, Requirement};
+use super::CatalogSource;
+use super::source::{LocatedCatalog, Requirement};
 
 /// Default configuration directory for catalog discovery.
 pub const DEFAULT_CONFIG_DIR: &str = "~/.config/vectordata";

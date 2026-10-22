@@ -35,7 +35,7 @@ pub use veks_io::reader::{
     AnyVectorReader, AnyVvecReader, ConvertingReader, DIM_UNDEFINED, IoError, VectorReader, VvecReader,
     remove_vvec_index,
 };
-pub use veks_io::source::ByteSource;
+pub use veks_io::source::{ByteSource, OpenSource};
 pub use veks_io::writer::{ScalarWriter, VvecWriter, XvecWriter};
 
 pub(crate) use veks_io::reader::{
@@ -71,9 +71,7 @@ impl std::fmt::Debug for StorageSource {
     }
 }
 
-impl ByteSource for StorageSource {
-    type Progress = crate::transport::DownloadProgress;
-
+impl veks_io::OpenSource for StorageSource {
     fn open(source: &str) -> Result<Self, IoError> {
         Ok(Self(Storage::open(source)?))
     }
@@ -81,6 +79,9 @@ impl ByteSource for StorageSource {
     fn open_path(path: &Path) -> Result<Self, IoError> {
         Ok(Self(Storage::open_path(path)?))
     }
+}
+
+impl ByteSource for StorageSource {
 
     fn total_size(&self) -> u64 {
         self.0.total_size()
@@ -122,7 +123,7 @@ impl ByteSource for StorageSource {
         self.0.precache()
     }
 
-    fn prebuffer_with_progress(&self, cb: &mut dyn FnMut(&Self::Progress)) -> io::Result<()> {
+    fn prebuffer_with_progress(&self, cb: &mut dyn FnMut(&crate::DownloadProgress)) -> io::Result<()> {
         self.0.prebuffer_with_progress(cb)
     }
 

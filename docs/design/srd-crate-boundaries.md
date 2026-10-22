@@ -743,3 +743,135 @@ shown failing on the code before it.
    checks: veks-transport no longer reaches veks-io).
 10. **Docs**: sysref 02, the transport crate's README, the CHANGELOG
     under Unreleased, this SRD's implementation records.
+
+## 12. Implementation
+
+### 12.1 Step 0: the API core (2026-10-22)
+
+`crates/veks-apicore` holds the contracts and the vocabulary they name;
+vectordata and veks-io implement it and re-export it at every path they
+had, so `vectordata::TestDataView`, `vectordata::dataset::*`,
+`vectordata::io::VectorReader` and `veks_io::ByteSource` resolve as
+before.
+
+**What moved.**
+- From veks-io: `ByteSource` and `SourcePart` (`source`), the reader
+  contracts with `IoError`, `ConvertingReader` and the `Any…` readers
+  (`reader`), the streaming traits (`stream`, the old `traits.rs`).
+- From vectordata: the descriptor model (`dataset`, except `infer`,
+  `layout` and shard discovery; `model`; `location`), the overlay
+  values (`AttributeSource`, `OverlayKind`, `Stated`, and
+  `Contradiction`, new), the fetch values and orchestration (`fetch`,
+  without the meters and `fetch_text`), the verify report types
+  (`verify`), the record contracts (`records`, without the slab
+  container and the codecs), `TestDataView`, `TestDataViewExt`,
+  `QuantizedBase` and the plan values (`view`), `CatalogSource`,
+  `CatalogOrigin`, `CatalogDiagnostic` (`catalog`), `Error`,
+  `InsufficientCacheSpace` (`error`), `ContentId`, `DownloadProgress`.
+- New: `FacetBytes` (DA-3), `ProgressSink` and `NoProgress` (one sink
+  for every labelled pass; `VerifyProgress` is it), `TransportError`
+  and `TransportErrorKind` (TR-6's minimum, so `Error::Transport` could
+  replace `Error::Http` now; step 7 adds the transport contracts).
+
+**Settled in implementation.**
+- **AC-1's dependency list** is the vocabulary's actual needs:
+  `veks-datatypes`, `thiserror`, `serde`, `serde_json` (JSON catalogs),
+  `serde_yaml`, `indexmap`, `url`, `regex` (profile selectors) and
+  `log` (the descriptor model's parse warnings). The guard holds it
+  to exactly that.
+- **Return types that carried implementation state are contracts with
+  thin API types over them**, as DA-3 set for `FacetStorage`:
+  `FacetBytes` exposes what fetch execution needs (prebuffer by part
+  and by shard range, revalidate, sizes, fills, record-to-byte
+  mapping, content identity, cache check, records) and `as_any`, by
+  which vectordata recovers its own handle on its cold paths.
+  `RecordFacet` is an API type over `RecordContainer`s, opened through
+  `FacetBytes::open_records`. `PrefetchHandle` is the API's (std
+  threads only). Fetch planning and execution (`plan_view`,
+  `plan_from`, `FetchPlan::execute`) are written against these and
+  live in the API; the one implementation hook is `CapacityCheck`,
+  which a view supplies through `TestDataView::cache_capacity`.
+- **`FacetBytes` has defaults for bytes already here** (complete,
+  local, nothing to fetch, no cache, no identity), so a second
+  implementation writes three methods; vectordata overrides every one.
+- **`verify`, `verify_report` and `normalization` are
+  `TestDataView`'s**, `verify` provided over `verify_report`: the
+  extension trait is a blanket impl, so behaviour an implementation
+  supplies must be on the core trait (DA-4).
+- **`DatasetConfig::validate` stays on the type**: it checks declared
+  paths against the managed directories and touches no file. Only
+  `load_from` (a URL) and `reconcile_shard_declarations` (the files on
+  disk) moved to `DatasetConfigIo`.
+- **The series rules split by what they touch**, refining Q3: the
+  naming, declaration and addressing rules are descriptor vocabulary
+  (a profile names a series) and are the API core's
+  (`dataset::shards`); finding and measuring a series' files on disk
+  (`discover_shards`, `observe_series`) is vectordata's for now and
+  moves to veks-io in step 3. Nothing about the naming changed.
+- **`CatalogEntry::apply_overlay` returns its contradictions**; the API
+  does not log, vectordata warns once per dataset and key as before.
+- **AC-2's guard lists what is not a contract**: `DatasetConfigIo` and
+  `ElementTypeExt` (extension traits: one implementation, methods on an
+  API type) and veks-io's `OpenSource` (its constructor protocol,
+  PR-4).
+- **PR-8's lint deny is on in veks-apicore**; nine `unwrap`/`expect`
+  sites in the moved descriptor code were rewritten without them.
+  veks-io takes the deny with its own steps (1–3).
+- **apicore's doc examples on the dataset contracts run against
+  vectordata**, a path-only dev-dependency (stripped on publish). Every
+  contract also has an example implementing it with apicore alone
+  (AC-6).
+
+**Guards** (`crates/veks-apicore/tests/contracts.rs`), each shown
+failing on 7c14023 before it passed:
+- `the_api_core_depends_only_on_its_vocabulary` (AC-1): against
+  7c14023's veks-io, where the contracts lived, it lists `arrow`,
+  `byteorder`, `half`, `libc`, `memmap2`, `ndarray`, `ndarray-npy`,
+  `parquet`, `slabtastic`.
+- `contracts_are_the_api_cores` (AC-2): against 7c14023 it lists
+  `veks-io::VectorReader`, `VvecReader`, `ByteSource`, `AnyElement`,
+  `VecSource`, `VecSink` and vectordata's `TestDataView`,
+  `TestDataViewExt` used by other crates.
+- `hot_path_functions_are_inlinable_across_crates` (PR-2): with
+  `DownloadProgress`'s accessors as they were (no `#[inline]`), it
+  lists each of them.
+
+**PR-10.** The reader bench gained `view` (reads through `Arc<dyn
+TestDataView>`), `stream_write`, `remote_fetch` (a whole facet over
+loopback into a fresh cache) and `remote_cached`, and ran at 7c14023
+(saved as the `step0-before` baseline) and after, pinned to one core.
+Of 39 cases, none is slower after the change once two artifacts are
+set aside, each checked by running the old build (7c14023 with the
+same bench) and the new one alternately:
+
+| Case | Before | After | |
+|---|---|---|---|
+| `random_f32/get` (vectordata / veks-io) | 111.3 / 122.9 ms | 110.6 / 111.0 ms | the direct reader: unchanged and faster |
+| `view/seq_read_into` | 118.0 ms | 117.6 ms | |
+| `view/random_get` | 152.5 ms | 156.2 ms | see below |
+| `view/open` | 10.48 µs | 10.51 µs | |
+| `stream_write/sink_write_record` / `typed_xvec_writer` | 205.7 / 199.4 ms | 192.2 / 199.0 ms | |
+| `remote_fetch/whole_facet` (64 MiB) | 167.0 ms | 165.7 ms | |
+| `remote_cached/seq_read_into` / `random_get` | 5.77 / 17.20 ms | 5.71 / 17.17 ms | |
+| `scalar/u8/as_slice_sum` (veks-io), first bench | 1.232 s | 1.540 s | see below |
+| `scalar/u8/as_slice_sum`, fixed bench, old vs new | 206.9 ms | 206.7 ms | |
+
+- `view/random_get` is 77 % `memmove` of a 512-byte record from a
+  1 GiB mapping read at random (memory latency); the reader's `get` is
+  4 % of samples in both builds, and the profiles have the same shape.
+  Over the same data files, alternating old and new three times gave
+  157.6/154.2/154.4 ms old and 157.6/156.9/157.2 ms new: inside the old
+  build's own spread. The 152.5 ms baseline had read its own copy of
+  the file. No change is attributable to the boundary.
+- `scalar/u8/as_slice_sum/veks-io` was 25 % slower in every run while
+  its `vectordata` twin, the same reader code, was not. The profile is
+  the bench's own loop — load a byte, an indirect call through the
+  `widen` `fn` pointer, branch — 94 % of samples, the reader 0 %; the
+  loop's closing branch now straddled a 64-byte boundary. The case
+  measured an indirect call per element, so its `widen` became an
+  inlined closure; with that bench the old and new builds are equal
+  (206.9 vs 206.7 ms) and every other scalar case is within 0.1 %.
+
+The workspace passes (121 test binaries), clippy reports nothing new in
+the changed files, and `RUSTDOCFLAGS="-D warnings" cargo doc` is clean
+for veks-apicore, vectordata and veks-io.

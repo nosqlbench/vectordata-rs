@@ -26,13 +26,12 @@
 //! - `typed_reader_remote`: scalar `.u8` and uniform `.fvec` over
 //!   HTTP, native + widening + cross-sign overflow.
 //! - `view_round_trip`: `TestDataGroup::load(http_url)` →
-//!   `TestDataView` → readers; `prebuffer_all_with_progress`
-//!   actually downloads every facet.
+//!   `TestDataView` → readers.
 //! - `cache_stats`: `FacetStorage::cache_stats` reports
 //!   valid/total/complete during partial fill.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 mod support;
@@ -48,6 +47,7 @@ use vectordata::{
     io::{open_vec, open_vvec},
 };
 use vectordata::merkle::MerkleRef;
+use vectordata::TestDataViewExt;
 
 use support::testserver::TestServer;
 
@@ -572,21 +572,21 @@ fn view_round_trip_over_http() {
     let view = group.profile("default").expect("default profile must exist");
 
     // Vector facets — read through Arc<dyn VectorReader<T>>
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(base.count(), 50);
     assert_eq!(base.dim(), 8);
     assert_eq!(base.get(0).unwrap()[0], 0.0);
     assert_eq!(base.get(1).unwrap()[0], 100.0);
 
-    let q = view.query_vectors().unwrap();
+    let q = view.query_vectors_as::<f32>().unwrap();
     assert_eq!(q.count(), 5);
 
-    let ni = view.neighbor_indices().unwrap();
+    let ni = view.neighbor_indices_as::<i32>().unwrap();
     assert_eq!(ni.count(), 5);
     assert_eq!(ni.dim(), 10);
     assert_eq!(ni.get(0).unwrap()[3], 3i32);
 
-    let nd = view.neighbor_distances().unwrap();
+    let nd = view.neighbor_distances_as::<f32>().unwrap();
     assert_eq!(nd.count(), 5);
 
     // Distance function attribute round-trips through the layout
@@ -620,43 +620,6 @@ fn view_open_facet_typed_over_http() {
     // covers metadata_content (TypedReader access is exercised
     // separately above through TypedReader::open_url).
     assert!(view.facet_manifest().contains_key("metadata_content"));
-}
-
-/// Pins the deprecated `prebuffer_all_with_progress`, which must keep
-/// working — and keep reporting chunk progress — now that it delegates
-/// to `fetch` (SRD DX-34).
-#[test]
-#[allow(deprecated)]
-fn prebuffer_all_drives_every_facet_complete() {
-    let tmp = make_tmp();
-    make_remote_dataset(tmp.path());
-    let server = TestServer::start(tmp.path()).unwrap();
-    init_test_cache();
-    let group = TestDataGroup::load(&server.base_url()).unwrap();
-    let view = group.profile("default").unwrap();
-
-    let mut facets_seen: Vec<String> = Vec::new();
-    let mut chunks_total = 0u32;
-    view.prebuffer_all_with_progress(vectordata::WholeFacetFallback::Refuse, &mut |facet, p| {
-        if !facets_seen.contains(&facet.to_string()) {
-            facets_seen.push(facet.to_string());
-        }
-        chunks_total += p.total_chunks;
-    }).unwrap();
-
-    // Every standard facet declared in the dataset.yaml must have
-    // been visited.
-    for expected in &["base_vectors", "query_vectors", "neighbor_indices",
-                      "neighbor_distances", "metadata_content"] {
-        assert!(facets_seen.iter().any(|f| f == expected),
-            "prebuffer_all must visit '{expected}' (saw: {facets_seen:?})");
-    }
-    assert!(chunks_total > 0, "at least one chunk must have been processed");
-
-    // After prebuffer_all, opening any facet again must be complete.
-    let base_storage = view.open_facet_storage("base_vectors").unwrap();
-    assert!(base_storage.is_complete(), "base_vectors must be complete after prebuffer_all");
-    assert!(base_storage.is_local(), "fully-prebuffered cached storage must report is_local");
 }
 
 /// dataset.yaml with a `sized` profile that windows base_vectors to
@@ -876,7 +839,7 @@ profiles:
     // FileSystem branch would have path-joined the URL and failed
     // to open.)
     let baseline_conns = server.accepted_connections();
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(base.count(), 1000);
     assert_eq!(base.dim(), 64);
     assert_eq!(base.get(0).unwrap()[0], 0.0);
@@ -1026,7 +989,7 @@ fn prebuffer_via_view_promotes_other_open_readers() {
     let view = group.profile("default").unwrap();
 
     // Open a reader BEFORE precache (early-bound accessor).
-    let base_early = view.base_vectors().unwrap();
+    let base_early = view.base_vectors_as::<f32>().unwrap();
     assert!(!base_early.is_complete(),
         "early reader against remote view should not be complete pre-precache");
 
@@ -1800,7 +1763,7 @@ fn a_uniform_series_reads_over_http() {
 
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
 
     assert_eq!(base.count(), 50, "the count spans the series");
     assert_eq!(base.dim(), 8);
@@ -1832,7 +1795,7 @@ fn an_explicit_series_reads_over_http() {
     init_test_cache();
 
     let group = TestDataGroup::load(&server.base_url()).unwrap();
-    let base = group.profile("default").unwrap().base_vectors().unwrap();
+    let base = group.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(base.count(), 50);
     for i in [0usize, 24, 25, 49] {
         assert_eq!(base.get(i).unwrap()[0], i as f32 * 100.0, "record {i}");
@@ -1994,7 +1957,7 @@ fn assert_only_the_window_is_resident(view: &dyn vectordata::TestDataView) {
         !storage.is_complete() && resident <= total * 2 / 3,
         "precaching the 500-record window fetched {resident} of {total} bytes: the last shard was dragged in"
     );
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(base.count(), 500);
     assert_eq!(base.get(499).unwrap()[0], 499.0 * 100.0);
 }
@@ -2100,7 +2063,7 @@ fn a_facet_byte_range_prebuffers_the_shard_it_lives_in() {
     // Records 1150..1160 sit deep in the last shard, past the chunks
     // that opening the series faulted in to read dim headers.
     storage
-        .prebuffer_range_with_progress(1150 * 36, 1160 * 36, |_| {})
+        .prebuffer_range_with_progress(1150 * 36, 1160 * 36, &mut |_| {})
         .unwrap();
     let after = storage.cache_stats().unwrap();
     assert!(
@@ -2144,7 +2107,7 @@ fn cache_stats_for_a_series_cover_every_shard() {
     assert!(!stats.is_complete, "nothing has been fetched yet");
 
     // Reading everything fills every shard, and the aggregate says so.
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     for i in 0..1200usize {
         assert_eq!(base.get(i).unwrap()[0], i as f32 * 100.0, "record {i}");
     }
@@ -2172,7 +2135,7 @@ fn a_series_reads_correctly_on_a_range_less_server() {
 
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
 
     assert_eq!(base.count(), 50);
     for i in 0..50usize {
@@ -2200,7 +2163,7 @@ fn a_missing_shard_over_http_is_named() {
 
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
-    let err = match view.base_vectors() {
+    let err = match view.base_vectors_as::<f32>() {
         Ok(r) => panic!(
             "a series with a missing shard must not open; it reported {} records",
             r.count()
@@ -2251,7 +2214,7 @@ fn precaching_a_series_downloads_every_shard() {
     assert_eq!(stats.content_size, 3 * 400 * 36);
 
     // And the data reads without touching the network again.
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     for i in [0usize, 399, 400, 800, 1199] {
         assert_eq!(base.get(i).unwrap()[0], i as f32 * 100.0, "record {i}");
     }
@@ -2840,7 +2803,7 @@ profiles:
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     let _ = base.get(0).unwrap();
     let stats = view.open_facet_storage("base_vectors").unwrap().cache_stats().unwrap();
     assert!(stats.total_chunks >= 3, "fixture spans {} chunks", stats.total_chunks);
@@ -2876,7 +2839,7 @@ profiles:
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
-    let refused = match view.metadata_results() {
+    let refused = match view.metadata_results_as::<i32>() {
         Ok(_) => panic!("opening must not walk the remote file"),
         Err(e) => e.to_string(),
     };
@@ -2896,7 +2859,7 @@ profiles:
         &mut vectordata::fetch::Silent,
     )
     .unwrap();
-    let results = view.metadata_results().expect("opens locally once fetched");
+    let results = view.metadata_results_as::<i32>().expect("opens locally once fetched");
     assert_eq!(results.count(), 20_000);
     let r7 = results.get(7).unwrap();
     assert_eq!(r7, vec![700, 701, 702]);

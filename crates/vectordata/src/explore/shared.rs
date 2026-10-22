@@ -247,7 +247,7 @@ impl ChunkGeometry {
 pub(super) struct AnyDatasetReader {
     view: std::sync::Arc<dyn crate::TestDataView>,
     base: std::sync::Arc<dyn crate::VectorReader<f32>>,
-    facet_storage: Option<crate::FacetStorage>,
+    facet_storage: Option<Box<dyn crate::FacetBytes>>,
     dim: usize,
     count: usize,
     /// Bytes per record in the underlying file (dim header + payload).
@@ -319,7 +319,7 @@ impl AnyDatasetReader {
     /// range. No-op when there is no storage handle.
     pub(super) fn prefetch_byte_range(&self, byte_start: u64, byte_end: u64) -> std::io::Result<()> {
         match &self.facet_storage {
-            Some(fs) => fs.prebuffer_range_with_progress(byte_start, byte_end, |_| {}),
+            Some(fs) => fs.prebuffer_range_with_progress(byte_start, byte_end, &mut |_| {}),
             None => Ok(()),
         }
     }

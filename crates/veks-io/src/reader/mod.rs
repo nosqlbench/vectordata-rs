@@ -21,8 +21,6 @@
 //! [`ByteSource`]: crate::source::ByteSource
 //! [`MappedFile`]: crate::source::MappedFile
 
-use std::io;
-
 use veks_datatypes::{Container, Element, ElementConversion, ElementType};
 
 mod any;
@@ -30,7 +28,11 @@ mod scalar;
 mod vvec;
 mod xvec;
 
-pub use any::{AnyElement, AnyVectorReader, AnyVvecReader, ConvertingReader};
+pub use veks_apicore::reader::{
+    AnyElement, AnyVectorReader, AnyVvecReader, ConvertingReader, DIM_UNDEFINED, IoError, VectorReader, VvecReader,
+    records_to_read,
+};
+pub(crate) use veks_apicore::reader::decode_vec;
 pub use any::{open_vec, open_vec_as, open_vec_as_with, open_vec_native, open_vec_native_with, open_vec_with};
 pub use any::{open_vvec, open_vvec_untyped, open_vvec_untyped_with, open_vvec_with};
 pub use scalar::ScalarReader;
@@ -38,223 +40,6 @@ pub use vvec::{IndexedVvecReader, load_offsets, remove_vvec_index};
 pub(crate) use vvec::write_offset_index;
 pub use xvec::{StreamReclaim, XvecReader};
 
-/// The dimension a uniform reader reports for an empty file: there is
-/// no record to read it from. Check `count() > 0` before relying on
-/// `dim()`.
-pub const DIM_UNDEFINED: usize = usize::MAX;
-
-/// What went wrong opening or reading a file.
-#[derive(thiserror::Error, Debug)]
-#[non_exhaustive]
-pub enum IoError {
-    /// The file holds one element type and the reader was asked for
-    /// another. A reader never reinterprets; see
-    /// [`ElementType::conversion_to`] for what converts.
-    #[error("the file holds {file} elements and cannot be read as {requested}: {reason}")]
-    ElementMismatch {
-        /// The element type the file holds, by its extension.
-        file: ElementType,
-        /// The element type the reader was asked for.
-        requested: ElementType,
-        /// Why not, in a few words.
-        reason: &'static str,
-    },
-    /// A value of the file's type does not fit the requested type,
-    /// under a conversion that checks each value.
-    #[error("value {value} at ordinal {index} does not fit in {target}")]
-    ValueOverflow {
-        /// The ordinal of the value, in the reader's own numbering.
-        index: usize,
-        /// The value as the file holds it.
-        value: veks_datatypes::Value,
-        /// The type it was asked to become.
-        target: ElementType,
-    },
-    /// An I/O error from the file or its source.
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-    /// An error from the transport a remote source fetches through.
-    #[error("transport error: {0}")]
-    Transport(Box<dyn std::error::Error + Send + Sync>),
-    /// The bytes are not a file of the expected layout.
-    #[error("Invalid format: {0}")]
-    InvalidFormat(String),
-    /// A record index at or past the end.
-    #[error("Index out of bounds: {0}")]
-    OutOfBounds(usize),
-    /// The records are not all one length, so a uniform reader cannot
-    /// address them. Read the file with [`IndexedVvecReader`].
-    #[error("Variable-length records: {0}")]
-    VariableLengthRecords(String),
-    /// A remote variable-length file has no published offset index,
-    /// and the only other way to find its record boundaries is to read
-    /// every byte of it.
-    ///
-    /// Opening a reader never does that implicitly: a whole-file
-    /// download behind a constructor is the trap this refusal replaces.
-    /// Fetch the file first, and the reader then rebuilds the index
-    /// from the local copy; or publish the `IDXFOR__` sidecar beside it.
-    #[error(
-        "no published offset index for {url}; finding its record boundaries means \
-         downloading the whole file ({bytes} bytes). Fetch it first \
-         (TestDataView::fetch, or `vectordata datasets precache`) or publish its \
-         IDXFOR__ sidecar"
-    )]
-    OffsetIndexUnavailable {
-        /// The file.
-        url: String,
-        /// Its size: what fetching it costs.
-        bytes: u64,
-    },
-}
-
-/// Random access to a uniform-stride file, or anything that reads like
-/// one: every record has [`dim`](Self::dim) elements of `T`.
-///
-/// Implementations may read a local mapping, a cache that fills as it
-/// is read, or a remote file; a consumer does not need to know which.
-pub trait VectorReader<T>: Send + Sync {
-    /// Elements per record.
-    fn dim(&self) -> usize;
-    /// Records available.
-    fn count(&self) -> usize;
-    /// The record at `index`, copied.
-    fn get(&self, index: usize) -> Result<Vec<T>, IoError>;
-
-    /// The record at `index` borrowed, with no copy. `None` when the
-    /// bytes are not mapped (a remote file not yet fetched), when they
-    /// are not aligned for `T`, or when the reader converts.
-    fn get_slice(&self, _index: usize) -> Option<&[T]> {
-        None
-    }
-
-    /// Copy consecutive records `start, start + 1, …` into `out`,
-    /// contiguously — record `start + k` lands at
-    /// `out[k * dim .. (k + 1) * dim]` — and return how many were copied:
-    /// as many as fit, up to the end.
-    ///
-    /// **The bulk read.** One call per batch instead of one per record:
-    /// one file reads the whole span in one request (or one copy from
-    /// its mapping), and a series or a window is split across files
-    /// here rather than by the caller. Use it to load a base set, or to
-    /// stream one a window at a time into a buffer you reuse.
-    ///
-    /// `out.len()` must be a multiple of [`dim`](Self::dim). `start ==
-    /// count()` copies nothing; past that is [`IoError::OutOfBounds`].
-    ///
-    /// Three `i16` records in an `.svecs` file; a buffer for two reads
-    /// records 1 and 2 in one copy, and from the last record only what
-    /// remains:
-    ///
-    /// ```
-    /// use veks_io::{IoError, VectorReader, XvecReader};
-    /// # use std::io::Write;
-    /// # let dir = tempfile::tempdir().unwrap();
-    /// # let path = dir.path().join("short.svecs");
-    /// # let mut f = std::fs::File::create(&path).unwrap();
-    /// # for row in [[1i16, -1], [200, -200], [i16::MAX, i16::MIN]] {
-    /// #     f.write_all(&2i32.to_le_bytes()).unwrap();
-    /// #     for v in row { f.write_all(&v.to_le_bytes()).unwrap(); }
-    /// # }
-    /// # drop(f);
-    /// let short = XvecReader::<i16>::open_path(&path).unwrap();
-    /// let mut out = vec![0i16; short.dim() * 2];
-    /// assert_eq!(short.read_into(1, &mut out).unwrap(), 2);
-    /// assert_eq!(out, [200, -200, i16::MAX, i16::MIN]);
-    /// assert_eq!(short.read_into(2, &mut out).unwrap(), 1); // only one record remains
-    /// assert_eq!(&out[..2], &[i16::MAX, i16::MIN]);
-    /// assert!(matches!(short.read_into(4, &mut out), Err(IoError::OutOfBounds(4))));
-    /// ```
-    fn read_into(&self, start: usize, out: &mut [T]) -> Result<usize, IoError>
-    where
-        T: Copy,
-    {
-        let dim = self.dim();
-        let n = records_to_read(start, out.len(), dim, self.count())?;
-        for (k, record) in out[..n * dim].chunks_exact_mut(dim).enumerate() {
-            match self.get_slice(start + k) {
-                Some(s) => record.copy_from_slice(s),
-                None => record.copy_from_slice(&self.get(start + k)?),
-            }
-        }
-        Ok(n)
-    }
-
-    /// Bring the whole file here, so later reads are zero-copy. A no-op
-    /// for a local file. Idempotent.
-    fn precache(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    /// Whether every byte is here, so no read makes a request.
-    fn is_complete(&self) -> bool {
-        true
-    }
-
-    /// Every element of every record, contiguous, borrowed: `count() *
-    /// dim()` elements with no copy.
-    ///
-    /// `Some` only for a header-free column in one mapped file
-    /// ([`ScalarReader`]), or a window over one. `None` for xvec files,
-    /// whose record headers interleave the elements; for a series; for
-    /// bytes not mapped; and for a converting reader, which has nothing
-    /// of `T` to borrow.
-    fn as_slice(&self) -> Option<&[T]> {
-        None
-    }
-
-    /// How values reach `T`: [`Native`](ElementConversion::Native)
-    /// unless this reader converts them from the file's own type.
-    fn conversion(&self) -> ElementConversion {
-        ElementConversion::Native
-    }
-
-    /// The element type the file holds, when the reader knows it.
-    fn native_element_type(&self) -> Option<ElementType> {
-        None
-    }
-}
-
-/// Random access to a file whose records vary in length.
-pub trait VvecReader<T: Element>: Send + Sync {
-    /// Records in the file.
-    fn count(&self) -> usize;
-    /// Elements in record `index`.
-    fn dim_at(&self, index: usize) -> Result<usize, IoError>;
-    /// Record `index`'s elements as raw little-endian bytes, without
-    /// the dimension header.
-    fn get_bytes(&self, index: usize) -> Result<Vec<u8>, IoError>;
-    /// Record `index` as elements.
-    fn get(&self, index: usize) -> Result<Vec<T>, IoError> {
-        let bytes = self.get_bytes(index)?;
-        Ok(decode_vec(&bytes))
-    }
-    /// See [`VectorReader::precache`].
-    fn precache(&self) -> io::Result<()> {
-        Ok(())
-    }
-    /// See [`VectorReader::is_complete`].
-    fn is_complete(&self) -> bool {
-        true
-    }
-}
-
-/// How many records a [`VectorReader::read_into`] call copies: as many
-/// whole records as `out_len` holds, up to the end.
-pub fn records_to_read(start: usize, out_len: usize, dim: usize, count: usize) -> Result<usize, IoError> {
-    if dim == 0 {
-        return Ok(0);
-    }
-    if !out_len.is_multiple_of(dim) {
-        return Err(IoError::InvalidFormat(format!(
-            "read_into: buffer of {out_len} elements is not a whole number of {dim}-element records"
-        )));
-    }
-    if start > count {
-        return Err(IoError::OutOfBounds(start));
-    }
-    Ok((out_len / dim).min(count - start))
-}
 
 /// The bytes of one record of a uniform vector file whose first header
 /// says `dim`, for elements of `elem`: the 4-byte header and `dim`
@@ -373,26 +158,6 @@ pub(crate) fn copy_elements<T: Element>(bytes: &[u8], out: &mut [T]) {
     }
 }
 
-/// The elements `bytes` encodes, as a new `Vec`: one allocation and,
-/// on a little-endian host, one copy. Never a loop the compiler must
-/// inline to make fast (the IO-4 measurement of an out-of-line
-/// per-element decode: 2.4× slower).
-#[inline]
-pub(crate) fn decode_vec<T: Element>(bytes: &[u8]) -> Vec<T> {
-    let n = bytes.len() / T::SIZE;
-    let mut out = Vec::<T>::with_capacity(n);
-    #[cfg(target_endian = "little")]
-    // SAFETY: the capacity is `n` elements, `n * T::SIZE` bytes are
-    // copied into it, and every bit pattern of those bytes is a valid
-    // `T` (every `Element` is a plain number).
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, n * T::SIZE);
-        out.set_len(n);
-    }
-    #[cfg(not(target_endian = "little"))]
-    out.extend(bytes.chunks_exact(T::SIZE).map(T::from_le_bytes));
-    out
-}
 
 /// Copy `n` xvec records out of `bytes` — each a 4-byte dimension header
 /// followed by `dim` little-endian elements, `entry_size` bytes apart —
@@ -403,11 +168,6 @@ pub(crate) fn copy_records<T: Element>(bytes: &[u8], entry_size: usize, dim: usi
         let src = &bytes[k * entry_size + 4..k * entry_size + 4 + body];
         copy_elements(src, record);
     }
-}
-
-/// A zero of `T`, for a scratch buffer.
-pub(crate) fn zero<T: Element>() -> T {
-    T::from_value(veks_datatypes::Value::Int(0)).expect("every element type holds zero")
 }
 
 /// How an extension decides whether a file's first four bytes are a

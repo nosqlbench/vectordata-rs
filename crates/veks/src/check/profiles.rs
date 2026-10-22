@@ -319,7 +319,6 @@ fn check_ground_truth(
     failures: &mut Vec<String>,
     sink: &mut dyn super::progress::ScanSink,
 ) {
-    use vectordata::TestDataViewExt;
     let group = match vectordata::TestDataGroup::load(&ds_dir.to_string_lossy()) {
         Ok(g) => g,
         Err(e) => {

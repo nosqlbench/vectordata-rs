@@ -95,6 +95,7 @@ members = [
     "crates/slabtastic",
     "crates/veks-io",
     "crates/veks-datatypes",
+    "crates/veks-apicore",
     "crates/tools",
     "crates/veks-studies",
 ]
@@ -130,6 +131,7 @@ default-members = [
     "crates/slabtastic",
     "crates/veks-io",
     "crates/veks-datatypes",
+    "crates/veks-apicore",
     "crates/tools",
 ]
 resolver = "3"

@@ -319,8 +319,7 @@ pub fn describe_spec(spec: &str) -> String {
     let spec = spec.trim();
     if let Some(rest) = spec.strip_prefix("mul:") {
         if let Some((range, factor)) = rest.split_once('/') {
-            if range.contains("..") {
-                let (start, end) = range.split_once("..").unwrap();
+            if let Some((start, end)) = range.split_once("..") {
                 format!("geometric series from {} to {}, multiplying by {} each step", start.trim(), end.trim(), factor.trim())
             } else {
                 format!("geometric series from {}, multiplying by {} each step, up to dataset size", range.trim(), factor.trim())

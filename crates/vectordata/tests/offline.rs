@@ -4,8 +4,8 @@
 //! A fetched dataset opens and reads with no network, and a changed
 //! upstream is still caught where the network is meant to be used.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 mod support;
@@ -16,6 +16,7 @@ use std::sync::LazyLock;
 use support::fixtures::{fvec_value, write_catalogs, write_fvec, write_ivvec, write_mref};
 use support::testserver::TestServer;
 use vectordata::TestDataGroup;
+use vectordata::TestDataViewExt;
 use vectordata::fetch::{FetchRequest, Silent};
 
 static TEST_CACHE_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
@@ -125,12 +126,12 @@ fn read_offline_in_a_child() {
     let group = TestDataGroup::load(&url).expect("the kept dataset.yaml opens it offline");
     let view = group.profile("default").unwrap();
 
-    let base = view.base_vectors().expect("complete merkle data opens offline");
+    let base = view.base_vectors_as::<f32>().expect("complete merkle data opens offline");
     assert_eq!(base.get(1999).unwrap()[7], fvec_value(seed, 8, 1999, 7));
     assert!(base.get_slice(0).is_some(), "mapped");
-    let query = view.query_vectors().expect("complete chunk-store data opens offline");
+    let query = view.query_vectors_as::<f32>().expect("complete chunk-store data opens offline");
     assert_eq!(query.get(49).unwrap()[0], fvec_value(seed + 0.5, 8, 49, 0));
-    let results = view.metadata_results().expect("the kept offset index opens offline");
+    let results = view.metadata_results_as::<i32>().expect("the kept offset index opens offline");
     assert_eq!(results.get(299).unwrap(), vec![seed as i32 + 299]);
     let labels: vectordata::TypedReader<u8> =
         vectordata::open_facet_typed(&*view, "metadata_content").unwrap();
@@ -164,7 +165,7 @@ fn a_changed_upstream_is_stale_at_fetch_time() {
 
     let group = TestDataGroup::load(&url).unwrap();
     let view = group.profile("default").unwrap();
-    let base = view.base_vectors().expect("the complete copy opens as cached");
+    let base = view.base_vectors_as::<f32>().expect("the complete copy opens as cached");
     assert_eq!(base.get(0).unwrap()[0], fvec_value(4.0e7, 8, 0, 0), "serving the verified copy");
     let err = view
         .fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent)
@@ -240,13 +241,13 @@ fn read_strictly_offline_in_a_child() {
     );
     assert!(catalog.diagnostics().is_empty(), "the kept catalog copy loads: {:?}", catalog.diagnostics());
     let view = catalog.open_profile("strict", "default").expect("the dataset opens by name");
-    assert_eq!(view.base_vectors().unwrap().get(5).unwrap()[0], fvec_value(seed, 8, 5, 0));
-    assert_eq!(view.metadata_results().unwrap().get(7).unwrap(), vec![seed as i32 + 7]);
+    assert_eq!(view.base_vectors_as::<f32>().unwrap().get(5).unwrap()[0], fvec_value(seed, 8, 5, 0));
+    assert_eq!(view.metadata_results_as::<i32>().unwrap().get(7).unwrap(), vec![seed as i32 + 7]);
     let labels: vectordata::TypedReader<u8> =
         vectordata::open_facet_typed(&*view, "metadata_content").unwrap();
     assert_eq!(labels.get_native(9).unwrap(), 9);
 
-    let refused = match view.query_vectors() {
+    let refused = match view.query_vectors_as::<f32>() {
         Ok(_) => panic!("a facet never fetched cannot be read offline"),
         Err(e) => e.to_string(),
     };
@@ -318,7 +319,7 @@ fn a_dataset_opened_by_its_yaml_url_opens_with_the_server_gone() {
     drop(server);
 
     let group = TestDataGroup::load(&url).expect("the kept dataset.yaml opens it");
-    let base = group.profile("default").unwrap().base_vectors().unwrap();
+    let base = group.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(base.get(1234).unwrap()[3], fvec_value(9.0e7, 8, 1234, 3));
 }
 
@@ -352,7 +353,7 @@ fn a_knn_entries_dataset_opens_with_the_server_gone() {
     drop(server);
 
     let group = TestDataGroup::load(&url).expect("the kept knn_entries.yaml opens it");
-    let base = group.profile("default").unwrap().base_vectors().unwrap();
+    let base = group.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(base.get(499).unwrap()[0], fvec_value(1.1e8, 8, 499, 0));
 }
 
@@ -440,7 +441,7 @@ fn read_partially_offline_in_a_child() {
     vectordata::settings::override_cache_dir_for_process(cache.into());
 
     let group = TestDataGroup::load(&url).expect("the kept dataset.yaml opens it offline");
-    let base = group.profile("default").unwrap().base_vectors().expect("a partial copy opens offline");
+    let base = group.profile("default").unwrap().base_vectors_as::<f32>().expect("a partial copy opens offline");
     assert!(!vectordata::VectorReader::is_complete(&*base));
     assert_eq!(base.get(42).unwrap()[5], fvec_value(seed, 8, 42, 5));
     let started = std::time::Instant::now();
@@ -491,7 +492,7 @@ fn a_hanging_server_falls_back_to_the_kept_copy_in_seconds() {
     let group = TestDataGroup::load(&url).expect("the kept copy, once the connection times out");
     let waited = started.elapsed();
     assert!(waited < std::time::Duration::from_secs(30), "waited {waited:?}");
-    let base = group.profile("default").unwrap().base_vectors().unwrap();
+    let base = group.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(base.get(7).unwrap()[1], fvec_value(1.5e8, 8, 7, 1));
 }
 

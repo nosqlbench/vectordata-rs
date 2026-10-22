@@ -13,6 +13,22 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
 
 ### Highlights
 
+- **`veks-apicore`: the API, as a crate of its own.** The contracts the
+  crates speak through — `TestDataView` and `TestDataViewExt`,
+  `CatalogSource`, `ByteSource`, `VectorReader` and `VvecReader`, the
+  streaming `VecSource`/`VecSink`, `FacetBytes`, `RecordContainer`,
+  `FetchProgress`, `ProgressSink` — and every type they name (the
+  dataset descriptor model, `Location`, fetch plans and reports,
+  verification reports, `Error`, `IoError`) are defined there, with no
+  implementation. vectordata and veks-io implement it and re-export
+  it at every path they had, so `vectordata::TestDataView`,
+  `vectordata::dataset::DatasetConfig` and `veks_io::VectorReader` are
+  unchanged. A program that needs only the contracts, or a second
+  implementation (a test double, its own byte source), depends on
+  `veks-apicore` alone; each contract has an example that implements
+  it with nothing else. Reads cost what they did: readers stay generic
+  over their source, and what a hot path calls across the boundary
+  inlines (`docs/design/srd-crate-boundaries.md` §4).
 - **veks-io's readers take any byte source.** `XvecReader<T, S>`,
   `IndexedVvecReader<T, S>`, `ScalarReader<T, S>` and `StreamReclaim`
   are generic over a `ByteSource`, defaulting to `MappedFile`, a local
@@ -95,6 +111,45 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
 
 ### Breaking
 
+- **`TestDataView` is defined without its deprecated methods.** Each
+  has had its replacement since 4.0.0 or 2.5.0:
+
+  | Removed | Use |
+  |---|---|
+  | `base_vectors()`, `query_vectors()` | `base_vectors_as::<f32>()`, `query_vectors_as::<f32>()` |
+  | `neighbor_indices()`, `neighbor_distances()` | `neighbor_indices_as::<i32>()`, `neighbor_distances_as::<f32>()` |
+  | `prefiltered_*()`, `postfiltered_*()` | `prefiltered_*_as::<T>()`, `postfiltered_*_as::<T>()` |
+  | `metadata_results()` | `metadata_results_as::<i32>()` |
+  | `facet(name)` | `facet_as::<f32>(name)` |
+  | `prebuffer_all()`, `prebuffer_all_with_progress(..)` | `fetch(&FetchRequest::all(), &mut sink)` |
+  | `prefetch(..)`, `prefetch_with_progress(..)` | `fetch(&FetchRequest::facets([f]).window(w), &mut sink)` |
+
+  The `*_as` readers are `TestDataViewExt`'s: `use vectordata::TestDataViewExt`.
+- `vectordata::Error::Http(reqwest::Error)` is
+  `Error::Transport(TransportError)`: the URL, the HTTP status when the
+  server answered, and whether a retry could succeed. No reqwest type
+  is in the API.
+- `TestDataView::open_facet_storage` returns `Box<dyn FacetBytes>`, the
+  API's contract for a facet's bytes; vectordata's `FacetStorage`
+  behind it is reached with `as_any().downcast_ref::<FacetStorage>()`.
+  `content_id_with_progress` and `verify_cached` take a `&mut dyn
+  ProgressSink` (`|label, done, total|`); `prebuffer_with_progress`,
+  `prebuffer_range_with_progress` and the other prebuffer forms take
+  `&mut dyn FnMut(&DownloadProgress)` through it.
+- `verify`, `verify_report` and `normalization` are `TestDataView`'s
+  (they were `TestDataViewExt`'s); a view implements `verify_report`
+  and `normalization`. `vectordata::verify::VerifyProgress` is the
+  API's `ProgressSink`.
+- `ByteSource` has no constructors and no `Progress` type: opening a
+  source is veks-io's `OpenSource` (`open`, `open_path`), which the
+  readers' `open` functions take; `prebuffer_with_progress` reports a
+  `DownloadProgress`.
+- `DatasetConfig::load_from` (a URL) and
+  `DatasetConfig::reconcile_shard_declarations` (the files on disk) are
+  `vectordata::dataset::DatasetConfigIo`'s: `use` it to call them.
+  Loading and saving a local `dataset.yaml` are unchanged.
+- `CatalogEntry::apply_overlay` returns what it found contradicted
+  instead of warning; vectordata warns as before.
 - `vectordata::io::IoError::Http(reqwest::Error)` is
   `IoError::Transport(Box<dyn Error + Send + Sync>)`: the error type
   is veks-io's, which has no HTTP client.

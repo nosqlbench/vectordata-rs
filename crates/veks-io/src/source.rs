@@ -1,7 +1,8 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Where a reader's bytes come from: [`ByteSource`], and
+//! Where a reader's bytes come from: the [`ByteSource`] contract
+//! (veks-apicore's), [`OpenSource`] for a source opened by name, and
 //! [`MappedFile`], the source for a local file.
 //!
 //! Every reader in [`crate::reader`] is generic over its source, so the
@@ -26,108 +27,19 @@ use memmap2::Mmap;
 
 use crate::reader::IoError;
 
-/// One file of a source that is a series of files: where it is
-/// mapped, when it is, and how many bytes it holds.
-#[derive(Debug, Clone, Copy)]
-pub struct SourcePart {
-    /// The part's mapped base address, `None` when it is not mapped.
-    pub base: Option<*const u8>,
-    /// The part's size in bytes.
-    pub size: u64,
-}
+pub use veks_apicore::source::{ByteSource, SourcePart};
 
-// SAFETY: the address is only ever dereferenced by a reader that also
-// holds the source owning the mapping, for as long as it holds it.
-unsafe impl Send for SourcePart {}
-// SAFETY: as above; the mapping is read-only.
-unsafe impl Sync for SourcePart {}
-
-/// The bytes of one file, as a reader asks for them.
-///
-/// A source is cheap to clone (it shares what it holds), and once it
-/// answers [`mmap_base`](Self::mmap_base) with `Some`, it answers with
-/// the same address for as long as it lives: a reader may keep it.
-pub trait ByteSource: Clone + Send + Sync + fmt::Debug + 'static {
-    /// What [`prebuffer_with_progress`](Self::prebuffer_with_progress)
-    /// reports as the source fills itself.
-    type Progress;
-
+/// A source that can be opened by name: what the readers' `open`
+/// functions take. Opening is an implementation's, so it is veks-io's
+/// trait, not the contract's: [`MappedFile`] opens a local path, and
+/// `vectordata`'s source opens a path, a URL or a cached facet.
+pub trait OpenSource: ByteSource {
     /// Open the file `source` names: a path, or whatever else this
     /// source can reach.
     fn open(source: &str) -> Result<Self, IoError>;
 
     /// Open a local file.
     fn open_path(path: &Path) -> Result<Self, IoError>;
-
-    /// The file's size in bytes.
-    fn total_size(&self) -> u64;
-
-    /// `len` bytes at `offset`, fetched if they are not here.
-    fn read_bytes(&self, offset: u64, len: u64) -> io::Result<Vec<u8>>;
-
-    /// `len` bytes at `offset`, borrowed, when they are mapped. `None`
-    /// sends the caller to [`read_bytes`](Self::read_bytes).
-    fn mmap_slice(&self, offset: u64, len: u64) -> Option<&[u8]>;
-
-    /// The whole file's mapped base address, when it is one mapping.
-    fn mmap_base(&self) -> Option<*const u8>;
-
-    /// The files of a series, in order. Empty for one file.
-    fn parts(&self) -> Vec<SourcePart> {
-        Vec::new()
-    }
-
-    /// The local file holding the bytes, when there is one: the file
-    /// itself, or a cache copy of a remote one.
-    fn local_path(&self) -> Option<PathBuf> {
-        None
-    }
-
-    /// Whether the bytes live somewhere else and `local_path` is a
-    /// copy of them. A copy's mtime changes as it fills, so it says
-    /// nothing about whether a sidecar beside it is stale.
-    fn is_remote(&self) -> bool {
-        false
-    }
-
-    /// Whether every byte is here, so no read makes a request.
-    fn is_complete(&self) -> bool {
-        true
-    }
-
-    /// Bring every byte here. A no-op for a local file.
-    fn precache(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    /// [`precache`](Self::precache), reporting progress.
-    fn prebuffer_with_progress(&self, _cb: &mut dyn FnMut(&Self::Progress)) -> io::Result<()> {
-        self.precache()
-    }
-
-    /// The bytes of `name`, a file published beside `data_source`
-    /// (an `IDXFOR__` offset index), or `None` when there is none or
-    /// it cannot be asked for. A local source has nothing to fetch:
-    /// its sidecars are read from beside [`local_path`](Self::local_path).
-    fn fetch_sibling(&self, _data_source: &str, _name: &str) -> Option<Vec<u8>> {
-        None
-    }
-
-    /// Hint a front-to-back read of the whole file.
-    fn advise_sequential(&self) {}
-
-    /// Hint reads in no order.
-    fn advise_random(&self) {}
-
-    /// Hint that `start..end` will be read soon; does not wait.
-    fn prefetch_range_bytes(&self, _start: u64, _end: u64) {}
-
-    /// Let the pages of `start..end` go; they read back in on demand.
-    fn release_range_bytes(&self, _start: u64, _end: u64) {}
-
-    /// Page `start..end` in and wait, adding the bytes touched to
-    /// `paged`.
-    fn prefetch_pages_bytes(&self, _start: u64, _end: u64, _paged: Option<&AtomicU64>) {}
 }
 
 /// A local file, memory-mapped: the source of the readers a program
@@ -160,9 +72,7 @@ impl fmt::Debug for MappedFile {
     }
 }
 
-impl ByteSource for MappedFile {
-    type Progress = ();
-
+impl OpenSource for MappedFile {
     fn open(source: &str) -> Result<Self, IoError> {
         Self::open_path(Path::new(source))
     }
@@ -170,7 +80,9 @@ impl ByteSource for MappedFile {
     fn open_path(path: &Path) -> Result<Self, IoError> {
         Ok(Self::map(path)?)
     }
+}
 
+impl ByteSource for MappedFile {
     fn total_size(&self) -> u64 {
         self.mmap.len() as u64
     }

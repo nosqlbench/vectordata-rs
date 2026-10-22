@@ -12,7 +12,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use veks_datatypes::Element;
 
 use super::{IoError, VvecReader, ext_of, is_vvec_ext, require_native};
-use crate::source::{ByteSource, MappedFile};
+use crate::source::{ByteSource, MappedFile, OpenSource};
 
 /// A file whose records vary in length: each a little-endian `i32`
 /// dimension and that many elements of `T`. Random access goes through
@@ -56,14 +56,20 @@ impl<T, S: ByteSource> std::fmt::Debug for IndexedVvecReader<T, S> {
 
 impl<T: Element, S: ByteSource> IndexedVvecReader<T, S> {
     /// Open a local variable-length file whose extension names `T`.
-    pub fn open_path(path: &Path) -> Result<Self, IoError> {
+    pub fn open_path(path: &Path) -> Result<Self, IoError>
+    where
+        S: OpenSource,
+    {
         let name = path.to_string_lossy();
         Self::validate_source(&name)?;
         Self::from_source(S::open_path(path)?, &name)
     }
 
     /// Open the variable-length file `source` names.
-    pub fn open(source: &str) -> Result<Self, IoError> {
+    pub fn open(source: &str) -> Result<Self, IoError>
+    where
+        S: OpenSource,
+    {
         Self::validate_source(source)?;
         Self::from_source(S::open(source)?, source)
     }

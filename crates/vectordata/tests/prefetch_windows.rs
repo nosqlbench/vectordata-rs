@@ -10,12 +10,13 @@
 //! the ad-hoc path exists, resolves to the same bytes the profile path
 //! would, and reports its cost before spending it.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 use std::io::Write;
 use vectordata::WholeFacetFallback;
+use vectordata::TestDataViewExt;
 use vectordata::fetch::{FetchEvent, FetchRequest};
 use vectordata::dataset::source::parse_window;
 
@@ -565,7 +566,7 @@ fn dropping_the_handle_detaches_without_blocking() {
         // Dropped here without joining.
     }
     // The view is still usable and the facet still reads correctly.
-    let reader = view.base_vectors().unwrap();
+    let reader = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(reader.count(), 100);
 }
 
@@ -1227,7 +1228,7 @@ fn reading_a_prefetched_window_fetches_nothing_further() {
         .unwrap_or(0);
 
     // Read inside the prefetched window.
-    let reader = view.base_vectors().unwrap();
+    let reader = view.base_vectors_as::<f32>().unwrap();
     for i in 500..600 {
         let v = reader.get(i).unwrap();
         assert_eq!(v.len(), 16);

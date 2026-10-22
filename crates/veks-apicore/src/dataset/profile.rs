@@ -144,7 +144,7 @@ impl DSView {
 
     /// This view's declaration, realized by the **same** code the
     /// `dataset.yaml` loader uses (SH-90).
-    pub(crate) fn declaration<'a>(
+    pub fn declaration<'a>(
         &self,
         sources: &'a [String],
     ) -> crate::dataset::shards::Declaration<'a> {
@@ -164,7 +164,7 @@ impl DSView {
     /// **one** implementation rather than two that can drift (SH-90).
     /// `Display` and `parse_source_string` are inverses, which is what
     /// makes that safe.
-    pub(crate) fn declaration_sources(&self) -> Vec<String> {
+    pub fn declaration_sources(&self) -> Vec<String> {
         self.sources().iter().map(|s| s.to_string()).collect()
     }
 }
@@ -513,8 +513,9 @@ impl DSProfileGroup {
                 "size".to_string(),
                 size_tag.unwrap_or_else(|| serde_yaml::Value::from(rung.as_str())),
             );
-            {
-                let layer = self.profiles.get_mut(&rung).expect("rung exists");
+            // The rung was read just above; a profile set keyed by it
+            // cannot have lost it since.
+            if let Some(layer) = self.profiles.get_mut(&rung) {
                 for f in &moved {
                     if let Some(v) = layer.views.shift_remove(f) {
                         // The set's copies live under its own directory.
@@ -1524,13 +1525,13 @@ impl DSProfileGroup {
     /// is what a save leaves out, so loading and saving cannot drift.
     ///
     /// A child keeps every facet it declares; a missing one comes from
-    /// the parent by [`crossing_view`]'s rule. `maxk` always crosses;
+    /// the parent by `crossing_view`'s rule. `maxk` always crosses;
     /// `base_count` crosses only on a step at one size. A partition has
     /// no parent and keeps only what it declares. A cycle leaves its
     /// members with what they declared, as naming no parent would, and
     /// `veks check` names it.
     ///
-    /// The child's facets come out in [`inherited_order`]: what every
+    /// The child's facets come out in `inherited_order`: what every
     /// profile shares with the default first, then its own, then what a
     /// nearer parent adds. Every projection (`dataset.json`, catalogs,
     /// docs) lists facets in this order, so it is part of what they
@@ -1540,7 +1541,7 @@ impl DSProfileGroup {
     /// profiles are still waiting on variables to be expanded, waits
     /// too: its parent may be one of them, and falling back to
     /// `default` would give it the wrong facets. Expansion resolves it.
-    pub(crate) fn resolve_inheritance(&mut self) {
+    pub fn resolve_inheritance(&mut self) {
         for name in self.inheritance_order() {
             let waits = self.has_deferred()
                 && self.profiles[&name]
@@ -1583,7 +1584,7 @@ impl DSProfileGroup {
     /// catch one that disagrees with itself, through the same code the
     /// `dataset.yaml` loader runs, so a dataset cannot be accepted by one
     /// path and rejected by the other (SH-85, SH-90).
-    pub(crate) fn settle(&mut self) -> Result<(), String> {
+    pub fn settle(&mut self) -> Result<(), String> {
         self.resolve_inheritance();
         for (profile_name, profile) in &self.profiles {
             for (facet_name, view) in &profile.views {

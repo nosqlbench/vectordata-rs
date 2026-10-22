@@ -14,11 +14,12 @@
 //! See `docs/design/srd-multifile-facet-shards.md` (SH-96, SH-98) and
 //! `docs/design/metadata-facets-and-layout-namespace.md`.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 use vectordata::formats::anode::ANode;
+use vectordata::TestDataViewExt;
 use vectordata::formats::anode_vernacular::Vernacular;
 use vectordata::formats::mnode::{MNode, MValue};
 use vectordata::records::{Anode, Serde, Text};
@@ -475,7 +476,7 @@ fn a_facet_reports_which_shape_it_holds() {
     for name in ["base_vectors", "metadata_content"] {
         match view.facet_shape(name).unwrap() {
             FacetShape::Elements => {
-                assert!(view.facet(name).is_ok(), "{name} should open as vectors");
+                assert!(view.facet_as::<f32>(name).is_ok(), "{name} should open as vectors");
             }
             FacetShape::Records => {
                 assert!(
@@ -503,7 +504,7 @@ fn opening_a_record_facet_as_vectors_points_at_the_right_reader() {
     let view = g.profile("default").unwrap();
 
     // Structured, so a caller can branch rather than parse prose.
-    match view.facet("metadata_content") {
+    match view.facet_as::<f32>("metadata_content") {
         Err(vectordata::Error::WrongFacetShape {
             facet,
             shape,

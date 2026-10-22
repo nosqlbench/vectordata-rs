@@ -11,12 +11,13 @@
 //! describing available facets without materializing data.
 
 use crate::dataset::facet::StandardFacet;
-use crate::dataset::source::DSWindow;
 use crate::location::Location;
 use crate::io::IoError;
 use crate::io::{self, Element, VectorReader, VvecReader};
 use crate::model::{FacetConfig, ProfileConfig};
-use crate::{Error, Result};
+use crate::{Error, FacetBytes, Result};
+
+pub use veks_apicore::view::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -38,39 +39,6 @@ fn parse_window_first(s: &str) -> Option<(usize, usize)> {
         return None;
     }
     Some((start, end))
-}
-
-/// Resolve a facet's window bounds from whichever encoding the config
-/// carries, mirroring `open_uniform`: the `[start..end)` suffix on the
-/// source string takes precedence, else the explicit `window:` field.
-///
-/// A malformed window is an error, not an absent window. Conflating
-/// them is what let `base.fvec[0,1000)` fall through to an unbounded
-/// prebuffer and download a whole terabyte in silence.
-fn parse_window_bounds(
-    raw_source: &str,
-    explicit_window: Option<&str>,
-) -> Result<Option<(String, u64, u64)>> {
-    let parsed = crate::dataset::source::parse_source_string(raw_source)
-        .map_err(|e| Error::Other(format!("source '{raw_source}' has a malformed window: {e}")))?;
-    let (path_no_window, win_start, win_end): (String, u64, u64) = if !parsed.window.is_empty() {
-        let iv = &parsed.window.0[0];
-        (parsed.path, iv.min_incl, iv.max_excl)
-    } else if let Some(w) = explicit_window {
-        let dsw = crate::dataset::source::parse_window(w)
-            .map_err(|e| Error::Other(format!("window '{w}' is malformed: {e}")))?;
-        match dsw.0.first() {
-            Some(iv) => (parsed.path, iv.min_incl, iv.max_excl),
-            None => return Ok(None),
-        }
-    } else {
-        return Ok(None);
-    };
-    // Empty intervals no longer parse, so this is belt-and-braces.
-    if win_end <= win_start {
-        return Ok(None);
-    }
-    Ok(Some((path_no_window, win_start, win_end)))
 }
 
 /// The single source of a facet, or an error naming sharding as the
@@ -128,44 +96,6 @@ pub(crate) fn records_in(path: &str, storage: &std::sync::Arc<crate::storage::St
     (bpr > 0).then(|| total / bpr)
 }
 
-/// Map a record range to a byte range, for formats where that mapping
-/// is computable from the file alone.
-///
-/// Split out so the mapping can serve
-/// a window the *caller* named as well as one a profile declared. A
-/// profile window is a convenience — a name for a range someone will
-/// want repeatedly — not the only range anyone is allowed to ask for.
-///
-/// Two mappings, by format:
-///   - **xvec** (uniform stride): `4 + dim × elem_size`, with `dim`
-///     read from the header at byte 0. That read pulls one chunk on
-///     remote storage, which is the same first-chunk read any reader
-///     does on first access.
-///   - **vvec** (variable length): the sibling `IDXFOR__` offset index,
-///     loaded whole. Record `i` begins at `offsets[i]`, so a window is
-///     `offsets[start]` to `offsets[end]` — exact, not approximate.
-///
-/// `None`, meaning "cannot window this", for parquet — whose ordinal
-/// windowing is **excluded by design**, since its row-group structure
-/// has no record-to-byte mapping a caller could predict — and for
-/// unrecognized extensions, a corrupt header, an index that cannot be
-/// loaded, or an empty range.
-///
-/// `None` is not a failure and not a placeholder. It is the answer, and
-/// [`WholeFacetFallback`] decides what a caller does with it.
-/// A record range resolved to bytes, and what resolving it cost.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MappedRange {
-    /// The shard-qualified byte ranges the record window resolved to.
-    ///
-    /// One entry for a single-file facet; one per shard the window
-    /// touches for a series (SH-14, SH-28).
-    pub ranges: Vec<ShardRange>,
-    /// Bytes that had to be read before the mapping could be computed
-    /// at all — the offset index, for variable-length formats. Zero
-    /// where the stride is computable from the header.
-    pub prerequisite_bytes: u64,
-}
 
 /// Map a record range to shard-qualified byte ranges.
 ///
@@ -372,29 +302,6 @@ fn map_in_slab(
     (byte_start < byte_end).then_some((byte_start, byte_end, index.prerequisite_bytes()))
 }
 
-/// The window a facet declares for itself, in facet ordinals: a
-/// `[start..end)` suffix on a single source, else the `window:` field
-/// (which is where a series carries it, having no single source), else
-/// none. This is the window the whole-profile precache honours per
-/// facet, and it comes from the same two encodings the reader consults.
-/// A malformed window is an error, not an absent one.
-pub fn facet_declared_window(desc: &FacetDescriptor) -> Result<DSWindow> {
-    match desc.source_path.as_deref() {
-        Some(src) => Ok(match parse_window_bounds(src, desc.window.as_deref())? {
-            Some((_, start, end)) => DSWindow(vec![crate::dataset::source::DSInterval {
-                min_incl: start,
-                max_excl: end,
-            }]),
-            None => DSWindow(Vec::new()),
-        }),
-        None => match desc.window.as_deref() {
-            Some(w) => crate::dataset::source::parse_window(w)
-                .map_err(|e| Error::Other(format!("window '{w}' is malformed: {e}"))),
-            None => Ok(DSWindow(Vec::new())),
-        },
-    }
-}
-
 /// Reader wrapper that clips access to a sub-range of the underlying
 /// reader. `count()` reports the window length; `get(i)` reads from
 /// `underlying.get(i + start)` and rejects `i >= window length`.
@@ -468,742 +375,6 @@ impl<T: Send + Sync> VectorReader<T> for WindowedVectorReader<T> {
     }
 }
 
-/// Describes a single facet declared in a dataset profile.
-///
-/// Returned by `facet_manifest()` for discover-then-load patterns.
-/// Does not materialize data — just describes what's available.
-#[derive(Debug, Clone)]
-pub struct FacetDescriptor {
-    /// Facet name as declared in dataset.yaml (canonical key).
-    pub name: String,
-    /// Source file path or filename. Retains any `[start..end)`
-    /// sub-ordinal suffix the catalog declared inline.
-    pub source_path: Option<String>,
-    /// Inferred source format type (e.g., "fvec", "ivec", "mvec", "slab").
-    pub source_type: Option<String>,
-    /// Explicit `window:` field from a `Detailed` facet config, when
-    /// present. The suffix form stays embedded in `source_path`;
-    /// consumers that need the effective window must consult both.
-    pub window: Option<String>,
-    /// Matching StandardFacet if this is a recognized standard facet.
-    pub standard_kind: Option<StandardFacet>,
-    /// How many files a sharded facet spans; `None` for a single file.
-    /// A series has no single source path, and a caller that reports
-    /// what opening the facet will cost needs this number without
-    /// realising the series first.
-    pub shard_count: Option<u32>,
-}
-
-impl FacetDescriptor {
-    /// Returns true if this is a recognized standard facet.
-    pub fn is_standard(&self) -> bool {
-        self.standard_kind.is_some()
-    }
-
-    /// Infer the source type from a file extension. Accepts any
-    /// recognized xvec/vvec/scalar extension (including plural forms
-    /// like `fvecs`, `mvecs`) via
-    /// [`crate::typed_access::ElementType::from_extension`], plus the
-    /// container extensions (`slab`, `json`, `parquet`, `npy`, `hdf5`,
-    /// `h5`). The returned string is the lowercase canonical form.
-    fn infer_type(source: &str) -> Option<String> {
-        // Strip the `[start..end)` window suffix and any `:namespace`
-        // before looking at the extension. A window contains dots, so
-        // `base.fvec[0..20)` splits to `20)` and the facet reports no
-        // format at all — which is invisible while the answer is only
-        // shown to a human, and load-bearing the moment anything gates
-        // on it. `facet_element_type` has always done this; the
-        // manifest did not.
-        let path = match crate::dataset::source::parse_source_string(source) {
-            Ok(parsed) => parsed.path,
-            Err(_) => source.to_string(),
-        };
-        let ext = path.rsplit('.').next()?;
-        let lower = ext.to_lowercase();
-        if crate::typed_access::ElementType::from_extension(&lower).is_some() {
-            return Some(lower);
-        }
-        match lower.as_str() {
-            "slab" | "json" | "parquet" | "npy" | "hdf5" | "h5" => Some(lower),
-            _ => None,
-        }
-    }
-}
-
-/// Interface for accessing the components of a dataset profile.
-///
-/// This mirrors the Java `TestDataView` interface. Vector and filtered-neighbor
-/// methods return `VectorReader`s; metadata accessors return the `FacetConfig`
-/// so callers can resolve the underlying resource.
-pub trait TestDataView: Send + Sync {
-    // -- Vector facets --
-
-    /// Returns a reader for the base (database) vectors.
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::base_vectors_as::<f32>()`, which also takes any other element type")]
-    fn base_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>>;
-    /// Returns a reader for the query vectors.
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::query_vectors_as::<f32>()`, which also takes any other element type")]
-    fn query_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>>;
-    /// Returns a reader for the neighbor indices (ground truth).
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::neighbor_indices_as::<i32>()`, which also takes any other element type")]
-    fn neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
-    /// Returns a reader for the neighbor distances (ground truth).
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::neighbor_distances_as::<f32>()`, which also takes any other element type")]
-    fn neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
-
-    // -- Filtered neighbor facets (F / E) --
-
-    /// Returns a reader for the **pre-filter** KNN ground-truth indices (F).
-    /// Top-K of `X_p` by distance; full K when `|X_p| ≥ K`. The legacy
-    /// `filtered_neighbor_indices` YAML key resolves to this facet.
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::prefiltered_neighbor_indices_as::<i32>()`, which also takes any other element type")]
-    fn prefiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
-    /// Returns a reader for the **pre-filter** KNN ground-truth distances (F).
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::prefiltered_neighbor_distances_as::<f32>()`, which also takes any other element type")]
-    fn prefiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
-
-    /// Returns a reader for the **post-filter** KNN ground-truth indices (E).
-    /// `G ∩ R` — the unfiltered top-K intersected with the predicate-passing
-    /// set; sparse possible.
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::postfiltered_neighbor_indices_as::<i32>()`, which also takes any other element type")]
-    fn postfiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
-    /// Returns a reader for the **post-filter** KNN ground-truth distances (E).
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::postfiltered_neighbor_distances_as::<f32>()`, which also takes any other element type")]
-    fn postfiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
-
-    // -- Metadata facets --
-
-    /// Returns the facet config for metadata content, if present.
-    fn metadata_content(&self) -> Option<&FacetConfig>;
-    /// Returns the facet config for metadata predicates, if present.
-    fn metadata_predicates(&self) -> Option<&FacetConfig>;
-    /// Returns the facet config for predicate result indices, if present.
-    fn predicate_results(&self) -> Option<&FacetConfig>;
-    /// Returns the facet config for metadata layout, if present.
-    fn metadata_layout(&self) -> Option<&FacetConfig>;
-
-    /// Returns a reader for the predicate-result indices (the `R` facet,
-    /// canonically `metadata_results`; legacy `metadata_indices` is still
-    /// resolved on read). This is typically a variable-length file (ivvec)
-    /// where each predicate maps to a different number of matching base
-    /// ordinals.
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::metadata_results_as::<i32>()`")]
-    fn metadata_results(&self) -> Result<Arc<dyn VvecReader<i32>>>;
-
-    // -- Facet discovery --
-
-    /// Returns descriptors for all facets in the profile, without
-    /// materializing data. Includes both standard and custom facets.
-    fn facet_manifest(&self) -> HashMap<String, FacetDescriptor>;
-
-    /// Materializes and returns the reader for any named facet.
-    ///
-    /// For standard vector facets, delegates to the typed accessor.
-    /// For custom facets or facets with non-standard types, this is
-    /// the generic access path. Returns f32 vectors.
-    #[deprecated(since = "4.0.0", note = "use `TestDataViewExt::facet_as::<T>(name)`; `facet_as::<f32>` is this call")]
-    fn facet(&self, name: &str) -> Result<Arc<dyn VectorReader<f32>>>;
-
-    // -- Typed facet access --
-
-    /// Returns the native element type of a named facet, inferred from
-    /// the file extension in the profile config.
-    ///
-    /// ```rust,ignore
-    /// let etype = view.facet_element_type("metadata_content")?; // → ElementType::U8
-    /// ```
-    fn facet_element_type(&self, name: &str) -> Result<crate::typed_access::ElementType>;
-
-    // -- Profile metadata --
-
-    /// Returns the base vector count for this profile, if declared.
-    fn base_count(&self) -> Option<u64>;
-
-    // -- Dataset metadata --
-
-    /// Returns the distance function name if declared in attributes,
-    /// as written; [`distance`](Self::distance) is it typed.
-    fn distance_function(&self) -> Option<String>;
-
-    /// The declared distance function, read through the one spelling
-    /// table ([`DistanceFunction::parse`](crate::DistanceFunction::parse)),
-    /// so a catalog's `angular`, `ip` or `euclidean` is the same as
-    /// `COSINE`, `DOT_PRODUCT` or `L2`. `None` when none is declared or
-    /// the spelling is not one the table holds.
-    fn distance(&self) -> Option<crate::DistanceFunction> {
-        self.distance_function().as_deref().and_then(crate::DistanceFunction::parse)
-    }
-
-    /// One dataset-level attribute by name — a known one or a
-    /// consumer's namespaced key — with overlays merged in
-    /// ([`crate::overlay`]). `None` when the view does not carry
-    /// attributes, as the default does.
-    fn dataset_attribute(&self, _key: &str) -> Option<serde_yaml::Value> {
-        None
-    }
-
-    /// Where [`dataset_attribute`](Self::dataset_attribute)'s value for
-    /// `key` came from. `None` when the view does not know.
-    fn dataset_attribute_source(&self, _key: &str) -> Option<crate::overlay::AttributeSource> {
-        None
-    }
-
-    /// The dataset's name in the cache (`<cache_root>/<name>/`), when
-    /// it has one there.
-    fn cache_name(&self) -> Option<String> {
-        None
-    }
-
-    /// The `quantization` attribute, when the profile or the dataset
-    /// declares one: how the codes in `base_vectors` relate to the
-    /// vectors they stand for. The profile's wins over the dataset's.
-    /// `None` when neither declares it; `Some(Err)` when one does and it
-    /// does not parse.
-    fn quantization(&self) -> Option<std::result::Result<crate::dataset::Quantization, String>> {
-        None
-    }
-
-    /// Resolved source string (path or URL) for a named facet, if it
-    /// exists, for a caller holding an `Arc<dyn TestDataView>` that
-    /// opens the file itself (with [`open_vec_as`](crate::io::open_vec_as),
-    /// say) without knowing the dataset's transport details.
-    fn facet_source(&self, name: &str) -> Option<String>;
-
-    // -- Fetch --------------------------------------------------------
-
-    /// Bring facets of this profile into the local cache, with progress.
-    /// **The fetch call** — also what to use for "precache", "prebuffer"
-    /// or "download" ([`crate::fetch`]).
-    ///
-    /// `request` picks the facets ([`FetchRequest::all`](crate::fetch::FetchRequest::all)
-    /// or [`FetchRequest::facets`](crate::fetch::FetchRequest::facets))
-    /// and optionally a record window; `progress` hears every step
-    /// ([`Silent`](crate::fetch::Silent), [`TextMeter`](crate::fetch::TextMeter),
-    /// or a closure). This is [`plan_fetch`](Self::plan_fetch) followed
-    /// by [`FetchPlan::execute`](crate::fetch::FetchPlan::execute).
-    ///
-    /// Before any byte moves, the whole run is checked: an unknown facet
-    /// ([`Error::UnknownFacets`]), a window that would silently become a
-    /// whole-facet download ([`Error::WindowUnresolvable`]), and a cache
-    /// directory without room ([`Error::InsufficientCacheSpace`]) are all
-    /// refused up front. Returning `Ok` means every planned byte is
-    /// resident; readers opened afterwards take the zero-copy path.
-    ///
-    /// ```no_run
-    /// # use vectordata::fetch::{FetchRequest, TextMeter};
-    /// # fn demo(view: &dyn vectordata::TestDataView) -> vectordata::Result<()> {
-    /// let report = view.fetch(
-    ///     &FetchRequest::facets(["base_vectors", "query_vectors"]),
-    ///     &mut TextMeter::stderr("Fetch"),
-    /// )?;
-    /// assert!(report.facet("base_vectors").is_some());
-    /// # Ok(()) }
-    /// ```
-    fn fetch(
-        &self,
-        request: &crate::fetch::FetchRequest,
-        progress: &mut dyn crate::fetch::FetchProgress,
-    ) -> Result<crate::fetch::FetchReport> {
-        self.plan_fetch(request, progress)?.execute(progress)
-    }
-
-    /// Plan a [`fetch`](Self::fetch) without fetching: open each facet
-    /// and resolve its window to the ranges and chunks it needs, net of
-    /// what is already resident. Read the cost from the returned
-    /// [`FetchPlan`](crate::fetch::FetchPlan), then
-    /// [`execute`](crate::fetch::FetchPlan::execute) it or drop it.
-    ///
-    /// `progress` hears a `PlanBegin`/`PlanEnd` pair per facet, because
-    /// opening a large remote facet takes long enough to need saying.
-    fn plan_fetch(
-        &self,
-        request: &crate::fetch::FetchRequest,
-        progress: &mut dyn crate::fetch::FetchProgress,
-    ) -> Result<crate::fetch::FetchPlan> {
-        let mut facets = Vec::new();
-        crate::fetch::plan_view(self, None, request, progress, &mut facets)?;
-        Ok(crate::fetch::plan_from(facets, request))
-    }
-
-    /// Deprecated: use [`fetch`](Self::fetch) with
-    /// [`FetchRequest::all`](crate::fetch::FetchRequest::all), which this
-    /// now is, and which reports progress and returns what it did.
-    #[deprecated(
-        since = "2.5.0",
-        note = "use `view.fetch(&FetchRequest::all(), &mut Silent)` (vectordata::fetch)"
-    )]
-    fn prebuffer_all(&self) -> Result<()> {
-        self.fetch(&crate::fetch::FetchRequest::all(), &mut crate::fetch::Silent)
-            .map(|_| ())
-    }
-
-    /// Deprecated: use [`fetch`](Self::fetch) with
-    /// [`FetchRequest::all`](crate::fetch::FetchRequest::all) and a
-    /// [`FetchProgress`](crate::fetch::FetchProgress) sink, which this
-    /// now is.
-    ///
-    /// `cb` hears each facet once before it is fetched with
-    /// `total_bytes` set and nothing verified, then chunk-level progress,
-    /// then once more when it completes. Every facet is fetched against
-    /// the window it declares; one the format cannot map is refused under
-    /// [`WholeFacetFallback::Refuse`] and fetched whole under
-    /// [`WholeFacetFallback::Allow`].
-    #[deprecated(
-        since = "2.5.0",
-        note = "use `view.fetch(&FetchRequest::all(), &mut sink)` (vectordata::fetch)"
-    )]
-    fn prebuffer_all_with_progress(
-        &self,
-        fallback: WholeFacetFallback,
-        cb: &mut dyn FnMut(&str, &PrebufferProgress),
-    ) -> Result<()> {
-        let request = crate::fetch::FetchRequest::all().fallback(fallback);
-        self.fetch(&request, &mut prebuffer_progress_adapter(&mut |_, facet, p| cb(facet, p)))
-            .map(|_| ())
-    }
-
-    /// Open a record-shaped facet — a slab of opaque records, such as
-    /// `metadata_content` — for ordinal access to its records. A facet
-    /// of element runs is refused naming the reader that opens it; ask
-    /// [`facet_shape`](Self::facet_shape) to know which to use. A
-    /// namespace in the declaration (`metadata_content.slab:layout`)
-    /// selects that document inside the container.
-    fn open_facet_records(
-        &self,
-        name: &str,
-    ) -> std::result::Result<crate::records::RecordFacet, crate::records::RecordError> {
-        // The mirror of the vector path's guard: an element-shaped
-        // facet brought here would fail as a slab parse error about a
-        // footer, which says nothing about what went wrong.
-        if self.facet_shape(name).ok() == Some(crate::dataset::facet::FacetShape::Elements) {
-            return Err(crate::records::RecordError::WrongShape {
-                facet: name.to_string(),
-                reader: crate::dataset::facet::FacetShape::Elements.reader(),
-            });
-        }
-        let storage = self.open_facet_storage(name).map_err(|e| {
-            crate::records::RecordError::Container(format!("open facet '{name}': {e}"))
-        })?;
-        // A namespace written into the declaration selects a document
-        // inside the container — `metadata_content.slab:layout` — and
-        // travels with the facet rather than being passed separately.
-        let namespace = self
-            .facet_manifest()
-            .get(name)
-            .and_then(|d| d.source_path.as_deref())
-            .and_then(|raw| crate::dataset::source::parse_source_string(raw).ok())
-            .and_then(|p| p.namespace);
-        crate::records::RecordFacet::open(&storage, name, namespace.as_deref())
-    }
-
-    /// How this facet's records are addressed, and therefore which
-    /// reader opens it.
-    ///
-    /// Ask this rather than trying a reader and interpreting the
-    /// failure. Some facets hold element runs and some hold opaque
-    /// records; that is a property of the data, and a caller handling
-    /// both should branch on it explicitly.
-    ///
-    /// ```rust,ignore
-    /// match view.facet_shape("metadata_content")? {
-    ///     FacetShape::Elements => { let r = view.facet_as::<i32>("metadata_content")?; }
-    ///     FacetShape::Records  => { let r = view.open_facet_records("metadata_content")?; }
-    /// }
-    /// ```
-    fn facet_shape(&self, name: &str) -> Result<crate::dataset::facet::FacetShape> {
-        let desc = self
-            .facet_manifest()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| Error::MissingFacet(name.to_string()))?;
-        desc.source_type
-            .as_deref()
-            .and_then(crate::dataset::facet::FacetFormat::from_extension)
-            .map(|f| f.shape())
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "facet '{name}': the spec names no format for '{}'",
-                    desc.source_type.as_deref().unwrap_or("(none)")
-                ))
-            })
-    }
-
-    /// Refuse a facet whose shape this reader cannot address, naming
-    /// the one that can.
-    ///
-    /// A facet of the wrong shape is not unreadable — it is readable
-    /// elsewhere — so the error says where rather than describing the
-    /// symptom the caller happened to hit.
-    fn require_facet_shape(
-        &self,
-        name: &str,
-        attempted: crate::dataset::facet::FacetShape,
-    ) -> Result<()> {
-        let shape = self.facet_shape(name)?;
-        if shape == attempted {
-            return Ok(());
-        }
-        Err(Error::WrongFacetShape {
-            facet: name.to_string(),
-            shape,
-            attempted,
-            reader: shape.reader(),
-        })
-    }
-
-    /// Whether this facet holds data this build can move.
-    ///
-    /// **Not the same question as "what element width does it have?"**,
-    /// which is what the gates here used to ask. For every fixed-width
-    /// format the two coincide; for a slab they do not — a slab record
-    /// is not a run of elements — and taking the element answer skipped
-    /// metadata facets entirely: `prebuffer_all` downloaded the vectors
-    /// and silently left the metadata behind, and the catalog path of
-    /// `derive` dropped it from its output while the local path kept
-    /// it.
-    ///
-    /// The facet spec is the authority on what formats exist
-    /// (`FacetFormat`), so it is what gets asked. That keeps this to
-    /// exactly the formats the spec names — a parquet or hdf5 facet is
-    /// still out of scope here, as it was.
-    fn facet_holds_data(&self, name: &str) -> bool {
-        self.facet_manifest()
-            .get(name)
-            .and_then(|d| d.source_type.as_deref())
-            .and_then(crate::dataset::facet::FacetFormat::from_extension)
-            .is_some()
-    }
-
-    /// Low-level: an open [`FacetStorage`] handle on the facet's bytes,
-    /// for cache inspection and planning. Most callers want
-    /// [`fetch`](Self::fetch) to bring bytes in and a reader to read
-    /// them. Every implementor provides it; the default fetch, planning
-    /// and typed-access methods are built on it.
-    fn open_facet_storage(&self, name: &str) -> Result<FacetStorage>;
-
-    // -- Typed access, erased -------------------------------------
-
-    /// Open an element facet as `target`: at the file's own type when
-    /// `target` is it, converted where
-    /// [`ElementType::conversion_to`](crate::typed_access::ElementType::conversion_to)
-    /// allows, refused with [`IoError::ElementMismatch`]
-    /// otherwise. Dyn-safe; the typed `*_as` methods of
-    /// [`TestDataViewExt`] are built on it, and are what a caller with
-    /// a `T` in hand uses.
-    ///
-    /// A view that cannot open typed facets leaves the default, which
-    /// says so.
-    ///
-    /// The refusal is a value, so a caller learns the rule from the
-    /// error: an f32 facet asked for as u8 is not narrowed.
-    ///
-    /// ```
-    /// use vectordata::{Error, ElementType, TestDataGroup, TestDataViewExt};
-    /// use vectordata::io::IoError;
-    /// # use std::io::Write;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let dir = tempfile::tempdir()?;
-    /// # let ds = dir.path().join("ds");
-    /// # std::fs::create_dir_all(&ds)?;
-    /// # let mut f = std::fs::File::create(ds.join("base.fvecs"))?;
-    /// # f.write_all(&1i32.to_le_bytes())?; f.write_all(&1.5f32.to_le_bytes())?;
-    /// # drop(f);
-    /// # std::fs::write(ds.join("dataset.yaml"), "name: floats\nprofiles:\n  default:\n    base_vectors: base.fvecs\n")?;
-    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
-    /// match view.base_vectors_as::<u8>() {
-    ///     Err(Error::VectorIo(IoError::ElementMismatch { file, requested, reason })) => {
-    ///         assert_eq!((file, requested), (ElementType::F32, ElementType::U8));
-    ///         assert_eq!(reason, "no conversion between the two");
-    ///     }
-    ///     other => panic!("expected a refusal, got {:?}", other.map(|r| r.count())),
-    /// }
-    /// # Ok(()) }
-    /// ```
-    fn open_facet_as_type(
-        &self,
-        name: &str,
-        target: crate::typed_access::ElementType,
-    ) -> Result<crate::io::AnyVectorReader> {
-        let _ = (name, target);
-        Err(Error::Other("this view does not open typed facets".into()))
-    }
-
-    /// Open an element facet at the type its file holds, for a caller
-    /// that does not know the type ahead of time.
-    ///
-    /// ```
-    /// use vectordata::{ElementType, TestDataGroup, TestDataView, VectorReader};
-    /// use vectordata::io::AnyVectorReader;
-    /// # use std::io::Write;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let dir = tempfile::tempdir()?;
-    /// # let ds = dir.path().join("ds");
-    /// # std::fs::create_dir_all(&ds)?;
-    /// # let mut f = std::fs::File::create(ds.join("gt.i64vecs"))?;
-    /// # for v in [[0i64, 1 << 40]] { f.write_all(&2i32.to_le_bytes())?; for x in v { f.write_all(&x.to_le_bytes())?; } }
-    /// # drop(f);
-    /// # std::fs::write(ds.join("dataset.yaml"), "name: wide\nprofiles:\n  default:\n    neighbor_indices: gt.i64vecs\n")?;
-    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
-    /// assert_eq!(view.facet_element_type("neighbor_indices")?, ElementType::I64);   // from the extension, no open
-    /// let ids: Vec<i64> = match view.open_facet_native("neighbor_indices")? {
-    ///     AnyVectorReader::I32(r) => r.get(0)?.into_iter().map(i64::from).collect(),  // the common case
-    ///     AnyVectorReader::I64(r) => r.get(0)?,                                        // a corpus past 2^31 vectors
-    ///     other => other.as_type::<i64>()?.get(0)?,                                    // any other integer widens
-    /// };
-    /// assert_eq!(ids, vec![0, 1 << 40]);
-    /// # Ok(()) }
-    /// ```
-    fn open_facet_native(&self, name: &str) -> Result<crate::io::AnyVectorReader> {
-        let native = self.facet_element_type(name)?;
-        self.open_facet_as_type(name, native)
-    }
-
-    /// Open a variable-length facet at the type its file holds. A
-    /// variable-length facet is never converted.
-    fn open_vvec_facet_native(&self, name: &str) -> Result<crate::io::AnyVvecReader> {
-        let _ = name;
-        Err(Error::Other("this view does not open typed facets".into()))
-    }
-
-    // -- Prefetch --------------------------------------------------
-
-    /// What prefetching `window` on `facet` would cost, without
-    /// fetching any of it.
-    ///
-    /// `window` is in **record** coordinates and is the caller's to
-    /// choose. A profile's `window:` is a convenience — a name for a
-    /// range someone wants repeatedly — not a fence around which ranges
-    /// may be asked for.
-    fn prefetch_plan(&self, facet: &str, window: &DSWindow) -> Result<PrefetchPlan> {
-        let storage = self.open_facet_storage(facet)?;
-        self.prefetch_plan_on(&storage, facet, window)
-    }
-
-    /// The same, against a handle the caller already holds.
-    ///
-    /// Reusing one handle is what makes the offset-index cache pay: a
-    /// plan and the fetch that follows it both need the index, and
-    /// opening a handle each would load it twice.
-    fn prefetch_plan_on(
-        &self,
-        storage: &FacetStorage,
-        facet: &str,
-        window: &DSWindow,
-    ) -> Result<PrefetchPlan> {
-        let facet_bytes = storage.total_size();
-        let mut plan = PrefetchPlan {
-            facet_bytes,
-            ..PrefetchPlan::default()
-        };
-
-        // Where the bytes live, for the record→byte mapping. Absent a
-        // source path there is nothing to map against.
-        let desc = self.facet_manifest();
-        let path = desc
-            .get(facet)
-            .and_then(|d| d.source_path.as_deref())
-            .and_then(|raw| crate::dataset::source::parse_source_string(raw).ok())
-            .map(|p| p.path);
-        // A series has no single source path — each shard carries its
-        // own, and the mapping below reads them from the shard model.
-        // Absent both, there is nothing to map against and the request
-        // degrades.
-        let path = match (path, storage.series_ref()) {
-            (Some(p), _) => p,
-            (None, Some(_)) => String::new(),
-            (None, None) => {
-                plan.degrades_to_full_download = true;
-                plan.resident_bytes = storage.resident_bytes().min(facet_bytes);
-                return Ok(plan);
-            }
-        };
-
-        // No window is a request for the whole facet, and that is not a
-        // fallback from anything — it resolves to the whole byte range
-        // whatever the format, with no ordinal mapping needed. Routing
-        // it through the mapping would make an unmappable format look
-        // like it had degraded when the caller asked for everything in
-        // the first place.
-        if window.is_empty() {
-            // The whole facet, shard by shard — one range per shard, so
-            // the plan names real files rather than a byte span that
-            // exists in none of them (SH-28).
-            for (shard, bytes) in storage.shard_sizes().into_iter().enumerate() {
-                let r = ShardRange {
-                    shard,
-                    start: 0,
-                    end: bytes,
-                };
-                plan.requested_ranges.push(r);
-                plan.byte_ranges.push(r);
-                if let Some(fill) = storage.shard_range_fill(shard, 0, bytes) {
-                    plan.fills.push(fill);
-                }
-            }
-            return Ok(plan);
-        }
-        let intervals: Vec<(u64, u64)> = window
-            .0
-            .iter()
-            .map(|iv| (iv.min_incl, iv.max_excl))
-            .collect();
-
-        for (start, end) in intervals {
-            match record_range_to_bytes(&path, start, end, storage) {
-                Some(m) => {
-                    plan.prerequisite_bytes = plan.prerequisite_bytes.max(m.prerequisite_bytes);
-                    plan.requested_ranges.extend(m.ranges.iter().copied());
-                }
-                None => {
-                    // One unmappable interval makes the whole request a
-                    // full download; reporting a partial plan beside it
-                    // would understate what is about to happen.
-                    plan.degrades_to_full_download = true;
-                    plan.resident_bytes = storage.resident_bytes().min(facet_bytes);
-                    plan.requested_ranges.clear();
-                    plan.byte_ranges.clear();
-                    plan.fills.clear();
-                    return Ok(plan);
-                }
-            }
-        }
-
-        // Merge before planning the fills, so the chunk accounting
-        // describes the requests that will actually be issued rather
-        // than the intervals that were asked for.
-        let chunk_size = storage.cache_stats().map(|c| c.chunk_size);
-        plan.byte_ranges = coalesce_ranges(plan.requested_ranges.clone(), chunk_size);
-        for r in &plan.byte_ranges {
-            if let Some(fill) = storage.shard_range_fill(r.shard, r.start, r.end) {
-                plan.fills.push(fill);
-            }
-        }
-        Ok(plan)
-    }
-
-    /// Start fetching `window` of `facet` on another thread, returning
-    /// a handle to watch, cancel or join it. The background form of
-    /// [`fetch`](Self::fetch): use that instead when the caller waits
-    /// for the bytes anyway.
-    ///
-    /// The plan is computed, and the cache directory's free space
-    /// checked, before this returns — planning needs the view, and a
-    /// caller deserves the cost before committing — so the `Err` here
-    /// is a planning or capacity failure. Fetch failures arrive through
-    /// [`PrefetchHandle::join`], and are logged regardless so an
-    /// unwatched prefetch cannot fail silently.
-    ///
-    /// This is the form for warming ahead of a scan: start it, keep
-    /// reading, and let the bytes arrive underneath. Reads that
-    /// overtake the prefetch are not wrong, only slower — they fault in
-    /// the chunk themselves, and the prefetch skips what is already
-    /// resident.
-    fn prefetch_in_background(
-        &self,
-        facet: &str,
-        window: &DSWindow,
-        fallback: WholeFacetFallback,
-    ) -> Result<PrefetchHandle> {
-        let storage = self.open_facet_storage(facet)?;
-        let plan = self.prefetch_plan_on(&storage, facet, window)?;
-        check_fallback(facet, &plan, fallback)?;
-        crate::cache::ensure_cache_capacity(plan.bytes_to_fetch())?;
-
-        let state = std::sync::Arc::new(PrefetchState::default());
-        let worker_state = state.clone();
-        let worker_plan = plan.clone();
-        let name = facet.to_string();
-
-        let thread = std::thread::Builder::new()
-            .name(format!("prefetch:{name}"))
-            .spawn(move || {
-                use std::sync::atomic::Ordering;
-                let outcome = crate::fetch::fetch_planned(
-                    &storage,
-                    &worker_plan,
-                    &|| worker_state.cancelled.load(Ordering::Acquire),
-                    &mut |bytes, _| worker_state.bytes_fetched.store(bytes, Ordering::Relaxed),
-                    &mut |ranges| worker_state.ranges_fetched.store(ranges, Ordering::Relaxed),
-                );
-                if let Err(e) = outcome {
-                    log::warn!("prefetch of '{name}' failed: {e}");
-                    *worker_state.error.lock().unwrap() = Some(e.to_string());
-                }
-                // Set last, and with Release, so a caller that sees
-                // `is_done()` also sees the error and the counters.
-                worker_state.done.store(true, Ordering::Release);
-            })
-            .map_err(|e| Error::Other(format!("could not start prefetch thread: {e}")))?;
-
-        Ok(PrefetchHandle {
-            plan,
-            state,
-            thread: Some(thread),
-        })
-    }
-
-    /// Deprecated: use [`fetch`](Self::fetch) with
-    /// `FetchRequest::facets([facet]).window(window)`, which also checks
-    /// cache space and reports progress.
-    #[deprecated(
-        since = "2.5.0",
-        note = "use `view.fetch(&FetchRequest::facets([facet]).window(w), &mut Silent)` (vectordata::fetch)"
-    )]
-    fn prefetch(
-        &self,
-        facet: &str,
-        window: &DSWindow,
-        fallback: WholeFacetFallback,
-    ) -> Result<PrefetchReport> {
-        #[allow(deprecated)]
-        self.prefetch_with_progress(facet, window, fallback, &mut |_| {})
-    }
-
-    /// Deprecated: use [`fetch`](Self::fetch) with
-    /// `FetchRequest::facets([facet]).window(window)` and a
-    /// [`FetchProgress`](crate::fetch::FetchProgress) sink.
-    ///
-    /// Fetches `window` of `facet` and returns when it is resident;
-    /// `cb` hears the transport's progress per range.
-    #[deprecated(
-        since = "2.5.0",
-        note = "use `view.fetch(&FetchRequest::facets([facet]).window(w), &mut sink)` (vectordata::fetch)"
-    )]
-    fn prefetch_with_progress(
-        &self,
-        facet: &str,
-        window: &DSWindow,
-        fallback: WholeFacetFallback,
-        cb: &mut dyn FnMut(&crate::transport::DownloadProgress),
-    ) -> Result<PrefetchReport> {
-        // One handle for both the plan and the fetch, so the offset
-        // index a vvec window needs is loaded once rather than twice.
-        let storage = self.open_facet_storage(facet)?;
-        let planned = self.prefetch_plan_on(&storage, facet, window)?;
-        check_fallback(facet, &planned, fallback)?;
-        crate::cache::ensure_cache_capacity(planned.bytes_to_fetch())?;
-        let fetched = if planned.degrades_to_full_download {
-            storage
-                .prebuffer_with_progress(|p| cb(p))
-                .map(|_| 1)
-        } else {
-            planned
-                .byte_ranges
-                .iter()
-                .try_fold(0usize, |n, r| {
-                    storage
-                        .prebuffer_shard_range(r.shard, r.start, r.end, |p| cb(p))
-                        .map(|_| n + 1)
-                })
-        }
-        .map_err(|e| Error::Other(e.to_string()))?;
-        Ok(PrefetchReport {
-            planned,
-            ranges_fetched: fetched,
-        })
-    }
-}
-
 /// Adapt a [`FetchProgress`](crate::fetch::FetchProgress) stream to the
 /// per-facet callback the deprecated `prebuffer_*_with_progress` forms
 /// take: `(profile, facet, progress)`, with `profile` empty for a
@@ -1249,459 +420,6 @@ pub(crate) fn prebuffer_progress_adapter<'c>(
     }
 }
 
-/// The typed facet readers: every [`TestDataView`] method that serves
-/// a vector facet, with the element type a parameter.
-///
-/// `view.base_vectors_as::<f32>()` is what `view.base_vectors()` was;
-/// `view.base_vectors_as::<u8>()` reads a quantized base in place, and
-/// `view.base_vectors_as::<f32>()` over a `bf16` base widens it. What
-/// each pair of types means is one table,
-/// [`ElementType::conversion_to`](crate::typed_access::ElementType::conversion_to):
-/// the file's own type reads in place (zero-copy where the storage is
-/// mapped), a lossless conversion widens, a same-width sign change is
-/// checked value by value, and anything else is refused at open with
-/// [`IoError::ElementMismatch`].
-/// The reader says which it is: [`VectorReader::conversion`].
-///
-/// Implemented for every view, so it works on an `Arc<dyn
-/// TestDataView>` as on the concrete one; bring it into scope with
-/// `use vectordata::TestDataViewExt`.
-///
-/// ```
-/// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader};
-/// # use std::io::Write;
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # let dir = tempfile::tempdir()?;
-/// # let ds = dir.path().join("ds");
-/// # std::fs::create_dir_all(&ds)?;
-/// # let mut f = std::fs::File::create(ds.join("codes.bvecs"))?;
-/// # for v in [[1u8, 2, 3], [4, 5, 6]] { f.write_all(&3i32.to_le_bytes())?; f.write_all(&v)?; }
-/// # drop(f);
-/// # std::fs::write(ds.join("dataset.yaml"), "name: codes\nprofiles:\n  default:\n    base_vectors: codes.bvecs\n")?;
-/// let group = TestDataGroup::load(ds.to_str().unwrap())?;
-/// let view = group.profile("default").unwrap();
-///
-/// // Native: the u8 codes as they are, borrowed from the mapping.
-/// let codes = view.base_vectors_as::<u8>()?;
-/// assert_eq!(codes.get_slice(1), Some(&[4u8, 5, 6][..]));
-///
-/// // Widening: the same facet as f32, converted on read.
-/// let wide = view.base_vectors_as::<f32>()?;
-/// assert_eq!(wide.get(1)?, vec![4.0, 5.0, 6.0]);
-/// assert_eq!(wide.get_slice(1), None, "nothing of f32 exists to borrow");
-/// # Ok(()) }
-/// ```
-pub trait TestDataViewExt: TestDataView {
-    /// Any element facet as `T`; see the trait docs for what `T` may be.
-    ///
-    /// A `bf16` facet at its own type is zero-copy; as `f32` it widens
-    /// exactly, at the cost of one conversion per element read:
-    ///
-    /// ```
-    /// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader, ElementConversion};
-    /// use vectordata::typed_access::bf16;
-    /// # use std::io::Write;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let dir = tempfile::tempdir()?;
-    /// # let ds = dir.path().join("ds");
-    /// # std::fs::create_dir_all(&ds)?;
-    /// # let mut f = std::fs::File::create(ds.join("base.bf16vecs"))?;
-    /// # for v in [[1.5f32, -2.0], [0.25, 8.0]] {
-    /// #     f.write_all(&2i32.to_le_bytes())?;
-    /// #     for x in v { f.write_all(&bf16::from_f32(x).to_le_bytes())?; }
-    /// # }
-    /// # drop(f);
-    /// # std::fs::write(ds.join("dataset.yaml"), "name: brains\nprofiles:\n  default:\n    base_vectors: base.bf16vecs\n")?;
-    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
-    ///
-    /// // Native: the bf16 values borrowed from the mapping, no conversion.
-    /// let native = view.facet_as::<bf16>("base_vectors")?;
-    /// assert_eq!(native.conversion(), ElementConversion::Native);
-    /// assert_eq!(native.get_slice(1).map(|r| r[1].to_f32()), Some(8.0));
-    ///
-    /// // Widening: every bf16 is an f32, so the values are exact; each
-    /// // read converts, and there is no slice of f32 to borrow.
-    /// let wide = view.facet_as::<f32>("base_vectors")?;
-    /// assert_eq!(wide.conversion(), ElementConversion::Widening);
-    /// assert_eq!(wide.get(0)?, vec![1.5, -2.0]);
-    /// assert_eq!(wide.get_slice(0), None);
-    /// # Ok(()) }
-    /// ```
-    ///
-    /// A column facet (`.u8`, `.f32`, …) is one slice at its own type —
-    /// the zero-copy path for quantization parameters and labels:
-    ///
-    /// ```
-    /// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader};
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let dir = tempfile::tempdir()?;
-    /// # let ds = dir.path().join("ds");
-    /// # std::fs::create_dir_all(&ds)?;
-    /// # std::fs::write(ds.join("labels.u8"), [3u8, 1, 4, 1, 5])?;
-    /// # std::fs::write(ds.join("dataset.yaml"), "name: labels\nprofiles:\n  default:\n    metadata_content: labels.u8\n")?;
-    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
-    /// let labels = view.facet_as::<u8>("metadata_content")?;
-    /// assert_eq!(labels.dim(), 1);
-    /// let all: &[u8] = labels.as_slice().expect("a local column maps whole");
-    /// assert_eq!(all, &[3, 1, 4, 1, 5]);
-    /// # Ok(()) }
-    /// ```
-    fn facet_as<T: Element>(&self, name: &str) -> Result<Arc<dyn VectorReader<T>>> {
-        Ok(self.open_facet_as_type(name, T::TYPE)?.into_typed::<T>()?)
-    }
-
-    /// The base (database) vectors as `T`.
-    ///
-    /// At the file's own type, a profile window reads in place through
-    /// [`read_into`](VectorReader::read_into) into a buffer you keep —
-    /// the bulk path for a chunked build:
-    ///
-    /// ```
-    /// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader, ElementConversion};
-    /// # use std::io::Write;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let dir = tempfile::tempdir()?;
-    /// # let ds = dir.path().join("ds");
-    /// # std::fs::create_dir_all(&ds)?;
-    /// # let mut f = std::fs::File::create(ds.join("base.fvecs"))?;
-    /// # for i in 0..6i32 { f.write_all(&2i32.to_le_bytes())?; for d in 0..2 { f.write_all(&((i * 2 + d) as f32).to_le_bytes())?; } }
-    /// # drop(f);
-    /// // The profile reads records 1..5 of the six in the file.
-    /// # std::fs::write(ds.join("dataset.yaml"), "name: window\nprofiles:\n  default:\n    base_vectors: base.fvecs[1..5)\n")?;
-    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
-    /// let base = view.base_vectors_as::<f32>()?;
-    /// assert_eq!(base.conversion(), ElementConversion::Native);
-    /// assert_eq!(base.count(), 4);
-    ///
-    /// let mut block = vec![0f32; base.dim() * 2];      // two records at a time
-    /// let mut start = 0;
-    /// while start < base.count() {
-    ///     let got = base.read_into(start, &mut block)?;
-    ///     if start == 0 { assert_eq!(&block[..4], &[2.0, 3.0, 4.0, 5.0]); }
-    ///     start += got;
-    /// }
-    /// assert_eq!(start, 4);
-    /// # Ok(()) }
-    /// ```
-    fn base_vectors_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
-        self.facet_as("base_vectors")
-    }
-
-    /// The query vectors as `T`.
-    fn query_vectors_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
-        self.facet_as("query_vectors")
-    }
-
-    /// The neighbor indices (ground truth) as `T`.
-    ///
-    /// Read at their own type, i32, and checked against the base count
-    /// the way a consumer should check any ground truth it is handed:
-    ///
-    /// ```
-    /// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader};
-    /// # use std::io::Write;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let dir = tempfile::tempdir()?;
-    /// # let ds = dir.path().join("ds");
-    /// # std::fs::create_dir_all(&ds)?;
-    /// # let mut f = std::fs::File::create(ds.join("base.fvecs"))?;
-    /// # for i in 0..3i32 { f.write_all(&1i32.to_le_bytes())?; f.write_all(&(i as f32).to_le_bytes())?; }
-    /// # drop(f);
-    /// # let mut g = std::fs::File::create(ds.join("gt.ivecs"))?;
-    /// # for row in [[0i32, 1], [1, 2]] { g.write_all(&2i32.to_le_bytes())?; for id in row { g.write_all(&id.to_le_bytes())?; } }
-    /// # drop(g);
-    /// # std::fs::write(ds.join("dataset.yaml"), "name: gt\nprofiles:\n  default:\n    base_vectors: base.fvecs\n    neighbor_indices: gt.ivecs\n")?;
-    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
-    /// let base = view.base_vectors_as::<f32>()?;
-    /// let gt = view.neighbor_indices_as::<i32>()?;
-    /// for q in 0..gt.count() {
-    ///     let ids = gt.get_slice(q).expect("a local i32 file borrows");
-    ///     assert!(ids.iter().all(|&id| (id as usize) < base.count()), "query {q} names a base vector");
-    /// }
-    /// # Ok(()) }
-    /// ```
-    fn neighbor_indices_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
-        self.facet_as("neighbor_indices")
-    }
-
-    /// The neighbor distances (ground truth) as `T`.
-    ///
-    /// ```
-    /// use vectordata::{ElementConversion, TestDataGroup, TestDataViewExt, VectorReader};
-    /// # use std::io::Write;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let dir = tempfile::tempdir()?;
-    /// # let ds = dir.path().join("ds");
-    /// # std::fs::create_dir_all(&ds)?;
-    /// # let mut f = std::fs::File::create(ds.join("dist.dvecs"))?;
-    /// # for v in [[0.0f64, 1e-300]] { f.write_all(&2i32.to_le_bytes())?; for x in v { f.write_all(&x.to_le_bytes())?; } }
-    /// # drop(f);
-    /// # std::fs::write(ds.join("dataset.yaml"), "name: d\nprofiles:\n  default:\n    neighbor_distances: dist.dvecs\n")?;
-    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
-    /// let d = view.neighbor_distances_as::<f64>()?;                     // the file's type: zero-copy
-    /// assert_eq!((d.conversion(), d.get(0)?), (ElementConversion::Native, vec![0.0, 1e-300]));
-    /// assert!(view.neighbor_distances_as::<f32>().is_err(), "f64 never narrows: read it as f64");
-    /// # Ok(()) }
-    /// ```
-    fn neighbor_distances_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
-        self.facet_as("neighbor_distances")
-    }
-
-    /// The pre-filter KNN ground-truth indices (F) as `T`.
-    fn prefiltered_neighbor_indices_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
-        self.facet_as("prefiltered_neighbor_indices")
-    }
-
-    /// The pre-filter KNN ground-truth distances (F) as `T`.
-    fn prefiltered_neighbor_distances_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
-        self.facet_as("prefiltered_neighbor_distances")
-    }
-
-    /// The post-filter KNN ground-truth indices (E) as `T`.
-    fn postfiltered_neighbor_indices_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
-        self.facet_as("postfiltered_neighbor_indices")
-    }
-
-    /// The post-filter KNN ground-truth distances (E) as `T`.
-    fn postfiltered_neighbor_distances_as<T: Element>(&self) -> Result<Arc<dyn VectorReader<T>>> {
-        self.facet_as("postfiltered_neighbor_distances")
-    }
-
-    /// The predicate-result indices (the `R` facet) as `T`, which must
-    /// be the type the file holds: a variable-length facet is never
-    /// converted.
-    ///
-    /// ```
-    /// use vectordata::{Error, ElementType, TestDataGroup, TestDataViewExt};
-    /// use vectordata::io::IoError;
-    /// # use std::io::Write;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let dir = tempfile::tempdir()?;
-    /// # let ds = dir.path().join("ds");
-    /// # std::fs::create_dir_all(&ds)?;
-    /// # let mut f = std::fs::File::create(ds.join("matches.i16vvecs"))?;
-    /// # for v in [vec![3i16, 1, 2], vec![], vec![-1]] { f.write_all(&(v.len() as i32).to_le_bytes())?; for x in v { f.write_all(&x.to_le_bytes())?; } }
-    /// # drop(f);
-    /// # std::fs::write(ds.join("dataset.yaml"), "name: r\nprofiles:\n  default:\n    metadata_results: matches.i16vvecs\n")?;
-    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
-    /// let r = view.metadata_results_as::<i16>()?;                       // the file's type: zero-copy index, decoded records
-    /// assert_eq!((r.count(), r.dim_at(1)?), (3, 0));
-    /// assert_eq!(r.get(0)?, vec![3i16, 1, 2]);
-    /// match view.metadata_results_as::<i32>() {                         // wider, but a vvec is never converted
-    ///     Err(Error::VectorIo(IoError::ElementMismatch { file, requested, .. })) => assert_eq!((file, requested), (ElementType::I16, ElementType::I32)),
-    ///     other => panic!("{:?}", other.map(|r| r.count())),
-    /// }
-    /// # Ok(()) }
-    /// ```
-    fn metadata_results_as<T: Element>(&self) -> Result<Arc<dyn VvecReader<T>>> {
-        Ok(self.open_vvec_facet_native("metadata_results")?.into_typed::<T>()?)
-    }
-
-    /// A quantized base as one thing: the codes at their own type `C`,
-    /// the three parameter columns, and the scheme, checked against
-    /// each other. See [`QuantizedBase`].
-    ///
-    /// `C` is the type the `quantization` attribute's `codes` names —
-    /// here signed, symmetric codes:
-    ///
-    /// ```
-    /// use vectordata::{ElementType, TestDataGroup, TestDataViewExt, VectorReader};
-    /// use vectordata::dataset::QuantScheme;
-    /// # use std::io::Write;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let dir = tempfile::tempdir()?;
-    /// # let ds = dir.path().join("ds");
-    /// # std::fs::create_dir_all(&ds)?;
-    /// # let mut f = std::fs::File::create(ds.join("codes.i8vecs"))?;
-    /// # for v in [[-128i8, 0, 127], [1, -1, 64]] { f.write_all(&3i32.to_le_bytes())?; for x in v { f.write_all(&x.to_le_bytes())?; } }
-    /// # drop(f);
-    /// # std::fs::write(ds.join("quant_scale.f32"), [0.5f32, 0.25].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
-    /// # std::fs::write(ds.join("quant_zero_point.i32"), [0i32, 0].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
-    /// # std::fs::write(ds.join("quant_sum.i32"), [-1i32, 64].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
-    /// # std::fs::write(ds.join("dataset.yaml"), "name: q\nattributes:\n  quantization:\n    scheme: symmetric\n    granularity: per-vector\n    codes: i8\n    range: [-127, 127]\nprofiles:\n  default:\n    base_vectors: codes.i8vecs\n    quant_scale: quant_scale.f32\n    quant_zero_point: quant_zero_point.i32\n    quant_sum: quant_sum.i32\n")?;
-    /// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
-    /// let q = view.quantized_base::<i8>()?;
-    /// assert_eq!(q.codes.get_slice(0), Some(&[-128i8, 0, 127][..]));    // the codes, zero-copy
-    /// assert_eq!(q.scale.as_slice(), Some(&[0.5f32, 0.25][..]));        // each column, one slice
-    /// assert_eq!((q.scheme.scheme, q.scheme.codes), (QuantScheme::Symmetric, ElementType::I8));
-    /// assert!(view.quantized_base::<u8>().is_err(), "the scheme names i8; no other type opens the codes");
-    /// # Ok(()) }
-    /// ```
-    fn quantized_base<C: Element>(&self) -> Result<QuantizedBase<C>> {
-        QuantizedBase::open(self)
-    }
-
-    /// Whether the base is unit length, and on whose word: the declared
-    /// `is_normalized` (the dataset's, an overlay's, or inferred from
-    /// file names) checked against a 1000-vector sample, or the sample
-    /// alone when nothing declares it ([`crate::verify::normalization`]).
-    /// The sample of a remote base is recorded by its content identity
-    /// and never re-taken; it fetches the chunks it touches when the
-    /// base is not here yet.
-    ///
-    /// ```
-    /// use vectordata::overlay::AttributeSource;
-    /// use vectordata::{TestDataGroup, TestDataViewExt};
-    /// # use std::io::Write;
-    /// # let dir = tempfile::tempdir().unwrap();
-    /// # let mut f = std::fs::File::create(dir.path().join("base.fvecs")).unwrap();
-    /// # for i in 0..10 { let a = i as f32 * 0.3; f.write_all(&2i32.to_le_bytes()).unwrap(); for x in [a.cos(), a.sin()] { f.write_all(&x.to_le_bytes()).unwrap(); } }
-    /// # std::fs::write(dir.path().join("dataset.yaml"), "name: n\nprofiles:\n  default:\n    base_vectors: base.fvecs\n").unwrap();
-    /// let view = TestDataGroup::load(dir.path().to_str().unwrap()).unwrap().profile("default").unwrap();
-    /// let n = view.normalization().unwrap();
-    /// assert!(n.value && !n.contradicted);
-    /// assert!(matches!(n.source, AttributeSource::Measured { .. }), "nothing declares it: the sample says");
-    /// assert_eq!(n.measured.sample, 10);
-    /// ```
-    fn normalization(&self) -> Result<crate::verify::Normalization> {
-        crate::verify::normalization(self)
-    }
-
-    /// Verify that the profile's facets belong together: the checks of
-    /// [`crate::verify`] (V1–V7), every failure listed. A profile that
-    /// passes is [`Ok`] with what was checked; one that does not is
-    /// [`Error::Verification`] naming each
-    /// check, what it found and the file. V5 reads every ground-truth
-    /// index and reports its progress to `progress`.
-    ///
-    /// ```
-    /// use vectordata::verify::{Check, NoProgress};
-    /// use vectordata::{TestDataGroup, TestDataViewExt};
-    /// # use std::io::Write;
-    /// # fn rows<T: Copy>(path: &std::path::Path, rows: &[&[T]], bytes: fn(T) -> Vec<u8>) {
-    /// #     let mut f = std::fs::File::create(path).unwrap();
-    /// #     for r in rows { f.write_all(&(r.len() as i32).to_le_bytes()).unwrap(); for &v in *r { f.write_all(&bytes(v)).unwrap(); } }
-    /// # }
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let dir = tempfile::tempdir()?;
-    /// # rows::<f32>(&dir.path().join("base.fvecs"), &[&[0.0, 1.0], &[1.0, 0.0], &[1.0, 1.0]], |v| v.to_le_bytes().to_vec());
-    /// # rows::<f32>(&dir.path().join("query.fvecs"), &[&[0.0, 0.9], &[0.9, 0.0]], |v| v.to_le_bytes().to_vec());
-    /// # rows::<i32>(&dir.path().join("good.ivecs"), &[&[0, 2], &[1, 2]], |v| v.to_le_bytes().to_vec());
-    /// # rows::<i32>(&dir.path().join("bad.ivecs"), &[&[0, 2], &[1, 3]], |v| v.to_le_bytes().to_vec());
-    /// # std::fs::write(dir.path().join("dataset.yaml"), "name: v\nprofiles:\n  default:\n    base_vectors: base.fvecs\n    query_vectors: query.fvecs\n    neighbor_indices: good.ivecs\n  stale:\n    base_vectors: base.fvecs\n    query_vectors: query.fvecs\n    neighbor_indices: bad.ivecs\n")?;
-    /// let group = TestDataGroup::load(dir.path().to_str().unwrap())?;
-    /// let good = group.profile("default").unwrap().verify(&mut NoProgress)?;
-    /// assert!(good.checked.contains(&Check::V5TruthIndices));
-    ///
-    /// // Index 3 names no vector of a 3-vector base: this truth was not computed against it.
-    /// let err = group.profile("stale").unwrap().verify(&mut NoProgress).unwrap_err();
-    /// assert!(err.to_string().contains("V5 neighbor_indices"), "{err}");
-    /// assert!(err.to_string().contains("row 1 column 1 holds 3, which names no base vector of 3 base vectors"), "{err}");
-    /// # Ok(()) }
-    /// ```
-    fn verify(&self, progress: &mut dyn crate::verify::VerifyProgress) -> Result<crate::verify::VerifyReport> {
-        let report = self.verify_report(&crate::verify::VerifyOptions::default(), progress);
-        if report.passed() {
-            Ok(report)
-        } else {
-            Err(crate::Error::Verification { failures: report.failures })
-        }
-    }
-
-    /// [`verify`](Self::verify) as a report, failures and all, never an
-    /// error: for a caller that lists every problem (`veks check`).
-    fn verify_report(
-        &self,
-        options: &crate::verify::VerifyOptions,
-        progress: &mut dyn crate::verify::VerifyProgress,
-    ) -> crate::verify::VerifyReport {
-        crate::verify::verify_view(self, options, progress)
-    }
-}
-
-/// A pre-quantized base resolved as one dataset: the codes, the
-/// per-vector parameters the dequantized distance needs, and the scheme
-/// that says how to apply them.
-///
-/// Opening checks what a consumer would otherwise have to: that the
-/// `quantization` attribute names the type the codes are read at, and
-/// that every column holds exactly one value per base vector
-/// ([`Error::FacetCardinality`] otherwise). On a local single-file
-/// dataset each column's [`as_slice`](VectorReader::as_slice) is `Some`,
-/// so the three reach a kernel as borrowed slices with no copy.
-///
-/// ```
-/// use vectordata::{TestDataGroup, TestDataViewExt, VectorReader};
-/// # use std::io::Write;
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # let dir = tempfile::tempdir()?;
-/// # let ds = dir.path().join("ds");
-/// # std::fs::create_dir_all(&ds)?;
-/// # let mut f = std::fs::File::create(ds.join("base_vectors.bvecs"))?;
-/// # for v in [[10u8, 20, 30], [40, 50, 60]] { f.write_all(&3i32.to_le_bytes())?; f.write_all(&v)?; }
-/// # drop(f);
-/// # std::fs::write(ds.join("quant_scale.f32"), [0.5f32, 0.25].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())?;
-/// # std::fs::write(ds.join("quant_zero_point.i32"), [128i32, 100].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())?;
-/// # std::fs::write(ds.join("quant_sum.i32"), [60i32, 150].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())?;
-/// # std::fs::write(ds.join("dataset.yaml"), "name: q\nattributes:\n  quantization:\n    scheme: affine\n    granularity: per-vector\n    codes: u8\n    range: [0, 255]\nprofiles:\n  default:\n    base_vectors: base_vectors.bvecs\n    quant_scale: quant_scale.f32\n    quant_zero_point: quant_zero_point.i32\n    quant_sum: quant_sum.i32\n")?;
-/// let view = TestDataGroup::load(ds.to_str().unwrap())?.profile("default").unwrap();
-/// let q = view.quantized_base::<u8>()?;
-/// assert_eq!(q.codes.get_slice(1), Some(&[40u8, 50, 60][..]));
-/// assert_eq!(q.scale.as_slice(), Some(&[0.5f32, 0.25][..]));
-/// assert_eq!(q.zero_point.as_slice(), Some(&[128i32, 100][..]));
-/// assert_eq!(q.sum.as_slice(), Some(&[60i32, 150][..]));
-/// assert_eq!(q.scheme.range, [0, 255]);
-/// # Ok(()) }
-/// ```
-pub struct QuantizedBase<C: Element> {
-    /// The codes: `base_vectors` at its own type.
-    pub codes: Arc<dyn VectorReader<C>>,
-    /// Per-vector scale (`quant_scale`).
-    pub scale: Arc<dyn VectorReader<f32>>,
-    /// Per-vector zero point (`quant_zero_point`).
-    pub zero_point: Arc<dyn VectorReader<i32>>,
-    /// Per-vector sum of the codes (`quant_sum`).
-    pub sum: Arc<dyn VectorReader<i32>>,
-    /// The scheme, from the `quantization` attribute.
-    pub scheme: crate::dataset::Quantization,
-}
-
-impl<C: Element> QuantizedBase<C> {
-    fn open<V: TestDataView + ?Sized>(view: &V) -> Result<Self> {
-        let scheme = match view.quantization() {
-            Some(Ok(q)) => q,
-            Some(Err(e)) => return Err(Error::Other(format!("the quantization attribute does not parse: {e}"))),
-            None => {
-                return Err(Error::Other(
-                    "no quantization attribute: a quantized base declares its scheme at the dataset or \
-                     profile level"
-                        .into(),
-                ));
-            }
-        };
-        if scheme.codes != C::TYPE {
-            return Err(IoError::ElementMismatch {
-                file: scheme.codes,
-                requested: C::TYPE,
-                reason: "the quantization attribute names the type the codes are read at",
-            }
-            .into());
-        }
-        let codes = view.base_vectors_as::<C>()?;
-        let expected = codes.count();
-        let column = |name: &str, count: usize| -> Result<()> {
-            if count == expected {
-                Ok(())
-            } else {
-                Err(Error::FacetCardinality {
-                    facet: name.to_string(),
-                    against: "base_vectors".to_string(),
-                    expected,
-                    found: count,
-                })
-            }
-        };
-        let scale = view.facet_as::<f32>("quant_scale")?;
-        column("quant_scale", scale.count())?;
-        let zero_point = view.facet_as::<i32>("quant_zero_point")?;
-        column("quant_zero_point", zero_point.count())?;
-        let sum = view.facet_as::<i32>("quant_sum")?;
-        column("quant_sum", sum.count())?;
-        Ok(Self { codes, scale, zero_point, sum, scheme })
-    }
-}
-
-impl<V: TestDataView + ?Sized> TestDataViewExt for V {}
 
 /// Open a typed reader for a named facet on any [`TestDataView`].
 ///
@@ -1748,9 +466,12 @@ pub fn open_facet_typed<T: crate::typed_access::Element>(
     // Built on the facet's own storage — the dataset-anchored open a
     // fetch fills — never on its resolved URL, which would key a second
     // cache entry and read past everything the fetch brought in.
-    let storage = view
+    let opened = view
         .open_facet_storage(facet_name)
         .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
+    let storage = opened.as_any().downcast_ref::<FacetStorage>().ok_or_else(|| {
+        crate::typed_access::TypedAccessError::Io(format!("facet '{facet_name}': not a vectordata view's facet"))
+    })?;
     if let Some(source) = view.facet_source(facet_name) {
         let is_scalar = crate::io::is_scalar_ext(
             crate::dataset::source::parse_source_string(&source)
@@ -1797,429 +518,6 @@ pub struct PrebufferProgress {
     pub verified_bytes: u64,
     /// Bytes the facet's fetch covers.
     pub total_bytes: u64,
-}
-
-/// Live cache fill statistics for a single facet's underlying storage.
-/// Returned by [`FacetStorage::cache_stats`]. `None` when the storage
-/// is not cache-backed (e.g., local mmap or direct HTTP).
-#[derive(Debug, Clone)]
-pub struct CacheStats {
-    /// Verified chunks in the local cache.
-    pub valid_chunks: u32,
-    /// Total chunks in the file.
-    pub total_chunks: u32,
-    /// Transfer-chunk size in bytes. Every chunk except the last is
-    /// exactly this size, so consumers can map byte offsets to chunk
-    /// ordinals (e.g. for chunk-aligned sampling or prefetch).
-    pub chunk_size: u64,
-    /// Total content size in bytes.
-    pub content_size: u64,
-    /// Whether every chunk is verified.
-    pub is_complete: bool,
-}
-
-/// What fetching a byte range would actually cost.
-///
-/// Returned by [`FacetStorage::range_fill`]. The unit of fetch is a
-/// chunk, not a byte, so a range's real cost is rarely the range's
-/// length: a 4 KiB window against 8 MiB chunks is 8 MiB, and a window
-/// whose chunks are already resident is free. Both facts have to be
-/// visible *before* the fetch, or a caller cannot tell an incremental
-/// warm-up from a full download wearing one's clothes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RangeFill {
-    /// First chunk covering the range.
-    pub first_chunk: u32,
-    /// Last chunk covering the range, inclusive.
-    pub last_chunk: u32,
-    /// Transfer-chunk size in bytes.
-    pub chunk_size: u64,
-    /// Chunks covering the range.
-    pub chunks: u32,
-    /// Of those, how many are already resident. These cost nothing.
-    pub chunks_resident: u32,
-    /// Bytes of the resident chunks, each at its real length — the
-    /// file's last chunk holds only what is left of the file.
-    pub resident_bytes: u64,
-    /// Byte range the fetch actually spans once widened to chunk
-    /// boundaries — always a superset of what was asked for.
-    pub aligned_start: u64,
-    /// End of that chunk-aligned span (exclusive).
-    pub aligned_end: u64,
-}
-
-impl RangeFill {
-    /// Chunks that still have to be fetched.
-    pub fn chunks_to_fetch(&self) -> u32 {
-        self.chunks.saturating_sub(self.chunks_resident)
-    }
-
-    /// Bytes that will cross the network, at chunk granularity: the
-    /// chunk-aligned span less what is resident. A span ending at the
-    /// end of the file ends with a short chunk, charged at its length.
-    pub fn bytes_to_fetch(&self) -> u64 {
-        self.aligned_end.saturating_sub(self.aligned_start).saturating_sub(self.resident_bytes)
-    }
-
-    /// Bytes fetched beyond the requested range because chunks are the
-    /// granularity. This is the number that tells a caller its
-    /// scattered single-record prefetches are really a full download.
-    pub fn overfetch_bytes(&self, requested_start: u64, requested_end: u64) -> u64 {
-        let requested = requested_end.saturating_sub(requested_start);
-        let spanned = self.aligned_end.saturating_sub(self.aligned_start);
-        spanned.saturating_sub(requested)
-    }
-
-    /// Whether every chunk covering the range is already resident.
-    pub fn is_resident(&self) -> bool {
-        self.chunks_resident >= self.chunks
-    }
-}
-
-/// Map a record range to a byte range for a variable-length facet,
-/// through its offset index.
-///
-/// Merge byte ranges whose fetches would overlap.
-///
-/// The unit of fetch is a chunk, so two ranges landing in the same
-/// chunk are already one fetch — issuing them separately asks for the
-/// same bytes twice. Ranges in *adjacent* chunks are contiguous on the
-/// device, so one request covering both beats two. Ranges with a whole
-/// chunk between them are not merged: bridging that gap would fetch a
-/// chunk nobody asked for.
-///
-/// With `chunk_size` `None` — local storage, which has no chunks —
-/// merging falls back to plain byte overlap or adjacency.
-///
-/// Pure, and separated from the plan so the boundaries can be tested
-/// without a device. Merging one chunk too eagerly silently inflates
-/// every scattered prefetch; merging one too shyly silently doubles the
-/// request count. Neither fails visibly.
-pub(crate) fn coalesce_ranges(
-    mut ranges: Vec<ShardRange>,
-    chunk_size: Option<u64>,
-) -> Vec<ShardRange> {
-    ranges.retain(|r| !r.is_empty());
-    if ranges.len() < 2 {
-        return ranges;
-    }
-    // Sort by shard first: merging is only ever *within* a shard,
-    // because two ranges in different shards are in different files and
-    // cannot share a request (SH-28).
-    ranges.sort_unstable_by_key(|r| (r.shard, r.start, r.end));
-
-    // Do two ranges belong in one request?
-    let joins = |cur_end: u64, next_start: u64| -> bool {
-        match chunk_size.filter(|cs| *cs > 0) {
-            // Touching or overlapping in chunk space: the chunk holding
-            // the current end, and the one holding the next start, are
-            // the same or neighbours.
-            Some(cs) => next_start / cs <= (cur_end - 1) / cs + 1,
-            None => next_start <= cur_end,
-        }
-    };
-
-    let mut merged: Vec<ShardRange> = Vec::with_capacity(ranges.len());
-    for r in ranges {
-        match merged.last_mut() {
-            Some(cur) if cur.shard == r.shard && joins(cur.end, r.start) => {
-                cur.end = cur.end.max(r.end);
-            }
-            _ => merged.push(r),
-        }
-    }
-    merged
-}
-
-/// What a prefetch would fetch, before any of it moves.
-///
-/// The unit of fetch is a chunk, not a byte, so a window's real cost is
-/// rarely its length: a 4 KiB window against 8 MiB chunks is 8 MiB, and
-/// a window whose chunks are resident is free. Both have to be visible
-/// up front, or a caller cannot tell an incremental warm-up from a full
-/// download wearing its clothes.
-#[derive(Debug, Clone, Default)]
-pub struct PrefetchPlan {
-    /// Byte ranges the window resolved to, one per interval, before
-    /// merging. What the caller actually asked for.
-    ///
-    /// **Shard-qualified** (SH-28): a bare `(start, end)` is meaningless
-    /// across a series, because byte 500 exists in every shard. Index 0
-    /// for a single-file facet.
-    pub requested_ranges: Vec<ShardRange>,
-    /// Ranges that will be issued, after merging those whose fetches
-    /// would overlap. One request each.
-    ///
-    /// Merging happens **within** a shard: two ranges in different
-    /// shards are in different files and cannot share a request.
-    pub byte_ranges: Vec<ShardRange>,
-    /// Chunk-level cost of each range. Empty when the facet has no
-    /// chunks — local storage, which is free by definition.
-    pub fills: Vec<RangeFill>,
-    /// Bytes that had to be read before the window could be resolved at
-    /// all — the offset index, for variable-length formats. Zero for
-    /// uniform-stride formats, whose stride comes from a header read
-    /// every reader pays anyway.
-    ///
-    /// Reported whether or not it was paid this time: the index is
-    /// cached on the facet handle, so a plan and the fetch that follows
-    /// it load it once between them, and repeated asks against a handle
-    /// a caller keeps are free. The number is what the mapping *needs*,
-    /// which is what makes one large window cheaper than a hundred
-    /// small ones across freshly-opened handles.
-    pub prerequisite_bytes: u64,
-    /// Set when the window could not be resolved and honouring the
-    /// request means fetching the whole facet: a format whose
-    /// record→byte mapping this layer cannot compute (vvec without its
-    /// index; parquet, excluded by design), or storage with no range
-    /// capability.
-    pub degrades_to_full_download: bool,
-    /// Size of the facet, for reading the degrade case against.
-    pub facet_bytes: u64,
-    /// For a plan that degrades to the whole facet, bytes of it already
-    /// in the local cache — what an interrupted whole-facet fetch left
-    /// behind, which a retry need not fetch again. Zero otherwise.
-    pub resident_bytes: u64,
-}
-
-/// A byte range within a named shard.
-///
-/// The shard index is not decoration: across a series the same byte
-/// offset exists in every file, so a range without one names no bytes
-/// (SH-28). A single-file facet is shard `0`, which is exactly the old
-/// meaning under a new name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShardRange {
-    /// Which shard of the facet this range is in.
-    pub shard: usize,
-    /// Start byte within that shard's file.
-    pub start: u64,
-    /// End byte (exclusive) within that shard's file.
-    pub end: u64,
-}
-
-impl ShardRange {
-    /// A range in the only shard of a single-file facet.
-    pub fn whole(start: u64, end: u64) -> Self {
-        Self {
-            shard: 0,
-            start,
-            end,
-        }
-    }
-
-    /// Bytes this range spans.
-    pub fn len(&self) -> u64 {
-        self.end.saturating_sub(self.start)
-    }
-
-    /// Whether the range names no bytes.
-    pub fn is_empty(&self) -> bool {
-        self.end <= self.start
-    }
-}
-
-/// A range in the only shard compares equal to the plain `(start, end)`
-/// pair it replaced.
-///
-/// This is the migration made explicit rather than papered over: for a
-/// single-file facet the shape changed and the meaning did not, so the
-/// old spelling still answers. A range in shard 1 compares unequal to
-/// any pair, which is correct — a bare pair names no bytes across a
-/// series (SH-28).
-impl PartialEq<(u64, u64)> for ShardRange {
-    fn eq(&self, other: &(u64, u64)) -> bool {
-        self.shard == 0 && self.start == other.0 && self.end == other.1
-    }
-}
-
-impl PrefetchPlan {
-    /// Bytes that will cross the network.
-    pub fn bytes_to_fetch(&self) -> u64 {
-        if self.degrades_to_full_download {
-            return self.facet_bytes.saturating_sub(self.resident_bytes);
-        }
-        self.fills.iter().map(|f| f.bytes_to_fetch()).sum()
-    }
-
-    /// Chunks that still have to be fetched.
-    pub fn chunks_to_fetch(&self) -> u32 {
-        self.fills.iter().map(|f| f.chunks_to_fetch()).sum()
-    }
-
-    /// Requests that will be issued. Lower than the interval count when
-    /// intervals were merged.
-    pub fn requests(&self) -> usize {
-        self.byte_ranges.len()
-    }
-
-    /// Bytes fetched beyond what was asked for.
-    ///
-    /// Two sources, counted together: chunks are the granularity, so a
-    /// 4 KiB window against 8 MiB chunks drags in most of a chunk; and
-    /// merging two nearby intervals bridges the gap between them. Both
-    /// are bytes crossing the wire that nobody asked for, and a caller
-    /// deciding whether its scattered prefetches are really a full
-    /// download needs them in one number.
-    pub fn overfetch_bytes(&self) -> u64 {
-        let spanned: u64 = self
-            .fills
-            .iter()
-            .map(|f| f.aligned_end.saturating_sub(f.aligned_start))
-            .sum();
-        let asked: u64 = self.requested_ranges.iter().map(|r| r.len()).sum();
-        spanned.saturating_sub(asked)
-    }
-
-    /// Whether everything the window covers is already resident, so a
-    /// prefetch would do nothing.
-    pub fn is_resident(&self) -> bool {
-        !self.degrades_to_full_download && self.fills.iter().all(|f| f.is_resident())
-    }
-}
-
-/// Whether a caller will accept the whole facet when the window it
-/// asked for cannot be resolved.
-///
-/// Some formats have no ordinal-to-byte mapping: parquet, whose
-/// windowing is excluded by design, and a vvec whose offset index
-/// cannot be loaded. Asking for records 5M..6M of one of those and
-/// quietly fetching a terabyte is the exact surprise windowed prefetch
-/// exists to prevent, so the fallback is **refused unless the caller
-/// says otherwise**.
-///
-/// This only concerns a window that was actually asked for. A prefetch
-/// with no window is a request for the whole facet, and fetching it is
-/// not a fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WholeFacetFallback {
-    /// An unresolvable window is an error. The default.
-    #[default]
-    Refuse,
-    /// Fetch the entire facet rather than failing. The caller has seen
-    /// the size — [`PrefetchPlan::facet_bytes`] — and accepted it.
-    Allow,
-}
-
-/// Refuse a plan that would fetch the whole facet, unless allowed.
-///
-/// A free function rather than a trait method: a static method on
-/// `TestDataView` would make the trait dyn-incompatible, and every
-/// caller in this crate holds it as `&dyn TestDataView`.
-///
-/// The message carries the size, because the decision the caller has to
-/// make is whether that size is acceptable.
-fn check_fallback(facet: &str, plan: &PrefetchPlan, fallback: WholeFacetFallback) -> Result<()> {
-    if plan.degrades_to_full_download && fallback == WholeFacetFallback::Refuse {
-        return Err(Error::Other(format!(
-            "facet '{facet}': the requested window cannot be resolved for this format, \
-             so honouring it means fetching the whole facet ({} bytes). Pass \
-             WholeFacetFallback::Allow to accept that.",
-            plan.facet_bytes
-        )));
-    }
-    Ok(())
-}
-
-/// A prefetch running on another thread.
-///
-/// The **plan is computed synchronously**, before this is returned, so
-/// a caller learns the cost up front and can decide not to proceed.
-/// Only the fetching moves off-thread — which is the part that takes
-/// time and the part a scan wants to overlap with.
-///
-/// Dropping the handle **detaches**: the fetch keeps running and its
-/// bytes land in the cache, which is what a caller who has moved on
-/// still wants. A failure is logged by the worker whether or not
-/// anybody joins, so an unwatched prefetch cannot fail silently.
-pub struct PrefetchHandle {
-    plan: PrefetchPlan,
-    state: std::sync::Arc<PrefetchState>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-#[derive(Debug, Default)]
-struct PrefetchState {
-    cancelled: std::sync::atomic::AtomicBool,
-    done: std::sync::atomic::AtomicBool,
-    bytes_fetched: std::sync::atomic::AtomicU64,
-    ranges_fetched: std::sync::atomic::AtomicUsize,
-    error: std::sync::Mutex<Option<String>>,
-}
-
-impl PrefetchHandle {
-    /// What this prefetch set out to do. Available immediately.
-    pub fn plan(&self) -> &PrefetchPlan {
-        &self.plan
-    }
-
-    /// Whether the worker has finished — successfully, in error, or by
-    /// cancellation.
-    pub fn is_done(&self) -> bool {
-        self.state.done.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Bytes fetched so far.
-    pub fn bytes_fetched(&self) -> u64 {
-        self.state
-            .bytes_fetched
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Ranges completed so far, of [`PrefetchPlan::requests`].
-    pub fn ranges_fetched(&self) -> usize {
-        self.state
-            .ranges_fetched
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Ask the worker to stop.
-    ///
-    /// **Granular to a range**, not to a byte: a fetch already in
-    /// flight runs to completion, because the transport has no way to
-    /// abandon one part-way and leave the chunk bitmap honest. With one
-    /// large range this cancels nothing; with many small ones it stops
-    /// promptly. Ranges already fetched stay in the cache — a cancelled
-    /// prefetch is partial work, not undone work.
-    pub fn cancel(&self) {
-        self.state
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Whether [`cancel`](Self::cancel) has been called.
-    pub fn is_cancelled(&self) -> bool {
-        self.state
-            .cancelled
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Wait for the fetch and report what it did.
-    pub fn join(mut self) -> Result<PrefetchReport> {
-        if let Some(t) = self.thread.take() {
-            // A worker panic is a bug here, not a fetch failure; say so
-            // rather than reporting it as an I/O error.
-            t.join()
-                .map_err(|_| Error::Other("prefetch worker panicked".into()))?;
-        }
-        if let Some(e) = self.state.error.lock().unwrap().take() {
-            return Err(Error::Other(e));
-        }
-        Ok(PrefetchReport {
-            planned: self.plan.clone(),
-            ranges_fetched: self.ranges_fetched(),
-        })
-    }
-}
-
-/// What a prefetch actually did.
-#[derive(Debug, Clone, Default)]
-pub struct PrefetchReport {
-    /// The plan as it stood before fetching.
-    pub planned: PrefetchPlan,
-    /// Byte ranges handed to the transport. Fewer than the plan's when
-    /// ranges were merged.
-    pub ranges_fetched: usize,
 }
 
 /// How to open one of a series' files, recorded at handle creation so
@@ -2756,61 +1054,6 @@ impl FacetStorage {
         let len = len.min(self.total_size());
         self.storage.read_bytes(0, len)
     }
-    /// The facet's content identity ([`ContentId`](crate::merkle::ContentId)):
-    /// the root of a merkle tree over its bytes at the 8 MiB chunk
-    /// size — the publisher's for a facet with a `.mref`, the one
-    /// recorded as its chunks were fetched for one without (`None`
-    /// until every chunk is here), a local file's computed once per
-    /// process. Equal bytes have equal roots, whichever way. `None`
-    /// for a series. [`content_id_with_progress`](Self::content_id_with_progress)
-    /// reports any hashing it takes.
-    pub fn content_id(&self) -> std::io::Result<Option<crate::merkle::ContentId>> {
-        self.content_id_with_progress(&mut |_, _| {})
-    }
-
-    /// [`content_id`](Self::content_id), hearing `(done, total)` bytes
-    /// of any hashing.
-    pub fn content_id_with_progress(
-        &self,
-        progress: &mut dyn FnMut(u64, u64),
-    ) -> std::io::Result<Option<crate::merkle::ContentId>> {
-        match &self.series {
-            None => self.storage.content_id(progress),
-            Some(_) => Ok(None),
-        }
-    }
-
-    /// The content identity the cache already knows, reading nothing
-    /// (a published root, or a recorded one once fetched): what
-    /// [`content_id`](Self::content_id) answers without hashing. `None`
-    /// for a local file and a series.
-    pub fn known_content_id(&self) -> Option<crate::merkle::ContentId> {
-        match &self.series {
-            None => self.storage.known_content_id(),
-            Some(_) => None,
-        }
-    }
-
-    /// Check the cached chunks against what they were verified or
-    /// recorded as when they landed: the chunk numbers whose bytes no
-    /// longer match (local corruption), `None` for a local file.
-    pub fn verify_cached(&self, progress: &mut dyn FnMut(u64, u64)) -> std::io::Result<Option<Vec<u32>>> {
-        match &self.series {
-            None => self.storage.verify_cached(progress),
-            Some(series) => {
-                let mut bad = Vec::new();
-                let mut any = false;
-                for i in 0..series.file_count() {
-                    if let Some(b) = series.file(i).map_err(std::io::Error::other)?.verify_cached(progress)? {
-                        any = true;
-                        bad.extend(b);
-                    }
-                }
-                Ok(any.then_some(bad))
-            }
-        }
-    }
-
     /// Low-level: download everything this facet can address. Most
     /// callers want [`TestDataView::fetch`], which plans, checks cache
     /// space and reports progress.
@@ -3118,7 +1361,7 @@ impl FacetStorage {
     /// cache file is pre-sized and sparse until complete, its validity
     /// lives in a separate chunk bitmap, and a series spans several
     /// files; only vectordata's readers account for all of that. Read
-    /// through [`TestDataView::base_vectors`], [`TestDataView::facet`]
+    /// through [`TestDataViewExt::base_vectors_as`], [`TestDataViewExt::facet_as`]
     /// and the other facet readers, which are zero-copy once the facet
     /// is fetched.
     ///
@@ -3134,7 +1377,7 @@ impl FacetStorage {
     /// order — one per shard for a series — for tools that manage files
     /// (hash, copy, inspect the cache). **Not an access path for the
     /// data:** read vectors through the facet's readers
-    /// ([`TestDataView::base_vectors`], [`TestDataView::facet`], …), which
+    /// ([`TestDataViewExt::base_vectors_as`], [`TestDataViewExt::facet_as`], …), which
     /// are zero-copy once the facet is fetched and know the record
     /// layout, shard boundaries and windows that a raw file does not.
     /// `None` when any file has no local copy yet.
@@ -3292,6 +1535,149 @@ impl FacetStorage {
             });
         }
         acc
+    }
+}
+
+/// vectordata's facet handle as the API's [`FacetBytes`]: each method
+/// is the inherent one of the same name, or, for content identity and
+/// the cache check, the storage layer's, reporting as a [`ProgressSink`](crate::ProgressSink).
+impl FacetBytes for FacetStorage {
+    fn total_size(&self) -> u64 {
+        FacetStorage::total_size(self)
+    }
+
+    fn try_total_size(&self) -> Result<u64> {
+        FacetStorage::try_total_size(self)
+    }
+
+    fn is_complete(&self) -> bool {
+        FacetStorage::is_complete(self)
+    }
+
+    fn is_local(&self) -> bool {
+        FacetStorage::is_local(self)
+    }
+
+    fn is_series(&self) -> bool {
+        self.series.is_some()
+    }
+
+    fn shard_sizes(&self) -> Vec<u64> {
+        FacetStorage::shard_sizes(self)
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        FacetStorage::resident_bytes(self)
+    }
+
+    fn cache_path(&self) -> Option<std::path::PathBuf> {
+        FacetStorage::cache_path(self)
+    }
+
+    fn local_files(&self) -> Option<Vec<std::path::PathBuf>> {
+        FacetStorage::local_files(self)
+    }
+
+    fn cache_stats(&self) -> Option<CacheStats> {
+        FacetStorage::cache_stats(self)
+    }
+
+    fn range_fill(&self, byte_start: u64, byte_end: u64) -> Option<RangeFill> {
+        FacetStorage::range_fill(self, byte_start, byte_end)
+    }
+
+    fn shard_range_fill(&self, shard: usize, byte_start: u64, byte_end: u64) -> Option<RangeFill> {
+        FacetStorage::shard_range_fill(self, shard, byte_start, byte_end)
+    }
+
+    fn read_prefix(&self, len: u64) -> std::io::Result<Vec<u8>> {
+        FacetStorage::read_prefix(self, len)
+    }
+
+    fn map_records(&self, path: &str, start: u64, end: u64) -> Option<MappedRange> {
+        record_range_to_bytes(path, start, end, self)
+    }
+
+    fn precache(&self) -> std::io::Result<()> {
+        FacetStorage::precache(self)
+    }
+
+    fn prebuffer_with_progress(&self, cb: &mut dyn FnMut(&crate::DownloadProgress)) -> std::io::Result<()> {
+        FacetStorage::prebuffer_with_progress(self, cb)
+    }
+
+    fn prebuffer_parts(&self, cb: &mut dyn FnMut(usize, &crate::DownloadProgress)) -> std::io::Result<()> {
+        FacetStorage::prebuffer_parts(self, cb)
+    }
+
+    fn prebuffer_range_with_progress(
+        &self,
+        byte_start: u64,
+        byte_end: u64,
+        cb: &mut dyn FnMut(&crate::DownloadProgress),
+    ) -> std::io::Result<()> {
+        FacetStorage::prebuffer_range_with_progress(self, byte_start, byte_end, cb)
+    }
+
+    fn prebuffer_shard_range(
+        &self,
+        shard: usize,
+        byte_start: u64,
+        byte_end: u64,
+        cb: &mut dyn FnMut(&crate::DownloadProgress),
+    ) -> std::io::Result<()> {
+        FacetStorage::prebuffer_shard_range(self, shard, byte_start, byte_end, cb)
+    }
+
+    fn revalidate(&self) -> std::io::Result<bool> {
+        FacetStorage::revalidate(self)
+    }
+
+    fn content_id_with_progress(
+        &self,
+        progress: &mut dyn crate::ProgressSink,
+    ) -> std::io::Result<Option<crate::ContentId>> {
+        match &self.series {
+            None => self.storage.content_id(&mut |done, total| progress.report("hashing", done, total)),
+            Some(_) => Ok(None),
+        }
+    }
+
+    fn known_content_id(&self) -> Option<crate::ContentId> {
+        match &self.series {
+            None => self.storage.known_content_id(),
+            Some(_) => None,
+        }
+    }
+
+    fn verify_cached(&self, progress: &mut dyn crate::ProgressSink) -> std::io::Result<Option<Vec<u32>>> {
+        let mut hear = |done: u64, total: u64| progress.report("verifying cached chunks", done, total);
+        match &self.series {
+            None => self.storage.verify_cached(&mut hear),
+            Some(series) => {
+                let mut bad = Vec::new();
+                let mut any = false;
+                for i in 0..series.file_count() {
+                    if let Some(b) = series.file(i).map_err(std::io::Error::other)?.verify_cached(&mut hear)? {
+                        any = true;
+                        bad.extend(b);
+                    }
+                }
+                Ok(any.then_some(bad))
+            }
+        }
+    }
+
+    fn open_records(
+        &self,
+        facet: &str,
+        namespace: Option<&str>,
+    ) -> std::result::Result<crate::records::RecordFacet, crate::records::RecordError> {
+        crate::records::open_record_facet(self, facet, namespace)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -3784,7 +2170,7 @@ impl GenericTestDataView {
         // window inside the series is in file ordinals and has already
         // been folded into the shards.
         if facet.is_series() {
-            let storage = self.open_facet_storage(name)?;
+            let storage = self.facet_storage(name)?;
             let series = storage
                 .series_ref()
                 .ok_or_else(|| Error::Other(format!("facet '{name}': series not realized")))?
@@ -3841,7 +2227,7 @@ impl GenericTestDataView {
         // second cache entry by URL: everything downloaded twice, and
         // every read a range request against the empty one.
         let (_, container) = io::require_native::<N>(&path_str)?;
-        let storage = self.open_facet_storage(name)?;
+        let storage = self.facet_storage(name)?;
         let reader: Box<dyn VectorReader<N>> = match container {
             crate::typed_access::Container::Scalar => {
                 Box::new(io::scalar_from_storage::<N>(storage.storage_handle())?)
@@ -3885,7 +2271,7 @@ impl GenericTestDataView {
                 }
                 .into());
             }
-            let storage = self.open_facet_storage(name)?;
+            let storage = self.facet_storage(name)?;
             let series = storage
                 .series_ref()
                 .ok_or_else(|| Error::Other(format!("facet '{name}': series not realized")))?
@@ -3900,7 +2286,7 @@ impl GenericTestDataView {
         // offset index's sidecar lives.
         let path_or_url = self.resolve_as_string(facet)?;
         io::IndexedVvecReader::<T>::validate_source(&path_or_url)?;
-        let storage = self.open_facet_storage(name)?;
+        let storage = self.facet_storage(name)?;
         Ok(Arc::new(io::vvec_from_storage::<T>(
             storage.storage_handle(),
             &path_or_url,
@@ -4197,53 +2583,6 @@ impl GenericTestDataView {
 }
 
 impl TestDataView for GenericTestDataView {
-    fn base_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>> {
-        self.open_uniform(self.config.base_vectors.as_ref(), "base_vectors")
-    }
-
-    fn query_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>> {
-        self.open_uniform(self.config.query_vectors.as_ref(), "query_vectors")
-    }
-
-    fn neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>> {
-        self.open_uniform(self.config.neighbor_indices.as_ref(), "neighbor_indices")
-    }
-
-    fn neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
-        self.open_uniform(
-            self.config.neighbor_distances.as_ref(),
-            "neighbor_distances",
-        )
-    }
-
-    fn prefiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>> {
-        self.open_uniform(
-            self.config.prefiltered_neighbor_indices.as_ref(),
-            "prefiltered_neighbor_indices",
-        )
-    }
-
-    fn prefiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
-        self.open_uniform(
-            self.config.prefiltered_neighbor_distances.as_ref(),
-            "prefiltered_neighbor_distances",
-        )
-    }
-
-    fn postfiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>> {
-        self.open_uniform(
-            self.config.postfiltered_neighbor_indices.as_ref(),
-            "postfiltered_neighbor_indices",
-        )
-    }
-
-    fn postfiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
-        self.open_uniform(
-            self.config.postfiltered_neighbor_distances.as_ref(),
-            "postfiltered_neighbor_distances",
-        )
-    }
-
     fn metadata_content(&self) -> Option<&FacetConfig> {
         self.config.metadata_content.as_ref()
     }
@@ -4262,10 +2601,6 @@ impl TestDataView for GenericTestDataView {
 
     fn facet_manifest(&self) -> HashMap<String, FacetDescriptor> {
         self.collect_facets()
-    }
-
-    fn metadata_results(&self) -> Result<Arc<dyn VvecReader<i32>>> {
-        self.open_variable(self.config.predicate_results.as_ref(), "metadata_results")
     }
 
     fn open_facet_as_type(
@@ -4296,17 +2631,6 @@ impl TestDataView for GenericTestDataView {
             let reader = self.open_variable::<T>(config, name)?;
             Ok(<T as crate::io::AnyElement>::into_any_vvec(reader))
         })
-    }
-
-    fn facet(&self, name: &str) -> Result<Arc<dyn VectorReader<f32>>> {
-        // Try standard facets first (uniform vector types). The legacy
-        // `filtered_*` aliases route to the prefilter distances method
-        // because legacy on-disk files carry pre-filter shape.
-        let name = match name {
-            "filtered_neighbor_distances" => "prefiltered_neighbor_distances",
-            other => other,
-        };
-        self.open_uniform::<f32>(self.facet_config_by_name(name), name)
     }
 
     fn facet_element_type(&self, name: &str) -> Result<crate::typed_access::ElementType> {
@@ -4387,7 +2711,32 @@ impl TestDataView for GenericTestDataView {
         self.resolve_path_str(&path_str).ok()
     }
 
-    fn open_facet_storage(&self, name: &str) -> Result<FacetStorage> {
+    fn open_facet_storage(&self, name: &str) -> Result<Box<dyn FacetBytes>> {
+        Ok(Box::new(self.facet_storage(name)?))
+    }
+
+    fn cache_capacity(&self) -> crate::fetch::CapacityCheck {
+        crate::fetch::CapacityCheck::new(|bytes| Ok(crate::cache::ensure_cache_capacity(bytes)?))
+    }
+
+    fn normalization(&self) -> Result<crate::verify::Normalization> {
+        crate::verify::normalization(self)
+    }
+
+    fn verify_report(
+        &self,
+        options: &crate::verify::VerifyOptions,
+        progress: &mut dyn crate::ProgressSink,
+    ) -> crate::verify::VerifyReport {
+        crate::verify::verify_view(self, options, progress)
+    }
+}
+
+impl GenericTestDataView {
+    /// The facet's bytes as vectordata's own handle: what the trait's
+    /// [`open_facet_storage`](TestDataView::open_facet_storage) boxes,
+    /// and what the readers here are built from.
+    pub fn facet_storage(&self, name: &str) -> Result<FacetStorage> {
         let facet = self
             .facet_config_by_name(name)
             .ok_or_else(|| Error::MissingFacet(name.to_string()))?;

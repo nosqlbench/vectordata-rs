@@ -19,6 +19,9 @@ veks-datatypes = { path = "../veks-datatypes", version = "=4.0.2" }
 # The one implementation of the file formats: vectordata's readers are
 # veks-io's over its own storage (srd-loose-files-overlays-integrity §6.1).
 veks-io = { path = "../veks-io", version = "=4.0.2" }
+# The API vectordata implements: the dataset, catalog, reader and source
+# contracts and the descriptor model (srd-crate-boundaries.md §4).
+veks-apicore = { path = "../veks-apicore", version = "=4.0.2" }
 veks-anode = { path = "../veks-anode", version = "=4.0.2" }
 slabtastic = { path = "../slabtastic", version = "=4.0.2" }
 regex = "1"

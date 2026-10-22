@@ -32,60 +32,9 @@
 //! # Ok::<(), vectordata::Error>(())
 //! ```
 
-use std::fmt;
 
-use super::CatalogDiagnostic;
+use super::{CatalogDiagnostic, CatalogOrigin, CatalogSource};
 use crate::dataset::CatalogEntry;
-
-/// A catalog: a named supply of [`CatalogEntry`] values.
-///
-/// The crate provides [`LocatedCatalog`] (a file, directory or URL) and
-/// [`BuiltCatalog`] (from [`CatalogBuilder`]). A program may implement it
-/// to serve entries from anywhere else.
-pub trait CatalogSource: Send + Sync {
-    /// The catalog's symbolic name: what provenance, ambiguity reports
-    /// and the catalogs screen show.
-    fn name(&self) -> &str;
-
-    /// Where it came from, for display and diagnostics.
-    fn origin(&self) -> CatalogOrigin;
-
-    /// Its entries. `None` when there is no catalog there at all, such
-    /// as a location with no catalog file; the set it belongs to decides
-    /// whether that is an error. Problems with what is there (a file
-    /// that does not parse, an entry skipped) go into `diagnostics`,
-    /// never to stdout.
-    fn entries(&self, diagnostics: &mut Vec<CatalogDiagnostic>) -> Option<Vec<CatalogEntry>>;
-}
-
-/// Where a [`CatalogSource`] came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CatalogOrigin {
-    /// A file, directory or URL, as written: a catalog location is a
-    /// cache identity (its kept copy is named by it), so it is never
-    /// re-spelled.
-    Located {
-        /// The location.
-        location: String,
-        /// The `catalogs.yaml` that names it, when one does.
-        configured_in: Option<String>,
-    },
-    /// Built in memory by a program; `label` is what diagnostics and
-    /// the catalogs screen show.
-    Registered {
-        /// The label.
-        label: String,
-    },
-}
-
-impl fmt::Display for CatalogOrigin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CatalogOrigin::Located { location, .. } => f.write_str(location),
-            CatalogOrigin::Registered { label } => f.write_str(label),
-        }
-    }
-}
 
 /// Whether a catalog in a [`CatalogSources`](super::CatalogSources) set
 /// must load.

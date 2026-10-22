@@ -46,49 +46,7 @@ pub(crate) fn download_concurrency() -> usize {
         .unwrap_or(crate::transport::DEFAULT_PARALLEL_STREAMS)
 }
 
-/// Raised when the configured cache directory cannot hold a planned
-/// download. Carries the three numbers a user needs to act on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InsufficientCacheSpace {
-    /// The configured cache directory the download would write into.
-    pub cache_dir: PathBuf,
-    /// Bytes the download still needs to fetch (already-resident
-    /// bytes are excluded by the caller).
-    pub needed: u64,
-    /// Bytes currently free on the cache directory's filesystem.
-    pub available: u64,
-}
-
-impl std::fmt::Display for InsufficientCacheSpace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "not enough free space in cache directory {}: need {} ({} B) but only {} ({} B) available. \
-             Free up space, or point the cache elsewhere (set `cache_dir` in settings or VECTORDATA_HOME).",
-            self.cache_dir.display(),
-            fmt_gib(self.needed),
-            self.needed,
-            fmt_gib(self.available),
-            self.available,
-        )
-    }
-}
-
-impl std::error::Error for InsufficientCacheSpace {}
-
-/// Compact binary-unit rendering for capacity messages (GiB/MiB).
-/// Local to the cache module so the one error string doesn't reach
-/// across into the `datasets` formatter.
-fn fmt_gib(bytes: u64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    let b = bytes as f64;
-    if b >= GIB {
-        format!("{:.1} GiB", b / GIB)
-    } else {
-        format!("{:.1} MiB", b / MIB)
-    }
-}
+pub use veks_apicore::error::InsufficientCacheSpace;
 
 /// Fail fast when the configured cache directory cannot hold `needed`
 /// additional bytes. Returns `Ok(())` — i.e. lets the download

@@ -1305,7 +1305,7 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
     // facet the pipeline split under the shard cap has shards on disk
     // and nothing at its declared filename (SH-37).
     let workspace = dataset_path.parent().unwrap_or(std::path::Path::new("."));
-    let reconciled = config.reconcile_shard_declarations(workspace);
+    let reconciled = vectordata::dataset::DatasetConfigIo::reconcile_shard_declarations(&mut config, workspace);
     if reconciled > 0 {
         eprintln!("  declared {reconciled} facet(s) as multi-file series");
     }

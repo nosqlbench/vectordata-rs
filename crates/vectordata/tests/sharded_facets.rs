@@ -9,8 +9,8 @@
 //!
 //! See `docs/design/srd-multifile-facet-shards.md`.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 mod support;
@@ -213,7 +213,7 @@ fn a_plain_facet_is_untouched_by_any_of_this() {
     assert!(storage.is_complete());
 
     // And it still reads, through the ordinary reader path.
-    let reader = view.base_vectors().unwrap();
+    let reader = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(reader.count(), 50);
     assert_eq!(reader.dim(), 4);
 }
@@ -296,7 +296,7 @@ fn a_series_reads_identically_to_the_single_file_it_was_split_from() {
     let open = |dir: &std::path::Path| {
         let g = vectordata::TestDataGroup::load(dir.to_str().unwrap()).unwrap();
         let v = g.profile("default").unwrap();
-        v.base_vectors().unwrap()
+        v.base_vectors_as::<f32>().unwrap()
     };
     let a = open(&single);
     let b = open(&series);
@@ -329,7 +329,7 @@ fn reading_past_the_series_end_is_out_of_bounds() {
     .unwrap();
 
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    let r = g.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(r.count(), 15);
     assert!(r.get(14).is_ok());
     assert!(r.get(15).is_err(), "one past the end must fail");
@@ -364,8 +364,8 @@ fn a_profile_window_clips_the_series_not_a_shard() {
     .unwrap();
     let full = vectordata::TestDataGroup::load(full_dir.to_str().unwrap()).unwrap();
 
-    let windowed = g.profile("default").unwrap().base_vectors().unwrap();
-    let whole = full.profile("default").unwrap().base_vectors().unwrap();
+    let windowed = g.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
+    let whole = full.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
 
     assert_eq!(windowed.count(), 100, "the window spans a shard boundary");
     // Window record 0 is facet record 50, which lives in shard 0;
@@ -396,7 +396,7 @@ fn a_series_with_a_disagreeing_shard_is_refused() {
     .unwrap();
 
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-    let msg = match g.profile("default").unwrap().base_vectors() {
+    let msg = match g.profile("default").unwrap().base_vectors_as::<f32>() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("shards of different shapes must not open as one facet"),
     };
@@ -515,7 +515,7 @@ fn a_vvec_series_reads_through_per_file_indexes() {
 
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    let r = view.metadata_results().unwrap();
+    let r = view.metadata_results_as::<i32>().unwrap();
 
     assert_eq!(r.count(), 16, "the series spans both shards");
     // Shard 0, record 0: dim 1, value 0.
@@ -547,7 +547,7 @@ fn a_vvec_series_matches_the_single_file_it_was_split_from() {
     .unwrap();
 
     let g = vectordata::TestDataGroup::load(single.to_str().unwrap()).unwrap();
-    let whole = g.profile("default").unwrap().metadata_results().unwrap();
+    let whole = g.profile("default").unwrap().metadata_results_as::<i32>().unwrap();
     assert_eq!(whole.count(), 16);
     for i in 0..16 {
         assert_eq!(whole.dim_at(i).unwrap(), dims[i] as usize, "dim at {i}");
@@ -557,6 +557,7 @@ fn a_vvec_series_matches_the_single_file_it_was_split_from() {
 // ─── Prefetch planning over a series ───────────────────────────────
 
 use vectordata::WholeFacetFallback;
+use vectordata::TestDataViewExt;
 use vectordata::dataset::source::parse_window;
 use vectordata::dataset::Sharding;
 
@@ -724,9 +725,9 @@ fn a_window_on_a_uniform_pattern_bounds_the_reader() {
     .unwrap();
 
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-    let full = g.profile("default").unwrap().base_vectors().unwrap();
+    let full = g.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(full.count(), 25);
-    let sized = g.profile("small").unwrap().base_vectors().unwrap();
+    let sized = g.profile("small").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(sized.count(), 12, "the window bounds the facet, not a file");
     assert_eq!(sized.get(0).unwrap()[0], 0.0);
     assert_eq!(sized.get(11).unwrap()[0], 11.0, "the window crosses the first seam");
@@ -820,9 +821,9 @@ fn a_derived_series_round_trips_through_the_reader() {
 
     // And it reads back, record for record, as the source did.
     let orig = vectordata::TestDataGroup::load(src.to_str().unwrap()).unwrap();
-    let orig_r = orig.profile("default").unwrap().base_vectors().unwrap();
+    let orig_r = orig.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     let derived = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
-    let derived_r = derived.profile("default").unwrap().base_vectors().unwrap();
+    let derived_r = derived.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
 
     assert_eq!(derived_r.count(), 250);
     assert_eq!(derived_r.dim(), orig_r.dim());
@@ -1023,7 +1024,7 @@ fn a_series_wider_than_the_descriptor_budget_still_reads() {
 
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    let r = view.base_vectors().unwrap();
+    let r = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(r.count(), n);
 
     // Every record reads, in order and out of order — the second pass
@@ -1037,10 +1038,11 @@ fn a_series_wider_than_the_descriptor_budget_still_reads() {
 
     // And the budget was enforced along the way: reading every record
     // touched every file, but no more than the cap are held open.
-    let storage = view.open_facet_storage("base_vectors").unwrap();
+    let opened = view.open_facet_storage("base_vectors").unwrap();
+    let storage = opened.as_any().downcast_ref::<vectordata::FacetStorage>().expect("a vectordata facet");
     let series = storage.series_ref().expect("a series");
     for i in 0..n {
-        let _ = view.base_vectors().unwrap().get(i).unwrap();
+        let _ = view.base_vectors_as::<f32>().unwrap().get(i).unwrap();
     }
     assert!(
         series.open_file_count() <= vectordata::view::open_file_cap(),
@@ -1237,7 +1239,7 @@ fn a_sharded_derive_declares_version_two() {
     assert_eq!(
         g.profile("default")
             .unwrap()
-            .base_vectors()
+            .base_vectors_as::<f32>()
             .unwrap()
             .count(),
         250
@@ -1357,7 +1359,7 @@ fn a_gap_in_the_middle_of_a_series_is_reported_by_name() {
 
     // And a read that would land past the gap must not answer from the
     // shard that happens to be there.
-    let reader = view.base_vectors();
+    let reader = view.base_vectors_as::<f32>();
     if let Ok(r) = reader {
         assert!(
             r.get(250).is_err(),
@@ -1401,8 +1403,8 @@ fn a_shard_sharing_a_basename_with_another_facet_reads_its_own_bytes() {
     // Local files resolve to distinct absolute paths, so this dataset
     // is legal on disk; the guard is a catalog-cache concern. What must
     // hold either way is that the two facets read their own bytes.
-    let base = view.base_vectors().unwrap();
-    let query = view.query_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
+    let query = view.query_vectors_as::<f32>().unwrap();
     assert_eq!(base.count(), 100);
     assert_eq!(query.count(), 50);
     assert_eq!(base.get(50).unwrap()[0], 50.0, "shard 1 of base_vectors");
@@ -1461,7 +1463,7 @@ fn the_cli_stride_and_the_yaml_key_mean_the_same_number() {
     );
     // And the dataset that comes back out reads as one facet.
     let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
-    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    let r = g.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(r.count(), 250);
     assert_eq!(r.get(249).unwrap()[0], 249.0);
 }
@@ -1489,7 +1491,7 @@ fn a_sliced_series_publishes_whole_files() {
 
     // The declaration reads 70 of the 200 records on disk.
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
-    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    let r = g.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(r.count(), 70);
     assert_eq!(r.get(0).unwrap()[0], 20.0, "the first entry's window applies");
     assert_eq!(r.get(40).unwrap()[0], 100.0, "the second entry starts at its own base");
@@ -1542,7 +1544,7 @@ fn validation_reports_a_non_canonical_series_without_rewriting_it() {
     // The reader accepts it, and the file on disk is untouched.
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     assert_eq!(
-        g.profile("default").unwrap().base_vectors().unwrap().count(),
+        g.profile("default").unwrap().base_vectors_as::<f32>().unwrap().count(),
         40
     );
     assert_eq!(
@@ -1603,10 +1605,10 @@ fn saving_a_sharded_dataset_preserves_its_series() {
 
     let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    let base = view.base_vectors().unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(base.count(), 150, "the uniform series survived the round trip");
     assert_eq!(base.get(149).unwrap()[0], 149.0);
-    let query = view.query_vectors().unwrap();
+    let query = view.query_vectors_as::<f32>().unwrap();
     assert_eq!(query.count(), 40, "the explicit series kept both entries");
     assert_eq!(query.get(39).unwrap()[0], 39.0);
 }
@@ -1671,7 +1673,8 @@ fn a_local_series_reports_local_through_its_handle() {
 
     let g = vectordata::TestDataGroup::load(ds.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    let storage = view.open_facet_storage("base_vectors").unwrap();
+    let opened = view.open_facet_storage("base_vectors").unwrap();
+    let storage = opened.as_any().downcast_ref::<vectordata::FacetStorage>().expect("a vectordata facet");
 
     // The declared source is the NNNN pattern, which names no file —
     // the series must classify its shards, not that.

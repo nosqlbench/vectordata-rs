@@ -8,8 +8,8 @@
 //! and a choice that cannot take effect is refused. The choice is
 //! per-process, so each case runs in a fresh process.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 mod support;
@@ -20,6 +20,7 @@ use std::process::Command;
 use support::fixtures::{fvec_value, write_catalogs, write_fvec, write_mref};
 use support::testserver::TestServer;
 use vectordata::fetch::{FetchRequest, Silent};
+use vectordata::TestDataViewExt;
 use vectordata::settings::{self, CacheDirConflict};
 
 const CASE: &str = "VECTORDATA_TEST_CACHE_DIR_CASE";
@@ -107,7 +108,7 @@ fn own_cache_in_a_child() {
     let group = vectordata::TestDataGroup::load(&format!("{}owned/", server.base_url())).unwrap();
     let view = group.profile("default").unwrap();
     view.fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent).unwrap();
-    assert_eq!(view.base_vectors().unwrap().get(399).unwrap()[7], fvec_value(2.1e8, 8, 399, 7));
+    assert_eq!(view.base_vectors_as::<f32>().unwrap().get(399).unwrap()[7], fvec_value(2.1e8, 8, 399, 7));
 }
 
 /// **A choice made after a dataset file was opened in the configured
@@ -169,7 +170,7 @@ fn catalog_first_in_a_child() {
     let own = home.join("own-cache");
     settings::set_cache_dir(&own).expect("loading catalogs and definitions is not using the cache for data");
     group.fetch(&FetchRequest::facets(["base_vectors"]), &mut Silent).unwrap();
-    assert_eq!(group.view().unwrap().base_vectors().unwrap().get(5).unwrap()[2], fvec_value(2.4e8, 8, 5, 2));
+    assert_eq!(group.view().unwrap().base_vectors_as::<f32>().unwrap().get(5).unwrap()[2], fvec_value(2.4e8, 8, 5, 2));
     let again = vectordata::catalog::Catalog::of(&sources);
     assert!(again.diagnostics().is_empty(), "{:?}", again.diagnostics());
 }

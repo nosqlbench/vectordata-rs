@@ -981,27 +981,7 @@ pub fn distinct_data_sizes(entries: &[&CatalogEntry], mode: ProbeMode) -> Vec<u6
     set.into_iter().collect()
 }
 
-/// Render a byte count for the data axis: the largest decimal byte
-/// unit (`TB`/`GB`/`MB`/`KB`) whose rounded quotient is at least 10,
-/// so values keep 2–4 significant digits and read unmistakably as
-/// bytes (`118MB`, `12GB`) rather than counts (`100k`). Rounding
-/// error is at most half the displayed unit — exactly the tolerance
-/// the `--with-data` filter applies, so a displayed candidate always
-/// matches the dataset it came from.
-pub fn format_bytes_approx(n: u64) -> String {
-    for (mult, suffix) in [
-        (1_000_000_000_000u64, "TB"),
-        (1_000_000_000, "GB"),
-        (1_000_000, "MB"),
-        (1_000, "KB"),
-    ] {
-        let rounded = (n + mult / 2) / mult;
-        if rounded >= 10 {
-            return format!("{rounded}{suffix}");
-        }
-    }
-    n.to_string()
-}
+pub use veks_apicore::dataset::shard_sizing::format_bytes_approx;
 
 /// Render `n` in the most compact form [`parse_number_with_suffix`]
 /// reads back exactly: the largest decimal suffix (`t`/`g`/`m`/`k`)

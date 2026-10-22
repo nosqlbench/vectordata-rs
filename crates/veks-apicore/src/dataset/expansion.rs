@@ -374,11 +374,13 @@ pub fn expand_per_profile_steps_scoped(
             // `window.0[0]` picks up the empty `[0,0)` → base_n = 0 →
             // divide-by-zero downstream. `..` is the interval separator,
             // matching the inline authoring form `file.fvec[0..N)`.
-            if base_count_opt.is_some() && !is_partition && !expanded_options.contains_key("range") {
+            if let Some(base_end) = base_count_opt
+                && !is_partition
+                && !expanded_options.contains_key("range")
+            {
                 // base_end = base_count. See `base_end_str` above for
                 // why query_count is NOT added — by compute-knn time
                 // the base file holds only base vectors.
-                let base_end = base_count_opt.unwrap();
                 expanded_options.insert(
                     "range".to_string(),
                     serde_yaml::Value::String(format!("[0..{})", base_end)),

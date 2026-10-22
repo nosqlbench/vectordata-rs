@@ -26,8 +26,8 @@
 //! port; the `Storage` layer goes through `HttpTransport` →
 //! `ChunkStore` exactly as it would for an S3 fetch.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 mod support;
@@ -40,6 +40,7 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
 
 use vectordata::{VectorReader, XvecReader};
+use vectordata::TestDataViewExt;
 
 use support::testserver::TestServer;
 
@@ -366,7 +367,7 @@ profiles:
     fs.precache().expect("precache succeeds end-to-end");
     assert!(fs.is_complete(), "facet must be complete after precache");
 
-    // Concurrent reads via view.base_vectors() — different
+    // Concurrent reads via view.base_vectors_as::<f32>() — different
     // entry path than open_facet_storage, but the underlying
     // Storage Arc is shared via the registry. With the file
     // fully mmapped, reads should be zero-copy fast.
@@ -378,7 +379,7 @@ profiles:
             scope.spawn(move || {
                 let group = TestDataGroup::load(&url).unwrap();
                 let view = group.profile("default").unwrap();
-                let base = view.base_vectors().unwrap();
+                let base = view.base_vectors_as::<f32>().unwrap();
                 let mut rng = SmallRng::seed_from_u64(0xa15c_b00b ^ w as u64);
                 for _ in 0..100 {
                     let i = rng.random_range(0..STRESS_COUNT);
@@ -431,7 +432,7 @@ profiles:
     for session in 0..12 {
         let group = TestDataGroup::load(&url).unwrap();
         let view = group.profile("default").unwrap();
-        let base = view.base_vectors().unwrap();
+        let base = view.base_vectors_as::<f32>().unwrap();
         let reads = rng.random_range(5..40);
         for _ in 0..reads {
             let i = rng.random_range(0..STRESS_COUNT);
@@ -447,7 +448,7 @@ profiles:
     {
         let group = TestDataGroup::load(&url).unwrap();
         let view = group.profile("default").unwrap();
-        let base = view.base_vectors().unwrap();
+        let base = view.base_vectors_as::<f32>().unwrap();
         for i in 0..STRESS_COUNT {
             let v = base.get(i).unwrap();
             assert_eq!(v, expected_vec(i, STRESS_DIM));

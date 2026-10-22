@@ -1,7 +1,7 @@
 //! Library API. The reader's view of a `dataset.yaml`.
 //!
 //! [`DatasetConfig`], [`ProfileConfig`] and [`FacetConfig`] are what
-//! [`TestDataGroup`](crate::TestDataGroup) and the dataset views read:
+//! vectordata's `TestDataGroup` and the dataset views read:
 //! each profile's standard facets, resolved. They are a **projection** of
 //! the one description type, [`crate::dataset::DatasetConfig`], which
 //! parses the file, applies the version gates and the inheritance rule,
@@ -202,7 +202,7 @@ impl DatasetConfig {
     /// `variables:` block, then the description is projected. Every
     /// open goes through this, from a file, a URL, a catalog entry or a
     /// description built in code.
-    pub(crate) fn opened(mut description: crate::dataset::DatasetConfig) -> Self {
+    pub fn opened(mut description: crate::dataset::DatasetConfig) -> Self {
         description.unify_strata();
         if description.profiles.has_deferred() {
             let vars = description.variables.clone();
@@ -777,7 +777,7 @@ impl FacetConfig {
     /// The single adapter between the serde types and the ordinal model
     /// — both loaders realize through it, so neither can grow its own
     /// interpretation of a declaration (SH-90).
-    pub(crate) fn declaration(&self) -> crate::dataset::shards::Declaration<'_> {
+    pub fn declaration(&self) -> crate::dataset::shards::Declaration<'_> {
         crate::dataset::shards::Declaration {
             sources: self.sources(),
             is_array: self.is_explicit_series(),

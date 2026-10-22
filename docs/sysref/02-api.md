@@ -435,7 +435,19 @@ let dim: usize = r.dim_at(42)?;
 
 ## 2.5 Traits and concrete types
 
-The readers and their traits are veks-io's: veks-io is the one
+The traits themselves — `ByteSource`, `VectorReader`, `VvecReader`, the
+streaming `VecSource`/`VecSink`, and the dataset contracts of §2.6 —
+are defined by `veks-apicore`, the API core: the contracts and every
+type they name (the descriptor model, `Location`, fetch plans and
+reports, verification reports, `Error`, `IoError`), with no
+implementation. vectordata and veks-io implement them and re-export
+them at their usual paths. A program that needs only the contracts,
+or implements one itself (a test double of `TestDataView`, its own
+`ByteSource` or `CatalogSource`), depends on `veks-apicore` alone;
+each trait's documentation there implements it with nothing else
+(`docs/design/srd-crate-boundaries.md` §4).
+
+The readers are veks-io's: veks-io is the one
 implementation of every file format in the workspace, and
 `vectordata::io` re-exports it. Each reader is generic over a
 `ByteSource` (where the bytes come from): veks-io's `MappedFile` for a
@@ -669,14 +681,21 @@ let src: Option<String> = view.facet_source("metadata_content");
 
 // Fetch into the cache / inspect it
 view.fetch(&FetchRequest::all(), &mut Silent)?;
-let storage = view.open_facet_storage("base_vectors")?;    // FacetStorage
+let storage = view.open_facet_storage("base_vectors")?;    // Box<dyn FacetBytes>
+let id = storage.content_id()?;                           // Option<ContentId>
+
+// Integrity: the checks of §2.7 "Verifying a profile", and the measured normalization
+let report = view.verify(&mut NoProgress)?;
+let normalized = view.normalization()?;
 ```
 
 The pinned methods of 3.0 — `base_vectors()`, `query_vectors()`,
-`neighbor_indices()`, `facet(name)` and the filtered six — remain on
-`TestDataView`, deprecated, as `*_as::<f32>` or `<i32>`. They now go
-through the same table: `facet("codes")` on a `.u8` facet widens where
-it once reinterpreted the bytes, and on an `.ivecs` facet is refused.
+`neighbor_indices()`, `facet(name)`, the filtered six and
+`metadata_results()` — and the `prebuffer_all*`/`prefetch*` forms are
+gone; each is its `*_as::<T>` reader or a `fetch` (the CHANGELOG has
+the table). `open_facet_storage` returns the API's `FacetBytes`; a
+caller holding vectordata's own `FacetStorage` gets it back with
+`storage.as_any().downcast_ref::<FacetStorage>()`.
 
 ---
 

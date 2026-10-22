@@ -442,7 +442,7 @@ impl StandardFacet {
     /// Composes with the `IDXFOR__` prefix stripping above, so
     /// `IDXFOR__base_vectors__0007.ivvec.i32` reduces to
     /// `base_vectors` (SH-6).
-    pub(crate) fn strip_shard_suffix(basename: &str) -> &str {
+    pub fn strip_shard_suffix(basename: &str) -> &str {
         match basename.rsplit_once("__") {
             Some((head, tail))
                 if tail.len() == 4 && tail.bytes().all(|b| b.is_ascii_digit()) =>

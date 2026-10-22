@@ -36,12 +36,11 @@
 //! claim about is opened, a disagreement — a `base_count` that is not
 //! the base's, a `maxk` that is not the ground truth's width — is a
 //! warning naming the file, the key and both values, once per process.
-//! [`TestDataViewExt::verify`](crate::TestDataViewExt::verify) reports
+//! [`TestDataView::verify`](crate::TestDataView::verify) reports
 //! it as a failed check.
 //!
 //! (`docs/design/srd-loose-files-overlays-integrity.md` §4.)
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -50,54 +49,7 @@ use serde_yaml::Value;
 /// The file name of the user overlay, in the configuration directory.
 pub const USER_OVERLAY_FILE: &str = "overlays.yaml";
 
-/// Who stated an overlay.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum OverlayKind {
-    /// The user, in `<config_dir>/overlays.yaml`.
-    User,
-    /// A program, by the name it registered the overlay under.
-    Program(String),
-}
-
-/// Where an attribute's value came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AttributeSource {
-    /// The dataset's own descriptor or catalog listing.
-    Dataset,
-    /// Its loose files' names (`dataset::infer`, LF-12).
-    Inferred,
-    /// An overlay.
-    Overlay {
-        /// The overlay's file, or the program's name for one built in
-        /// code.
-        file: String,
-        /// Who stated it.
-        kind: OverlayKind,
-    },
-    /// Measured from the data, and recorded in this file
-    /// (`<cache_root>/<dataset>/measured.yaml`), or not recorded (a
-    /// local base, measured each time).
-    Measured {
-        /// The file the measurement is recorded in, when it is.
-        file: Option<String>,
-    },
-}
-
-impl fmt::Display for AttributeSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AttributeSource::Dataset => write!(f, "dataset"),
-            AttributeSource::Inferred => write!(f, "inferred from file names"),
-            AttributeSource::Overlay { file, kind: OverlayKind::User } => write!(f, "overlay {file}"),
-            AttributeSource::Overlay { file, kind: OverlayKind::Program(name) } => {
-                write!(f, "program overlay '{name}' ({file})")
-            }
-            AttributeSource::Measured { file: Some(file) } => write!(f, "measured, recorded in {file}"),
-            AttributeSource::Measured { file: None } => write!(f, "measured"),
-        }
-    }
-}
+pub use veks_apicore::overlay::{AttributeSource, Contradiction, OverlayKind, Stated};
 
 /// The attribute keys an overlay may set without a namespace: the
 /// fields a dataset's attributes hold, and the counts a dataset
@@ -286,16 +238,6 @@ pub struct Overlays {
     user: Option<Overlay>,
 }
 
-/// One attribute an overlay sets, with its source.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Stated {
-    /// The key.
-    pub key: String,
-    /// The value.
-    pub value: Value,
-    /// Who stated it.
-    pub source: AttributeSource,
-}
 
 impl Overlays {
     /// No overlays.
@@ -418,6 +360,15 @@ pub(crate) fn warn_contradiction(dataset: &str, key: &str, claimed: &str, observ
     log::warn!(
         "{source} states {key}: {claimed} for '{dataset}', but {observed} was observed; the overlay's value is in force"
     );
+}
+
+/// [`warn_contradiction`] for each of `found`: what
+/// [`CatalogEntry::apply_overlay`](crate::dataset::CatalogEntry::apply_overlay)
+/// returns.
+pub(crate) fn warn_contradictions(found: Vec<Contradiction>) {
+    for c in found {
+        warn_contradiction(&c.dataset, &c.key, &c.claimed, &c.observed, &c.source);
+    }
 }
 
 // ── Editing the user overlay, line by line ─────────────────────────────

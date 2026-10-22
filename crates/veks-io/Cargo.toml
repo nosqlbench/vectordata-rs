@@ -26,6 +26,9 @@ thiserror = "2.0.18"
 # says, and what a reader may do when asked for another type. Shared
 # with vectordata so the two agree by construction.
 veks-datatypes = { path = "../veks-datatypes", version = "=4.0.2" }
+# The contracts veks-io implements: ByteSource, the reader and streaming
+# traits and the reader error (srd-crate-boundaries.md §4).
+veks-apicore = { path = "../veks-apicore", version = "=4.0.2" }
 
 # Optional: npy format support
 ndarray = { version = "0.16", optional = true }

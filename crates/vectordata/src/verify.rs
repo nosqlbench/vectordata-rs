@@ -4,7 +4,7 @@
 //! Library API. Verify that a profile's facets belong together, before
 //! a vector of it is used.
 //!
-//! [`TestDataViewExt::verify`] proves a
+//! [`TestDataView::verify`] proves a
 //! profile's base, queries and ground truth agree:
 //!
 //! | Check | What it proves |
@@ -24,148 +24,12 @@
 //!
 //! (`docs/design/srd-loose-files-overlays-integrity.md` §5.1.)
 
-use std::fmt;
+pub use veks_apicore::verify::*;
+
 
 use crate::view::{TestDataView, TestDataViewExt};
 use crate::VectorReader;
 
-/// One of the checks [`TestDataViewExt::verify`] makes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Check {
-    /// Every facet opens.
-    V1Opens,
-    /// The queries have the base's dimension.
-    V2QueryDimension,
-    /// A ground truth has one row per query.
-    V3TruthRows,
-    /// A ground truth's rows are not empty.
-    V4TruthWidth,
-    /// Every ground-truth index names a base vector.
-    V5TruthIndices,
-    /// A ground truth's distances have its rows and width.
-    V6Distances,
-    /// A declared count is the facet's.
-    V7DeclaredCount,
-    /// A declared `is_normalized` is what a sample of the base shows.
-    V8Normalized,
-    /// Every cached chunk still hashes to what it was verified or
-    /// recorded as when it landed (opt-in: it reads every cached byte).
-    V9CachedChunks,
-}
-
-impl Check {
-    /// The check's code: `V1` … `V7`.
-    pub fn code(self) -> &'static str {
-        match self {
-            Check::V1Opens => "V1",
-            Check::V2QueryDimension => "V2",
-            Check::V3TruthRows => "V3",
-            Check::V4TruthWidth => "V4",
-            Check::V5TruthIndices => "V5",
-            Check::V6Distances => "V6",
-            Check::V7DeclaredCount => "V7",
-            Check::V8Normalized => "V8",
-            Check::V9CachedChunks => "V9",
-        }
-    }
-}
-
-/// A check that failed: which, on which facet and file, and what it
-/// found against what it expected.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifyFailure {
-    /// The check.
-    pub check: Check,
-    /// The facet it failed on.
-    pub facet: String,
-    /// The facet's file, as the view resolves it, when it has one.
-    pub file: Option<String>,
-    /// What was found, as a sentence about the facet: `holds 4 rows
-    /// for 3 queries`.
-    pub found: String,
-}
-
-impl fmt::Display for VerifyFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.check.code(), self.facet)?;
-        if let Some(file) = &self.file {
-            write!(f, " {file}")?;
-        }
-        write!(f, " {}", self.found)
-    }
-}
-
-/// What a verification ran and found.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VerifyReport {
-    /// The checks made, in order; a check with nothing to check (no
-    /// ground truth, say) is not made.
-    pub checked: Vec<Check>,
-    /// The checks that failed.
-    pub failures: Vec<VerifyFailure>,
-}
-
-impl VerifyReport {
-    /// Whether every check passed.
-    pub fn passed(&self) -> bool {
-        self.failures.is_empty()
-    }
-}
-
-/// How a verification is run.
-#[derive(Debug, Clone, Default)]
-pub struct VerifyOptions {
-    /// Skip a facet whose local file is not there, rather than fail V1
-    /// on it: for checking a dataset still being built, whose later
-    /// facets are not written yet.
-    pub skip_absent: bool,
-    /// Also check every cached chunk of a remote facet against the
-    /// hash it was verified or recorded as (V9): local corruption of
-    /// the cache. Reads every cached byte, so it is asked for.
-    pub cached_chunks: bool,
-}
-
-/// Hears a verification's progress: the label of the scan under way
-/// (`scanning neighbor_indices`), and how far it has got.
-pub trait VerifyProgress {
-    /// `done` of `total` rows of the scan `label` are checked.
-    fn report(&mut self, label: &str, done: u64, total: u64);
-}
-
-impl<F: FnMut(&str, u64, u64)> VerifyProgress for F {
-    fn report(&mut self, label: &str, done: u64, total: u64) {
-        self(label, done, total)
-    }
-}
-
-/// Progress that goes nowhere.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoProgress;
-
-impl VerifyProgress for NoProgress {
-    fn report(&mut self, _label: &str, _done: u64, _total: u64) {}
-}
-
-/// A fact about a facet measured from its bytes, with how it was
-/// measured.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Measured<T> {
-    /// What the measurement found.
-    pub value: T,
-    /// How many records it read.
-    pub sample: usize,
-    /// The largest distance from the ideal among them (for unit length,
-    /// `|‖v‖ − 1|`).
-    pub worst_deviation: f64,
-}
-
-/// Records a normalization sample reads, at most: a stride apart
-/// across the whole base.
-pub const NORMALIZATION_SAMPLE: usize = 1000;
-
-/// How far from 1 a sampled norm may be and still count as unit length.
-pub const UNIT_NORM_TOLERANCE: f64 = 1e-3;
 
 /// Whether the base is unit length: [`NORMALIZATION_SAMPLE`] vectors
 /// (every one, when there are fewer) a fixed stride apart across the
@@ -184,22 +48,6 @@ pub fn measure_normalization<V: TestDataView + ?Sized>(view: &V) -> crate::Resul
         worst = worst.max((norm - 1.0).abs());
     }
     Ok(Measured { value: sample > 0 && worst <= UNIT_NORM_TOLERANCE, sample, worst_deviation: worst })
-}
-
-/// What a dataset's base is, as to unit length: the declared value (the
-/// dataset's, an overlay's, or one inferred from file names) checked
-/// against a sample, or the sample alone when nothing declares it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Normalization {
-    /// Whether the base is unit length: the declared value when there is
-    /// one, even contradicted, else the measured one.
-    pub value: bool,
-    /// Where the value came from.
-    pub source: crate::overlay::AttributeSource,
-    /// The sample, recorded or just taken.
-    pub measured: Measured<bool>,
-    /// Whether the sample disagrees with the declared value.
-    pub contradicted: bool,
 }
 
 /// The file `view`'s measurements are recorded in: the dataset's
@@ -267,7 +115,7 @@ pub fn recorded_normalization<V: TestDataView + ?Sized>(view: &V) -> crate::Resu
 /// Whether `view`'s base is unit length, and on whose word
 /// ([`Normalization`]). A declared value the sample contradicts is kept
 /// and marked; when an overlay declared it, the contradiction is a
-/// warning, once (OV-5), and [`TestDataViewExt::verify`] reports it as
+/// warning, once (OV-5), and [`TestDataView::verify`] reports it as
 /// V8 either way.
 pub fn normalization<V: TestDataView + ?Sized>(view: &V) -> crate::Result<Normalization> {
     let declared = view.dataset_attribute("is_normalized").and_then(|v| v.as_bool());
@@ -302,8 +150,8 @@ const TRUTHS: [(&str, &str, bool); 3] = [
 /// Indices per scan block: 64 Ki.
 const SCAN_BLOCK: usize = 1 << 16;
 
-/// Run every check on `view`. The checks [`TestDataViewExt::verify`]
-/// and [`TestDataViewExt::verify_report`] make.
+/// Run every check on `view`. The checks [`TestDataView::verify`](crate::TestDataView::verify)
+/// and [`TestDataView::verify_report`](crate::TestDataView::verify_report) make.
 pub(crate) fn verify_view<V: TestDataView + ?Sized>(
     view: &V,
     options: &VerifyOptions,
@@ -472,7 +320,7 @@ pub(crate) fn verify_view<V: TestDataView + ?Sized>(
             }
             let Ok(storage) = view.open_facet_storage(name) else { continue };
             let label = format!("checking cached {name}");
-            let mut hear = |done: u64, total: u64| progress.report(&label, done, total);
+            let mut hear = |_: &str, done: u64, total: u64| progress.report(&label, done, total);
             match storage.verify_cached(&mut hear) {
                 Ok(None) => {}
                 Ok(Some(bad)) => {

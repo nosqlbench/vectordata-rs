@@ -362,7 +362,7 @@ profiles:
     /// the facet and the extension.
     #[test]
     fn every_facet_accepts_or_refuses_every_element_type_per_its_formats() {
-        use crate::typed_access::{Container, ElementType};
+        use crate::{Container, ElementType};
         for &facet in StandardFacet::PREFERRED_ORDER {
             let key = facet.key();
             for &ty in ElementType::ALL {

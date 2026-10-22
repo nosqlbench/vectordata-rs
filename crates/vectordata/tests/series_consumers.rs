@@ -15,12 +15,13 @@
 //!
 //! See `docs/design/srd-multifile-facet-shards.md`.
 
-// The pinned readers and the typed reader are deprecated in favour of
-// `TestDataViewExt::facet_as`; this suite still covers them.
+// The typed reader and the group's prebuffer forms are deprecated;
+// this suite still covers the ones it calls.
 #![allow(deprecated)]
 
 use std::io::Write as _;
 use vectordata::dataset::Sharding;
+use vectordata::TestDataViewExt;
 
 fn write_fvec(path: &std::path::Path, dim: i32, records: usize, first: usize) {
     let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
@@ -104,7 +105,7 @@ fn deriving_from_an_explicit_series_copies_every_record() {
     );
 
     let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
-    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    let r = g.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(r.count(), 200, "every record of every shard");
     for i in 0..200usize {
         assert_eq!(r.get(i).unwrap()[0], i as f32, "derived record {i}");
@@ -138,7 +139,7 @@ fn deriving_from_a_uniform_series_copies_every_record() {
     );
 
     let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
-    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    let r = g.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(r.count(), 200);
     assert_eq!(r.get(0).unwrap()[0], 0.0);
     assert_eq!(r.get(99).unwrap()[0], 99.0);
@@ -193,7 +194,7 @@ fn a_series_re_strides_to_a_different_shard_layout() {
     assert_eq!(last, 20 * (4 + 4 * 4), "the last shard holds the remainder");
 
     let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
-    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    let r = g.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(r.count(), 200);
     for i in 0..200usize {
         assert_eq!(r.get(i).unwrap()[0], i as f32, "re-strided record {i}");
@@ -235,7 +236,7 @@ fn deriving_a_windowed_series_slices_the_series() {
     );
 
     let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
-    let r = g.profile("default").unwrap().base_vectors().unwrap();
+    let r = g.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
     assert_eq!(r.count(), 50, "the window is in the series' ordinals");
     assert_eq!(r.get(0).unwrap()[0], 80.0);
     assert_eq!(r.get(19).unwrap()[0], 99.0, "last record of the first shard");
@@ -315,8 +316,8 @@ fn a_full_sequential_and_random_pass_matches_the_unsplit_file() {
 
     let gw = vectordata::TestDataGroup::load(whole.to_str().unwrap()).unwrap();
     let gs = vectordata::TestDataGroup::load(split.to_str().unwrap()).unwrap();
-    let rw = gw.profile("default").unwrap().base_vectors().unwrap();
-    let rs = gs.profile("default").unwrap().base_vectors().unwrap();
+    let rw = gw.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
+    let rs = gs.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
 
     assert_eq!(rw.count(), rs.count());
     assert_eq!(rw.dim(), rs.dim());
@@ -360,8 +361,8 @@ fn a_window_across_the_seam_matches_the_unsplit_file() {
 
     let gw = vectordata::TestDataGroup::load(whole.to_str().unwrap()).unwrap();
     let gs = vectordata::TestDataGroup::load(split.to_str().unwrap()).unwrap();
-    let rw = gw.profile("default").unwrap().base_vectors().unwrap();
-    let rs = gs.profile("default").unwrap().base_vectors().unwrap();
+    let rw = gw.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
+    let rs = gs.profile("default").unwrap().base_vectors_as::<f32>().unwrap();
 
     assert_eq!(rw.count(), 50);
     assert_eq!(rs.count(), 50, "the window clips the series, not a shard");
@@ -423,7 +424,7 @@ fn deriving_a_series_without_a_stride_yields_the_single_file_a_kernel_needs() {
         view.facet_source("base_vectors").is_some(),
         "a flat facet resolves to one path"
     );
-    let r = view.base_vectors().unwrap();
+    let r = view.base_vectors_as::<f32>().unwrap();
     assert_eq!(r.count(), 200);
     assert_eq!(r.get(199).unwrap()[0], 199.0);
 }
@@ -484,7 +485,7 @@ fn a_vvec_series_derives_into_one_facet() {
     // And it reads back as 60 records with the right shapes.
     let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    let r = view.metadata_results().unwrap();
+    let r = view.metadata_results_as::<i32>().unwrap();
     assert_eq!(r.count(), 60, "every record of both shards");
     // Record shapes and values survive the concatenation.
     for o in [0usize, 29, 30, 59] {
@@ -522,7 +523,7 @@ fn a_windowed_vvec_series_slices_the_series() {
 
     let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    let r = view.metadata_results().unwrap();
+    let r = view.metadata_results_as::<i32>().unwrap();
     assert_eq!(r.count(), 25, "a 25-record window across the seam");
     // The window starts at series ordinal 20 and crosses into the
     // second shard at 30.
@@ -567,7 +568,7 @@ fn a_sliced_vvec_shard_contributes_only_its_own_records() {
 
     let g = vectordata::TestDataGroup::load(out.to_str().unwrap()).unwrap();
     let view = g.profile("default").unwrap();
-    let r = view.metadata_results().unwrap();
+    let r = view.metadata_results_as::<i32>().unwrap();
     assert_eq!(r.count(), 15, "only the windowed records");
     // The first shard contributed its records 10..20, whose ids are
     // 10..20; the second contributed its 0..5, whose ids are 100..105.

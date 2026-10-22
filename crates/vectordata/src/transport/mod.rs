@@ -9,12 +9,11 @@
 
 #![allow(dead_code)] // pub(crate) module — many helpers are kept for Storage and tests
 pub mod http;
-mod progress;
 pub(crate) mod pump;
 mod retry;
 
 pub use http::HttpTransport;
-pub use progress::DownloadProgress;
+pub use veks_apicore::DownloadProgress;
 pub use retry::RetryPolicy;
 
 use std::io;
@@ -156,6 +155,20 @@ impl std::fmt::Display for OfflineRefusal {
 
 impl std::error::Error for OfflineRefusal {}
 
+/// A reqwest failure as the API's [`TransportError`](crate::TransportError):
+/// its URL, its status when the server answered, and whether a retry
+/// could succeed by the same rule [`is_permanent`] applies.
+pub(crate) fn transport_error(e: reqwest::Error) -> crate::TransportError {
+    let status = e.status().map(|s| s.as_u16());
+    let permanent = status.is_some_and(status_is_permanent) || e.is_builder() || e.is_redirect();
+    crate::TransportError {
+        url: e.url().map(|u| u.to_string()),
+        status,
+        kind: if permanent { veks_apicore::error::TransportErrorKind::Permanent } else { veks_apicore::error::TransportErrorKind::Transient },
+        message: e.to_string(),
+    }
+}
+
 /// Whether `error` is one that no retry can change, found anywhere in
 /// its source chain: an offline-mode refusal, or an HTTP response whose
 /// status says the request itself is refused ([`status_is_permanent`]).
@@ -219,16 +232,7 @@ pub(crate) fn http_runtimes() -> usize {
     client_pool(false).len()
 }
 
-/// Returns `true` for any URL whose transport vectordata speaks
-/// directly: `http://`, `https://`, or `s3://`. The `s3://` form
-/// is dispatched as a drop-in for HTTPS via
-/// [`normalize_remote_url`] — the actual fetch uses S3's
-/// virtual-hosted-style HTTPS endpoint, so by the time bytes hit
-/// the wire the URL has been rewritten. Anything else is treated
-/// as a local filesystem path by callers.
-pub(crate) fn is_remote_url(s: &str) -> bool {
-    s.starts_with("http://") || s.starts_with("https://") || s.starts_with("s3://")
-}
+pub(crate) use crate::location::is_remote_url;
 
 /// Translate any remote URL to the actual HTTPS form the shared
 /// HTTP client should fetch. `http(s)://` URLs pass through;

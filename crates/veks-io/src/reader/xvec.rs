@@ -16,7 +16,7 @@ use super::{
     DIM_UNDEFINED, IoError, VectorReader, aligned_for, copy_records, decode_vec, ext_of, records_to_read,
     require_native,
 };
-use crate::source::{ByteSource, MappedFile};
+use crate::source::{ByteSource, MappedFile, OpenSource};
 
 /// A uniform vector file: every record a little-endian `i32` dimension
 /// followed by that many elements of `T`, the type its extension names
@@ -141,7 +141,7 @@ impl<T, S: ByteSource> XvecReader<T, S> {
     /// progress.
     pub fn prebuffer_with_progress<F>(&self, mut cb: F) -> std::io::Result<()>
     where
-        F: FnMut(&S::Progress),
+        F: FnMut(&veks_apicore::DownloadProgress),
     {
         self.source.prebuffer_with_progress(&mut cb)
     }
@@ -203,13 +203,19 @@ impl<T, S: ByteSource> XvecReader<T, S> {
 impl<T: Element, S: ByteSource> XvecReader<T, S> {
     /// Open the file `source` names — a path, or whatever else `S`
     /// reaches — whose extension names `T` in a vector layout.
-    pub fn open(source: &str) -> Result<Self, IoError> {
+    pub fn open(source: &str) -> Result<Self, IoError>
+    where
+        S: OpenSource,
+    {
         Self::require_vectors(source)?;
         Self::from_source(S::open(source)?)
     }
 
     /// Open a local file whose extension names `T`.
-    pub fn open_path(path: &Path) -> Result<Self, IoError> {
+    pub fn open_path(path: &Path) -> Result<Self, IoError>
+    where
+        S: OpenSource,
+    {
         Self::require_vectors(&path.to_string_lossy())?;
         Self::from_source(S::open_path(path)?)
     }

@@ -6441,6 +6441,7 @@ dependencies = [
  "unicode-width 0.2.0",
  "url",
  "veks-anode",
+ "veks-apicore",
  "veks-completion",
  "veks-completion-derive",
  "veks-datatypes",
@@ -6511,6 +6512,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "veks-apicore"
+version = "4.0.2"
+dependencies = [
+ "indexmap",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.21",
+ "url",
+ "vectordata",
+ "veks-datatypes",
+]
+
+[[package]]
 name = "veks-completion"
 version = "4.0.2"
 dependencies = [
@@ -6578,6 +6596,7 @@ dependencies = [
  "slabtastic",
  "tempfile",
  "thiserror 2.0.21",
+ "veks-apicore",
  "veks-datatypes",
 ]
 

@@ -23,6 +23,12 @@
 //! ```
 //!
 //! `READERS_BENCH_MIB` sets each uniform file's size (default 1024).
+//!
+//! The crate-boundaries SRD (PR-10) adds the paths its moves touch:
+//! reads through a dataset view (`view`), the streaming and typed
+//! writers (`stream_write`), a whole fetch over loopback into a fresh
+//! cache (`remote_fetch`), and reads from that cache (`remote_cached`).
+//! Each runs before and after every step that touches a hot path.
 
 use std::fs::File;
 use std::hint::black_box;
@@ -32,6 +38,12 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use vectordata::io::{IndexedVvecReader, ScalarReader, VectorReader, VvecReader, XvecReader};
+use vectordata::fetch::{FetchEvent, FetchRequest};
+use vectordata::{TestDataGroup, TestDataViewExt};
+
+#[allow(dead_code)]
+#[path = "../tests/support/testserver.rs"]
+mod testserver;
 
 /// Records per bulk read: a reused buffer of this many records.
 const BATCH: usize = 4096;
@@ -298,7 +310,12 @@ fn scalar_case<T>(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     ty: &str,
     path: PathBuf,
-    widen: fn(T) -> i64,
+    // A closure, not a `fn` pointer: the sum inlines the widening, so
+    // the case measures the borrow and one pass over the column rather
+    // than an indirect call per element, whose cost moved with where
+    // the linker happened to place the loop (srd-crate-boundaries.md
+    // §12.1).
+    widen: impl Fn(T) -> i64 + Copy,
 ) where
     T: vectordata::Element + Default + Copy + veks_io::Element,
 {
@@ -335,5 +352,201 @@ fn scalar_case<T>(
     });
 }
 
-criterion_group!(benches, sequential, random, vvec, scalar);
+/// A dataset directory over the sequential f32 file: a `dataset.yaml`
+/// naming it, so the reads below go through the dataset API.
+fn view_dataset() -> (PathBuf, usize) {
+    let (path, count) = uniform("seq.fvecs", 128, 4, f32_value);
+    let dir = data_dir().join("view");
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("base.fvecs");
+    if !base.exists() {
+        std::fs::hard_link(&path, &base).unwrap();
+    }
+    std::fs::write(dir.join("dataset.yaml"), "name: view\nprofiles:\n  default:\n    base_vectors: base.fvecs\n").unwrap();
+    (dir, count)
+}
+
+/// Reads through `Arc<dyn TestDataView>` and the reader it hands out:
+/// the dispatch every dataset consumer pays.
+fn view(c: &mut Criterion) {
+    let (dir, count) = view_dataset();
+    let view = TestDataGroup::load(dir.to_str().unwrap()).unwrap().profile("default").unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
+    let dim = base.dim();
+    let mut group = c.benchmark_group("view");
+    group.sample_size(10).measurement_time(Duration::from_secs(20));
+
+    let mut buf = vec![0f32; BATCH * dim];
+    group.throughput(Throughput::Bytes((count * (4 + dim * 4)) as u64));
+    group.bench_function("seq_read_into", |b| {
+        b.iter(|| {
+            let mut start = 0;
+            while start < count {
+                start += base.read_into(start, &mut buf).unwrap();
+                black_box(&buf);
+            }
+        })
+    });
+
+    let indices = random_indices(count);
+    group.throughput(Throughput::Elements(RANDOM_READS as u64));
+    group.bench_function("random_get", |b| {
+        b.iter(|| {
+            for &i in &indices {
+                black_box(base.get(i).unwrap());
+            }
+        })
+    });
+    group.bench_function("open", |b| {
+        b.iter(|| black_box(view.base_vectors_as::<f32>().unwrap()))
+    });
+    group.finish();
+}
+
+/// Records written through veks-io's streaming sink and the typed
+/// writer, 256 MiB of dim-128 f32 each, to a file rewritten in place.
+fn stream_write(c: &mut Criterion) {
+    let dim = 128;
+    let count = (256usize << 20) / (4 + dim * 4);
+    let mut rng = Lcg(7);
+    let row: Vec<f32> = (0..dim).map(|_| f32::from_le_bytes(f32_value(&mut rng).try_into().unwrap())).collect();
+    let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = data_dir().join("write.fvecs");
+    let mut group = c.benchmark_group("stream_write");
+    group.sample_size(10).measurement_time(Duration::from_secs(20));
+    group.throughput(Throughput::Bytes((count * (4 + dim * 4)) as u64));
+    group.bench_function("sink_write_record", |b| {
+        b.iter(|| {
+            let mut sink = veks_io::create(&out, dim as u32).unwrap();
+            for i in 0..count {
+                sink.write_record(i as i64, &bytes);
+            }
+            sink.finish().unwrap();
+        })
+    });
+    group.bench_function("typed_xvec_writer", |b| {
+        b.iter(|| {
+            let mut w = vectordata::io::XvecWriter::<f32>::create(&out, dim).unwrap();
+            for _ in 0..count {
+                w.write(&row).unwrap();
+            }
+            w.finish().unwrap();
+        })
+    });
+    group.finish();
+}
+
+/// The remote dataset the two remote groups read: 64 MiB of dim-128 f32
+/// served over loopback.
+fn remote_dataset() -> (PathBuf, usize) {
+    let (path, count) = uniform_sized("remote.fvecs", 128, 64 << 20);
+    let root = data_dir().join("served");
+    let dir = root.join("remote");
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("base.fvecs");
+    if !base.exists() {
+        std::fs::hard_link(&path, &base).unwrap();
+    }
+    std::fs::write(dir.join("dataset.yaml"), "name: remote\nprofiles:\n  default:\n    base_vectors: base.fvecs\n").unwrap();
+    (root, count)
+}
+
+/// A uniform f32 file of about `bytes`, written once.
+fn uniform_sized(name: &str, dim: usize, bytes: usize) -> (PathBuf, usize) {
+    let path = data_dir().join(name);
+    let count = bytes / (4 + dim * 4);
+    ensure(&path, (count * (4 + dim * 4)) as u64, |w| {
+        let mut rng = Lcg(11);
+        for _ in 0..count {
+            w.write_all(&(dim as i32).to_le_bytes()).unwrap();
+            for _ in 0..dim {
+                w.write_all(&f32_value(&mut rng)).unwrap();
+            }
+        }
+    });
+    (path, count)
+}
+
+/// The cache the remote groups fetch into, one per bench process.
+fn bench_cache() -> PathBuf {
+    let dir = data_dir().join(format!("cache-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    vectordata::settings::override_cache_dir_for_process(dir.clone());
+    dir
+}
+
+/// A whole facet fetched over loopback into a fresh cache directory,
+/// each iteration: the chunk store's transfer, verification-free path
+/// (no `.mref` is published), sidecar writes included.
+fn remote_fetch(c: &mut Criterion) {
+    let (root, _) = remote_dataset();
+    let cache = bench_cache();
+    let server = testserver::TestServer::start(&root).unwrap();
+    let mut group = c.benchmark_group("remote_fetch");
+    group.sample_size(10).measurement_time(Duration::from_secs(30));
+    group.throughput(Throughput::Bytes(std::fs::metadata(root.join("remote/base.fvecs")).unwrap().len()));
+    let mut round = 0u64;
+    group.bench_function("whole_facet", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                round += 1;
+                // A fresh dataset name is a fresh cache directory.
+                let name = format!("remote-{round}");
+                let served = root.join(&name);
+                if !served.exists() {
+                    std::os::unix::fs::symlink(root.join("remote"), &served).unwrap();
+                }
+                let group = TestDataGroup::load(&format!("{}/{name}/", server.base_url())).unwrap();
+                let view = group.profile("default").unwrap();
+                let start = std::time::Instant::now();
+                view.fetch(&FetchRequest::all(), &mut |_: &FetchEvent<'_>| {}).unwrap();
+                total += start.elapsed();
+                drop(view);
+                let _ = std::fs::remove_dir_all(cache.join(&name));
+                let _ = std::fs::remove_file(&served);
+            }
+            total
+        })
+    });
+    group.finish();
+}
+
+/// Reads of a remote facet once it is all in the cache: the promoted
+/// mapping under the chunk store.
+fn remote_cached(c: &mut Criterion) {
+    let (root, count) = remote_dataset();
+    let _cache = bench_cache();
+    let server = testserver::TestServer::start(&root).unwrap();
+    let group_ = TestDataGroup::load(&format!("{}/remote/", server.base_url())).unwrap();
+    let view = group_.profile("default").unwrap();
+    view.fetch(&FetchRequest::all(), &mut |_: &FetchEvent<'_>| {}).unwrap();
+    let base = view.base_vectors_as::<f32>().unwrap();
+    let dim = base.dim();
+    let mut buf = vec![0f32; BATCH * dim];
+    let mut group = c.benchmark_group("remote_cached");
+    group.sample_size(10).measurement_time(Duration::from_secs(15));
+    group.throughput(Throughput::Bytes((count * (4 + dim * 4)) as u64));
+    group.bench_function("seq_read_into", |b| {
+        b.iter(|| {
+            let mut start = 0;
+            while start < count {
+                start += base.read_into(start, &mut buf).unwrap();
+                black_box(&buf);
+            }
+        })
+    });
+    let indices: Vec<usize> = random_indices(count).into_iter().take(200_000).collect();
+    group.throughput(Throughput::Elements(indices.len() as u64));
+    group.bench_function("random_get", |b| {
+        b.iter(|| {
+            for &i in &indices {
+                black_box(base.get(i).unwrap());
+            }
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(benches, sequential, random, vvec, scalar, view, stream_write, remote_fetch, remote_cached);
 criterion_main!(benches);

@@ -18,7 +18,7 @@
 //! | `datasets describe` | [`Catalog::open_spec`](crate::catalog::Catalog::open_spec), [`TestDataView::facet_manifest`](crate::TestDataView::facet_manifest) |
 //! | `datasets cache` (veks) | [`cache_admin::list_entries`](crate::cache_admin::list_entries) |
 //! | `datasets drop-cache` (veks) | [`cache_admin::prune_by_filter`](crate::cache_admin::prune_by_filter) is the library equivalent; the command still scans the cache itself |
-//! | `datasets ping` | [`Catalog::open_spec`](crate::catalog::Catalog::open_spec), then a reader per facet ([`TestDataView::facet`](crate::TestDataView::facet)) |
+//! | `datasets ping` | [`Catalog::open_spec`](crate::catalog::Catalog::open_spec), then a reader per facet ([`TestDataViewExt::facet_as`](crate::TestDataViewExt::facet_as)) |
 //! | `datasets derive`, `datasets filter`, `datasets curlify` | no library equivalent; these are commands |
 //!
 //! The full map, for every command of both binaries, is in the crate's

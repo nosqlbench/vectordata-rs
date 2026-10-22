@@ -267,7 +267,7 @@ pub mod merkle;
 /// Internal. HTTP transport layer, reached only through readers and the
 /// cache.
 pub(crate) mod transport;
-pub mod model;
+pub use veks_apicore::model;
 pub mod io;
 pub mod access;
 pub mod metadata_schema;
@@ -277,7 +277,7 @@ pub mod verify;
 pub mod overlay;
 pub mod fetch;
 pub mod group;
-pub mod location;
+pub use veks_apicore::location;
 
 /// Library API. The guide for coding agents shipped in this package
 /// (`AGENTS.md`), rendered here so its links are checked with the rest
@@ -312,9 +312,11 @@ pub mod cache_admin {
 pub use group::{TestDataGroup, PREBUFFER_LARGE_WARNING_BYTES};
 pub use location::Location;
 pub use model::FacetConfig;
-pub use view::{
-    CacheStats, FacetDescriptor, FacetStorage, PrebufferProgress, PrefetchHandle, PrefetchPlan,
-    PrefetchReport, RangeFill, TestDataView, TestDataViewExt, WholeFacetFallback,
+pub use view::{FacetStorage, PrebufferProgress};
+pub use veks_apicore::{
+    CacheStats, ContentId, ContentIdKind, FacetBytes, FacetDescriptor, NoProgress, PrefetchHandle, PrefetchPlan,
+    PrefetchReport, ProgressSink, QuantizedBase, RangeFill, ShardRange, TestDataView, TestDataViewExt,
+    WholeFacetFallback,
 };
 #[allow(deprecated)]
 pub use view::open_facet_typed;
@@ -322,7 +324,7 @@ pub use io::{
     AnyVectorReader, AnyVvecReader, ConvertingReader, IndexedVvecReader, IoError, ScalarReader,
     VectorReader, VvecReader, XvecReader, open_vec_as, open_vec_native,
 };
-pub use cache::InsufficientCacheSpace;
+pub use veks_apicore::InsufficientCacheSpace;
 pub use access::AccessMode;
 pub use typed_access::{Container, Element, ElementConversion, ElementType, ElementTypeExt};
 pub use veks_datatypes::{DistanceFunction, UnknownDistanceFunction};
@@ -331,154 +333,7 @@ pub use typed_access::{TypedAccessError, TypedReader};
 /// Re-exported so external callers of
 /// [`FacetStorage::prebuffer_with_progress`] can name the
 /// progress type their callback receives.
-pub use transport::DownloadProgress;
+pub use veks_apicore::DownloadProgress;
 
-use thiserror::Error;
+pub use veks_apicore::{Error, Result, TransportError};
 
-/// Top-level error type for the vectordata crate.
-#[derive(Error, Debug)]
-pub enum Error {
-    /// A vector I/O operation failed (read, mmap, HTTP fetch).
-    #[error("Vector IO error: {0}")]
-    VectorIo(#[from] crate::io::IoError),
-    /// The `dataset.yaml` file could not be read from disk or network.
-    #[error("Failed to read dataset configuration: {0}")]
-    ConfigIo(#[source] std::io::Error),
-    /// The `dataset.yaml` content is not valid YAML or does not match the schema.
-    #[error("Failed to parse dataset configuration: {0}")]
-    ConfigParse(#[from] serde_yaml::Error),
-    /// A URL string could not be parsed.
-    #[error("Invalid URL: {0}")]
-    UrlParse(#[from] url::ParseError),
-    /// An HTTP request to a remote dataset failed.
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    /// A required facet (e.g., `base_vectors`) is not defined in the profile.
-    #[error("Required facet not defined: {0}")]
-    MissingFacet(String),
-    /// A facet that must hold one record per record of another holds
-    /// a different number: a quantization column against its base.
-    #[error("facet '{facet}' holds {found} records where {expected} were expected, one per record of '{against}'")]
-    FacetCardinality {
-        /// The facet with the wrong count.
-        facet: String,
-        /// The facet it must match.
-        against: String,
-        /// The count it must have.
-        expected: usize,
-        /// The count it has.
-        found: usize,
-    },
-    /// The facet was opened through a reader for the wrong shape.
-    ///
-    /// Not a missing capability: the facet is readable, through the
-    /// other path. A `metadata_content.slab` holds opaque records and
-    /// has no element width, so asking a vector reader for it is asking
-    /// a question it cannot answer — and saying "cannot infer element
-    /// size" describes the symptom rather than the situation.
-    ///
-    /// Carries the shape so a caller can branch on it rather than parse
-    /// a message; [`crate::dataset::facet::FacetShape`] is also
-    /// available up front through `facet_shape()`, which is the way to
-    /// avoid the error entirely.
-    #[error(
-        "facet '{facet}' holds {shape} and was opened as {attempted}; \
-         open it with {reader}"
-    )]
-    WrongFacetShape {
-        /// The facet as declared.
-        facet: String,
-        /// What the facet actually holds.
-        shape: crate::dataset::facet::FacetShape,
-        /// The shape the caller's reader expects.
-        attempted: crate::dataset::facet::FacetShape,
-        /// The reader that does open this facet.
-        reader: &'static str,
-    },
-    /// A fetch named facets the profile does not declare. Nothing was
-    /// fetched: fetching the facets that do exist and reporting success
-    /// would hide the typo.
-    #[error(
-        "no such facet(s){}: {}; the profile declares: {}",
-        .profile.as_deref().map(|p| format!(" in profile '{p}'")).unwrap_or_default(),
-        .missing.join(", "),
-        .declared.join(", ")
-    )]
-    UnknownFacets {
-        /// The profile, when the fetch spanned several.
-        profile: Option<String>,
-        /// The names asked for that the profile does not declare, sorted.
-        missing: Vec<String>,
-        /// Every facet the profile declares, sorted.
-        declared: Vec<String>,
-    },
-    /// A fetch window cannot be resolved for these facets' formats, so
-    /// honouring it means fetching them whole, and the request did not
-    /// allow that. Refused before anything was fetched.
-    #[error(
-        "the window cannot be resolved for {}, so honouring it means fetching \
-         the whole facet ({bytes} bytes); allow that with \
-         FetchRequest::allow_whole_facet (--allow-whole-facet on the command \
-         line), or drop the window",
-        .facets.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", ")
-    )]
-    WindowUnresolvable {
-        /// The facets, as `facet` or `profile/facet`.
-        facets: Vec<String>,
-        /// Their combined size — what allowing it means fetching, less
-        /// whatever is already cached. The number the decision turns on.
-        bytes: u64,
-    },
-    /// The cache directory cannot hold what a fetch would download.
-    /// Refused before anything was fetched.
-    #[error("{0}")]
-    InsufficientCacheSpace(#[from] InsufficientCacheSpace),
-    /// No configured catalog has a dataset by this name.
-    #[error(
-        "dataset '{name}' not found{}",
-        if .suggestions.is_empty() { String::new() } else { format!("; did you mean {}?", .suggestions.join(", ")) }
-    )]
-    UnknownDataset {
-        /// The name looked up.
-        name: String,
-        /// Datasets whose names contain it, for a "did you mean".
-        suggestions: Vec<String>,
-    },
-    /// More than one dataset matches this name (case-insensitively).
-    ///
-    /// Two catalogs that both declare the name are a collision to fix —
-    /// narrow the catalogs consulted — not something resolved by
-    /// precedence.
-    #[error("multiple datasets match '{name}': {}", .matches.join("; "))]
-    AmbiguousDataset {
-        /// The name looked up.
-        name: String,
-        /// Every dataset it matches, each with the catalog it came from
-        /// and that catalog's location when known:
-        /// `ds (catalog 'lab': /data/lab/catalog.json)`.
-        matches: Vec<String>,
-    },
-    /// A dataset spec or profile selector is malformed, or matches no
-    /// profile of the dataset.
-    #[error("dataset '{dataset}': {message}")]
-    Selection {
-        /// The dataset the selector was applied to.
-        dataset: String,
-        /// What is wrong with it.
-        message: String,
-    },
-    /// A profile's facets do not belong together: each check that
-    /// failed, what it found and the file
-    /// ([`TestDataViewExt::verify`]).
-    #[error("{}", .failures.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; "))]
-    Verification {
-        /// Every check that failed, in the order they ran.
-        failures: Vec<crate::verify::VerifyFailure>,
-    },
-    /// Catch-all for errors that do not fit other variants.
-    #[error("{0}")]
-    Other(String),
-}
-
-/// A specialized Result type for the library.
-pub type Result<T> = std::result::Result<T, Error>;

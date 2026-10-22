@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::Path;
 
 use vectordata::verify::{Check, NoProgress, VerifyOptions};
-use vectordata::{Error, TestDataGroup, TestDataViewExt};
+use vectordata::{Error, TestDataGroup};
 
 fn rows<T: Copy>(path: &Path, dim: i32, rows: &[Vec<T>], bytes: fn(T) -> Vec<u8>) {
     let mut f = std::fs::File::create(path).unwrap();

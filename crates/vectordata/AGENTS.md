@@ -48,9 +48,9 @@ documentation's **Common tasks** table is the same index with examples.
   [`&FetchEvent`](crate::fetch::FetchEvent). Show nothing:
   [`Silent`](crate::fetch::Silent).
 - Read fetched data through vectordata's readers —
-  [`TestDataView::base_vectors`](crate::TestDataView::base_vectors) and
+  [`TestDataViewExt::base_vectors_as`](crate::TestDataViewExt::base_vectors_as) and
   the other facet accessors, or
-  [`TestDataView::facet`](crate::TestDataView::facet). Once a facet is
+  [`TestDataViewExt::facet_as`](crate::TestDataViewExt::facet_as). Once a facet is
   fetched ([`FacetFetch::complete`](crate::fetch::FacetFetch::complete)),
   [`VectorReader::get_slice`](crate::VectorReader::get_slice) is a
   zero-copy borrow from the mapped cache: there is no second copy to
@@ -58,16 +58,16 @@ documentation's **Common tasks** table is the same index with examples.
 - Warm a window in the background while reading:
   [`TestDataView::prefetch_in_background`](crate::TestDataView::prefetch_in_background).
 - Read vectors:
-  [`TestDataView::base_vectors`](crate::TestDataView::base_vectors) /
-  [`query_vectors`](crate::TestDataView::query_vectors) →
+  [`TestDataViewExt::base_vectors_as`](crate::TestDataViewExt::base_vectors_as) /
+  [`query_vectors_as`](crate::TestDataViewExt::query_vectors_as) →
   [`VectorReader::get`](crate::VectorReader::get) or the zero-copy
   [`get_slice`](crate::VectorReader::get_slice) per record, and
   [`VectorReader::read_into`](crate::VectorReader::read_into) to copy a
   run of records into a contiguous buffer you own — a whole base set,
   or one window at a time — split across shards and windows for you.
 - Read ground truth:
-  [`TestDataView::neighbor_indices`](crate::TestDataView::neighbor_indices),
-  [`neighbor_distances`](crate::TestDataView::neighbor_distances).
+  [`TestDataViewExt::neighbor_indices_as`](crate::TestDataViewExt::neighbor_indices_as),
+  [`neighbor_distances_as`](crate::TestDataViewExt::neighbor_distances_as).
 - Read any element facet at the type it holds or converted (u8 codes
   in place, bf16 or f16 widened to f32, a metadata column as i32):
   [`TestDataViewExt::facet_as`](crate::TestDataViewExt::facet_as); the
@@ -189,7 +189,7 @@ Each of these exists, is tested, and handles cases that are easy to miss.
 | `vectordata datasets precache` | [`TestDataView::fetch`](crate::TestDataView::fetch), [`TestDataGroup::fetch`](crate::TestDataGroup::fetch), [`Catalog::fetch`](crate::catalog::Catalog::fetch) |
 | `vectordata datasets list` | [`Catalog::datasets`](crate::catalog::Catalog::datasets), [`Catalog::match_glob`](crate::catalog::Catalog::match_glob) |
 | `vectordata datasets describe` | [`Catalog::open_spec`](crate::catalog::Catalog::open_spec), [`TestDataView::facet_manifest`](crate::TestDataView::facet_manifest) |
-| `vectordata datasets ping` | [`Catalog::open_spec`](crate::catalog::Catalog::open_spec), then a reader per facet ([`TestDataView::facet`](crate::TestDataView::facet)) |
+| `vectordata datasets ping` | [`Catalog::open_spec`](crate::catalog::Catalog::open_spec), then a reader per facet ([`TestDataViewExt::facet_as`](crate::TestDataViewExt::facet_as)) |
 | `vectordata datasets push` | [`push::execute`](crate::push::execute) |
 | `vectordata datasets derive` | none — a command that writes a new dataset directory |
 | `vectordata datasets init` | [`dataset::infer::infer_dir`](crate::dataset::infer::infer_dir) — writes its `yaml`; `TestDataGroup::load` on the directory reads the same descriptor |

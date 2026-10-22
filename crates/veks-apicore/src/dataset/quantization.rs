@@ -27,7 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::typed_access::ElementType;
+use crate::ElementType;
 
 /// How codes map back to values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +111,7 @@ fn kebab(g: QuantGranularity) -> &'static str {
 mod element_name {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    use crate::typed_access::ElementType;
+    use crate::ElementType;
 
     pub fn serialize<S: Serializer>(ty: &ElementType, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(ty.name())

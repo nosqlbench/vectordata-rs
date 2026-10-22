@@ -10,7 +10,8 @@
 
 use crate::dataset::{CatalogEntry, CatalogLayout};
 
-use super::source::{CatalogOrigin, Requirement};
+use super::CatalogOrigin;
+use super::source::Requirement;
 use super::sources::CatalogSources;
 use super::CatalogDiagnostic;
 
@@ -59,7 +60,7 @@ impl Catalog {
                     e.set_catalog_name(source.name());
                     // The one place an entry's attributes meet the
                     // overlays, so every reader of the entry sees them.
-                    e.apply_overlay(sources.overlays().resolve(Some(source.name()), e.name()));
+                    crate::overlay::warn_contradictions(e.apply_overlay(sources.overlays().resolve(Some(source.name()), e.name())));
                     e
                 })),
                 None if requirement == Requirement::Required => {
@@ -412,7 +413,7 @@ impl DatasetSelection {
             .collect()
     }
 
-    /// [Verify](crate::TestDataViewExt::verify) every selected profile:
+    /// [Verify](crate::TestDataView::verify) every selected profile:
     /// each profile's report, by name, or
     /// [`Error::Verification`](crate::Error::Verification) with every
     /// failure, each prefixed by its profile.
@@ -420,7 +421,6 @@ impl DatasetSelection {
         &self,
         progress: &mut dyn crate::verify::VerifyProgress,
     ) -> crate::Result<Vec<(String, crate::verify::VerifyReport)>> {
-        use crate::view::TestDataViewExt;
         let mut reports = Vec::new();
         let mut failures = Vec::new();
         for (name, view) in self.views()? {

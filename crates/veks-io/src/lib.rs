@@ -128,7 +128,7 @@ pub use reader::{
     ScalarReader, StreamReclaim, VectorReader, VvecReader, XvecReader,
 };
 pub use reader::{open_vec, open_vec_as, open_vec_native, open_vvec, open_vvec_untyped};
-pub use source::{ByteSource, MappedFile, SourcePart};
+pub use source::{ByteSource, MappedFile, OpenSource, SourcePart};
 pub use writer::{ScalarWriter, VvecWriter, XvecWriter};
 pub use traits::{SourceMeta, VecSink, VecSource};
 pub use traits::{VarlenRecord, VarlenSink, VarlenSource};

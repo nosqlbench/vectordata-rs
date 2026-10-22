@@ -73,16 +73,15 @@ fn an_f16_facet_widens_to_f32_with_the_right_count() {
     assert_eq!(all, [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]);
 }
 
-/// `facet()` is `facet_as::<f32>`: an index facet is refused, not
-/// reinterpreted as 3.0.4 did.
+/// `facet_as::<f32>` refuses an index facet, not reinterpreting it as
+/// 3.0.4's `facet()` did.
 #[test]
-#[allow(deprecated)]
 fn facet_refuses_an_index_facet() {
     let dir = tempfile::tempdir().unwrap();
     write_xvec::<i32>(&dir.path().join("gt.ivec"), 2, 3, |i, d| (i * 3 + d) as i32);
     write_dataset_yaml(dir.path(), "ids", &[("neighbor_indices", "gt.ivec")]);
     let view = load(dir.path());
-    let err = view.facet("neighbor_indices").err().expect("i32 does not widen to f32");
+    let err = view.facet_as::<f32>("neighbor_indices").err().expect("i32 does not widen to f32");
     assert_eq!(mismatch(&err), Some((ElementType::I32, ElementType::F32)));
     assert_eq!(view.facet_as::<i64>("neighbor_indices").unwrap().get(1).unwrap(), vec![3, 4, 5]);
 }
@@ -200,23 +199,6 @@ fn an_i32_index_facet_as_u32_fails_on_a_negative_sentinel() {
     assert_eq!(overflow(&unsigned.get(1).unwrap_err()), Some(1));
     let wide = view.neighbor_indices_as::<i64>().unwrap();
     assert_eq!(wide.get(1).unwrap(), vec![2, -1]);
-}
-
-#[test]
-#[allow(deprecated)]
-fn the_deprecated_readers_equal_the_generic_ones() {
-    let dir = tempfile::tempdir().unwrap();
-    write_xvec::<f32>(&dir.path().join("base.fvecs"), 6, 2, |i, d| (i * 2 + d) as f32);
-    write_xvec::<i32>(&dir.path().join("gt.ivecs"), 2, 2, |i, d| (i + d) as i32);
-    write_dataset_yaml(dir.path(), "same", &[("base_vectors", "base.fvecs[1..5)"), ("neighbor_indices", "gt.ivecs")]);
-    let view = load(dir.path());
-    let old = view.base_vectors().unwrap();
-    let new = view.base_vectors_as::<f32>().unwrap();
-    assert_eq!((old.count(), new.count()), (4, 4), "the window applies to both");
-    for i in 0..4 {
-        assert_eq!(old.get(i).unwrap(), new.get(i).unwrap());
-    }
-    assert_eq!(view.neighbor_indices().unwrap().get(1).unwrap(), view.neighbor_indices_as::<i32>().unwrap().get(1).unwrap());
 }
 
 // ── Refused ────────────────────────────────────────────────────────────

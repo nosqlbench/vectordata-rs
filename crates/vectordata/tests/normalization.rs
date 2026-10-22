@@ -17,7 +17,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use support::testserver::TestServer;
 use vectordata::overlay::{AttributeSource, Overlay, Overlays};
 use vectordata::verify::{Check, NoProgress};
-use vectordata::{TestDataGroup, TestDataViewExt};
+use vectordata::TestDataGroup;
 
 static CACHE: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
