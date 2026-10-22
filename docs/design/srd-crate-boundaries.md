@@ -1089,12 +1089,35 @@ and the dispatch by facet.
 
 **Settled in implementation.**
 - **hdf5 was done in step 1** (§12.2).
-- **The slab reader still reports 4-byte elements** and states no
-  type, so acceptance test 5's slab case is not met. A slab's records
-  are opaque bytes, and nothing in the file says their element type.
-  Open: whether a slab vector facet should declare its element type
-  (in the schema sidecar) or the reader should take it from the
-  caller.
+- **A slab of vectors declares its element type in its schema
+  sidecar** (decided 2026-10-22; acceptance test 5's slab case is
+  met). A third descriptor kind, `VectorSchema` (`kind: "vector"`,
+  `element_type` by `ElementType::name`), joins `MetadataSchema` and
+  `PredicateSchema` in the `:schema` namespace; the file layout, the
+  slab container and the cache layout are unchanged. A slab that
+  declares none — no sidecar (every slab written before), a metadata
+  or predicate one, or one that is not JSON — reads as bytes:
+  `element_type` `None`, `element_size` 1, the dimension in bytes,
+  and one `log::warn!` per opened file saying why. A vector sidecar
+  that does not parse is an error, not bytes.
+  - `SinkConfig::source_format` is replaced by `element_type`: the
+    type of the records written, which a slab sink declares and sizes
+    from (`None` = opaque, sized as bytes). It was only ever read for
+    the slab width, and guessed `f32` for npy and parquet.
+  - `SlabReader::probe` is the one slab probe (veks-core's
+    `probe_slab`, which assumed 4 bytes, delegates to it), and
+    `veks_io::probe_format` answers for a slab.
+  - `metadata_schema::sidecar_kind` is the one reading of a sidecar's
+    `kind` (a kindless one is metadata).
+  - `transform convert` writes a declared slab from any typed source;
+    from a slab that declares none it copies only into a slab (still
+    undeclared) and refuses a typed target, which before was written
+    at a guessed `f32`. veks-pipeline's `ImportFacetOp`, compiled but
+    never registered as a command, is deleted as dead code (maintainer,
+    2026-10-22). `element_type_of_width` is gone: no source
+    needs a type guessed from its width.
+  - `analyze describe` prints the stated element type, `undeclared`
+    for such a slab; `slab explain` renders a vector sidecar.
 
 **Guards** (`crates/veks-io/tests/containers.rs`, new; needs `npy` and
 `parquet`):
@@ -1102,6 +1125,17 @@ and the dispatch by facet.
   reader found no vector column in it.
 - `a_parquet_fixed_size_list_column_decodes`.
 - `an_npy_f16_file_states_its_type`: 2 bytes, `F16`.
+
+**Guards** for the slab case (`crates/veks-io/tests/slab_vectors.rs`,
+new; needs `slab`; and `crates/veks-pipeline/tests/slab_element_type.rs`):
+- `a_slab_of_u8_vectors_reports_one_byte_and_u8`: 1 byte, `U8`.
+  Failed before with `(0, 4, None)` for a 3-dim u8 slab.
+- `an_f32_slab_reports_f32`; `an_undeclared_slab_reads_as_bytes` (no
+  sidecar, metadata, kindless, garbage); `an_unreadable_vector_sidecar_is_an_error`;
+  `every_element_type_round_trips_through_a_slab` (`ElementType::ALL`).
+- `convert_into_a_slab_declares_every_element_type`,
+  `an_undeclared_slab_is_not_converted_into_a_typed_file`,
+  `an_undeclared_slab_copies_into_an_undeclared_slab`.
 
 ### 12.6 Steps 5 and 6: inline sites and `TypedReader` (2026-10-22)
 
@@ -1164,8 +1198,8 @@ documents. sysref 02 and 08 are updated.
   `VecFormat`" is read as defining the trait or the enum.** The traits
   are veks-apicore's, and `VecFormat` is veks-io's. Any crate may
   implement the traits. `parquet_mnode`, which §8 keeps in veks-core,
-  and the compilers' in-memory sinks implement them. **This reading
-  needs the user's confirmation.**
+  and the compilers' in-memory sinks implement them. Confirmed by
+  the maintainer, 2026-10-22.
 - **Append refuses a cut file.** The old `gen vectors` appended onto a
   file with a partial last record, and every record after it was
   misread.
@@ -1287,16 +1321,17 @@ is only a dev-dependency.
   pooled connection to a stopped server fails with "error sending
   request", and it now counts as `Unreachable`. This fixed a flaky
   test.
-- **Open: PR-7 is not met as written, and should be amended.** PR-7
-  says credentials are resolved once per origin, "as
-  `apply_read_auth` effectively does now". That was wrong. The old
-  `apply_read_auth` resolved a token for every request, as an
-  in-memory longest-prefix lookup with no I/O. Credentials are keyed by
-  URL prefix (on purpose, not by origin) and can be reloaded
-  mid-session, so caching them per origin would be incorrect. Step 7
-  keeps the per-request lookup, so nothing regressed. Recommended:
-  amend PR-7 to "one in-memory lookup per request, no I/O". This is
-  the maintainer's decision.
+- **PR-7 amended (decided 2026-10-22).** PR-7 said credentials were
+  resolved once per origin, "as `apply_read_auth` effectively does
+  now". The old `apply_read_auth` resolved a token for every request,
+  as an in-memory longest-prefix lookup with no I/O, and credentials
+  are keyed by URL prefix and reloadable, so a per-origin cache would
+  send the wrong token. PR-7 now states the rule the code keeps: one
+  in-memory lookup per request, never I/O. Guarded by
+  `crates/vectordata/tests/credential_lookup.rs`
+  (`a_read_token_is_looked_up_in_memory_per_prefix`): with the lookup
+  made to read the store file, it fails with "a request read the
+  credentials file".
 
 **Guards:**
 - `crates/vectordata/tests/cache_layout.rs`:
@@ -1343,3 +1378,276 @@ this step did not touch. Alternating the old and new builds gave
 
 The workspace passes (131 test binaries), and
 `RUSTDOCFLAGS="-D warnings" cargo doc` is clean.
+
+### 12.8 Step 8: clients onto the transport (2026-10-22)
+
+Every network client outside vectordata's own sites now sends through
+a veks-transport `Transport`. SigV4 is the transport's (§10 Q6).
+
+**What moved or changed.**
+- veks-transport:
+  - `sigv4` (new, public): `AwsCredentials` (its `Debug` hides the
+    secret and the session token) and `SigV4Signer`, a
+    `RequestSigner` (`new`, `s3`), with `sign_at(&mut Request,
+    SystemTime)` for a fixed time. It depends on `hmac`.
+  - `Response` implements `io::Read`, so a downloader streams the body
+    in its own increments. `status_error()` turns an answer the caller
+    found failed into a `TransportError`: the status, permanent or
+    transient by `RetryPolicy`'s rule, and up to
+    `STATUS_DETAIL_BYTES` (1 KiB) of the body as detail.
+  - vectordata re-exports `sigv4` at `vectordata::transport::sigv4`.
+- veks-pipeline (TR-9): `fetch_dlhf`, `fetch_s2ag` and
+  `fetch_bulkdl/{mod,download,cos}` send through
+  `vectordata::transport::shared()`: its pool, TLS trust, offline gate
+  and user agent. Each request carries only its own authorisation:
+  - Hugging Face: `bearer_or_anonymous(HF_TOKEN)`;
+  - the S2 file list: `x-api-key`, otherwise anonymous;
+  - S2 files and template downloads: anonymous;
+  - COS: `.signed(SigV4Signer)`.
+  The hand-rolled SigV4 and `CosCredentials` are gone, and
+  `cos::credentials_from_env()` returns `AwsCredentials`.
+  `download_file` and `download_signed_file` are one streaming
+  `download_file(transport, Request, dest, listed_size, on_bytes)`.
+  Progress is unchanged: 256 KiB reads, `on_bytes` after each.
+  Retries are `RetryPolicy`:
+  - the S2 file list: 2, 4, 8, 16 s, no jitter (the old schedule);
+  - per-file downloads: `download_retry_policy(tries)`, with the
+    transport's default backoff;
+  - the HEAD probe: 0.5 s fixed, 10 attempts.
+- `update_check` (TR-10) builds its `Transport` from the pure
+  `probe_config(base)`: the process's TLS trust and offline mode,
+  redirects 0, 5 s request and connect timeouts, one client, the
+  descriptive user agent, anonymous. Its reqwest client is gone. It
+  followed no redirect before either; what is new is the process's
+  TLS trust and offline gate.
+- vecd's readiness probe (TR-11) sends through a transport from the
+  pure `health_probe_config(own_cert, host, addr)`: verification on,
+  vecd's own `tls_cert` added to the trusted roots, no origin trusted
+  unverified, 2 s timeouts, no redirects, anonymous and explicit. It
+  accepted every certificate before. The host it names is the pure
+  `probe_host(cert, ip)` over the certificate's subject alt names (§10
+  Q9): a name is pinned to the listener's address through
+  `TransportConfig::resolve`, so the handshake verifies the certificate
+  for that name while the connection goes to loopback.
+- TR-12: `fetch_if_modified` was fixed in step 7, and the resolver
+  only calls `shared().send(Request::get(url))`, so no hand-written
+  auth is left. `endpoint.rs` now checks offline: `whoami` and
+  `candidate_namespaces` are refused offline, through `send`.
+  `login_password`, `issue_token`, `revoke_token` and backup's
+  `versions`, `manifest` and `get_object` go through `send_command`,
+  which marks them explicit.
+
+**Settled in implementation.**
+- **One shared transport, with authorisation per request**, rather
+  than a second transport with no credentials for third-party hosts.
+  A request that names its own authorisation never asks the read
+  credentials (TR-5).
+- **The user agent is `vectordata/<version>`**, replacing `veks/0.14`.
+  COS requests and the HEAD probe sent none before.
+- **Retries are stricter**:
+  - a permanent 4xx (other than 408, 425 and 429) and an offline
+    refusal are not retried, in every downloader. The HEAD probe used
+    to retry a 404 ten times.
+  - per-file retries back off 1 s, doubling to 30 s, ±10 %, where they
+    retried at once;
+  - `tries = 0` means one attempt (bulk made none);
+  - the S2 list also retries 408, 425 and a failed body read.
+- **A blank `HF_TOKEN` sends no `Authorization` header.** It sent
+  `Bearer ` before.
+- **Downloader errors are `TransportError` text** ("HTTP request
+  failed: HTTP 404: Not Found …"). The messages tests assert and the
+  S2 user-facing messages are unchanged. "FAILED … after N attempts"
+  now counts the attempts made.
+- **Signer conventions**:
+  - it signs `host`, `content-type`, the `x-amz-*` headers and
+    `x-amz-date`;
+  - `x-amz-content-sha256` only for `s3`; `x-amz-security-token` for a
+    session token;
+  - S3 paths are signed as sent, and other services' path segments
+    are encoded once more, as SigV4 specifies;
+  - a file body is `UNSIGNED-PAYLOAD`, so an upload is not read twice;
+  - signing again replaces the signature.
+- **`head_content_length` and `CosContext::signed_head` are deleted**
+  as dead code.
+- **The probe's trust is vecd's certificate as a root**, not a
+  per-origin self-signed entry. **User decision 2026-10-22:** the probe
+  is to address the name the certificate was issued for, resolved to
+  loopback. A follow-up implements it.
+- **The offline split in `endpoint.rs` is kept (user decision
+  2026-10-22):** introspection is refused, the explicit commands are
+  not (login, push and backup, per sysref 02's documented rule). One
+  consequence: an offline `login --token` stores the credential
+  without a user label, because the label comes from `whoami`.
+- **`backup` is an explicit command throughout.** As first built,
+  `run_backup` listed the readable namespaces with `whoami`, so offline
+  mode stopped it before its explicit reads, against the rule. It now
+  uses `endpoint::access_view`, `whoami` sent as an explicit request.
+  `endpoint_offline.rs` runs a backup offline and expects exactly
+  login's and backup's requests at the server; before the fix it
+  failed with "backup is an explicit command: … offline mode is on".
+- **hf-hub** (the optional `embed` feature) has its own HTTP stack.
+  It is outside this work.
+
+**Guards.** The integration tests below were shown failing on the
+step-7 tree, with the message given. The unit tests are new with the
+code they test.
+- `sigv4`'s unit tests (acceptance test 10):
+  - `the_aws_documentation_example_signs_to_the_published_values`:
+    the IAM `ListUsers` example's canonical request, its hash
+    (`f536975d…`), the string to sign, the signing key (`c4afb1cc…`)
+    and the signature (`5d672d79…`);
+  - `the_aws_test_suite_get_vanilla_signs_to_its_published_signature`
+    (`5fa00fa3…`);
+  - `s3_requests_sign_as_the_pipelines_cos_code_did`: four signatures
+    captured from the old pipeline code, a listing and an object GET,
+    each with and without a session token;
+  - `signing_twice_leaves_one_signature`,
+    `the_payload_hash_follows_the_body`, `a_debug_print_names_no_secret`,
+    `dates_are_utc_civil_dates`,
+    `the_canonical_query_is_decoded_encoded_strictly_and_sorted`.
+- `crates/veks-pipeline/tests/downloads_through_the_transport.rs`
+  (acceptance test 9), `download s2ag` and `download bulk` (template
+  and COS) against a local axum server, each in a child process:
+  - `offline_mode_stops_every_downloader_before_the_network`: "download
+    s2ag succeeded offline: 1 downloaded…";
+  - `a_trusted_ca_certificate_reaches_a_private_https_server`:
+    "download s2ag refused a trusted CA certificate: file-list request
+    failed: error sending request…";
+  - `downloads_carry_their_own_authorisation_never_a_vectordata_token`:
+    "not the transport's user agent: Seen { … }". Its "only its own
+    authorisation" part cannot fail on step 7, whose downloaders had
+    clients of their own. It was shown by mutation (the S2 list given
+    the default read credentials): "a vectordata read token reached a
+    third-party host".
+- `fetch_dlhf`'s unit tests: `hub_requests_carry_only_their_own_token`,
+  `offline_mode_refuses_the_hub`, `a_blank_hf_token_sends_none`.
+- `crates/vectordata/tests/endpoint_offline.rs`:
+  `offline_mode_refuses_endpoint_introspection_before_any_request`
+  (with `login` still reaching the server): "whoami is refused
+  offline: Object {"namespaces": Array []}".
+- `crates/vecd/tests/health_probe_trust.rs`:
+  `the_readiness_probe_trusts_its_own_certificate_and_refuses_another_origin`,
+  through the binary's `daemon status --wait`: "the probe accepted a
+  self-signed certificate that is not vecd's own, at another origin".
+  vecd's unit test `the_health_probe_trusts_only_its_own_certificate`
+  checks the configuration.
+- `update_check`'s unit tests:
+  `the_probe_follows_no_redirect_within_five_seconds` and
+  `the_tag_is_read_from_the_unfollowed_redirect` (and, offline, no
+  tag).
+
+**PR-10.** `download bulk`, 8 × 1 GiB from a loopback axum server,
+with 250 ms resolution from the progress ticker:
+
+| Case | Before | After |
+|---|---|---|
+| `download bulk`, median | 4.00 s (about 2050 MiB/s) | 3.50–3.75 s (about 2340 MiB/s) |
+
+The workspace passes (134 test binaries).
+
+### 12.9 Step 9: dependencies and the guard (2026-10-22)
+
+**What changed (CB-1).**
+- vectordata and vecd have reqwest in `[dev-dependencies]` only; their
+  tests stand up and probe servers with it. The manifests' old reqwest
+  comments are kept, under a new lead-in line.
+- veks drops its unused reqwest.
+- veks-pipeline drops reqwest, and tokio moves to
+  `[dev-dependencies]` (`rt`, `rt-multi-thread`, `net`, `macros`). Its
+  axum, axum-server and rcgen dev-dependencies came in step 8, for the
+  downloader tests.
+- veks-transport has veks-io as a dev-dependency only, as since step
+  7.
+
+**Settled in implementation.**
+- **The graph guard is a layer table** (`LAYERS`), lowest first. A
+  crate's `[dependencies]` name only workspace crates on lower layers;
+  skipping layers is allowed, and a crate on no layer is an error.
+  veks-studies, veks-anode and tools sit on the bottom layer, and the
+  root package on the top.
+- **Dev-dependencies are exempt**: a test may stand up anything.
+- **Manifests are read line by line** by the test, not through
+  `cargo metadata`: a section header, then the `name = …` keys at the
+  top level of a dependency table, `[target.….dependencies]` included.
+- **hf-hub is unseen by the guard**: it is a dependency of its own
+  with its own HTTP stack, and names no `reqwest::` in workspace
+  source.
+- CB-2's AC-2 part (no public trait of an implementation crate used
+  outside it) is not in this step.
+
+**Guards** (`crates/tools/tests/crate_boundaries.rs`, acceptance test
+1's network and graph parts):
+- `the_dependency_graph_is_the_srds`: every crate on a layer, edges to
+  lower layers only; only veks-transport depends on reqwest;
+  veks-transport and veks-io do not reach each other, and neither
+  reaches vectordata; veks-apicore's dependencies are within its AC-1
+  list (`APICORE_DEPENDENCIES`). On the step-7 tree it fails with
+  vecd, vectordata, veks and veks-pipeline depending on reqwest. The
+  transport and apicore rules were shown by mutation (veks-io added to
+  veks-transport's dependencies, memmap2 to veks-apicore's):
+  "veks-transport depends on veks-io, which is not on a lower layer",
+  "veks-transport reaches veks-io", "veks-apicore depends on memmap2,
+  outside its vocabulary".
+- `only_veks_transport_names_reqwest`: no production source outside
+  veks-transport names `reqwest::` or `use reqwest`. On the step-7
+  tree it lists every site in `vecd/src/cli.rs`, `update_check.rs`,
+  `cos.rs`, `download.rs`, `fetch_bulkdl/mod.rs` and `fetch_dlhf.rs`.
+- `the_graph_matchers_catch_what_they_are_for`: the manifest reader
+  (comments, multi-line tables, target and `[dependencies.<name>]`
+  tables, dev-dependencies) and each graph rule, on the shapes they
+  are for.
+
+No PR-10 numbers: the step changes manifests and a test. The
+workspace passes (134 test binaries; 135 with the PR-7
+`credential_lookup` test).
+
+### 12.10 Follow-ups (2026-10-22)
+
+Decisions made while closing out steps 7–9, each implemented.
+
+- **PR-7 amended** to one in-memory token lookup per request (§12.7).
+- **vecd's probe** verifies vecd's own certificate for a name it was
+  issued for: the connected loopback address when the certificate
+  names it, else localhost or its first DNS name, pinned to the
+  listener's address (`TransportConfig::resolve`). Guard:
+  `the_readiness_probe_reaches_a_certificate_issued_only_for_a_dns_name`
+  (before: "vecd did not answer /healthz within 2s"), with
+  `the_readiness_probe_refuses_another_certificate_for_the_same_name`
+  keeping the trust strict.
+- **Slab vectors declare their element type** in a `kind: "vector"`
+  schema sidecar (`VectorSchema`); see §12.5.
+- **`ImportFacetOp`**, never registered as a command, is deleted.
+- **Streaming sources report failures.** `VecSource::next_record`,
+  `read_record_into` and `VarlenSource::next_record` return
+  `Result<_, IoError>`; `Ok(None)` ends a stream and an error stops it
+  for good. The npy and parquet directory readers (and veks-core's
+  `ParquetMnodeReader`) skipped a file that failed to load with an
+  info-level log, so a stream ended early with no error; they now
+  return the file's error at its place in the order. The xvec, varlen,
+  scalar and slab sources return what they turned into `None`.
+  Drivers: `transform convert` (both stream paths) and veks'
+  `probe_directory_vectors`. Guards (`veks-io/tests/stream_failures.rs`,
+  `veks-pipeline/tests/convert_source_failures.rs`), each failing on
+  the old code: "the stream ended after 4 of Some(12) records with no
+  error" for npy and parquet, and `transform convert` reporting
+  "converted 4 records (npy -> slab)" as success.
+  - **Found by the guard:** a healthy multi-file parquet directory
+    streamed only its first file (the consumer waited for the file
+    `open` had preloaded). Fixed, with slot ownership made explicit;
+    `a_parquet_directory_streams_every_file` failed with 4 of 12.
+  - **Stricter:** parquet refuses null rows, rows of the wrong length
+    and a later file of another schema (before: garbage, a panic or an
+    early end); varlen refuses a negative header and a short tail; a
+    varlen record of dimension 0 reads as empty instead of ending the
+    stream.
+  - **PR-10, deferred by the maintainer:** sequential u8 `next_record`
+    is about 8 % slower (332.6 → 360–364 ms) because
+    `Result<Option<Vec<u8>>, IoError>` is 64 bytes against
+    `Option<Vec<u8>>`'s 24 (`IoError`'s `ValueOverflow` and `Transport`
+    payloads). `read_record_into`, the hot path, is within 3 %
+    (f32 −1.0 %, u8 +1.4–2.8 %, i32 +2.6 %; varlen scan +1.3 %).
+    Boxing the large payloads would recover it; not done now.
+- **veks-io denies `unwrap` and `expect`** (PR-8): lock poisoning is
+  recovered, the slab reader's page lookup returns an error, and the
+  unchecked `get_slice`'s documented panic carries a reasoned allow.
+- **`backup` is explicit** under offline mode (§12.8).

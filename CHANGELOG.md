@@ -44,6 +44,23 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
   veks-transport reads a remote `.fvecs` through `XvecReader` with no
   vectordata. vectordata still places every cache file, and the cache
   layout is unchanged (`docs/design/srd-crate-boundaries.md` §6).
+- **Only veks-transport talks HTTP.** vectordata, vecd, veks and
+  veks-pipeline no longer depend on reqwest (vectordata and vecd keep
+  it for their tests): the pipeline's Hugging Face, Semantic Scholar
+  and bulk downloaders, the update check and vecd's readiness probe
+  send through the transport, with its TLS trust, offline gate and
+  user agent, and each request carries only its own authorisation
+  (`HF_TOKEN`, the S2 API key, a SigV4 signature, or none), never a
+  vectordata read token. veks-pipeline no longer depends on tokio. A
+  workspace test holds the crate graph to the SRD's layers
+  (`docs/design/srd-crate-boundaries.md` §7).
+- **SigV4 in the transport: `vectordata::transport::sigv4`.**
+  `SigV4Signer` is a `RequestSigner` for S3 and S3-compatible stores
+  (and any SigV4 service), over `AwsCredentials`, whose `Debug` shows
+  no secret; checked against AWS's published examples. The COS
+  downloader signs with it, as before. `Response` is `io::Read`, so a
+  body streams in the caller's increments, and `status_error()` gives
+  the `TransportError` of an answer the caller found failed.
 - **The format layer is veks-io, and only veks-io.** veks-core's
   streaming readers and writers (xvec, npy, parquet, slab), the sinks
   and the sharding sink, the positional writer, element conversion,
@@ -271,8 +288,52 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
 - The refusal of a convertible type now reads "open it through a
   dataset view or a converting reader to widen" (or "to check each
   value").
+- **The downloaders' user agent and error text.** `download
+  huggingface`, `download s2ag` and `download bulk` send
+  `vectordata/<version>`, not `veks/0.14` (COS requests and the bulk
+  HEAD probe sent none). Their HTTP failures read as the transport's
+  errors ("HTTP request failed: HTTP 404: Not Found …"); the S2
+  messages are unchanged, and "FAILED … after N attempts" counts the
+  attempts made.
+- **Offline mode refuses `whoami`, `ping` and namespace completion**
+  before any request, with the offline error. `login`, `token issue`,
+  `token revoke`, `push` and `backup` are not affected (`backup` lists
+  its namespaces with `endpoint::access_view`, the explicit form of
+  `whoami`). An offline
+  `login --token` stores the credential without a user label.
+- **The downloaders retry less, and later.** A permanent 4xx (other
+  than 408, 425 and 429) and an offline refusal fail at once; per-file
+  retries back off from 1 s, doubling to 30 s, ±10 %, where they
+  retried at once. The S2 file list keeps its 2–16 s schedule, and
+  also retries 408, 425 and a failed body read.
+- **`tries = 0` means one attempt** in `download bulk`, which made
+  none.
+- **A streaming source reports a record it cannot read.**
+  `VecSource::next_record` returns `Result<Option<Vec<u8>>, IoError>`,
+  `read_record_into` `Result<bool, IoError>`, and
+  `VarlenSource::next_record` `Result<Option<VarlenRecord>, IoError>`:
+  `Ok(None)` is the end, and an error is where the stream stops. A
+  source implemented outside the workspace wraps its records in `Ok`.
 
 ### Fixes
+
+- **A directory of npy or parquet files that held a corrupt file
+  ended early, quietly.** The loaders logged the file at info level
+  and skipped it, so the stream stopped with fewer records than its
+  `record_count` and every caller took that for the end. The stream
+  now yields the records of the files before it, then an error naming
+  the file; `transform convert` fails on it instead of reporting
+  success. The parquet MNode reader is the same.
+- **A parquet directory streamed only its first file.** The reader
+  waited for that file again from its loaders, which had started at
+  the second, and ended when they finished; every file is read now.
+- **The other streaming sources stop with an error, not an end:** an
+  xvec record whose header states another dimension, a varlen record
+  the file ends inside of or whose header is negative, a scalar value
+  the file can no longer deliver, a slab page that cannot be read, and
+  a parquet row that is null, of another length, or in a file of
+  another schema. A varlen record of dimension 0, as the varlen writer
+  writes it, reads as an empty record where it ended the stream.
 
 - **veks-io's byte-level writers reported a full disk as success.**
   `xvec::writer`, `scalar::writer` and the varlen writer discarded
@@ -318,6 +379,23 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
 - **A request to a server that has gone away is unreachable**, not a
   transient error to retry: for example, a pooled connection that gets
   no answer.
+- **`vecd daemon status --wait` accepted any certificate.** Its
+  readiness probe trusts vecd's own `tls_cert` and nothing else, with
+  verification on.
+- **The update check ignored the TLS trust and offline gate** of
+  `settings.yaml`. It goes through a transport of its own built from
+  the process's, still following no redirect, with its 5 s ceiling.
+- **Offline mode was ignored by endpoint lookups and the downloaders.**
+  `whoami`, `ping` and namespace completion, and `download
+  huggingface`, `download s2ag` and `download bulk`, made requests
+  with offline mode on; they are refused before the network.
+- **The downloaders ignored per-origin TLS trust**: a custom CA in
+  `trusted_ca_certs` or an origin in `trust_self_signed` did not reach
+  them. They use the process's trust.
+- **A blank `HF_TOKEN` sent `Authorization: Bearer `.** It sends no
+  `Authorization` header.
+- **The bulk HEAD probe retried a 404 ten times.** A permanent answer
+  fails at once.
 
 ## 4.0.2 — 2026-10-20
 

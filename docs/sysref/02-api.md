@@ -120,8 +120,9 @@ four:
 | Reader | `VectorReader`, `VvecReader`, `AnyVectorReader`, `records` | ordinal access to one facet |
 | Storage | `FacetStorage` (low-level) | a facet's bytes: cache state, range fetches |
 
-Transport and cache internals below storage are crate-private. Nothing
-in these layers prints, prompts or exits: problems are values
+The cache internals below storage are crate-private. The transport
+under them is the `veks-transport` crate, re-exported at
+`vectordata::transport` (§2.10b). Nothing in these layers prints, prompts or exits: problems are values
 (`Error`, `Catalog::diagnostics`), and progress reaches a terminal only
 through a sink the caller passes (`fetch::FetchProgress`,
 `push::ProgressSink`).
@@ -1196,6 +1197,70 @@ never written to the remote source.
   `shell::complete(words)` (the words after the embedding command).
   `completions` run under an embedding name explains this and exits 1.
 
+## 2.10b The transport
+
+Every request the workspace sends goes through `veks-transport`, the
+one crate that depends on an HTTP client (reqwest; a workspace test
+keeps it that way). Its types at the seam are veks-apicore's, so no
+reqwest type is in any public signature. `vectordata::transport`
+re-exports its client API for programs that already depend on
+vectordata.
+
+- **One transport per process.** `vectordata::transport::shared()` is
+  built once, on first use, from `config_from(offline_setting, tls,
+  &TransportEnv)`, a pure function of the `offline` setting, the TLS
+  trust in `settings.yaml` and the environment values it reads once
+  (`VECTORDATA_OFFLINE`, `VECTORDATA_HTTP_RUNTIMES`,
+  `VECTORDATA_DOWNLOAD_CONCURRENCY`, `AWS_REGION`,
+  `AWS_DEFAULT_REGION`). Every request shares its client pools and TLS
+  policy. The transport itself reads no environment variable and no
+  file.
+- **Configuration is a value:** `TransportConfig { offline,
+  offline_hint, tls: TlsTrust { trusted_ca_certs, trust_self_signed },
+  user_agent, timeouts: Timeouts { request, connect }, redirects,
+  parallel_streams, download_concurrency, s3_region }`. vectordata's
+  sends `vectordata/<version>`, follows ten redirects, and has a
+  one-hour request ceiling and a ten-second connect timeout. A program
+  builds its own with `Transport::new(config)` or
+  `Transport::with_credentials(config, credentials)`.
+- **Read credentials are a trait:** `Credentials::read_token(url)`.
+  vectordata's is `credentials::StoredCredentials`:
+  `$VECTORDATA_TOKEN`, else the credential `vectordata login` stored
+  for the URL, by longest prefix. The store is read once per process
+  and on `reload_credentials`; each request then makes one in-memory
+  lookup, never I/O. `NoCredentials` sends every read anonymously.
+- **A request is a value:** `Request::get(url)` (and `head`, `put`,
+  `post`, `patch`, `delete`), with `header`, `bytes` or `file` for the
+  body, `timeout`, and its authorisation (`Authorization`): the read
+  credentials by default, or `bearer(token)`, `bearer_or_anonymous`,
+  `anonymous()`, or `signed(signer)`. A request with authorisation of
+  its own never asks the read credentials.
+- **Signing:** `RequestSigner::sign(&mut Request)` runs just before the
+  request is sent, on its URL in wire form. `sigv4::SigV4Signer`
+  (`SigV4Signer::s3(AwsCredentials::new(key, secret), region)`) is AWS
+  Signature Version 4, for S3 and S3-compatible stores.
+- **The answer:** `Transport::send(req) -> Result<Response,
+  TransportError>`. `Response` gives the status, headers,
+  `content_length`, `last_modified`, and the body as `bytes()`,
+  `text()`, `copy_to(writer)`, or read as it arrives (`io::Read`).
+  `error_for_status()` and `status_error()` turn a failed answer into
+  a `TransportError`, with up to 1 KiB of the body as detail.
+- **The offline gate is in `send`.** With offline mode on, a request is
+  refused before the network with the offline error
+  (`TransportErrorKind::Offline`), unless it is marked `explicit()`:
+  the server commands `login`, `token`, `push` and `backup`'s object
+  reads. `Transport::ensure_online(url)` asks the same question.
+- **Retries** are `RetryPolicy` (by default ten retries, from 1 s
+  doubling to 30 s, ±10 %). A permanent error is never retried.
+
+The programs on the transport besides vectordata's own reads: the
+pipeline's `download huggingface`, `download s2ag` and `download
+bulk`, each with its own authorisation (`HF_TOKEN`, the S2 API key,
+SigV4) and never a vectordata read token; the update check, through a
+transport of its own with the process's trust and offline mode, no
+redirects and a 5 s ceiling; and `vecd daemon status --wait`, whose
+probe trusts vecd's own `tls_cert` and nothing else.
+
 ## 2.11 Error handling
 
 ```rust
@@ -1236,6 +1301,13 @@ A view's facet methods return `vectordata::Error`, which wraps
 quantization column whose count disagrees with its base) and
 `Error::AmbiguousDataset { name, matches }` (a name, or a
 `knn_entries.yaml` directory, that resolves to more than one dataset).
+A failed request is `Error::Transport(TransportError)` (and
+`IoError::Transport` from a reader, the same value): the URL, the HTTP
+status when the server answered, a message, and its kind:
+`Permanent` (a retry cannot succeed: a 4xx other than 408, 425 and
+429), `Transient`, `Unreachable` (no answer: refused, timed out, an
+untrusted certificate, so a local copy stands in) or `Offline`.
+`is_permanent()` says whether a retry is worth it.
 
 ---
 
@@ -1500,8 +1572,13 @@ server. Catalogs, definitions and offset indexes come from their kept
 copies, data from the cache — a partially fetched file serves the chunks
 it holds — and anything not held locally is an error saying offline mode
 is on. `fetch` does not revalidate or download. The environment variable
-overrides the setting in both directions. Explicit server commands
-(`login`, `push`, `backup`) are not affected.
+overrides the setting in both directions. The endpoint lookups
+(`whoami`, `ping`, namespace completion), the update check and the
+pipeline's downloaders are refused too. Explicit server commands
+(`login`, `token`, `push`, `backup`) are not affected; `backup` lists
+its namespaces with `endpoint::access_view`, the explicit form of
+`whoami`. An offline `login --token` stores the credential without a
+user label.
 
 ### Per-facet cache stats
 
@@ -1628,17 +1705,18 @@ many threads" pattern safe by construction. The
 `parallel_opens_share_single_cache_channel` integration tests
 lock this in.
 
-**Shared `reqwest::blocking::Client`.** A single client lives
-process-wide; every internal HTTP site clones from it. The clone
-is cheap (the client is internally `Arc`-wrapped) and shares the
-connection pool, DNS cache, and TLS session state. Without this,
-each `Client::new()` would trigger
+**One shared transport.** A single `Transport`
+(`vectordata::transport::shared()`, §2.10b) lives process-wide; every
+request goes through it. It builds its client pools once and keeps
+them; a client taken from a pool is cheap (internally `Arc`-wrapped)
+and shares the connection pool, DNS cache, and TLS session state.
+Without this, each new client would trigger
 `rustls_native_certs::load_native_certs` (~1 ms on Linux walking
 `/etc/ssl/certs/`). The
-`many_per_record_reads_share_one_tcp_connection`,
-`many_storage_opens_share_one_client_no_cert_load_storm`, and
-`shared_client_is_singleton_across_storages` integration tests
-lock in the connection-pool reuse property.
+`many_per_record_reads_share_one_tcp_connection` and
+`many_storage_opens_bounded_by_pool_no_cert_load_storm` integration
+tests and veks-transport's `a_transport_builds_its_pools_once` lock
+in the connection-pool reuse property.
 
 ## 2.13 Thread Safety
 
