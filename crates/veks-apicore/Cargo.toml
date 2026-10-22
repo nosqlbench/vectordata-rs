@@ -6,6 +6,7 @@ description = "The vectordata API: the dataset, catalog, reader, source, streami
 license = "Apache-2.0"
 homepage = "https://github.com/nosqlbench/vectordata-rs"
 repository = "https://github.com/nosqlbench/vectordata-rs"
+readme = "README.md"
 keywords = ["vector", "dataset", "api", "knn"]
 categories = ["data-structures", "encoding"]
 

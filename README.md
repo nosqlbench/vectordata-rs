@@ -114,6 +114,21 @@ variable-length records.
 **[veks-anode](./crates/veks-anode/)** — binary codecs for structured metadata
 and predicate trees.
 
+**[veks-io](./crates/veks-io/)** — the format layer: readers and writers for
+every vector file format (xvec, vvec, scalar columns, npy, parquet, slab),
+usable without the rest of the toolkit.
+
+**[veks-transport](./crates/veks-transport/)** — remote access and streaming
+storage: the one HTTP client, range reads, uploads, request signing, and the
+merkle-verified cache files.
+
+**[veks-apicore](./crates/veks-apicore/)** — the API itself: the contracts the
+crates speak through and every type they name, for programs that need only
+the contracts or implement one.
+
+**[veks-datatypes](./crates/veks-datatypes/)** — the element model: element
+types, the one extension table, and the conversion rules between types.
+
 ---
 
 ## Build, analyze, and serve your own
