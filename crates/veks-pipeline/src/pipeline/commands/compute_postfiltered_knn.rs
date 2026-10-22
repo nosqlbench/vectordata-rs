@@ -276,7 +276,10 @@ sign convention (FAISS publication convention for KNN outputs from
         };
 
         let pb = ctx.ui.bar(n as u64, "intersecting G ∩ R");
-        let dim_le = (k as i32).to_le_bytes();
+        // One query's F row and its xvec record, reused across queries.
+        let mut f_idx: Vec<i32> = Vec::with_capacity(k);
+        let mut f_dist: Vec<f32> = Vec::with_capacity(k);
+        let mut record: Vec<u8> = Vec::new();
 
         let mut produced = vec![indices_path.clone()];
         if let Some(p) = distances_path.as_ref() {
@@ -290,20 +293,12 @@ sign convention (FAISS publication convention for KNN outputs from
             let g_row = gt_reader.get_slice(q);
             let d_row: Option<&[f32]> = gt_dist_reader.as_ref().map(|r| r.get_slice(q));
 
-            if let Err(e) = idx_writer.write_all(&dim_le) {
-                return error_result(format!("write indices header: {}", e), start);
-            }
-            if let Some(ref mut dw) = dist_writer
-                && let Err(e) = dw.write_all(&dim_le)
-            {
-                return error_result(format!("write distances header: {}", e), start);
-            }
-
             // Walk G in rank order; emit survivors first, then sentinel
             // pad to k. Preserving rank order keeps the F output sorted
             // by distance (since G is rank-sorted), which downstream
             // consumers rely on.
-            let mut emitted = 0usize;
+            f_idx.clear();
+            f_dist.clear();
             for (i, &ord) in g_row.iter().enumerate() {
                 if ord < 0 { continue; } // G sentinel
                 // Membership by binary search on the ascending record.
@@ -312,31 +307,32 @@ sign convention (FAISS publication convention for KNN outputs from
                     Ok(false) => continue,
                     Err(e) => return error_result(e, start),
                 }
-                if let Err(e) = idx_writer.write_all(&ord.to_le_bytes()) {
-                    return error_result(format!("write F index q={}: {}", q, e), start);
+                f_idx.push(ord);
+                if let Some(drow) = d_row {
+                    f_dist.push(drow[i]);
                 }
-                if let Some(ref mut dw) = dist_writer
-                    && let Some(drow) = d_row
-                {
-                    let dist = drow[i];
-                    if let Err(e) = dw.write_all(&dist.to_le_bytes()) {
-                        return error_result(format!("write F distance q={}: {}", q, e), start);
-                    }
-                }
-                emitted += 1;
             }
+            let emitted = f_idx.len();
             // Sentinel pad.
             let pad = k - emitted;
             survivors_total += emitted as u64;
             sentinels_total += pad as u64;
-            for _ in 0..pad {
-                if let Err(e) = idx_writer.write_all(&(-1i32).to_le_bytes()) {
-                    return error_result(format!("write F sentinel q={}: {}", q, e), start);
+            f_idx.resize(k, -1);
+            record.clear();
+            if let Err(e) = veks_io::writer::encode_records(&f_idx, k, &mut record) {
+                return error_result(format!("write F indices q={}: {}", q, e), start);
+            }
+            if let Err(e) = idx_writer.write_all(&record) {
+                return error_result(format!("write F indices q={}: {}", q, e), start);
+            }
+            if let Some(ref mut dw) = dist_writer {
+                f_dist.resize(k, f32::INFINITY);
+                record.clear();
+                if let Err(e) = veks_io::writer::encode_records(&f_dist, k, &mut record) {
+                    return error_result(format!("write F distances q={}: {}", q, e), start);
                 }
-                if let Some(ref mut dw) = dist_writer
-                    && let Err(e) = dw.write_all(&f32::INFINITY.to_le_bytes())
-                {
-                    return error_result(format!("write F sentinel distance q={}: {}", q, e), start);
+                if let Err(e) = dw.write_all(&record) {
+                    return error_result(format!("write F distances q={}: {}", q, e), start);
                 }
             }
             if (q + 1) % 1024 == 0 || q + 1 == n {

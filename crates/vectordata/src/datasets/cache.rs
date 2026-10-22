@@ -350,11 +350,11 @@ fn facet_chunk_coverage(
     if win_end <= win_start { return whole(); }
 
     let ext = clean.rsplit('.').next().unwrap_or("");
-    let elem_size = crate::io::infer_elem_size(ext);
-    if elem_size == 0 || crate::io::is_vvec_ext(ext) { return whole(); }
+    let Some(elem) = crate::io::ElementType::from_extension(ext) else { return whole(); };
+    if crate::io::is_vvec_ext(ext) { return whole(); }
 
     let cache_file = ds_cache.join(clean);
-    let Some(bpr) = read_xvec_bpr(&cache_file, elem_size) else { return whole(); };
+    let Some(bpr) = read_xvec_bpr(&cache_file, elem) else { return whole(); };
 
     let byte_start = win_start.saturating_mul(bpr);
     let byte_end = win_end.saturating_mul(bpr).min(shape.total_content_size);
@@ -371,18 +371,15 @@ fn facet_chunk_coverage(
     (valid, total_in_window)
 }
 
-/// Read the 4-byte xvec dim header at byte 0 of a cache file and
-/// derive bytes-per-record (`4 + dim * elem_size`). Returns `None`
-/// when chunk 0 isn't downloaded (sparse hole reads as zeros →
-/// dim = 0 → bounds reject) or the file can't be opened.
-fn read_xvec_bpr(cache_file: &Path, elem_size: usize) -> Option<u64> {
-    use std::io::Read;
-    let mut buf = [0u8; 4];
-    let mut f = std::fs::File::open(cache_file).ok()?;
-    f.read_exact(&mut buf).ok()?;
-    let dim = i32::from_le_bytes(buf);
-    if dim <= 0 || dim > 1_000_000 { return None; }
-    Some(4 + (dim as u64) * (elem_size as u64))
+/// Bytes per record of a cache file, from veks-io's probe of its first
+/// header — a mapping touched for four bytes, so a sparse file is not
+/// read. Returns `None` when chunk 0 isn't downloaded (sparse hole
+/// reads as zeros → dim = 0 → the probe refuses it), the header claims
+/// more than a million elements, or the file can't be opened.
+fn read_xvec_bpr(cache_file: &Path, elem: crate::io::ElementType) -> Option<u64> {
+    let file = veks_io::MappedFile::map(cache_file).ok()?;
+    let probe = veks_io::reader::probe_source(&file, elem).ok()?;
+    (probe.dim <= 1_000_000).then_some(probe.record_bytes)
 }
 
 /// Rows: (path, valid_chunks, total_chunks, cached_bytes, content_bytes, complete, rle_string)

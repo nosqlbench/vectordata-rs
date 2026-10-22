@@ -245,7 +245,14 @@ fn scan_zeros_f32(
     // work to interleave. Aggregate in-flight memory stays small
     // (`threads * chunk_bytes`).
     const PER_WORKER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-    let entry_size = 4 + dim * 4;
+    let entry_size = match veks_io::reader::xvec_record_bytes(dim as i32, veks_io::ElementType::F32) {
+        Ok(n) => n,
+        Err(e) => {
+            pb.finish();
+            log::error!("{}: {}", path.display(), e);
+            return Vec::new();
+        }
+    };
     let vecs_per_chunk = (PER_WORKER_CHUNK_BYTES / entry_size).max(1);
 
     let file = match File::open(path) {
@@ -412,7 +419,14 @@ fn scan_zeros_f16(
     // Backing buffer as `Vec<u16>` so it's 2-byte aligned — the
     // header is 4 bytes (2 u16s), then `dim` u16 payload values
     // reinterpretable as `half::f16` via `#[repr(transparent)]`.
-    let entry_size = 4 + dim * 2;
+    let entry_size = match veks_io::reader::xvec_record_bytes(dim as i32, veks_io::ElementType::F16) {
+        Ok(n) => n,
+        Err(e) => {
+            pb.finish();
+            log::error!("{}: {}", path.display(), e);
+            return Vec::new();
+        }
+    };
     let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
     let chunk_capacity_bytes = vecs_per_chunk * entry_size;
     let chunk_capacity_u16 = chunk_capacity_bytes.div_ceil(2);
@@ -843,12 +857,12 @@ fn scan_file_concise_f32(
         .map_err(|e| format!("{}", e))?;
     let count = VectorReader::<f32>::count(&reader);
     let dim = VectorReader::<f32>::dim(&reader);
+    let entry_size = reader.entry_size();
     drop(reader);
 
     if count == 0 || dim == 0 {
         return Ok((count, dim, 0, 0));
     }
-    let entry_size = 4 + dim * 4;
     let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
     let chunk_capacity_f32 = (vecs_per_chunk * entry_size).div_ceil(4);
     let mut chunk_buf: Vec<f32> = vec![0.0; chunk_capacity_f32];
@@ -926,12 +940,12 @@ fn scan_file_concise_f16(
         .map_err(|e| format!("{}", e))?;
     let count = VectorReader::<half::f16>::count(&reader);
     let dim = VectorReader::<half::f16>::dim(&reader);
+    let entry_size = reader.entry_size();
     drop(reader);
 
     if count == 0 || dim == 0 {
         return Ok((count, dim, 0, 0));
     }
-    let entry_size = 4 + dim * 2;
     let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
     let chunk_capacity_u16 = (vecs_per_chunk * entry_size).div_ceil(2);
     let mut chunk_buf: Vec<u16> = vec![0u16; chunk_capacity_u16];

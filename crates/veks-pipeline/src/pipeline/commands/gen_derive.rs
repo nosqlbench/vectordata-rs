@@ -320,13 +320,19 @@ statistics.
     }
 }
 
+/// Whether `path` names an f32 vector file, in any spelling the element
+/// model reads (`.fvec`, `.fvecs`, `.f32vecs`, …).
+fn is_fvec(path: &Path) -> bool {
+    veks_io::VecFormat::detect_from_path(path) == Some(veks_io::VecFormat::Fvec)
+}
+
 /// Find a base vectors .fvec file in a source path.
 ///
 /// If the path is a .fvec file directly, returns it.
 /// Otherwise searches the directory for base_vectors.fvec or any .fvec file.
 fn find_base_vectors(source: &Path) -> Option<PathBuf> {
     if source.is_file() {
-        if source.extension().and_then(|e| e.to_str()) == Some("fvec") {
+        if is_fvec(source) {
             return Some(source.to_path_buf());
         }
         return None;
@@ -342,7 +348,7 @@ fn find_base_vectors(source: &Path) -> Option<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(source) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("fvec") {
+            if is_fvec(&path) {
                 return Some(path);
             }
         }

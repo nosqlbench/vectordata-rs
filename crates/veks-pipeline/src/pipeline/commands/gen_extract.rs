@@ -255,7 +255,10 @@ facets of the dataset.
             // than one file (SH-35). Every fvec record is the same
             // width, so the split is arithmetic and the loop below
             // does not change.
-            let record_bytes = 4 + dim as u64 * 4;
+            let record_bytes = match veks_io::reader::xvec_record_bytes(dim as i32, veks_io::ElementType::F32) {
+                Ok(b) => b as u64,
+                Err(e) => return error_result(format!("{}: {}", fvec_path.display(), e), start),
+            };
             let cap = crate::pipeline::shard_write::cap_for_output(
                 &ctx.governor, &ctx.workspace, &output_path,
             );
@@ -266,6 +269,8 @@ facets of the dataset.
                 Err(e) => return error_result(format!("failed to create {}: {}", output_path.display(), e), start),
             };
             let pb = ctx.ui.bar((effective_end - range_start) as u64, "extracting fvec");
+            // One record's bytes, encoded by veks-io and reused per row.
+            let mut record: Vec<u8> = Vec::with_capacity(record_bytes as usize);
             for i in range_start..effective_end {
                 let vec = match fvec_reader.get(i) {
                     Ok(v) => v,
@@ -277,10 +282,11 @@ facets of the dataset.
                 } else {
                     vec
                 };
-                writer.write_all(&(dim as i32).to_le_bytes()).unwrap_or(());
-                for &v in &output_vec {
-                    writer.write_all(&v.to_le_bytes()).unwrap_or(());
+                record.clear();
+                if let Err(e) = veks_io::writer::encode_records(&output_vec, dim as usize, &mut record) {
+                    return error_result(format!("encode error at {}: {}", i, e), start);
                 }
+                writer.write_all(&record).unwrap_or(());
                 pb.inc(1);
             }
             pb.finish();
@@ -496,9 +502,8 @@ ordinal.
                     return error_result(format!("failed to create directory: {}", e), start);
                 }
 
-        use std::io::Write;
-        let file = match safe_create_file(&output_path) {
-            Ok(f) => f,
+        let mut writer = match veks_io::XvecWriter::<i32>::create(&output_path, dim as usize) {
+            Ok(w) => w,
             Err(e) => {
                 return error_result(
                     format!("failed to create {}: {}", output_path.display(), e),
@@ -506,7 +511,6 @@ ordinal.
                 )
             }
         };
-        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
         if let Some(ref idx_p) = index_path {
             // Index-based extraction: read indices from index-file, look up records in source ivec
@@ -566,17 +570,15 @@ ordinal.
                     }
                 };
 
-                writer.write_all(&(dim as i32).to_le_bytes()).map_err(|e| e.to_string()).unwrap();
-                let slice: &[i32] = vec.as_ref();
-                for &val in slice {
-                    writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                if let Err(e) = writer.write(&vec) {
+                    return error_result(format!("failed to write {}: {}", output_path.display(), e), start);
                 }
                 count += 1;
                 if count.is_multiple_of(10_000) { pb.set_position(count); }
             }
             pb.finish();
 
-            if let Err(e) = writer.flush() {
+            if let Err(e) = writer.finish() {
                 return error_result(format!("failed to flush output: {}", e), start);
             }
 
@@ -625,17 +627,15 @@ ordinal.
                     }
                 };
 
-                writer.write_all(&(dim as i32).to_le_bytes()).map_err(|e| e.to_string()).unwrap();
-                let slice: &[i32] = vec.as_ref();
-                for &val in slice {
-                    writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                if let Err(e) = writer.write(&vec) {
+                    return error_result(format!("failed to write {}: {}", output_path.display(), e), start);
                 }
                 count += 1;
                 if count.is_multiple_of(10_000) { pb.set_position(count); }
             }
             pb.finish();
 
-            if let Err(e) = writer.flush() {
+            if let Err(e) = writer.finish() {
                 return error_result(format!("failed to flush output: {}", e), start);
             }
 
@@ -864,18 +864,6 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
             ctx.ui.log("  L2 normalization enabled during extraction");
         }
 
-        use std::io::Write;
-        let file = match safe_create_file(&output_path) {
-            Ok(f) => f,
-            Err(e) => {
-                return error_result(
-                    format!("failed to create {}: {}", output_path.display(), e),
-                    start,
-                )
-            }
-        };
-        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
-
         if let Some(ref ivec_p) = ivec_path {
             // Index-based extraction: read indices from ivec, look up vectors in mvec.
             //
@@ -948,6 +936,18 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                 );
             }
 
+            // The index path above writes its own output; only the
+            // range path streams through this writer.
+            let mut writer = match veks_io::XvecWriter::<half::f16>::create(&output_path, dim as usize) {
+                Ok(w) => w,
+                Err(e) => {
+                    return error_result(
+                        format!("failed to create {}: {}", output_path.display(), e),
+                        start,
+                    )
+                }
+            };
+
             let pb = ctx.ui.bar((effective_end - range_start) as u64, "extracting mvec");
             let mut count: u64 = 0;
             for i in range_start..effective_end {
@@ -961,17 +961,15 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                     }
                 };
 
-                writer.write_all(&(dim as i32).to_le_bytes()).map_err(|e| e.to_string()).unwrap();
-                let slice: &[half::f16] = vec.as_ref();
-                for &val in slice {
-                    writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                if let Err(e) = writer.write(&vec) {
+                    return error_result(format!("failed to write {}: {}", output_path.display(), e), start);
                 }
                 count += 1;
                 if count.is_multiple_of(10_000) { pb.set_position(count); }
             }
             pb.finish();
 
-            if let Err(e) = writer.flush() {
+            if let Err(e) = writer.finish() {
                 return error_result(format!("failed to flush output: {}", e), start);
             }
 
@@ -1486,7 +1484,9 @@ fn sorted_index_extract_mvec(
     use std::io::Write;
 
     let extract_count = effective_end - range_start;
-    let record_bytes = 4 + (dim as usize) * 2; // dim header + f16 values
+    // dim header + f16 values
+    let record_bytes = veks_io::reader::xvec_record_bytes(dim as i32, veks_io::ElementType::F16)
+        .map_err(|e| e.to_string())?;
 
     // Governor-controlled thread pool for parallel phases
     let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
@@ -1538,7 +1538,6 @@ fn sorted_index_extract_mvec(
         .open(output_path)
         .map_err(|e| format!("failed to open output {}: {}", output_path.display(), e))?;
 
-    let dim_bytes = (dim as i32).to_le_bytes();
     let pass_label = |p: usize| -> String {
         if num_partitions > 1 { format!(" (pass {}/{})", p + 1, num_partitions) } else { String::new() }
     };
@@ -1751,12 +1750,8 @@ fn sorted_index_extract_mvec(
 
                     let buf_offset = local_pos * record_bytes;
                     let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
-                    dest[..4].copy_from_slice(&dim_bytes);
-                    let slice: &[half::f16] = vector.as_ref();
-                    let src_bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 2)
-                    };
-                    dest[4..].copy_from_slice(src_bytes);
+                    veks_io::xvec::record::encode_record_into(&vector, dest)
+                        .map_err(|e| format!("failed to encode mvec[{}]: {}", source_idx, e))?;
 
                     let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
                     if done.is_multiple_of(100_000) {
@@ -1785,24 +1780,24 @@ fn sorted_index_extract_mvec(
         if normalize {
             let buf_used = part_len * record_bytes;
             let dim_usize = dim as usize;
-            let stride = 4 + dim_usize * 2; // dim header + dim f16s
-            for offset in (0..buf_used).step_by(stride) {
-                let values_start = offset + 4;
+            // One reused row: each record is decoded, normalized and
+            // encoded back in place through veks-io.
+            let mut row = vec![half::f16::ZERO; dim_usize];
+            for slot in part_buf[..buf_used].chunks_exact_mut(record_bytes) {
+                veks_io::xvec::record::decode_record_into(slot, &mut row)
+                    .map_err(|e| format!("decode error during normalize: {}", e))?;
                 let mut norm_sq = 0.0f64;
-                for d in 0..dim_usize {
-                    let pos = values_start + d * 2;
-                    let v = half::f16::from_le_bytes([part_buf[pos], part_buf[pos + 1]]);
+                for v in &row {
                     let vf = v.to_f64();
                     norm_sq += vf * vf;
                 }
                 if norm_sq > 0.0 {
                     let inv_norm = 1.0 / norm_sq.sqrt();
-                    for d in 0..dim_usize {
-                        let pos = values_start + d * 2;
-                        let v = half::f16::from_le_bytes([part_buf[pos], part_buf[pos + 1]]);
-                        let normalized = half::f16::from_f64(v.to_f64() * inv_norm);
-                        part_buf[pos..pos + 2].copy_from_slice(&normalized.to_le_bytes());
+                    for v in row.iter_mut() {
+                        *v = half::f16::from_f64(v.to_f64() * inv_norm);
                     }
+                    veks_io::xvec::record::encode_record_into(&row, slot)
+                        .map_err(|e| format!("encode error during normalize: {}", e))?;
                 }
             }
             ctx.ui.log(&format!(
@@ -1890,29 +1885,14 @@ fn sorted_index_extract_fvec(
     // so a single fd is safe for parallel rayon access.
     let fvec_file = std::fs::File::open(fvec_path)
         .map_err(|e| format!("open {} for pread: {}", fvec_path.display(), e))?;
-    let entry_size = fvec_reader.entry_size();
-    // Helper: pread one vector's f32 components into a fresh Vec<f32>.
-    // Allocates per-call (per-thread allocator slabs handle this
-    // efficiently for the ~1.5 KiB sizes here). `_ = entry_size; _ = &fvec_file;`
-    // keeps the closure capturing them so it can be moved into
-    // par_iter without borrowing `fvec_path`.
-    let pread_vector = |source_idx: usize| -> std::io::Result<Vec<f32>> {
-        use veks_io::file::pread_exact;
-        let dim_u = dim as usize;
-        let value_bytes = entry_size - 4;
-        let mut bytes = vec![0u8; value_bytes];
-        let offset = (source_idx * entry_size + 4) as u64;
-        pread_exact(&fvec_file, &mut bytes, offset)?;
-        let mut out = Vec::with_capacity(dim_u);
-        for i in 0..dim_u {
-            out.push(f32::from_le_bytes([
-                bytes[i * 4], bytes[i * 4 + 1],
-                bytes[i * 4 + 2], bytes[i * 4 + 3],
-            ]));
-        }
-        Ok(out)
+    let _ = fvec_reader;
+    // Helper: pread record `source_idx` into the caller's row buffer
+    // through veks-io, reusing the caller's byte scratch. Each worker
+    // holds one scratch and one row for its whole chunk, so no read
+    // allocates and nothing is mapped (RSS stays bounded).
+    let pread_vector = |source_idx: usize, scratch: &mut Vec<u8>, row: &mut [f32]| {
+        veks_io::xvec::record::pread_record(&fvec_file, source_idx as u64, scratch, row)
     };
-    let _ = &pread_vector; // anchor the binding for closures below
     // Near-zero threshold from step options (SRD §19). Vectors with
     // L2 norm below this threshold are skipped during extraction.
     // The threshold is always active when normalizing — near-zero
@@ -1924,7 +1904,9 @@ fn sorted_index_extract_fvec(
     use std::io::Write;
 
     let extract_count = effective_end - range_start;
-    let record_bytes = 4 + (dim as usize) * 4; // dim header + f32 values
+    // dim header + f32 values
+    let record_bytes = veks_io::reader::xvec_record_bytes(dim as i32, veks_io::ElementType::F32)
+        .map_err(|e| e.to_string())?;
 
     let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
 
@@ -2023,7 +2005,6 @@ fn sorted_index_extract_fvec(
         crate::pipeline::shard_write::FacetWriter::open(output_path, record_bytes as u64, cap)
             .map_err(|e| format!("failed to create output {}: {}", output_path.display(), e))?;
 
-    let dim_bytes = (dim as i32).to_le_bytes();
     let pass_label = |p: usize| -> String {
         if num_partitions > 1 { format!(" (pass {}/{})", p + 1, num_partitions) } else { String::new() }
     };
@@ -2187,21 +2168,20 @@ fn sorted_index_extract_fvec(
                         out_min: f64::MAX, out_max: 0.0,
                         out_count: 0, out_samples: Vec::new(),
                     };
+                    // One pread scratch and one row per chunk, reused.
+                    let mut scratch: Vec<u8> = Vec::with_capacity(record_bytes);
+                    let mut row = vec![0f32; dim_usize];
                     for &(source_idx, local_pos) in chunk {
-                        let src_vec = match pread_vector(source_idx) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                eprintln!("pread error at source_idx={}: {}", source_idx, e);
-                                local.zeros.push(source_idx);
-                                continue;
-                            }
-                        };
-                        let src_slice: &[f32] = &src_vec;
+                        if let Err(e) = pread_vector(source_idx, &mut scratch, &mut row) {
+                            eprintln!("pread error at source_idx={}: {}", source_idx, e);
+                            local.zeros.push(source_idx);
+                            continue;
+                        }
 
                         if normalize {
                             let mut norm_sq = 0.0f64;
-                            for d in 0..dim_usize {
-                                let v = src_slice[d] as f64;
+                            for &v in &row {
+                                let v = v as f64;
                                 norm_sq += v * v;
                             }
 
@@ -2226,31 +2206,22 @@ fn sorted_index_extract_fvec(
 
                             let buf_offset = local_pos * record_bytes;
                             let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
-                            dest[..4].copy_from_slice(&dim_bytes);
 
-                            if skip_normalize {
-                                let src_bytes: &[u8] = unsafe {
-                                    std::slice::from_raw_parts(
-                                        src_slice.as_ptr() as *const u8,
-                                        src_slice.len() * 4,
-                                    )
-                                };
-                                dest[4..].copy_from_slice(src_bytes);
-                            } else {
+                            if !skip_normalize {
                                 let inv_norm = (1.0 / norm) as f32;
-                                for d in 0..dim_usize {
-                                    let normalized = src_slice[d] * inv_norm;
-                                    dest[4 + d * 4..4 + (d + 1) * 4]
-                                        .copy_from_slice(&normalized.to_le_bytes());
+                                for v in row.iter_mut() {
+                                    *v *= inv_norm;
                                 }
                             }
+                            // The slot length is the record length, so
+                            // this cannot fail.
+                            let _ = veks_io::xvec::record::encode_record_into(&row, dest);
 
+                            // The output norm of exactly the values
+                            // written (encoding is bit-exact).
                             let mut out_norm_sq_val = 0.0f64;
-                            for d in 0..dim_usize {
-                                let v = f32::from_le_bytes([
-                                    dest[4 + d * 4], dest[4 + d * 4 + 1],
-                                    dest[4 + d * 4 + 2], dest[4 + d * 4 + 3],
-                                ]) as f64;
+                            for &v in &row {
+                                let v = v as f64;
                                 out_norm_sq_val += v * v;
                             }
                             let out_epsilon = (out_norm_sq_val.sqrt() - 1.0).abs();
@@ -2265,14 +2236,9 @@ fn sorted_index_extract_fvec(
                         } else {
                             let buf_offset = local_pos * record_bytes;
                             let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
-                            dest[..4].copy_from_slice(&dim_bytes);
-                            let src_bytes: &[u8] = unsafe {
-                                std::slice::from_raw_parts(
-                                    src_slice.as_ptr() as *const u8,
-                                    src_slice.len() * 4,
-                                )
-                            };
-                            dest[4..].copy_from_slice(src_bytes);
+                            // The slot length is the record length, so
+                            // this cannot fail.
+                            let _ = veks_io::xvec::record::encode_record_into(&row, dest);
                         }
                         local.written += 1;
 
@@ -2321,20 +2287,17 @@ fn sorted_index_extract_fvec(
             // When zeros were skipped, the transpose buffer has gaps at
             // those local_pos slots. Compact the buffer by removing the
             // gap slots. We know which slots were filled by checking the
-            // dim header (filled slots have dim_bytes, gaps are all-zero).
+            // dim header (filled slots have a positive dim, gaps are all-zero).
             if !zeros.is_empty() {
                 let mut compacted = Vec::with_capacity(w * record_bytes);
                 for pos in 0..part_len {
                     let offset = pos * record_bytes;
-                    if offset + 4 <= part_buf.len() {
-                        let dim_val = i32::from_le_bytes(
-                            part_buf[offset..offset + 4].try_into().unwrap_or([0; 4])
+                    if offset + 4 <= part_buf.len()
+                        && veks_io::xvec::record::record_dim(&part_buf[offset..]).is_some()
+                    {
+                        compacted.extend_from_slice(
+                            &part_buf[offset..offset + record_bytes]
                         );
-                        if dim_val > 0 {
-                            compacted.extend_from_slice(
-                                &part_buf[offset..offset + record_bytes]
-                            );
-                        }
                     }
                 }
                 part_buf = compacted;
@@ -2380,23 +2343,22 @@ fn sorted_index_extract_fvec(
                     let mut out_norm_samples = Vec::new();
                     let sample_every = (chunk.len() / 1000).max(1);
 
+                    // One pread scratch and one row per chunk, reused.
+                    let mut scratch: Vec<u8> = Vec::with_capacity(record_bytes);
+                    let mut row = vec![0f32; dim_usize];
                     for &(source_idx, _local_pos) in chunk {
                         // pread (heap buffer) instead of mmap.get_slice;
                         // see file header comment for the RSS rationale.
-                        let src_vec = match pread_vector(source_idx) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                eprintln!("pread error at source_idx={}: {}", source_idx, e);
-                                zeros.push(source_idx);
-                                continue;
-                            }
-                        };
-                        let src_slice: &[f32] = &src_vec;
+                        if let Err(e) = pread_vector(source_idx, &mut scratch, &mut row) {
+                            eprintln!("pread error at source_idx={}: {}", source_idx, e);
+                            zeros.push(source_idx);
+                            continue;
+                        }
 
                         if normalize {
                             let mut norm_sq = 0.0f64;
-                            for d in 0..dim_usize {
-                                let v = src_slice[d] as f64;
+                            for &v in &row {
+                                let v = v as f64;
                                 norm_sq += v * v;
                             }
 
@@ -2420,32 +2382,23 @@ fn sorted_index_extract_fvec(
 
                             let buf_offset = written * record_bytes;
                             let dest = &mut buf[buf_offset..buf_offset + record_bytes];
-                            dest[..4].copy_from_slice(&dim_bytes);
 
-                            if skip_normalize {
-                                let src_bytes: &[u8] = unsafe {
-                                    std::slice::from_raw_parts(
-                                        src_slice.as_ptr() as *const u8,
-                                        src_slice.len() * 4,
-                                    )
-                                };
-                                dest[4..].copy_from_slice(src_bytes);
-                            } else {
+                            if !skip_normalize {
                                 let inv_norm = (1.0 / norm) as f32;
-                                for d in 0..dim_usize {
-                                    let normalized = src_slice[d] * inv_norm;
-                                    dest[4 + d * 4..4 + (d + 1) * 4]
-                                        .copy_from_slice(&normalized.to_le_bytes());
+                                for v in row.iter_mut() {
+                                    *v *= inv_norm;
                                 }
                             }
+                            // The slot length is the record length, so
+                            // this cannot fail.
+                            let _ = veks_io::xvec::record::encode_record_into(&row, dest);
 
                             {
+                                // The output norm of exactly the values
+                                // written (encoding is bit-exact).
                                 let mut out_norm_sq_val = 0.0f64;
-                                for d in 0..dim_usize {
-                                    let v = f32::from_le_bytes([
-                                        dest[4 + d * 4], dest[4 + d * 4 + 1],
-                                        dest[4 + d * 4 + 2], dest[4 + d * 4 + 3],
-                                    ]) as f64;
+                                for &v in &row {
+                                    let v = v as f64;
                                     out_norm_sq_val += v * v;
                                 }
                                 let out_epsilon = (out_norm_sq_val.sqrt() - 1.0).abs();
@@ -2461,14 +2414,9 @@ fn sorted_index_extract_fvec(
                         } else {
                             let buf_offset = written * record_bytes;
                             let dest = &mut buf[buf_offset..buf_offset + record_bytes];
-                            dest[..4].copy_from_slice(&dim_bytes);
-                            let src_bytes: &[u8] = unsafe {
-                                std::slice::from_raw_parts(
-                                    src_slice.as_ptr() as *const u8,
-                                    src_slice.len() * 4,
-                                )
-                            };
-                            dest[4..].copy_from_slice(src_bytes);
+                            // The slot length is the record length, so
+                            // this cannot fail.
+                            let _ = veks_io::xvec::record::encode_record_into(&row, dest);
                         }
                         written += 1;
 
@@ -2627,11 +2575,14 @@ fn sorted_index_extract_fvec(
                     // pages are never looked at twice.
                     let dz = ords
                         .par_iter()
-                        .filter(|&&ord| {
-                            let near_zero = match pread_vector(ord as usize) {
-                                Ok(v) => {
+                        // One pread scratch and one row per worker split.
+                        .map_init(
+                            || (Vec::<u8>::with_capacity(record_bytes), vec![0f32; dim as usize]),
+                            |(scratch, row), &ord| {
+                            let near_zero = match pread_vector(ord as usize, scratch, row) {
+                                Ok(()) => {
                                     let norm_sq: f64 =
-                                        v.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                                        row.iter().map(|&x| (x as f64) * (x as f64)).sum();
                                     norm_sq < zero_threshold_sq
                                 }
                                 // A read that fails cannot be judged
@@ -2645,6 +2596,7 @@ fn sorted_index_extract_fvec(
                             }
                             near_zero
                         })
+                        .filter(|&near_zero| near_zero)
                         .count();
                     pb.finish();
 
@@ -2677,14 +2629,13 @@ fn sorted_index_extract_fvec(
         if let Some(parent) = zeros_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut f = safe_create_file(&zeros_path)
+        let mut f = veks_io::XvecWriter::<i32>::create(&zeros_path, 1)
             .map_err(|e| format!("failed to create {}: {}", zeros_path.display(), e))?;
         for &ord in &zero_ordinals {
-            f.write_all(&1i32.to_le_bytes())
-                .map_err(|e| format!("write error: {}", e))?;
-            f.write_all(&(ord as i32).to_le_bytes())
+            f.write(&[ord as i32])
                 .map_err(|e| format!("write error: {}", e))?;
         }
+        f.finish().map_err(|e| format!("write error: {}", e))?;
         ctx.ui.log(&format!("  wrote {} near-zero ordinals to {}", zero_count, zeros_path.display()));
     }
 
@@ -3281,12 +3232,13 @@ impl GenerateRecordExtractOp {
     ) -> Result<Vec<PathBuf>, String> {
         let reader = XvecReader::<T>::open_path(source).map_err(|e| format!("failed to open {}: {e}", source.display()))?;
         let (count, dim) = (VectorReader::<T>::count(&reader), VectorReader::<T>::dim(&reader));
-        let record_bytes = 4 + (dim * T::SIZE) as u64;
+        let record_bytes = veks_io::reader::xvec_record_bytes(dim as i32, T::TYPE)
+            .map_err(|e| format!("{}: {e}", source.display()))? as u64;
         let cap = crate::pipeline::shard_write::cap_for_output(&ctx.governor, &ctx.workspace, output);
         let mut writer = crate::pipeline::shard_write::FacetWriter::open(output, record_bytes, cap)
             .map_err(|e| format!("failed to create {}: {e}", output.display()))?;
-        let mut record = vec![0u8; record_bytes as usize];
-        record[..4].copy_from_slice(&(dim as i32).to_le_bytes());
+        // One record's bytes, encoded by veks-io and reused per row.
+        let mut record: Vec<u8> = Vec::with_capacity(record_bytes as usize);
         let pb = ctx.ui.bar(total as u64, format!("extracting {}", T::TYPE.name()));
         for ord in ordinals {
             let ord = ord?;
@@ -3294,9 +3246,9 @@ impl GenerateRecordExtractOp {
                 return Err(format!("ordinal {ord} is past the {count} records of {}", source.display()));
             }
             let values = VectorReader::<T>::get(&reader, ord).map_err(|e| format!("read error at {ord}: {e}"))?;
-            for (v, slot) in values.iter().zip(record[4..].chunks_exact_mut(T::SIZE)) {
-                v.write_le_bytes(slot);
-            }
+            record.clear();
+            veks_io::writer::encode_records(&values, dim, &mut record)
+                .map_err(|e| format!("encode error at {ord}: {e}"))?;
             std::io::Write::write_all(&mut writer, &record).map_err(|e| format!("write {}: {e}", output.display()))?;
             pb.inc(1);
         }
@@ -3674,18 +3626,15 @@ impl CommandOp for TransformExtractOp {
             let _ = std::fs::create_dir_all(&ctx.cache);
             let tmp_ivec = ctx.cache.join(format!("_predicate_{}.ivec", pred_idx));
             {
-                use std::io::Write;
-                let f = match std::fs::File::create(&tmp_ivec) {
-                    Ok(f) => f,
+                // dim=1: each ordinal is one record.
+                let mut w = match veks_io::XvecWriter::<i32>::create(&tmp_ivec, 1) {
+                    Ok(w) => w,
                     Err(e) => return error_result(
                         format!("create temp ivec: {}", e), start),
                 };
-                let mut w = std::io::BufWriter::new(f);
-                for &ord in &ordinals {
-                    w.write_all(&1i32.to_le_bytes()).unwrap_or(()); // dim=1
-                    w.write_all(&ord.to_le_bytes()).unwrap_or(());
+                if let Err(e) = w.write_packed(&ordinals).and_then(|_| w.finish().map(|_| ())) {
+                    return error_result(format!("write temp ivec {}: {}", tmp_ivec.display(), e), start);
                 }
-                let _ = w.flush();
             }
             ctx.ui.log(&format!("  predicate-index {}: {} ordinals from {}",
                 pred_idx, ordinals.len(), ivvec_path.file_name().unwrap_or_default().to_string_lossy()));

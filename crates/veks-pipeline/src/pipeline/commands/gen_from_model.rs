@@ -33,7 +33,6 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
-use crate::pipeline::atomic_write::safe_create_file;
 use crate::pipeline::rng;
 
 /// Pipeline command: generate vectors from a statistical model.
@@ -354,6 +353,9 @@ is proprietary or too large to distribute.
 }
 
 /// Generate vectors from compiled model samplers as fvec.
+///
+/// Each row is sampled into one reused buffer and written by
+/// [`veks_io::XvecWriter`], which owns the record layout.
 fn generate_from_model_fvec(
     output: &Path,
     dim: u32,
@@ -361,22 +363,17 @@ fn generate_from_model_fvec(
     samplers: &[ModelSampler],
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> Result<(), String> {
-    use std::io::Write;
-    let file = safe_create_file(output)
+    let mut writer = veks_io::XvecWriter::<f32>::create(output, dim as usize)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+    let mut row: Vec<f32> = Vec::with_capacity(samplers.len());
 
     for _ in 0..count {
-        writer
-            .write_all(&(dim as i32).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        for sampler in samplers {
-            let val = sampler.sample(rng) as f32;
-            writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
+        row.clear();
+        row.extend(samplers.iter().map(|sampler| sampler.sample(rng) as f32));
+        writer.write(&row).map_err(|e| e.to_string())?;
     }
 
-    writer.flush().map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
 

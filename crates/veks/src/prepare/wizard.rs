@@ -1738,22 +1738,26 @@ fn format_count_label(n: u64) -> String {
 // Precision confirmation
 // ---------------------------------------------------------------------------
 
-/// Element type label for a given element size.
-fn element_label(elem_size: usize) -> &'static str {
-    match elem_size {
-        2 => "float16 (f16, half-precision)",
-        4 => "float32 (f32, single-precision)",
-        8 => "float64 (f64, double-precision)",
-        _ => "unknown",
-    }
+/// Element type label for a floating-point element type, e.g.
+/// `float16 (f16, half-precision)`.
+fn element_label(elem: veks_io::ElementType) -> String {
+    use veks_io::ElementType;
+    let precision = match elem {
+        ElementType::F16 => "half",
+        ElementType::F32 => "single",
+        ElementType::F64 => "double",
+        _ => return "unknown".to_string(),
+    };
+    format!("{} ({}, {}-precision)", elem.long_name(), elem.name(), precision)
 }
 
 /// The xvec floating-point formats in ascending precision order.
-const FLOAT_XVEC_FORMATS: &[(VecFormat, usize, &str)] = &[
-    (VecFormat::Mvec, 2, "mvec / float16"),
-    (VecFormat::Fvec, 4, "fvec / float32"),
-    (VecFormat::Dvec, 8, "dvec / float64"),
-];
+const FLOAT_XVEC_FORMATS: [VecFormat; 3] = [VecFormat::Mvec, VecFormat::Fvec, VecFormat::Dvec];
+
+/// How the precision prompts name a format, e.g. `mvec / float16`.
+fn precision_name(format: VecFormat) -> String {
+    format!("{} / {}", format.name(), format.element_type().map_or("unknown", veks_io::ElementType::long_name))
+}
 
 /// Check whether the user is satisfied with the native precision of an xvec
 /// vector file, and advise on up-conversion vs down-conversion if not.
@@ -1763,13 +1767,13 @@ const FLOAT_XVEC_FORMATS: &[(VecFormat, usize, &str)] = &[
 fn check_vector_precision(label: &str, path: &Path) -> Option<String> {
     let format = VecFormat::detect(path)?;
 
-    // Only relevant for floating-point xvec formats
-    let current = match format {
-        VecFormat::Fvec => (4usize, "fvec / float32"),
-        VecFormat::Mvec => (2, "mvec / float16"),
-        VecFormat::Dvec => (8, "dvec / float64"),
-        _ => return None, // ivec, bvec, svec, slab, npy, parquet — skip
-    };
+    // Only relevant for floating-point xvec formats; ivec, bvec, svec,
+    // slab, npy, parquet — skip
+    if !FLOAT_XVEC_FORMATS.contains(&format) {
+        return None;
+    }
+    let elem = format.element_type()?;
+    let current = (format.element_size(), precision_name(format));
 
     // Probe for dimensions and record count
     let meta = match crate::formats::reader::probe_source(path, format) {
@@ -1779,7 +1783,7 @@ fn check_vector_precision(label: &str, path: &Path) -> Option<String> {
 
     println!();
     println!("  {} format: {} — {} elements, dim={}, {} records",
-        label, current.1, element_label(current.0),
+        label, current.1, element_label(elem),
         meta.dimension,
         meta.record_count.map_or("unknown".to_string(), |n| n.to_string()),
     );
@@ -1791,9 +1795,9 @@ fn check_vector_precision(label: &str, path: &Path) -> Option<String> {
     // User wants a different precision — show options
     println!();
     println!("  Available floating-point precisions:");
-    for (i, (_, elem_size, name)) in FLOAT_XVEC_FORMATS.iter().enumerate() {
-        let marker = if *elem_size == current.0 { " (current)" } else { "" };
-        println!("    {}. {}{}", i + 1, name, marker);
+    for (i, fmt) in FLOAT_XVEC_FORMATS.iter().enumerate() {
+        let marker = if fmt.element_size() == current.0 { " (current)" } else { "" };
+        println!("    {}. {}{}", i + 1, precision_name(*fmt), marker);
     }
 
     let choice_str = prompt_optional("  Target precision [1/2/3]");
@@ -1805,7 +1809,7 @@ fn check_vector_precision(label: &str, path: &Path) -> Option<String> {
     };
 
     let (target_fmt, target_size, target_name) = match chosen {
-        Some((fmt, size, name)) => (*fmt, *size, *name),
+        Some(fmt) => (*fmt, fmt.element_size(), precision_name(*fmt)),
         None => {
             println!("  No change — keeping {} format.", current.1);
             return None;

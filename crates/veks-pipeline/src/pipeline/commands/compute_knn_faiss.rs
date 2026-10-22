@@ -295,7 +295,9 @@ Only f32 (fvec) inputs are supported.
 
         let search_start = Instant::now();
         let pb = ctx.ui.bar(query_count as u64, "FAISS search");
-        let dim_bytes = (internal_k as i32).to_le_bytes();
+        // Each batch's rows are encoded into one buffer and written at once.
+        let mut labels_i32: Vec<i32> = Vec::new();
+        let mut records: Vec<u8> = Vec::new();
 
         for chunk_start in (0..query_count).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(query_count);
@@ -309,30 +311,27 @@ Only f32 (fvec) inputs are supported.
 
             // Stream results directly to output files
             let chunk_n = chunk_end - chunk_start;
-            for qi in 0..chunk_n {
-                // ivec record
-                if let Err(e) = idx_file.write_all(&dim_bytes) {
-                    return error_result(format!("write indices: {}", e), start);
-                }
-                for j in 0..internal_k {
-                    let label = result.labels[qi * internal_k + j];
-                    let idx: i32 = label.get().map(|v| v as i32).unwrap_or(-1);
-                    if let Err(e) = idx_file.write_all(&idx.to_le_bytes()) {
-                        return error_result(format!("write indices: {}", e), start);
-                    }
-                }
+            let n = chunk_n * internal_k;
 
-                // fvec record (distances)
-                if let Some(ref mut dw) = dist_file {
-                    if let Err(e) = dw.write_all(&dim_bytes) {
-                        return error_result(format!("write distances: {}", e), start);
-                    }
-                    for j in 0..internal_k {
-                        let dist = result.distances[qi * internal_k + j];
-                        if let Err(e) = dw.write_all(&dist.to_le_bytes()) {
-                            return error_result(format!("write distances: {}", e), start);
-                        }
-                    }
+            // ivec records
+            labels_i32.clear();
+            labels_i32.extend(result.labels[..n].iter().map(|label| label.get().map(|v| v as i32).unwrap_or(-1)));
+            records.clear();
+            if let Err(e) = veks_io::writer::encode_records(&labels_i32, internal_k, &mut records) {
+                return error_result(format!("write indices: {}", e), start);
+            }
+            if let Err(e) = idx_file.write_all(&records) {
+                return error_result(format!("write indices: {}", e), start);
+            }
+
+            // fvec records (distances)
+            if let Some(ref mut dw) = dist_file {
+                records.clear();
+                if let Err(e) = veks_io::writer::encode_records(&result.distances[..n], internal_k, &mut records) {
+                    return error_result(format!("write distances: {}", e), start);
+                }
+                if let Err(e) = dw.write_all(&records) {
+                    return error_result(format!("write distances: {}", e), start);
                 }
             }
 

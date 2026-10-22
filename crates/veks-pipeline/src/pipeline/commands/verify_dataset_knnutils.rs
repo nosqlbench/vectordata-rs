@@ -866,7 +866,10 @@ checks, in a single pipeline step.
             Err(e) => return error_result(format!("open base for streaming: {}", e), start),
         };
 
-        let mut scan_buffers = super::compute_knn_blas::SgemmScanBuffers::new(actual_sample, dim);
+        let mut scan_buffers = match super::compute_knn_blas::SgemmScanBuffers::new(actual_sample, dim) {
+            Ok(b) => b,
+            Err(e) => return error_result(e, start),
+        };
         emit(ctx, &format!(
             "  chunk plan: {} base/chunk × {} queries/sub-batch",
             scan_buffers.vecs_per_chunk(), scan_buffers.qb_size(),

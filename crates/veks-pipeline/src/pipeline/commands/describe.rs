@@ -500,7 +500,8 @@ fn scan_xvec_records(
     use std::collections::HashMap;
     use std::io::{Read, Seek, SeekFrom};
 
-    let elem_size = format.element_size() as u64;
+    let element = format.element_type()
+        .ok_or_else(|| format!("{} has no element type", format.name()))?;
     let mut f = std::fs::File::open(path)
         .map_err(|e| format!("open: {}", e))?;
     let mut dim_buf = [0u8; 4];
@@ -523,13 +524,11 @@ fn scan_xvec_records(
             .map_err(|e| format!("seek record {}: {}", record_idx, e))?;
         f.read_exact(&mut dim_buf)
             .map_err(|e| format!("read dim record {}: {}", record_idx, e))?;
-        let dim = i32::from_le_bytes(dim_buf);
+        let dim = veks_io::xvec::record::record_dim(&dim_buf)
+            .ok_or_else(|| format!("invalid dim (not positive) at record {} (offset {})", record_idx, offset))? as i32;
 
-        if dim <= 0 {
-            return Err(format!("invalid dim {} at record {} (offset {})", dim, record_idx, offset));
-        }
-
-        let record_size = 4 + dim as u64 * elem_size;
+        let record_size = veks_io::reader::xvec_record_bytes(dim, element)
+            .map_err(|e| format!("record {} (offset {}): {}", record_idx, offset, e))? as u64;
         if offset + record_size > file_size {
             return Err(format!("record {} truncated at offset {}", record_idx, offset));
         }

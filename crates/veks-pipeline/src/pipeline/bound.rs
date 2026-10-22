@@ -202,37 +202,26 @@ fn xvec_record_count(path: &Path) -> Result<u64, ArtifactState> {
         return if file_size == 0 { Ok(0) } else { Err(ArtifactState::Partial) };
     }
 
-    // Read dimension from first 4 bytes
-    let dim = match std::fs::File::open(path) {
-        Ok(mut f) => {
-            use std::io::Read;
-            let mut buf = [0u8; 4];
-            if f.read_exact(&mut buf).is_err() {
-                return Err(ArtifactState::Partial);
-            }
-            i32::from_le_bytes(buf) as u64
-        }
-        Err(_) => return Err(ArtifactState::Absent),
-    };
-
-    if dim == 0 || dim > 100_000 {
-        return Err(ArtifactState::Partial);
-    }
-
-    let format = match VecFormat::detect(path) {
-        Some(f) => f,
+    let element = match VecFormat::detect(path).and_then(|f| f.element_type()) {
+        Some(e) => e,
         None => return Ok(0),
     };
-    let elem_size = format.element_size() as u64;
-    if elem_size == 0 {
-        return Ok(0);
-    }
 
-    let record_stride = 4 + dim * elem_size;
-    if file_size % record_stride != 0 {
+    // The shape from the first record's header: a file cut off mid-record
+    // has trailing bytes past its last whole one.
+    let source = match veks_io::MappedFile::map(path) {
+        Ok(s) => s,
+        Err(_) => return Err(ArtifactState::Absent),
+    };
+    let probe = match veks_io::reader::probe_source(&source, element) {
+        Ok(p) => p,
+        Err(_) => return Err(ArtifactState::Partial),
+    };
+
+    if probe.dim > 100_000 || probe.trailing_bytes != 0 {
         return Err(ArtifactState::Partial);
     }
-    Ok(file_size / record_stride)
+    Ok(probe.records)
 }
 
 /// Hold an xvec artifact's record count to the `verified_count:<name>`

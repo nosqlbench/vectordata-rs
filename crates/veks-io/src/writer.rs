@@ -47,6 +47,13 @@ fn le_bytes<T: Element>(row: &[T]) -> std::borrow::Cow<'_, [u8]> {
 
 /// Check that `path` names a `container` file of `T`, and create it.
 fn create_for<T: Element>(path: &Path, container: Container, reader: &str) -> Result<BufWriter<File>, IoError> {
+    check_target::<T>(path, container, reader)?;
+    Ok(BufWriter::with_capacity(WRITE_BUF_SIZE, File::create(path)?))
+}
+
+/// Check that `path` names a `container` file of `T` and is not a
+/// symlink, so a writer may open it.
+fn check_target<T: Element>(path: &Path, container: Container, reader: &str) -> Result<(), IoError> {
     let name = path.to_string_lossy();
     let (file, found) = require_native::<T>(&name)?;
     let found = if found == Container::Vec && container == Container::Vvec && is_vvec_ext(ext_of(&name)) {
@@ -67,8 +74,7 @@ fn create_for<T: Element>(path: &Path, container: Container, reader: &str) -> Re
             }
         )));
     }
-    crate::xvec::writer::refuse_symlink(path).map_err(IoError::InvalidFormat)?;
-    Ok(BufWriter::with_capacity(WRITE_BUF_SIZE, File::create(path)?))
+    crate::xvec::writer::refuse_symlink(path).map_err(IoError::InvalidFormat)
 }
 
 /// Rows of `T`, every one `dim` elements, into a uniform vector file
@@ -110,6 +116,56 @@ impl<T: Element> XvecWriter<T> {
             .to_le_bytes();
         let out = create_for::<T>(path, Container::Vec, "XvecWriter")?;
         Ok(Self { out, path: path.to_path_buf(), dim, header, records: 0, _t: PhantomData })
+    }
+
+    /// Open the existing `path` to write more rows after its last one.
+    /// Its records must be `dim`-element rows of `T`, every one whole:
+    /// rows written after a partial record would be misread from it on,
+    /// so a file with bytes past its last whole record is refused, as is
+    /// one of another dimension. An empty file takes rows of any `dim`.
+    /// [`records`](Self::records) and `finish` count the file's rows
+    /// with the new ones.
+    ///
+    /// ```
+    /// use veks_io::{IoError, VectorReader, XvecReader, XvecWriter};
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// let path = dir.path().join("base.fvecs");
+    /// let mut writer = XvecWriter::<f32>::create(&path, 2).unwrap();
+    /// writer.write(&[1.0, 2.0]).unwrap();
+    /// writer.finish().unwrap();
+    ///
+    /// let mut writer = XvecWriter::<f32>::append(&path, 2).unwrap();
+    /// writer.write(&[3.0, 4.0]).unwrap();
+    /// assert_eq!(writer.finish().unwrap(), 2);
+    /// assert_eq!(XvecReader::<f32>::open_path(&path).unwrap().get(1).unwrap(), vec![3.0, 4.0]);
+    /// assert!(matches!(XvecWriter::<f32>::append(&path, 3), Err(IoError::InvalidFormat(_))), "another dimension");
+    /// ```
+    pub fn append(path: &Path, dim: usize) -> Result<Self, IoError> {
+        let header = i32::try_from(dim)
+            .ok()
+            .filter(|&d| d > 0)
+            .ok_or_else(|| IoError::InvalidFormat(format!("dimension {dim} is not 1 to {}", i32::MAX)))?
+            .to_le_bytes();
+        check_target::<T>(path, Container::Vec, "XvecWriter")?;
+        let file = std::fs::OpenOptions::new().append(true).open(path)?;
+        let size = file.metadata()?.len();
+        let records = if size == 0 {
+            0
+        } else {
+            let probe = crate::reader::probe_source(&crate::MappedFile::map(path)?, T::TYPE)?;
+            if probe.dim != dim || probe.trailing_bytes != 0 {
+                return Err(IoError::InvalidFormat(format!(
+                    "{} holds {} records of dimension {} and {} bytes past them; rows of dimension {dim} are not appended to it",
+                    path.display(),
+                    probe.records,
+                    probe.dim,
+                    probe.trailing_bytes
+                )));
+            }
+            probe.records
+        };
+        let out = BufWriter::with_capacity(WRITE_BUF_SIZE, file);
+        Ok(Self { out, path: path.to_path_buf(), dim, header, records, _t: PhantomData })
     }
 
     /// Write one row, which must be `dim` elements.

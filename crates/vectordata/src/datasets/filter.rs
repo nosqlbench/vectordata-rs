@@ -501,10 +501,10 @@ fn probe_facet_dim_header(path: &str) -> Option<u32> {
         .extension()
         .and_then(|e| e.to_str())?
         .to_lowercase();
-    if !ext.ends_with("vec") && !ext.ends_with("vecs") {
-        return None;
-    }
-    let header: [u8; 4] = if crate::transport::is_remote_url(path) {
+    let elem = veks_io::VecFormat::from_extension(&ext)
+        .filter(|f| f.is_xvec())
+        .and_then(veks_io::VecFormat::element_type)?;
+    let dim = if crate::transport::is_remote_url(path) {
         use crate::transport::ChunkedTransport;
         let normalized = crate::transport::normalize_remote_url(path);
         let parsed = url::Url::parse(normalized.as_ref()).ok()?;
@@ -512,16 +512,18 @@ fn probe_facet_dim_header(path: &str) -> Option<u32> {
         if !transport.supports_range() {
             return None;
         }
-        transport.fetch_range(0, 4).ok()?.as_slice().try_into().ok()?
+        // A ranged GET is no byte source veks-io reads; its four bytes
+        // are a header veks-io decodes from the buffer.
+        let header = transport.fetch_range(0, 4).ok()?;
+        if header.len() != 4 {
+            return None;
+        }
+        veks_io::xvec::record::record_dim(&header)?
     } else {
-        use std::io::Read;
-        let mut file = std::fs::File::open(path).ok()?;
-        let mut buf = [0u8; 4];
-        file.read_exact(&mut buf).ok()?;
-        buf
+        let file = veks_io::MappedFile::map(std::path::Path::new(path)).ok()?;
+        veks_io::reader::probe_source(&file, elem).ok()?.dim
     };
-    let dim = i32::from_le_bytes(header);
-    (dim > 0 && dim <= 1_000_000).then_some(dim as u32)
+    (dim <= 1_000_000).then_some(dim as u32)
 }
 
 /// Infer dimensionality from attributes/tags or the dataset name.
@@ -690,24 +692,23 @@ fn total_data_bytes(entry: &CatalogEntry, mode: ProbeMode) -> Option<u64> {
         }
         let elem_bytes = infer_vtype(entry)
             .as_deref()
-            .and_then(vtype_elem_bytes)
-            .unwrap_or(4);
+            .and_then(vtype_element)
+            .map_or(4, |ty| ty.byte_width() as u64);
         let base_count = max_base_count(entry)?;
         Some(base_count * dim * elem_bytes)
     })
 }
 
-/// Per-element byte width for an xvec-family vector type name.
-/// `None` for container formats (numpy/hdf5/parquet) whose record
-/// layout isn't dim-header-derivable.
-fn vtype_elem_bytes(vtype: &str) -> Option<u64> {
-    match vtype {
-        "uint8" | "int8" => Some(1),
-        "float16" | "int16" | "uint16" => Some(2),
-        "float32" | "int32" | "uint32" => Some(4),
-        "float64" | "int64" | "uint64" => Some(8),
-        _ => None,
-    }
+/// The element type an xvec-family vector type name (an element
+/// type's [`long_name`](crate::typed_access::ElementType::long_name),
+/// as [`vtype_from_extension`] spells it) stands for. `None` for
+/// container formats (numpy/hdf5/parquet) whose record layout isn't
+/// dim-header-derivable.
+fn vtype_element(vtype: &str) -> Option<crate::typed_access::ElementType> {
+    crate::typed_access::ElementType::ALL
+        .iter()
+        .copied()
+        .find(|ty| ty.long_name() == vtype)
 }
 
 /// Byte length of one facet file: a local stat, or an authed HEAD
@@ -736,8 +737,8 @@ fn probed_base_records(entry: &CatalogEntry, mode: ProbeMode) -> Option<u64> {
     if let Some(n) = declared_base_records(entry) {
         return Some(n);
     }
-    let elem = infer_vtype(entry).as_deref().and_then(vtype_elem_bytes)?;
-    let dim = resolve_dimension(entry, mode)? as u64;
+    let elem = infer_vtype(entry).as_deref().and_then(vtype_element)?;
+    let dim = resolve_dimension(entry, mode)?;
     // Summed across every shard: one file's bytes are one file's
     // records, not the facet's.
     let files = base_vectors_files(entry);
@@ -748,7 +749,7 @@ fn probed_base_records(entry: &CatalogEntry, mode: ProbeMode) -> Option<u64> {
     for f in &files {
         total += facet_bytes(f, mode)?;
     }
-    let bytes_per_record = 4 + dim * elem;
+    let bytes_per_record = veks_io::reader::xvec_record_bytes(i32::try_from(dim).ok()?, elem).ok()? as u64;
     Some(total / bytes_per_record)
 }
 

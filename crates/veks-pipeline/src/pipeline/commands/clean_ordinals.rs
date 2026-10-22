@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use byteorder::{LittleEndian, WriteBytesExt};
+use std::io::Write;
 use vectordata::VectorReader;
 use vectordata::io::XvecReader;
 
@@ -154,6 +154,8 @@ are excluded from the final dataset.
         let pb = ctx.ui.bar_with_unit(total as u64, "filtering ordinals", "ordinals");
         let mut kept = 0u64;
         let mut excluded = 0u64;
+        // One dim=1 record, re-encoded in place for each kept ordinal.
+        let mut record: Vec<u8> = Vec::with_capacity(8);
 
         // Bound mmap RSS during a full sequential scan.
         let mut reclaim = vectordata::io::StreamReclaim::new(&reader, 0, total);
@@ -169,9 +171,11 @@ are excluded from the final dataset.
             if exclude.contains(&ordinal) {
                 excluded += 1;
             } else {
-                if let Err(e) = writer.write_i32::<LittleEndian>(1)
-                    .and_then(|_| writer.write_i32::<LittleEndian>(ordinal as i32))
-                {
+                record.clear();
+                if let Err(e) = veks_io::writer::encode_records(&[ordinal as i32], 1, &mut record) {
+                    return error_result(format!("write error: {}", e), start);
+                }
+                if let Err(e) = writer.write_all(&record) {
                     return error_result(format!("write error: {}", e), start);
                 }
                 kept += 1;

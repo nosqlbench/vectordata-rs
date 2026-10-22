@@ -129,6 +129,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use veks_io::VecSink;
+use veks_io::xvec::record::RecordHeader;
 
 use super::VecFormat;
 
@@ -977,8 +978,8 @@ fn write_parquet_shards(
     let max_in_flight = MAX_IN_FLIGHT.min(total_files);
 
     let dim = extractor.dimension();
-    // Pre-computed dim header for the records.
-    let dim_prefix: [u8; 4] = (dim as i32).to_le_bytes();
+    // The records' header, checked once.
+    let dim_prefix = RecordHeader::new(dim as usize).map_err(|e| e.to_string())?;
 
     let total_records: u64 = per_file_rows.iter().sum();
 
@@ -1183,7 +1184,7 @@ fn shard_worker_loop(
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
     first_err: Arc<Mutex<Option<String>>>,
     mut extractor: CompiledVectorExtractor,
-    dim_prefix: [u8; 4],
+    dim_prefix: RecordHeader,
     stride: usize,
     max_in_flight: usize,
     total_files: usize,
@@ -1711,7 +1712,7 @@ pub(super) fn read_file_with_advise(path: &Path) -> std::io::Result<Vec<u8>> {
 fn append_batch_to_buf(
     extractor: &mut CompiledVectorExtractor,
     batch: &RecordBatch,
-    dim_prefix: &[u8; 4],
+    dim_prefix: &RecordHeader,
     scratch: &mut Vec<u8>,
 ) -> Result<usize, String> {
     let mut sink = BufSink { buf: scratch, dim_prefix: *dim_prefix };
@@ -1723,13 +1724,12 @@ fn append_batch_to_buf(
 /// batch's bytes before issuing a single kernel write.
 struct BufSink<'a> {
     buf: &'a mut Vec<u8>,
-    dim_prefix: [u8; 4],
+    dim_prefix: RecordHeader,
 }
 
 impl VecSink for BufSink<'_> {
     fn write_record(&mut self, _ordinal: i64, data: &[u8]) {
-        self.buf.extend_from_slice(&self.dim_prefix);
-        self.buf.extend_from_slice(data);
+        self.dim_prefix.append_record(data, self.buf);
     }
 
     fn write_records_fixed_dim(
@@ -1740,18 +1740,7 @@ impl VecSink for BufSink<'_> {
         record_size: usize,
     ) {
         debug_assert_eq!(packed.len(), count * record_size);
-        let stride = 4 + record_size;
-        let initial = self.buf.len();
-        self.buf.resize(initial + count * stride, 0);
-        let mut dst = initial;
-        let mut src = 0;
-        for _ in 0..count {
-            self.buf[dst..dst + 4].copy_from_slice(&self.dim_prefix);
-            self.buf[dst + 4..dst + stride]
-                .copy_from_slice(&packed[src..src + record_size]);
-            dst += stride;
-            src += record_size;
-        }
+        self.dim_prefix.append_records(packed, record_size, self.buf);
     }
 
     fn finish(self: Box<Self>) -> Result<(), String> { Ok(()) }

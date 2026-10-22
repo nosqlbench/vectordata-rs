@@ -63,8 +63,8 @@ impl VecReader {
         let pread_file = std::fs::File::open(path)
             .map_err(|e| format!("failed to open {} for pread: {}", path.display(), e))?;
         let pread_file = Arc::new(pread_file);
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("mvec") | Some("mvecs") => {
+        match path.extension().and_then(|e| e.to_str()).and_then(veks_io::ElementType::from_extension) {
+            Some(veks_io::ElementType::F16) => {
                 let mmap = XvecReader::<half::f16>::open_path(path)
                     .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
                 let entry_size = mmap.entry_size();
@@ -107,19 +107,27 @@ impl VecReader {
         }
     }
 
-    /// Read the raw bytes (excluding the 4-byte dim header) of one
-    /// vector at `index` into a fresh `Vec<u8>` via `pread`. Used by
-    /// the phase-2 full-vector compare path so we don't touch the
-    /// mmap and don't leak page maps into process RSS — the bytes
-    /// flow through the kernel page cache (cache-warm if recently
-    /// touched) and are copied into the returned buffer, then dropped
-    /// at the end of the comparison call.
-    fn pread_one_vector_bytes(&self, index: usize) -> Result<Vec<u8>, String> {
+    /// Bytes per element of the source: 4 for f32, 2 for f16.
+    fn elem_size(&self) -> usize {
+        match self {
+            VecReader::F32 { .. } => 4,
+            VecReader::F16 { .. } => 2,
+        }
+    }
+
+    /// Read the whole record (header and elements) of the vector at
+    /// `index` into a fresh `Vec<u8>` via `pread`; its element bytes
+    /// are [`record_payload`](veks_io::xvec::record::record_payload)
+    /// of it, header checked. Used by the phase-2 full-vector compare
+    /// path so we don't touch the mmap and don't leak page maps into
+    /// process RSS — the bytes flow through the kernel page cache
+    /// (cache-warm if recently touched) and are copied into the
+    /// returned buffer, then dropped at the end of the comparison call.
+    fn pread_one_record(&self, index: usize) -> Result<Vec<u8>, String> {
         use veks_io::file::pread_exact;
         let entry_size = self.entry_size();
-        let value_bytes = entry_size - 4;
-        let byte_offset = (index * entry_size + 4) as u64;  // skip i32 dim header
-        let mut buf = vec![0u8; value_bytes];
+        let byte_offset = (index * entry_size) as u64;
+        let mut buf = vec![0u8; entry_size];
         pread_exact(self.pread_file(), &mut buf, byte_offset)
             .map_err(|e| format!("pread vector {}: {}", index, e))?;
         Ok(buf)
@@ -129,25 +137,25 @@ impl VecReader {
     /// `pread` (heap buffer, no mmap touch) so calls in tight loops
     /// don't accumulate mmap RSS.
     fn get_f32(&self, index: usize) -> Result<Vec<f32>, String> {
-        let bytes = self.pread_one_vector_bytes(index)?;
+        use veks_io::xvec::record::pread_record;
         let dim = self.dim();
         match self {
-            VecReader::F32 { .. } => {
-                let mut out = Vec::with_capacity(dim);
-                for i in 0..dim {
-                    out.push(f32::from_le_bytes([
-                        bytes[i * 4], bytes[i * 4 + 1],
-                        bytes[i * 4 + 2], bytes[i * 4 + 3],
-                    ]));
-                }
+            VecReader::F32 { pread_file, .. } => {
+                let mut scratch = Vec::new();
+                let mut out = vec![0f32; dim];
+                pread_record(pread_file, index as u64, &mut scratch, &mut out)
+                    .map_err(|e| format!("pread vector {}: {}", index, e))?;
                 Ok(out)
             }
             VecReader::F16 { .. } => {
+                // Widened while decoding, so no f16 row is allocated
+                // between the bytes and the f32 result.
+                let record = self.pread_one_record(index)?;
+                let payload = veks_io::xvec::record::record_payload(&record, 2)
+                    .map_err(|e| format!("pread vector {}: {}", index, e))?;
                 let mut out = Vec::with_capacity(dim);
-                for i in 0..dim {
-                    let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
-                    out.push(half::f16::from_bits(bits).to_f32());
-                }
+                out.extend(payload.chunks_exact(2)
+                    .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()));
                 Ok(out)
             }
         }
@@ -157,9 +165,13 @@ impl VecReader {
     /// vectors' raw bytes and compare. Same RSS-safety contract as
     /// `get_f32`: no mmap touch.
     fn vectors_equal(&self, a: usize, b: usize) -> bool {
-        let ba = match self.pread_one_vector_bytes(a) { Ok(v) => v, Err(_) => return false };
-        let bb = match self.pread_one_vector_bytes(b) { Ok(v) => v, Err(_) => return false };
-        ba == bb
+        use veks_io::xvec::record::record_payload;
+        let ra = match self.pread_one_record(a) { Ok(v) => v, Err(_) => return false };
+        let rb = match self.pread_one_record(b) { Ok(v) => v, Err(_) => return false };
+        match (record_payload(&ra, self.elem_size()), record_payload(&rb, self.elem_size())) {
+            (Ok(pa), Ok(pb)) => pa == pb,
+            _ => false,
+        }
     }
 
     /// Full lexicographic comparison of two vectors via `pread`. Used
@@ -168,26 +180,24 @@ impl VecReader {
     /// mmap pages get mapped into this process during the millions of
     /// compares phase 2 may issue.
     fn compare_vectors(&self, a: usize, b: usize) -> std::cmp::Ordering {
-        let ba = match self.pread_one_vector_bytes(a) {
+        use veks_io::xvec::record::record_payload;
+        let ra = match self.pread_one_record(a) {
             Ok(v) => v,
             Err(_) => return std::cmp::Ordering::Equal,
         };
-        let bb = match self.pread_one_vector_bytes(b) {
+        let rb = match self.pread_one_record(b) {
             Ok(v) => v,
             Err(_) => return std::cmp::Ordering::Equal,
         };
-        let dim = self.dim();
+        let (ba, bb) = match (record_payload(&ra, self.elem_size()), record_payload(&rb, self.elem_size())) {
+            (Ok(pa), Ok(pb)) => (pa, pb),
+            _ => return std::cmp::Ordering::Equal,
+        };
         match self {
             VecReader::F32 { .. } => {
-                for i in 0..dim {
-                    let fa = f32::from_le_bytes([
-                        ba[i * 4], ba[i * 4 + 1],
-                        ba[i * 4 + 2], ba[i * 4 + 3],
-                    ]);
-                    let fb = f32::from_le_bytes([
-                        bb[i * 4], bb[i * 4 + 1],
-                        bb[i * 4 + 2], bb[i * 4 + 3],
-                    ]);
+                for (ca, cb) in ba.chunks_exact(4).zip(bb.chunks_exact(4)) {
+                    let fa = f32::from_le_bytes([ca[0], ca[1], ca[2], ca[3]]);
+                    let fb = f32::from_le_bytes([cb[0], cb[1], cb[2], cb[3]]);
                     match fa.partial_cmp(&fb) {
                         Some(std::cmp::Ordering::Equal) => continue,
                         Some(ord) => return ord,
@@ -201,13 +211,9 @@ impl VecReader {
                 std::cmp::Ordering::Equal
             }
             VecReader::F16 { .. } => {
-                for i in 0..dim {
-                    let fa = half::f16::from_bits(
-                        u16::from_le_bytes([ba[i * 2], ba[i * 2 + 1]])
-                    ).to_f32();
-                    let fb = half::f16::from_bits(
-                        u16::from_le_bytes([bb[i * 2], bb[i * 2 + 1]])
-                    ).to_f32();
+                for (ca, cb) in ba.chunks_exact(2).zip(bb.chunks_exact(2)) {
+                    let fa = half::f16::from_bits(u16::from_le_bytes([ca[0], ca[1]])).to_f32();
+                    let fb = half::f16::from_bits(u16::from_le_bytes([cb[0], cb[1]])).to_f32();
                     match fa.partial_cmp(&fb) {
                         Some(std::cmp::Ordering::Equal) => continue,
                         Some(ord) => return ord,
@@ -307,38 +313,35 @@ impl VecReader {
             })
     }
 
-    /// Decode the prefix of vector `local_idx` (offset within `batch_buf`)
-    /// into `out`. `batch_buf` must be the bytes from
-    /// [`pread_vector_range`] for this vector range. Decodes
-    /// f16 → f32 in-line for f16 sources.
+    /// Decode the prefix of vector `local_idx` (its whole record, within
+    /// `batch_buf`) into `out`. `batch_buf` must be the bytes from
+    /// [`pread_vector_range_into`](Self::pread_vector_range_into) for
+    /// this vector range. Decodes f16 → f32 in-line for f16 sources.
+    /// A record whose header does not state the file's dimension is an
+    /// error.
     fn prefix_from_buf_into(
         &self,
         batch_buf: &[u8],
         local_idx: usize,
         out: &mut [f32],
-    ) {
+    ) -> Result<(), String> {
         let entry_size = self.entry_size();
-        let entry_offset = local_idx * entry_size + 4;  // skip i32 dim header
-        let n = out.len();
+        let record = &batch_buf[local_idx * entry_size..(local_idx + 1) * entry_size];
+        let src = veks_io::xvec::record::record_payload(record, self.elem_size())
+            .map_err(|e| format!("vector {} of the batch: {}", local_idx, e))?;
         match self {
             VecReader::F32 { .. } => {
-                let bytes_needed = n * 4;
-                let src = &batch_buf[entry_offset..entry_offset + bytes_needed];
-                for i in 0..n {
-                    out[i] = f32::from_le_bytes([
-                        src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3],
-                    ]);
+                for (o, b) in out.iter_mut().zip(src.chunks_exact(4)) {
+                    *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 }
             }
             VecReader::F16 { .. } => {
-                let bytes_needed = n * 2;
-                let src = &batch_buf[entry_offset..entry_offset + bytes_needed];
-                for i in 0..n {
-                    let bits = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
-                    out[i] = half::f16::from_bits(bits).to_f32();
+                for (o, b) in out.iter_mut().zip(src.chunks_exact(2)) {
+                    *o = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -754,10 +757,9 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         // syscalls — single-threaded this takes 15+ minutes of silent
         // wall time even with all pages cache-warm. Rayon-parallelize
         // and emit a progress bar so the step is observable.
-        let scan_zeros = |data: &[u8], label: &str| -> Result<Vec<usize>, String> {
+        let scan_zeros = |ords: &XvecReader<i32>, label: &str| -> Result<Vec<usize>, String> {
             use rayon::prelude::*;
-            let record_size = 4 + 4; // dim=1 (i32) + ordinal (i32)
-            let ord_count = data.len() / record_size;
+            let ord_count = ords.count();
             if ord_count == 0 { return Ok(Vec::new()); }
 
             let pb = ctx.ui.bar_with_unit(ord_count as u64, label, "vec");
@@ -769,11 +771,8 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             let result: Result<Vec<usize>, String> = (0..ord_count)
                 .into_par_iter()
                 .filter_map(|i| {
-                    let offset = i * record_size + 4;
-                    let ordinal = i32::from_le_bytes([
-                        data[offset], data[offset+1],
-                        data[offset+2], data[offset+3],
-                    ]) as usize;
+                    // `i < ord_count`, so the record is in the file.
+                    let ordinal = ords.get_slice(i)[0] as usize;
                     let vec = match reader.get_f32(ordinal) {
                         Ok(v) => v,
                         Err(e) => return Some(Err(format!("zero scan: {}", e))),
@@ -830,26 +829,25 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
 
         // Scan the surviving-uniques path and rewrite it without zeros.
         let output_zero_count = if skip_zero_sweep { 0 } else {
-            let ord_data = match std::fs::read(&output_path) {
-                Ok(d) => d,
+            let ords = match XvecReader::<i32>::open_path(&output_path) {
+                Ok(r) => r,
                 Err(e) => return error_result(format!("read ordinals for zero scan: {}", e), start),
             };
-            let record_size = 4 + 4;
-            let ord_count = ord_data.len() / record_size;
-            let zeros = match scan_zeros(&ord_data, "zero scan: uniques") {
+            let ord_count = ords.count();
+            let zeros = match scan_zeros(&ords, "zero scan: uniques") {
                 Ok(z) => z,
                 Err(e) => return error_result(e, start),
             };
             if !zeros.is_empty() {
                 let zero_set: std::collections::HashSet<usize> = zeros.iter().copied().collect();
-                let mut clean_data = Vec::with_capacity(ord_data.len());
-                for i in 0..ord_count {
-                    if !zero_set.contains(&i) {
-                        let s = i * record_size;
-                        clean_data.extend_from_slice(&ord_data[s..s + record_size]);
-                    }
-                }
-                if let Err(e) = std::fs::write(&output_path, &clean_data) {
+                // Collect the survivors before rewriting: the file is
+                // mapped by `ords`, and is truncated by the rewrite.
+                let clean: Vec<u32> = (0..ord_count)
+                    .filter(|i| !zero_set.contains(i))
+                    .map(|i| ords.get_slice(i)[0] as u32)
+                    .collect();
+                drop(ords);
+                if let Err(e) = write_ivec(&output_path, &clean) {
                     return error_result(format!("rewrite ordinals without zeros: {}", e), start);
                 }
                 ctx.ui.log(&format!("  removed {} zero vector(s) from ordinals", zeros.len()));
@@ -863,9 +861,14 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         // Same short-circuit applies — see the output_zero_count
         // block for the full reasoning.
         let dup_zero_count = if skip_zero_sweep { 0 } else {
-            match std::fs::read(&duplicates_path) {
-                Ok(data) if !data.is_empty() => {
-                    let zeros = match scan_zeros(&data, "zero scan: dups") {
+            match std::fs::metadata(&duplicates_path) {
+                Ok(m) if m.len() > 0 => {
+                    let dups = match XvecReader::<i32>::open_path(&duplicates_path) {
+                        Ok(r) => r,
+                        Err(e) => return error_result(
+                            format!("read duplicates for zero scan: {}", e), start),
+                    };
+                    let zeros = match scan_zeros(&dups, "zero scan: dups") {
                         Ok(z) => z,
                         Err(e) => return error_result(e, start),
                     };
@@ -1249,7 +1252,7 @@ fn create_sorted_runs(
                     .map(|local_i| {
                         let i = batch_start + local_i;
                         let mut prefix_buf = [0.0f32; MAX_PREFIX];
-                        reader.prefix_from_buf_into(&batch_buf, local_i, &mut prefix_buf[..pw]);
+                        reader.prefix_from_buf_into(&batch_buf, local_i, &mut prefix_buf[..pw])?;
                         let key = build_sort_key(&prefix_buf[..pw]);
                         let record = RunRecord::new(i as u32, &prefix_buf[..pw]);
                         let done = progress.fetch_add(1, AtomicOrd::Relaxed) + 1;
@@ -1480,10 +1483,11 @@ fn merge_runs(
     // ── Sub-phase C: Parallel dedup scan → ivec bytes ──────────────
     //
     // Partition the sorted records into chunks and scan each in parallel.
-    // Each chunk builds its output + dup ivec byte buffers directly —
+    // Each chunk builds its output + dup ordinal lists directly —
     // the prefix ("memo header") in each RunRecord drives the dup check
-    // inline, and ivec records (8 bytes: dim=1 + ordinal) are written
-    // straight into the byte buffer. One pass, no intermediate Vec<u32>.
+    // inline, and each ordinal is pushed as the dim=1 ivec row it
+    // becomes. One pass; the rows are encoded as ivec records when the
+    // files are written.
     //
     // Boundary pairs (last of chunk N vs first of chunk N+1) are fixed
     // up in a tiny sequential pass before concatenating the buffers.
@@ -1495,11 +1499,9 @@ fn merge_runs(
     let chunks: Vec<&[RunRecord]> = all_records.chunks(chunk_size).collect();
     let num_chunks = chunks.len();
 
-    let dim_bytes = 1_i32.to_le_bytes();
-
     struct ChunkResult {
-        out_buf: Vec<u8>,      // ivec bytes for output ordinals
-        dup_buf: Vec<u8>,      // ivec bytes for dup ordinals
+        out_buf: Vec<i32>,     // dim=1 ivec rows for output ordinals
+        dup_buf: Vec<i32>,     // dim=1 ivec rows for dup ordinals
         dup_count: usize,
     }
 
@@ -1532,7 +1534,7 @@ fn merge_runs(
     let prefix_group_stats = std::sync::Mutex::new(PrefixGroupStats::default());
 
     let chunk_scan = |chunk: &[RunRecord]| -> ChunkResult {
-        let mut out_buf = Vec::with_capacity(chunk.len() * 8);
+        let mut out_buf = Vec::with_capacity(chunk.len());
         let mut dup_buf = Vec::new();
         let mut dups = 0usize;
         let mut local_stats = PrefixGroupStats::default();
@@ -1563,8 +1565,7 @@ fn merge_runs(
             if group_len == 1 {
                 // Single-element group — no duplicates possible
                 let record = &chunk[group_start];
-                out_buf.extend_from_slice(&dim_bytes);
-                out_buf.extend_from_slice(&(record.ordinal as i32).to_le_bytes());
+                out_buf.push(record.ordinal as i32);
                 local_stats.singleton_groups += 1;
             } else {
                 // Multi-element prefix group — sort by full vector content
@@ -1590,26 +1591,22 @@ fn merge_runs(
                 });
 
                 let mut last_unique_ord = group_ords[0];
-                out_buf.extend_from_slice(&dim_bytes);
-                out_buf.extend_from_slice(&(last_unique_ord as i32).to_le_bytes());
+                out_buf.push(last_unique_ord as i32);
 
                 for &ord in &group_ords[1..] {
                     let is_dup = reader.vectors_equal(
                         last_unique_ord as usize, ord as usize,
                     );
 
-                    let ord_bytes = (ord as i32).to_le_bytes();
+                    let ord_row = ord as i32;
                     if is_dup {
                         dups += 1;
-                        dup_buf.extend_from_slice(&dim_bytes);
-                        dup_buf.extend_from_slice(&ord_bytes);
+                        dup_buf.push(ord_row);
                         if !elide {
-                            out_buf.extend_from_slice(&dim_bytes);
-                            out_buf.extend_from_slice(&ord_bytes);
+                            out_buf.push(ord_row);
                         }
                     } else {
-                        out_buf.extend_from_slice(&dim_bytes);
-                        out_buf.extend_from_slice(&ord_bytes);
+                        out_buf.push(ord_row);
                         last_unique_ord = ord;
                     }
                 }
@@ -1670,13 +1667,12 @@ fn merge_runs(
             let result = &mut chunk_results[i + 1];
             result.dup_count += 1;
 
-            // The first 8 bytes of out_buf is this record's ivec entry.
+            // The first row of out_buf is this record's ivec entry.
             // Move it to dup_buf (or remove if eliding).
-            if result.out_buf.len() >= 8 {
-                let first_record = result.out_buf[..8].to_vec();
-                result.dup_buf.extend_from_slice(&first_record);
+            if let Some(&first_record) = result.out_buf.first() {
+                result.dup_buf.push(first_record);
                 if elide {
-                    result.out_buf.drain(..8);
+                    result.out_buf.remove(0);
                 }
             }
         }
@@ -1685,8 +1681,10 @@ fn merge_runs(
     // Tally results
     let dup_count: usize = chunk_results.iter().map(|r| r.dup_count).sum();
     let unique_count = total - dup_count;
-    let total_out_bytes: usize = chunk_results.iter().map(|r| r.out_buf.len()).sum();
-    let total_dup_bytes: usize = chunk_results.iter().map(|r| r.dup_buf.len()).sum();
+    // Each row is one dim=1 ivec record: the header and the ordinal.
+    let ivec_record_bytes = 2 * std::mem::size_of::<i32>();
+    let total_out_bytes: usize = chunk_results.iter().map(|r| r.out_buf.len() * ivec_record_bytes).sum();
+    let total_dup_bytes: usize = chunk_results.iter().map(|r| r.dup_buf.len() * ivec_record_bytes).sum();
 
     // Free sorted records before allocating output buffers
     drop(all_records);
@@ -1732,24 +1730,10 @@ fn merge_runs(
         total_dup_bytes as f64 / (1024.0 * 1024.0),
     ));
 
-    // Concatenate output chunks and write in one shot
-    {
-        let mut out_bytes = Vec::with_capacity(total_out_bytes);
-        for r in &chunk_results {
-            out_bytes.extend_from_slice(&r.out_buf);
-        }
-        std::fs::write(output_path, &out_bytes)
-            .map_err(|e| format!("failed to write {}: {}", output_path.display(), e))?;
-    }
-
-    {
-        let mut dup_bytes = Vec::with_capacity(total_dup_bytes);
-        for r in &chunk_results {
-            dup_bytes.extend_from_slice(&r.dup_buf);
-        }
-        std::fs::write(duplicates_path, &dup_bytes)
-            .map_err(|e| format!("failed to write {}: {}", duplicates_path.display(), e))?;
-    }
+    // Encode each chunk's rows as one batch and write the batches in
+    // chunk order.
+    write_ivec_chunks(output_path, chunk_results.iter().map(|r| r.out_buf.as_slice()))?;
+    write_ivec_chunks(duplicates_path, chunk_results.iter().map(|r| r.dup_buf.as_slice()))?;
 
     let write_secs = write_start.elapsed().as_secs_f64();
     ctx.ui.log(&format!(
@@ -1764,13 +1748,6 @@ fn merge_runs(
 // I/O helpers
 // ---------------------------------------------------------------------------
 
-/// Write a single ivec record (dim=1, one i32 ordinal).
-fn write_ivec_record<W: Write>(w: &mut W, ordinal: u32) -> std::io::Result<()> {
-    w.write_i32::<LittleEndian>(1)?;
-    w.write_i32::<LittleEndian>(ordinal as i32)?;
-    Ok(())
-}
-
 /// Write a complete ivec file from a slice of ordinals.
 fn write_ivec(path: &Path, ordinals: &[u32]) -> Result<(), String> {
     write_ivec_bulk(path, ordinals)
@@ -1778,21 +1755,30 @@ fn write_ivec(path: &Path, ordinals: &[u32]) -> Result<(), String> {
 
 /// Bulk-write an ivec file from a slice of ordinals.
 ///
-/// Builds the entire byte buffer in memory (8 bytes per record:
-/// 4-byte dim=1 header + 4-byte ordinal) and writes it in a single
-/// syscall. This is orders of magnitude faster than per-record writes
-/// for large ordinal lists.
+/// Encodes every ordinal as a dim=1 record in one buffer and writes it
+/// as one batch. This is orders of magnitude faster than per-record
+/// writes for large ordinal lists.
 fn write_ivec_bulk(path: &Path, ordinals: &[u32]) -> Result<(), String> {
-    // 8 bytes per record: dim header (1_i32 LE) + ordinal (i32 LE)
-    let mut buf = vec![0u8; ordinals.len() * 8];
-    let dim_bytes = 1_i32.to_le_bytes();
-    for (i, &ord) in ordinals.iter().enumerate() {
-        let offset = i * 8;
-        buf[offset..offset + 4].copy_from_slice(&dim_bytes);
-        buf[offset + 4..offset + 8].copy_from_slice(&(ord as i32).to_le_bytes());
+    let rows: Vec<i32> = ordinals.iter().map(|&ord| ord as i32).collect();
+    write_ivec_chunks(path, std::iter::once(rows.as_slice()))
+}
+
+/// Write a dim=1 ivec file whose rows are the ordinals of `chunks`, in
+/// order: each chunk is encoded as one batch of records
+/// ([`veks_io::writer::encode_records`]) into a buffer reused across
+/// chunks, and written with one [`veks_io::XvecWriter::write_raw`].
+fn write_ivec_chunks<'a>(path: &Path, chunks: impl IntoIterator<Item = &'a [i32]>) -> Result<(), String> {
+    let mut writer = veks_io::XvecWriter::<i32>::create(path, 1)
+        .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
+    let mut batch = Vec::new();
+    for rows in chunks {
+        batch.clear();
+        veks_io::writer::encode_records(rows, 1, &mut batch)
+            .and_then(|()| writer.write_raw(&batch))
+            .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
     }
-    std::fs::write(path, &buf)
-        .map_err(|e| format!("failed to write {}: {}", path.display(), e))
+    writer.finish().map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
+    Ok(())
 }
 
 /// Write the JSON deduplication report.

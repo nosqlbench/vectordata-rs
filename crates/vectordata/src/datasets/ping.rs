@@ -191,16 +191,20 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&
                 // can show this dataset's size from now on.
                 let shape = match storage.read_prefix(4) {
                     Ok(hdr) if hdr.len() == 4 => {
-                        let dim = i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-                        let ext = source.rsplit('.').next().unwrap_or("");
-                        let elem = crate::io::infer_elem_size(ext);
-                        if dim > 0 && dim <= 1_000_000 && elem > 0 && !crate::io::is_vvec_ext(ext) {
-                            let bpr = 4 + dim as u64 * elem as u64;
-                            format!(", dim={dim}, ~{} records", size / bpr)
-                        } else if dim > 0 && dim <= 1_000_000 {
-                            format!(", dim={dim}")
-                        } else {
-                            String::new()
+                        match veks_io::xvec::record::record_dim(&hdr).filter(|&d| d <= 1_000_000) {
+                            Some(dim) => {
+                                let ext = source.rsplit('.').next().unwrap_or("");
+                                // Only a uniform file has one stride; veks-io's
+                                // record size is the one the readers use.
+                                let bpr = crate::io::ElementType::from_extension(ext)
+                                    .filter(|_| !crate::io::is_vvec_ext(ext))
+                                    .and_then(|elem| veks_io::reader::xvec_record_bytes(dim as i32, elem).ok());
+                                match bpr {
+                                    Some(bpr) => format!(", dim={dim}, ~{} records", size / bpr as u64),
+                                    None => format!(", dim={dim}"),
+                                }
+                            }
+                            None => String::new(),
                         }
                     }
                     Ok(_) => String::new(),

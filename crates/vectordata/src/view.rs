@@ -84,16 +84,20 @@ pub(crate) fn records_in(path: &str, storage: &std::sync::Arc<crate::storage::St
         return Some(total / elem_size as u64);
     }
     // Uniform xvec: one dim header governs the whole file.
-    let header = storage.read_bytes(0, 4).ok()?;
-    if header.len() != 4 {
-        return None;
-    }
-    let dim = i32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-    if dim <= 0 || dim > 1_000_000 {
-        return None;
-    }
-    let bpr = 4 + (dim as u64) * (elem_size as u64);
-    (bpr > 0).then(|| total / bpr)
+    let bpr = uniform_record_bytes(ext, storage)?;
+    Some(total / bpr)
+}
+
+/// Bytes per record of a uniform xvec file, from its first header as
+/// veks-io reads it — four bytes, so a sparse remote file stays sparse.
+///
+/// `None` when the extension names no element type, the header is not
+/// a positive dimension, or it claims more than a million elements (a
+/// corrupt header, not a vector).
+fn uniform_record_bytes(ext: &str, storage: &std::sync::Arc<crate::storage::Storage>) -> Option<u64> {
+    let elem = veks_io::ElementType::from_extension(ext)?;
+    let probe = veks_io::reader::probe_source(&crate::io::StorageSource::new(storage.clone()), elem).ok()?;
+    (probe.dim <= 1_000_000).then_some(probe.record_bytes)
 }
 
 
@@ -164,7 +168,7 @@ fn map_in_file(
     path_no_window: &str,
     lo: u64,
     hi: u64,
-    storage: &crate::storage::Storage,
+    storage: &std::sync::Arc<crate::storage::Storage>,
     offsets: &dyn Fn(usize) -> Option<std::sync::Arc<Vec<u64>>>,
 ) -> Option<(u64, u64, u64)> {
     if hi <= lo {
@@ -238,15 +242,7 @@ fn map_in_file(
     }
 
     // Uniform xvec: one dim header governs the file.
-    let header = storage.read_bytes(0, 4).ok()?;
-    if header.len() != 4 {
-        return None;
-    }
-    let dim = i32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-    if dim <= 0 || dim > 1_000_000 {
-        return None; // sanity vs corrupt header
-    }
-    let bpr = 4 + (dim as u64) * (elem_size as u64);
+    let bpr = uniform_record_bytes(ext, storage)?;
     let byte_start = lo.saturating_mul(bpr).min(total);
     let byte_end = hi.saturating_mul(bpr).min(total);
     // A uniform-stride mapping costs a 4-byte header read, which every

@@ -58,6 +58,86 @@ fn resolve_path(s: &str, workspace: &Path) -> std::path::PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
 }
 
+/// Write `count` records of `fields` values drawn uniformly from
+/// `[range_min, range_min + range)` to `path` in the integer format
+/// `fmt`: a scalar column of its type, or an ivec of `fields`-element
+/// rows.
+///
+/// Each value is narrowed to the column's type by `as`, so a column of
+/// any width holds the low bytes of the drawn i32 — the same bytes for
+/// the signed and unsigned type of one width.
+pub(crate) fn write_int_records<R: Rng>(
+    path: &Path,
+    fmt: veks_io::VecFormat,
+    count: usize,
+    fields: usize,
+    rng: &mut R,
+    range_min: i32,
+    range: i32,
+    pb: &veks_core::ui::ProgressHandle,
+) -> Result<(), String> {
+    use veks_io::ElementType as E;
+    let column = fmt.is_scalar();
+    match fmt.element_type() {
+        Some(E::U8) => write_int_rows(path, column, count, fields, rng, range_min, range, pb, |v| v as u8),
+        Some(E::I8) => write_int_rows(path, column, count, fields, rng, range_min, range, pb, |v| v as i8),
+        Some(E::U16) => write_int_rows(path, column, count, fields, rng, range_min, range, pb, |v| v as u16),
+        Some(E::I16) => write_int_rows(path, column, count, fields, rng, range_min, range, pb, |v| v as i16),
+        Some(E::U32) => write_int_rows(path, column, count, fields, rng, range_min, range, pb, |v| v as u32),
+        Some(E::I32) => write_int_rows(path, column, count, fields, rng, range_min, range, pb, |v| v),
+        Some(E::U64) => write_int_rows(path, column, count, fields, rng, range_min, range, pb, |v| v as u64),
+        Some(E::I64) => write_int_rows(path, column, count, fields, rng, range_min, range, pb, |v| v as i64),
+        _ => Err(format!("format {fmt} is not an integer format")),
+    }
+}
+
+/// [`write_int_records`] at the element type `T`: one reused row of
+/// `fields` values per record, through veks-io's typed writer for the
+/// layout (`ScalarWriter` for a column, `XvecWriter` for an ivec).
+#[allow(clippy::too_many_arguments)]
+fn write_int_rows<T: veks_io::Element, R: Rng>(
+    path: &Path,
+    column: bool,
+    count: usize,
+    fields: usize,
+    rng: &mut R,
+    range_min: i32,
+    range: i32,
+    pb: &veks_core::ui::ProgressHandle,
+    narrow: fn(i32) -> T,
+) -> Result<(), String> {
+    let create_err = |e: veks_io::IoError| format!("create {}: {}", path.display(), e);
+    let mut scalar = None;
+    let mut rows = None;
+    if column {
+        scalar = Some(veks_io::ScalarWriter::<T>::create(path).map_err(create_err)?);
+    } else {
+        rows = Some(veks_io::XvecWriter::<T>::create(path, fields).map_err(create_err)?);
+    }
+    let mut row: Vec<T> = Vec::with_capacity(fields);
+    for ordinal in 0..count {
+        row.clear();
+        row.extend((0..fields).map(|_| narrow(range_min + rng.random_range(0..range))));
+        let written = match (&mut scalar, &mut rows) {
+            (Some(w), _) => w.write(&row),
+            (_, Some(w)) => w.write(&row),
+            _ => unreachable!("one writer is open"),
+        };
+        if written.is_err() {
+            return Err(format!("write record {}", ordinal));
+        }
+        if (ordinal + 1) % 10_000 == 0 {
+            pb.set_position((ordinal + 1) as u64);
+        }
+    }
+    let finished = match (scalar, rows) {
+        (Some(w), _) => w.finish(),
+        (_, Some(w)) => w.finish(),
+        _ => unreachable!("one writer is open"),
+    };
+    finished.map(|_| ()).map_err(|e| format!("flush {}: {}", path.display(), e))
+}
+
 /// Pipeline command: generate synthetic metadata.
 pub struct GenerateMetadataOp;
 
@@ -149,68 +229,26 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
         let range = range_max - range_min;
 
-        // Detect scalar formats (u8, i8, u16, i16, u32, i32, u64, i64)
-        let is_scalar = matches!(format, "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64");
-        let scalar_elem_size: usize = match format {
-            "u8" | "i8" => 1, "u16" | "i16" => 2, "u32" | "i32" => 4, "u64" | "i64" => 8, _ => 0,
-        };
+        // Integer content formats: a header-free column of one integer
+        // type (`u8` … `i64`), or i32 vectors (`ivec`), named as their
+        // extensions are, so the element model decides the layout.
+        let int_format = veks_io::VecFormat::from_extension(format)
+            .filter(|f| f.is_integer() && (f.is_scalar() || *f == veks_io::VecFormat::Ivec));
 
         // The metadata field schema. The same `field_N` names back every
         // content format (scalar/ivec/slab), so the layout is identical
         // regardless of how the content is encoded.
         let field_names: Vec<String> = (0..fields).map(|i| format!("field_{}", i)).collect();
 
-        if is_scalar {
-            // Write as flat packed scalar: each record is `fields` values of the scalar type
-            use std::io::Write;
-            let mut f = match std::fs::File::create(&output_path) {
-                Ok(f) => std::io::BufWriter::new(f),
-                Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
-            };
+        if let Some(fmt) = int_format {
+            // A scalar column holds each record as `fields` values of its
+            // type; an ivec holds each as one `fields`-element i32 vector.
             let pb = ctx.ui.bar_with_unit(count as u64, "generating metadata", "records");
-            for ordinal in 0..count {
-                for _ in 0..fields {
-                    let value = range_min + rng.random_range(0..range);
-                    let write_ok = match scalar_elem_size {
-                        1 => f.write_all(&[value as u8]).is_ok(),
-                        2 => f.write_all(&(value as i16).to_le_bytes()).is_ok(),
-                        4 => f.write_all(&value.to_le_bytes()).is_ok(),
-                        8 => f.write_all(&(value as i64).to_le_bytes()).is_ok(),
-                        _ => false,
-                    };
-                    if !write_ok {
-                        return error_result(format!("write record {}", ordinal), start);
-                    }
-                }
-                if (ordinal + 1) % 10_000 == 0 {
-                    pb.set_position((ordinal + 1) as u64);
-                }
-            }
+            let written = write_int_records(&output_path, fmt, count, fields, &mut rng, range_min, range, &pb);
             pb.finish();
-        } else if format == "ivec" {
-            // Write as ivec: each record is `fields` i32 values
-            use std::io::Write;
-            let mut f = match std::fs::File::create(&output_path) {
-                Ok(f) => std::io::BufWriter::new(f),
-                Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
-            };
-            let pb = ctx.ui.bar_with_unit(count as u64, "generating metadata", "records");
-            for ordinal in 0..count {
-                // Write dimension header
-                if f.write_all(&(fields as i32).to_le_bytes()).is_err() {
-                    return error_result(format!("write record {}", ordinal), start);
-                }
-                for _ in 0..fields {
-                    let value = range_min + rng.random_range(0..range);
-                    if f.write_all(&value.to_le_bytes()).is_err() {
-                        return error_result(format!("write record {}", ordinal), start);
-                    }
-                }
-                if (ordinal + 1) % 10_000 == 0 {
-                    pb.set_position((ordinal + 1) as u64);
-                }
+            if let Err(e) = written {
+                return error_result(e, start);
             }
-            pb.finish();
         } else {
             // Write as slab of MNode records
             let config = match slabtastic::WriterConfig::new(512, 4096, u32::MAX, false) {

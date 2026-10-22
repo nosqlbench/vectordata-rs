@@ -104,10 +104,8 @@ impl CommandOp for CleanupOverlapOp {
             );
         }
 
-        let elem_size = base_etype.byte_width();
-
         let write_path = output_path.as_ref().unwrap_or(&query_path);
-        let result = fix_overlap(&base_path, &query_path, write_path, elem_size, &ctx.ui);
+        let result = fix_overlap(&base_path, &query_path, write_path, base_etype, &ctx.ui);
 
         let (base_count, original_query_count, kept, removed) = match result {
             Ok(r) => r,
@@ -209,8 +207,8 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 /// Read a file fully into memory.
-fn read_file(path: &Path) -> Result<Vec<u8>, String> {
-    std::fs::read(path)
+fn map_file(path: &Path) -> Result<veks_io::MappedFile, String> {
+    veks_io::MappedFile::map(path)
         .map_err(|e| format!("read {}: {}", path.display(), e))
 }
 
@@ -225,11 +223,13 @@ fn fix_overlap(
     base_path: &Path,
     query_path: &Path,
     write_path: &Path,
-    elem_size: usize,
+    elem: ElementType,
     ui: &veks_core::ui::UiHandle,
 ) -> Result<(usize, usize, usize, usize), String> {
-    let base_data = read_file(base_path)?;
-    let query_data = read_file(query_path)?;
+    let base_file = map_file(base_path)?;
+    let query_file = map_file(query_path)?;
+    let base_data = base_file.bytes();
+    let query_data = query_file.bytes();
 
     if base_data.len() < 4 {
         return Err("base file too small to contain a dimension header".into());
@@ -238,16 +238,21 @@ fn fix_overlap(
         return Err("query file too small to contain a dimension header".into());
     }
 
-    let base_dim = u32::from_le_bytes(base_data[..4].try_into().unwrap()) as usize;
-    let query_dim = u32::from_le_bytes(query_data[..4].try_into().unwrap()) as usize;
+    // Each file's shape from its first header, as `elem` records.
+    let base = veks_io::reader::probe_source(&base_file, elem)
+        .map_err(|e| format!("base {}: {}", base_path.display(), e))?;
+    let query = veks_io::reader::probe_source(&query_file, elem)
+        .map_err(|e| format!("query {}: {}", query_path.display(), e))?;
+    let base_dim = base.dim;
+    let query_dim = query.dim;
 
     if base_dim != query_dim {
         return Err(format!("dimension mismatch: base={}, query={}", base_dim, query_dim));
     }
 
-    let record_size = 4 + base_dim * elem_size; // 4-byte dim header + data
-    let base_count = base_data.len() / record_size;
-    let query_count = query_data.len() / record_size;
+    let record_size = base.record_bytes as usize;
+    let base_count = base.records as usize;
+    let query_count = query.records as usize;
 
     // Phase 1: hash all base vectors
     ui.log(&format!("  hashing {} base vectors (dim={})", base_count, base_dim));

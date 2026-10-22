@@ -116,13 +116,15 @@ fn pread_and_unpack(
 ) -> std::io::Result<()> {
     let n_bytes = n_vecs * entry_size;
     file.pread_exact(&mut raw[..n_bytes], byte_off)?;
-    // Unpack: for each entry, skip the 4-byte dim header, then decode
-    // dim elements into the packed buffer.
-    for i in 0..n_vecs {
-        let src_off = i * entry_size + 4;
+    // Unpack: for each entry, decode its element bytes (header
+    // checked) into the packed buffer.
+    let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("pread_and_unpack: {e}"));
+    for (i, record) in raw[..n_bytes].chunks_exact(entry_size).enumerate() {
+        let payload = veks_io::xvec::record::record_payload(record, elem.byte_width())
+            .map_err(|e| invalid(e.to_string()))?;
         let dst = &mut packed[i * dim..(i + 1) * dim];
-        crate::pipeline::element_type::widen_le_into(elem, &raw[src_off..i * entry_size + entry_size], dst)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("pread_and_unpack: {e}")))?;
+        crate::pipeline::element_type::widen_le_into(elem, payload, dst)
+            .map_err(|e| invalid(e.to_string()))?;
     }
     Ok(())
 }
@@ -257,9 +259,14 @@ impl SgemmScanBuffers {
     /// Allocate buffers sized for the given shape. Picks `vecs_per_chunk`
     /// so that the score matrix (`qb_size × vecs_per_chunk × 4`) fits
     /// [`SCORE_MATRIX_BUDGET_BYTES`] and the raw chunk (`vecs_per_chunk
-    /// × entry_size`) fits [`STREAM_CHUNK_BYTES`].
-    pub(super) fn new(query_count: usize, dim: usize) -> Self {
-        let entry_size = 4 + dim * 4;
+    /// × entry_size`) fits [`STREAM_CHUNK_BYTES`], `entry_size` being
+    /// one f32 record of `dim` elements. A `dim` no record can have
+    /// (zero, or past `i32::MAX`) is an error.
+    pub(super) fn new(query_count: usize, dim: usize) -> Result<Self, String> {
+        let entry_size = i32::try_from(dim)
+            .map_err(|_| veks_io::IoError::InvalidFormat(format!("dimension {dim} is past i32::MAX")))
+            .and_then(|d| veks_io::reader::xvec_record_bytes(d, ElementType::F32))
+            .map_err(|e| format!("sgemm scan buffers: {e}"))?;
         let qb_size = QUERY_SUBBATCH_SIZE.min(query_count.max(1));
         let vecs_per_chunk_score = (SCORE_MATRIX_BUDGET_BYTES / (qb_size * 4).max(1)).max(1);
         let vecs_per_chunk_io = (STREAM_CHUNK_BYTES / entry_size.max(1)).max(1);
@@ -267,7 +274,7 @@ impl SgemmScanBuffers {
         let raw_chunk_bytes = vecs_per_chunk * entry_size;
         let _packed_chunk_f32 = vecs_per_chunk * dim;
         let score_matrix_len = qb_size * vecs_per_chunk;
-        Self {
+        Ok(Self {
             raw_a: alloc_raw_buf(raw_chunk_bytes),
             raw_b: alloc_raw_buf(raw_chunk_bytes),
             packed_a: alloc_packed_buf(vecs_per_chunk, dim),
@@ -276,7 +283,7 @@ impl SgemmScanBuffers {
             base_norms_sq: Vec::new(), // sized lazily
             vecs_per_chunk,
             qb_size,
-        }
+        })
     }
 
     pub(super) fn vecs_per_chunk(&self) -> usize { self.vecs_per_chunk }
@@ -313,7 +320,7 @@ pub(super) fn scan_range_sgemm(
     thresholds: &mut [f32],
     mut progress: Option<&mut dyn FnMut(u64)>,
 ) -> Result<(), String> {
-    let entry_size = 4 + dim * elem.byte_width();
+    let entry_size = veks_io::reader::xvec_record_bytes(dim as i32, elem).map_err(|e| e.to_string())?;
     let range_start = base_range.start;
     let range_end = base_range.end;
     let range_len = range_end.saturating_sub(range_start);
@@ -673,7 +680,10 @@ Reuses the shared segment-cache infrastructure:
             );
         }
         let dim = base_dim;
-        let entry_size = 4 + dim * base_elem.byte_width();
+        let entry_size = match veks_io::reader::xvec_record_bytes(dim as i32, base_elem) {
+            Ok(n) => n,
+            Err(e) => return error_result(format!("open base: {e}"), start),
+        };
 
         // Resolve the effective base window from BOTH the inline path
         // syntax (`base.fvec[0..N]`) and the injected `range` option
@@ -883,7 +893,10 @@ Reuses the shared segment-cache infrastructure:
         // sub-batch shape that the in-line code did before. The same
         // `&mut SgemmScanBuffers` is passed to every per-segment
         // `scan_range_sgemm` call below — no per-segment allocation.
-        let mut scan_buffers = SgemmScanBuffers::new(query_count, dim);
+        let mut scan_buffers = match SgemmScanBuffers::new(query_count, dim) {
+            Ok(b) => b,
+            Err(e) => return error_result(e, start),
+        };
         let vecs_per_chunk = scan_buffers.vecs_per_chunk();
         let qb_size = scan_buffers.qb_size();
         let proper_cosine = matches!(cosine_mode, Some(CosineMode::ProperMetric));
@@ -1033,28 +1046,26 @@ Reuses the shared segment-cache infrastructure:
         };
         // Write top-internal_k per query; the canonical f64-direct
         // rerank below collapses each row to top-k.
-        let dim_bytes = (internal_k as i32).to_le_bytes();
+        let (mut idx_row, mut dist_row) = (Vec::with_capacity(internal_k), Vec::with_capacity(internal_k));
+        let mut record: Vec<u8> = Vec::new();
         for row in &all_results {
-            idx_file.write_all(&dim_bytes).map_err(|e| e.to_string()).unwrap();
-            for j in 0..internal_k {
-                let idx: i32 = if j < row.len() { row[j].index as i32 } else { -1 };
-                idx_file.write_all(&idx.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
-            }
+            record.clear();
+            super::knn_segment::encode_padded_row(
+                row.iter().map(|n| n.index as i32), internal_k, -1, &mut idx_row, &mut record,
+            ).unwrap();
+            idx_file.write_all(&record).map_err(|e| e.to_string()).unwrap();
             if let Some(ref mut dw) = dist_file {
-                dw.write_all(&dim_bytes).map_err(|e| e.to_string()).unwrap();
-                for j in 0..internal_k {
-                    // Single sign convention everywhere on disk:
-                    // FAISS publication (`+L2sq`, `+dot`, `+cos_sim`).
-                    // The heap holds kernel-internal distances; convert
-                    // via the shared helper so segment caches, cached
-                    // sibling profiles, and final output all agree.
-                    let dist: f32 = if j < row.len() {
-                        super::knn_segment::kernel_to_published(row[j].distance, kernel_metric)
-                    } else {
-                        f32::INFINITY
-                    };
-                    dw.write_all(&dist.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
-                }
+                // Single sign convention everywhere on disk:
+                // FAISS publication (`+L2sq`, `+dot`, `+cos_sim`).
+                // The heap holds kernel-internal distances; convert
+                // via the shared helper so segment caches, cached
+                // sibling profiles, and final output all agree.
+                record.clear();
+                super::knn_segment::encode_padded_row(
+                    row.iter().map(|n| super::knn_segment::kernel_to_published(n.distance, kernel_metric)),
+                    internal_k, f32::INFINITY, &mut dist_row, &mut record,
+                ).unwrap();
+                dw.write_all(&record).map_err(|e| e.to_string()).unwrap();
             }
         }
         let _ = use_ip;

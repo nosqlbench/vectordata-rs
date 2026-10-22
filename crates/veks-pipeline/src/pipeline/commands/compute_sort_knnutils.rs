@@ -40,6 +40,22 @@ fn error_result(message: impl Into<String>, start: Instant) -> CommandResult {
     }
 }
 
+/// Write `ordinals` to `w` as dim=1 ivec records, encoded by
+/// [`veks_io::writer::encode_records`] through the caller's reusable
+/// `rows` and `records` buffers.
+fn write_ordinal_batch(
+    w: &mut impl Write,
+    ordinals: &[u32],
+    rows: &mut Vec<i32>,
+    records: &mut Vec<u8>,
+) -> Result<(), String> {
+    rows.clear();
+    rows.extend(ordinals.iter().map(|&ord| ord as i32));
+    records.clear();
+    veks_io::writer::encode_records(rows, 1, records).map_err(|e| e.to_string())?;
+    w.write_all(records).map_err(|e| e.to_string())
+}
+
 fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
     let p = PathBuf::from(path_str);
     if p.is_absolute() { p } else { workspace.join(p) }
@@ -231,12 +247,16 @@ byte-identical shuffle results.
             Ok(w) => w,
             Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
         };
-        let dim_1: i32 = 1;
         let batch = 10_000.max(unique_count / 1000);
-        for (i, &ord) in unique_ordinals.iter().enumerate() {
-            writer.write_all(&dim_1.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
-            writer.write_all(&(ord as i32).to_le_bytes()).map_err(|e| e.to_string()).unwrap();
-            if (i + 1) % batch == 0 {
+        // A progress batch of ordinals as dim=1 ivec rows, and its
+        // encoded records; both reused across batches.
+        let mut rows: Vec<i32> = Vec::with_capacity(batch);
+        let mut records: Vec<u8> = Vec::new();
+        for chunk in unique_ordinals.chunks(batch) {
+            if let Err(e) = write_ordinal_batch(&mut writer, chunk, &mut rows, &mut records) {
+                return error_result(format!("write {}: {}", output_path.display(), e), start);
+            }
+            if chunk.len() == batch {
                 write_pb.inc(batch as u64);
             }
         }
@@ -250,10 +270,11 @@ byte-identical shuffle results.
             Ok(w) => w,
             Err(e) => return error_result(format!("create {}: {}", duplicates_path.display(), e), start),
         };
-        for (i, &ord) in dup_ordinals.iter().enumerate() {
-            dup_writer.write_all(&dim_1.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
-            dup_writer.write_all(&(ord as i32).to_le_bytes()).map_err(|e| e.to_string()).unwrap();
-            if (i + 1) % batch == 0 {
+        for chunk in dup_ordinals.chunks(batch) {
+            if let Err(e) = write_ordinal_batch(&mut dup_writer, chunk, &mut rows, &mut records) {
+                return error_result(format!("write {}: {}", duplicates_path.display(), e), start);
+            }
+            if chunk.len() == batch {
                 dup_pb.inc(batch as u64);
             }
         }

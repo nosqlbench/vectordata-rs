@@ -650,57 +650,72 @@ impl MemProfile {
 // Format-aware record parsing
 // ---------------------------------------------------------------------------
 
-/// Parse records from scalar (u8, i16, etc.) or ivec format into Vec<Vec<i32>>.
-fn parse_scalar_records(data: &[u8], ext: &str, fields: usize) -> Vec<Vec<i32>> {
-    let elem_size: usize = match ext {
-        "u8" | "i8" => 1,
-        "u16" | "i16" => 2,
-        "u32" | "i32" => 4,
-        "u64" | "i64" => 8,
-        "ivec" | "ivecs" => 0, // xvec with dim header
-        _ => 0,
-    };
+/// Read the integer records of a scalar column (`.u8`, `.i16`, …,
+/// `fields` values per record) or of an i32 vector file (`.ivecs`
+/// uniform, `.ivvecs` variable-length; the first `fields` values of
+/// each record) into `Vec<Vec<i32>>`. The format is the one the
+/// extension names ([`veks_io::VecFormat::from_extension`]); a 64-bit
+/// value keeps its low 32 bits, as an `as i32` cast does.
+fn read_int_records(path: &Path, fields: usize) -> Result<Vec<Vec<i32>>, String> {
+    use veks_io::{ElementType as Et, VectorReader};
 
-    let mut records = Vec::new();
+    /// `fields` values per record of the column `path`, each cast to i32.
+    fn column<T: veks_io::Element + Default>(
+        path: &Path,
+        fields: usize,
+        to_i32: impl Fn(T) -> i32,
+    ) -> Result<Vec<Vec<i32>>, String> {
+        let reader = veks_io::ScalarReader::<T>::open_path(path)
+            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        if fields == 0 { return Ok(Vec::new()); }
+        let mut values = vec![T::default(); reader.count()];
+        reader.read_into(0, &mut values)
+            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        Ok(values.chunks_exact(fields)
+            .map(|record| record.iter().map(|&v| to_i32(v)).collect())
+            .collect())
+    }
 
-    if elem_size > 0 {
-        // Scalar format: flat packed, no header
-        let record_size = elem_size * fields;
-        if record_size == 0 { return records; }
-        let total = data.len() / record_size;
-        for i in 0..total {
-            let offset = i * record_size;
-            let mut vals = Vec::with_capacity(fields);
-            for f in 0..fields {
-                let fo = offset + f * elem_size;
-                let val: i32 = match elem_size {
-                    1 => data[fo] as i32,
-                    2 => i16::from_le_bytes([data[fo], data[fo+1]]) as i32,
-                    4 => i32::from_le_bytes(data[fo..fo+4].try_into().unwrap()),
-                    8 => i64::from_le_bytes(data[fo..fo+8].try_into().unwrap()) as i32,
-                    _ => 0,
-                };
-                vals.push(val);
-            }
-            records.push(vals);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let format = veks_io::VecFormat::from_extension(ext);
+    match format.and_then(|f| f.is_scalar().then(|| f.element_type()).flatten()) {
+        Some(Et::U8) => return column::<u8>(path, fields, |v| v as i32),
+        Some(Et::I8) => return column::<i8>(path, fields, |v| v as i32),
+        Some(Et::U16) => return column::<u16>(path, fields, |v| v as i32),
+        Some(Et::I16) => return column::<i16>(path, fields, |v| v as i32),
+        Some(Et::U32) => return column::<u32>(path, fields, |v| v as i32),
+        Some(Et::I32) => return column::<i32>(path, fields, |v| v),
+        Some(Et::U64) => return column::<u64>(path, fields, |v| v as i32),
+        Some(Et::I64) => return column::<i64>(path, fields, |v| v as i32),
+        Some(other) => return Err(format!(
+            "{}: a column of {} is not integer metadata", path.display(), other)),
+        None => {}
+    }
+    match format {
+        Some(f) if f.is_uniform_xvec() => {
+            let reader = veks_io::XvecReader::<i32>::open_path(path)
+                .map_err(|e| format!("read {}: {}", path.display(), e))?;
+            let take = fields.min(reader.dim());
+            Ok((0..reader.count()).map(|i| reader.get_slice(i)[..take].to_vec()).collect())
         }
-    } else {
-        // ivec format: [dim:i32, val0:i32, val1:i32, ...]
-        let mut offset = 0;
-        while offset + 4 <= data.len() {
-            let dim = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
-            offset += 4;
-            if offset + dim * 4 > data.len() { break; }
-            let mut vals = Vec::with_capacity(fields.min(dim));
-            for f in 0..fields.min(dim) {
-                let fo = offset + f * 4;
-                vals.push(i32::from_le_bytes(data[fo..fo+4].try_into().unwrap()));
-            }
-            records.push(vals);
-            offset += dim * 4;
+        _ => {
+            // Front to back over the mapped bytes: a read of an input
+            // writes no offset index beside it.
+            let mapped = veks_io::MappedFile::map(path)
+                .map_err(|e| format!("read {}: {}", path.display(), e))?;
+            veks_io::xvec::record::records(mapped.bytes(), 4)
+                .enumerate()
+                .map(|(i, record)| {
+                    let (_, payload) = record
+                        .map_err(|e| format!("read {} record {}: {}", path.display(), i, e))?;
+                    Ok(payload.chunks_exact(4)
+                        .take(fields)
+                        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect())
+                })
+                .collect()
         }
     }
-    records
 }
 
 // ---------------------------------------------------------------------------
@@ -738,22 +753,20 @@ impl GenPredicateKeysOp {
         }
 
         // Read metadata: detect format from extension
-        let meta_bytes = match std::fs::read(&input_path) {
-            Ok(b) => b,
-            Err(e) => return error_result(format!("read {}: {}", input_path.display(), e), start),
-        };
         let meta_ext = input_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let metadata = parse_scalar_records(&meta_bytes, meta_ext, fields);
+        let metadata = match read_int_records(&input_path, fields) {
+            Ok(r) => r,
+            Err(e) => return error_result(e, start),
+        };
         ctx.ui.log(&format!("  evaluate: {} metadata records, {} fields (format={})",
             metadata.len(), fields, meta_ext));
 
         // Read predicate file
-        let pred_bytes = match std::fs::read(&predicates_path) {
-            Ok(b) => b,
-            Err(e) => return error_result(format!("read {}: {}", predicates_path.display(), e), start),
-        };
         let pred_ext = predicates_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let predicates = parse_scalar_records(&pred_bytes, pred_ext, fields);
+        let predicates = match read_int_records(&predicates_path, fields) {
+            Ok(r) => r,
+            Err(e) => return error_result(e, start),
+        };
         ctx.ui.log(&format!("  evaluate: {} predicates (format={})", predicates.len(), pred_ext));
 
         // Build index: map from field values → matching ordinals
@@ -795,35 +808,18 @@ impl GenPredicateKeysOp {
             results
         };
 
-        // Remove stale index before rewriting the vvec file
-        vectordata::io::remove_vvec_index(&output_path);
-
-        // Write output as ivec (each record = matching ordinals)
+        // Write output as a variable-length i32 file (each record =
+        // matching ordinals). The writer removes any stale offset index
+        // before it writes, and writes the new one on finish.
         {
-            use std::io::Write;
-            let mut f = match std::fs::File::create(&output_path) {
-                Ok(f) => std::io::BufWriter::new(f),
+            let mut w = match veks_io::VvecWriter::<i32>::create(&output_path) {
+                Ok(w) => w,
                 Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
             };
-            for matches in &results {
-                let dim = matches.len() as i32;
-                f.write_all(&dim.to_le_bytes()).unwrap_or(());
-                for &ord in matches {
-                    f.write_all(&ord.to_le_bytes()).unwrap_or(());
-                }
+            if let Err(e) = w.write_all(&results).and_then(|()| w.finish().map(|_| ())) {
+                return error_result(format!("write {}: {}", output_path.display(), e), start);
             }
-        }
-
-        // Build offset index for variable-length output (vvec/ivvec)
-        let out_ext = output_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if veks_io::VecFormat::from_extension(out_ext)
-            .map(|f| f.is_vvec()).unwrap_or(false)
-            || out_ext == "ivec" || out_ext == "ivecs"
-        {
-            match vectordata::io::IndexedVvecReader::<i32>::open_path(&output_path) {
-                Ok(r) => ctx.ui.log(&format!("  built offset index ({} records)", r.count())),
-                Err(e) => ctx.ui.log(&format!("  WARNING: failed to build offset index: {}", e)),
-            }
+            ctx.ui.log(&format!("  wrote offset index ({} records)", results.len()));
         }
 
         let total_matches: usize = results.iter().map(|r| r.len()).sum();

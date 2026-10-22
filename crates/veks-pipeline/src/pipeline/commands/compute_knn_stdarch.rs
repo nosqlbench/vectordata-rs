@@ -577,11 +577,16 @@ are ever mapped into the process.
         // narrower base is pread into a byte buffer and widened into
         // a packed f32 buffer by the same task, so the widening
         // overlaps the previous chunk's compute as the I/O does.
-        let entry_size = 4 + dim * base_elem.byte_width();
+        let entry_size = match veks_io::reader::xvec_record_bytes(dim as i32, base_elem) {
+            Ok(n) => n,
+            Err(e) => return error_result(format!("open base: {e}"), start),
+        };
         let vecs_per_chunk = (STREAM_CHUNK_BYTES / entry_size).max(1);
         let chunk_byte_cap = vecs_per_chunk * entry_size;
         let in_place = base_elem == ElementType::F32;
-        let layout = if in_place { (1 + dim, 1) } else { (dim, 0) };
+        // In place, the scan reads raw f32 records as f32 slots: the
+        // dim header occupies the one slot each record's elements follow.
+        let layout = if in_place { (entry_size / 4, 1) } else { (dim, 0) };
         let (mut buf_a, mut buf_b) = if in_place {
             (alloc_chunk_buf(chunk_byte_cap), alloc_chunk_buf(chunk_byte_cap))
         } else {
@@ -596,9 +601,11 @@ are ever mapped into the process.
                 return pread_exact(file, &mut buf_bytes_mut(packed)[..bytes], off);
             }
             pread_exact(file, &mut raw[..bytes], off)?;
-            for j in 0..n {
-                widen_le_into(base_elem, &raw[j * entry_size + 4..(j + 1) * entry_size], &mut packed[j * dim..(j + 1) * dim])
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+            for (j, record) in raw[..bytes].chunks_exact(entry_size).enumerate() {
+                let payload = veks_io::xvec::record::record_payload(record, base_elem.byte_width())
+                    .map_err(|e| invalid(e.to_string()))?;
+                widen_le_into(base_elem, payload, &mut packed[j * dim..(j + 1) * dim]).map_err(invalid)?;
             }
             Ok(())
         };
@@ -836,29 +843,25 @@ are ever mapped into the process.
 
         // Write top-internal_k per query to disk; the canonical
         // f64-direct rerank below collapses each row to top-k.
-        let dim_bytes = (internal_k as i32).to_le_bytes();
+        let (mut idx_row, mut dist_row) = (Vec::with_capacity(internal_k), Vec::with_capacity(internal_k));
+        let mut record: Vec<u8> = Vec::new();
         for qi in 0..query_count {
-            idx_file.write_all(&dim_bytes).unwrap();
+            record.clear();
+            super::knn_segment::encode_padded_row(
+                all_results[qi].iter().map(|n| n.index as i32),
+                internal_k, -1, &mut idx_row, &mut record,
+            ).unwrap();
+            idx_file.write_all(&record).unwrap();
             if let Some(ref mut dw) = dist_file {
-                dw.write_all(&dim_bytes).unwrap();
-            }
-            for j in 0..internal_k {
-                if j < all_results[qi].len() {
-                    let n = &all_results[qi][j];
-                    idx_file.write_all(&(n.index as i32).to_le_bytes()).unwrap();
-                    if let Some(ref mut dw) = dist_file {
-                        // Convert kernel-internal heap distance to
-                        // FAISS publication convention before writing —
-                        // the single on-disk standard.
-                        let d = super::knn_segment::kernel_to_published(n.distance, kernel_metric);
-                        dw.write_all(&d.to_le_bytes()).unwrap();
-                    }
-                } else {
-                    idx_file.write_all(&(-1i32).to_le_bytes()).unwrap();
-                    if let Some(ref mut dw) = dist_file {
-                        dw.write_all(&f32::INFINITY.to_le_bytes()).unwrap();
-                    }
-                }
+                // Convert kernel-internal heap distance to
+                // FAISS publication convention before writing —
+                // the single on-disk standard.
+                record.clear();
+                super::knn_segment::encode_padded_row(
+                    all_results[qi].iter().map(|n| super::knn_segment::kernel_to_published(n.distance, kernel_metric)),
+                    internal_k, f32::INFINITY, &mut dist_row, &mut record,
+                ).unwrap();
+                dw.write_all(&record).unwrap();
             }
         }
         idx_file.flush().unwrap();

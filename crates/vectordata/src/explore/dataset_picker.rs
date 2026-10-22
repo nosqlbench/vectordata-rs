@@ -447,8 +447,7 @@ fn profile_cache_coverage(
         // the manifest each added 1 to `total` without ever showing up
         // in the cache.
         let ext = clean.rsplit('.').next().unwrap_or("");
-        let elem_size = crate::io::infer_elem_size(ext);
-        if elem_size == 0 { continue; }
+        let Some(elem) = crate::io::ElementType::from_extension(ext) else { continue };
 
         // Prefer the survey (which reads the `.mrkl` / `.chunks`
         // sidecar for true chunk-level coverage). The expected cache
@@ -466,7 +465,7 @@ fn profile_cache_coverage(
             let relpath = crate::view::facet_cache_relpath(&url, &home);
             let expected = ds_workspace.join(relpath);
             if let Some(cv) = survey.get(&expected) {
-                let (v, t) = window_bounded_coverage(cv, view, source_path, ext, elem_size);
+                let (v, t) = window_bounded_coverage(cv, view, source_path, ext, elem);
                 valid += v;
                 total += t;
                 continue;
@@ -949,7 +948,7 @@ fn window_bounded_coverage(
     view: &crate::dataset::profile::DSView,
     source_path: &str,
     ext: &str,
-    elem_size: usize,
+    elem: crate::io::ElementType,
 ) -> (u32, u32) {
     // Window: `view.effective_window()` returns the view-level
     // override when set, else the source-level window. The catalog's
@@ -973,13 +972,13 @@ fn window_bounded_coverage(
     }
 
     // Format guard: only uniform-stride xvec is record→byte computable
-    // from `4 + dim * elem_size`. vvec / parquet need metadata we
+    // from its first header. vvec / parquet need metadata we
     // don't carry at this layer.
     if crate::io::is_vvec_ext(ext) {
         return (cv.whole_file_valid(), cv.total_chunks);
     }
 
-    let Some(bpr) = read_xvec_bpr(&cv.cache_file_path, elem_size) else {
+    let Some(bpr) = read_xvec_bpr(&cv.cache_file_path, elem) else {
         // Cache file isn't downloaded far enough to read the dim
         // header — windowed coverage can't be computed; reporting
         // the whole-file count is the only honest fallback.
@@ -991,19 +990,16 @@ fn window_bounded_coverage(
     chunks_for_byte_range(cv, byte_start, byte_end)
 }
 
-/// Read the 4-byte xvec dim header at byte 0 of the cache file, then
-/// compute bytes-per-record as `4 + dim * elem_size`. Returns `None`
-/// when chunk 0 isn't downloaded (sparse hole at the start of the
-/// file → reads as zeros → dim parses as 0 → rejected by sanity
-/// bounds) or when the file can't be opened.
-fn read_xvec_bpr(cache_file: &std::path::Path, elem_size: usize) -> Option<u64> {
-    use std::io::Read;
-    let mut buf = [0u8; 4];
-    let mut f = std::fs::File::open(cache_file).ok()?;
-    f.read_exact(&mut buf).ok()?;
-    let dim = i32::from_le_bytes(buf);
-    if dim <= 0 || dim > 1_000_000 { return None; }
-    Some(4 + (dim as u64) * (elem_size as u64))
+/// Bytes per record of the cache file, from veks-io's probe of the
+/// xvec dim header at byte 0 — a mapping touched for four bytes, so a
+/// sparse file is not read. Returns `None` when chunk 0 isn't
+/// downloaded (sparse hole at the start of the file → reads as zeros
+/// → dim 0 → refused by the probe), when the header claims more than
+/// a million elements, or when the file can't be opened.
+fn read_xvec_bpr(cache_file: &std::path::Path, elem: crate::io::ElementType) -> Option<u64> {
+    let file = veks_io::MappedFile::map(cache_file).ok()?;
+    let probe = veks_io::reader::probe_source(&file, elem).ok()?;
+    (probe.dim <= 1_000_000).then_some(probe.record_bytes)
 }
 
 /// Count `(valid_chunks_in_range, total_chunks_in_range)` for the
@@ -1529,7 +1525,7 @@ const SIZE_PENDING: &str = "…";
 struct FacetKnowledge {
     /// Total file size in bytes.
     bytes: Option<u64>,
-    /// Bytes per record (`4 + dim * elem_size`, uniform xvec only).
+    /// Bytes per record (header and `dim` elements, uniform xvec only).
     bpr: Option<u64>,
     /// A remote probe is queued or in flight.
     pending: bool,
@@ -1543,7 +1539,7 @@ struct FacetKnowledge {
 /// between a profile's views and the knowledge map.
 struct FacetShape {
     url: String,
-    elem_size: usize,
+    elem: crate::io::ElementType,
     /// Uniform-stride xvec — record counts derivable from byte math.
     uniform: bool,
     /// `[start..end)` record window, when the view declares one.
@@ -1556,8 +1552,7 @@ struct FacetShape {
 fn facet_shape(entry: &CatalogEntry, view: &crate::dataset::profile::DSView) -> Option<FacetShape> {
     let clean = strip_window_suffix(&view.source.path);
     let ext = clean.rsplit('.').next().unwrap_or("");
-    let elem_size = crate::io::infer_elem_size(ext);
-    if elem_size == 0 { return None; }
+    let elem = crate::io::ElementType::from_extension(ext)?;
     let url = resolve_facet_url(entry, view)?;
     let window = view.effective_window().0.first()
         .map(|iv| (iv.min_incl, iv.max_excl))
@@ -1565,7 +1560,7 @@ fn facet_shape(entry: &CatalogEntry, view: &crate::dataset::profile::DSView) -> 
         .filter(|(s, e)| e > s);
     Some(FacetShape {
         url,
-        elem_size,
+        elem,
         uniform: !crate::io::is_vvec_ext(ext),
         window,
     })
@@ -1616,7 +1611,7 @@ fn collect_local_knowledge(
                 if bytes.is_none() { continue; }
                 let bpr = header_file
                     .filter(|_| shape.uniform)
-                    .and_then(|p| read_xvec_bpr(&p, shape.elem_size));
+                    .and_then(|p| read_xvec_bpr(&p, shape.elem));
                 let slot = knowledge.entry(shape.url).or_default();
                 slot.bytes = bytes.filter(|&b| b > 0).or(slot.bytes);
                 slot.bpr = bpr.or(slot.bpr);
@@ -1629,7 +1624,7 @@ fn collect_local_knowledge(
 /// the local pass couldn't answer.
 struct SizeProbeJob {
     url: String,
-    elem_size: usize,
+    elem: crate::io::ElementType,
     uniform: bool,
 }
 
@@ -1660,7 +1655,7 @@ fn collect_size_probe_jobs(
                 slot.pending = true;
                 jobs.push(SizeProbeJob {
                     url: shape.url,
-                    elem_size: shape.elem_size,
+                    elem: shape.elem,
                     uniform: shape.uniform,
                 });
             }
@@ -1709,8 +1704,8 @@ fn spawn_size_probes(
 /// One remote probe: HEAD for `Content-Length` (with read auth and
 /// S3 wrong-region handling via `HttpTransport`), then — when the
 /// facet is a uniform xvec on a range-capable server — a 4-byte
-/// ranged GET of the dim header for bytes-per-record, the same
-/// `4 + dim * elem` math ping and the cache survey use.
+/// ranged GET of the dim header for bytes-per-record, sized by
+/// veks-io's record math as ping and the cache survey are.
 fn probe_facet(job: &SizeProbeJob) -> (Option<u64>, Option<u64>) {
     use crate::transport::ChunkedTransport;
     let normalized = crate::transport::normalize_remote_url(&job.url);
@@ -1723,9 +1718,8 @@ fn probe_facet(job: &SizeProbeJob) -> (Option<u64>, Option<u64>) {
     if job.uniform && transport.supports_range()
         && let Ok(hdr) = transport.fetch_range(0, 4)
             && hdr.len() == 4 {
-                let dim = i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-                if dim > 0 && dim <= 1_000_000 {
-                    bpr = Some(4 + dim as u64 * job.elem_size as u64);
+                if let Some(dim) = veks_io::xvec::record::record_dim(&hdr).filter(|&d| d <= 1_000_000) {
+                    bpr = veks_io::reader::xvec_record_bytes(dim as i32, job.elem).ok().map(|b| b as u64);
                 }
             }
     ((total > 0).then_some(total), bpr)

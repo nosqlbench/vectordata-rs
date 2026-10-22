@@ -605,7 +605,10 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         };
 
         // ── Allocate scan buffers ONCE, reused across boundaries ──
-        let mut scan_buffers = super::compute_knn_blas::SgemmScanBuffers::new(num_samples, dim);
+        let mut scan_buffers = match super::compute_knn_blas::SgemmScanBuffers::new(num_samples, dim) {
+            Ok(b) => b,
+            Err(e) => return error_result(e, start),
+        };
         let vecs_per_chunk = scan_buffers.vecs_per_chunk();
         let qb_size = scan_buffers.qb_size();
         ctx.ui.log(&format!(
@@ -1072,9 +1075,10 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
                 }
             };
 
-            // Load stored filtered GT as ivec
-            let gt_data = match std::fs::read(&gt_path) {
-                Ok(d) => d, Err(e) => {
+            // Load stored filtered GT: uniform ivec rows of k ordinals
+            // (short result sets padded with -1).
+            let gt_records = match veks_io::XvecReader::<i32>::open_path(&gt_path) {
+                Ok(r) => r, Err(e) => {
                     results.push(serde_json::json!({
                         "name": name, "status": "error", "message": format!("{}", e),
                     }));
@@ -1082,31 +1086,13 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
                 }
             };
 
-            // Parse GT ivec records
-            let mut gt_records: Vec<Vec<i32>> = Vec::new();
-            {
-                let mut offset = 0;
-                while offset + 4 <= gt_data.len() {
-                    let dim = i32::from_le_bytes(gt_data[offset..offset+4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    if offset + dim * 4 > gt_data.len() { break; }
-                    let mut vals = Vec::with_capacity(dim);
-                    for i in 0..dim {
-                        let fo = offset + i * 4;
-                        vals.push(i32::from_le_bytes(gt_data[fo..fo+4].try_into().unwrap()));
-                    }
-                    gt_records.push(vals);
-                    offset += dim * 4;
-                }
-            }
-
-            let k = if gt_records.is_empty() { 100 } else { gt_records[0].len() };
+            let k = if gt_records.count() == 0 { 100 } else { gt_records.dim() };
             let mut pass = 0usize;
             let mut fail = 0usize;
 
             let pb = ctx.ui.bar(actual_sample as u64, format!("verify filtered-knn '{}'", name));
             for (si, &qi) in sample_indices.iter().enumerate() {
-                if qi >= gt_records.len() || qi >= pred_indices.count() { continue; }
+                if qi >= gt_records.count() || qi >= pred_indices.count() { continue; }
 
                 // Get matching ordinals for this query's predicate
                 let matching = match pred_indices.get_ordinals(qi) {
@@ -1128,8 +1114,8 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
                 let expected: Vec<i32> = dists.iter().take(k).map(|(_, idx)| *idx).collect();
 
                 // Compare against stored GT
-                let stored = &gt_records[qi];
-                let is_exact = expected == *stored;
+                let stored = gt_records.get_slice(qi);
+                let is_exact = expected == stored;
                 let recall = if is_exact {
                     1.0
                 } else {

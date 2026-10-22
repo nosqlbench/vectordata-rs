@@ -130,7 +130,8 @@ Norm is computed as `sqrt(v · v)` (matching knn\_utils, which uses
             Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
         };
 
-        let dim_bytes = (dim as i32).to_le_bytes();
+        // One kept record, re-encoded in place for each one written.
+        let mut record: Vec<u8> = Vec::with_capacity(4 + dim * 4);
         let mut kept = 0usize;
         let mut removed = 0usize;
 
@@ -139,14 +140,13 @@ Norm is computed as `sqrt(v · v)` (matching knn\_utils, which uses
             let norm = l2_norm(slice);
 
             if norm > tolerance {
-                writer.write_all(&dim_bytes).map_err(|e| e.to_string()).unwrap();
-                let src_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        slice.as_ptr() as *const u8,
-                        slice.len() * 4,
-                    )
-                };
-                writer.write_all(src_bytes).map_err(|e| e.to_string()).unwrap();
+                record.clear();
+                if let Err(e) = veks_io::writer::encode_records(slice, dim, &mut record) {
+                    return error_result(format!("write {}: {}", output_path.display(), e), start);
+                }
+                if let Err(e) = writer.write_all(&record) {
+                    return error_result(format!("write {}: {}", output_path.display(), e), start);
+                }
                 kept += 1;
             } else {
                 removed += 1;

@@ -8,7 +8,6 @@
 //! Near-zero vectors cause undefined behavior in cosine similarity and
 //! degenerate results after normalization. See SRD §19.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -19,7 +18,6 @@ use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     ResourceDesc, Status, StreamContext, render_options_table,
 };
-use crate::pipeline::atomic_write::safe_create_file;
 
 /// Default L2-norm threshold for near-zero detection.
 const DEFAULT_THRESHOLD: f64 = 1e-6;
@@ -229,14 +227,13 @@ impl CommandOp for AnalyzeZerosOp {
 /// Write a list of ordinals as a dim=1 ivec file.
 fn write_ordinals_ivec(path: &Path, ordinals: &[usize]) -> Result<(), String> {
     ensure_parent(path);
-    let mut f = safe_create_file(path)
+    let mut w = veks_io::XvecWriter::<i32>::create(path, 1)
         .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
     for &ord in ordinals {
-        f.write_all(&1i32.to_le_bytes())
-            .map_err(|e| format!("write error: {}", e))?;
-        f.write_all(&(ord as i32).to_le_bytes())
+        w.write(&[ord as i32])
             .map_err(|e| format!("write error: {}", e))?;
     }
+    w.finish().map_err(|e| format!("write error: {}", e))?;
     Ok(())
 }
 
@@ -317,6 +314,7 @@ fn error_result(message: String, start: Instant) -> CommandResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use indexmap::IndexMap;
     use crate::pipeline::progress::ProgressLog;
 

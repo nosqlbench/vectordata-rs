@@ -100,6 +100,47 @@ fn a_writer_refuses_what_its_file_cannot_hold() {
 
 /// **A vvec writer replaces a stale index**: rewriting a file leaves no
 /// index from the previous version for a reader to pair with it.
+/// **An append adds whole rows after whole rows**: a file of another
+/// dimension, one with bytes past its last whole record, a symlink and
+/// a missing file are refused and left as they were; an empty file
+/// takes rows; the count is the file's rows with the new ones.
+#[test]
+fn an_append_continues_only_a_whole_file_of_its_dimension() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rows.i32vecs");
+    let mut w = XvecWriter::<i32>::create(&path, 2).unwrap();
+    w.write_packed(&[1, 2, 3, 4]).unwrap();
+    w.finish().unwrap();
+
+    let mut w = XvecWriter::<i32>::append(&path, 2).unwrap();
+    assert_eq!(w.records(), 2);
+    w.write(&[5, 6]).unwrap();
+    assert_eq!(w.finish().unwrap(), 3);
+    let r = XvecReader::<i32>::open_path(&path).unwrap();
+    assert_eq!((r.count(), r.get(2).unwrap()), (3, vec![5, 6]));
+
+    assert!(matches!(XvecWriter::<i32>::append(&path, 3), Err(IoError::InvalidFormat(_))));
+
+    let cut = dir.path().join("cut.i32vecs");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend([2, 0, 0]);
+    std::fs::write(&cut, &bytes).unwrap();
+    assert!(matches!(XvecWriter::<i32>::append(&cut, 2), Err(IoError::InvalidFormat(_))));
+    assert_eq!(std::fs::read(&cut).unwrap(), bytes, "a refused append writes nothing");
+
+    let link = dir.path().join("link.i32vecs");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(XvecWriter::<i32>::append(&link, 2).is_err());
+    assert!(XvecWriter::<i32>::append(&dir.path().join("missing.i32vecs"), 2).is_err());
+    assert!(matches!(XvecWriter::<f32>::append(&path, 2), Err(IoError::ElementMismatch { .. })));
+
+    let empty = dir.path().join("empty.i32vecs");
+    std::fs::write(&empty, b"").unwrap();
+    let mut w = XvecWriter::<i32>::append(&empty, 4).unwrap();
+    w.write(&[1, 2, 3, 4]).unwrap();
+    assert_eq!(w.finish().unwrap(), 1);
+}
+
 #[test]
 fn a_rewritten_vvec_file_is_read_by_its_own_index() {
     let dir = tempfile::tempdir().unwrap();

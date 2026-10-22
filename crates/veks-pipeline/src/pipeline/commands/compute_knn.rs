@@ -438,12 +438,8 @@ fn cache_prefix_for(base_path: &Path, query_path: &Path) -> String {
 }
 
 /// Validate that a cache file exists and has the expected byte size.
-fn validate_cache_file(path: &Path, query_count: usize, k: usize, elem_size: usize) -> bool {
-    let expected = query_count as u64 * (4 + k as u64 * elem_size as u64);
-    match std::fs::metadata(path) {
-        Ok(meta) => meta.len() == expected,
-        Err(_) => false,
-    }
+fn validate_cache_file(path: &Path, query_count: usize, k: usize, elem: veks_io::ElementType) -> bool {
+    super::knn_segment::validate_cache_file(path, query_count, k, elem)
 }
 
 /// Query-partitioned KNN for f32 vectors.
@@ -1372,7 +1368,8 @@ fn merge_partitions(
     // facet is written as a series here the same way every other
     // fixed-stride facet is (SH-35).
     use crate::pipeline::shard_write::FacetWriter;
-    let row_bytes = 4 + k * 4; // dim header + k elements
+    let row_bytes = veks_io::reader::xvec_record_bytes(k as i32, veks_io::ElementType::I32)
+        .map_err(|e| e.to_string())?; // dim header + k elements
     let mut idx_writer = FacetWriter::open(indices_path, row_bytes as u64, max_shard_bytes)
         .map_err(|e| format!("create {}: {}", indices_path.display(), e))?;
 
@@ -1386,6 +1383,13 @@ fn merge_partitions(
 
     let mut ivec_row = vec![0u8; row_bytes];
     let mut fvec_row = vec![0u8; row_bytes];
+    // One partition row, decoded.
+    let mut part_idx: Vec<i32> = vec![0; k];
+    let mut part_dist: Vec<f32> = vec![0.0; k];
+    // Scratch for encoding each merged output row.
+    let mut out_idx_row: Vec<i32> = Vec::with_capacity(k);
+    let mut out_dist_row: Vec<f32> = Vec::with_capacity(k);
+    let mut out_record: Vec<u8> = Vec::with_capacity(row_bytes);
 
     let mut tie_count: usize = 0;
     let mut tied_neighbors: usize = 0;
@@ -1413,22 +1417,12 @@ fn merge_partitions(
                 .read_exact(&mut fvec_row)
                 .map_err(|e| format!("read fvec partition: {}", e))?;
 
-            // Parse k (index, distance) pairs from this partition's row
-            for j in 0..k {
-                let idx_offset = 4 + j * 4;
-                let idx = i32::from_le_bytes([
-                    ivec_row[idx_offset],
-                    ivec_row[idx_offset + 1],
-                    ivec_row[idx_offset + 2],
-                    ivec_row[idx_offset + 3],
-                ]);
-                let dist = f32::from_le_bytes([
-                    fvec_row[idx_offset],
-                    fvec_row[idx_offset + 1],
-                    fvec_row[idx_offset + 2],
-                    fvec_row[idx_offset + 3],
-                ]);
-
+            // Decode k (index, distance) pairs from this partition's row
+            veks_io::xvec::record::decode_record_into(&ivec_row, &mut part_idx)
+                .map_err(|e| format!("read ivec partition: {}", e))?;
+            veks_io::xvec::record::decode_record_into(&fvec_row, &mut part_dist)
+                .map_err(|e| format!("read fvec partition: {}", e))?;
+            for (&idx, &dist) in part_idx.iter().zip(&part_dist) {
                 if idx >= 0 && dist.is_finite() {
                     // Partition cache fvecs are in FAISS publication
                     // convention; convert to kernel-internal so the
@@ -1502,37 +1496,24 @@ fn merge_partitions(
         candidates.truncate(k);
 
         // Write merged row to indices output
-        let dim = k as i32;
-        idx_writer
-            .write_all(&dim.to_le_bytes())
-            .map_err(|e| e.to_string())?;
         let offset32 = base_offset as u32;
-        for j in 0..k {
-            let idx: i32 = if j < candidates.len() {
-                (candidates[j].index - offset32) as i32
-            } else {
-                -1
-            };
-            idx_writer
-                .write_all(&idx.to_le_bytes())
-                .map_err(|e| e.to_string())?;
-        }
+        out_record.clear();
+        super::knn_segment::encode_padded_row(
+            candidates.iter().map(|c| (c.index - offset32) as i32),
+            k, -1, &mut out_idx_row, &mut out_record,
+        )?;
+        idx_writer.write_all(&out_record).map_err(|e| e.to_string())?;
 
         // Write merged row to distances output. Convert from
         // kernel-internal heap distances to FAISS publication
         // convention before writing — single on-disk standard.
         if let Some(ref mut dw) = dist_writer {
-            dw.write_all(&dim.to_le_bytes())
-                .map_err(|e| e.to_string())?;
-            for j in 0..k {
-                let dist: f32 = if j < candidates.len() {
-                    publication_distance(candidates[j].distance, metric)
-                } else {
-                    f32::INFINITY
-                };
-                dw.write_all(&dist.to_le_bytes())
-                    .map_err(|e| e.to_string())?;
-            }
+            out_record.clear();
+            super::knn_segment::encode_padded_row(
+                candidates.iter().map(|c| publication_distance(c.distance, metric)),
+                k, f32::INFINITY, &mut out_dist_row, &mut out_record,
+            )?;
+            dw.write_all(&out_record).map_err(|e| e.to_string())?;
         }
 
         pb.inc(1);
@@ -2768,8 +2749,8 @@ where
                 crate::pipeline::gz_cache::gz_exists(&n_path)
                     && crate::pipeline::gz_cache::gz_exists(&d_path)
             } else {
-                validate_cache_file(&n_path, query_count, k, 4)
-                    && validate_cache_file(&d_path, query_count, k, 4)
+                validate_cache_file(&n_path, query_count, k, veks_io::ElementType::I32)
+                    && validate_cache_file(&d_path, query_count, k, veks_io::ElementType::F32)
             }
         };
 
@@ -2825,8 +2806,8 @@ where
                     if pbc == 0 || pbc >= base_end { continue; }
                     let idx_path = entry.path().join("neighbor_indices.ivecs");
                     let dist_path = entry.path().join("neighbor_distances.fvecs");
-                    if validate_cache_file(&idx_path, query_count, k, 4)
-                        && validate_cache_file(&dist_path, query_count, k, 4)
+                    if validate_cache_file(&idx_path, query_count, k, veks_io::ElementType::I32)
+                        && validate_cache_file(&dist_path, query_count, k, veks_io::ElementType::F32)
                     {
                         let already = segments.iter().any(|s| s.start == 0 && s.end == pbc);
                         if !already {
@@ -3129,8 +3110,8 @@ where
                 write_indices(&neighbors_path, &results, k, 0)?;
                 write_distances(&distances_path, &results, k, metric)?;
 
-                if !validate_cache_file(&neighbors_path, part_query_count, k, 4)
-                    || !validate_cache_file(&distances_path, part_query_count, k, 4)
+                if !validate_cache_file(&neighbors_path, part_query_count, k, veks_io::ElementType::I32)
+                    || !validate_cache_file(&distances_path, part_query_count, k, veks_io::ElementType::F32)
                 {
                     return Err(format!(
                         "partition [{}, {}) cache files failed size validation after write",
@@ -3325,22 +3306,15 @@ fn write_indices(path: &Path, results: &[Vec<Neighbor>], k: usize, base_offset: 
     let mut writer = AtomicWriter::with_capacity(1 << 20, path)
         .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
 
-    let dim = k as i32;
     let offset32 = base_offset as u32;
+    let (mut row_i32, mut record) = (Vec::with_capacity(k), Vec::new());
     for row in results {
-        writer
-            .write_all(&dim.to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        for i in 0..k {
-            let idx: i32 = if i < row.len() {
-                (row[i].index - offset32) as i32
-            } else {
-                -1 // Padding if fewer than k neighbors
-            };
-            writer
-                .write_all(&idx.to_le_bytes())
-                .map_err(|e| e.to_string())?;
-        }
+        record.clear();
+        // Padding with -1 if fewer than k neighbors.
+        super::knn_segment::encode_padded_row(
+            row.iter().map(|n| (n.index - offset32) as i32), k, -1, &mut row_i32, &mut record,
+        )?;
+        writer.write_all(&record).map_err(|e| e.to_string())?;
     }
     writer.finish().map_err(|e| e.to_string())?;
     Ok(())
@@ -3356,15 +3330,14 @@ fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize, metric: Met
     let mut writer = AtomicWriter::with_capacity(1 << 20, path)
         .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
 
-    let dim = k as i32;
+    let (mut row_f32, mut record) = (Vec::with_capacity(k), Vec::new());
     for row in results {
-        writer.write_all(&dim.to_le_bytes()).map_err(|e| e.to_string())?;
-        for i in 0..k {
-            let dist: f32 = if i < row.len() {
-                publication_distance(row[i].distance, metric)
-            } else { f32::INFINITY };
-            writer.write_all(&dist.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
+        record.clear();
+        super::knn_segment::encode_padded_row(
+            row.iter().map(|n| publication_distance(n.distance, metric)), k, f32::INFINITY,
+            &mut row_f32, &mut record,
+        )?;
+        writer.write_all(&record).map_err(|e| e.to_string())?;
     }
     writer.finish().map_err(|e| e.to_string())?;
     Ok(())
@@ -3402,20 +3375,15 @@ fn kernel_distance(d_published: f32, metric: Metric) -> f32 {
 ///
 /// Same layout as [`write_indices`] but returns bytes instead of writing to a file.
 fn serialize_indices(results: &[Vec<Neighbor>], k: usize, base_offset: usize) -> Result<Vec<u8>, String> {
-    let row_bytes = 4 + k * 4;
-    let mut buf = Vec::with_capacity(results.len() * row_bytes);
-    let dim = k as i32;
+    let record = veks_io::reader::xvec_record_bytes(k as i32, veks_io::ElementType::I32)
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::with_capacity(results.len() * record);
     let offset32 = base_offset as u32;
+    let mut row_i32 = Vec::with_capacity(k);
     for row in results {
-        buf.extend_from_slice(&dim.to_le_bytes());
-        for i in 0..k {
-            let idx: i32 = if i < row.len() {
-                (row[i].index - offset32) as i32
-            } else {
-                -1
-            };
-            buf.extend_from_slice(&idx.to_le_bytes());
-        }
+        super::knn_segment::encode_padded_row(
+            row.iter().map(|n| (n.index - offset32) as i32), k, -1, &mut row_i32, &mut buf,
+        )?;
     }
     Ok(buf)
 }
@@ -3424,17 +3392,15 @@ fn serialize_indices(results: &[Vec<Neighbor>], k: usize, base_offset: usize) ->
 ///
 /// Same layout as [`write_distances`] but returns bytes instead of writing to a file.
 fn serialize_distances(results: &[Vec<Neighbor>], k: usize, metric: Metric) -> Result<Vec<u8>, String> {
-    let row_bytes = 4 + k * 4;
-    let mut buf = Vec::with_capacity(results.len() * row_bytes);
-    let dim = k as i32;
+    let record = veks_io::reader::xvec_record_bytes(k as i32, veks_io::ElementType::F32)
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::with_capacity(results.len() * record);
+    let mut row_f32 = Vec::with_capacity(k);
     for row in results {
-        buf.extend_from_slice(&dim.to_le_bytes());
-        for i in 0..k {
-            let dist: f32 = if i < row.len() {
-                publication_distance(row[i].distance, metric)
-            } else { f32::INFINITY };
-            buf.extend_from_slice(&dist.to_le_bytes());
-        }
+        super::knn_segment::encode_padded_row(
+            row.iter().map(|n| publication_distance(n.distance, metric)), k, f32::INFINITY,
+            &mut row_f32, &mut buf,
+        )?;
     }
     Ok(buf)
 }

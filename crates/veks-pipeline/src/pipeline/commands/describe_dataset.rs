@@ -223,13 +223,7 @@ fn write_header(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
         if let Some(view) = profile.view("base_vectors") {
             let path = workspace.join(view.path());
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("fvec");
-            let etype = match ext {
-                "fvec" | "fvecs" => "f32",
-                "mvec" => "f16",
-                "bvec" | "bvecs" => "u8",
-                "ivec" | "ivecs" => "i32",
-                _ => ext,
-            };
+            let etype = veks_io::ElementType::from_extension(ext).map_or(ext, |t| t.name());
             if let Ok(reader) = XvecReader::<f32>::open_path(&path) {
                 let count = VectorReader::<f32>::count(&reader);
                 let dim = VectorReader::<f32>::dim(&reader);
@@ -307,7 +301,11 @@ fn write_provenance(_config: &DatasetConfig, workspace: &Path, doc: &mut String)
         for entry in files {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-            if name.starts_with('_') || name.ends_with(".fvecs") || name.ends_with(".ivecs") {
+            let is_vector_file = matches!(
+                veks_io::VecFormat::detect_from_path(&path),
+                Some(veks_io::VecFormat::Fvec | veks_io::VecFormat::Ivec)
+            );
+            if name.starts_with('_') || is_vector_file {
                 let target = if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
                     std::fs::read_link(&path)
                         .map(|t| t.to_string_lossy().to_string())

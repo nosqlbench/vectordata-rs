@@ -17,6 +17,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::traits::VecSink;
+use crate::xvec::record::RecordHeader;
 
 /// Size of the `BufWriter`'s internal buffer.
 ///
@@ -66,6 +67,8 @@ pub(crate) fn refuse_symlink(path: &Path) -> Result<(), String> {
 /// assert_eq!(second.iter().map(|&b| i8::from_le_bytes([b])).collect::<Vec<_>>(), [i8::MIN, 0, i8::MAX]);
 /// ```
 pub fn open(path: &Path, dimension: u32) -> Result<Box<dyn VecSink>, String> {
+    // Checked once here, so the hot loop is a plain copy of four bytes.
+    let header = RecordHeader::new(dimension as usize).map_err(|e| format!("{}: {e}", path.display()))?;
     refuse_symlink(path)?;
     let file = File::create(path)
         .map_err(|e| format!("create {}: {}", path.display(), e))?;
@@ -73,10 +76,7 @@ pub fn open(path: &Path, dimension: u32) -> Result<Box<dyn VecSink>, String> {
 
     Ok(Box::new(XvecWriter {
         writer,
-        // `dim_prefix` is the 4-byte little-endian dim header emitted in
-        // front of every record. Pre-computed once at open time so the hot
-        // loop is a plain copy of a small stack slice.
-        dim_prefix: (dimension as i32).to_le_bytes(),
+        header,
         // Reusable per-batch scratch buffer for the coalesced batch-write
         // path. Grows on demand and is reused across batches so the steady
         // state has zero allocations in the hot loop.
@@ -88,7 +88,7 @@ pub fn open(path: &Path, dimension: u32) -> Result<Box<dyn VecSink>, String> {
 
 struct XvecWriter {
     writer: BufWriter<File>,
-    dim_prefix: [u8; 4],
+    header: RecordHeader,
     scratch: Vec<u8>,
     /// The first write that failed: kept, and returned by `finish`, so a
     /// full disk is an error rather than a short file.
@@ -186,7 +186,7 @@ impl VecSink for XvecWriter {
         if self.error.is_some() {
             return;
         }
-        let header = self.writer.write_all(&self.dim_prefix);
+        let header = self.writer.write_all(&self.header.bytes());
         self.keep(header);
         let body = self.writer.write_all(data);
         self.keep(body);
@@ -217,22 +217,9 @@ impl VecSink for XvecWriter {
         record_size: usize,
     ) {
         debug_assert_eq!(packed.len(), count * record_size);
-        let stride = 4 + record_size;
-        let total = count * stride;
-        // resize fills with zeros; the loop overwrites every byte. Could
-        // be replaced with `set_len` after `reserve` for an unsafe fast
-        // path, but the zero-fill is well-vectorized by the compiler and
-        // not the bottleneck (tested under perf).
-        self.scratch.resize(total, 0);
-        let mut dst = 0;
-        let mut src = 0;
-        for _ in 0..count {
-            self.scratch[dst..dst + 4].copy_from_slice(&self.dim_prefix);
-            self.scratch[dst + 4..dst + stride]
-                .copy_from_slice(&packed[src..src + record_size]);
-            dst += stride;
-            src += record_size;
-        }
+        let total = count * (4 + record_size);
+        self.scratch.clear();
+        self.header.append_records(packed, record_size, &mut self.scratch);
         if self.error.is_none() {
             let result = self.writer.write_all(&self.scratch);
             self.keep(result);

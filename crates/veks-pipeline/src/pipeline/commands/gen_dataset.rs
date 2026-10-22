@@ -15,7 +15,6 @@
 //! Equivalent to the Java `CMD_generate_dataset` command.
 
 use std::collections::BinaryHeap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -27,7 +26,6 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
-use crate::pipeline::atomic_write::safe_create_file;
 use crate::pipeline::rng;
 use crate::pipeline::simd_distance;
 
@@ -373,6 +371,9 @@ generation, or half-precision storage.
 }
 
 /// Generate fvec file with random f32 vectors.
+///
+/// Each row is drawn into one reused buffer and written by
+/// [`veks_io::XvecWriter`], which owns the record layout.
 fn generate_fvec(
     path: &Path,
     count: usize,
@@ -381,24 +382,18 @@ fn generate_fvec(
     max: f32,
     rng: &mut impl Rng,
 ) -> Result<(), String> {
-    let mut file = safe_create_file(path)
+    let mut writer = veks_io::XvecWriter::<f32>::create(path, dim)
         .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
-    let mut buf = std::io::BufWriter::new(&mut file);
-
-    let dim_bytes = (dim as i32).to_le_bytes();
     let range = max - min;
+    let mut row: Vec<f32> = Vec::with_capacity(dim);
 
     for _ in 0..count {
-        buf.write_all(&dim_bytes)
-            .map_err(|e| format!("write error: {}", e))?;
-        for _ in 0..dim {
-            let val: f32 = min + rng.random::<f32>() * range;
-            buf.write_all(&val.to_le_bytes())
-                .map_err(|e| format!("write error: {}", e))?;
-        }
+        row.clear();
+        row.extend((0..dim).map(|_| min + rng.random::<f32>() * range));
+        writer.write(&row).map_err(|e| format!("write error: {}", e))?;
     }
 
-    buf.flush().map_err(|e| format!("flush error: {}", e))?;
+    writer.finish().map_err(|e| format!("flush error: {}", e))?;
     Ok(())
 }
 
@@ -423,16 +418,15 @@ fn compute_ground_truth(
     let base_count = <XvecReader<f32> as VectorReader<f32>>::count(&base);
     let query_count = <XvecReader<f32> as VectorReader<f32>>::count(&query);
 
-    let mut idx_file = std::io::BufWriter::new(
-        safe_create_file(indices_path)
-            .map_err(|e| format!("failed to create indices: {}", e))?,
-    );
-    let mut dist_file = std::io::BufWriter::new(
-        safe_create_file(distances_path)
-            .map_err(|e| format!("failed to create distances: {}", e))?,
-    );
+    let mut idx_file = veks_io::XvecWriter::<i32>::create(indices_path, k)
+        .map_err(|e| format!("failed to create indices: {}", e))?;
+    let mut dist_file = veks_io::XvecWriter::<f32>::create(distances_path, k)
+        .map_err(|e| format!("failed to create distances: {}", e))?;
 
-    let k_bytes = (k as i32).to_le_bytes();
+    // One query's rows, reused across queries; a short result is padded
+    // with index -1 and distance f32::MAX.
+    let mut idx_row: Vec<i32> = Vec::with_capacity(k);
+    let mut dist_row: Vec<f32> = Vec::with_capacity(k);
 
     for qi in 0..query_count {
         let qvec = query.get(qi).map_err(|e| format!("read query {}: {}", qi, e))?;
@@ -457,39 +451,19 @@ fn compute_ground_truth(
         let mut results: Vec<DistEntry> = heap.into_sorted_vec();
         results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Write indices
-        idx_file
-            .write_all(&k_bytes)
-            .map_err(|e| format!("write error: {}", e))?;
-        for r in &results {
-            idx_file
-                .write_all(&(r.idx as i32).to_le_bytes())
-                .map_err(|e| format!("write error: {}", e))?;
-        }
-        for _ in results.len()..k {
-            idx_file
-                .write_all(&(-1i32).to_le_bytes())
-                .map_err(|e| format!("write error: {}", e))?;
-        }
-
-        // Write distances
-        dist_file
-            .write_all(&k_bytes)
-            .map_err(|e| format!("write error: {}", e))?;
-        for r in &results {
-            dist_file
-                .write_all(&r.dist.to_le_bytes())
-                .map_err(|e| format!("write error: {}", e))?;
-        }
-        for _ in results.len()..k {
-            dist_file
-                .write_all(&f32::MAX.to_le_bytes())
-                .map_err(|e| format!("write error: {}", e))?;
-        }
+        // Write indices and distances
+        idx_row.clear();
+        idx_row.extend(results.iter().map(|r| r.idx as i32));
+        idx_row.resize(k, -1);
+        dist_row.clear();
+        dist_row.extend(results.iter().map(|r| r.dist));
+        dist_row.resize(k, f32::MAX);
+        idx_file.write(&idx_row).map_err(|e| format!("write error: {}", e))?;
+        dist_file.write(&dist_row).map_err(|e| format!("write error: {}", e))?;
     }
 
-    idx_file.flush().map_err(|e| format!("flush error: {}", e))?;
-    dist_file.flush().map_err(|e| format!("flush error: {}", e))?;
+    idx_file.finish().map_err(|e| format!("flush error: {}", e))?;
+    dist_file.finish().map_err(|e| format!("flush error: {}", e))?;
 
     Ok(())
 }
@@ -761,13 +735,8 @@ mod tests {
     }
 
     fn write_fvec(path: &Path, vectors: &[Vec<f32>]) {
-        let mut f = std::fs::File::create(path).unwrap();
-        for v in vectors {
-            let dim = v.len() as i32;
-            f.write_all(&dim.to_le_bytes()).unwrap();
-            for &val in v {
-                f.write_all(&val.to_le_bytes()).unwrap();
-            }
-        }
+        let mut w = veks_io::XvecWriter::<f32>::create(path, vectors[0].len()).unwrap();
+        w.write_all(vectors).unwrap();
+        w.finish().unwrap();
     }
 }

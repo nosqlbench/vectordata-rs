@@ -860,32 +860,18 @@ fn write_sampled_query_file(
             for extension '{ext}'", query_path.display()))?;
     let elem_size = elem.byte_width();
 
-    let mut f_in = std::fs::File::open(query_path)
+    let mapped = veks_io::MappedFile::map(query_path)
         .map_err(|e| format!("open query {}: {}", query_path.display(), e))?;
-    let total_size = f_in.metadata()
-        .map_err(|e| format!("stat {}: {}", query_path.display(), e))?
-        .len();
-    if total_size < 4 {
-        return Err(format!("query file {} too short for xvec header",
-            query_path.display()));
-    }
-    let mut dim_buf = [0u8; 4];
-    use std::io::Read;
-    f_in.read_exact(&mut dim_buf)
-        .map_err(|e| format!("read dim header: {e}"))?;
-    let dim = i32::from_le_bytes(dim_buf);
-    if dim <= 0 {
-        return Err(format!("query file {} has invalid dim {dim}",
-            query_path.display()));
-    }
-    let dim = dim as usize;
-    let stride = 4 + dim * elem_size;
-    if total_size % stride as u64 != 0 {
-        return Err(format!("query file {} has size {total_size} not a multiple \
+    let probe = veks_io::reader::probe_source(&mapped, elem)
+        .map_err(|e| format!("query file {}: {e}", query_path.display()))?;
+    let dim = probe.dim;
+    let stride = probe.record_bytes as usize;
+    if probe.trailing_bytes != 0 {
+        return Err(format!("query file {} has size {} not a multiple \
             of stride {stride} (dim={dim}, {elem_size}B/elem from .{ext}). \
-            Element type may be misidentified.", query_path.display()));
+            Element type may be misidentified.", query_path.display(), mapped.bytes().len()));
     }
-    let total = (total_size / stride as u64) as usize;
+    let total = probe.records as usize;
 
     if n >= total {
         return Ok(query_path.to_path_buf());
@@ -912,14 +898,11 @@ fn write_sampled_query_file(
             .map_err(|e| format!("create {}: {}", out_path.display(), e))?,
     );
 
-    use std::io::{Seek, SeekFrom};
-    let mut buf = vec![0u8; stride];
+    // Whole records, copied byte-for-byte at the probed stride.
+    let bytes = mapped.bytes();
     for &qi in &indices {
-        let offset = (qi as u64) * (stride as u64);
-        f_in.seek(SeekFrom::Start(offset))
-            .map_err(|e| e.to_string())?;
-        f_in.read_exact(&mut buf).map_err(|e| e.to_string())?;
-        f_out.write_all(&buf).map_err(|e| e.to_string())?;
+        let offset = qi * stride;
+        f_out.write_all(&bytes[offset..offset + stride]).map_err(|e| e.to_string())?;
     }
     f_out.flush().map_err(|e| e.to_string())?;
 
@@ -1055,8 +1038,7 @@ fn write_synthetic_fvec(
     seed: u64,
     dist: Distribution,
 ) -> std::io::Result<()> {
-    let mut f = std::fs::File::create(path)?;
-    let dim32 = dim as i32;
+    let mut f = veks_io::XvecWriter::<f32>::create(path, dim).map_err(std::io::Error::other)?;
     let mut rng = seed.max(1);
 
     // Closure: one uniform-[0,1) draw — building block for both modes.
@@ -1120,11 +1102,9 @@ fn write_synthetic_fvec(
             }
         }
 
-        f.write_all(&dim32.to_le_bytes())?;
-        for v in &row {
-            f.write_all(&v.to_le_bytes())?;
-        }
+        f.write(&row).map_err(std::io::Error::other)?;
     }
+    f.finish().map_err(std::io::Error::other)?;
     Ok(())
 }
 
@@ -1411,16 +1391,15 @@ fn run_blas_mirror(
         .collect();
 
     // Emit ivec with per-query reranked top-k.
-    let mut f = std::fs::File::create(out_path)
-        .map_err(|e| format!("create {}: {}", out_path.display(), e))?;
-    let dim_bytes = (k as i32).to_le_bytes();
+    let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(out_path)
+        .map_err(|e| format!("create {}: {}", out_path.display(), e))?);
+    let (mut row, mut record) = (Vec::with_capacity(k), Vec::new());
     for v in reranked {
-        f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
-        for j in 0..k {
-            let idx = if j < v.len() { v[j].index as i32 } else { -1 };
-            f.write_all(&idx.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
+        record.clear();
+        super::knn_segment::encode_padded_row(v.iter().map(|n| n.index as i32), k, -1, &mut row, &mut record)?;
+        f.write_all(&record).map_err(|e| e.to_string())?;
     }
+    f.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
 

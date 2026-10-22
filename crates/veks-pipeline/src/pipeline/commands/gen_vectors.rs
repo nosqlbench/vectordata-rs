@@ -19,7 +19,6 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
-use crate::pipeline::atomic_write::safe_create_file;
 use crate::pipeline::element_type::ElementType;
 use crate::pipeline::rng;
 
@@ -142,24 +141,17 @@ data.
         };
 
         // Validate that the output extension matches the element type.
-        // Accept both singular and plural forms (`.fvec` and `.fvecs` etc.)
-        // by comparing through the format enum, which canonicalizes both.
-        let expected_ext = match elem_type {
-            "float[]" | "f32" => "fvecs",
-            "half" | "f16" => "mvecs",
-            "double[]" | "f64" => "dvecs",
-            "int[]" | "i32" => "ivecs",
-            "short[]" | "i16" => "svecs",
-            "byte[]" | "u8" => "bvecs",
-            _ => "",
-        };
-        if !expected_ext.is_empty()
+        // Every spelling of the type's uniform-vector format is accepted
+        // (`.fvec`, `.fvecs`, `.f32vecs`, …): the comparison goes through
+        // the format enum, which canonicalizes them all.
+        let gen_type = generated_element_type(elem_type);
+        if let Some(et) = gen_type
+            && let Some(expected_fmt) = veks_io::VecFormat::of(veks_io::Container::Vec, et)
             && let Some(ext) = output_path.extension().and_then(|e| e.to_str())
         {
             let actual_fmt = veks_io::VecFormat::from_extension(ext);
-            let expected_fmt =
-                veks_io::VecFormat::from_extension(expected_ext);
-            if actual_fmt != expected_fmt {
+            let expected_ext = expected_fmt.preferred_extension();
+            if actual_fmt != Some(expected_fmt) {
                 return error_result(
                     format!(
                         "output extension '.{}' does not match element type '{}' (expected '.{}'). \
@@ -210,12 +202,20 @@ data.
             if file_size < 4 {
                 return error_result(format!("append target too small to read dimension: {}", ap.display()), start);
             }
-            let data = std::fs::read(ap)
-                .map_err(|e| format!("read append target: {}", e));
-            let existing_dim = match data {
-                Ok(d) => i32::from_le_bytes([d[0], d[1], d[2], d[3]]) as u32,
-                Err(e) => return error_result(e, start),
+            let existing = match veks_io::probe(ap) {
+                Ok(meta) => meta,
+                Err(e) => return error_result(format!("read append target: {}", e), start),
             };
+            // Records of another element type would corrupt the target.
+            if let (Some(have), Some(want)) = (existing.element_type, gen_type)
+                && have != want
+            {
+                return error_result(
+                    format!("append target {} holds {} elements, not '{}'", ap.display(), have, elem_type),
+                    start,
+                );
+            }
+            let existing_dim = existing.dimension;
             if dimension != existing_dim {
                 ctx.ui.log(&format!(
                     "  NOTE: --dimension {} overridden by append target dimension {}",
@@ -248,9 +248,15 @@ data.
         let normal_count = count.saturating_sub(zeros_count).saturating_sub(dups_count);
 
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        let record_bytes = 4 + effective_dim as u64 * match elem_type {
-            "double[]" | "f64" => 8u64, "float[]" | "f32" | "int[]" | "i32" => 4,
-            "half" | "f16" | "short[]" | "i16" => 2, "byte[]" | "u8" => 1, _ => 4,
+        let Some(gen_type) = gen_type else {
+            return error_result(format!("unsupported element type: '{}'", elem_type), start);
+        };
+        let record_bytes = match i32::try_from(effective_dim)
+            .map_err(|_| format!("dimension {} is not 1 to {}", effective_dim, i32::MAX))
+            .and_then(|d| veks_io::reader::xvec_record_bytes(d, gen_type).map_err(|e| e.to_string()))
+        {
+            Ok(b) => b as u64,
+            Err(e) => return error_result(e, start),
         };
         let total_bytes = count * record_bytes;
         let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
@@ -278,18 +284,29 @@ data.
         // Single unified path: parallel chunked generation with optional
         // zero/duplicate injection. When zeros_count and dups_count are 0,
         // the alias table produces all-Normal dispositions — no overhead.
-        let es: usize = match elem_type {
-            "float[]" | "f32" | "int[]" | "i32" => 4,
-            "half" | "f16" | "short[]" | "i16" => 2,
-            "double[]" | "f64" => 8,
-            "byte[]" | "u8" => 1,
+        // The type is dispatched once here; each generator is monomorphic.
+        macro_rules! generate {
+            ($t:ty, $sample:expr) => {
+                generate_xvec_with_injection::<$t>(
+                    &actual_output, d, count, zeros_count, dups_count, open_mode,
+                    &mut rng_inst, &pb, $sample,
+                )
+            };
+        }
+        use veks_io::ElementType as Et;
+        let result = match gen_type {
+            Et::F32 => generate!(f32, move |r: &mut Xoshiro| fmin + r.random::<f32>() * frange),
+            Et::F16 => generate!(veks_io::f16, move |r: &mut Xoshiro| {
+                veks_io::f16::from_f32(fmin + r.random::<f32>() * frange)
+            }),
+            Et::F64 => generate!(f64, move |r: &mut Xoshiro| float_min + r.random::<f64>() * drange),
+            Et::I32 => generate!(i32, move |r: &mut Xoshiro| r.random_range(int_min..=int_max)),
+            Et::I16 => generate!(i16, move |r: &mut Xoshiro| {
+                r.random_range(int_min as i16..=int_max as i16)
+            }),
+            Et::U8 => generate!(u8, move |r: &mut Xoshiro| r.random::<u8>()),
             _ => return error_result(format!("unsupported element type: '{}'", elem_type), start),
         };
-        let result = generate_xvec_with_injection(
-            &actual_output, d, es, elem_type, count, zeros_count, dups_count, open_mode,
-            fmin, frange, float_min, drange, int_min, int_max,
-            &mut rng_inst, &pb,
-        );
 
         let mode_str = if open_mode { "appended" } else { "generated" };
         match result {
@@ -416,9 +433,6 @@ data.
     }
 }
 
-/// Batch size for progress updates in generate loops.
-const GEN_BATCH: u64 = 10_000;
-
 /// Vector disposition: what kind of vector to write at each position.
 #[derive(Clone, Copy, PartialEq)]
 enum VecDisposition {
@@ -485,37 +499,34 @@ impl AliasTable {
     }
 }
 
+/// The generators' RNG.
+type Xoshiro = rand_xoshiro::Xoshiro256PlusPlus;
+
 /// Generic generation with zero/duplicate injection, append support,
 /// and parallel chunk generation.
 ///
-/// Splits the work into chunks, generates each chunk's byte buffer in
+/// Splits the work into chunks, generates each chunk's rows of `T` in
 /// parallel using per-thread RNGs (seeded deterministically from the
 /// main RNG), then writes all chunks sequentially to maintain ordering.
-fn generate_xvec_with_injection(
+/// `sample` draws one element. The rows go through
+/// [`veks_io::XvecWriter`], which creates the file or, for an append,
+/// continues it after its last whole record.
+fn generate_xvec_with_injection<T: veks_io::Element>(
     output: &Path,
     dim: u32,
-    elem_size: usize,
-    elem_type: &str,
     count: u64,
     zeros_count: u64,
     dups_count: u64,
     append: bool,
-    float_min: f32,
-    float_range: f32,
-    float_min_f64: f64,
-    float_range_f64: f64,
-    int_min: i32,
-    int_max: i32,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    rng: &mut Xoshiro,
     pb: &veks_core::ui::ProgressHandle,
+    sample: impl Fn(&mut Xoshiro) -> T + Sync,
 ) -> Result<(), String> {
-    use std::io::Write;
     use rand::{Rng, SeedableRng};
 
-    let record_data_size = dim as usize * elem_size;
-    let record_total_size = 4 + record_data_size; // dim header + data
-    let dim_header = (dim as i32).to_le_bytes();
-    let zero_bytes = vec![0u8; record_data_size];
+    let dim = dim as usize;
+    // Every element type's zero is the all-zero encoding.
+    let zero = T::from_le_bytes(&[0u8; 16]);
 
     let normal_ratio = if count > 0 {
         1.0 - (zeros_count as f64 / count as f64) - (dups_count as f64 / count as f64)
@@ -536,55 +547,28 @@ fn generate_xvec_with_injection(
     // Progress reporting interval: ~10K vectors per update
     let progress_interval = 10_000usize;
 
-    let chunks: Vec<Vec<u8>> = {
+    let chunks: Vec<Vec<T>> = {
         use rayon::prelude::*;
         chunk_seeds.into_par_iter().enumerate().map(|(ci, seed)| {
             let start_idx = ci * chunk_size;
             let end_idx = std::cmp::min(start_idx + chunk_size, count as usize);
             let chunk_len = end_idx - start_idx;
 
-            let mut chunk_rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed);
-            let mut buf = Vec::with_capacity(chunk_len * record_total_size);
+            let mut chunk_rng = Xoshiro::seed_from_u64(seed);
+            let mut buf: Vec<T> = Vec::with_capacity(chunk_len * dim);
 
             for j in 0..chunk_len {
                 let disp = alias_table.sample(&mut chunk_rng);
-                buf.extend_from_slice(&dim_header);
                 match disp {
-                    VecDisposition::Zero => buf.extend_from_slice(&zero_bytes),
-                    // `j` records have been written when record `j` starts.
+                    VecDisposition::Zero => buf.resize(buf.len() + dim, zero),
+                    // `j` rows have been generated when row `j` starts.
                     VecDisposition::Duplicate if j > 0 => {
                         let src_idx = chunk_rng.random_range(0..j);
-                        let src_offset = src_idx * record_total_size + 4;
-                        buf.extend_from_within(src_offset..src_offset + record_data_size);
+                        buf.extend_from_within(src_idx * dim..src_idx * dim + dim);
                     }
                     VecDisposition::Normal | VecDisposition::Duplicate => {
                         for _ in 0..dim {
-                            match elem_type {
-                                "f32" | "float[]" => {
-                                    let v: f32 = float_min + chunk_rng.random::<f32>() * float_range;
-                                    buf.extend_from_slice(&v.to_le_bytes());
-                                }
-                                "f16" | "half" => {
-                                    let v = half::f16::from_f32(float_min + chunk_rng.random::<f32>() * float_range);
-                                    buf.extend_from_slice(&v.to_le_bytes());
-                                }
-                                "f64" | "double[]" => {
-                                    let v: f64 = float_min_f64 + chunk_rng.random::<f64>() * float_range_f64;
-                                    buf.extend_from_slice(&v.to_le_bytes());
-                                }
-                                "i32" | "int[]" => {
-                                    let v: i32 = chunk_rng.random_range(int_min..=int_max);
-                                    buf.extend_from_slice(&v.to_le_bytes());
-                                }
-                                "i16" | "short[]" => {
-                                    let v: i16 = chunk_rng.random_range(int_min as i16..=int_max as i16);
-                                    buf.extend_from_slice(&v.to_le_bytes());
-                                }
-                                "u8" | "byte[]" => {
-                                    buf.push(chunk_rng.random::<u8>());
-                                }
-                                _ => unreachable!(),
-                            }
+                            buf.push(sample(&mut chunk_rng));
                         }
                     }
                 }
@@ -603,205 +587,34 @@ fn generate_xvec_with_injection(
     };
 
     // Write all chunks sequentially
-    let file = if append {
-        std::fs::OpenOptions::new().append(true).open(output)
+    let mut writer = if append {
+        veks_io::XvecWriter::<T>::append(output, dim)
     } else {
-        safe_create_file(output)
-    }.map_err(|e| format!("failed to open {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 22, file);
+        veks_io::XvecWriter::<T>::create(output, dim)
+    }
+    .map_err(|e| format!("failed to open {}: {}", output.display(), e))?;
     for chunk in &chunks {
-        writer.write_all(chunk).map_err(|e| e.to_string())?;
+        writer.write_packed(chunk).map_err(|e| e.to_string())?;
     }
-    writer.flush().map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
 
     pb.set_position(count);
     Ok(())
 }
 
-/// Generate f32 vectors in fvec format.
-fn generate_xvec_f32(
-    output: &Path,
-    dim: u32,
-    count: u64,
-    min: f32,
-    max: f32,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-    pb: &veks_core::ui::ProgressHandle,
-) -> Result<(), String> {
-    use std::io::Write;
-    let file = safe_create_file(output)
-        .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
-    let range = max - min;
-
-    for i in 0..count {
-        writer
-            .write_all(&(dim as i32).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        for _ in 0..dim {
-            let val: f32 = min + rng.random::<f32>() * range;
-            writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
-        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
+/// The element type a `type` option generates, by its generator spelling
+/// (`float[]`, `f32`, …); `None` for a spelling the generators lack.
+fn generated_element_type(elem_type: &str) -> Option<veks_io::ElementType> {
+    use veks_io::ElementType;
+    match elem_type {
+        "float[]" | "f32" => Some(ElementType::F32),
+        "half" | "f16" => Some(ElementType::F16),
+        "double[]" | "f64" => Some(ElementType::F64),
+        "int[]" | "i32" => Some(ElementType::I32),
+        "short[]" | "i16" => Some(ElementType::I16),
+        "byte[]" | "u8" => Some(ElementType::U8),
+        _ => None,
     }
-    pb.set_position(count);
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Generate i32 vectors in ivec format.
-fn generate_xvec_i32(
-    output: &Path,
-    dim: u32,
-    count: u64,
-    min: i32,
-    max: i32,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-    pb: &veks_core::ui::ProgressHandle,
-) -> Result<(), String> {
-    use std::io::Write;
-    let file = safe_create_file(output)
-        .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
-    let range = (max - min + 1) as u32;
-
-    for i in 0..count {
-        writer
-            .write_all(&(dim as i32).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        for _ in 0..dim {
-            let val: i32 = min + (rng.random::<u32>() % range) as i32;
-            writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
-        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
-    }
-    pb.set_position(count);
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Generate f64 vectors in dvec format.
-fn generate_xvec_f64(
-    output: &Path,
-    dim: u32,
-    count: u64,
-    min: f64,
-    max: f64,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-    pb: &veks_core::ui::ProgressHandle,
-) -> Result<(), String> {
-    use std::io::Write;
-    let file = safe_create_file(output)
-        .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
-    let range = max - min;
-
-    for i in 0..count {
-        writer
-            .write_all(&(dim as i32).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        for _ in 0..dim {
-            let val: f64 = min + rng.random::<f64>() * range;
-            writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
-        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
-    }
-    pb.set_position(count);
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Generate u8 vectors in bvec format.
-fn generate_xvec_u8(
-    output: &Path,
-    dim: u32,
-    count: u64,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-    pb: &veks_core::ui::ProgressHandle,
-) -> Result<(), String> {
-    use std::io::Write;
-    let file = safe_create_file(output)
-        .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
-
-    for i in 0..count {
-        writer
-            .write_all(&(dim as i32).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        for _ in 0..dim {
-            let val: u8 = rng.random();
-            writer.write_all(&[val]).map_err(|e| e.to_string())?;
-        }
-        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
-    }
-    pb.set_position(count);
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Generate f16 vectors in mvec format.
-fn generate_xvec_f16(
-    output: &Path,
-    dim: u32,
-    count: u64,
-    min: f32,
-    max: f32,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-    pb: &veks_core::ui::ProgressHandle,
-) -> Result<(), String> {
-    use std::io::Write;
-    let file = safe_create_file(output)
-        .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
-    let range = max - min;
-
-    for i in 0..count {
-        writer
-            .write_all(&(dim as i32).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        for _ in 0..dim {
-            let val_f32: f32 = min + rng.random::<f32>() * range;
-            let val_f16 = half::f16::from_f32(val_f32);
-            writer
-                .write_all(&val_f16.to_le_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
-    }
-    pb.set_position(count);
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Generate i16 vectors in svec format.
-fn generate_xvec_i16(
-    output: &Path,
-    dim: u32,
-    count: u64,
-    min: i16,
-    max: i16,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-    pb: &veks_core::ui::ProgressHandle,
-) -> Result<(), String> {
-    use std::io::Write;
-    let file = safe_create_file(output)
-        .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
-    let range = (max as i32 - min as i32 + 1) as u32;
-
-    for i in 0..count {
-        writer
-            .write_all(&(dim as i32).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        for _ in 0..dim {
-            let val: i16 = min + (rng.random::<u32>() % range) as i16;
-            writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
-        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
-    }
-    pb.set_position(count);
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
@@ -872,6 +685,32 @@ mod tests {
         // fvec: each record = 4 bytes (dim) + 4 * 4 bytes (elements) = 20 bytes
         let size = std::fs::metadata(&out).unwrap().len();
         assert_eq!(size, 10 * (4 + 4 * 4));
+    }
+
+    /// **An append continues only a whole file**: rows appended after a
+    /// partial record would be misread from it on, so a target with
+    /// bytes past its last whole record is refused and left unchanged.
+    #[test]
+    fn an_append_to_a_cut_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("base.fvecs");
+        let mut opts = Options::new();
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("dimension", "4");
+        opts.set("count", "10");
+        let mut ctx = test_ctx(tmp.path());
+        assert_eq!(GenerateVectorsOp.execute(&opts, &mut ctx).status, Status::Ok);
+
+        let mut bytes = std::fs::read(&out).unwrap();
+        bytes.extend([4, 0, 0]);
+        std::fs::write(&out, &bytes).unwrap();
+        let mut opts = Options::new();
+        opts.set("append", out.to_string_lossy().to_string());
+        opts.set("dimension", "4");
+        opts.set("count", "5");
+        let result = GenerateVectorsOp.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Error, "{}", result.message);
+        assert_eq!(std::fs::read(&out).unwrap(), bytes, "the target is left as it was");
     }
 
     #[test]

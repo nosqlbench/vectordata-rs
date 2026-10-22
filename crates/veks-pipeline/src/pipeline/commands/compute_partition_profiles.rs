@@ -10,7 +10,6 @@
 //! re-expansion.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -253,33 +252,22 @@ templates (compute-knn, verify-knn) for the new partition profiles.
             let part_base_path = profile_dir.join("base_vectors.fvecs");
             remove_if_symlink(&part_base_path);
             {
-                let mut f = match std::fs::File::create(&part_base_path) {
-                    Ok(f) => std::io::BufWriter::new(f),
+                let mut f = match veks_io::XvecWriter::<f32>::create(&part_base_path, dim) {
+                    Ok(f) => f,
                     Err(e) => {
                         ctx.ui.log(&format!("    ERROR creating {}: {}", part_base_path.display(), e));
                         continue;
                     }
                 };
-                let dim_bytes = (dim as i32).to_le_bytes();
-                let mut wrote = Ok(());
-                for &ord in ordinals {
-                    let slice = base_reader.get_slice(ord);
-                    wrote = wrote.and_then(|()| f.write_all(&dim_bytes));
-                    for &val in slice {
-                        wrote = wrote.and_then(|()| f.write_all(&val.to_le_bytes()));
-                    }
-                    if wrote.is_err() {
-                        break;
-                    }
-                }
-                // A `BufWriter` dropped without a flush swallows the
-                // error on its last buffer, so the flush is checked
-                // here rather than left to the drop. A member whose
-                // base vectors are short is the case P-10 exists to
+                let wrote = ordinals.iter().try_for_each(|&ord| f.write(base_reader.get_slice(ord)));
+                // A writer dropped without `finish` swallows the error
+                // on its last buffer, so the finish is checked here
+                // rather than left to the drop. A member whose base
+                // vectors are short is the case P-10 exists to
                 // prevent: absent is a visible gap, half-written is a
                 // selectable profile whose ground truth does not match
                 // its data.
-                if let Err(e) = wrote.and_then(|()| f.flush()) {
+                if let Err(e) = wrote.and_then(|()| f.finish().map(drop)) {
                     ctx.ui.log(&format!(
                         "    ERROR writing {}: {} — profile not declared",
                         part_base_path.display(), e));
@@ -308,26 +296,15 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                     let _ = veks_core::paths::portable_symlink_file(&rel, &part_query_path);
                     query_count
                 } else {
-                    let mut f = match std::fs::File::create(&part_query_path) {
-                        Ok(f) => std::io::BufWriter::new(f),
+                    let mut f = match veks_io::XvecWriter::<f32>::create(&part_query_path, dim) {
+                        Ok(f) => f,
                         Err(e) => {
                             ctx.ui.log(&format!("    ERROR creating {}: {}", part_query_path.display(), e));
                             continue;
                         }
                     };
-                    let dim_bytes = (dim as i32).to_le_bytes();
-                    let mut wrote = Ok(());
-                    for &qi in &matching {
-                        let slice = query_reader.get_slice(qi);
-                        wrote = wrote.and_then(|()| f.write_all(&dim_bytes));
-                        for &val in slice {
-                            wrote = wrote.and_then(|()| f.write_all(&val.to_le_bytes()));
-                        }
-                        if wrote.is_err() {
-                            break;
-                        }
-                    }
-                    if let Err(e) = wrote.and_then(|()| f.flush()) {
+                    let wrote = matching.iter().try_for_each(|&qi| f.write(query_reader.get_slice(qi)));
+                    if let Err(e) = wrote.and_then(|()| f.finish().map(drop)) {
                         ctx.ui.log(&format!(
                             "    ERROR writing {}: {} — profile not declared",
                             part_query_path.display(), e));

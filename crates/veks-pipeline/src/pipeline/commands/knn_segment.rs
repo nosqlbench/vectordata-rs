@@ -26,7 +26,7 @@
 //!   - a distance kernel (per-vector SIMD loop, BLAS GEMM, ...).
 
 use std::collections::BinaryHeap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::compute_knn::Neighbor;
@@ -319,17 +319,54 @@ pub(super) fn build_cache_path(
     ))
 }
 
-/// A segment cache's two files are each `query_count × (4 + k × elem_size)`
-/// bytes — one row per query consisting of a 4-byte dim header plus
-/// `k` 4-byte payload values (i32 for indices, f32 for distances).
-/// Validate by exact byte-size equality; any mismatch means the cache
-/// was written with different settings and must not be loaded.
-pub(super) fn validate_cache_file(path: &Path, query_count: usize, k: usize, elem_size: usize) -> bool {
-    let expected = query_count as u64 * (4 + k as u64 * elem_size as u64);
+/// A segment cache's two files are each `query_count` records of `k`
+/// elements of `elem` (i32 for indices, f32 for distances), the record
+/// size as [`veks_io::reader::xvec_record_bytes`] gives it. Validate by
+/// exact byte-size equality; any mismatch means the cache was written
+/// with different settings and must not be loaded.
+pub(super) fn validate_cache_file(path: &Path, query_count: usize, k: usize, elem: veks_io::ElementType) -> bool {
+    let Ok(record) = veks_io::reader::xvec_record_bytes(k as i32, elem) else { return false };
+    let expected = query_count as u64 * record as u64;
     match std::fs::metadata(path) {
         Ok(meta) => meta.len() == expected,
         Err(_) => false,
     }
+}
+
+/// Append one row of a kNN output to `out` as an xvec record of `k`
+/// elements ([`veks_io::writer::encode_records`]): the first `k` of
+/// `values`, then `pad` up to `k` — `-1` for a missing index, `+∞`
+/// for its distance. `row` is the caller's scratch, reused across
+/// rows so the write loop does not allocate.
+pub(super) fn encode_padded_row<T: veks_io::Element>(
+    values: impl IntoIterator<Item = T>,
+    k: usize,
+    pad: T,
+    row: &mut Vec<T>,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    row.clear();
+    row.extend(values.into_iter().take(k));
+    row.resize(k, pad);
+    veks_io::writer::encode_records(row, k, out).map_err(|e| e.to_string())
+}
+
+/// Open a kNN result file — `query_count` rows of `k` neighbours — for
+/// reading, refusing one of another shape.
+pub(super) fn open_knn_rows<T: veks_io::Element>(
+    path: &Path,
+    k: usize,
+    query_count: usize,
+) -> Result<veks_io::XvecReader<T>, String> {
+    let reader = veks_io::XvecReader::<T>::open_path(path)
+        .map_err(|e| format!("open {}: {}", path.display(), e))?;
+    if query_count > 0 && (reader.dim() != k || reader.count() < query_count) {
+        return Err(format!(
+            "{} holds {} rows of {} neighbours; expected {} rows of {}",
+            path.display(), reader.count(), reader.dim(), query_count, k,
+        ));
+    }
+    Ok(reader)
 }
 
 /// Write a segment's per-query top-k contribution to `ivec_path`
@@ -349,40 +386,27 @@ pub(super) fn write_segment_cache(
     k: usize,
     metric: Metric,
 ) -> Result<(), String> {
-    use std::io::BufWriter;
-    let dim_bytes = (k as i32).to_le_bytes();
+    use veks_io::atomic::AtomicWriter;
+    let mut iw = AtomicWriter::with_capacity(1 << 20, ivec_path)
+        .map_err(|e| format!("create {}: {}", ivec_path.display(), e))?;
+    let mut fw = AtomicWriter::with_capacity(1 << 20, fvec_path)
+        .map_err(|e| format!("create {}: {}", fvec_path.display(), e))?;
 
-    let ivec_tmp = ivec_path.with_extension("tmp");
-    let fvec_tmp = fvec_path.with_extension("tmp");
-
-    let ivec_f = std::fs::File::create(&ivec_tmp)
-        .map_err(|e| format!("create {}: {}", ivec_tmp.display(), e))?;
-    let fvec_f = std::fs::File::create(&fvec_tmp)
-        .map_err(|e| format!("create {}: {}", fvec_tmp.display(), e))?;
-    let mut iw = BufWriter::with_capacity(1 << 20, ivec_f);
-    let mut fw = BufWriter::with_capacity(1 << 20, fvec_f);
-
+    let (mut idx_row, mut dist_row) = (Vec::with_capacity(k), Vec::with_capacity(k));
+    let (mut idx_rec, mut dist_rec) = (Vec::new(), Vec::new());
     for row in per_query {
-        iw.write_all(&dim_bytes).map_err(|e| e.to_string())?;
-        fw.write_all(&dim_bytes).map_err(|e| e.to_string())?;
-        for j in 0..k {
-            let (idx_i32, dist_f32) = if j < row.len() {
-                (row[j].index as i32, kernel_to_published(row[j].distance, metric))
-            } else {
-                (-1i32, f32::INFINITY)
-            };
-            iw.write_all(&idx_i32.to_le_bytes()).map_err(|e| e.to_string())?;
-            fw.write_all(&dist_f32.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
+        idx_rec.clear();
+        dist_rec.clear();
+        encode_padded_row(row.iter().map(|n| n.index as i32), k, -1, &mut idx_row, &mut idx_rec)?;
+        encode_padded_row(
+            row.iter().map(|n| kernel_to_published(n.distance, metric)),
+            k, f32::INFINITY, &mut dist_row, &mut dist_rec,
+        )?;
+        iw.write_all(&idx_rec).map_err(|e| e.to_string())?;
+        fw.write_all(&dist_rec).map_err(|e| e.to_string())?;
     }
-    iw.flush().map_err(|e| e.to_string())?;
-    fw.flush().map_err(|e| e.to_string())?;
-    drop(iw);
-    drop(fw);
-    std::fs::rename(&ivec_tmp, ivec_path)
-        .map_err(|e| format!("rename {} → {}: {}", ivec_tmp.display(), ivec_path.display(), e))?;
-    std::fs::rename(&fvec_tmp, fvec_path)
-        .map_err(|e| format!("rename {} → {}: {}", fvec_tmp.display(), fvec_path.display(), e))?;
+    iw.finish().map_err(|e| format!("finish {}: {}", ivec_path.display(), e))?;
+    fw.finish().map_err(|e| format!("finish {}: {}", fvec_path.display(), e))?;
     Ok(())
 }
 
@@ -400,25 +424,13 @@ pub(super) fn load_segment_cache(
     query_count: usize,
     metric: Metric,
 ) -> Result<Vec<Vec<Neighbor>>, String> {
-    use std::io::BufReader;
-    let mut iw = BufReader::with_capacity(1 << 20, std::fs::File::open(ivec_path)
-        .map_err(|e| format!("open {}: {}", ivec_path.display(), e))?);
-    let mut fw = BufReader::with_capacity(1 << 20, std::fs::File::open(fvec_path)
-        .map_err(|e| format!("open {}: {}", fvec_path.display(), e))?);
+    let iw = open_knn_rows::<i32>(ivec_path, k, query_count)?;
+    let fw = open_knn_rows::<f32>(fvec_path, k, query_count)?;
 
     let mut result: Vec<Vec<Neighbor>> = Vec::with_capacity(query_count);
-    let mut hdr = [0u8; 4];
-    let mut idx_buf = [0u8; 4];
-    let mut dist_buf = [0u8; 4];
-    for _ in 0..query_count {
-        iw.read_exact(&mut hdr).map_err(|e| format!("read ivec dim: {}", e))?;
-        fw.read_exact(&mut hdr).map_err(|e| format!("read fvec dim: {}", e))?;
+    for qi in 0..query_count {
         let mut row: Vec<Neighbor> = Vec::with_capacity(k);
-        for _ in 0..k {
-            iw.read_exact(&mut idx_buf).map_err(|e| format!("read ivec body: {}", e))?;
-            fw.read_exact(&mut dist_buf).map_err(|e| format!("read fvec body: {}", e))?;
-            let idx = i32::from_le_bytes(idx_buf);
-            let raw = f32::from_le_bytes(dist_buf);
+        for (&idx, &raw) in iw.get_slice(qi).iter().zip(fw.get_slice(qi)) {
             let dist = published_to_kernel(raw, metric);
             if idx >= 0 {
                 row.push(Neighbor { index: idx as u32, distance: dist });
@@ -534,8 +546,8 @@ pub(super) fn scan_cached_segments(
 
             let ivec = build_cache_path(cache_dir, engine, cache_prefix, s, e, k, metric, "neighbors", "ivec");
             let fvec = build_cache_path(cache_dir, engine, cache_prefix, s, e, k, metric, "distances", "fvec");
-            if validate_cache_file(&ivec, query_count, k, 4)
-                && validate_cache_file(&fvec, query_count, k, 4)
+            if validate_cache_file(&ivec, query_count, k, veks_io::ElementType::I32)
+                && validate_cache_file(&fvec, query_count, k, veks_io::ElementType::F32)
             {
                 segments.push(CachedSegment {
                     start: s, end: e, ivec_path: ivec, fvec_path: fvec,
@@ -564,8 +576,8 @@ pub(super) fn scan_cached_segments(
 
                 let idx_path = entry.path().join("neighbor_indices.ivecs");
                 let dist_path = entry.path().join("neighbor_distances.fvecs");
-                if validate_cache_file(&idx_path, query_count, k, 4)
-                    && validate_cache_file(&dist_path, query_count, k, 4)
+                if validate_cache_file(&idx_path, query_count, k, veks_io::ElementType::I32)
+                    && validate_cache_file(&dist_path, query_count, k, veks_io::ElementType::F32)
                 {
                     let already = segments.iter().any(|s| s.start == 0 && s.end == pbc);
                     if !already {
@@ -784,26 +796,19 @@ pub(super) fn rerank_output_post_pass(
     ui: &veks_core::ui::UiHandle,
 ) -> Result<(), String> {
     use rayon::prelude::*;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
-    // Read the existing indices file. Each row is `[k_header:i32,
-    // i32 × k_header]`.
-    let mut idx_bytes = Vec::new();
-    std::fs::File::open(indices_path)
-        .map_err(|e| format!("open {}: {}", indices_path.display(), e))?
-        .read_to_end(&mut idx_bytes)
+    // Read the existing indices file: rows of `header_k` i32
+    // candidates, as the engine wrote them.
+    let idx_reader = veks_io::XvecReader::<i32>::open_path(indices_path)
         .map_err(|e| format!("read {}: {}", indices_path.display(), e))?;
 
-    if idx_bytes.is_empty() {
+    if idx_reader.count() == 0 {
         return Ok(()); // empty file — nothing to rerank
     }
 
-    let header_k = i32::from_le_bytes([idx_bytes[0], idx_bytes[1], idx_bytes[2], idx_bytes[3]]) as usize;
-    let row_bytes = 4 + header_k * 4;
-    if idx_bytes.len() % row_bytes != 0 {
-        return Err(format!("indices file {} has unaligned size", indices_path.display()));
-    }
-    let n_rows = idx_bytes.len() / row_bytes;
+    let header_k = idx_reader.dim();
+    let n_rows = idx_reader.count();
     let n_query = query_reader.count();
     if n_rows != n_query {
         return Err(format!(
@@ -821,20 +826,16 @@ pub(super) fn rerank_output_post_pass(
     // recomputed in the rerank).
     let mut rows: Vec<Vec<super::compute_knn::Neighbor>> = Vec::with_capacity(n_rows);
     for r in 0..n_rows {
-        let off = r * row_bytes;
-        let mut row = Vec::with_capacity(header_k);
-        for j in 0..header_k {
-            let p = off + 4 + j * 4;
-            let idx = i32::from_le_bytes([idx_bytes[p], idx_bytes[p+1], idx_bytes[p+2], idx_bytes[p+3]]);
-            if idx >= 0 {
-                row.push(super::compute_knn::Neighbor {
-                    index: idx as u32,
-                    distance: f32::INFINITY, // recomputed below
-                });
-            }
-        }
+        let row = idx_reader.get_slice(r).iter()
+            .filter(|&&idx| idx >= 0)
+            .map(|&idx| super::compute_knn::Neighbor {
+                index: idx as u32,
+                distance: f32::INFINITY, // recomputed below
+            })
+            .collect();
         rows.push(row);
     }
+    drop(idx_reader);
 
     // Rerank each query's row. `base_offset` lets engines that
     // store window-relative indices in ivec (like compute_knn.rs
@@ -888,28 +889,22 @@ pub(super) fn rerank_output_post_pass(
     // writes the same scheme back out (no shift needed — the index
     // round-trips the caller's scheme).
 
-    // Atomically rewrite the indices file. Wrapped in BufWriter
-    // because each row issues `1 + k` write_all calls of 4 bytes —
-    // for a typical 10k-query × k=100 file that's 1M syscalls
-    // without buffering, easily 1+ seconds of pure syscall overhead.
-    // BufWriter coalesces them into a handful of large writes.
-    let dim_bytes = (k as i32).to_le_bytes();
-    let tmp_idx = indices_path.with_extension("rerank.tmp");
+    // Atomically rewrite the indices file. Each row is encoded into
+    // one record buffer and written through the AtomicWriter's buffer,
+    // so a typical 10k-query × k=100 file is a handful of large writes
+    // rather than a syscall per value.
+    let mut row_i32: Vec<i32> = Vec::with_capacity(k);
+    let mut record: Vec<u8> = Vec::new();
     {
-        let f = std::fs::File::create(&tmp_idx)
-            .map_err(|e| format!("create {}: {}", tmp_idx.display(), e))?;
-        let mut f = std::io::BufWriter::with_capacity(1 << 20, f);
+        let mut f = veks_io::atomic::AtomicWriter::with_capacity(1 << 20, indices_path)
+            .map_err(|e| format!("create {}: {}", indices_path.display(), e))?;
         for row in &reranked {
-            f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
-            for j in 0..k {
-                let idx = if j < row.len() { row[j].index as i32 } else { -1 };
-                f.write_all(&idx.to_le_bytes()).map_err(|e| e.to_string())?;
-            }
+            record.clear();
+            encode_padded_row(row.iter().map(|n| n.index as i32), k, -1, &mut row_i32, &mut record)?;
+            f.write_all(&record).map_err(|e| e.to_string())?;
         }
-        f.flush().map_err(|e| e.to_string())?;
+        f.finish().map_err(|e| format!("finish {}: {}", indices_path.display(), e))?;
     }
-    std::fs::rename(&tmp_idx, indices_path)
-        .map_err(|e| format!("rename {} → {}: {}", tmp_idx.display(), indices_path.display(), e))?;
 
     // If the engine emitted distances, rewrite those too with the
     // canonical f64-cast-to-f32 values that pair with the reranked
@@ -932,25 +927,20 @@ pub(super) fn rerank_output_post_pass(
     // get loaded with the wrong sign and the merging heap accumulates
     // worst-of-k instead of best-of-k.
     if let Some(dp) = distances_path {
-        let tmp_dist = dp.with_extension("rerank.tmp");
-        {
-            let f = std::fs::File::create(&tmp_dist)
-                .map_err(|e| format!("create {}: {}", tmp_dist.display(), e))?;
-            // Same buffering rationale as the indices write above —
-            // unbuffered writes here cost ~1s on a typical pipeline.
-            let mut f = std::io::BufWriter::with_capacity(1 << 20, f);
-            for row in &reranked {
-                f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
-                for j in 0..k {
-                    let d_kernel = if j < row.len() { row[j].distance } else { f32::INFINITY };
-                    let d_published = kernel_to_published(d_kernel, metric);
-                    f.write_all(&d_published.to_le_bytes()).map_err(|e| e.to_string())?;
-                }
-            }
-            f.flush().map_err(|e| e.to_string())?;
+        // Same buffering as the indices write above.
+        let mut row_f32: Vec<f32> = Vec::with_capacity(k);
+        let mut f = veks_io::atomic::AtomicWriter::with_capacity(1 << 20, dp)
+            .map_err(|e| format!("create {}: {}", dp.display(), e))?;
+        for row in &reranked {
+            record.clear();
+            encode_padded_row(
+                row.iter().map(|n| n.distance).chain(std::iter::repeat(f32::INFINITY)).take(k)
+                    .map(|d_kernel| kernel_to_published(d_kernel, metric)),
+                k, f32::INFINITY, &mut row_f32, &mut record,
+            )?;
+            f.write_all(&record).map_err(|e| e.to_string())?;
         }
-        std::fs::rename(&tmp_dist, dp)
-            .map_err(|e| format!("rename {} → {}: {}", tmp_dist.display(), dp.display(), e))?;
+        f.finish().map_err(|e| format!("finish {}: {}", dp.display(), e))?;
     }
 
     Ok(())

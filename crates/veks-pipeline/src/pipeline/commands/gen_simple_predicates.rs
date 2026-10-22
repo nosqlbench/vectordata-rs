@@ -114,55 +114,21 @@ consumes the rich `SurveyReport` from `analyze survey`.
             count, fields, range_min, range_max, seed,
         ));
 
-        let is_scalar = matches!(format, "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64");
-        let scalar_elem_size: usize = match format {
-            "u8" | "i8" => 1, "u16" | "i16" => 2, "u32" | "i32" => 4, "u64" | "i64" => 8, _ => 0,
-        };
+        // Integer formats: a header-free column of one integer type
+        // (`u8` … `i64`), or i32 vectors (`ivec`), named as their
+        // extensions are — the same layouts `generate metadata` writes.
+        let int_format = veks_io::VecFormat::from_extension(format)
+            .filter(|f| f.is_integer() && (f.is_scalar() || *f == veks_io::VecFormat::Ivec));
 
-        if is_scalar {
-            use std::io::Write;
-            let mut f = match std::fs::File::create(&output_path) {
-                Ok(f) => std::io::BufWriter::new(f),
-                Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
-            };
+        if let Some(fmt) = int_format {
             let pb = ctx.ui.bar(count as u64, "generating predicates");
-            for i in 0..count {
-                for _ in 0..fields {
-                    let val = range_min + rng_inst.random_range(0..range);
-                    let write_ok = match scalar_elem_size {
-                        1 => f.write_all(&[val as u8]).is_ok(),
-                        2 => f.write_all(&(val as i16).to_le_bytes()).is_ok(),
-                        4 => f.write_all(&val.to_le_bytes()).is_ok(),
-                        8 => f.write_all(&(val as i64).to_le_bytes()).is_ok(),
-                        _ => false,
-                    };
-                    if !write_ok {
-                        return error_result("write error".into(), start);
-                    }
-                }
-                if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
-            }
+            let written = super::gen_metadata::write_int_records(
+                &output_path, fmt, count, fields, &mut rng_inst, range_min, range, &pb,
+            );
             pb.finish();
-        } else if format == "ivec" {
-            use std::io::Write;
-            let mut f = match std::fs::File::create(&output_path) {
-                Ok(f) => std::io::BufWriter::new(f),
-                Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
-            };
-            let pb = ctx.ui.bar(count as u64, "generating predicates");
-            for i in 0..count {
-                if f.write_all(&(fields as i32).to_le_bytes()).is_err() {
-                    return error_result("write error".into(), start);
-                }
-                for _ in 0..fields {
-                    let val = range_min + rng_inst.random_range(0..range);
-                    if f.write_all(&val.to_le_bytes()).is_err() {
-                        return error_result("write error".into(), start);
-                    }
-                }
-                if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
+            if let Err(e) = written {
+                return error_result(e, start);
             }
-            pb.finish();
         } else {
             let config = match WriterConfig::new(512, 4096, u32::MAX, false) {
                 Ok(c) => c,

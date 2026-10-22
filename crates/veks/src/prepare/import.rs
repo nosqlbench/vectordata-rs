@@ -529,9 +529,9 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
                 let ty = fmt.element_type()?;
                 Some(VecFormat::of(vectordata::typed_access::Container::Vec, ty)?.preferred_extension())
             })
-            .unwrap_or("fvecs")
+            .unwrap_or(VecFormat::Fvec.preferred_extension())
     } else {
-        "fvecs"
+        VecFormat::Fvec.preferred_extension()
     };
 
     let all_vectors = if needs_import {
@@ -602,7 +602,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .and_then(VecFormat::canonical_extension)
-            .unwrap_or("fvecs")
+            .unwrap_or(VecFormat::Fvec.preferred_extension())
     };
 
     let (shuffle, query_vectors, base_vectors, base_count) = if self_search {
@@ -1078,7 +1078,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .and_then(VecFormat::canonical_extension)
-            .unwrap_or("fvec");
+            .unwrap_or(VecFormat::Fvec.name());
         let subset_output = format!("${{cache}}/all_vectors.{}", ext);
         steps.push(Step {
             id: "subset-vectors".into(),
@@ -1130,7 +1130,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .and_then(VecFormat::canonical_extension)
-            .unwrap_or("fvec");
+            .unwrap_or(VecFormat::Fvec.name());
         format!("${{cache}}/all_vectors.{}", ext)
     } else {
         slots.all_vectors.path().to_string()
@@ -2426,7 +2426,7 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
             let ext = std::path::Path::new(path).extension()
                 .and_then(|e| e.to_str())
                 .and_then(veks_io::VecFormat::canonical_extension)
-                .unwrap_or("fvec");
+                .unwrap_or(VecFormat::Fvec.name());
             views.push(("base_vectors".into(),
                 format!("{}base_vectors.{}", args.profile_prefix(), ext)));
         }
@@ -2441,7 +2441,7 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
                 let ext = std::path::Path::new(path).extension()
                     .and_then(|e| e.to_str())
                     .and_then(veks_io::VecFormat::canonical_extension)
-                    .unwrap_or("fvec");
+                    .unwrap_or(VecFormat::Fvec.name());
                 views.push(("query_vectors".into(),
                     format!("{}query_vectors.{}", args.profile_prefix(), ext)));
             }
@@ -2471,7 +2471,7 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
                 let ext = std::path::Path::new(path).extension()
                     .and_then(|e| e.to_str())
                     .and_then(veks_io::VecFormat::canonical_extension)
-                    .unwrap_or("ivec");
+                    .unwrap_or(VecFormat::Ivec.name());
                 views.push(("neighbor_indices".into(),
                     format!("{}neighbor_indices.{}", args.profile_prefix(), ext)));
                 // Include pre-provided distances if available
@@ -2479,7 +2479,7 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
                     let dext = gt_dist.extension()
                         .and_then(|e| e.to_str())
                         .and_then(veks_io::VecFormat::canonical_extension)
-                        .unwrap_or("fvec");
+                        .unwrap_or(VecFormat::Fvec.name());
                     views.push(("neighbor_distances".into(),
                         format!("{}neighbor_distances.{}", args.profile_prefix(), dext)));
                 }
@@ -2968,7 +2968,7 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
                 let ext = base_path.extension()
                     .and_then(|e| e.to_str())
                     .and_then(VecFormat::canonical_extension)
-                    .unwrap_or("fvec");
+                    .unwrap_or(VecFormat::Fvec.name());
                 let link = base_dir.join(format!("base_vectors.{}", ext));
                 create_symlink(base_path, &link);
             }
@@ -2982,7 +2982,7 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
                 let ext = query_path.extension()
                     .and_then(|e| e.to_str())
                     .and_then(VecFormat::canonical_extension)
-                    .unwrap_or("fvec");
+                    .unwrap_or(VecFormat::Fvec.name());
                 if qv.is_materialized() {
                     // Overlap/convert step reads from _raw
                     let link = base_dir.join(format!("query_vectors_raw.{}", ext));
@@ -3002,7 +3002,7 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
                     let ext = gt_path.extension()
                         .and_then(|e| e.to_str())
                         .and_then(VecFormat::canonical_extension)
-                        .unwrap_or("ivec");
+                        .unwrap_or(VecFormat::Ivec.name());
                     let link = base_dir.join(format!("neighbor_indices.{}", ext));
                     create_symlink(gt_path, &link);
                 }
@@ -3011,7 +3011,7 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
                     let ext = gt_dist.extension()
                         .and_then(|e| e.to_str())
                         .and_then(VecFormat::canonical_extension)
-                        .unwrap_or("fvec");
+                        .unwrap_or(VecFormat::Fvec.name());
                     let link = base_dir.join(format!("neighbor_distances.{}", ext));
                     create_symlink(gt_dist, &link);
                 }

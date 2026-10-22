@@ -8,7 +8,6 @@
 //! available (e.g. slab structural validation).
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use veks_io::VecFormat;
@@ -79,22 +78,16 @@ fn check_xvec(path: &Path, format: VecFormat) -> Result<(), String> {
         return Err("file too small for dimension header (< 4 bytes)".to_string());
     }
 
-    // Read the dimension from the first record
-    let mut f = fs::File::open(path)
-        .map_err(|e| format!("cannot open: {}", e))?;
-    let mut dim_buf = [0u8; 4];
-    f.read_exact(&mut dim_buf)
-        .map_err(|e| format!("cannot read dimension: {}", e))?;
-    let dim = i32::from_le_bytes(dim_buf);
+    // The first record's header and the record size the readers use:
+    // the header and `dim` elements.
+    let elem = format
+        .element_type()
+        .ok_or_else(|| format!("{} names no element type", format.name()))?;
+    let file = veks_io::MappedFile::map(path).map_err(|e| format!("cannot open: {}", e))?;
+    let probe = veks_io::reader::probe_source(&file, elem).map_err(|e| format!("invalid header: {e}"))?;
+    let (dim, stride) = (probe.dim, probe.record_bytes);
 
-    if dim <= 0 {
-        return Err(format!("invalid dimension: {} (must be > 0)", dim));
-    }
-
-    let elem_size = format.element_size() as u64;
-    let stride = 4 + (dim as u64) * elem_size;
-
-    if file_size < stride {
+    if probe.records == 0 {
         return Err(format!(
             "file size {} is smaller than a single record of dim={} ({}B)",
             file_size, dim, stride,
@@ -110,13 +103,11 @@ fn check_xvec(path: &Path, format: VecFormat) -> Result<(), String> {
     // For all other xvec formats, records should be uniform-dimension.
     // A file size that isn't evenly divisible by stride indicates truncation
     // or corruption.
-    let remainder = file_size % stride;
-    if remainder != 0 {
-        let record_count = file_size / stride;
+    if probe.trailing_bytes != 0 {
         return Err(format!(
             "file size {} is not evenly divisible by stride {} (dim={}, elem={}B): \
              {} complete records + {} trailing bytes",
-            file_size, stride, dim, elem_size, record_count, remainder,
+            file_size, stride, dim, elem.byte_width(), probe.records, probe.trailing_bytes,
         ));
     }
 

@@ -76,25 +76,17 @@ fn probe_file(path: &Path) -> Result<FileInfo, String> {
         return Err(format!("file too small ({} bytes)", file_size));
     }
 
-    // Read first 4 bytes to get dimension count
-    let header_bytes = std::fs::read(path)
+    // The shape from the first record's header: four bytes are read.
+    let mapped = veks_io::MappedFile::map(path)
         .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-
-    let dim_i32 = i32::from_le_bytes([
-        header_bytes[0],
-        header_bytes[1],
-        header_bytes[2],
-        header_bytes[3],
-    ]);
-
-    if dim_i32 <= 0 {
-        return Err(format!("invalid dimension {} in {}", dim_i32, path.display()));
-    }
-    let dimensions = dim_i32 as usize;
-
-    let bytes_per_vector = 4 + dimensions * bytes_per_element;
-    let vector_count = file_size as usize / bytes_per_vector;
-    let trailing_bytes = file_size - (vector_count * bytes_per_vector) as u64;
+    let element = fmt.element_type()
+        .ok_or_else(|| format!("unknown vector format: '.{}'", ext))?;
+    let probe = veks_io::reader::probe_source(&mapped, element)
+        .map_err(|e| format!("invalid header in {}: {}", path.display(), e))?;
+    let dimensions = probe.dim;
+    let bytes_per_vector = probe.record_bytes as usize;
+    let vector_count = probe.records as usize;
+    let trailing_bytes = probe.trailing_bytes;
 
     Ok(FileInfo {
         vec_format: fmt,
@@ -121,64 +113,46 @@ fn human_bytes(bytes: u64) -> String {
     format!("{:.1} PB", size)
 }
 
-/// Read sample vectors as formatted strings.
+/// Read sample vectors as formatted strings: the first `count` records
+/// of `data` (the file's bytes), walked strictly, so a record that is
+/// cut short or whose header disagrees with the file's dimension is an
+/// error rather than a garbled sample.
 fn read_samples(
     data: &[u8],
     info: &FileInfo,
     count: usize,
     max_dims_shown: usize,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let mut samples = Vec::new();
     let actual_count = count.min(info.vector_count);
+    let dims_to_show = info.dimensions.min(max_dims_shown);
 
-    for i in 0..actual_count {
-        let offset = i * info.bytes_per_vector + 4; // skip dim header
-        let dims_to_show = info.dimensions.min(max_dims_shown);
-        let mut values = Vec::new();
-
-        for d in 0..dims_to_show {
-            let pos = offset + d * info.bytes_per_element;
-            let val = match info.vec_format {
-                VecFormat::Fvec => {
-                    let v = f32::from_le_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
-                    ]);
-                    format!("{:.4}", v)
-                }
-                VecFormat::Ivec => {
-                    let v = i32::from_le_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
-                    ]);
-                    format!("{}", v)
-                }
-                VecFormat::Bvec => format!("{}", data[pos]),
-                VecFormat::Dvec => {
-                    let v = f64::from_le_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
-                        data[pos + 4],
-                        data[pos + 5],
-                        data[pos + 6],
-                        data[pos + 7],
-                    ]);
-                    format!("{:.6}", v)
-                }
+    let records = veks_io::xvec::record::records(data, info.bytes_per_element);
+    for (i, record) in records.take(actual_count).enumerate() {
+        let (dim, payload) = record.map_err(|e| format!("sample {}: {}", i, e))?;
+        if dim != info.dimensions {
+            return Err(format!(
+                "sample {}: record dimension {} differs from the file's {}",
+                i, dim, info.dimensions
+            ));
+        }
+        let values: Vec<String> = payload
+            .chunks_exact(info.bytes_per_element)
+            .take(dims_to_show)
+            .map(|b| match info.vec_format {
+                VecFormat::Fvec => format!("{:.4}", f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                VecFormat::Ivec => format!("{}", i32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                VecFormat::Bvec => format!("{}", b[0]),
+                VecFormat::Dvec => format!(
+                    "{:.6}",
+                    f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                ),
                 VecFormat::Mvec | VecFormat::Svec => {
-                    let bits = u16::from_le_bytes([data[pos], data[pos + 1]]);
-                    format!("0x{:04x}", bits)
+                    format!("0x{:04x}", u16::from_le_bytes([b[0], b[1]]))
                 }
                 _ => "?".to_string(),
-            };
-            values.push(val);
-        }
+            })
+            .collect();
 
         let suffix = if info.dimensions > max_dims_shown {
             format!(", ... ({} more)", info.dimensions - max_dims_shown)
@@ -189,7 +163,7 @@ fn read_samples(
         samples.push(format!("  [{}]: [{}{}]", i, values.join(", "), suffix));
     }
 
-    samples
+    Ok(samples)
 }
 
 impl CommandOp for InfoFileOp {
@@ -296,8 +270,14 @@ subtle errors in later pipeline steps.
         }
 
         if sample_count > 0 {
-            let data = std::fs::read(&source_path).unwrap_or_default();
-            let samples = read_samples(&data, &info, sample_count, 8);
+            let mapped = match veks_io::MappedFile::map(&source_path) {
+                Ok(m) => m,
+                Err(e) => return error_result(format!("failed to read {}: {}", source_path.display(), e), start),
+            };
+            let samples = match read_samples(mapped.bytes(), &info, sample_count, 8) {
+                Ok(s) => s,
+                Err(e) => return error_result(format!("{}: {}", source_path.display(), e), start),
+            };
             ctx.ui.log("  Sample vectors:");
             for s in &samples {
                 ctx.ui.log(&s.to_string());

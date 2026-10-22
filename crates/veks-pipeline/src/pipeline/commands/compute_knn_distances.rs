@@ -22,8 +22,6 @@ use crate::pipeline::element_type::ElementTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use byteorder::{LittleEndian, WriteBytesExt};
-
 use vectordata::VectorReader;
 use vectordata::io::{Element, XvecReader};
 
@@ -419,6 +417,7 @@ where
     let mut q_buf: Vec<f32> = vec![0.0; dim];
     let mut b_buf: Vec<f32> = vec![0.0; dim];
     let mut row_dists: Vec<f32> = vec![0.0; k];
+    let mut record: Vec<u8> = Vec::new();
 
     let pb = ctx.ui.bar_with_unit(query_count as u64, "computing distances", "queries");
     let mut bad_index_msg: Option<String> = None;
@@ -447,13 +446,12 @@ where
         if let Some(ref m) = bad_index_msg {
             return Err(m.clone());
         }
-        // Write `(k as i32) + k × f32` little-endian.
-        writer.write_i32::<LittleEndian>(k as i32)
-            .map_err(|e| format!("write dim header: {}", e))?;
-        for &d in &row_dists {
-            writer.write_f32::<LittleEndian>(d)
-                .map_err(|e| format!("write distance: {}", e))?;
-        }
+        // Write the row as one fvec record of `k` distances.
+        record.clear();
+        veks_io::writer::encode_records(&row_dists, k, &mut record)
+            .map_err(|e| format!("write distances: {}", e))?;
+        std::io::Write::write_all(&mut writer, &record)
+            .map_err(|e| format!("write distance: {}", e))?;
         if qi % 1024 == 0 { pb.set_position(qi as u64); }
     }
     pb.finish();

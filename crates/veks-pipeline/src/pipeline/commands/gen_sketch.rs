@@ -417,6 +417,8 @@ fn generate_sketch_fvec(
     let dim_usize = dim as usize;
     let batch_size = 10_000usize;
     let mut written = 0u64;
+    // One batch of encoded records, reused across batches.
+    let mut records: Vec<u8> = Vec::new();
 
     while written < count {
         let batch_count = batch_size.min((count - written) as usize);
@@ -452,18 +454,11 @@ fn generate_sketch_fvec(
             }
         }
 
-        // Write batch to fvec
-        for v in 0..batch_count {
-            let offset = v * dim_usize;
-            writer
-                .write_all(&(dim as i32).to_le_bytes())
-                .map_err(|e| e.to_string())?;
-            for d in 0..dim_usize {
-                writer
-                    .write_all(&batch[offset + d].to_le_bytes())
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+        // Write batch to fvec: veks-io encodes the records, the atomic
+        // writer keeps the publish-on-finish rename.
+        records.clear();
+        veks_io::writer::encode_records(&batch, dim_usize, &mut records).map_err(|e| e.to_string())?;
+        writer.write_all(&records).map_err(|e| e.to_string())?;
 
         written += batch_count as u64;
         pb.set_position(written);

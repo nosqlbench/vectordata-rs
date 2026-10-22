@@ -109,9 +109,15 @@ fn plan_output_size(src: &SourceSpans, kind: FacetKind, window: &DSWindow) -> io
             let mut f = src.open()?;
             let mut dim_bytes = [0u8; 4];
             f.read_exact(&mut dim_bytes)?;
-            let dim = i32::from_le_bytes(dim_bytes) as u64;
-            if dim == 0 { return Ok(0); }
-            4 + dim * elem.byte_width() as u64
+            // veks-io's header and record size; a header that is no
+            // positive dimension sizes nothing, and the meter counts as
+            // it goes.
+            match veks_io::xvec::record::record_dim(&dim_bytes)
+                .and_then(|dim| veks_io::reader::xvec_record_bytes(dim as i32, elem).ok())
+            {
+                Some(bytes) => bytes as u64,
+                None => return Ok(0),
+            }
         }
         // Slab and vvec are variable-length — return 0 so the meter
         // ticks against the running byte count. The actual write is
@@ -881,8 +887,9 @@ fn fixed_record_size(src: &SourceSpans, kind: FacetKind) -> io::Result<Option<u6
             let mut f = src.open()?;
             let mut dim_bytes = [0u8; 4];
             f.read_exact(&mut dim_bytes)?;
-            let dim = i32::from_le_bytes(dim_bytes) as u64;
-            (dim > 0).then_some(4 + dim * elem.byte_width() as u64)
+            veks_io::xvec::record::record_dim(&dim_bytes)
+                .and_then(|dim| veks_io::reader::xvec_record_bytes(dim as i32, elem).ok())
+                .map(|bytes| bytes as u64)
         }
         FacetKind::VariableVvec | FacetKind::Slab => None,
     })
@@ -1742,7 +1749,9 @@ fn materialize_uniform_xvec<F: FnMut(u64)>(
     }
     let mut dim_bytes = [0u8; 4];
     src_f.read_exact(&mut dim_bytes)?;
-    let record_size = veks_io::reader::xvec_record_bytes(i32::from_le_bytes(dim_bytes), elem)
+    let record_size = veks_io::xvec::record::record_dim(&dim_bytes)
+        .ok_or_else(|| veks_io::IoError::InvalidFormat("the dimension is not positive".into()))
+        .and_then(|dim| veks_io::reader::xvec_record_bytes(dim as i32, elem))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("first xvec record header: {e}")))?
         as u64;
 

@@ -127,20 +127,14 @@ The same shuffle ivec is also applied to metadata slabs (via
         // level ordinals. Otherwise, generate [0, interval).
         let mut values: Vec<i32> = if let Some(ref ord_path) = ordinals_path {
             ctx.ui.log(&format!("  loading ordinals from {}", ord_path.display()));
-            let data = match std::fs::read(ord_path) {
-                Ok(d) => d,
+            let reader = match veks_io::XvecReader::<i32>::open_path(ord_path) {
+                Ok(r) => r,
                 Err(e) => return error_result(format!("failed to read ordinals: {}", e), start),
             };
-            // Parse dim=1 ivec records
-            let mut ords = Vec::with_capacity(interval);
-            let mut pos = 0;
-            while pos + 8 <= data.len() && ords.len() < interval {
-                // skip dim header (always 1)
-                pos += 4;
-                let val = i32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                ords.push(val);
-                pos += 4;
-            }
+            // One ordinal per dim=1 ivec record, up to `interval` of them.
+            let ords: Vec<i32> = (0..reader.count().min(interval))
+                .map(|i| reader.get_slice(i)[0])
+                .collect();
             if ords.len() != interval {
                 ctx.ui.log(&format!("  warning: ordinals file has {} records, expected {}",
                     ords.len(), interval));
@@ -251,16 +245,15 @@ fn write_ivec_1d(output: &Path, values: &[i32], pb: &veks_core::ui::ProgressHand
     let mut writer = AtomicWriter::new(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
 
-    let dim: i32 = 1;
+    // Encode a progress batch of values as dim=1 records at a time,
+    // into one buffer reused across batches.
     let batch = 10_000.max(values.len() / 1000);
-    for (i, &value) in values.iter().enumerate() {
-        writer
-            .write_all(&dim.to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        writer
-            .write_all(&value.to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        if (i + 1) % batch == 0 {
+    let mut records = Vec::new();
+    for chunk in values.chunks(batch) {
+        records.clear();
+        veks_io::writer::encode_records(chunk, 1, &mut records).map_err(|e| e.to_string())?;
+        writer.write_all(&records).map_err(|e| e.to_string())?;
+        if chunk.len() == batch {
             pb.inc(batch as u64);
         }
     }

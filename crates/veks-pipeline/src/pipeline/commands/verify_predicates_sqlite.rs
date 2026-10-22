@@ -331,7 +331,105 @@ impl CommandOp for VerifyPredicatesSqliteOp {
     }
 }
 
-/// Load scalar metadata (u8 or ivec) into SQLite.
+/// An integer element as an i64, by `as`: exact for every type but
+/// `u64`, whose values past `i64::MAX` keep their bits.
+trait WidenI64: Copy {
+    const ZERO: Self;
+    fn widen_i64(self) -> i64;
+}
+
+macro_rules! widen_i64 {
+    ($($t:ty),*) => {$(
+        impl WidenI64 for $t {
+            const ZERO: Self = 0;
+            #[inline]
+            fn widen_i64(self) -> i64 { self as i64 }
+        }
+    )*};
+}
+widen_i64!(u8, i8, u16, i16, u32, i32, u64, i64);
+
+/// Integer records of a metadata or predicate file, in order, each
+/// widened to i64 and handed to `each` with its ordinal.
+///
+/// The layout is the one the extension names, through veks-io's
+/// readers: a header-free integer column (`u8` … `i64`) holds each
+/// record as `fields` values of its type; an i32 vector file (`ivec`,
+/// `ivvec`, …) holds each as one record, of which the first `fields`
+/// values are given (fewer when the record is shorter). `what` names the
+/// file in the unsupported-format error.
+fn for_each_int_record(
+    path: &Path,
+    ext: &str,
+    fields: usize,
+    what: &str,
+    mut each: impl FnMut(i64, &[i64]) -> Result<(), String>,
+) -> Result<(), String> {
+    use veks_io::{Container, ElementType as E};
+    let open_err = |e: veks_io::IoError| format!("read {}: {}", path.display(), e);
+    match E::parse_extension(ext) {
+        Some((ty, Container::Scalar)) if ty.is_integer() => {
+            fn column<T: veks_io::Element + WidenI64, F: FnMut(i64, &[i64]) -> Result<(), String>>(
+                path: &Path,
+                fields: usize,
+                each: &mut F,
+            ) -> Result<(), String> {
+                use veks_io::VectorReader;
+                let reader = veks_io::ScalarReader::<T>::open_path(path)
+                    .map_err(|e| format!("read {}: {}", path.display(), e))?;
+                let mut values = vec![T::ZERO; reader.count()];
+                reader.read_into(0, &mut values).map_err(|e| format!("read {}: {}", path.display(), e))?;
+                // A trailing partial record is not a record.
+                let mut row = Vec::with_capacity(fields);
+                for (i, rec) in values.chunks_exact(fields).enumerate() {
+                    row.clear();
+                    row.extend(rec.iter().map(|&v| v.widen_i64()));
+                    each(i as i64, &row)?;
+                }
+                Ok(())
+            }
+            match ty {
+                E::U8 => column::<u8, _>(path, fields, &mut each),
+                E::I8 => column::<i8, _>(path, fields, &mut each),
+                E::U16 => column::<u16, _>(path, fields, &mut each),
+                E::I16 => column::<i16, _>(path, fields, &mut each),
+                E::U32 => column::<u32, _>(path, fields, &mut each),
+                E::I32 => column::<i32, _>(path, fields, &mut each),
+                E::U64 => column::<u64, _>(path, fields, &mut each),
+                _ => column::<i64, _>(path, fields, &mut each),
+            }
+        }
+        Some((E::I32, _)) if veks_io::reader::is_vvec_ext(ext) => {
+            // `ivec`/`ivvec`: records may differ in length. Walked front
+            // to back over the mapped bytes, so verifying an input writes
+            // no offset index beside it.
+            let mapped = veks_io::MappedFile::map(path)
+                .map_err(|e| format!("read {}: {}", path.display(), e))?;
+            let mut row = Vec::with_capacity(fields);
+            for (i, record) in veks_io::xvec::record::records(mapped.bytes(), 4).enumerate() {
+                let (_, payload) = record.map_err(|e| format!("record {}: {}", i, e))?;
+                row.clear();
+                row.extend(payload.chunks_exact(4).take(fields)
+                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64));
+                each(i as i64, &row)?;
+            }
+            Ok(())
+        }
+        Some((E::I32, Container::Vec)) => {
+            let reader = veks_io::XvecReader::<i32>::open_path(path).map_err(open_err)?;
+            let mut row = Vec::with_capacity(fields);
+            for i in 0..reader.count() {
+                row.clear();
+                row.extend(reader.get_slice(i).iter().take(fields).map(|&v| v as i64));
+                each(i as i64, &row)?;
+            }
+            Ok(())
+        }
+        _ => Err(format!("unsupported {} format: {}", what, ext)),
+    }
+}
+
+/// Load scalar metadata (an integer column or ivec) into SQLite.
 fn load_scalar_metadata(conn: &Connection, path: &Path, ext: &str, fields: usize) -> Result<usize, String> {
     // Create table
     let mut cols = vec!["ordinal INTEGER PRIMARY KEY".to_string()];
@@ -341,17 +439,6 @@ fn load_scalar_metadata(conn: &Connection, path: &Path, ext: &str, fields: usize
     let create_sql = format!("CREATE TABLE metadata ({})", cols.join(", "));
     conn.execute(&create_sql, []).map_err(|e| format!("create table: {}", e))?;
 
-    let data = std::fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-
-    let elem_size = match ext {
-        "u8" | "i8" => 1,
-        "u16" | "i16" => 2,
-        "u32" | "i32" => 4,
-        "u64" | "i64" => 8,
-        "ivec" | "ivecs" => 0, // special: xvec with dim header
-        _ => return Err(format!("unsupported metadata format: {}", ext)),
-    };
-
     let insert_sql = {
         let placeholders: Vec<&str> = (0..=fields).map(|_| "?").collect();
         format!("INSERT INTO metadata VALUES ({})", placeholders.join(", "))
@@ -360,54 +447,19 @@ fn load_scalar_metadata(conn: &Connection, path: &Path, ext: &str, fields: usize
     conn.execute("BEGIN", []).map_err(|e| e.to_string())?;
 
     let mut count = 0;
-    if elem_size > 0 {
-        // Scalar format: flat packed
-        let record_size = elem_size * fields;
-        let total = data.len() / record_size;
-        for i in 0..total {
-            let offset = i * record_size;
-            let mut params: Vec<i64> = vec![i as i64]; // ordinal
-            for f in 0..fields {
-                let fo = offset + f * elem_size;
-                let val = match elem_size {
-                    1 => data[fo] as i64,
-                    2 => i16::from_le_bytes([data[fo], data[fo+1]]) as i64,
-                    4 => i32::from_le_bytes(data[fo..fo+4].try_into().unwrap()) as i64,
-                    8 => i64::from_le_bytes(data[fo..fo+8].try_into().unwrap()),
-                    _ => 0,
-                };
-                params.push(val);
-            }
-            let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter()
-                .map(|v| v as &dyn rusqlite::types::ToSql).collect();
-            conn.execute(&insert_sql, refs.as_slice()).map_err(|e| format!("insert: {}", e))?;
-            count += 1;
-        }
-    } else {
-        // ivec format: [dim:i32, val0:i32, val1:i32, ...]
-        let mut offset = 0;
-        let mut ordinal = 0i64;
-        while offset + 4 <= data.len() {
-            let dim = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
-            offset += 4;
-            if offset + dim * 4 > data.len() { break; }
-            let mut params: Vec<i64> = vec![ordinal];
-            for f in 0..fields.min(dim) {
-                let fo = offset + f * 4;
-                params.push(i32::from_le_bytes(data[fo..fo+4].try_into().unwrap()) as i64);
-            }
-            // Pad missing fields with 0
-            while params.len() <= fields {
-                params.push(0);
-            }
-            let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter()
-                .map(|v| v as &dyn rusqlite::types::ToSql).collect();
-            conn.execute(&insert_sql, refs.as_slice()).map_err(|e| format!("insert: {}", e))?;
-            offset += dim * 4;
-            ordinal += 1;
-            count += 1;
-        }
-    }
+    let mut params: Vec<i64> = Vec::with_capacity(fields + 1);
+    for_each_int_record(path, ext, fields, "metadata", |ordinal, vals| {
+        params.clear();
+        params.push(ordinal);
+        params.extend_from_slice(vals);
+        // Pad missing fields with 0
+        params.resize(fields + 1, 0);
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql).collect();
+        conn.execute(&insert_sql, refs.as_slice()).map_err(|e| format!("insert: {}", e))?;
+        count += 1;
+        Ok(())
+    })?;
 
     conn.execute("COMMIT", []).map_err(|e| e.to_string())?;
 
@@ -420,66 +472,24 @@ fn load_scalar_metadata(conn: &Connection, path: &Path, ext: &str, fields: usize
     Ok(count)
 }
 
-/// Load scalar predicates (u8, ivec, etc.) into Vec<Vec<i64>>.
+/// Load scalar predicates (an integer column, ivec, ivvec) into Vec<Vec<i64>>.
 fn load_scalar_predicates(path: &Path, ext: &str, fields: usize) -> Result<Vec<Vec<i64>>, String> {
-    let data = std::fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-
-    let elem_size = match ext {
-        "u8" | "i8" => 1,
-        "u16" | "i16" => 2,
-        "u32" | "i32" => 4,
-        "u64" | "i64" => 8,
-        "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => 0,
-        _ => return Err(format!("unsupported predicate format: {}", ext)),
-    };
-
     let mut predicates = Vec::new();
-
-    if elem_size > 0 {
-        let record_size = elem_size * fields;
-        let total = data.len() / record_size;
-        for i in 0..total {
-            let offset = i * record_size;
-            let mut vals = Vec::with_capacity(fields);
-            for f in 0..fields {
-                let fo = offset + f * elem_size;
-                let val = match elem_size {
-                    1 => data[fo] as i64,
-                    2 => i16::from_le_bytes([data[fo], data[fo+1]]) as i64,
-                    4 => i32::from_le_bytes(data[fo..fo+4].try_into().unwrap()) as i64,
-                    8 => i64::from_le_bytes(data[fo..fo+8].try_into().unwrap()),
-                    _ => 0,
-                };
-                vals.push(val);
-            }
-            predicates.push(vals);
-        }
-    } else {
-        // ivec
-        let mut offset = 0;
-        while offset + 4 <= data.len() {
-            let dim = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
-            offset += 4;
-            if offset + dim * 4 > data.len() { break; }
-            let mut vals = Vec::with_capacity(fields.min(dim));
-            for f in 0..fields.min(dim) {
-                let fo = offset + f * 4;
-                vals.push(i32::from_le_bytes(data[fo..fo+4].try_into().unwrap()) as i64);
-            }
-            predicates.push(vals);
-            offset += dim * 4;
-        }
-    }
-
+    for_each_int_record(path, ext, fields, "predicate", |_, vals| {
+        predicates.push(vals.to_vec());
+        Ok(())
+    })?;
     Ok(predicates)
 }
 
 /// Load predicate results (ivec of matching ordinals per predicate).
 fn load_results(path: &Path, ext: &str) -> Result<Vec<Vec<i32>>, String> {
+    let is_i32_vvec = veks_io::reader::is_vvec_ext(ext)
+        && veks_io::ElementType::from_extension(ext) == Some(veks_io::ElementType::I32);
     match ext {
-        "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => {
+        _ if is_i32_vvec => {
             // Use IndexedVvecReader::<i32> for both uniform and variable-length ivec
-            let reader = vectordata::io::IndexedVvecReader::<i32>::open_path(path)
+            let reader = veks_io::IndexedVvecReader::<i32>::open_path(path)
                 .map_err(|e| format!("{}: {}", path.display(), e))?;
             let mut results = Vec::with_capacity(reader.count());
             for i in 0..reader.count() {

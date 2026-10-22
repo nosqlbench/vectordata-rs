@@ -158,18 +158,14 @@ vector ordering exactly.
         // Build value sequence to shuffle
         let mut values: Vec<i32> = if let Some(ref ord_path) = ordinals_path {
             ctx.ui.log(&format!("  loading ordinals from {}", ord_path.display()));
-            let data = match std::fs::read(ord_path) {
-                Ok(d) => d,
+            let reader = match veks_io::XvecReader::<i32>::open_path(ord_path) {
+                Ok(r) => r,
                 Err(e) => return error_result(format!("read ordinals: {}", e), start),
             };
-            let mut ords = Vec::with_capacity(interval);
-            let mut pos = 0;
-            while pos + 8 <= data.len() && ords.len() < interval {
-                pos += 4; // skip dim header
-                let val = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-                ords.push(val);
-                pos += 4;
-            }
+            // One ordinal per dim=1 ivec record, up to `interval` of them.
+            let ords: Vec<i32> = (0..reader.count().min(interval))
+                .map(|i| reader.get_slice(i)[0])
+                .collect();
             if ords.len() != interval {
                 ctx.ui.log(&format!("  warning: ordinals has {} records, expected {}",
                     ords.len(), interval));
@@ -243,15 +239,18 @@ vector ordering exactly.
             Ok(w) => w,
             Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
         };
-        let dim: i32 = 1;
-        for (i, &value) in values.iter().enumerate() {
-            if let Err(e) = writer.write_all(&dim.to_le_bytes()) {
+        // Encode a progress batch of values as dim=1 records at a time,
+        // into one buffer reused across batches.
+        let mut records = Vec::new();
+        for chunk in values.chunks(batch) {
+            records.clear();
+            if let Err(e) = veks_io::writer::encode_records(chunk, 1, &mut records) {
                 return error_result(format!("write: {}", e), start);
             }
-            if let Err(e) = writer.write_all(&value.to_le_bytes()) {
+            if let Err(e) = writer.write_all(&records) {
                 return error_result(format!("write: {}", e), start);
             }
-            if (i + 1) % batch == 0 {
+            if chunk.len() == batch {
                 write_pb.inc(batch as u64);
             }
         }

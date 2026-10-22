@@ -11,4 +11,5 @@ pub mod reader;
 pub mod writer;
 pub mod mmap;
 pub mod positional;
+pub mod record;
 pub mod varlen;

@@ -172,18 +172,16 @@ pub fn probe_xvec_directory(
         ));
     }
     files.sort_by(|a, b| natural_path_cmp(a, b));
+    let element = expected_format
+        .element_type()
+        .ok_or_else(|| format!("format {} names no element type", expected_format.name()))?;
 
     // Probe the first file's dim header so we can compute stride and
-    // validate every other file against it.
-    let dim = read_first_dim(&files[0])?;
-    if dim <= 0 {
-        return Err(format!(
-            "first file {} reports non-positive dim {}",
-            files[0].display(),
-            dim,
-        ));
-    }
-    let stride: u64 = 4 + dim as u64 * element_size as u64;
+    // validate every other file against it. The probe refuses a
+    // non-positive dim.
+    let first = probe_first_record(&files[0], element)?;
+    let dim = first.dim;
+    let stride: u64 = first.record_bytes;
 
     let mut per_file_bytes = Vec::with_capacity(files.len());
     let mut per_file_records = Vec::with_capacity(files.len());
@@ -205,7 +203,7 @@ pub fn probe_xvec_directory(
         // Cross-file dim check: peek the first 4 bytes of every file. Cheap
         // (one cached page read per file) and catches a corpus that mixes
         // dimensions, which would silently produce a corrupt output.
-        let file_dim = read_first_dim(f)?;
+        let file_dim = probe_first_record(f, element)?.dim;
         if file_dim != dim {
             return Err(format!(
                 "file {} has dim {} but first file {} has dim {} — \
@@ -875,17 +873,15 @@ fn kick_writeback(file: &File, offset: u64, len: u64) {
 #[cfg(not(target_os = "linux"))]
 fn kick_writeback(_file: &File, _offset: u64, _len: u64) {}
 
-/// Read the four-byte little-endian dim header from the start of an
-/// xvec file. Cheap enough that the probe phase calls it once per file
-/// to validate cross-file dimension consistency.
-fn read_first_dim(path: &Path) -> Result<i32, String> {
-    use std::io::Read;
-    let mut f = File::open(path)
+/// veks-io's probe of an xvec file's first header: its dim and record
+/// size, from a mapping touched for four bytes. Cheap enough that the
+/// probe phase calls it once per file to validate cross-file dimension
+/// consistency.
+fn probe_first_record(path: &Path, element: veks_io::ElementType) -> Result<veks_io::reader::XvecProbe, String> {
+    let file = veks_io::MappedFile::map(path)
         .map_err(|e| format!("open {}: {}", path.display(), e))?;
-    let mut buf = [0u8; 4];
-    f.read_exact(&mut buf)
-        .map_err(|e| format!("read dim header {}: {}", path.display(), e))?;
-    Ok(i32::from_le_bytes(buf))
+    veks_io::reader::probe_source(&file, element)
+        .map_err(|e| format!("read dim header {}: {}", path.display(), e))
 }
 
 /// Natural-order comparison on file basenames so unpadded shard
