@@ -267,13 +267,20 @@ impl CatalogSources {
     /// required: what `--at <name>` reads. `Ok(None)` when no catalog
     /// has the name; an error naming each when several do, since a
     /// choice between catalogs is never made by order.
+    ///
+    /// The set holds the catalog alone, with no overlays: the overlays
+    /// belong to the set they were registered on, and
+    /// [`at_sources`](crate::datasets::at_sources) carries them once
+    /// for every catalog it names. A program overlay carried by each of
+    /// two named sets would be registered twice when they are joined
+    /// with [`extend`](Self::extend), which refuses it as two programs
+    /// setting one key (OV-2).
     pub fn named(&self, name: &str) -> Result<Option<CatalogSources>, String> {
         let matches: Vec<&Slot> = self.sources.iter().filter(|slot| slot.source.name() == name).collect();
         match matches.as_slice() {
             [] => Ok(None),
             [slot] => Ok(Some(CatalogSources {
                 sources: vec![Slot { requirement: Requirement::Required, from_config: None, ..(*slot).clone() }],
-                overlays: self.overlays.clone(),
                 ..CatalogSources::default()
             })),
             several => Err(format!(

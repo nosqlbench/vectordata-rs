@@ -85,6 +85,15 @@ pub use reader::{AnyElement, AnyVectorReader, AnyVvecReader, ConvertingReader, D
 pub use source::{ByteSource, SourcePart};
 pub use stream::{SourceMeta, VarlenRecord, VarlenSink, VarlenSource, VecSink, VecSource};
 pub use transport::{Credentials, NoCredentials, RequestSigner, TlsTrust, TransportConfig};
+
+/// The YAML library the descriptor model is written in, at the version
+/// this crate uses: attributes, profile tags and overlay values are its
+/// values, so a consumer names them through this re-export and needs no
+/// `serde_yaml` dependency of its own.
+pub use serde_yaml;
+/// The value of a dataset attribute (`CatalogEntry::attribute`), a
+/// profile tag or an overlay entry: a `serde_yaml` value.
+pub use serde_yaml::Value as AttributeValue;
 pub use view::{
     CacheStats, FacetDescriptor, MappedRange, PrefetchHandle, PrefetchPlan, PrefetchReport, QuantizedBase, RangeFill,
     ShardRange, TestDataView, TestDataViewExt, WholeFacetFallback,

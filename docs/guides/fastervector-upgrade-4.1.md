@@ -104,8 +104,11 @@ match err {
 
 ### Facet storage and progress
 
-- `TestDataView::open_facet_storage` returns `Box<dyn FacetBytes>`. To
-  reach vectordata's `FacetStorage` behind it, use
+- `TestDataView::open_facet_storage` returns `Box<dyn FacetBytes>`
+  (`vectordata::FacetBytes`). Where you held a `&FacetStorage`, a
+  `&dyn FacetBytes` usually serves: `total_size`, `is_complete`,
+  `local_files`, `cache_stats` and `content_id` are on the contract. For
+  anything that is only vectordata's, downcast with
   `as_any().downcast_ref::<vectordata::view::FacetStorage>()`.
 - `content_id_with_progress` and `verify_cached` take a
   `&mut dyn ProgressSink`. A closure `|label, done, total| …` is one.

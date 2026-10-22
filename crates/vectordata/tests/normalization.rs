@@ -155,6 +155,57 @@ fn a_remote_measurement_is_recorded_by_content_id_and_reused() {
     assert_eq!((again.value, again.measured.worst_deviation), (first.value, first.measured.worst_deviation), "read from the record, not re-sampled");
 }
 
+/// **A fetch that completes a facet published without a `.mref` makes
+/// its recorded root known at once**, with no `content_id()` call in
+/// between: `known_content_id` is the root `content_id` computes, the
+/// first `normalization` records under it, and a reopened view's is
+/// served from that record. The base spans two chunks, so the root is
+/// a tree over leaves recorded by separate fetch workers.
+#[test]
+fn a_completed_fetch_without_a_reference_knows_its_root_and_records_the_measurement() {
+    use vectordata::fetch::{FetchRequest, Silent};
+    vectordata::settings::override_cache_dir_for_process(CACHE.path().to_path_buf());
+    let served = tempfile::tempdir().unwrap();
+    let dir = served.path().join("fetched-unit");
+    std::fs::create_dir(&dir).unwrap();
+    let rows = 800_000; // 12 bytes a row: 9.6 MB, two 8 MiB chunks
+    base(&dir.join("base.fvecs"), rows, 1.0);
+    dataset(&dir, "fetched-unit", "");
+    let expected = *vectordata::merkle::MerkleRef::from_content(&std::fs::read(dir.join("base.fvecs")).unwrap(), 8 * 1024 * 1024).root_hash();
+    let server = TestServer::start(served.path()).unwrap();
+    let url = format!("{}/fetched-unit/", server.base_url());
+
+    let file = {
+        let group = TestDataGroup::load(&url).unwrap();
+        let view = group.profile("default").unwrap();
+        view.fetch(&FetchRequest::all(), &mut Silent).unwrap();
+        let storage = view.open_facet_storage("base_vectors").unwrap();
+        let known = storage.known_content_id().expect("fetched whole: the recorded root is known");
+        assert_eq!(known.root, expected, "the root a .mref of the same bytes has");
+        assert_eq!(Some(known), storage.content_id().unwrap(), "the root content_id computes");
+
+        let first = view.normalization().unwrap();
+        assert!(first.value);
+        let AttributeSource::Measured { file: Some(file) } = &first.source else { panic!("not recorded: {:?}", first.source) };
+        let recorded = std::fs::read_to_string(file).unwrap();
+        assert!(recorded.contains(&known.hex()) && recorded.contains("is_normalized"), "{recorded}");
+        file.clone()
+    };
+
+    // A reopened view, its storage opened afresh from the cache, finds
+    // the record: the cached bytes made non-unit would show a re-take.
+    let cached = PathBuf::from(&file).parent().unwrap().join("base.fvecs");
+    let mut bytes = std::fs::read(&cached).unwrap();
+    for rec in 0..rows {
+        bytes[rec * 12 + 4..rec * 12 + 8].copy_from_slice(&9.0f32.to_le_bytes());
+    }
+    std::fs::write(&cached, &bytes).unwrap();
+    let view = TestDataGroup::load(&url).unwrap().profile("default").unwrap();
+    let again = view.normalization().unwrap();
+    assert!(again.value, "read from the record, not re-sampled");
+    assert_eq!(again.source, AttributeSource::Measured { file: Some(file) });
+}
+
 /// **A `norm` token's claim is the inferred source.**
 #[test]
 fn an_inferred_normalization_is_sourced_to_the_names() {

@@ -317,6 +317,24 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
 
 ### Fixes
 
+- **`vectordata::catalog::source::{CatalogSource, CatalogOrigin}`
+  resolve again.** 4.1.0 moved the two to veks-apicore and re-exported
+  them at `vectordata::catalog`, but not at `catalog::source`, where
+  4.0.2 defined them, so code naming them there stopped compiling.
+- **`datasets::at_sources` with two or more catalog names registered
+  a program overlay once per name.** Each named catalog came with the
+  candidates' overlays, so every name after the first added the
+  program's overlay again, and that was refused as two overlays setting
+  one key: an error diagnostic per name, which `Catalog::of` reported.
+  The overlays are now carried once for the whole set, and a location
+  in the list reads them as a name does. `CatalogSources::named`
+  returns the catalog alone.
+- **The attribute value type had no name in vectordata.** Attributes,
+  profile tags and overlay values are `serde_yaml` values, but neither
+  the type nor the crate was re-exported, so a program writing a helper
+  over attributes needed its own `serde_yaml` at vectordata's exact
+  version. `vectordata::AttributeValue` (and `veks_apicore::AttributeValue`)
+  names the type, and `vectordata::serde_yaml` is the crate.
 - **A directory of npy or parquet files that held a corrupt file
   ended early, quietly.** The loaders logged the file at info level
   and skipped it, so the stream stopped with fewer records than its

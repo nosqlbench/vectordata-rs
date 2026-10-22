@@ -33,7 +33,10 @@
 //! ```
 
 
-use super::{CatalogDiagnostic, CatalogOrigin, CatalogSource};
+// The contracts are veks-apicore's; they are re-exported here, where
+// they were defined before 4.1.0, as well as at `vectordata::catalog`.
+pub use super::{CatalogOrigin, CatalogSource};
+use super::CatalogDiagnostic;
 use crate::dataset::CatalogEntry;
 
 /// Whether a catalog in a [`CatalogSources`](super::CatalogSources) set

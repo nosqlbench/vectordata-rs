@@ -333,4 +333,7 @@ pub use veks_datatypes::{DistanceFunction, UnknownDistanceFunction};
 pub use veks_apicore::DownloadProgress;
 
 pub use veks_apicore::{Error, Result, TransportError};
+/// The attribute value type and the YAML library it comes from, so a
+/// program reading attributes needs no `serde_yaml` dependency.
+pub use veks_apicore::{AttributeValue, serde_yaml};
 

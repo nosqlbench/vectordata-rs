@@ -111,13 +111,12 @@ pub fn build_sources(program: &CatalogSources, configdir: &str, extra_catalogs: 
     let candidates = CatalogSources::new().configure(configdir).extend(program.clone());
     if !at.is_empty() {
         // `--at` names which catalogs to read; what the user and the
-        // program know of datasets (their overlays) still applies.
-        let sources = at_sources(&at, &candidates)
-            .unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            })
-            .with_overlays_from(&candidates);
+        // program know of datasets (their overlays) still applies, as
+        // `at_sources` carries them.
+        let sources = at_sources(&at, &candidates).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
         let named = sources.iter().map(|(s, _)| s.name().to_string()).collect();
         return RunSources { sources, named };
     }
@@ -140,8 +139,13 @@ pub fn build_sources(program: &CatalogSources, configdir: &str, extra_catalogs: 
 /// name; else a location, as before. A name two candidates share is an
 /// error naming both, never settled by order. Numbered shortcuts are
 /// resolved before this ([`catalog_args`]).
+///
+/// The set carries `candidates`' overlays, each once: `--at` names
+/// which catalogs to read, not what the user and the program know of
+/// datasets, so the overlays apply to every catalog named, a location
+/// as well as a name.
 pub fn at_sources(values: &[String], candidates: &CatalogSources) -> Result<CatalogSources, String> {
-    let mut sources = CatalogSources::new();
+    let mut sources = CatalogSources::new().with_overlays_from(candidates);
     for value in values {
         let is_location = value.contains("://")
             || std::path::Path::new(&crate::catalog::sources::expand_tilde(value)).exists();
