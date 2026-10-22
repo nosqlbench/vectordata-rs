@@ -44,7 +44,8 @@ println!("dim={}, records={:?}", meta.dimension, meta.record_count);
 
 // Stream-read all records
 let mut reader = open("dataset.fvecs")?;
-while let Some(record) = reader.next_record() {
+// Ok(None) is the end; an Err is a record that cannot be read
+while let Some(record) = reader.next_record()? {
     // record: Vec<u8> — raw little-endian element bytes
 }
 
@@ -77,7 +78,7 @@ For files where records have non-uniform dimensions:
 
 ```rust
 let mut reader = veks_io::open_varlen("mixed.fvecs")?;
-while let Some(record) = reader.next_record() {
+while let Some(record) = reader.next_record()? {
     println!("dim={}, bytes={}", record.dimension, record.data.len());
 }
 ```

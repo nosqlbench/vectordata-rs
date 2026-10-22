@@ -14,6 +14,7 @@ use std::path::Path;
 use byteorder::{LittleEndian, WriteBytesExt};
 
 use crate::format::VecFormat;
+use crate::reader::IoError;
 use crate::source::{MappedFile, mapping};
 use crate::traits::{VarlenRecord, VarlenSink, VarlenSource};
 use crate::xvec::reader::RELEASE_WINDOW;
@@ -33,7 +34,7 @@ pub fn open_reader(path: &Path, format: VecFormat) -> Result<Box<dyn VarlenSourc
 
     let file = MappedFile::map(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
     mapping::advise_sequential_bytes(file.bytes());
-    Ok(Box::new(XvecVarlenReader { file, elem_size, offset: 0, released: 0 }))
+    Ok(Box::new(XvecVarlenReader { file, path: path.to_path_buf(), elem_size, offset: 0, released: 0 }))
 }
 
 /// Open an xvec file for variable-length writing.
@@ -53,6 +54,8 @@ pub fn open_writer(path: &Path) -> Result<Box<dyn VarlenSink>, String> {
 
 struct XvecVarlenReader {
     file: MappedFile,
+    /// The file, for an error that names it.
+    path: std::path::PathBuf,
     elem_size: usize,
     /// Where the next record starts.
     offset: usize,
@@ -70,17 +73,49 @@ impl VarlenSource for XvecVarlenReader {
         None
     }
 
-    fn next_record(&mut self) -> Option<VarlenRecord> {
+    /// The end of the file at a record boundary is the end of the
+    /// stream. A header that is cut short or negative, or a record the
+    /// file ends inside of, is an error naming the file and the byte;
+    /// the cursor stays there, so a further call returns it again. A
+    /// header of 0 is a record with no elements, as the variable-length
+    /// writer writes it and the indexed reader reads it.
+    fn next_record(&mut self) -> Result<Option<VarlenRecord>, IoError> {
         let bytes = self.file.bytes();
-        let dim = crate::xvec::record::record_dim(bytes.get(self.offset..)?)? as u32;
+        let rest = &bytes[self.offset..];
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        let Some(header) = rest.get(..4) else {
+            return Err(self.malformed(format_args!("{} bytes remain, too few for a record header", rest.len())));
+        };
+        let header = i32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let Ok(dim) = usize::try_from(header) else {
+            return Err(self.malformed(format_args!("the header states dimension {header}")));
+        };
         let start = self.offset + 4;
-        let data = bytes.get(start..start + dim as usize * self.elem_size)?.to_vec();
+        let Some(data) = dim.checked_mul(self.elem_size).and_then(|n| bytes.get(start..start.checked_add(n)?)) else {
+            return Err(self.malformed(format_args!(
+                "the header states dimension {dim} and {} bytes follow it",
+                rest.len() - 4
+            )));
+        };
+        let data = data.to_vec();
         self.offset = start + data.len();
         if self.offset - self.released >= RELEASE_WINDOW as usize {
             mapping::release_range_bytes(bytes, self.released as u64, self.offset as u64);
             self.released = self.offset;
         }
-        Some(VarlenRecord { dimension: dim, data })
+        // A non-negative i32 header, so the cast is exact.
+        Ok(Some(VarlenRecord { dimension: dim as u32, data }))
+    }
+}
+
+impl XvecVarlenReader {
+    /// The error for the record at the cursor: the file, the byte and
+    /// what is wrong.
+    #[cold]
+    fn malformed(&self, what: std::fmt::Arguments<'_>) -> IoError {
+        IoError::InvalidFormat(format!("{}: the record at byte {}: {what}", self.path.display(), self.offset))
     }
 }
 
@@ -137,17 +172,17 @@ mod tests {
         writer.finish().unwrap();
 
         let mut reader = open_reader(&path, VecFormat::Fvec).unwrap();
-        let r0 = reader.next_record().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
         assert_eq!(r0.dimension, 2);
         assert_eq!(r0.data.len(), 8);
 
-        let r1 = reader.next_record().unwrap();
+        let r1 = reader.next_record().unwrap().unwrap();
         assert_eq!(r1.dimension, 2);
 
-        let r2 = reader.next_record().unwrap();
+        let r2 = reader.next_record().unwrap().unwrap();
         assert_eq!(r2.dimension, 2);
 
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     #[test]
@@ -169,22 +204,22 @@ mod tests {
 
         let mut reader = open_reader(&path, VecFormat::Fvec).unwrap();
 
-        let r0 = reader.next_record().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
         assert_eq!(r0.dimension, 1);
         assert_eq!(r0.data.len(), 4);
         assert_eq!(f32::from_le_bytes(r0.data[0..4].try_into().unwrap()), 1.0);
 
-        let r1 = reader.next_record().unwrap();
+        let r1 = reader.next_record().unwrap().unwrap();
         assert_eq!(r1.dimension, 3);
         assert_eq!(r1.data.len(), 12);
         assert_eq!(f32::from_le_bytes(r1.data[0..4].try_into().unwrap()), 2.0);
         assert_eq!(f32::from_le_bytes(r1.data[8..12].try_into().unwrap()), 4.0);
 
-        let r2 = reader.next_record().unwrap();
+        let r2 = reader.next_record().unwrap().unwrap();
         assert_eq!(r2.dimension, 2);
         assert_eq!(r2.data.len(), 8);
 
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     #[test]
@@ -209,7 +244,7 @@ mod tests {
         std::fs::File::create(&path).unwrap();
 
         let mut reader = open_reader(&path, VecFormat::Fvec).unwrap();
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     #[test]
@@ -230,10 +265,62 @@ mod tests {
         }
 
         let mut reader = open_reader(&path, VecFormat::Fvec).unwrap();
-        let r0 = reader.next_record().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
         assert_eq!(r0.dimension, 2);
-        // Truncated record should return None
-        assert!(reader.next_record().is_none());
+        // The record the file ends inside of is an error naming the
+        // file and the byte, not the end of the stream
+        let error = reader.next_record().unwrap_err().to_string();
+        assert!(error.contains("trunc.fvec") && error.contains("byte 12"), "{error}");
+        // and a further read returns it again rather than going on
+        assert!(reader.next_record().is_err());
+    }
+
+    #[test]
+    fn varlen_negative_header_is_an_error() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("negative.fvec");
+        let mut bytes = 1i32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&(-3i32).to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = open_reader(&path, VecFormat::Fvec).unwrap();
+        assert_eq!(reader.next_record().unwrap().unwrap().dimension, 1);
+        let error = reader.next_record().unwrap_err().to_string();
+        assert!(error.contains("dimension -3"), "{error}");
+    }
+
+    #[test]
+    fn varlen_short_tail_is_an_error() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("tail.fvec");
+        let mut bytes = 1i32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&[7, 0]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = open_reader(&path, VecFormat::Fvec).unwrap();
+        assert!(reader.next_record().unwrap().is_some());
+        let error = reader.next_record().unwrap_err().to_string();
+        assert!(error.contains("2 bytes remain"), "{error}");
+    }
+
+    /// A header of 0 is a record with no elements, as the writer writes
+    /// it: the stream goes on past it rather than ending there.
+    #[test]
+    fn varlen_empty_record_reads_and_continues() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("empty_record.ivec");
+        let mut writer = open_writer(&path).unwrap();
+        writer.write_record(0, &[]);
+        writer.write_record(1, &7i32.to_le_bytes());
+        writer.finish().unwrap();
+
+        let mut reader = open_reader(&path, VecFormat::Ivec).unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
+        assert_eq!((r0.dimension, r0.data.len()), (0, 0));
+        assert_eq!(reader.next_record().unwrap().unwrap().dimension, 1);
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     #[test]
@@ -249,14 +336,14 @@ mod tests {
         writer.finish().unwrap();
 
         let mut reader = open_reader(&path, VecFormat::Ivec).unwrap();
-        let r0 = reader.next_record().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
         assert_eq!(r0.dimension, 2);
         assert_eq!(r0.data.len(), 8);
 
-        let r1 = reader.next_record().unwrap();
+        let r1 = reader.next_record().unwrap().unwrap();
         assert_eq!(r1.dimension, 4);
         assert_eq!(r1.data.len(), 16);
 
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().unwrap().is_none());
     }
 }

@@ -309,7 +309,14 @@ Convert with explicit source format override:
             let mut epsilon_sum = 0.0f64;
             let mut sampled = 0usize;
             for _ in 0..sample_size {
-                if let Some(data) = source.next_record() {
+                let next = match source.next_record() {
+                    Ok(next) => next,
+                    Err(e) => return error_result(
+                        format!("failed to read source {}: {}", source_path.display(), e),
+                        start,
+                    ),
+                };
+                if let Some(data) = next {
                     let dim = data.len() / src_element_size;
                     let mut norm_sq = 0.0f64;
                     if src_element_size == 4 {
@@ -695,13 +702,18 @@ Convert with explicit source format override:
             ctx.ui.spinner("converting records")
         };
 
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(READ_AHEAD_BUFSIZE);
+        // A record the source cannot read travels as an error in its
+        // place, and the reader stops there.
+        let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>, veks_io::IoError>>(READ_AHEAD_BUFSIZE);
 
         let reader_handle = std::thread::Builder::new()
             .name("convert-reader".into())
             .spawn(move || {
-                while let Some(data) = source.next_record() {
-                    if tx.send(data).is_err() {
+                loop {
+                    let next = source.next_record().transpose();
+                    let Some(next) = next else { break };
+                    let failed = next.is_err();
+                    if tx.send(next).is_err() || failed {
                         break;
                     }
                 }
@@ -723,6 +735,16 @@ Convert with explicit source format override:
         count = 0;
         let mut failed: Option<String> = None;
         for data in rx {
+            let data = match data {
+                Ok(data) => data,
+                Err(e) => {
+                    failed = Some(format!(
+                        "failed to read source {} after {} record(s): {}",
+                        source_path.display(), input_count, e,
+                    ));
+                    break;
+                }
+            };
             input_count += 1;
             let record_data = match plan {
                 Some(plan) => match plan.convert_record(&data, &mut conv_buf) {

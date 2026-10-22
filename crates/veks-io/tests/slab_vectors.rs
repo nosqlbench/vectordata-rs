@@ -58,7 +58,7 @@ fn probed(meta: &SourceMeta) -> (u32, usize, Option<ElementType>) {
 
 fn all(mut source: Box<dyn VecSource>) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    while let Some(r) = source.next_record() {
+    while let Some(r) = source.next_record().unwrap() {
         out.push(r);
     }
     out

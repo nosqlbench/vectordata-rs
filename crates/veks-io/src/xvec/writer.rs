@@ -62,9 +62,10 @@ pub(crate) fn refuse_symlink(path: &Path) -> Result<(), String> {
 /// assert_eq!(std::fs::metadata(&path).unwrap().len(), 2 * (4 + 3));
 ///
 /// let mut reader = veks_io::open(&path).unwrap();
-/// reader.next_record().unwrap();
-/// let second = reader.next_record().unwrap();
+/// reader.next_record()?;
+/// let second = reader.next_record()?.unwrap();
 /// assert_eq!(second.iter().map(|&b| i8::from_le_bytes([b])).collect::<Vec<_>>(), [i8::MIN, 0, i8::MAX]);
+/// # Ok::<(), veks_io::IoError>(())
 /// ```
 pub fn open(path: &Path, dimension: u32) -> Result<Box<dyn VecSink>, String> {
     // Checked once here, so the hot loop is a plain copy of four bytes.

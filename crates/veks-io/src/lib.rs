@@ -48,12 +48,13 @@
 //! // Stream-read all records: each is a fresh Vec<u8> of element bytes
 //! let mut reader = open(&path).unwrap();
 //! let mut sum = 0.0f32;
-//! while let Some(record) = reader.next_record() {
+//! while let Some(record) = reader.next_record()? {
 //!     for chunk in record.chunks_exact(4) {
 //!         sum += f32::from_le_bytes(chunk.try_into().unwrap());
 //!     }
 //! }
 //! assert_eq!(sum, 21.0);
+//! # Ok::<(), veks_io::IoError>(())
 //! ```
 //!
 //! ## Zero-Copy Random Access
@@ -175,10 +176,11 @@ use std::path::Path;
 /// let mut reader = veks_io::open(&path).unwrap();
 /// assert_eq!((reader.dimension(), reader.element_size()), (3, 1));
 /// let mut rows: Vec<Vec<i8>> = Vec::new();
-/// while let Some(record) = reader.next_record() {
+/// while let Some(record) = reader.next_record()? {
 ///     rows.push(record.iter().map(|&b| i8::from_le_bytes([b])).collect());
 /// }
 /// assert_eq!(rows, [[-1, 2, -3], [4, -5, 6]]);
+/// # Ok::<(), veks_io::IoError>(())
 /// ```
 pub fn open(path: impl AsRef<Path>) -> Result<Box<dyn VecSource>, String> {
     let path = path.as_ref();
@@ -309,11 +311,12 @@ pub fn probe(path: impl AsRef<Path>) -> Result<SourceMeta, String> {
 /// let mut reader = veks_io::open_varlen(&path).unwrap();
 /// assert_eq!(reader.element_size(), 2); // u16
 /// let mut dims = Vec::new();
-/// while let Some(record) = reader.next_record() {
+/// while let Some(record) = reader.next_record()? {
 ///     assert_eq!(record.data.len(), record.dimension as usize * 2);
 ///     dims.push(record.dimension);
 /// }
 /// assert_eq!(dims, [2, 3]);
+/// # Ok::<(), veks_io::IoError>(())
 /// ```
 pub fn open_varlen(path: impl AsRef<Path>) -> Result<Box<dyn VarlenSource>, String> {
     let path = path.as_ref();
@@ -346,10 +349,11 @@ pub fn open_varlen(path: impl AsRef<Path>) -> Result<Box<dyn VarlenSource>, Stri
 /// writer.finish().unwrap();
 ///
 /// let mut reader = veks_io::open_varlen(&path).unwrap();
-/// let first = reader.next_record().unwrap();
+/// let first = reader.next_record()?.unwrap();
 /// assert_eq!(first.dimension, 2);
 /// assert_eq!(i64::from_le_bytes(first.data[8..16].try_into().unwrap()), -8);
-/// assert_eq!(reader.next_record().unwrap().dimension, 3);
+/// assert_eq!(reader.next_record()?.unwrap().dimension, 3);
+/// # Ok::<(), veks_io::IoError>(())
 /// ```
 pub fn create_varlen(path: impl AsRef<Path>) -> Result<Box<dyn VarlenSink>, String> {
     let path = path.as_ref();
@@ -400,15 +404,15 @@ mod tests {
         assert_eq!(reader.element_size(), 4);
         assert_eq!(reader.record_count(), Some(2));
 
-        let r0 = reader.next_record().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
         assert_eq!(r0.len(), 12); // 3 × 4 bytes
         let v0 = f32::from_le_bytes(r0[0..4].try_into().unwrap());
         assert_eq!(v0, 1.0);
 
-        let r1 = reader.next_record().unwrap();
+        let r1 = reader.next_record().unwrap().unwrap();
         assert_eq!(r1.len(), 12);
 
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     #[test]
@@ -427,7 +431,7 @@ mod tests {
         let mut reader = open(&path).unwrap();
         assert_eq!(reader.dimension(), 3);
         assert_eq!(reader.record_count(), Some(1));
-        let record = reader.next_record().unwrap();
+        let record = reader.next_record().unwrap().unwrap();
         assert_eq!(record, data);
     }
 
@@ -457,7 +461,7 @@ mod tests {
 
         let mut reader = open(&path).unwrap();
         assert_eq!(reader.dimension(), 2);
-        let record = reader.next_record().unwrap();
+        let record = reader.next_record().unwrap().unwrap();
         let v0 = i32::from_le_bytes(record[0..4].try_into().unwrap());
         let v1 = i32::from_le_bytes(record[4..8].try_into().unwrap());
         assert_eq!((v0, v1), (10, 20));
@@ -509,11 +513,11 @@ mod tests {
         assert_eq!(reader.element_size(), 2);
         assert_eq!(reader.record_count(), Some(2));
 
-        let r0 = reader.next_record().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
         assert_eq!(r0, v0);
-        let r1 = reader.next_record().unwrap();
+        let r1 = reader.next_record().unwrap().unwrap();
         assert_eq!(r1, v1);
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     // ── dvec (f64) roundtrip ────────────────────────────────────────
@@ -532,7 +536,7 @@ mod tests {
         let mut reader = open(&path).unwrap();
         assert_eq!(reader.dimension(), 2);
         assert_eq!(reader.element_size(), 8);
-        let r0 = reader.next_record().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
         let d0 = f64::from_le_bytes(r0[0..8].try_into().unwrap());
         let d1 = f64::from_le_bytes(r0[8..16].try_into().unwrap());
         assert_eq!((d0, d1), (1.0, 2.0));
@@ -554,7 +558,7 @@ mod tests {
         let mut reader = open(&path).unwrap();
         assert_eq!(reader.dimension(), 5);
         assert_eq!(reader.element_size(), 1);
-        let r0 = reader.next_record().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
         assert_eq!(r0, v0);
     }
 
@@ -574,7 +578,7 @@ mod tests {
         let mut reader = open(&path).unwrap();
         assert_eq!(reader.dimension(), 3);
         assert_eq!(reader.element_size(), 2);
-        let r0 = reader.next_record().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
         let s0 = i16::from_le_bytes(r0[0..2].try_into().unwrap());
         let s1 = i16::from_le_bytes(r0[2..4].try_into().unwrap());
         let s2 = i16::from_le_bytes(r0[4..6].try_into().unwrap());
@@ -626,11 +630,11 @@ mod tests {
         assert_eq!(reader.dimension(), 1);
         assert_eq!(reader.record_count(), Some(5));
         for i in 0..5 {
-            let r = reader.next_record().unwrap();
+            let r = reader.next_record().unwrap().unwrap();
             let v = f32::from_le_bytes(r[0..4].try_into().unwrap());
             assert_eq!(v, i as f32);
         }
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     // ── large dimension ─────────────────────────────────────────────
@@ -648,7 +652,7 @@ mod tests {
 
         let mut reader = open(&path).unwrap();
         assert_eq!(reader.dimension(), dim);
-        let r = reader.next_record().unwrap();
+        let r = reader.next_record().unwrap().unwrap();
         assert_eq!(r.len(), dim as usize * 4);
         let v0 = f32::from_le_bytes(r[0..4].try_into().unwrap());
         let vlast = f32::from_le_bytes(r[(dim as usize - 1) * 4..dim as usize * 4].try_into().unwrap());
@@ -678,7 +682,7 @@ mod tests {
 
         let mut reader = open(&path).unwrap();
         let mut read_count = 0u32;
-        while reader.next_record().is_some() {
+        while reader.next_record().unwrap().is_some() {
             read_count += 1;
         }
         assert_eq!(read_count, count);
@@ -736,11 +740,17 @@ mod tests {
 
         let mut reader = open(&path).unwrap();
         assert_eq!(reader.dimension(), 3);
-        let r0 = reader.next_record();
+        let r0 = reader.next_record().unwrap();
         assert!(r0.is_some(), "first record should be readable");
-        // Second record has wrong dim — reader should stop
-        let r1 = reader.next_record();
-        assert!(r1.is_none(), "dimension mismatch should stop iteration");
+        // Second record has wrong dim — an error naming the file and
+        // the record, not the end of the stream
+        let r1 = reader.next_record().unwrap_err().to_string();
+        assert!(
+            r1.contains("bad_dim.fvec") && r1.contains("record 1") && r1.contains("dimension 5"),
+            "dimension mismatch is an error: {r1}"
+        );
+        // and the stream does not go on past it
+        assert!(reader.next_record().is_err());
     }
 
     // ── mmap on truncated file ──────────────────────────────────────
@@ -786,7 +796,7 @@ mod tests {
         assert_eq!(meta.record_count, Some(3));
 
         let mut reader = open(&path).unwrap();
-        let r0 = reader.next_record().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
         let v00 = f32::from_le_bytes(r0[0..4].try_into().unwrap());
         assert_eq!(v00, 0.0);
 
@@ -852,10 +862,10 @@ mod tests {
         assert_eq!(meta.record_count, Some(3));
 
         let mut r = open(&path).unwrap();
-        assert_eq!(r.next_record().unwrap(), vec![0u8]);
-        assert_eq!(r.next_record().unwrap(), vec![127u8]);
-        assert_eq!(r.next_record().unwrap(), vec![255u8]);
-        assert!(r.next_record().is_none());
+        assert_eq!(r.next_record().unwrap().unwrap(), vec![0u8]);
+        assert_eq!(r.next_record().unwrap().unwrap(), vec![127u8]);
+        assert_eq!(r.next_record().unwrap().unwrap(), vec![255u8]);
+        assert!(r.next_record().unwrap().is_none());
     }
 
     #[test]
@@ -874,9 +884,9 @@ mod tests {
         assert_eq!(meta.record_count, Some(5));
 
         let mut r = open(&path).unwrap();
-        let v0 = r.next_record().unwrap();
+        let v0 = r.next_record().unwrap().unwrap();
         assert_eq!(i32::from_le_bytes(v0[..4].try_into().unwrap()), -1);
-        let v3 = { r.next_record(); r.next_record(); r.next_record().unwrap() };
+        let v3 = { r.next_record().unwrap(); r.next_record().unwrap(); r.next_record().unwrap().unwrap() };
         assert_eq!(i32::from_le_bytes(v3[..4].try_into().unwrap()), i32::MAX);
     }
 
@@ -937,7 +947,7 @@ mod tests {
         let mut r = open(&path).unwrap();
         assert_eq!(r.dimension(), 3);
         assert_eq!(r.element_size(), 1);
-        let rec = r.next_record().unwrap();
+        let rec = r.next_record().unwrap().unwrap();
         assert_eq!(rec[0] as i8, -1);
         assert_eq!(rec[1] as i8, 0);
         assert_eq!(rec[2] as i8, 127);
@@ -985,7 +995,7 @@ mod tests {
         let mut r = open(&path).unwrap();
         assert_eq!(r.dimension(), 1);
         assert_eq!(r.element_size(), 8);
-        let rec = r.next_record().unwrap();
+        let rec = r.next_record().unwrap().unwrap();
         assert_eq!(i64::from_le_bytes(rec[..8].try_into().unwrap()), i64::MIN);
     }
 
@@ -1000,7 +1010,7 @@ mod tests {
 
         let mut r = open(&path).unwrap();
         assert_eq!(r.element_size(), 8);
-        let rec = r.next_record().unwrap();
+        let rec = r.next_record().unwrap().unwrap();
         assert_eq!(u64::from_le_bytes(rec[..8].try_into().unwrap()), u64::MAX);
     }
 }

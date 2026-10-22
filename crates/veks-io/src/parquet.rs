@@ -26,6 +26,7 @@ use arrow::array::{Array, ListArray};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+use crate::reader::IoError;
 use crate::traits::{SourceMeta, VecSource};
 use veks_datatypes::ElementType;
 
@@ -57,8 +58,10 @@ struct PrefetchGate {
 struct IndexedFile {
     /// Position in the original sorted file list
     index: usize,
-    /// All record batches from this file
-    batches: Vec<RecordBatch>,
+    /// All record batches from this file, or why it failed to load,
+    /// naming it. The consumer returns the error when it reaches this
+    /// index, so a failure lands where the file's rows would have.
+    batches: Result<Vec<RecordBatch>, String>,
 }
 
 /// Shared work queue: workers atomically claim the next file index to load.
@@ -92,19 +95,31 @@ impl WorkQueue {
 /// unloaded file from a shared `WorkQueue`, loads it, and sends the result
 /// (tagged with its file index) through a channel. The consumer reassembles
 /// results in sorted order using a small reorder buffer.
+///
+/// A file that fails to load is an error at its place in that order:
+/// the stream yields every row of the files before it, then the error,
+/// naming the file. So is a row that is not one vector of the stream's
+/// dimension and element type — a later file of another schema, a null
+/// row, a list of another length — and loaders that stop before every
+/// file is delivered.
 pub struct ParquetDirReader {
     /// Channel receiving loaded files from the worker pool
     receiver: mpsc::Receiver<IndexedFile>,
     /// Shared prefetch gate for adaptive backpressure
     gate: Arc<PrefetchGate>,
     /// Reorder buffer: files that arrived out of order, keyed by file index
-    reorder_buf: HashMap<usize, Vec<RecordBatch>>,
+    reorder_buf: HashMap<usize, Result<Vec<RecordBatch>, String>>,
     /// The file index we need next to maintain sorted order
     next_file_index: usize,
     /// Total number of files being loaded
     total_files: usize,
+    /// Every file's path, for an error that names the file it is in
+    files: Arc<WorkQueue>,
     /// Batches from the currently-consumed file
     current_batches: Vec<RecordBatch>,
+    /// Whether the current file holds an in-flight slot: every file a
+    /// worker loaded does; the first, loaded by `open`, does not
+    holds_slot: bool,
     /// Index into `current_batches`
     current_batch_idx: usize,
     /// Row index within the current batch
@@ -117,6 +132,8 @@ pub struct ParquetDirReader {
     dimension: u32,
     /// Total record count across all files
     record_count: Option<u64>,
+    /// The error the stream stopped at; every later read returns it.
+    failure: Option<String>,
     /// Worker thread handles
     _workers: Vec<thread::JoinHandle<()>>,
 }
@@ -330,18 +347,16 @@ impl ParquetDirReader {
                         break;
                     };
 
-                    match load_parquet_file(path) {
-                        Ok(batches) => {
-                            if tx.send(IndexedFile { index: idx, batches }).is_err() {
-                                break; // consumer dropped
-                            }
-                        }
-                        Err(e) => {
-                            log::info!("Warning: failed to load {}: {}", path.display(), e);
-                            let mut in_flight = gate.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
-                            *in_flight -= 1;
-                            gate.can_send.notify_one();
-                        }
+                    let batches = load_parquet_file(path);
+                    if batches.is_err() {
+                        // A failure holds no rows in memory: its slot is
+                        // free at once, not when the consumer passes it.
+                        let mut in_flight = gate.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+                        *in_flight -= 1;
+                        gate.can_send.notify_one();
+                    }
+                    if tx.send(IndexedFile { index: idx, batches }).is_err() {
+                        break; // consumer dropped
                     }
                 }
             }));
@@ -353,15 +368,19 @@ impl ParquetDirReader {
             receiver: rx,
             gate,
             reorder_buf: HashMap::new(),
-            next_file_index: 0,
+            // File 0 is current already; the workers deliver from 1.
+            next_file_index: 1,
             total_files,
+            files: queue,
             current_batches: first_batches,
+            holds_slot: false,
             current_batch_idx: 0,
             current_row: 0,
             vector_col_idx,
             element,
             dimension,
             record_count: Some(total_rows),
+            failure: None,
             _workers: workers,
         }))
     }
@@ -373,38 +392,38 @@ impl ParquetDirReader {
         self.gate.can_send.notify_one();
     }
 
-    /// Try to advance to the next file in sorted order.
+    /// Try to advance to the next file in sorted order: `Ok(false)` past
+    /// the last file, and an error for the next file failing to load or
+    /// the loaders stopping before delivering it.
     ///
     /// First checks the reorder buffer for the next expected file index. If
     /// not buffered, receives from the channel — buffering any out-of-order
     /// results — until the needed file arrives or the channel closes.
-    fn advance_to_next_file(&mut self) -> bool {
+    fn advance_to_next_file(&mut self) -> Result<bool, IoError> {
         if self.next_file_index >= self.total_files {
-            return false;
+            return Ok(false);
         }
 
         // Release the previous file's in-flight slot
-        if !self.current_batches.is_empty() {
+        if self.holds_slot {
             self.release_in_flight();
-            self.current_batches.clear();
+            self.holds_slot = false;
         }
+        self.current_batches.clear();
 
         // Check reorder buffer first — the file's in-flight slot will be
         // released at the top of the NEXT advance_to_next_file call when
         // this file finishes being consumed.
         if let Some(batches) = self.reorder_buf.remove(&self.next_file_index) {
-            self.current_batches = batches;
-            self.current_batch_idx = 0;
-            self.current_row = 0;
-            self.next_file_index += 1;
-            return true;
+            self.install(batches)?;
+            return Ok(true);
         }
 
         // Try non-blocking first to detect "shorts"
         match self.receiver.try_recv() {
             Ok(loaded) => {
-                if self.accept_loaded(loaded) {
-                    return true;
+                if self.accept_loaded(loaded)? {
+                    return Ok(true);
                 }
                 // Out of order — stashed, fall through to block-receive
             }
@@ -420,7 +439,7 @@ impl ParquetDirReader {
                     );
                 }
             }
-            Err(mpsc::TryRecvError::Disconnected) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => return Err(self.loaders_stopped()),
         }
 
         // Block-receive until we get the file we need, checking the reorder
@@ -430,36 +449,92 @@ impl ParquetDirReader {
             // Check reorder buffer — the file's in-flight slot will be
             // released at the top of the NEXT advance_to_next_file call.
             if let Some(batches) = self.reorder_buf.remove(&self.next_file_index) {
-                self.current_batches = batches;
-                self.current_batch_idx = 0;
-                self.current_row = 0;
-                self.next_file_index += 1;
-                return true;
+                self.install(batches)?;
+                return Ok(true);
             }
             match self.receiver.recv() {
                 Ok(loaded) => {
-                    if self.accept_loaded(loaded) {
-                        return true;
+                    if self.accept_loaded(loaded)? {
+                        return Ok(true);
                     }
                 }
-                Err(_) => return false,
+                Err(_) => return Err(self.loaders_stopped()),
             }
         }
     }
 
     /// Process a received `IndexedFile`: if it's the one we need, install it
     /// as current; otherwise stash it in the reorder buffer and return false.
-    fn accept_loaded(&mut self, loaded: IndexedFile) -> bool {
+    fn accept_loaded(&mut self, loaded: IndexedFile) -> Result<bool, IoError> {
         if loaded.index == self.next_file_index {
-            self.current_batches = loaded.batches;
-            self.current_batch_idx = 0;
-            self.current_row = 0;
-            self.next_file_index += 1;
-            true
+            self.install(loaded.batches)?;
+            Ok(true)
         } else {
             self.reorder_buf.insert(loaded.index, loaded.batches);
-            false
+            Ok(false)
         }
+    }
+
+    /// Make the next file current, or stop the stream at its error. A
+    /// file a worker loaded holds an in-flight slot until it is passed.
+    fn install(&mut self, batches: Result<Vec<RecordBatch>, String>) -> Result<(), IoError> {
+        self.next_file_index += 1;
+        match batches {
+            Ok(batches) => {
+                self.current_batches = batches;
+                self.holds_slot = true;
+                self.current_batch_idx = 0;
+                self.current_row = 0;
+                Ok(())
+            }
+            Err(message) => Err(self.fail(message)),
+        }
+    }
+
+    /// Check the current batch's vector column is a list of the
+    /// stream's element type, once per batch: a later file of another
+    /// schema is an error naming it, not a panic or rows of the wrong
+    /// width.
+    fn check_batch(&self) -> Result<(), String> {
+        let batch = &self.current_batches[self.current_batch_idx];
+        let col = batch.columns().get(self.vector_col_idx).ok_or_else(|| {
+            format!("has {} column(s), and the vector column is column {}", batch.num_columns(), self.vector_col_idx)
+        })?;
+        if list_element(col.data_type()) != Some(self.element) {
+            return Err(format!(
+                "column {} is {}, not a list of {}",
+                self.vector_col_idx,
+                col.data_type(),
+                self.element
+            ));
+        }
+        Ok(())
+    }
+
+    /// The error for a row of the current file that is not a vector of
+    /// the stream's shape.
+    #[cold]
+    fn bad_row(&mut self, what: String) -> IoError {
+        let file = self.files.files[self.next_file_index - 1].display().to_string();
+        self.fail(format!("{file}: {what}"))
+    }
+
+    /// The error for a channel that closed with files still undelivered.
+    #[cold]
+    fn loaders_stopped(&mut self) -> IoError {
+        let message = format!(
+            "parquet loaders stopped after {} of {} file(s); the rest were never delivered",
+            self.next_file_index, self.total_files
+        );
+        self.fail(message)
+    }
+
+    /// Stop the stream at `message`: this read and every later one
+    /// return it.
+    #[cold]
+    fn fail(&mut self, message: String) -> IoError {
+        self.failure = Some(message.clone());
+        IoError::InvalidFormat(message)
     }
 }
 
@@ -480,18 +555,43 @@ impl VecSource for ParquetDirReader {
         self.record_count
     }
 
-    fn next_record(&mut self) -> Option<Vec<u8>> {
+    fn next_record(&mut self) -> Result<Option<Vec<u8>>, IoError> {
+        if let Some(message) = &self.failure {
+            return Err(IoError::InvalidFormat(message.clone()));
+        }
         loop {
             // Try current batch
             if self.current_batch_idx < self.current_batches.len() {
                 let batch = &self.current_batches[self.current_batch_idx];
                 if self.current_row < batch.num_rows() {
+                    let row = self.current_row;
+                    if row == 0
+                        && let Err(what) = self.check_batch()
+                    {
+                        return Err(self.bad_row(what));
+                    }
+                    let batch = &self.current_batches[self.current_batch_idx];
                     let col = batch.column(self.vector_col_idx);
-                    let values = list_row(col.as_ref(), self.current_row)?;
+                    let values = match list_row(col.as_ref(), row) {
+                        Some(values) if col.is_valid(row) && values.len() == self.dimension as usize => values,
+                        values => {
+                            let what = match values {
+                                None => format!("column {} is not a list column", self.vector_col_idx),
+                                Some(_) if col.is_null(row) => format!("row {row} of batch {} is null", self.current_batch_idx),
+                                Some(v) => format!(
+                                    "row {row} of batch {} holds {} elements where the stream's dimension is {}",
+                                    self.current_batch_idx,
+                                    v.len(),
+                                    self.dimension
+                                ),
+                            };
+                            return Err(self.bad_row(what));
+                        }
+                    };
                     let bytes = row_bytes(values.as_ref(), self.element.byte_width());
 
                     self.current_row += 1;
-                    return Some(bytes);
+                    return Ok(Some(bytes));
                 }
                 // Next batch in this file
                 self.current_batch_idx += 1;
@@ -500,8 +600,8 @@ impl VecSource for ParquetDirReader {
             }
 
             // Need next file in sorted order
-            if !self.advance_to_next_file() {
-                return None;
+            if !self.advance_to_next_file()? {
+                return Ok(None);
             }
         }
     }
@@ -584,31 +684,37 @@ fn format_schema(schema: &Arc<arrow::datatypes::Schema>) -> String {
     lines.join("\n")
 }
 
-/// Find the first column in the schema that is a list of floats
+/// Find the first column in the schema that is a list of numbers.
 fn find_vector_column(schema: &Arc<arrow::datatypes::Schema>) -> Option<(usize, ElementType)> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find_map(|(i, field)| list_element(field.data_type()).map(|element| (i, element)))
+}
+
+/// The element type of a list column — `List`, `LargeList` or
+/// `FixedSizeList` — of numbers; `None` for any other column.
+fn list_element(data_type: &arrow::datatypes::DataType) -> Option<ElementType> {
     use arrow::datatypes::DataType;
-    for (i, field) in schema.fields().iter().enumerate() {
-        let inner = match field.data_type() {
-            DataType::List(inner) | DataType::LargeList(inner) | DataType::FixedSizeList(inner, _) => inner,
-            _ => continue,
-        };
-        let element = match inner.data_type() {
-            DataType::Int8 => ElementType::I8,
-            DataType::UInt8 => ElementType::U8,
-            DataType::Int16 => ElementType::I16,
-            DataType::UInt16 => ElementType::U16,
-            DataType::Int32 => ElementType::I32,
-            DataType::UInt32 => ElementType::U32,
-            DataType::Int64 => ElementType::I64,
-            DataType::UInt64 => ElementType::U64,
-            DataType::Float16 => ElementType::F16,
-            DataType::Float32 => ElementType::F32,
-            DataType::Float64 => ElementType::F64,
-            _ => continue,
-        };
-        return Some((i, element));
-    }
-    None
+    let inner = match data_type {
+        DataType::List(inner) | DataType::LargeList(inner) | DataType::FixedSizeList(inner, _) => inner,
+        _ => return None,
+    };
+    Some(match inner.data_type() {
+        DataType::Int8 => ElementType::I8,
+        DataType::UInt8 => ElementType::U8,
+        DataType::Int16 => ElementType::I16,
+        DataType::UInt16 => ElementType::U16,
+        DataType::Int32 => ElementType::I32,
+        DataType::UInt32 => ElementType::U32,
+        DataType::Int64 => ElementType::I64,
+        DataType::UInt64 => ElementType::U64,
+        DataType::Float16 => ElementType::F16,
+        DataType::Float32 => ElementType::F32,
+        DataType::Float64 => ElementType::F64,
+        _ => return None,
+    })
 }
 
 /// Get vector dimension from the first row of a batch

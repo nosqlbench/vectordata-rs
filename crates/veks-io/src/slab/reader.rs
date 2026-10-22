@@ -11,6 +11,7 @@ use veks_apicore::metadata_schema::{
 };
 
 use crate::element::ElementType;
+use crate::reader::IoError;
 use crate::traits::{SourceMeta, VecSource};
 
 /// Reads a `.slab` file containing vector data using the `slabtastic` crate.
@@ -25,6 +26,8 @@ use crate::traits::{SourceMeta, VecSource};
 /// [`element_size`](VecSource::element_size) is 1, the dimension counts
 /// bytes, and opening it logs one warning saying so.
 pub struct SlabReader {
+    /// The slab, for an error that names it.
+    path: std::path::PathBuf,
     batch_iter: SlabBatchIter,
     current_batch: Vec<(i64, Vec<u8>)>,
     current_idx: usize,
@@ -191,6 +194,7 @@ impl SlabReader {
         let batch_iter = reader.batch_iter(4096);
 
         Ok(Box::new(SlabReader {
+            path: path.to_path_buf(),
             batch_iter,
             current_batch: Vec::new(),
             current_idx: 0,
@@ -218,22 +222,29 @@ impl VecSource for SlabReader {
         self.record_count
     }
 
-    fn next_record(&mut self) -> Option<Vec<u8>> {
+    /// A page that cannot be read is an error naming the slab, not
+    /// the end of the stream.
+    fn next_record(&mut self) -> Result<Option<Vec<u8>>, IoError> {
         loop {
             if self.current_idx < self.current_batch.len() {
                 let (_ordinal, data) = &self.current_batch[self.current_idx];
                 self.current_idx += 1;
-                return Some(data.clone());
+                return Ok(Some(data.clone()));
             }
 
             // Fetch next batch
             match self.batch_iter.next_batch() {
-                Ok(batch) if batch.is_empty() => return None,
+                Ok(batch) if batch.is_empty() => return Ok(None),
                 Ok(batch) => {
                     self.current_batch = batch;
                     self.current_idx = 0;
                 }
-                Err(_) => return None,
+                Err(e) => {
+                    return Err(IoError::InvalidFormat(format!(
+                        "{}: reading a page: {e}",
+                        self.path.display()
+                    )));
+                }
             }
         }
     }

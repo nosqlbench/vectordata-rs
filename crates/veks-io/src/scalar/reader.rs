@@ -7,6 +7,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 use crate::format::VecFormat;
+use crate::reader::IoError;
 use crate::traits::{SourceMeta, VecSource};
 
 /// Open a scalar file for streaming reading.
@@ -29,6 +30,7 @@ pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String
     let count = file_len / elem_size;
     Ok(Box::new(ScalarReader {
         reader: BufReader::with_capacity(4 * 1024 * 1024, file),
+        path: path.to_path_buf(),
         element_size: elem_size,
         element: format.element_type(),
         total: count,
@@ -61,6 +63,8 @@ pub fn probe(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
 
 struct ScalarReader {
     reader: BufReader<std::fs::File>,
+    /// The file, for an error that names it.
+    path: std::path::PathBuf,
     element_size: usize,
     element: Option<veks_datatypes::ElementType>,
     total: usize,
@@ -73,17 +77,23 @@ impl VecSource for ScalarReader {
     fn element_type(&self) -> Option<veks_datatypes::ElementType> { self.element }
     fn record_count(&self) -> Option<u64> { Some(self.total as u64) }
 
-    fn next_record(&mut self) -> Option<Vec<u8>> {
+    /// A value the file's size at open promised and a read cannot
+    /// deliver — the file shrank, or the read failed — is an error
+    /// naming the file and the value, not the end of the stream.
+    fn next_record(&mut self) -> Result<Option<Vec<u8>>, IoError> {
         if self.read >= self.total {
-            return None;
+            return Ok(None);
         }
         let mut buf = vec![0u8; self.element_size];
         match self.reader.read_exact(&mut buf) {
             Ok(()) => {
                 self.read += 1;
-                Some(buf)
+                Ok(Some(buf))
             }
-            Err(_) => None,
+            Err(e) => Err(IoError::Io(std::io::Error::new(
+                e.kind(),
+                format!("{}: value {} of {}: {e}", self.path.display(), self.read, self.total),
+            ))),
         }
     }
 }

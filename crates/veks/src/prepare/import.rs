@@ -3450,7 +3450,18 @@ fn probe_directory_vectors(path: &Path) -> Option<(bool, usize, f64)> {
         _ => 4,                // f32 (fvec, npy, parquet)
     };
     let mut norms = Vec::with_capacity(100);
-    while let Some(record) = source.next_record() {
+    loop {
+        // A record the source cannot read ends the probe without a
+        // verdict: norms of the records before it are not the sample
+        // the verdict is drawn from.
+        let record = match source.next_record() {
+            Ok(Some(record)) => record,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("Warning: {}: cannot sample vectors for normalization: {e}", path.display());
+                return None;
+            }
+        };
         if record.is_empty() { continue; }
         let actual_elem_size = if record.len() == dim * 2 { 2 }
             else if record.len() == dim * 4 { 4 }

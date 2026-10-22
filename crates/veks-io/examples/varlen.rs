@@ -24,7 +24,7 @@ fn main() -> Result<(), String> {
     // ── Read back ────────────────────────────────────────────────────
     let mut reader = veks_io::open_varlen(&path)?;
     println!("\nRecords:");
-    while let Some(record) = reader.next_record() {
+    while let Some(record) = reader.next_record().map_err(|e| e.to_string())? {
         let floats: Vec<f32> = record.data
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))

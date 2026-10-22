@@ -23,6 +23,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use ndarray::Array2;
 use ndarray_npy::ReadNpyExt;
 
+use crate::reader::IoError;
 use crate::traits::{SourceMeta, VecSource};
 use veks_datatypes::ElementType;
 
@@ -97,8 +98,10 @@ struct PrefetchGate {
 struct IndexedFile {
     /// Position in the original sorted file list
     index: usize,
-    /// Loaded array data
-    data: NpyArrayData,
+    /// Loaded array data, or why the file failed to load, naming it.
+    /// The consumer returns the error when it reaches this index, so a
+    /// failure lands where the file's rows would have.
+    data: Result<NpyArrayData, String>,
 }
 
 /// Shared work queue: workers atomically claim the next file index to load.
@@ -330,13 +333,18 @@ pub fn scan_npy_headers(path: &Path, max_count: Option<u64>) -> Result<NpyScanRe
 /// Results are reassembled in strict file-sorted order using a reorder
 /// buffer, so row ordering is deterministic regardless of which worker
 /// finishes first.
+///
+/// A file that fails to load is an error at its place in that order:
+/// the stream yields every row of the files before it, then the error,
+/// naming the file. Loaders that stop before every file is delivered
+/// are an error too, never an early end.
 pub struct NpyDirReader {
     /// Channel receiving loaded files from the worker pool
     receiver: mpsc::Receiver<IndexedFile>,
     /// Shared prefetch gate for adaptive backpressure
     gate: Arc<PrefetchGate>,
     /// Reorder buffer: files that arrived out of order, keyed by file index
-    reorder_buf: HashMap<usize, NpyArrayData>,
+    reorder_buf: HashMap<usize, Result<NpyArrayData, String>>,
     /// The file index we need next to maintain sorted order
     next_file_index: usize,
     /// Total number of files being loaded
@@ -351,6 +359,8 @@ pub struct NpyDirReader {
     record_count: Option<u64>,
     /// Element type
     dtype: NpyDtype,
+    /// The error the stream stopped at; every later read returns it.
+    failure: Option<String>,
     /// Worker thread handles
     _workers: Vec<thread::JoinHandle<()>>,
 }
@@ -459,18 +469,20 @@ impl NpyDirReader {
                         break;
                     };
 
-                    match load_npy(path, queue.dtype) {
-                        Ok(array) => {
-                            if tx.send(IndexedFile { index: idx, data: array }).is_err() {
-                                break; // consumer dropped
-                            }
-                        }
-                        Err(e) => {
-                            log::info!("Warning: failed to load {}: {}", path.display(), e);
-                            let mut in_flight = gate.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
-                            *in_flight -= 1;
-                            gate.can_send.notify_one();
-                        }
+                    // The error names the file, once.
+                    let data = load_npy(path, queue.dtype).map_err(|e| {
+                        let name = path.display().to_string();
+                        if e.contains(&name) { e } else { format!("{name}: {e}") }
+                    });
+                    if data.is_err() {
+                        // A failure holds no rows in memory: its slot is
+                        // free at once, not when the consumer passes it.
+                        let mut in_flight = gate.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+                        *in_flight -= 1;
+                        gate.can_send.notify_one();
+                    }
+                    if tx.send(IndexedFile { index: idx, data }).is_err() {
+                        break; // consumer dropped
                     }
                 }
             }));
@@ -489,6 +501,7 @@ impl NpyDirReader {
             dimension,
             record_count: Some(total_rows),
             dtype,
+            failure: None,
             _workers: workers,
         }))
     }
@@ -500,14 +513,16 @@ impl NpyDirReader {
         self.gate.can_send.notify_one();
     }
 
-    /// Try to advance to the next file in sorted order.
+    /// Try to advance to the next file in sorted order: `Ok(false)` past
+    /// the last file, and an error for the next file failing to load or
+    /// the loaders stopping before delivering it.
     ///
     /// First checks the reorder buffer for the next expected file index. If
     /// not buffered, receives from the channel — buffering any out-of-order
     /// results — until the needed file arrives or the channel closes.
-    fn advance_to_next_file(&mut self) -> bool {
+    fn advance_to_next_file(&mut self) -> Result<bool, IoError> {
         if self.next_file_index >= self.total_files {
-            return false;
+            return Ok(false);
         }
 
         // Release the previous file's in-flight slot
@@ -518,17 +533,15 @@ impl NpyDirReader {
 
         // Check reorder buffer first
         if let Some(data) = self.reorder_buf.remove(&self.next_file_index) {
-            self.current_array = Some(data);
-            self.current_row = 0;
-            self.next_file_index += 1;
-            return true;
+            self.install(data)?;
+            return Ok(true);
         }
 
         // Try non-blocking first to detect "shorts"
         match self.receiver.try_recv() {
             Ok(loaded) => {
-                if self.accept_loaded(loaded) {
-                    return true;
+                if self.accept_loaded(loaded)? {
+                    return Ok(true);
                 }
                 // Out of order — stashed, fall through to block-receive
             }
@@ -544,7 +557,7 @@ impl NpyDirReader {
                     );
                 }
             }
-            Err(mpsc::TryRecvError::Disconnected) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => return Err(self.loaders_stopped()),
         }
 
         // Block-receive until we get the file we need, checking the reorder
@@ -552,34 +565,61 @@ impl NpyDirReader {
         // from the try_recv above.
         loop {
             if let Some(data) = self.reorder_buf.remove(&self.next_file_index) {
-                self.current_array = Some(data);
-                self.current_row = 0;
-                self.next_file_index += 1;
-                return true;
+                self.install(data)?;
+                return Ok(true);
             }
             match self.receiver.recv() {
                 Ok(loaded) => {
-                    if self.accept_loaded(loaded) {
-                        return true;
+                    if self.accept_loaded(loaded)? {
+                        return Ok(true);
                     }
                 }
-                Err(_) => return false,
+                Err(_) => return Err(self.loaders_stopped()),
             }
         }
     }
 
     /// Process a received `IndexedFile`: if it's the one we need, install it
     /// as current; otherwise stash it in the reorder buffer and return false.
-    fn accept_loaded(&mut self, loaded: IndexedFile) -> bool {
+    fn accept_loaded(&mut self, loaded: IndexedFile) -> Result<bool, IoError> {
         if loaded.index == self.next_file_index {
-            self.current_array = Some(loaded.data);
-            self.current_row = 0;
-            self.next_file_index += 1;
-            true
+            self.install(loaded.data)?;
+            Ok(true)
         } else {
             self.reorder_buf.insert(loaded.index, loaded.data);
-            false
+            Ok(false)
         }
+    }
+
+    /// Make the next file current, or stop the stream at its error.
+    fn install(&mut self, data: Result<NpyArrayData, String>) -> Result<(), IoError> {
+        self.next_file_index += 1;
+        match data {
+            Ok(array) => {
+                self.current_array = Some(array);
+                self.current_row = 0;
+                Ok(())
+            }
+            Err(message) => Err(self.fail(message)),
+        }
+    }
+
+    /// The error for a channel that closed with files still undelivered.
+    #[cold]
+    fn loaders_stopped(&mut self) -> IoError {
+        let message = format!(
+            "npy loaders stopped after {} of {} file(s); the rest were never delivered",
+            self.next_file_index, self.total_files
+        );
+        self.fail(message)
+    }
+
+    /// Stop the stream at `message`: this read and every later one
+    /// return it.
+    #[cold]
+    fn fail(&mut self, message: String) -> IoError {
+        self.failure = Some(message.clone());
+        IoError::InvalidFormat(message)
     }
 }
 
@@ -600,18 +640,21 @@ impl VecSource for NpyDirReader {
         self.record_count
     }
 
-    fn next_record(&mut self) -> Option<Vec<u8>> {
+    fn next_record(&mut self) -> Result<Option<Vec<u8>>, IoError> {
+        if let Some(message) = &self.failure {
+            return Err(IoError::InvalidFormat(message.clone()));
+        }
         loop {
             if let Some(ref array) = self.current_array
                 && self.current_row < array.nrows() {
                     let bytes = array.row_bytes(self.current_row);
                     self.current_row += 1;
-                    return Some(bytes);
+                    return Ok(Some(bytes));
                 }
 
             // Need next file in sorted order
-            if !self.advance_to_next_file() {
-                return None;
+            if !self.advance_to_next_file()? {
+                return Ok(None);
             }
         }
     }

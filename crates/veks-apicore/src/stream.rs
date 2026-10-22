@@ -6,6 +6,14 @@
 //! variable-length ([`VarlenSource`], [`VarlenSink`]). veks-io
 //! implements them for each format; the element type is the caller's to
 //! know ([`SourceMeta::element_size`]).
+//!
+//! A source reports a record it cannot read as an [`IoError`] in the
+//! stream's place, never as its end: a stream that ends early with
+//! fewer records than [`VecSource::record_count`] promised, and no
+//! error, is the failure this contract rules out
+//! (`srd-crate-boundaries.md` PR-8).
+
+use crate::reader::IoError;
 
 /// Metadata about a vector data source.
 #[derive(Debug, Clone)]
@@ -30,11 +38,16 @@ pub struct SourceMeta {
 /// The format and element type are determined at open time; the consumer
 /// interprets bytes according to `element_size()`.
 ///
+/// Each read is `Ok(Some(record))`, `Ok(None)` at the end, or `Err` for
+/// a record that cannot be read — a file of a directory that failed to
+/// load, a header that contradicts the stream's dimension. An error is
+/// where the stream stops: a caller returns it rather than read on.
+///
 /// Implementations exist for all xvec formats (fvec, ivec, mvec, dvec,
 /// bvec, svec) and optionally for npy, parquet, and slab formats.
 ///
 /// ```
-/// use veks_apicore::{VecSink, VecSource};
+/// use veks_apicore::{IoError, VecSink, VecSource};
 ///
 /// /// Two-dimensional f32 records, generated.
 /// struct Counting(u32);
@@ -43,11 +56,11 @@ pub struct SourceMeta {
 ///     fn dimension(&self) -> u32 { 2 }
 ///     fn element_size(&self) -> usize { 4 }
 ///     fn record_count(&self) -> Option<u64> { Some(3) }
-///     fn next_record(&mut self) -> Option<Vec<u8>> {
-///         (self.0 < 3).then(|| {
+///     fn next_record(&mut self) -> Result<Option<Vec<u8>>, IoError> {
+///         Ok((self.0 < 3).then(|| {
 ///             self.0 += 1;
 ///             [self.0 as f32, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect()
-///         })
+///         }))
 ///     }
 /// }
 ///
@@ -67,12 +80,13 @@ pub struct SourceMeta {
 /// let mut sink = Box::new(Collect(Vec::new()));
 /// let mut buf = Vec::new();
 /// let mut ordinal = 0;
-/// while source.read_record_into(&mut buf) {
+/// while source.read_record_into(&mut buf)? {
 ///     sink.write_record(ordinal, &buf);
 ///     ordinal += 1;
 /// }
 /// assert_eq!(sink.0.len(), 3);
 /// sink.finish().unwrap();
+/// # Ok::<(), IoError>(())
 /// ```
 pub trait VecSource: Send {
     /// Vector dimension (number of elements per record).
@@ -91,20 +105,22 @@ pub trait VecSource: Send {
     fn record_count(&self) -> Option<u64>;
 
     /// Read the next record as raw bytes (element data only, no dim prefix).
-    /// Returns `None` when exhausted.
-    fn next_record(&mut self) -> Option<Vec<u8>>;
+    /// Returns `Ok(None)` when exhausted, and `Err` for a record that
+    /// cannot be read; the stream does not go on past an error.
+    fn next_record(&mut self) -> Result<Option<Vec<u8>>, IoError>;
 
     /// Read the next record's bytes into `buf`, replacing what it held,
-    /// and say whether there was one. The form for a scan: one buffer
-    /// for every record, where [`next_record`](Self::next_record)
-    /// allocates one per record.
-    fn read_record_into(&mut self, buf: &mut Vec<u8>) -> bool {
-        match self.next_record() {
+    /// and say whether there was one: `Ok(false)` at the end, `Err` as
+    /// [`next_record`](Self::next_record) has it. The form for a scan:
+    /// one buffer for every record, where `next_record` allocates one
+    /// per record.
+    fn read_record_into(&mut self, buf: &mut Vec<u8>) -> Result<bool, IoError> {
+        match self.next_record()? {
             Some(record) => {
                 *buf = record;
-                true
+                Ok(true)
             }
-            None => false,
+            None => Ok(false),
         }
     }
 }
@@ -166,7 +182,7 @@ pub struct VarlenRecord {
 /// stride, so indexing requires a separate offset table.
 ///
 /// ```
-/// use veks_apicore::{VarlenRecord, VarlenSink, VarlenSource};
+/// use veks_apicore::{IoError, VarlenRecord, VarlenSink, VarlenSource};
 ///
 /// /// Rows of growing length, generated.
 /// struct Growing(u32);
@@ -174,11 +190,11 @@ pub struct VarlenRecord {
 /// impl VarlenSource for Growing {
 ///     fn element_size(&self) -> usize { 4 }
 ///     fn record_count(&self) -> Option<u64> { Some(2) }
-///     fn next_record(&mut self) -> Option<VarlenRecord> {
-///         (self.0 < 2).then(|| {
+///     fn next_record(&mut self) -> Result<Option<VarlenRecord>, IoError> {
+///         Ok((self.0 < 2).then(|| {
 ///             self.0 += 1;
 ///             VarlenRecord { dimension: self.0, data: vec![0; 4 * self.0 as usize] }
-///         })
+///         }))
 ///     }
 /// }
 ///
@@ -195,10 +211,11 @@ pub struct VarlenRecord {
 /// }
 ///
 /// let (mut source, mut sink) = (Growing(0), Box::new(Lengths(Vec::new())));
-/// while let Some(r) = source.next_record() {
+/// while let Some(r) = source.next_record()? {
 ///     sink.write_record(r.dimension, &r.data);
 /// }
 /// assert_eq!(sink.0, vec![1, 2]);
+/// # Ok::<(), IoError>(())
 /// ```
 pub trait VarlenSource: Send {
     /// Bytes per element (same for all records — only dimension varies).
@@ -208,8 +225,10 @@ pub trait VarlenSource: Send {
     fn record_count(&self) -> Option<u64>;
 
     /// Read the next record, returning its dimension and data.
-    /// Returns `None` when exhausted.
-    fn next_record(&mut self) -> Option<VarlenRecord>;
+    /// Returns `Ok(None)` when exhausted, and `Err` for a record that
+    /// cannot be read — a header that is negative, a record the file
+    /// ends inside of; the stream does not go on past an error.
+    fn next_record(&mut self) -> Result<Option<VarlenRecord>, IoError>;
 }
 
 /// Streaming writer for variable-length vector data.

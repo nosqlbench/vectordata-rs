@@ -208,7 +208,7 @@ fn bf16_vectors_round_trip_through_the_writer() {
     let meta = veks_io::probe(&path).unwrap();
     assert_eq!((meta.dimension, meta.element_size, meta.record_count), (3, 2, Some(2)));
     let mut stream = veks_io::open(&path).unwrap();
-    assert_eq!(stream.next_record().unwrap(), bytes_of(&rows[0]));
+    assert_eq!(stream.next_record().unwrap().unwrap(), bytes_of(&rows[0]));
 
     let reader = XvecReader::<bf16>::open_path(&path).unwrap();
     assert_eq!(VectorReader::get_slice(&reader, 1), Some(&rows[1][..]));
@@ -415,7 +415,7 @@ fn the_writers_write_every_element_type() {
                 assert_eq!(bytes_of(&reader.get(i).unwrap()), elem[i * dim * T::SIZE..(i + 1) * dim * T::SIZE], "{ty}: record {i}");
             }
             let mut streamed = veks_io::open(&vectors).unwrap();
-            let first = streamed.next_record().unwrap();
+            let first = streamed.next_record().unwrap().unwrap();
             assert_eq!(first, elem[..dim * T::SIZE], "{ty}: the streaming reader agrees");
         });
     }

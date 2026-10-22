@@ -141,10 +141,11 @@ mod tests {
         for (i, (_ordinal, expected_data)) in records.iter().enumerate() {
             let actual = reader
                 .next_record()
+                .unwrap()
                 .unwrap_or_else(|| panic!("Expected record {} but got None", i));
             assert_eq!(actual, *expected_data, "Record {} data mismatch", i);
         }
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     /// When a schema sidecar is passed in, `finish` lands it in the
@@ -233,9 +234,9 @@ mod tests {
         assert_eq!((reader.dimension(), reader.element_type()), (16, Some(ElementType::U8)));
 
         for i in 0..100 {
-            let data = reader.next_record().unwrap();
+            let data = reader.next_record().unwrap().unwrap();
             assert_eq!(data, vec![i as u8; 16]);
         }
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().unwrap().is_none());
     }
 }

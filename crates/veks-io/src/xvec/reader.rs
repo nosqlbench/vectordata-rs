@@ -13,6 +13,7 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::format::VecFormat;
+use crate::reader::IoError;
 use crate::source::{MappedFile, mapping};
 use crate::traits::{SourceMeta, VecSource};
 
@@ -69,11 +70,11 @@ fn shape(path: &Path, dim: i32, file_size: u64, elem_size: usize) -> Result<(u32
 /// assert_eq!((meta.dimension, meta.element_size, meta.record_count), (2, 8, Some(2)));
 ///
 /// let mut reader = xvec::reader::open(&path, VecFormat::U64vec).unwrap();
-/// let first = reader.next_record().unwrap();
+/// let first = reader.next_record().unwrap().unwrap();
 /// assert_eq!(u64::from_le_bytes(first[8..16].try_into().unwrap()), 2);
-/// let second = reader.next_record().unwrap();
+/// let second = reader.next_record().unwrap().unwrap();
 /// assert_eq!(u64::from_le_bytes(second[0..8].try_into().unwrap()), u64::MAX);
-/// assert!(reader.next_record().is_none());
+/// assert!(reader.next_record().unwrap().is_none());
 /// ```
 pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String> {
     let elem_size = format.element_size();
@@ -98,7 +99,7 @@ pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String
             Some(_) => {}
         }
         mapping::advise_sequential_bytes(bytes);
-        parts.push(Part { file: mapped, records });
+        parts.push(Part { file: mapped, path: file, records });
     }
     let (dim, record_bytes) = dim.ok_or_else(|| format!("no {format} files at {}", path.display()))?;
     let total_records = parts.iter().map(|p| p.records).sum();
@@ -178,6 +179,8 @@ pub fn probe(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
 /// One mapped file of the stream.
 struct Part {
     file: MappedFile,
+    /// The file, for an error that names it.
+    path: std::path::PathBuf,
     records: u64,
 }
 
@@ -196,7 +199,11 @@ struct XvecReader {
 }
 
 impl XvecReader {
-    fn next_slice(&mut self) -> Option<&[u8]> {
+    /// The next record's element bytes, `Ok(None)` at the end, or an
+    /// error for a record whose header states another dimension than
+    /// the stream's — every record of a uniform file has the first
+    /// one's, so a different one is corruption, not an end.
+    fn next_slice(&mut self) -> Result<Option<&[u8]>, IoError> {
         while self.part < self.parts.len() && self.read_in_part >= self.parts[self.part].records {
             // Done with a part: release what is left of it before the next.
             let bytes = self.parts[self.part].file.bytes();
@@ -205,12 +212,14 @@ impl XvecReader {
             self.read_in_part = 0;
             self.released = 0;
         }
-        let part = self.parts.get(self.part)?;
+        let Some(part) = self.parts.get(self.part) else {
+            return Ok(None);
+        };
         let at = self.read_in_part as usize * self.record_bytes;
         let bytes = part.file.bytes();
         let dim = i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
         if dim as u32 != self.dim {
-            return None; // dimension mismatch
+            return Err(self.dimension_mismatch(dim));
         }
         self.read_in_part += 1;
         let end = (at + self.record_bytes) as u64;
@@ -218,7 +227,19 @@ impl XvecReader {
             mapping::release_range_bytes(bytes, self.released, end);
             self.released = end;
         }
-        Some(&self.parts[self.part].file.bytes()[at + 4..at + self.record_bytes])
+        Ok(Some(&self.parts[self.part].file.bytes()[at + 4..at + self.record_bytes]))
+    }
+
+    /// The error for a record of the current part whose header states
+    /// `dim`: the file, the record and both dimensions.
+    #[cold]
+    fn dimension_mismatch(&self, dim: i32) -> IoError {
+        IoError::InvalidFormat(format!(
+            "{}: record {} states dimension {dim} where the stream's is {}",
+            self.parts[self.part].path.display(),
+            self.read_in_part,
+            self.dim
+        ))
     }
 }
 
@@ -228,18 +249,18 @@ impl VecSource for XvecReader {
     fn element_type(&self) -> Option<veks_datatypes::ElementType> { self.element }
     fn record_count(&self) -> Option<u64> { Some(self.total_records) }
 
-    fn next_record(&mut self) -> Option<Vec<u8>> {
-        self.next_slice().map(<[u8]>::to_vec)
+    fn next_record(&mut self) -> Result<Option<Vec<u8>>, IoError> {
+        Ok(self.next_slice()?.map(<[u8]>::to_vec))
     }
 
-    fn read_record_into(&mut self, buf: &mut Vec<u8>) -> bool {
-        match self.next_slice() {
+    fn read_record_into(&mut self, buf: &mut Vec<u8>) -> Result<bool, IoError> {
+        match self.next_slice()? {
             Some(record) => {
                 buf.clear();
                 buf.extend_from_slice(record);
-                true
+                Ok(true)
             }
-            None => false,
+            None => Ok(false),
         }
     }
 }

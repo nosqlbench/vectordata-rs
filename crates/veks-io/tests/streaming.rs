@@ -25,7 +25,7 @@ fn write_fvecs(path: &Path, dim: u32, rows: u32, base: f32) {
 fn firsts(mut source: Box<dyn VecSource>) -> Vec<f32> {
     let mut out = Vec::new();
     let mut buf = Vec::new();
-    while source.read_record_into(&mut buf) {
+    while source.read_record_into(&mut buf).unwrap() {
         out.push(f32::from_le_bytes(buf[..4].try_into().unwrap()));
     }
     out

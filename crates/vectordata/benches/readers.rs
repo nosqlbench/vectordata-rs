@@ -195,7 +195,7 @@ fn seq_case<T>(
     group.bench_function(BenchmarkId::new(ty, "veks-io-stream"), |b| {
         b.iter(|| {
             let mut source = veks_io::open(&path).unwrap();
-            while let Some(record) = source.next_record() {
+            while let Some(record) = source.next_record().unwrap() {
                 black_box(&record);
             }
         })
@@ -205,7 +205,7 @@ fn seq_case<T>(
         let mut record = Vec::new();
         b.iter(|| {
             let mut source = veks_io::open(&path).unwrap();
-            while source.read_record_into(&mut record) {
+            while source.read_record_into(&mut record).unwrap() {
                 black_box(&record);
             }
         })
@@ -277,7 +277,7 @@ fn vvec(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("scan", "veks-io-stream"), |b| {
         b.iter(|| {
             let mut source = veks_io::open_varlen(&path).unwrap();
-            while let Some(record) = source.next_record() {
+            while let Some(record) = source.next_record().unwrap() {
                 black_box(&record);
             }
         })

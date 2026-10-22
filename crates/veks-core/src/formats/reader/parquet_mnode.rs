@@ -27,6 +27,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use super::{SourceMeta, VecSource};
+use veks_io::IoError;
 use crate::formats::parquet_compiler::CompiledMnodeWriter;
 
 /// Maximum number of loaded files held in memory at once.
@@ -57,8 +58,10 @@ struct PrefetchGate {
 struct IndexedFile {
     /// Position in the original sorted file list
     index: usize,
-    /// All record batches from this file
-    batches: Vec<RecordBatch>,
+    /// All record batches from this file, or why it failed to load,
+    /// naming it. The consumer returns the error when it reaches this
+    /// index, so a failure lands where the file's rows would have.
+    batches: Result<Vec<RecordBatch>, String>,
 }
 
 /// Shared work queue: workers atomically claim the next file index to load.
@@ -90,19 +93,27 @@ impl WorkQueue {
 /// pulls the next unloaded file from a shared `WorkQueue`, loads it, and
 /// sends the result (tagged with its file index) through a channel. The
 /// consumer reassembles results in sorted order using a small reorder buffer.
+///
+/// A file that fails to load is an error at its place in that order:
+/// the stream yields every row of the files before it, then the error,
+/// naming the file. Loaders that stop before every file is delivered
+/// are an error too, never an early end.
 pub struct ParquetMnodeReader {
     /// Channel receiving loaded files from the worker pool
     receiver: mpsc::Receiver<IndexedFile>,
     /// Shared prefetch gate for adaptive backpressure
     gate: Arc<PrefetchGate>,
     /// Reorder buffer: files that arrived out of order, keyed by file index
-    reorder_buf: HashMap<usize, Vec<RecordBatch>>,
+    reorder_buf: HashMap<usize, Result<Vec<RecordBatch>, String>>,
     /// The file index we need next to maintain sorted order
     next_file_index: usize,
     /// Total number of files being loaded
     total_files: usize,
     /// Batches from the currently-consumed file
     current_batches: Vec<RecordBatch>,
+    /// Whether the current file holds an in-flight slot, released when
+    /// it is passed — an empty file included
+    holds_slot: bool,
     /// Index into `current_batches`
     current_batch_idx: usize,
     /// Row index within the current batch
@@ -113,6 +124,8 @@ pub struct ParquetMnodeReader {
     buf: Vec<u8>,
     /// Total row count across all files
     record_count: u64,
+    /// The error the stream stopped at; every later read returns it.
+    failure: Option<String>,
     /// Worker thread handles
     _workers: Vec<thread::JoinHandle<()>>,
 }
@@ -232,18 +245,16 @@ impl ParquetMnodeReader {
                         break;
                     };
 
-                    match load_parquet_file(path) {
-                        Ok(batches) => {
-                            if tx.send(IndexedFile { index: idx, batches }).is_err() {
-                                break; // consumer dropped
-                            }
-                        }
-                        Err(e) => {
-                            log::info!("Warning: failed to load {}: {}", path.display(), e);
-                            let mut in_flight = gate.in_flight.lock().unwrap();
-                            *in_flight -= 1;
-                            gate.can_send.notify_one();
-                        }
+                    let batches = load_parquet_file(path);
+                    if batches.is_err() {
+                        // A failure holds no rows in memory: its slot is
+                        // free at once, not when the consumer passes it.
+                        let mut in_flight = gate.in_flight.lock().unwrap();
+                        *in_flight -= 1;
+                        gate.can_send.notify_one();
+                    }
+                    if tx.send(IndexedFile { index: idx, batches }).is_err() {
+                        break; // consumer dropped
                     }
                 }
             }));
@@ -258,11 +269,13 @@ impl ParquetMnodeReader {
             next_file_index: 0,
             total_files,
             current_batches: Vec::new(),
+            holds_slot: false,
             current_batch_idx: 0,
             current_row: 0,
             writer,
             buf: Vec::new(),
             record_count: total_rows,
+            failure: None,
             _workers: workers,
         }))
     }
@@ -274,38 +287,38 @@ impl ParquetMnodeReader {
         self.gate.can_send.notify_one();
     }
 
-    /// Try to advance to the next file in sorted order.
+    /// Try to advance to the next file in sorted order: `Ok(false)` past
+    /// the last file, and an error for the next file failing to load or
+    /// the loaders stopping before delivering it.
     ///
     /// First checks the reorder buffer for the next expected file index. If
     /// not buffered, receives from the channel — buffering any out-of-order
     /// results — until the needed file arrives or the channel closes.
-    fn advance_to_next_file(&mut self) -> bool {
+    fn advance_to_next_file(&mut self) -> Result<bool, IoError> {
         if self.next_file_index >= self.total_files {
-            return false;
+            return Ok(false);
         }
 
         // Release the previous file's in-flight slot
-        if !self.current_batches.is_empty() {
+        if self.holds_slot {
             self.release_in_flight();
-            self.current_batches.clear();
+            self.holds_slot = false;
         }
+        self.current_batches.clear();
 
         // Check reorder buffer first — the file's in-flight slot will be
         // released at the top of the NEXT advance_to_next_file call when
         // this file finishes being consumed.
         if let Some(batches) = self.reorder_buf.remove(&self.next_file_index) {
-            self.current_batches = batches;
-            self.current_batch_idx = 0;
-            self.current_row = 0;
-            self.next_file_index += 1;
-            return true;
+            self.install(batches)?;
+            return Ok(true);
         }
 
         // Try non-blocking first to detect "shorts"
         match self.receiver.try_recv() {
             Ok(loaded) => {
-                if self.accept_loaded(loaded) {
-                    return true;
+                if self.accept_loaded(loaded)? {
+                    return Ok(true);
                 }
                 // Out of order — stashed, fall through to block-receive
             }
@@ -321,7 +334,7 @@ impl ParquetMnodeReader {
                     );
                 }
             }
-            Err(mpsc::TryRecvError::Disconnected) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => return Err(self.loaders_stopped()),
         }
 
         // Block-receive until we get the file we need, checking the reorder
@@ -331,36 +344,64 @@ impl ParquetMnodeReader {
             // Check reorder buffer — the file's in-flight slot will be
             // released at the top of the NEXT advance_to_next_file call.
             if let Some(batches) = self.reorder_buf.remove(&self.next_file_index) {
-                self.current_batches = batches;
-                self.current_batch_idx = 0;
-                self.current_row = 0;
-                self.next_file_index += 1;
-                return true;
+                self.install(batches)?;
+                return Ok(true);
             }
             match self.receiver.recv() {
                 Ok(loaded) => {
-                    if self.accept_loaded(loaded) {
-                        return true;
+                    if self.accept_loaded(loaded)? {
+                        return Ok(true);
                     }
                 }
-                Err(_) => return false,
+                Err(_) => return Err(self.loaders_stopped()),
             }
         }
     }
 
     /// Process a received `IndexedFile`: if it's the one we need, install it
     /// as current; otherwise stash it in the reorder buffer and return false.
-    fn accept_loaded(&mut self, loaded: IndexedFile) -> bool {
+    fn accept_loaded(&mut self, loaded: IndexedFile) -> Result<bool, IoError> {
         if loaded.index == self.next_file_index {
-            self.current_batches = loaded.batches;
-            self.current_batch_idx = 0;
-            self.current_row = 0;
-            self.next_file_index += 1;
-            true
+            self.install(loaded.batches)?;
+            Ok(true)
         } else {
             self.reorder_buf.insert(loaded.index, loaded.batches);
-            false
+            Ok(false)
         }
+    }
+
+    /// Make the next file current, or stop the stream at its error. A
+    /// loaded file holds an in-flight slot until it is passed.
+    fn install(&mut self, batches: Result<Vec<RecordBatch>, String>) -> Result<(), IoError> {
+        self.next_file_index += 1;
+        match batches {
+            Ok(batches) => {
+                self.current_batches = batches;
+                self.holds_slot = true;
+                self.current_batch_idx = 0;
+                self.current_row = 0;
+                Ok(())
+            }
+            Err(message) => Err(self.fail(message)),
+        }
+    }
+
+    /// The error for a channel that closed with files still undelivered.
+    #[cold]
+    fn loaders_stopped(&mut self) -> IoError {
+        let message = format!(
+            "parquet-mnode loaders stopped after {} of {} file(s); the rest were never delivered",
+            self.next_file_index, self.total_files
+        );
+        self.fail(message)
+    }
+
+    /// Stop the stream at `message`: this read and every later one
+    /// return it.
+    #[cold]
+    fn fail(&mut self, message: String) -> IoError {
+        self.failure = Some(message.clone());
+        IoError::InvalidFormat(message)
     }
 }
 
@@ -382,7 +423,10 @@ impl VecSource for ParquetMnodeReader {
         Some(self.record_count)
     }
 
-    fn next_record(&mut self) -> Option<Vec<u8>> {
+    fn next_record(&mut self) -> Result<Option<Vec<u8>>, IoError> {
+        if let Some(message) = &self.failure {
+            return Err(IoError::InvalidFormat(message.clone()));
+        }
         loop {
             // Try current batch
             if self.current_batch_idx < self.current_batches.len() {
@@ -391,7 +435,7 @@ impl VecSource for ParquetMnodeReader {
                     self.buf.clear();
                     self.writer.write_row(batch, self.current_row, &mut self.buf);
                     self.current_row += 1;
-                    return Some(self.buf.clone());
+                    return Ok(Some(self.buf.clone()));
                 }
                 // Next batch in this file
                 self.current_batch_idx += 1;
@@ -400,8 +444,8 @@ impl VecSource for ParquetMnodeReader {
             }
 
             // Need next file in sorted order
-            if !self.advance_to_next_file() {
-                return None;
+            if !self.advance_to_next_file()? {
+                return Ok(None);
             }
         }
     }
@@ -536,7 +580,7 @@ mod tests {
         assert_eq!(reader.record_count(), Some(3));
 
         let mut records = Vec::new();
-        while let Some(data) = reader.next_record() {
+        while let Some(data) = reader.next_record().unwrap() {
             let node = MNode::from_bytes(&data).unwrap();
             records.push(node);
         }
@@ -558,13 +602,13 @@ mod tests {
         let mut reader = ParquetMnodeReader::open(&file_path, 0).unwrap();
         assert_eq!(reader.record_count(), Some(1));
 
-        let data = reader.next_record().unwrap();
+        let data = reader.next_record().unwrap().unwrap();
         let node = MNode::from_bytes(&data).unwrap();
         use crate::formats::mnode::MValue;
         assert_eq!(node.fields["name"], MValue::Text("x".into()));
         assert_eq!(node.fields["age"], MValue::Int(99));
 
-        assert!(reader.next_record().is_none());
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     #[test]
@@ -585,7 +629,7 @@ mod tests {
         assert_eq!(reader.record_count(), Some(12));
 
         let mut records = Vec::new();
-        while let Some(data) = reader.next_record() {
+        while let Some(data) = reader.next_record().unwrap() {
             let node = MNode::from_bytes(&data).unwrap();
             records.push(node);
         }
@@ -624,7 +668,7 @@ mod tests {
 
         let mut count = 0;
         let mut prev_file_age_base: Option<i64> = None;
-        while let Some(data) = reader.next_record() {
+        while let Some(data) = reader.next_record().unwrap() {
             let node = MNode::from_bytes(&data).unwrap();
             use crate::formats::mnode::MValue;
             if let MValue::Int(age) = &node.fields["age"] {
