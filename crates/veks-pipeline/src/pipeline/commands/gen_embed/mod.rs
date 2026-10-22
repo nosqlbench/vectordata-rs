@@ -588,7 +588,7 @@ mod tests {
         write_npy_f32(&path, &vectors, 4).unwrap();
         let meta = veks_core::formats::reader::probe_source(
             &path,
-            veks_core::formats::VecFormat::Npy,
+            veks_io::VecFormat::Npy,
         )
         .unwrap();
         assert_eq!(meta.record_count, Some(7));

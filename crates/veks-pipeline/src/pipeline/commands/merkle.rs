@@ -103,7 +103,7 @@ impl MerkleTree {
         progress_fn: impl Fn(u64) + Send + Sync,
     ) -> std::io::Result<Self> {
         Self::validate_chunk_size(chunk_size);
-        use veks_core::formats::portable_io::pread;
+        use veks_io::file::pread;
         use std::sync::atomic::{AtomicU64, Ordering};
 
         let leaf_count = if file_size == 0 {

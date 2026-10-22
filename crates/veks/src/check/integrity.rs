@@ -11,7 +11,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::formats::VecFormat;
+use veks_io::VecFormat;
 
 use super::CheckResult;
 

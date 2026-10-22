@@ -10,7 +10,10 @@ use veks_datatypes::{Container, ElementKind, ElementType};
 /// Supported data formats.
 ///
 /// **Vector formats** (xvec family) store one record per vector as
-/// `[dim:i32, data...]`. Extensions end in `vec` or `vecs`.
+/// `[dim:i32, data...]`. Extensions end in `vec` or `vecs`. The uniform
+/// ones hold one dimension throughout; the variable-length ones
+/// (`vvec`) let each record carry its own, and are read by ordinal
+/// through an offset index (`IDXFOR__`).
 ///
 /// **Scalar formats** store one value per ordinal as a flat packed array
 /// with no header. Extension is the bare type name (e.g., `.u8`, `.f32`).
@@ -58,6 +61,31 @@ pub enum VecFormat {
     /// xvec uint64 (8 bytes/element). Extension: `.u64vec`
     U64vec,
 
+    // ── Variable-length vector formats (vvec) ──────────────────────
+    /// Variable-length float32 records. Extension: `.fvvec`
+    Fvvec,
+    /// Variable-length float64 records. Extension: `.dvvec`
+    Dvvec,
+    /// Variable-length float16 / half records. Extension: `.mvvec`
+    Mvvec,
+    /// Variable-length bfloat16 records. Extension: `.bf16vvec`
+    Bf16vvec,
+    /// Variable-length uint8 records. Extension: `.bvvec`
+    Bvvec,
+    /// Variable-length int8 records. Extension: `.i8vvec`
+    I8vvec,
+    /// Variable-length int16 records. Extension: `.svvec`
+    Svvec,
+    /// Variable-length uint16 records. Extension: `.u16vvec`
+    U16vvec,
+    /// Variable-length int32 records. Extension: `.ivvec`
+    Ivvec,
+    /// Variable-length uint32 records. Extension: `.u32vvec`
+    U32vvec,
+    /// Variable-length int64 records. Extension: `.i64vvec`
+    I64vvec,
+    /// Variable-length uint64 records. Extension: `.u64vvec`
+    U64vvec,
     // ── Scalar formats (flat packed, no header) ───────────────────
     /// Scalar uint8 (1 byte/element). Extension: `.u8`
     ScalarU8,
@@ -92,6 +120,9 @@ impl VecFormat {
         Self::Fvec, Self::Dvec, Self::Mvec, Self::Bf16vec,
         Self::Bvec, Self::I8vec, Self::Svec, Self::U16vec,
         Self::Ivec, Self::U32vec, Self::I64vec, Self::U64vec,
+        Self::Fvvec, Self::Dvvec, Self::Mvvec, Self::Bf16vvec,
+        Self::Bvvec, Self::I8vvec, Self::Svvec, Self::U16vvec,
+        Self::Ivvec, Self::U32vvec, Self::I64vvec, Self::U64vvec,
         Self::ScalarU8, Self::ScalarI8, Self::ScalarU16, Self::ScalarI16,
         Self::ScalarU32, Self::ScalarI32, Self::ScalarU64, Self::ScalarI64,
         Self::ScalarF16, Self::ScalarBf16, Self::ScalarF32, Self::ScalarF64,
@@ -115,6 +146,18 @@ impl VecFormat {
             Self::U32vec => "u32vec",
             Self::I64vec => "i64vec",
             Self::U64vec => "u64vec",
+            Self::Fvvec => "fvvec",
+            Self::Dvvec => "dvvec",
+            Self::Mvvec => "mvvec",
+            Self::Bf16vvec => "bf16vvec",
+            Self::Bvvec => "bvvec",
+            Self::I8vvec => "i8vvec",
+            Self::Svvec => "svvec",
+            Self::U16vvec => "u16vvec",
+            Self::Ivvec => "ivvec",
+            Self::U32vvec => "u32vvec",
+            Self::I64vvec => "i64vvec",
+            Self::U64vvec => "u64vvec",
             Self::ScalarU8 => "u8",
             Self::ScalarI8 => "i8",
             Self::ScalarU16 => "u16",
@@ -146,18 +189,18 @@ impl VecFormat {
     pub fn element_type(self) -> Option<ElementType> {
         Some(match self {
             Self::Npy | Self::Parquet | Self::Slab => return None,
-            Self::Fvec | Self::ScalarF32 => ElementType::F32,
-            Self::Dvec | Self::ScalarF64 => ElementType::F64,
-            Self::Mvec | Self::ScalarF16 => ElementType::F16,
-            Self::Bf16vec | Self::ScalarBf16 => ElementType::BF16,
-            Self::Bvec | Self::ScalarU8 => ElementType::U8,
-            Self::I8vec | Self::ScalarI8 => ElementType::I8,
-            Self::Svec | Self::ScalarI16 => ElementType::I16,
-            Self::U16vec | Self::ScalarU16 => ElementType::U16,
-            Self::Ivec | Self::ScalarI32 => ElementType::I32,
-            Self::U32vec | Self::ScalarU32 => ElementType::U32,
-            Self::I64vec | Self::ScalarI64 => ElementType::I64,
-            Self::U64vec | Self::ScalarU64 => ElementType::U64,
+            Self::Fvec | Self::Fvvec | Self::ScalarF32 => ElementType::F32,
+            Self::Dvec | Self::Dvvec | Self::ScalarF64 => ElementType::F64,
+            Self::Mvec | Self::Mvvec | Self::ScalarF16 => ElementType::F16,
+            Self::Bf16vec | Self::Bf16vvec | Self::ScalarBf16 => ElementType::BF16,
+            Self::Bvec | Self::Bvvec | Self::ScalarU8 => ElementType::U8,
+            Self::I8vec | Self::I8vvec | Self::ScalarI8 => ElementType::I8,
+            Self::Svec | Self::Svvec | Self::ScalarI16 => ElementType::I16,
+            Self::U16vec | Self::U16vvec | Self::ScalarU16 => ElementType::U16,
+            Self::Ivec | Self::Ivvec | Self::ScalarI32 => ElementType::I32,
+            Self::U32vec | Self::U32vvec | Self::ScalarU32 => ElementType::U32,
+            Self::I64vec | Self::I64vvec | Self::ScalarI64 => ElementType::I64,
+            Self::U64vec | Self::U64vvec | Self::ScalarU64 => ElementType::U64,
         })
     }
 
@@ -170,16 +213,18 @@ impl VecFormat {
             Self::Fvec | Self::Dvec | Self::Mvec | Self::Bf16vec
             | Self::Bvec | Self::I8vec | Self::Svec | Self::U16vec
             | Self::Ivec | Self::U32vec | Self::I64vec | Self::U64vec => Some(Container::Vec),
+            Self::Fvvec | Self::Dvvec | Self::Mvvec | Self::Bf16vvec
+            | Self::Bvvec | Self::I8vvec | Self::Svvec | Self::U16vvec
+            | Self::Ivvec | Self::U32vvec | Self::I64vvec | Self::U64vvec => Some(Container::Vvec),
             Self::ScalarU8 | Self::ScalarI8 | Self::ScalarU16 | Self::ScalarI16
             | Self::ScalarU32 | Self::ScalarI32 | Self::ScalarU64 | Self::ScalarI64
             | Self::ScalarF16 | Self::ScalarBf16 | Self::ScalarF32 | Self::ScalarF64 => Some(Container::Scalar),
         }
     }
 
-    /// The format that holds `element_type` in `container`. `None` for
-    /// [`Container::Vvec`], which this crate reads through
-    /// [`open_varlen`](crate::open_varlen) under the vector format's
-    /// name rather than as a format of its own.
+    /// The format that holds `element_type` in `container`. A
+    /// variable-length format is read with [`open_varlen`](crate::open_varlen)
+    /// or by ordinal through `IndexedVvecReader`.
     ///
     /// # Example
     ///
@@ -191,8 +236,8 @@ impl VecFormat {
     /// assert_eq!(VecFormat::of(Container::Vec, ElementType::BF16), Some(VecFormat::Bf16vec));
     /// // every type has a column format, the float ones included (f32, f64)
     /// assert_eq!(VecFormat::of(Container::Scalar, ElementType::F64), Some(VecFormat::ScalarF64));
-    /// // variable-length layouts are not formats of their own
-    /// assert_eq!(VecFormat::of(Container::Vvec, ElementType::F32), None);
+    /// // variable-length layouts are formats of their own
+    /// assert_eq!(VecFormat::of(Container::Vvec, ElementType::F32), Some(VecFormat::Fvvec));
     /// ```
     pub fn of(container: Container, element_type: ElementType) -> Option<Self> {
         Self::ALL
@@ -201,9 +246,22 @@ impl VecFormat {
             .find(|f| f.container() == Some(container) && f.element_type() == Some(element_type))
     }
 
-    /// True for the xvec family (vector formats with `[dim:i32, data...]` header).
+    /// True for the xvec family, uniform and variable-length: every
+    /// record is `[dim:i32, data...]`.
     pub fn is_xvec(self) -> bool {
+        self.is_uniform_xvec() || self.is_vvec()
+    }
+
+    /// True for a uniform xvec format: one dimension throughout, so a
+    /// record's offset is computable.
+    pub fn is_uniform_xvec(self) -> bool {
         self.container() == Some(Container::Vec)
+    }
+
+    /// True for a variable-length xvec format (`vvec`): each record
+    /// carries its own dimension.
+    pub fn is_vvec(self) -> bool {
+        self.container() == Some(Container::Vvec)
     }
 
     /// True for scalar formats (flat packed, no header, one value per ordinal).
@@ -226,9 +284,32 @@ impl VecFormat {
         self.element_type().map_or(0, ElementType::byte_width)
     }
 
-    /// True if this format supports writing.
+    /// True if this format supports writing as records of one
+    /// dimension ([`create_format`](crate::create_format)); a
+    /// variable-length format is written with
+    /// [`create_varlen`](crate::create_varlen).
     pub fn is_writable(self) -> bool {
-        self.is_xvec() || self.is_scalar() || self == Self::Slab
+        self.is_uniform_xvec() || self.is_scalar() || self == Self::Slab
+    }
+
+    /// The size of a file of `record_count` records of `dimension`
+    /// elements; `None` for a variable-length or container format,
+    /// whose size the count does not determine.
+    pub fn expected_file_size(self, record_count: u64, dimension: u32) -> Option<u64> {
+        self.record_bytes(dimension).map(|r| record_count * r)
+    }
+
+    /// Bytes per record of `dimension` elements: the header and the
+    /// elements for a uniform xvec, one element for a scalar column;
+    /// `None` for a variable-length or container format.
+    pub fn record_bytes(self, dimension: u32) -> Option<u64> {
+        if self.is_uniform_xvec() {
+            Some(4 + (dimension as u64) * (self.element_size() as u64))
+        } else if self.is_scalar() {
+            Some(self.element_size() as u64)
+        } else {
+            None
+        }
     }
 
     /// Preferred file extension for writing a new file of this format.
@@ -257,8 +338,8 @@ impl VecFormat {
     /// ```
     pub fn preferred_extension(self) -> &'static str {
         match (self.container(), self.element_type()) {
-            (Some(Container::Vec), Some(ty)) => {
-                ty.legacy_extension(Container::Vec).unwrap_or(ty.extension(Container::Vec))
+            (Some(c @ (Container::Vec | Container::Vvec)), Some(ty)) => {
+                ty.legacy_extension(c).unwrap_or(ty.extension(c))
             }
             _ => self.name(),
         }
@@ -275,8 +356,8 @@ impl VecFormat {
 
     /// Detect format from a file extension string.
     ///
-    /// Every spelling the element model reads is accepted; a
-    /// variable-length spelling (`fvvecs`) names no format here.
+    /// Every spelling the element model reads is accepted, the
+    /// variable-length ones (`fvvecs`) included.
     ///
     /// # Example
     ///
@@ -294,8 +375,9 @@ impl VecFormat {
     /// // float scalar columns
     /// assert_eq!(VecFormat::from_extension("f16"), Some(VecFormat::ScalarF16));
     /// assert_eq!(VecFormat::from_extension("f64"), Some(VecFormat::ScalarF64));
-    /// // variable-length spellings are read through `open_varlen`, not as a format
-    /// assert_eq!(VecFormat::from_extension("fvvecs"), None);
+    /// // variable-length spellings name the vvec formats
+    /// assert_eq!(VecFormat::from_extension("fvvecs"), Some(VecFormat::Fvvec));
+    /// assert!(VecFormat::Fvvec.is_xvec() && !VecFormat::Fvvec.is_uniform_xvec());
     /// ```
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
@@ -309,59 +391,74 @@ impl VecFormat {
         }
     }
 
-    /// Detect format from a file path.
-    ///
-    /// Handles HDF5 `#` notation (returns `None` — HDF5 not supported).
-    /// For directories, checks contents for npy/parquet files.
+    /// Detect the format of a file or a directory: a directory by its
+    /// contents ([`detect_from_directory`](Self::detect_from_directory)),
+    /// a file by its extension ([`detect_from_path`](Self::detect_from_path)).
     pub fn detect(path: &Path) -> Option<Self> {
-        let s = path.to_string_lossy();
+        if path.is_dir() { Self::detect_from_directory(path) } else { Self::detect_from_path(path) }
+    }
 
-        // HDF5 # notation → not supported
-        if s.contains('#') {
-            let hash_pos = s.rfind('#').unwrap();
-            let file_part = &s[..hash_pos];
-            if let Some(ext) = Path::new(file_part).extension().and_then(|e| e.to_str())
-                && (ext == "hdf5" || ext == "h5") {
+    /// Detect a file's format from its extension. HDF5's `file.h5#dataset`
+    /// notation is `None`: HDF5 is not supported.
+    pub fn detect_from_path(path: &Path) -> Option<Self> {
+        let s = path.to_string_lossy();
+        if let Some(hash) = s.rfind('#') {
+            let ext = s[..hash].rsplit('.').next().unwrap_or("");
+            if ext == "hdf5" || ext == "h5" {
                 return None;
             }
         }
-
-        // Try file extension
-        if let Some(ext) = path.extension().and_then(|e| e.to_str())
-            && let Some(fmt) = Self::from_extension(ext) {
-            return Some(fmt);
-        }
-
-        // For directories, detect by contents
-        if path.is_dir() {
-            return Self::detect_from_directory(path);
-        }
-
-        None
+        Self::from_extension(path.extension()?.to_str()?)
     }
 
-    /// Detect format from directory contents.
-    fn detect_from_directory(dir: &Path) -> Option<Self> {
-        let entries = std::fs::read_dir(dir).ok()?;
+    /// Detect a directory's format from the files in it: npy, then
+    /// parquet, then an xvec family member (shards of one facet), then
+    /// slab.
+    pub fn detect_from_directory(dir: &Path) -> Option<Self> {
         let mut has_npy = false;
         let mut has_parquet = false;
-        for entry in entries.flatten() {
-            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-                match ext {
-                    "npy" => has_npy = true,
-                    "parquet" => has_parquet = true,
-                    _ => {}
+        let mut xvec = None;
+        let mut has_slab = false;
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(ext) = name.to_str().and_then(|n| n.rsplit_once('.')).map(|(_, e)| e.to_string()) else {
+                continue;
+            };
+            match ext.as_str() {
+                "npy" => has_npy = true,
+                "parquet" => has_parquet = true,
+                "slab" => has_slab = true,
+                other => {
+                    if xvec.is_none() {
+                        xvec = Self::from_extension(other).filter(|f| f.is_xvec());
+                    }
                 }
             }
         }
-        if has_npy { return Some(Self::Npy); }
-        if has_parquet { return Some(Self::Parquet); }
-        None
+        if has_npy {
+            Some(Self::Npy)
+        } else if has_parquet {
+            Some(Self::Parquet)
+        } else if xvec.is_some() {
+            xvec
+        } else if has_slab {
+            Some(Self::Slab)
+        } else {
+            None
+        }
     }
 
-    /// Human-readable data type name.
+    /// Human-readable data type name: the element type's, `bytes` for a
+    /// slab, `float` for the other containers.
     pub fn data_type_name(self) -> &'static str {
-        self.element_type().map_or("float", ElementType::long_name)
+        match self.element_type() {
+            Some(ty) => ty.long_name(),
+            None if self == Self::Slab => "bytes",
+            None => "float",
+        }
     }
 }
 
@@ -430,7 +527,7 @@ mod tests {
     fn test_unknown_extension() {
         assert_eq!(VecFormat::from_extension("txt"), None);
         assert_eq!(VecFormat::from_extension("csv"), None);
-        assert_eq!(VecFormat::from_extension("fvvecs"), None, "variable-length files are not a VecFormat");
+        assert_eq!(VecFormat::from_extension("fvvecs"), Some(VecFormat::Fvvec), "variable-length files are a VecFormat");
     }
 
     // ── The element model ──────────────────────────────────────────
@@ -440,7 +537,7 @@ mod tests {
     #[test]
     fn vec_format_names_every_element_type_and_layout() {
         for &ty in ElementType::ALL {
-            for container in [Container::Vec, Container::Scalar] {
+            for container in [Container::Vec, Container::Vvec, Container::Scalar] {
                 let fmt = VecFormat::of(container, ty).unwrap_or_else(|| panic!("{ty} in {container:?}"));
                 assert_eq!(fmt.element_type(), Some(ty));
                 assert_eq!(fmt.container(), Some(container));
@@ -450,7 +547,6 @@ mod tests {
                     assert_eq!(VecFormat::from_extension(alias), Some(fmt), "{alias}");
                 }
             }
-            assert_eq!(VecFormat::of(Container::Vvec, ty), None);
         }
         for fmt in VecFormat::ALL {
             match (fmt.container(), fmt.element_type()) {
@@ -615,6 +711,7 @@ mod tests {
             assert_eq!(fmt.to_string(), fmt.name());
             let want = match fmt.element_type() {
                 Some(ty) => names.iter().find(|(t, _)| *t == ty).map(|(_, n)| *n).unwrap(),
+                None if fmt == VecFormat::Slab => "bytes",
                 None => "float",
             };
             assert_eq!(fmt.data_type_name(), want, "{fmt}");
@@ -642,8 +739,13 @@ mod tests {
 
     #[test]
     fn test_all_xvec_and_scalar_writable() {
-        for fmt in VecFormat::ALL.iter().filter(|f| f.is_xvec() || f.is_scalar()) {
+        for fmt in VecFormat::ALL.iter().filter(|f| f.is_uniform_xvec() || f.is_scalar()) {
             assert!(fmt.is_writable(), "{} should be writable", fmt);
+        }
+        // A variable-length format is written with `create_varlen`, not
+        // as records of one dimension.
+        for fmt in VecFormat::ALL.iter().filter(|f| f.is_vvec()) {
+            assert!(!fmt.is_writable() && fmt.is_xvec(), "{fmt}");
         }
     }
 

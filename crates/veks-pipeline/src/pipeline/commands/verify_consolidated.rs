@@ -599,7 +599,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // each record into the f32 sgemm packed buffer.
         // Opens the shards when the facet is a series (SH-35); a
         // single file is one part and reads exactly as before.
-        let base_file = match veks_core::formats::portable_io::SpanFile::open(&base_path) {
+        let base_file = match veks_io::file::SpanFile::open(&base_path) {
             Ok(f) => f,
             Err(e) => return error_result(format!("open base for streaming: {}", e), start),
         };

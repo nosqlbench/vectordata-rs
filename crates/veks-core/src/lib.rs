@@ -9,11 +9,11 @@
 //! it. It holds what both the CLI and the pipeline need but neither
 //! should own:
 //!
-//! - [`formats`] — vector and record file formats: the [`formats::VecFormat`]
-//!   taxonomy and extension detection, [`formats::reader`] and
-//!   [`formats::writer`] for xvec, npy, parquet and slab sources and sinks,
-//!   element-type conversion ([`formats::convert`]), and the parquet
-//!   compilers that turn columnar metadata into MNode records.
+//! - [`formats`] — [`formats::reader`] and [`formats::writer`] for xvec,
+//!   npy, parquet and slab sources and sinks, the facet → format choice
+//!   ([`formats::preferred_vec_format`]), and the parquet compilers that
+//!   turn columnar metadata into MNode records. The format model itself
+//!   (`VecFormat`, the streaming traits, element conversion) is veks-io's.
 //! - [`ui`] — the progress and logging abstraction every long-running
 //!   command reports through: a [`ui::UiHandle`] fronting a pluggable
 //!   [`ui::UiSink`] (ratatui, plain text, headless, or a capturing test
@@ -26,14 +26,13 @@
 //!   xvec links.
 //!
 //! ```
-//! use veks_core::formats::{VecFormat, convert::convert_elements};
+//! use veks_core::formats::preferred_vec_format;
+//! use veks_io::{ElementType, VecFormat};
+//! use vectordata::dataset::StandardFacet;
 //!
-//! assert_eq!(VecFormat::from_extension("fvecs"), Some(VecFormat::Fvec));
-//!
-//! // Widen one f16 element (1.0) to f32, as `transform convert` does.
-//! let f16_one = half::f16::from_f32(1.0).to_le_bytes();
-//! let f32_bytes = convert_elements(&f16_one, 2, 4).unwrap();
-//! assert_eq!(f32::from_le_bytes(f32_bytes.try_into().unwrap()), 1.0);
+//! // A bf16 base is written as bf16 vectors; ground truth is always i32.
+//! assert_eq!(preferred_vec_format(StandardFacet::BaseVectors, ElementType::BF16), VecFormat::Bf16vec);
+//! assert_eq!(preferred_vec_format(StandardFacet::NeighborIndices, ElementType::BF16), VecFormat::Ivec);
 //! ```
 
 #![allow(dead_code)]

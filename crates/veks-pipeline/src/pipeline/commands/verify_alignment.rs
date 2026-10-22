@@ -18,7 +18,7 @@ use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     Status, StreamContext, render_options_table,
 };
-use veks_core::formats::VecFormat;
+use veks_io::VecFormat;
 use veks_core::formats::passage_table::parquet_row_count;
 use veks_core::formats::reader::probe_source;
 

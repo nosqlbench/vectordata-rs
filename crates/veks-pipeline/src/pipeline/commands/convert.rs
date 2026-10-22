@@ -11,8 +11,8 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 
-use veks_core::formats::VecFormat;
-use veks_core::formats::convert::convert_elements_into;
+use veks_io::VecFormat;
+use veks_io::convert::convert_elements_into;
 use veks_datatypes::{Element, ElementConversion, ElementKind, FloatFormat};
 use crate::pipeline::element_type::ElementType;
 use veks_core::formats::parquet_vector_compiler;

@@ -156,9 +156,9 @@ data.
         if !expected_ext.is_empty()
             && let Some(ext) = output_path.extension().and_then(|e| e.to_str())
         {
-            let actual_fmt = veks_core::formats::VecFormat::from_extension(ext);
+            let actual_fmt = veks_io::VecFormat::from_extension(ext);
             let expected_fmt =
-                veks_core::formats::VecFormat::from_extension(expected_ext);
+                veks_io::VecFormat::from_extension(expected_ext);
             if actual_fmt != expected_fmt {
                 return error_result(
                     format!(

@@ -17,7 +17,7 @@ use std::io::{self, Write};
 
 use vectordata::dataset::config::DatasetConfig;
 
-use crate::formats::VecFormat;
+use veks_io::VecFormat;
 
 /// Classification of how a facet participates in sized profiles.
 /// Run the stratify command.

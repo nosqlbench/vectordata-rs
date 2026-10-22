@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 
-use veks_core::formats::VecFormat;
+use veks_io::VecFormat;
 use veks_core::formats::reader;
 use veks_core::formats::writer::{self, SinkConfig};
 use veks_core::formats::StandardFacet as Facet;

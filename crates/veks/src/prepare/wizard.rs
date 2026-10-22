@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::formats::VecFormat;
+use veks_io::VecFormat;
 use super::import::ImportArgs;
 
 /// When true, all prompts return their default value without waiting for input.
@@ -107,22 +107,8 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         for src in &seeds.sources {
             let path = if src.is_absolute() { src.clone() } else { cwd.join(src) };
             if let Some(format) = VecFormat::detect_from_path(&path) {
-                if format == VecFormat::Hdf5 {
-                    if let Ok(datasets) = veks_core::formats::reader::hdf5::list_datasets(&path) {
-                        for (ds_name, rows, cols, elem_size) in datasets {
-                            let ds_size = rows * cols as u64 * elem_size as u64;
-                            let fmt_name = match elem_size {
-                                4 => if ds_name.contains("indic") { "ivec" } else { "fvec" },
-                                8 => "dvec", 2 => "mvec", 1 => "bvec", _ => "fvec",
-                            };
-                            let rel = PathBuf::from(format!("{}#{}", src.display(), ds_name));
-                            explicit.push((rel, fmt_name.to_string(), ds_size));
-                        }
-                    }
-                } else {
-                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    explicit.push((src.clone(), format.name().to_string(), size));
-                }
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                explicit.push((src.clone(), format.name().to_string(), size));
             } else {
                 eprintln!("Warning: unrecognized format for --sources {}", src.display());
             }
@@ -1219,18 +1205,9 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     // For HDF5 # paths and other container formats, probe to get element size.
     let detect_format = |p: &Path| -> String {
         let path_str = p.to_string_lossy();
-        // HDF5 dataset paths
+        // HDF5 dataset paths (`file.h5#dataset`): not read, so not probed.
         if path_str.contains('#') {
-            let fmt = VecFormat::detect(p);
-            if let Some(f) = fmt
-                && let Ok(meta) = veks_core::formats::reader::probe_source(p, f) {
-                    let prec = match meta.element_size {
-                        1 => "u8", 2 => "f16", 4 => "f32", 8 => "f64",
-                        n => return format!("hdf5 {}B", n),
-                    };
-                    return format!("hdf5#{} dim={}", prec, meta.dimension);
-                }
-            return "hdf5".into();
+            return "hdf5 (not supported)".into();
         }
         if p.is_dir() {
             if std::fs::read_dir(p).ok()
@@ -2219,42 +2196,10 @@ fn scan_candidates(dir: &Path) -> Vec<(PathBuf, String, u64)> {
         }
 
         if let Some(format) = VecFormat::detect_from_path(&path) {
-            if format == VecFormat::Hdf5 {
-                // HDF5 is a container — list internal datasets as separate candidates.
-                // Each gets a path of the form `file.hdf5#dataset_name`.
-                if let Ok(datasets) = veks_core::formats::reader::hdf5::list_datasets(&path) {
-                    for (ds_name, rows, cols, elem_size) in datasets {
-                        let ds_size = rows * cols as u64 * elem_size as u64;
-                        // Map element size to the xvec format name that the
-                        // downstream role detection uses.
-                        let fmt_name = match elem_size {
-                            4 => {
-                                // Could be f32 or i32 — guess from dataset name
-                                if ds_name.contains("indic") || ds_name.contains("neighbor_ind") {
-                                    "ivec"
-                                } else {
-                                    "fvec"
-                                }
-                            }
-                            8 => "dvec",
-                            2 => "mvec",
-                            1 => "bvec",
-                            _ => "fvec",
-                        };
-                        let rel = PathBuf::from(format!(
-                            "{}#{}",
-                            entry.file_name().to_string_lossy(),
-                            ds_name,
-                        ));
-                        results.push((rel, fmt_name.to_string(), ds_size));
-                    }
-                }
-            } else {
-                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                // Store as relative path (just the filename within the scan dir)
-                let rel = PathBuf::from(entry.file_name());
-                results.push((rel, format.name().to_string(), size));
-            }
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            // Store as relative path (just the filename within the scan dir)
+            let rel = PathBuf::from(entry.file_name());
+            results.push((rel, format.name().to_string(), size));
         }
     }
 

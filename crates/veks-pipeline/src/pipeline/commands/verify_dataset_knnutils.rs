@@ -861,7 +861,7 @@ checks, in a single pipeline step.
             n_base, actual_sample, elem,
         ));
         // See `compute_knn_blas`: a series reads as one byte space.
-        let base_file = match veks_core::formats::portable_io::SpanFile::open(&base_path) {
+        let base_file = match veks_io::file::SpanFile::open(&base_path) {
             Ok(f) => f,
             Err(e) => return error_result(format!("open base for streaming: {}", e), start),
         };

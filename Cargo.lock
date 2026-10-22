@@ -6498,6 +6498,7 @@ dependencies = [
  "veks-completion-derive",
  "veks-core",
  "veks-datatypes",
+ "veks-io",
  "veks-pipeline",
 ]
 
@@ -6598,6 +6599,7 @@ dependencies = [
  "thiserror 2.0.21",
  "veks-apicore",
  "veks-datatypes",
+ "veks-simd",
 ]
 
 [[package]]
@@ -6653,6 +6655,7 @@ dependencies = [
  "veks-completion-derive",
  "veks-core",
  "veks-datatypes",
+ "veks-io",
  "veks-simd",
 ]
 

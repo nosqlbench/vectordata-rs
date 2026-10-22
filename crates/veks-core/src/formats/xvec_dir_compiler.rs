@@ -832,7 +832,7 @@ fn copy_file_range_at(
 /// only difference is one extra memcpy per chunk (the round trip
 /// through user space). EBS still sees one streaming sequential
 /// writer, just with slightly more CPU on the host. Portable across
-/// Unix/Windows via `formats::portable_io`.
+/// Unix/Windows via `veks_io::file`.
 fn read_pwrite_chunk(
     src: &File,
     src_off: u64,
@@ -841,7 +841,7 @@ fn read_pwrite_chunk(
     len: u64,
     scratch: &mut [u8],
 ) -> std::io::Result<()> {
-    use crate::formats::portable_io::{pread_exact, pwrite_all};
+    use veks_io::file::{pread_exact, pwrite_all};
     let len = len as usize;
     debug_assert!(scratch.len() >= len, "scratch too small for chunk");
     let buf = &mut scratch[..len];

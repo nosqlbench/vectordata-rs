@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
-use crate::formats::VecFormat;
+use veks_io::VecFormat;
 use crate::prepare::import::{self, ImportArgs};
 use crate::prepare::wizard;
 

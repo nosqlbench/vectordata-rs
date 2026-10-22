@@ -3,7 +3,6 @@
 
 //! Vector data readers for various formats.
 
-pub mod hdf5;
 pub mod npy;
 pub mod parquet;
 pub mod parquet_mnode;
@@ -12,53 +11,8 @@ pub mod xvec;
 
 use std::path::Path;
 
-use super::VecFormat;
+use veks_io::{SourceMeta, VecFormat, VecSource};
 use crate::formats::StandardFacet;
-
-/// Trait for reading vector records from a source format.
-///
-/// Records are raw element bytes (no dimension prefix). The dimension is
-/// metadata on the source itself.
-pub trait VecSource: Send {
-    /// The vector dimension (number of elements per record)
-    fn dimension(&self) -> u32;
-
-    /// Bytes per element in the source data.
-    ///
-    /// Used to select the correct xvec output variant during import:
-    /// 1 → bvec, 2 → mvec, 4 → fvec, 8 → dvec.
-    fn element_size(&self) -> usize;
-
-    /// Total record count, if known ahead of time
-    fn record_count(&self) -> Option<u64>;
-
-    /// Read the next record as raw bytes (element data only, no dim prefix).
-    /// Returns `None` when exhausted.
-    fn next_record(&mut self) -> Option<Vec<u8>>;
-}
-
-/// Adapter to wrap a `veks_io::VecSource` as a `veks_core::formats::reader::VecSource`.
-struct IoSourceAdapter(Box<dyn veks_io::VecSource>);
-
-impl VecSource for IoSourceAdapter {
-    fn dimension(&self) -> u32 { self.0.dimension() }
-    fn element_size(&self) -> usize { self.0.element_size() }
-    fn record_count(&self) -> Option<u64> { self.0.record_count() }
-    fn next_record(&mut self) -> Option<Vec<u8>> { self.0.next_record() }
-}
-
-/// Lightweight metadata from probing a source without opening a full reader.
-///
-/// This avoids spawning background threads or loading data — only reads
-/// headers and file metadata.
-pub struct SourceMeta {
-    /// Vector dimension (elements per record).
-    pub dimension: u32,
-    /// Bytes per element.
-    pub element_size: usize,
-    /// Total record count, or `None` when it cannot be learned from headers.
-    pub record_count: Option<u64>,
-}
 
 /// Probe a source to extract metadata without starting a full reader.
 ///
@@ -68,7 +22,6 @@ pub struct SourceMeta {
 pub fn probe_source(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
     match format {
         VecFormat::Npy => npy::NpyDirReader::probe(path),
-        VecFormat::Hdf5 => hdf5::probe(path),
         VecFormat::Slab => probe_slab(path),
         _ => {
             // Other formats are lightweight to open — just open and extract
@@ -115,16 +68,12 @@ pub fn open_source(path: &Path, format: VecFormat, threads: usize, max_count: Op
         return xvec::open_xvec(path, format);
     }
     if format.is_scalar() {
-        let io_fmt = veks_io::VecFormat::from_extension(format.name())
-            .unwrap_or(veks_io::VecFormat::ScalarU8);
-        let io_reader = veks_io::scalar::reader::open(path, io_fmt)?;
-        return Ok(Box::new(IoSourceAdapter(io_reader)));
+        return veks_io::scalar::reader::open(path, format);
     }
     match format {
         VecFormat::Npy => npy::NpyDirReader::open(path, threads, max_count),
         VecFormat::Parquet => parquet::ParquetDirReader::open(path, threads),
         VecFormat::Slab => slab::SlabReader::open(path),
-        VecFormat::Hdf5 => hdf5::open(path),
         _ => Err(format!("{} format not supported for reading", format)),
     }
 }

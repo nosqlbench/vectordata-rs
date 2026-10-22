@@ -208,26 +208,13 @@ fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
 }
 
 fn count_file(path: &Path) -> Result<String, String> {
-    // Handle HDF5 paths with #dataset selector (e.g., "file.hdf5#train")
+    // HDF5 paths with a #dataset selector (e.g., "file.hdf5#train") are
+    // not read: say so rather than failing on the extension.
     let path_str = path.to_string_lossy();
-    if let Some(hash_pos) = path_str.rfind('#') {
-        let file_part = &path_str[..hash_pos];
-        let file_path = Path::new(file_part);
-        let file_ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if file_ext == "hdf5" || file_ext == "h5" {
-            // Use the format-aware source reader which handles HDF5 datasets
-            let format = veks_core::formats::VecFormat::Hdf5;
-            let threads = 1;
-            match veks_core::formats::reader::open_source(path, format, threads, None) {
-                Ok(source) => {
-                    return match source.record_count() {
-                        Some(n) => Ok(n.to_string()),
-                        None => Err(format!("cannot determine record count for HDF5 dataset '{}'", path.display())),
-                    };
-                }
-                Err(e) => return Err(format!("failed to open HDF5 source {}: {}", path.display(), e)),
-            }
-        }
+    if let Some((file_part, _)) = path_str.rsplit_once('#')
+        && matches!(Path::new(file_part).extension().and_then(|e| e.to_str()), Some("hdf5" | "h5"))
+    {
+        return Err(format!("{} is an HDF5 dataset, which veks does not read; convert it to fvecs first", path.display()));
     }
 
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -239,7 +226,7 @@ fn count_file(path: &Path) -> Result<String, String> {
 
     // Handle directories (e.g. npy, parquet) via format-aware source reader
     if path.is_dir() {
-        if let Some(format) = veks_core::formats::VecFormat::detect(path) {
+        if let Some(format) = veks_io::VecFormat::detect(path) {
             match veks_core::formats::reader::open_source(path, format, 1, None) {
                 Ok(source) => {
                     return match source.record_count() {
@@ -257,7 +244,7 @@ fn count_file(path: &Path) -> Result<String, String> {
     // Single-file container formats (npy, parquet, hdf5 without a
     // `#dataset` selector) are counted via the format-aware probes; xvec
     // and scalar files fall through to the element-type reader below.
-    if let Some(format) = veks_core::formats::VecFormat::detect_from_path(path)
+    if let Some(format) = veks_io::VecFormat::detect_from_path(path)
         && !format.is_xvec()
         && !format.is_scalar()
     {
@@ -288,7 +275,7 @@ fn dim_file(path: &Path) -> Result<String, String> {
 
     // Container formats (single file or directory) carry their dimension in
     // format metadata — use the format-aware probes, mirroring count_file.
-    if let Some(format) = veks_core::formats::VecFormat::detect(path)
+    if let Some(format) = veks_io::VecFormat::detect(path)
         && !format.is_xvec()
         && !format.is_scalar()
     {

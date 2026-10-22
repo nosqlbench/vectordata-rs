@@ -221,7 +221,7 @@ fn scan_zeros_f32(
     ctx: &mut StreamContext,
 ) -> Vec<ZeroHit> {
     use std::fs::File;
-    use veks_core::formats::portable_io::pread_exact;
+    use veks_io::file::pread_exact;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -392,7 +392,7 @@ fn scan_zeros_f16(
     ctx: &mut StreamContext,
 ) -> Vec<ZeroHit> {
     use std::fs::File;
-    use veks_core::formats::portable_io::pread_exact;
+    use veks_io::file::pread_exact;
 
     let pb = ctx.ui.bar_with_unit(count as u64, "scanning", "vectors");
     let found = std::sync::atomic::AtomicUsize::new(0);
@@ -671,9 +671,9 @@ fn report_zeros_f16(
 /// True when `ext` names a recognized xvec (uniform-dimension) vector
 /// file extension. Accepts both singular and plural canonical forms
 /// (e.g. `fvec`/`fvecs`, `mvec`/`mvecs`) by delegating to
-/// [`veks_core::formats::VecFormat::from_extension`].
+/// [`veks_io::VecFormat::from_extension`].
 fn is_xvec_extension(ext: &str) -> bool {
-    veks_core::formats::VecFormat::from_extension(ext)
+    veks_io::VecFormat::from_extension(ext)
         .map(|f| f.is_uniform_xvec())
         .unwrap_or(false)
 }
@@ -835,7 +835,7 @@ fn scan_file_concise_f32(
     threads: usize,
 ) -> Result<(usize, usize, usize, usize), String> {
     use std::fs::File;
-    use veks_core::formats::portable_io::pread_exact;
+    use veks_io::file::pread_exact;
 
     // Metadata via mmap (touches only the dim header). Full scan via
     // pread streaming so RSS stays bounded on terabyte-class sources.
@@ -920,7 +920,7 @@ fn scan_file_concise_f16(
     threads: usize,
 ) -> Result<(usize, usize, usize, usize), String> {
     use std::fs::File;
-    use veks_core::formats::portable_io::pread_exact;
+    use veks_io::file::pread_exact;
 
     let reader = XvecReader::<half::f16>::open_path(path)
         .map_err(|e| format!("{}", e))?;

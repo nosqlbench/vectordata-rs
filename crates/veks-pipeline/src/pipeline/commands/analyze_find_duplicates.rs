@@ -354,9 +354,9 @@ fn scan_single_file(source_path: &Path, ctx: &mut StreamContext, start: Instant)
 /// True when `ext` names a recognized xvec (uniform-dimension) vector
 /// file extension. Accepts both singular and plural canonical forms
 /// (e.g. `fvec`/`fvecs`, `mvec`/`mvecs`) by delegating to
-/// [`veks_core::formats::VecFormat::from_extension`].
+/// [`veks_io::VecFormat::from_extension`].
 fn is_xvec_extension(ext: &str) -> bool {
-    veks_core::formats::VecFormat::from_extension(ext)
+    veks_io::VecFormat::from_extension(ext)
         .map(|f| f.is_uniform_xvec())
         .unwrap_or(false)
 }

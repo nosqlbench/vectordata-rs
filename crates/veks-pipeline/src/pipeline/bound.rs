@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use veks_core::formats::VecFormat;
+use veks_io::VecFormat;
 use crate::pipeline::command::{ArtifactState, Options};
 
 /// Default artifact check used when a `CommandOp` does not override

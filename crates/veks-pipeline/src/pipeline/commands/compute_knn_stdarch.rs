@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::Write;
-use veks_core::formats::portable_io::pread_exact;
+use veks_io::file::pread_exact;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;

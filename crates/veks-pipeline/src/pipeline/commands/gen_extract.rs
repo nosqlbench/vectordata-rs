@@ -1897,7 +1897,7 @@ fn sorted_index_extract_fvec(
     // keeps the closure capturing them so it can be moved into
     // par_iter without borrowing `fvec_path`.
     let pread_vector = |source_idx: usize| -> std::io::Result<Vec<f32>> {
-        use veks_core::formats::portable_io::pread_exact;
+        use veks_io::file::pread_exact;
         let dim_u = dim as usize;
         let value_bytes = entry_size - 4;
         let mut bytes = vec![0u8; value_bytes];

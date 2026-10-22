@@ -256,7 +256,7 @@ impl VecSink for ShardedSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::VecFormat;
+    use veks_io::VecFormat;
     use crate::formats::writer::{SinkConfig, open_sink};
 
     fn config(dim: u32) -> SinkConfig {

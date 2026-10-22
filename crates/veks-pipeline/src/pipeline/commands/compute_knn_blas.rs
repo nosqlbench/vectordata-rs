@@ -24,7 +24,7 @@
 
 use std::collections::BinaryHeap;
 use std::io::Write;
-use veks_core::formats::portable_io::SpanFile;
+use veks_io::file::SpanFile;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;

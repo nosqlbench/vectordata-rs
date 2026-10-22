@@ -188,7 +188,7 @@ fn import_native_fvec_self_search() {
 fn importing_a_source_of_every_element_type_pins_the_profile_extension() {
     for &ty in ElementType::ALL {
         let dir = tempfile::tempdir().unwrap();
-        let preferred = veks_core::formats::VecFormat::of(Container::Vec, ty).unwrap().preferred_extension();
+        let preferred = veks_io::VecFormat::of(Container::Vec, ty).unwrap().preferred_extension();
         let src = dir.path().join(format!("vectors.{}", ty.extension(Container::Vec)));
         veks_datatypes::dispatch_element!(ty, T => {
             let finite = samples::finite_samples::<T>();

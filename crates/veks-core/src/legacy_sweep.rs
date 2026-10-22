@@ -4,7 +4,7 @@
 //! Workspace sweep for legacy singular-extension xvec files.
 //!
 //! The canonical xvec extensions in this codebase normalise to the
-//! plural form (`fvecs`, `ivecs`, …; see [`crate::formats::VecFormat`]).
+//! plural form (`fvecs`, `ivecs`, …; see [`veks_io::VecFormat`]).
 //! Datasets bootstrapped before that normalisation still carry the
 //! singular-form symlinks (`base_vectors.fvec` &c). `merkle create`
 //! walks them recursively and produces redundant `.mref` siblings,
@@ -27,7 +27,7 @@
 use std::path::Path;
 
 use crate::filters::is_excluded_dir;
-use crate::formats::VecFormat;
+use veks_io::VecFormat;
 
 /// Walk `workspace` and remove every legacy singular-extension file
 /// or symlink (e.g. `*.fvec`, `*.ivec`) whose canonical plural

@@ -110,10 +110,13 @@
 // deprecated item's own example may, and it says so with an allow.
 #![doc(test(attr(deny(deprecated))))]
 
+pub mod convert;
 pub mod element;
+pub mod file;
 pub mod format;
 pub mod reader;
 pub mod scalar;
+pub mod series;
 pub mod source;
 pub mod traits;
 pub mod writer;
@@ -174,7 +177,10 @@ pub fn open(path: impl AsRef<Path>) -> Result<Box<dyn VecSource>, String> {
 
 /// Open a vector file with an explicit format.
 pub fn open_format(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String> {
-    if format.is_xvec() {
+    if format.is_vvec() {
+        return Err(format!("{format} records vary in length: read them with open_varlen"));
+    }
+    if format.is_uniform_xvec() {
         return xvec::reader::open(path, format);
     }
     if format.is_scalar() {
@@ -222,10 +228,13 @@ pub fn create(path: impl AsRef<Path>, dimension: u32) -> Result<Box<dyn VecSink>
 
 /// Create a vector file with an explicit format.
 pub fn create_format(path: &Path, format: VecFormat, dimension: u32) -> Result<Box<dyn VecSink>, String> {
+    if format.is_vvec() {
+        return Err(format!("{format} records vary in length: write them with create_varlen"));
+    }
     if !format.is_writable() {
         return Err(format!("{} is not a writable format", format));
     }
-    if format.is_xvec() {
+    if format.is_uniform_xvec() {
         return xvec::writer::open(path, dimension);
     }
     if format.is_scalar() {
@@ -342,7 +351,7 @@ pub fn create_varlen(path: impl AsRef<Path>) -> Result<Box<dyn VarlenSink>, Stri
 
 /// Probe with an explicit format.
 pub fn probe_format(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
-    if format.is_xvec() {
+    if format.is_uniform_xvec() {
         return xvec::reader::probe(path, format);
     }
     if format.is_scalar() {

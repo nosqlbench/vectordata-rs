@@ -1318,7 +1318,7 @@ fn shard_worker_loop(
             // continuously fed instead of bursting at the end.
             let tmp_path = with_tmp_suffix(&shard_path);
             {
-                use crate::formats::portable_io::pwrite_all;
+                use veks_io::file::pwrite_all;
                 let shard_file = OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -1562,7 +1562,7 @@ fn concat_shards_into_output(
 /// Copy `len` bytes from `src` (starting at offset 0) to `dst` (starting
 /// at `dst_offset`). On Linux uses `copy_file_range` for an in-kernel
 /// copy with no user-space buffer; on other targets falls back to a
-/// chunked `pread`+`pwrite` loop via `formats::portable_io`. Same
+/// chunked `pread`+`pwrite` loop via `veks_io::file`. Same
 /// observable semantics either way (loops until done; errors on
 /// short/zero copies).
 pub(super) fn copy_file_range_full(
@@ -1588,7 +1588,7 @@ fn copy_file_range_full_portable(
     dst_offset: u64,
     len: u64,
 ) -> std::io::Result<()> {
-    use crate::formats::portable_io::{pread_exact, pwrite_all};
+    use veks_io::file::{pread_exact, pwrite_all};
     // Chunk size matches the WRITE_CHUNK_BYTES sized writes the
     // kernel-copy path would have produced indirectly via `sgemm`-ish
     // tiling. 8 MiB keeps the scratch heap allocation modest while

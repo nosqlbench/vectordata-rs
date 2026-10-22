@@ -41,7 +41,7 @@ const DOCUMENTED_ITEMS: &[(&str, &str)] = &[
     ("src/format.rs", "pub fn from_extension("),
     ("src/format.rs", "pub fn preferred_extension("),
     ("src/format.rs", "pub fn element_type("),
-    ("src/scalar/convert.rs", "pub fn convert_scalars("),
+    ("src/convert.rs", "pub fn convert_scalars("),
     ("src/xvec/reader.rs", "pub fn open("),
     ("src/xvec/reader.rs", "pub fn probe("),
     ("src/xvec/writer.rs", "pub fn open("),

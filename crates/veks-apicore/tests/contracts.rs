@@ -251,3 +251,41 @@ fn contracts_are_the_api_cores() {
     let found = misplaced_contracts(&crates_dir());
     assert!(found.is_empty(), "contracts defined outside veks-apicore (srd-crate-boundaries.md AC-2):\n  {}", found.join("\n  "));
 }
+
+/// The streaming model's names and where each is defined.
+const STREAMING_MODEL: &[(&str, &str, &str)] = &[
+    ("trait", "VecSource", "veks-apicore"),
+    ("trait", "VecSink", "veks-apicore"),
+    ("struct", "SourceMeta", "veks-apicore"),
+    ("enum", "VecFormat", "veks-io"),
+];
+
+/// Every definition of a streaming-model name, as `crate: file`.
+fn streaming_definitions(root: &Path) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(root).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        for (path, text) in rust_sources(&entry.path().join("src")) {
+            for (kind, item, _) in STREAMING_MODEL {
+                if text.lines().any(|l| l.trim_start().starts_with(&format!("pub {kind} {item}"))) {
+                    found.push((format!("{item} in {name}"), path.display().to_string()));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// **FL-1: one streaming model.** `VecSource`, `VecSink` and
+/// `SourceMeta` are the API core's and `VecFormat` is veks-io's; no
+/// other crate defines its own, so nothing converts between two models
+/// through a string.
+#[test]
+fn the_streaming_model_is_defined_once() {
+    let found = streaming_definitions(&crates_dir());
+    let misplaced: Vec<&(String, String)> = found
+        .iter()
+        .filter(|(what, _)| !STREAMING_MODEL.iter().any(|(_, item, home)| *what == format!("{item} in {home}")))
+        .collect();
+    assert!(misplaced.is_empty(), "streaming-model types defined outside their home (FL-1): {misplaced:?}");
+}

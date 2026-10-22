@@ -816,7 +816,7 @@ impl GenPredicateKeysOp {
 
         // Build offset index for variable-length output (vvec/ivvec)
         let out_ext = output_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if veks_core::formats::VecFormat::from_extension(out_ext)
+        if veks_io::VecFormat::from_extension(out_ext)
             .map(|f| f.is_vvec()).unwrap_or(false)
             || out_ext == "ivec" || out_ext == "ivecs"
         {

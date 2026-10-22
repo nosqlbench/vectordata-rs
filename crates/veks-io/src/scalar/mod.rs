@@ -7,7 +7,6 @@
 //! is at byte offset `N * element_size`. Record count is
 //! `file_size / element_size`. Dimension is always 1.
 
-pub mod convert;
 pub mod reader;
 pub mod writer;
 pub mod mmap;

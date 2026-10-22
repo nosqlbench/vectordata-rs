@@ -11,7 +11,7 @@ use veks_pipeline::pipeline::element_type::ElementTypeKnn;
 use veks_pipeline::pipeline::element_type::ElementTypeExt;
 use std::path::{Path, PathBuf};
 
-use crate::formats::VecFormat;
+use veks_io::VecFormat;
 
 // ---------------------------------------------------------------------------
 // Public args (matched from CLI)
@@ -566,9 +566,6 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     let facets = resolve_facets(args);
     let wants_queries = facets.contains('Q');
     let has_separate_query = args.query_vectors.is_some();
-    let is_hdf5_source = args.base_vectors.as_ref()
-        .map(|p| VecFormat::detect_from_path(p) == Some(VecFormat::Hdf5))
-        .unwrap_or(false);
 
     // Shuffling randomizes vector order for train/test splitting.
     // Disabled when ground truth is pre-provided (Identity) — shuffling
@@ -594,7 +591,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     // set was given. Combining provided B+Q into one source and re-deriving Q
     // from base discards the user's queries, so only do it when the user
     // explicitly opts in with `--self-search`.
-    let combined_bq = args.self_search && has_separate_query && !is_hdf5_source
+    let combined_bq = args.self_search && has_separate_query
         && !has_precomputed_gt && shuffle_enabled;
     let self_search = wants_queries && (!has_separate_query || combined_bq);
     let has_queries = has_separate_query || self_search;
@@ -646,32 +643,6 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             output: String::new(),
         };
         (Some(shuffle), Some(qv), bv, Some(bc))
-    } else if has_separate_query && is_hdf5_source {
-        // Strategy 2: HDF5 with separate query — independent processing.
-        // Queries get normalize + zero-filter via convert-queries.
-        // Base gets full prepare-vectors + shuffle treatment.
-        // Shuffle randomizes the base vector order after dedup (optional).
-        let shuffle = if shuffle_enabled {
-            Some(Artifact::Materialized {
-                step_id: "generate-shuffle".into(),
-                output: "${cache}/shuffle.ivecs".into(),
-            })
-        } else {
-            None
-        };
-        let qv = Artifact::Materialized {
-            step_id: "convert-queries".into(),
-            output: format!("{}query_vectors.{}", pp, vec_ext),
-        };
-        let bv = Artifact::Materialized {
-            step_id: "extract-base".into(),
-            output: format!("{}base_vectors.{}", pp, vec_ext),
-        };
-        let bc = Artifact::Materialized {
-            step_id: "count-base".into(),
-            output: String::new(),
-        };
-        (shuffle, Some(qv), bv, Some(bc))
     } else if has_separate_query {
         // Separate query file with independent processing (e.g., pre-computed GT).
         let shuffle = if shuffle_enabled {
@@ -2454,7 +2425,7 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
         Artifact::Identity { path } => {
             let ext = std::path::Path::new(path).extension()
                 .and_then(|e| e.to_str())
-                .and_then(crate::formats::VecFormat::canonical_extension)
+                .and_then(veks_io::VecFormat::canonical_extension)
                 .unwrap_or("fvec");
             views.push(("base_vectors".into(),
                 format!("{}base_vectors.{}", args.profile_prefix(), ext)));
@@ -2469,7 +2440,7 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
             Artifact::Identity { path } => {
                 let ext = std::path::Path::new(path).extension()
                     .and_then(|e| e.to_str())
-                    .and_then(crate::formats::VecFormat::canonical_extension)
+                    .and_then(veks_io::VecFormat::canonical_extension)
                     .unwrap_or("fvec");
                 views.push(("query_vectors".into(),
                     format!("{}query_vectors.{}", args.profile_prefix(), ext)));
@@ -2499,7 +2470,7 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
             Artifact::Identity { path } => {
                 let ext = std::path::Path::new(path).extension()
                     .and_then(|e| e.to_str())
-                    .and_then(crate::formats::VecFormat::canonical_extension)
+                    .and_then(veks_io::VecFormat::canonical_extension)
                     .unwrap_or("ivec");
                 views.push(("neighbor_indices".into(),
                     format!("{}neighbor_indices.{}", args.profile_prefix(), ext)));
@@ -2507,7 +2478,7 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
                 if let Some(ref gt_dist) = args.ground_truth_distances {
                     let dext = gt_dist.extension()
                         .and_then(|e| e.to_str())
-                        .and_then(crate::formats::VecFormat::canonical_extension)
+                        .and_then(veks_io::VecFormat::canonical_extension)
                         .unwrap_or("fvec");
                     views.push(("neighbor_distances".into(),
                         format!("{}neighbor_distances.{}", args.profile_prefix(), dext)));
@@ -2678,8 +2649,27 @@ impl Step {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Whether `path` names an HDF5 file or a dataset in one
+/// (`file.h5#dataset`).
+fn is_hdf5_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let file = s.rsplit_once('#').map_or(&*s, |(f, _)| f);
+    matches!(file.rsplit('.').next(), Some("hdf5" | "h5"))
+}
+
 /// Run the `datasets import` subcommand.
 pub fn run(mut args: ImportArgs) {
+    // HDF5 is not read: say so before anything is planned against it.
+    for source in [&args.base_vectors, &args.query_vectors, &args.ground_truth, &args.ground_truth_distances].into_iter().flatten() {
+        if is_hdf5_path(source) {
+            eprintln!(
+                "Error: {} is HDF5, which veks does not read. Convert it to fvecs/ivecs first \
+                 (for example with knn_utils' hdf5_to_fvecs.py).",
+                source.display()
+            );
+            std::process::exit(1);
+        }
+    }
     // Apply --provided-facets masking: null out inputs for facets not
     // in the provided set so the pipeline generates compute steps for them.
     if let Some(ref provided) = args.provided_facets {
@@ -3037,7 +3027,7 @@ fn remove_legacy_xvec_sibling(canonical_link: &std::path::Path) {
     // signal that this is an xvec-class extension.
     if !ext.ends_with('s') { return; }
     let legacy = &ext[..ext.len() - 1];
-    let canon_check = crate::formats::VecFormat::canonical_extension(legacy);
+    let canon_check = veks_io::VecFormat::canonical_extension(legacy);
     if canon_check != Some(ext) { return; }
 
     let legacy_link = canonical_link.with_extension(legacy);
@@ -3595,6 +3585,17 @@ fn count_identity(slots: &PipelineSlots) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// **An HDF5 source is named as one**, file or `file.h5#dataset`,
+    /// so the import refuses it plainly instead of failing on a format
+    /// it cannot detect (srd-crate-boundaries.md Q8).
+    #[test]
+    fn hdf5_sources_are_recognised_to_be_refused() {
+        assert!(super::is_hdf5_path(std::path::Path::new("ann.hdf5")));
+        assert!(super::is_hdf5_path(std::path::Path::new("dir/ann.h5#train")));
+        assert!(!super::is_hdf5_path(std::path::Path::new("base.fvecs")));
+        assert!(!super::is_hdf5_path(std::path::Path::new("h5.fvecs")));
+    }
+
     use super::*;
 
     /// Write a minimal fvec file (N records, dim D).

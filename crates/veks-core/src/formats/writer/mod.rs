@@ -10,40 +10,7 @@ pub mod xvec;
 
 use std::path::Path;
 
-use super::VecFormat;
-
-/// Trait for writing vector records to an output format.
-///
-/// Records are raw element bytes (no dimension prefix). The dimension is
-/// configured at writer construction time.
-pub trait VecSink {
-    /// Write a record with the given ordinal. Data is raw element bytes.
-    fn write_record(&mut self, ordinal: i64, data: &[u8]);
-
-    /// Finalize the output (e.g., write pages page for slab).
-    ///
-    /// Consumes self — an unfinished slab file is corrupt, so the caller
-    /// must handle any I/O errors.
-    fn finish(self: Box<Self>) -> Result<(), String>;
-}
-
-/// Adapter to wrap a `veks_io::VecSink` as a `veks_core::formats::writer::VecSink`.
-struct IoSinkAdapter(Option<Box<dyn veks_io::VecSink>>);
-
-impl VecSink for IoSinkAdapter {
-    fn write_record(&mut self, ordinal: i64, data: &[u8]) {
-        if let Some(ref mut inner) = self.0 {
-            inner.write_record(ordinal, data);
-        }
-    }
-    fn finish(mut self: Box<Self>) -> Result<(), String> {
-        if let Some(inner) = self.0.take() {
-            inner.finish()
-        } else {
-            Ok(())
-        }
-    }
-}
+use veks_io::{VecFormat, VecSink};
 
 /// Configuration for opening a sink writer
 pub struct SinkConfig {
@@ -181,12 +148,7 @@ fn open_one_file(
             config.schema_sidecar.clone(),
         ),
         _ if format.is_xvec() => xvec::XvecWriter::open(path, config.dimension),
-        _ if format.is_scalar() => {
-            let io_fmt = veks_io::VecFormat::from_extension(format.name())
-                .unwrap_or(veks_io::VecFormat::ScalarU8);
-            let io_writer = veks_io::scalar::writer::open(path, io_fmt)?;
-            Ok(Box::new(IoSinkAdapter(Some(io_writer))))
-        }
+        _ if format.is_scalar() => veks_io::scalar::writer::open(path, format),
         _ => Err(format!("{} is not a supported output format", format)),
     }
 }

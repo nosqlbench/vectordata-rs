@@ -14,7 +14,7 @@ use vectordata::VectorReader;
 use vectordata::io::XvecReader;
 
 use super::VecSource;
-use crate::formats::VecFormat;
+use veks_io::VecFormat;
 
 /// Read buffer size for sequential xvec reads (4 MiB).
 ///

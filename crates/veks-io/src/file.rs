@@ -1,10 +1,11 @@
 // Copyright 2024-present nosqlbench / vectordata-rs contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cross-platform `pread` / `pwrite` wrappers.
+//! Cross-platform `pread` / `pwrite` wrappers, and [`SpanFile`].
 //!
-//! Linux-tuned compilers in this crate (`xvec_dir_compiler`,
-//! `parquet_vector_compiler`) lean on positional I/O so a single
+//! The readers and writers here, veks-core's compilers
+//! (`xvec_dir_compiler`, `parquet_vector_compiler`) and the pipeline's
+//! commands lean on positional I/O so a single
 //! shared `File` handle can serve concurrent readers/writers without
 //! needing `&mut self` for each operation. The Unix idiom is
 //! `std::os::unix::fs::FileExt::{read_exact_at, write_all_at}`; the
@@ -133,7 +134,7 @@ pub fn pwrite_all(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
 /// The hot scan paths read with `pread` into heap buffers rather than
 /// mapping the file, so they hold a `File` rather than a reader — and
 /// a `File` is one file. This presents the shards of a series the same
-/// way [`Storage::Series`](vectordata) presents them to the mapped
+/// way vectordata's series storage presents them to the mapped
 /// readers: as one byte space, with offsets that mean what the
 /// unsharded file's offsets meant.
 ///
@@ -158,7 +159,7 @@ impl SpanFile {
         let files: Vec<std::path::PathBuf> = if path.exists() {
             vec![path.to_path_buf()]
         } else {
-            let shards = vectordata::dataset::discover_shards(path);
+            let shards = crate::series::discover_shards(path);
             if shards.is_empty() {
                 // Let `File::open` produce the usual not-found error,
                 // naming the path the caller asked for.

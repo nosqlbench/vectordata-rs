@@ -115,7 +115,7 @@ impl VecReader {
     /// touched) and are copied into the returned buffer, then dropped
     /// at the end of the comparison call.
     fn pread_one_vector_bytes(&self, index: usize) -> Result<Vec<u8>, String> {
-        use veks_core::formats::portable_io::pread_exact;
+        use veks_io::file::pread_exact;
         let entry_size = self.entry_size();
         let value_bytes = entry_size - 4;
         let byte_offset = (index * entry_size + 4) as u64;  // skip i32 dim header
@@ -270,7 +270,7 @@ impl VecReader {
         buf: &mut Vec<u8>,
     ) -> Result<(), String> {
         use rayon::prelude::*;
-        use veks_core::formats::portable_io::pread_exact;
+        use veks_io::file::pread_exact;
         let entry_size = self.entry_size();
         let byte_start = (start * entry_size) as u64;
         let byte_len = (end - start) * entry_size;

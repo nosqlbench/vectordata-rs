@@ -43,6 +43,9 @@ unicode-width = "0.2"
 slabtastic = { path = "../slabtastic", version = "=4.0.2" }
 vectordata = { path = "../vectordata", version = "=4.0.2" }
 veks-core = { path = "../veks-core", version = "=4.0.2" }
+# The format layer: VecFormat, the streaming readers and writers,
+# element conversion and positional file I/O.
+veks-io = { path = "../veks-io", version = "=4.0.2" }
 veks-pipeline = { path = "../veks-pipeline", version = "=4.0.2" }
 libc = "0.2.183"
 
