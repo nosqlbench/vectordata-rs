@@ -20,18 +20,28 @@
 //! 3. Signed GETs (query-string auth; no HEAD probe) with per-file retries,
 //!    a worker pool, and status-file resume (`.s2ag-status.json`).
 //!
+//! Every request goes through the process's transport
+//! (`vectordata::transport::shared`) — its client pool, TLS trust, offline
+//! gate and user agent — with its retries as a [`RetryPolicy`]. The only
+//! authorisation sent is the API key on the file-list request (the bulk
+//! files are signed in their URLs); vectordata's read credentials never
+//! reach Semantic Scholar (`docs/design/srd-crate-boundaries.md` TR-9).
+//!
 //! The API key itself is never an option value: option values land in
 //! provenance sidecars and `dataset.log`, and secrets must not. The key is
 //! resolved from the `api-key-file` option (a file *reference* — only the
 //! path can enter provenance) or, failing that, from `S2_API_KEY`.
 
 use std::collections::VecDeque;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use vectordata::transport::{Request, RetryPolicy, Transport, TransportError};
+
 use super::fetch_bulkdl::config::StatusFile;
-use super::fetch_bulkdl::download::download_file;
+use super::fetch_bulkdl::download::{download_file, download_retry_policy};
 use super::fetch_bulkdl::expand::url_to_filename;
 use crate::pipeline::command::{
     ArtifactManifest, ArtifactState, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole,
@@ -308,7 +318,8 @@ subsequent runs.
             list_url, key_source
         ));
 
-        let urls = match fetch_file_list(&list_url, api_key.as_deref(), tries) {
+        let transport = vectordata::transport::shared();
+        let urls = match fetch_file_list(transport, &list_url, api_key.as_deref(), tries) {
             Ok(u) => u,
             Err(e) => return error_result(e, start),
         };
@@ -350,6 +361,7 @@ subsequent runs.
         let failures = Mutex::new(Vec::<String>::new());
         let done = std::sync::atomic::AtomicU64::new(0);
         let workers = concurrency.min(total_jobs.max(1));
+        let retry = download_retry_policy(tries);
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| {
@@ -357,24 +369,19 @@ subsequent runs.
                         let job = queue.lock().expect("queue lock").pop_front();
                         let Some((filename, url)) = job else { break };
                         let dest = output_dir.join(&filename);
-                        let mut last_err = String::new();
-                        let mut ok = false;
-                        for _attempt in 0..tries.max(1) {
-                            match download_file(&url, &dest, &|_| {}) {
-                                Ok(()) => {
-                                    ok = true;
-                                    break;
-                                }
-                                Err(e) => last_err = e,
-                            }
-                        }
-                        if ok {
+                        // The URL carries its own signature: the request
+                        // is sent with no authorisation header at all.
+                        let fetched = retry.execute(|| {
+                            download_file(transport, Request::get(url.as_str()).anonymous(), &dest, None, &|_| {})
+                        });
+                        if fetched.is_ok() {
                             let mut status = status.lock().expect("status lock");
                             if !status.completed.contains(&filename) {
                                 status.completed.push(filename);
                             }
                             let _ = status.save(&status_path);
                         } else {
+                            let last_err = fetched.err().map(|e| e.to_string()).unwrap_or_default();
                             failures
                                 .lock()
                                 .expect("failures lock")
@@ -527,60 +534,53 @@ subsequent runs.
 
 /// Fetch and parse the release file list: `{"files": ["<signed url>", ...]}`.
 ///
-/// Throttling (429) and server errors (5xx) are retried up to `tries` times
-/// with exponential backoff (2s, 4s, 8s, capped at 16s) — the API meters
-/// requests per second, so a fresh key or a shared-IP burst can 429
-/// transiently. Auth and client errors fail fast.
-fn fetch_file_list(list_url: &str, api_key: Option<&str>, tries: u32) -> Result<Vec<String>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("veks/0.14")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
+/// Throttling (429), server errors (5xx) and lost connections are retried
+/// up to `tries` attempts in all, backing off 2 s, 4 s, 8 s and then 16 s
+/// between them — the API meters requests per second, so a fresh key or a
+/// shared-IP burst can 429 transiently. Auth and other client errors, and
+/// offline mode, fail at once ([`RetryPolicy`]). The request carries the
+/// API key and no other authorisation.
+fn fetch_file_list(
+    transport: &Transport,
+    list_url: &str,
+    api_key: Option<&str>,
+    tries: u32,
+) -> Result<Vec<String>, String> {
     let attempts = tries.max(1);
-    let mut last_err = String::new();
-    let mut body = None;
-    for attempt in 0..attempts {
-        if attempt > 0 {
-            let backoff = (2u64 << (attempt - 1).min(3)).min(16);
-            std::thread::sleep(std::time::Duration::from_secs(backoff));
-        }
-        let mut request = client.get(list_url);
+    let policy = RetryPolicy {
+        max_retries: attempts - 1,
+        base_delay_ms: 2_000,
+        max_delay_ms: 16_000,
+        jitter_fraction: 0.0,
+    };
+    let mut made = 0u32;
+    let fetched = policy.execute(|| {
+        made += 1;
+        let mut request = Request::get(list_url).anonymous();
         if let Some(key) = api_key {
             request = request.header("x-api-key", key);
         }
-        let response = match request.send() {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = format!("file-list request failed: {}", e);
-                continue;
-            }
-        };
-        let status = response.status();
-        if status.is_success() {
-            body = Some(
-                response
-                    .text()
-                    .map_err(|e| format!("invalid response: {}", e))?,
-            );
-            break;
+        let response = transport.send(request).map_err(io::Error::other)?;
+        if !response.is_success() {
+            return Err(io::Error::other(response.status_error()));
         }
-        let code = status.as_u16();
-        if code == 429 || code >= 500 {
-            last_err = format!("HTTP {} from {}", code, list_url);
-            continue;
+        response.text().map_err(io::Error::other)
+    });
+    let body = fetched.map_err(|e| match e.get_ref().and_then(|c| c.downcast_ref::<TransportError>()) {
+        Some(t) if t.is_offline() => t.to_string(),
+        Some(TransportError { status: Some(code), kind, .. }) if kind.is_permanent() => {
+            let hint = if (*code == 401 || *code == 403) && api_key.is_none() {
+                format!(" (no API key was sent — set {})", API_KEY_ENV)
+            } else {
+                String::new()
+            };
+            format!("HTTP {} from {}{}", code, list_url, hint)
         }
-        let hint = if (code == 401 || code == 403) && api_key.is_none() {
-            format!(" (no API key was sent — set {})", API_KEY_ENV)
-        } else {
-            String::new()
-        };
-        return Err(format!("HTTP {} from {}{}", code, list_url, hint));
-    }
-    let Some(body) = body else {
-        return Err(format!("{} (after {} attempt(s))", last_err, attempts));
-    };
+        Some(TransportError { status: Some(code), .. }) => {
+            format!("HTTP {} from {} (after {} attempt(s))", code, list_url, made)
+        }
+        _ => format!("file-list request failed: {} (after {} attempt(s))", e, made),
+    })?;
     let json: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("JSON parse error: {}", e))?;
     let files = json

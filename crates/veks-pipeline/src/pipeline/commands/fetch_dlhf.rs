@@ -8,9 +8,18 @@
 //! HuggingFace HTTP API.
 //!
 //! Equivalent to the Java `CMD_fetch_dlhf` / `bulkdl` command.
+//!
+//! Requests go through the process's transport
+//! (`vectordata::transport::shared`): its client pool, TLS trust, offline
+//! gate and user agent. Their authorisation is the command's own — the
+//! `HF_TOKEN` bearer, or none — and never vectordata's read credentials,
+//! which belong to dataset servers, not to Hugging Face
+//! (`docs/design/srd-crate-boundaries.md` TR-9).
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+use vectordata::transport::{Request, Transport};
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status,
@@ -121,7 +130,9 @@ import, and vector file assembly.
             repo_type, repo, revision
         );
 
-        let file_list = match list_hf_files(&api_url) {
+        let transport = vectordata::transport::shared();
+        let token = hf_token(std::env::var("HF_TOKEN").ok());
+        let file_list = match list_hf_files(transport, &api_url, token.as_deref()) {
             Ok(files) => files,
             Err(e) => return error_result(format!("failed to list files: {}", e), start),
         };
@@ -177,7 +188,7 @@ import, and vector file assembly.
                 entry.rfilename, entry.size
             ));
 
-            match download_file(&download_url, &dest) {
+            match download_file(transport, &download_url, &dest, token.as_deref()) {
                 Ok(size) => {
                     ctx.ui.log(&format!("  {} — done ({} bytes)", entry.rfilename, size));
                     downloaded += 1;
@@ -270,27 +281,21 @@ struct HfFileEntry {
     file_type: String,
 }
 
-/// List files in a HuggingFace repo via the API.
-fn list_hf_files(api_url: &str) -> Result<Vec<HfFileEntry>, String> {
-    let client_builder = reqwest::blocking::Client::builder()
-        .user_agent("veks/0.14")
-        .redirect(reqwest::redirect::Policy::limited(10));
+/// The Hugging Face token from the `HF_TOKEN` value: `None` when unset
+/// or blank, so a blank variable sends no `Authorization` at all.
+fn hf_token(env_value: Option<String>) -> Option<String> {
+    env_value.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
 
-    let client = client_builder.build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    let mut request = client.get(api_url);
-
-    // Check for HF_TOKEN env var for authenticated access
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        request = request.bearer_auth(token);
-    }
-
-    let response = request.send()
+/// List files in a HuggingFace repo via the API, authorised by `token`
+/// alone (anonymous without one).
+fn list_hf_files(transport: &Transport, api_url: &str, token: Option<&str>) -> Result<Vec<HfFileEntry>, String> {
+    let response = transport
+        .send(Request::get(api_url).bearer_or_anonymous(token))
         .map_err(|e| format!("API request failed: {}", e))?;
 
-    if !response.status().is_success() {
-        return Err(format!("HTTP {} from {}", response.status().as_u16(), api_url));
+    if !response.is_success() {
+        return Err(format!("HTTP {} from {}", response.status(), api_url));
     }
 
     let json_str = response.text()
@@ -329,8 +334,9 @@ fn list_hf_files(api_url: &str) -> Result<Vec<HfFileEntry>, String> {
     Ok(files)
 }
 
-/// Download a URL to a local file.
-fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
+/// Download a URL to a local file, streaming the body to disk,
+/// authorised by `token` alone (anonymous without one).
+fn download_file(transport: &Transport, url: &str, dest: &Path, token: Option<&str>) -> Result<u64, String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create dir: {}", e))?;
@@ -339,25 +345,15 @@ fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
     let mut file =
         std::fs::File::create(dest).map_err(|e| format!("failed to create {}: {}", dest.display(), e))?;
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("veks/0.14")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    let mut request = client.get(url);
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        request = request.bearer_auth(token);
-    }
-
-    let mut response = request.send()
+    let response = transport
+        .send(Request::get(url).bearer_or_anonymous(token))
         .map_err(|e| format!("download failed: {}", e))?;
 
-    if !response.status().is_success() {
-        return Err(format!("HTTP {} from {}", response.status().as_u16(), url));
+    if !response.is_success() {
+        return Err(format!("HTTP {} from {}", response.status(), url));
     }
 
-    std::io::copy(&mut response, &mut file)
+    response.copy_to(&mut file)
         .map_err(|e| format!("write error: {}", e))?;
 
     let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
@@ -429,6 +425,96 @@ mod tests {
         assert!(glob_match("base.*", "base.fvec"));
         assert!(glob_match("*.f???", "data.fvec"));
         assert!(glob_match("data*", "data_vectors.fvec"));
+    }
+
+    /// Read credentials that would authorise every URL: what
+    /// `$VECTORDATA_TOKEN` is to the process's transport.
+    struct Everywhere;
+
+    impl vectordata::transport::Credentials for Everywhere {
+        fn read_token(&self, _url: &str) -> Option<String> {
+            Some("vectordata-secret".to_string())
+        }
+    }
+
+    /// A Hugging Face stand-in: the tree API lists `a.bin` (3 bytes) and
+    /// the resolve endpoint serves it. Returns its base URL and the
+    /// `Authorization` header of every request it got (`None` when absent).
+    fn hub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let mut auth = None;
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':')
+                        && k.eq_ignore_ascii_case("authorization")
+                    {
+                        auth = Some(v.trim().to_string());
+                    }
+                }
+                log.lock().unwrap().push(auth);
+                let body = if line.contains("/api/") { r#"[{"path":"a.bin","size":3,"type":"file"}]"# } else { "abc" };
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        (base, seen)
+    }
+
+    /// **A Hugging Face request carries `HF_TOKEN` or nothing — never a
+    /// vectordata read token**, even from a transport whose credentials
+    /// would authorise every URL (TR-9).
+    #[test]
+    fn hub_requests_carry_only_their_own_token() {
+        let transport = Transport::with_credentials(
+            vectordata::transport::TransportConfig::default(),
+            std::sync::Arc::new(Everywhere),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        for token in [Some("hf-token"), None] {
+            let (base, seen) = hub();
+            let files = list_hf_files(&transport, &format!("{base}/api/datasets/r/tree/main"), token).unwrap();
+            assert_eq!(files.len(), 1);
+            let dest = dir.path().join("a.bin");
+            assert_eq!(download_file(&transport, &format!("{base}/datasets/r/resolve/main/a.bin"), &dest, token).unwrap(), 3);
+            let expected = token.map(|t| format!("Bearer {t}"));
+            assert_eq!(*seen.lock().unwrap(), vec![expected.clone(), expected], "token {token:?}");
+        }
+    }
+
+    /// Offline mode refuses both requests before the network.
+    #[test]
+    fn offline_mode_refuses_the_hub() {
+        let offline = Transport::new(vectordata::transport::TransportConfig {
+            offline: true,
+            ..Default::default()
+        });
+        let (base, seen) = hub();
+        let listed = list_hf_files(&offline, &format!("{base}/api/datasets/r/tree/main"), None).unwrap_err();
+        assert!(listed.contains("offline mode is on"), "{listed}");
+        let dir = tempfile::tempdir().unwrap();
+        let fetched = download_file(&offline, &format!("{base}/datasets/r/resolve/main/a.bin"), &dir.path().join("a"), None)
+            .unwrap_err();
+        assert!(fetched.contains("offline mode is on"), "{fetched}");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_blank_hf_token_sends_none() {
+        assert_eq!(hf_token(None), None);
+        assert_eq!(hf_token(Some("  ".into())), None);
+        assert_eq!(hf_token(Some(" t ".into())).as_deref(), Some("t"));
     }
 
     #[test]

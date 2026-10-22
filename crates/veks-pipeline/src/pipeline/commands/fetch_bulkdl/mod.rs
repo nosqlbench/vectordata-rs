@@ -17,6 +17,13 @@
 //! tracking, and progress bar. The mode option determines only how the list
 //! of files is produced; the download mechanics below are mode-aware only at
 //! the per-request level.
+//!
+//! Every request goes through the process's transport
+//! (`vectordata::transport::shared`): its client pool, TLS trust, offline
+//! gate and user agent. Template-mode requests are anonymous and COS-mode
+//! requests are SigV4-signed; vectordata's read credentials never apply to
+//! either (`docs/design/srd-crate-boundaries.md` TR-9). Retries are a
+//! [`RetryPolicy`](vectordata::transport::RetryPolicy).
 
 // config, download, and expand are shared with the sibling `download s2ag`
 // command (fetch_s2ag), which reuses the status-file resume tracking, the
@@ -33,10 +40,10 @@ use std::time::Instant;
 
 
 use config::{StatusFile, parse_token_spec};
-use cos::{CosContext, CosCredentials};
-use download::{download_file, download_signed_file, head_content_length_retry};
+use cos::CosContext;
+use download::{download_file, download_retry_policy, head_content_length_retry};
 use expand::expand_tokens;
-use reqwest::blocking::Client;
+use vectordata::transport::{Request, Transport};
 use crate::pipeline::command::{
     ArtifactState, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     ResourceDesc, Status, StreamContext, render_options_table,
@@ -107,7 +114,6 @@ enum FetchJob {
         filename: String,
         expected_size: u64,
         ctx: Arc<CosContext>,
-        client: Arc<Client>,
     },
 }
 
@@ -136,32 +142,33 @@ impl FetchJob {
     /// Verify the local file's size matches the expected size, if known.
     /// In COS mode the size comes from the listing (no extra HTTP call).
     /// In HTTP mode this re-issues a HEAD with retries.
-    fn check_existing_size(&self, local_len: u64) -> Result<bool, String> {
+    fn check_existing_size(&self, transport: &Transport, local_len: u64) -> Result<bool, String> {
         match self {
             FetchJob::Http { url, .. } => {
-                let remote = head_content_length_retry(url, 10)?;
+                let remote = head_content_length_retry(transport, url, 10)?;
                 Ok(remote == local_len)
             }
             FetchJob::Cos { expected_size, .. } => Ok(*expected_size == local_len),
         }
     }
 
-    fn perform(&self, dest: &Path, on_bytes: &dyn Fn(u64)) -> Result<(), String> {
+    fn perform(&self, transport: &Transport, dest: &Path, on_bytes: &dyn Fn(u64)) -> std::io::Result<()> {
         // Ensure parent directory exists (COS keys may contain subpaths).
         if let Some(parent) = dest.parent()
             && !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| {
-                    format!("failed to create directory {}: {}", parent.display(), e)
+                    std::io::Error::other(format!("failed to create directory {}: {}", parent.display(), e))
                 })?;
             }
 
         match self {
-            FetchJob::Http { url, .. } => download_file(url, dest, on_bytes),
-            FetchJob::Cos { key, expected_size, ctx, client, .. } => {
-                // Sign at the moment of the GET — SigV4 signatures are valid
-                // for 15 minutes from x-amz-date.
-                let (url, headers) = ctx.signed_get(key);
-                download_signed_file(client, &url, headers, dest, *expected_size, on_bytes)
+            FetchJob::Http { url, .. } => {
+                download_file(transport, Request::get(url.as_str()).anonymous(), dest, None, on_bytes)
+            }
+            // Signed by the transport at the moment of the GET — SigV4
+            // signatures are valid for 15 minutes from x-amz-date.
+            FetchJob::Cos { key, expected_size, ctx, .. } => {
+                download_file(transport, ctx.get_request(key), dest, Some(*expected_size), on_bytes)
             }
         }
     }
@@ -278,12 +285,13 @@ size check verifies any pre-existing local file before re-downloading.
         }
 
         // 3. Enumerate the candidate files according to the mode.
+        let transport = vectordata::transport::shared();
         let candidates = match mode {
             Mode::Template => match enumerate_template(options) {
                 Ok(c) => c,
                 Err(e) => return error_result(e, start),
             },
-            Mode::Cos => match enumerate_cos(options, ctx) {
+            Mode::Cos => match enumerate_cos(transport, options, ctx) {
                 Ok(c) => c,
                 Err(e) => return error_result(e, start),
             },
@@ -317,7 +325,7 @@ size check verifies any pre-existing local file before re-downloading.
                         let local_len = meta.len();
                         if local_len > 0 {
                             verify_pb.set_message(format!("checking {}", filename));
-                            match job.check_existing_size(local_len) {
+                            match job.check_existing_size(transport, local_len) {
                                 Ok(true) => {
                                     st.completed.push(filename);
                                     skipped_size += 1;
@@ -420,6 +428,7 @@ size check verifies any pre-existing local file before re-downloading.
             let w_pb_id = pb_id;
             let w_byte_bar = byte_bar;
             let w_started = Arc::clone(&started_files);
+            let transport = transport.clone();
 
             workers.push(std::thread::spawn(move || {
                 loop {
@@ -438,7 +447,7 @@ size check verifies any pre-existing local file before re-downloading.
                     if dest.exists()
                         && let Ok(meta) = fs::metadata(&dest)
                             && meta.len() > 0
-                                && let Ok(true) = job.check_existing_size(meta.len()) {
+                                && let Ok(true) = job.check_existing_size(&transport, meta.len()) {
                                     ui.log(&format!(
                                         "[w{}] skip {} ({})",
                                         worker_id, filename, format_size(meta.len())
@@ -453,7 +462,9 @@ size check verifies any pre-existing local file before re-downloading.
 
                     let mut last_err = String::new();
                     let mut succeeded = false;
-                    for attempt in 1..=tries {
+                    let mut attempt = 0u32;
+                    let _ = download_retry_policy(tries).execute(|| {
+                        attempt += 1;
                         if attempt == 1 {
                             ui.log(&format!("[w{}] {}", worker_id, display));
                         } else {
@@ -477,7 +488,7 @@ size check verifies any pre-existing local file before re-downloading.
                                 }
                             }
                         };
-                        match job.perform(&dest, &on_bytes) {
+                        match job.perform(&transport, &dest, &on_bytes) {
                             Ok(()) => {
                                 let file_size = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
                                 let secs = t0.elapsed().as_secs_f64();
@@ -492,21 +503,22 @@ size check verifies any pre-existing local file before re-downloading.
                                 ));
                                 let _ = result_tx.send(DownloadResult::Ok(filename.clone(), file_size));
                                 succeeded = true;
-                                break;
+                                Ok(())
                             }
                             Err(e) => {
-                                last_err = e.clone();
+                                last_err = e.to_string();
                                 ui.log(&format!(
                                     "[w{}] FAIL {}/{} {}: {}",
                                     worker_id, attempt, tries, filename, e
                                 ));
+                                Err(e)
                             }
                         }
-                    }
+                    });
                     if !succeeded {
                         ui.log(&format!(
                             "[w{}] FAILED {} after {} attempts: {}",
-                            worker_id, filename, tries, last_err
+                            worker_id, filename, attempt, last_err
                         ));
                         let _ = result_tx.send(DownloadResult::Failed);
                     }
@@ -814,20 +826,19 @@ fn enumerate_template(options: &Options) -> Result<Vec<FetchJob>, String> {
 /// Parse cos-mode options, build the [`CosContext`], and list every object
 /// under `prefix`. The local filename for each key is the key with `prefix`
 /// stripped — preserving any subdirectory structure beneath the prefix.
-fn enumerate_cos(options: &Options, ctx: &mut StreamContext) -> Result<Vec<FetchJob>, String> {
+fn enumerate_cos(transport: &Transport, options: &Options, ctx: &mut StreamContext) -> Result<Vec<FetchJob>, String> {
     let endpoint = options.require("endpoint")?.to_string();
     let bucket = options.require("bucket")?.to_string();
     let prefix = options.get("prefix").unwrap_or("").to_string();
     let region = options.get("region").unwrap_or("us-south").to_string();
 
-    let credentials = CosCredentials::from_env()?;
+    let credentials = cos::credentials_from_env()?;
     let cos_ctx = Arc::new(CosContext::new(endpoint.clone(), bucket.clone(), region, credentials)?);
-    let client = Arc::new(Client::new());
 
     ctx.ui.log(&format!(
         "bulkdl (cos): listing s3://{}/{} via {}", bucket, prefix, endpoint
     ));
-    let listed = cos_ctx.list_prefix(&client, &prefix)?;
+    let listed = cos_ctx.list_prefix(transport, &prefix)?;
     ctx.ui.log(&format!("bulkdl (cos): found {} object(s) under prefix", listed.len()));
 
     let mut jobs = Vec::with_capacity(listed.len());
@@ -846,7 +857,6 @@ fn enumerate_cos(options: &Options, ctx: &mut StreamContext) -> Result<Vec<Fetch
             filename,
             expected_size: size,
             ctx: Arc::clone(&cos_ctx),
-            client: Arc::clone(&client),
         });
     }
     Ok(jobs)

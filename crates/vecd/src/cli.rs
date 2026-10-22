@@ -1780,32 +1780,63 @@ fn format_health_url(scheme: &str, addr: SocketAddr) -> String {
     format!("{scheme}://{host}:{}/healthz", addr.port())
 }
 
+/// The readiness probe's whole-request ceiling, connecting included.
+const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The readiness probe's transport configuration (pure): verification on,
+/// with vecd's own certificate (`own_cert`, the configured `tls_cert`)
+/// added to the trusted roots and no origin trusted without verification,
+/// so the probe accepts its own server and refuses any other — a
+/// different self-signed server at the probed address or anywhere else
+/// (`docs/design/srd-crate-boundaries.md` TR-11, §10 Q9). A plain-HTTP
+/// probe uses no TLS. Two-second ceilings, no redirects, one client.
+fn health_probe_config(own_cert: Option<PathBuf>) -> vectordata::transport::TransportConfig {
+    use vectordata::transport::{Timeouts, TlsTrust, TransportConfig};
+    TransportConfig {
+        tls: TlsTrust { trusted_ca_certs: own_cert.into_iter().collect(), trust_self_signed: Vec::new() },
+        user_agent: concat!("vecd/", env!("CARGO_PKG_VERSION")).to_string(),
+        timeouts: Timeouts { request: HEALTH_PROBE_TIMEOUT, connect: HEALTH_PROBE_TIMEOUT },
+        redirects: 0,
+        parallel_streams: 1,
+        download_concurrency: 1,
+        ..TransportConfig::default()
+    }
+}
+
+/// One readiness probe of `url`: `Ok` on a 2xx answer, else why not. The
+/// request is anonymous and explicit (vecd's own endpoint, not a dataset
+/// server), so neither vectordata's read credentials nor its offline mode
+/// apply.
+fn probe_health(transport: &vectordata::transport::Transport, url: &str) -> Result<(), String> {
+    use vectordata::transport::Request;
+    match transport.send(Request::get(url).anonymous().explicit()) {
+        Ok(resp) if resp.is_success() => Ok(()),
+        Ok(resp) => Err(format!("{url} → HTTP {}", resp.status_line())),
+        Err(e) => Err(format!("{url}: {e}")),
+    }
+}
+
 /// Poll `GET /healthz` until it answers 2xx or `timeout_secs` elapses — the
-/// readiness wait behind `vecd daemon status --wait`. Invalid certs are
-/// accepted: this is a liveness self-check of vecd's own (often self-signed)
-/// loopback endpoint, where cert trust is beside the point. The URL is
-/// re-resolved each iteration so an ephemeral-port plain-HTTP serve is picked
-/// up once it publishes `vecd.addr`.
+/// readiness wait behind `vecd daemon status --wait`. Over HTTPS the probe
+/// trusts vecd's own configured certificate and nothing else
+/// ([`health_probe_config`]). The URL is re-resolved each iteration so an
+/// ephemeral-port plain-HTTP serve is picked up once it publishes
+/// `vecd.addr`.
 fn wait_for_health(
     data_dir: &std::path::Path,
     cfg: &config::Config,
     timeout_secs: u64,
 ) -> Result<(), VecdError> {
     use std::time::{Duration, Instant};
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| VecdError::op(e.to_string()))?;
+    let transport = vectordata::transport::Transport::new(health_probe_config(cfg.get("tls_cert").map(PathBuf::from)));
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         // Every arm but the 2xx success (which returns) records why this
         // attempt failed, for the timeout message.
         let last = match health_probe_url(data_dir, cfg) {
-            Ok(url) => match client.get(&url).send() {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
-                Ok(resp) => format!("{url} → HTTP {}", resp.status()),
-                Err(e) => format!("{url}: {e}"),
+            Ok(url) => match probe_health(&transport, &url) {
+                Ok(()) => return Ok(()),
+                Err(why) => why,
             },
             Err(e) => e.to_string(),
         };
@@ -2444,6 +2475,20 @@ fn toggle_opt(active: bool, no_active: bool, what: &str) -> Result<Option<bool>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe's trust is vecd's own certificate, verified, and no
+    /// origin accepted unverified; no redirects, two-second ceilings.
+    #[test]
+    fn the_health_probe_trusts_only_its_own_certificate() {
+        let c = health_probe_config(Some(PathBuf::from("/etc/vecd/tls-cert.pem")));
+        assert_eq!(c.tls.trusted_ca_certs, vec![PathBuf::from("/etc/vecd/tls-cert.pem")]);
+        assert!(c.tls.trust_self_signed.is_empty(), "no origin is trusted unverified");
+        assert_eq!(c.redirects, 0);
+        assert_eq!((c.timeouts.request, c.timeouts.connect), (HEALTH_PROBE_TIMEOUT, HEALTH_PROBE_TIMEOUT));
+        assert_eq!(HEALTH_PROBE_TIMEOUT, std::time::Duration::from_secs(2));
+        let plain = health_probe_config(None);
+        assert!(plain.tls.trusted_ca_certs.is_empty() && plain.tls.trust_self_signed.is_empty());
+    }
 
     #[test]
     fn format_health_url_normalizes_host_and_scheme() {

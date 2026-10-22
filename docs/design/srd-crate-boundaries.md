@@ -890,3 +890,451 @@ same bench) and the new one alternately:
 The workspace passes (121 test binaries), clippy reports nothing new in
 the changed files, and `RUSTDOCFLAGS="-D warnings" cargo doc` is clean
 for veks-apicore, vectordata and veks-io.
+
+### 12.2 Step 1: veks-io's model complete (2026-10-22)
+
+`VecFormat`, the streaming traits and element conversion each have one
+definition. veks-core's copies are deleted, not aliased, and veks-core,
+veks-pipeline and veks use veks-io's names.
+
+**What moved or changed.**
+- FL-1: `veks_io::VecFormat` gains the twelve vvec variants (`Fvvec` …
+  `U64vvec`, in `ALL`), `is_uniform_xvec` and `is_vvec` (`is_xvec` is
+  now both), `detect_from_path`, `detect_from_directory` (public; npy,
+  then parquet, then an xvec member, then slab), `record_bytes` and
+  `expected_file_size`. `from_extension("fvvecs")` is `Fvvec` (it was
+  `None`), `VecFormat::of(Container::Vvec, ty)` names a format, and a
+  slab's `data_type_name` is `bytes`. `open_format` and
+  `create_format` refuse a vvec format and name `open_varlen` and
+  `create_varlen`.
+- veks-core's `VecSource`, `VecSink`, `SourceMeta` and `VecFormat` are
+  deleted, with the adapters between the two models (`IoSourceAdapter`,
+  `IoSinkAdapter`) and their `from_extension(name()).unwrap_or(ScalarU8)`
+  round trip.
+- FL-7: veks-core's `formats/convert.rs` and veks-io's
+  `scalar/convert.rs` are one module, `veks_io::convert`: float records
+  on veks-simd's byte converters, and checked columns. veks-io now
+  depends on veks-simd.
+- FL-8: veks-core's `portable_io` is `veks_io::file`.
+- Finding and measuring a series on disk (`discover_shards`,
+  `observe_series`) moved from vectordata's `dataset::shards` to
+  `veks_io::series`, as §12.1 said it would. vectordata re-exports
+  both.
+- Q8 landed here, not in step 4: veks-core's enum held `Hdf5`, so it
+  went with the enum. The stub reader (`reader/hdf5.rs`) is deleted.
+  `veks prepare import` refuses an `.h5` or `.hdf5` source, file or
+  `file.h5#dataset`, before it plans anything: hdf5 is not read, so
+  convert it first. The pipeline's `count:` variable says the same.
+  The wizard no longer lists an HDF5 file's datasets and shows it as
+  `hdf5 (not supported)`. The import's HDF5-with-separate-query
+  strategy is gone.
+
+**Settled in implementation.**
+- **`parse_hdf5_path` did not stay with the wizard**, as Q8 assumed: it
+  had no caller but its own test. It was deleted with the reader. The
+  import's `is_hdf5_path` recognises the notation in order to refuse
+  it.
+- **veks-core's lib example** shows `preferred_vec_format` instead of
+  `VecFormat` and `convert_elements`, which are veks-io's now.
+
+**Guard** (`crates/veks-apicore/tests/contracts.rs`):
+`the_streaming_model_is_defined_once` (FL-1). `VecSource`, `VecSink`
+and `SourceMeta` are defined only in veks-apicore, and `VecFormat`
+only in veks-io. On fa21340 it lists veks-core's `VecFormat`
+(`formats/mod.rs`), `VecSource` and `SourceMeta` (`formats/reader`)
+and `VecSink` (`formats/writer`).
+`hdf5_sources_are_recognised_to_be_refused` (veks, `prepare/import.rs`)
+holds the refusal.
+
+### 12.3 Step 2: streaming xvec merged (2026-10-22)
+
+veks-core's streaming xvec reader and writer (`formats/reader/xvec.rs`,
+`formats/writer/xvec.rs`) are deleted. `open_source` and `open_sink`
+open veks-io's.
+
+**What moved or changed.**
+- FL-2: `veks_io::xvec::reader::open` and `probe` read one file, a
+  directory of files of the format in name order (the order `__NNNN`
+  names sort in), or, when the path itself is absent, the series it is
+  the unsharded name of. Each file is checked for a whole number of
+  records and the same dimension as the files before it. As the stream
+  moves on to the next file, what is left of the finished one's pages
+  is released.
+- FL-3: the byte-level xvec writer starts writeback every 64 MiB and
+  releases what the cycle before wrote back
+  (`sync_file_range`, then `FADV_DONTNEED`; Linux only). It still
+  returns the first I/O error from `finish`.
+- FL-3: a symlink at the target is an error from every veks-io writer:
+  the xvec, scalar and varlen byte writers, and the typed writers
+  (`create_for`). The error names the link and what it points to.
+
+**Settled in implementation.**
+- **The symlink rule**, by the user's ruling ("it is foolish to assume
+  you can just remove a symlink"), is in FL-3 itself. veks-core's
+  writer removed a link silently. That is not carried over.
+- **The buffer stays 16 MiB**, by FL-3's measurement.
+- **The full-disk guard no longer writes through a symlink to
+  `/dev/full`**, since the writers refuse one now. It reruns itself as
+  a child process with `RLIMIT_FSIZE` at 1 MiB and `SIGXFSZ` ignored,
+  so the limit touches nothing else in the test process.
+
+**Guards** (`crates/veks-io/tests/streaming.rs`, new):
+- `a_directory_of_shards_reads_as_one_stream` and
+  `a_series_opens_by_its_unsharded_name` (FL-2): veks-io's step-1
+  reader mapped only the path it was given.
+- `shards_of_another_dimension_are_refused`.
+- `a_symlink_at_the_target_is_refused`: every writer, and the link and
+  the file it links to left as they were. veks-io's step-1 writers
+  opened the path with `File::create` and wrote through the link.
+- `a_file_written_across_writeback_cycles_reads_back_whole`: 70 MiB,
+  past one cycle.
+- In `tests/writers.rs`, `a_full_disk_is_an_error_from_every_writer`
+  runs `writes_past_the_file_size_limit_fail` under the limit.
+
+**PR-10.** `stream_write/sink_write_record` (256 MiB of dim-128 f32):
+183.6 ms at a 16 MiB buffer and 182.5 ms at 4 MiB (FL-3).
+
+### 12.4 Step 3: the gaps (2026-10-22)
+
+The rest of veks-core's writing side moved into veks-io: the sinks,
+the sharding sink, the positional writer, the slab reader and writer,
+and the pipeline's atomic writer and symlink guard. veks-core's
+`formats::writer` is gone.
+
+**What moved or changed.**
+- G1: `veks_io::reader::probe_source(&impl ByteSource, ElementType)`
+  returns an `XvecProbe` (`dim`, `record_bytes`, `records`,
+  `trailing_bytes`, `complete`). It reads one header, so it describes
+  a partial, sparse or truncated source instead of refusing it.
+- G2: veks-core's `mmap_xvec` is `veks_io::xvec::positional::PositionalXvecWriter`.
+- G3: `veks_io::writer::encode_records` packs rows into a caller's
+  buffer. `XvecWriter::write_raw` writes records already in the file's
+  layout, and checks that every header is the file's dimension and that
+  the bytes are whole records.
+- G4: `veks_io::atomic` (`AtomicWriter`, `temp_path_for`,
+  `guard_against_symlink_write`, `safe_create_file`, `safe_write`,
+  `safe_copy`), moved from veks-pipeline's `atomic_write.rs`, which now
+  re-exports it. The shard-capped writer is `veks_io::sharded`
+  (`ShardedSink`, `ShardedOutcome`, `ShardOpener`).
+- G5: `veks_io::reader::load_series_offsets` returns a vvec series'
+  offsets in the series' joined byte space.
+- FL-6: `open_sink`, `open_sharded_sink`, `SinkConfig` and
+  `SLAB_RECORD_FRAMING` are `veks_io::sink`. Shard naming stays the API
+  core's (`dataset::shards::shard_name`, `shard_source_spec`).
+- The slab reader and writer are `veks_io::slab` (feature `slab`).
+  veks-core and veks-pipeline enable the feature.
+- `metadata_schema` (`MetadataSchema`, `PredicateSchema`, the slab
+  namespace names) moved from vectordata to veks-apicore, because
+  veks-io's slab writer seals a slab with a schema sidecar and veks-io
+  does not depend on vectordata. `vectordata::metadata_schema`
+  re-exports it.
+- veks-core's shared test samples moved to `veks-io/tests/support`.
+
+**Settled in implementation.**
+- **`guard_against_symlink_write` errors.** The pipeline's version
+  printed "removing symlink" and removed it, in twelve files. Now
+  every writer refuses a symlink, by the user's ruling, and the byte
+  writers' `refuse_symlink` is this guard.
+- **The process that made a link removes it.** Before any step writes,
+  the import's `unlink_superseded_identity_links` removes the Identity
+  links that it created itself and that a new plan materializes. It
+  removes only symlinks and never a file, and it prints each removal.
+  This is FL-3's paragraph, amended in this step.
+
+**Guards:**
+- `crates/veks-io/tests/sinks.rs` (new), over every uniform vector and
+  scalar format, read back at the format's own type:
+  `open_sink_writes_every_vector_and_scalar_format_that_reads_back_at_its_type`,
+  `the_sharded_sink_writes_every_vector_and_scalar_format_across_shards`,
+  `the_positional_writer_writes_every_uniform_vector_format`.
+- `every_writer_refuses_a_symlink_target` (`veks_io::atomic`), and the
+  guard's doc example. The pipeline's guard removed the link.
+- `a_materialized_artifact_unlinks_the_previous_identity_link` (veks,
+  `prepare/import.rs`): the import's own link is removed, and a
+  regular file at another output and the linked source are left alone.
+- `metadata_schema.rs` joins veks-apicore's cold-module list
+  (`contracts.rs`, PR-2).
+
+### 12.5 Step 4: other formats (2026-10-22)
+
+The npy and parquet vector readers moved from veks-core to veks-io,
+behind veks-io's `npy` and `parquet` features. `veks_io::open_format`
+now opens npy, parquet and slab, where it used to return "not yet
+implemented". veks-core's `formats::reader` keeps only `parquet_mnode`
+and the dispatch by facet.
+
+**What moved or changed.**
+- `SourceMeta.element_type` and `VecSource::element_type()` (default
+  `None`) are new in veks-apicore. The xvec, scalar, npy and parquet
+  readers fill them in. A slab of opaque records and `parquet_mnode`
+  state none.
+- The parquet reader finds the first `List`, `LargeList` or
+  `FixedSizeList` column of any numeric element type and reads it at
+  that type. veks-core's took only `f32` lists and reported 4 bytes.
+  Before, a `FixedSizeList` column was found and then decoded as a
+  `List`, so every row was missing.
+- npy states its type (`F16`, `F32`, `F64`). Its width was already
+  right.
+- The import and `transform convert` take the element type from the
+  format, then from the source, and only then from the width
+  (`element_type_of_width`), so a same-width pair (`u8`/`i8`) is no
+  longer guessed.
+- `scan_npy_manifest`, `scan_npy_headers`, `load_npy` and
+  `NpyArrayData` are `veks_io::npy`.
+
+**Settled in implementation.**
+- **hdf5 was done in step 1** (§12.2).
+- **The slab reader still reports 4-byte elements** and states no
+  type, so acceptance test 5's slab case is not met. A slab's records
+  are opaque bytes, and nothing in the file says their element type.
+  Open: whether a slab vector facet should declare its element type
+  (in the schema sidecar) or the reader should take it from the
+  caller.
+
+**Guards** (`crates/veks-io/tests/containers.rs`, new; needs `npy` and
+`parquet`):
+- `a_parquet_u8_column_reads_at_its_type`: 1 byte, `U8`. veks-core's
+  reader found no vector column in it.
+- `a_parquet_fixed_size_list_column_decodes`.
+- `an_npy_f16_file_states_its_type`: 2 bytes, `F16`.
+
+### 12.6 Steps 5 and 6: inline sites and `TypedReader` (2026-10-22)
+
+The two steps ran together. They are recorded together, with one
+tree.
+
+**What moved or changed (step 5, FL-9).**
+- `veks_io::xvec::record` (new) is the one place, outside the readers
+  and writers, that writes down the record layout:
+  `encode_record_into` (a row into a record-sized slot), `record_dim`,
+  `decode_record_into`, `record_payload`, `records` (a strict
+  zero-copy walk of mapped bytes that stops at the first bad record
+  and writes no sidecar), `pread_record` (one record by `pread`, for
+  reads that must not map the file), and `RecordHeader`, validated once
+  (`append_record`, `append_records` for untyped payloads). veks-io's
+  byte sink and veks-core's parquet compiler write through it.
+- `XvecWriter::append(path, dim)` continues an existing file. It
+  continues only a whole file of the same dimension and element type.
+  It refuses trailing bytes, a symlink, a missing file and another
+  type. An empty file takes any dimension.
+- The inline sites of §2.3, by crate:
+  - veks-pipeline: the kNN engines and their segment cache, dedup,
+    extract, shuffle, sketch, metadata and predicate generation, the
+    verifiers, `info file`, `describe`, `bound`, and `gen vectors`
+    (which now appends through `XvecWriter::append`).
+  - veks: `check integrity` (`probe_source`), the import and the
+    wizard.
+  - veks-core: the parquet and xvec-directory compilers.
+  - vectordata: `datasets cache`, `derive`, `filter` and `ping`, and
+    the explorer's picker.
+  They read and write through veks-io's readers, writers, `probe_source`,
+  `xvec::record`, `ElementType` and `VecFormat`.
+- `cleanup_cleanfvec.rs` is deleted. It had been dead since 4f00785
+  (not in the module tree), so acceptance test 4 has one caller fewer.
+
+**What moved or changed (step 6, FL-10).** `TypedReader`,
+`TypedElement`, `TypedAccessError`, `dispatch_typed!`,
+`open_facet_typed` (the function and the `TestDataView` method) and
+`Storage::open_url` are removed. `typed_access.rs` stays, holding only
+the element-model re-exports and `ElementTypeExt`. `FacetShape::reader`
+names `facet_as() / open_facet_native()`. The tests are ported to
+`facet_as`, `open_vec_as` and `open_facet_native`, and none is
+deleted: vectordata has 1004 `#[test]` functions before and after.
+`deprecated_in_docs.rs` now also refuses the removed names in
+documents. sysref 02 and 08 are updated.
+
+**Settled in implementation.**
+- **The format guard lives in `crates/tools/tests/crate_boundaries.rs`**,
+  not in a root `tests/` as CB-2 says. `tools` is a default member with
+  no dependencies, so a plain `cargo test` runs it. The root package is
+  not a default member.
+- **What the guard counts as matching an extension**: a literal
+  compared (`==`, `!=`, `ends_with(`, `Some(`) or used as a `match`
+  arm. Naming a file (`format!("{name}.ivec")`, a cache path's
+  `"ivec"`) is not matching. veks-io and veks-datatypes (the one
+  extension table) are exempt, and the allow-list is
+  `analyze_checkendian.rs` alone. A header read is flagged when a
+  stride appears within six code lines.
+- **"No crate but veks-io defines a `VecSource`, `VecSink` or
+  `VecFormat`" is read as defining the trait or the enum.** The traits
+  are veks-apicore's, and `VecFormat` is veks-io's. Any crate may
+  implement the traits. `parquet_mnode`, which §8 keeps in veks-core,
+  and the compilers' in-memory sinks implement them. **This reading
+  needs the user's confirmation.**
+- **Append refuses a cut file.** The old `gen vectors` appended onto a
+  file with a partial last record, and every record after it was
+  misread.
+- **The byte sink validates its dimension** (1 to `i32::MAX`) at open,
+  through `RecordHeader::new`. The old cast wrapped.
+- **Behaviour that is stricter now**:
+  - `i8` scalar columns read signed, and `u16`/`u32` unsigned. They
+    were read with the wrong sign in `gen_predicate_keys` and
+    `verify_predicates_sqlite`.
+  - A kNN cache file whose rows are not `k` wide is refused
+    (`open_knn_rows`).
+  - `k = 0` is refused, because a record of no elements is not
+    written.
+  - `filter` matches an xvec by `VecFormat::is_xvec` instead of
+    `ends_with("vec")`, and sizes a bf16 base, which its width table
+    lacked.
+  - `derive` turns a negative dimension into nothing, not a huge one.
+  - Ordinal outputs must have an i32 vector extension.
+  - Writes that panicked or ignored their errors are buffered and
+    return them.
+- **Sites left as they are**:
+  - apicore's `shard_sizing` record-bytes arithmetic: apicore cannot
+    depend on veks-io.
+  - `derive`'s vvec record offsets over `SourceSpan`s: a span starts
+    mid-file, and `load_series_offsets` writes sidecars.
+  - `gen_extract`'s mvec SPLAT partition moves, which are raw byte
+    moves.
+  - The stdarch engine's `(1 + dim)` f32 slot layout, which is a kernel
+    layout and not a file.
+- **`check integrity` uses `probe_source`**, and its error still
+  carries the bad dimension.
+
+**Guards:**
+- `crates/tools/tests/crate_boundaries.rs`:
+  - `the_format_layer_is_veks_io`: 34 hits on the step-4 tree.
+  - `the_streaming_model_and_formats_are_defined_once`: adds
+    `VarlenSource`/`VarlenSink` to step 1's names.
+  - `the_matchers_catch_what_they_are_for`: the matchers on the shapes
+    they are for.
+  Both checks fail on 13577a2 (acceptance test 1's format part).
+- `veks_io::xvec::record`'s unit tests:
+  `slots_round_trip_every_element_type`,
+  `a_slot_of_the_wrong_size_or_header_is_refused`,
+  `a_payload_is_the_bytes_its_header_counts`,
+  `a_walk_yields_every_record_and_stops_at_the_first_bad_one`,
+  `pread_reads_the_record_the_writer_wrote`.
+- `an_append_continues_only_a_whole_file_of_its_dimension`
+  (`tests/writers.rs`).
+
+**Equivalence.** `gen vectors` output is byte-identical between the
+old and the new build for six element types, including append runs.
+
+### 12.7 Step 7: the transport crate (2026-10-22)
+
+`crates/veks-transport` is a new crate, a member and a default member.
+It depends on veks-apicore and not on veks-io or vectordata. veks-io
+is only a dev-dependency.
+
+**What moved or changed.**
+- veks-transport, moved from vectordata's `transport/`,
+  `chunked_http.rs`, `merkle/` and `cache/`:
+  - `client`: `Transport` (the client pools, per-origin TLS trust, the
+    offline gate and credentials), `Response`, `fetch_text`,
+    `fetch_if_modified`, `normalize_remote_url`.
+  - `http` (`HttpTransport`), `chunked` (`ChunkedTransport`,
+    `fetch_chunks_parallel`), `retry` (`RetryPolicy`), and `pump`
+    (internal).
+  - `merkle`, `verified` (`CachedChannel`), and `chunk_store`
+    (`ChunkStore`, `read_sidecar`).
+  - `files`: `VerifiedFile` and `ChunkedFile`, the old remote `Storage`
+    variants, and `RemoteSource` and `RangeSource`, which implement
+    `ByteSource`.
+  - `placement` (`CachePlacement`).
+  - `upload`: the request builders for streaming, conditional and
+    resumable uploads.
+  The crate has a README, a seams table in its crate docs, and denies
+  `unwrap` and `expect`.
+- veks-apicore: the `transport` module holds `TransportConfig`,
+  `TlsTrust`, `Timeouts`, `Credentials`, `NoCredentials`,
+  `RequestSigner`, `Request`, `Method`, `Body` and `Authorization`.
+  `TransportErrorKind` gains `Unreachable` and `Offline`, and
+  `is_permanent` on the kind and the error. `IoError::Transport`
+  carries a `TransportError` (TR-13). veks-transport joins
+  `contracts.rs`'s implementation crates.
+- vectordata: `src/transport.rs` is public and re-exports the client
+  API (CB-3). `shared()` builds the one transport from the pure
+  `config_from(setting, tls, &TransportEnv)`.
+  `credentials::StoredCredentials` implements `Credentials`.
+  `cache/layout::placement` decides the `.mrkl` and `.chunks` names
+  (TR-7). `Storage` holds the transport's file types by value. The
+  paths `vectordata::merkle`, `DownloadProgress` and `io::*` still
+  work. `group`, the resolver, `endpoint`, the picker, `filter` and
+  `push` use `Request` and `Response`. `io`'s sibling fetch is
+  `veks_transport::fetch_sibling`.
+- `MetadataSchema::to_json_bytes` and `PredicateSchema::to_json_bytes`
+  return `Result<Vec<u8>, String>`, because veks-apicore denies
+  `expect`.
+
+**Settled in implementation.**
+- **`cache/reader.rs` (listing and pruning the cache root) stays in
+  vectordata**, though TR-1 names it. It reads `origin.json` and the
+  layout, which TR-2 and principle 5 keep there.
+- **The cache-space check stays in vectordata**, as fetch planning.
+- **`Request` is apicore's**, because `RequestSigner` names it.
+  **`Response` stays in veks-transport**, because it holds a live
+  body.
+- **`TransportConfig` gained `offline_hint`, `parallel_streams`,
+  `download_concurrency` and `s3_region`**, which replace the moved
+  code's environment reads (TR-3). The worker-count variable is now
+  read once per process, not on every call.
+- **Offline gating is in `send`**, unless a request is marked
+  explicit. Push and endpoint requests are explicit. The picker's
+  catalog read is now gated; it was not before.
+- **The resolver takes its credentials from the transport**, and they
+  resolve the same way.
+- **Moved locks recover from poisoning** instead of panicking, and
+  `MerkleRef::to_bytes` no longer uses `expect`.
+- **A request that gets no answer is unreachable.** For example, a
+  pooled connection to a stopped server fails with "error sending
+  request", and it now counts as `Unreachable`. This fixed a flaky
+  test.
+- **Open: PR-7 is not met as written, and should be amended.** PR-7
+  says credentials are resolved once per origin, "as
+  `apply_read_auth` effectively does now". That was wrong. The old
+  `apply_read_auth` resolved a token for every request, as an
+  in-memory longest-prefix lookup with no I/O. Credentials are keyed by
+  URL prefix (on purpose, not by origin) and can be reloaded
+  mid-session, so caching them per origin would be incorrect. Step 7
+  keeps the per-request lookup, so nothing regressed. Recommended:
+  amend PR-7 to "one in-memory lookup per request, no I/O". This is
+  the maintainer's decision.
+
+**Guards:**
+- `crates/vectordata/tests/cache_layout.rs`:
+  `a_fetch_writes_the_paths_it_always_wrote`. These are the 25 paths a
+  representative fetch writes: a merkle-published file, an unpublished
+  one, a vvec with its rebuilt index, a scalar, a profile
+  subdirectory, the kept catalog and `dataset.yaml`, and a bare URL.
+  They were recorded on the code before the move and are identical
+  after.
+- `crates/vectordata/tests/per_origin_trust.rs` (TR-12, acceptance
+  test 8): `a_trusted_self_signed_origin_is_fetched_by_fetch_if_modified`
+  and `an_untrusted_self_signed_origin_is_refused`. Before the move,
+  `fetch_if_modified` failed against a trusted self-signed origin with
+  `InvalidCertificate(UnknownIssuer)`. This was re-confirmed against
+  the step 5+6 tree.
+- `crates/veks-transport/tests/remote_reads.rs` (TR-8, acceptance
+  tests 2 and 3) reads a remote file with veks-io's reader and no
+  vectordata:
+  - `a_remote_fvecs_is_read_through_the_chunk_store`
+  - `a_remote_fvecs_with_a_published_reference_is_verified`
+  - `offline_mode_refuses_a_remote_read_with_the_offline_error`
+  - `the_read_credentials_are_sent_and_a_request_of_its_own_is_not_overridden`
+  - `a_signed_request_is_sent_as_signed`
+- `crates/veks-transport/tests/hot_paths.rs`:
+  `per_read_methods_are_inlinable_across_crates` (PR-2), which
+  requires `#[inline]` on the per-read methods.
+- `a_connection_closed_without_an_answer_is_unreachable`
+  (`veks_transport::client`): it fails with the old rule.
+
+**PR-10.** Pinned to core 2, against the `step7-before` baseline:
+
+| Case | Before | After |
+|---|---|---|
+| `remote_fetch/whole_facet` | 169.3 ms | 167.5 ms |
+| `remote_cached/seq_read_into` | 5.73 ms | 5.71 ms |
+| `remote_cached/random_get` | 17.13 ms | 16.89 ms |
+| `view/random_get` | 154.8 ms | 152.9 ms |
+| `random_f32/get/vectordata` | 110.9 ms | 110.5 ms |
+
+The only case that moved more than 3 % is `seq_read_into/f32/veks-io`,
+at +5.6 % with a wide interval. That is veks-io's direct reader, which
+this step did not touch. Alternating the old and new builds gave
+118.26, 118.15, 118.19 and 118.47 ms, which is noise.
+
+The workspace passes (131 test binaries), and
+`RUSTDOCFLAGS="-D warnings" cargo doc` is clean.

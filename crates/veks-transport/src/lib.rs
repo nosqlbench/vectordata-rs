@@ -8,7 +8,8 @@
 //! trust, offline gate, user agent, timeouts, retry policy and read
 //! credentials; range reads and whole-file transfers ([`HttpTransport`],
 //! [`Transport::fetch_text`], [`Transport::fetch_if_modified`]); uploads
-//! ([`upload`]); and the cache copies remote files are read through —
+//! ([`upload`]); AWS Signature Version 4 request signing ([`sigv4`]);
+//! and the cache copies remote files are read through —
 //! merkle-verified ([`VerifiedFile`], over [`CachedChannel`]) or
 //! recorded as fetched ([`ChunkedFile`], over [`ChunkStore`]) — each a
 //! veks-apicore [`ByteSource`](veks_apicore::ByteSource)
@@ -27,7 +28,7 @@
 //! |---|---|---|---|
 //! | [`TransportConfig`], [`TlsTrust`] | veks-apicore | built by vectordata from its settings and environment, or by any program | [`Transport::new`] |
 //! | [`Credentials`] | veks-apicore | vectordata (its credential store), any program; [`NoCredentials`] | every request that carries no authorisation of its own |
-//! | [`RequestSigner`] | veks-apicore | any program (a signature scheme) | [`Transport::send`] |
+//! | [`RequestSigner`] | veks-apicore | [`sigv4::SigV4Signer`] here, any program (a signature scheme) | [`Transport::send`] |
 //! | [`Request`] | veks-apicore | — (a value) | [`Transport::send`], answered by [`Response`] |
 //! | [`TransportError`] | veks-apicore | — (a value) | every failed request |
 //! | [`ByteSource`](veks_apicore::ByteSource) | veks-apicore | [`RemoteSource`], [`RangeSource`] here | veks-io's readers, vectordata's storage |
@@ -80,6 +81,7 @@ pub mod merkle;
 mod placement;
 mod pump;
 mod retry;
+pub mod sigv4;
 pub mod upload;
 mod verified;
 

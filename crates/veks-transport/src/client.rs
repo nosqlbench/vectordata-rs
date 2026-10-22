@@ -428,6 +428,43 @@ impl Response {
             Err(e) => Err(transport_error(e)),
         }
     }
+
+    /// The error this answer's status is, for a caller that has read the
+    /// status itself and decided it is a failure: the URL, the status,
+    /// permanent or transient by the rule [`RetryPolicy`](crate::RetryPolicy)
+    /// stops on, and as its message the status's reason followed by the
+    /// start of the body, where a server explains (S3's XML error). At
+    /// most [`STATUS_DETAIL_BYTES`](Self::STATUS_DETAIL_BYTES) of the body
+    /// are read.
+    pub fn status_error(self) -> TransportError {
+        let status = self.status();
+        let reason = self.inner.status().canonical_reason().unwrap_or("").to_string();
+        let mut detail = Vec::new();
+        let _ = io::Read::read_to_end(&mut io::Read::take(self.inner, Self::STATUS_DETAIL_BYTES), &mut detail);
+        let detail = String::from_utf8_lossy(&detail);
+        let detail = detail.trim();
+        let message = match (reason.is_empty(), detail.is_empty()) {
+            (_, true) => reason,
+            (true, false) => detail.to_string(),
+            (false, false) => format!("{reason}: {detail}"),
+        };
+        let kind = if status_is_permanent(status) { TransportErrorKind::Permanent } else { TransportErrorKind::Transient };
+        TransportError { url: Some(self.url), status: Some(status), kind, message }
+    }
+
+    /// How much of a failed answer's body [`status_error`](Self::status_error)
+    /// keeps.
+    pub const STATUS_DETAIL_BYTES: u64 = 1024;
+}
+
+/// The body, read as it arrives: a caller streams it into a file in its
+/// own increments (reporting progress per increment) without holding
+/// it whole.
+impl io::Read for Response {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(&mut self.inner, buf)
+    }
 }
 
 /// A reqwest failure as the API's [`TransportError`]: its URL, its

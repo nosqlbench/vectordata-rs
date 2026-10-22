@@ -6,18 +6,33 @@
 //! endpoints live at the **server root**, so requests are addressed to the
 //! origin (`scheme://host[:port]`) of whatever URL the user passes,
 //! independent of any namespace path in it.
+//!
+//! Offline mode ([`settings::offline`](crate::settings::offline)) refuses
+//! the introspection calls — [`whoami`] (behind `ping` and `whoami`) and
+//! [`candidate_namespaces`] (behind completion and the post-login offer)
+//! — before any request is made. The explicit server commands it does
+//! not affect are `login` ([`login_password`]), `token issue` and
+//! `revoke` ([`issue_token`], [`revoke_token`]) and `backup`'s reads
+//! ([`versions`], [`manifest`], [`get_object`])
+//! (`docs/design/srd-crate-boundaries.md` TR-12).
 
 use serde::Deserialize;
 
 use crate::credentials::origin_of_str;
 use crate::transport::{Request, Response};
 
-/// Send a control-plane request through the shared transport. An
-/// explicit server command — offline mode does not refuse it — and
-/// authorised only as the caller says: its own token, or anonymous,
-/// never the read credentials.
+/// Send an introspection request through the shared transport, which
+/// offline mode refuses, authorised only as the caller says: its own
+/// token, or anonymous, never the read credentials.
 fn send(req: Request, token: Option<&str>) -> Result<Response, crate::TransportError> {
-    crate::transport::shared().send(req.bearer_or_anonymous(token).explicit())
+    crate::transport::shared().send(req.bearer_or_anonymous(token))
+}
+
+/// Send an explicit server command's request (a login, a token issued
+/// or revoked, a backup's read), which offline mode does not refuse;
+/// authorised as [`send`] is.
+fn send_command(req: Request, token: Option<&str>) -> Result<Response, crate::TransportError> {
+    send(req.explicit(), token)
 }
 
 /// `req` with `body` as its JSON body.
@@ -69,13 +84,14 @@ pub fn login_password(
     if let Some(e) = expires {
         body["expires"] = serde_json::json!(e);
     }
-    let resp = send(with_json(Request::post(format!("{base}/auth/token")), &body), None)
+    let resp = send_command(with_json(Request::post(format!("{base}/auth/token")), &body), None)
         .map_err(|e| format!("contacting {base}: {}", e.message))?;
     parse_token(resp, "login")
 }
 
 /// `GET /-/whoami` — the caller's effective access (JSON). `token = None`
-/// reflects anonymous (`PUBLIC`) access.
+/// reflects anonymous (`PUBLIC`) access. Refused in offline mode, with
+/// the offline error's message.
 pub fn whoami(url: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
     let base = api_base(url)?;
     let resp = send(Request::get(format!("{base}/-/whoami")), token)
@@ -93,8 +109,8 @@ pub fn whoami(url: &str, token: Option<&str>) -> Result<serde_json::Value, Strin
 ///
 /// Privileged callers (operator+) get the full *active* namespace list via
 /// `GET /-/namespaces`; everyone else falls back to the namespaces `whoami`
-/// reports a `write`/`publish` action for. Returns empty on any error (offline,
-/// not-a-vecd, 403, …). A short per-request timeout makes this safe to call
+/// reports a `write`/`publish` action for. Returns empty on any error (offline
+/// mode, which makes no request; not-a-vecd; 403; …). A short per-request timeout makes this safe to call
 /// from shell completion — it never hangs the prompt waiting on a dead server.
 pub fn candidate_namespaces(url: &str, token: Option<&str>) -> Vec<String> {
     let Ok(base) = api_base(url) else { return Vec::new() };
@@ -171,7 +187,7 @@ pub fn issue_token(
     if let Some(e) = expires {
         body["expires"] = serde_json::json!(e);
     }
-    let resp = send(with_json(Request::post(format!("{base}/tokens")), &body), Some(session_token))
+    let resp = send_command(with_json(Request::post(format!("{base}/tokens")), &body), Some(session_token))
         .map_err(|e| format!("contacting {base}: {}", e.message))?;
     parse_token(resp, "token issue")
 }
@@ -180,7 +196,7 @@ pub fn issue_token(
 /// admin, any token).
 pub fn revoke_token(url: &str, session_token: &str, id: i64) -> Result<(), String> {
     let base = api_base(url)?;
-    let resp = send(Request::delete(format!("{base}/tokens/{id}")), Some(session_token))
+    let resp = send_command(Request::delete(format!("{base}/tokens/{id}")), Some(session_token))
         .map_err(|e| format!("contacting {base}: {}", e.message))?;
     if resp.is_success() {
         Ok(())
@@ -215,9 +231,10 @@ pub fn get_object(
     resp.bytes().map_err(|e| format!("reading object body: {}", e.message))
 }
 
-/// Authenticated GET that errors on non-2xx.
+/// Authenticated GET that errors on non-2xx: a read of `backup`'s, an
+/// explicit server command.
 fn authed_get(url: &str, token: Option<&str>) -> Result<Response, String> {
-    let resp = send(Request::get(url), token).map_err(|e| format!("GET {url}: {}", e.message))?;
+    let resp = send_command(Request::get(url), token).map_err(|e| format!("GET {url}: {}", e.message))?;
     if resp.is_success() {
         Ok(resp)
     } else {

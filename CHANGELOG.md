@@ -29,6 +29,43 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
   it with nothing else. Reads cost what they did: readers stay generic
   over their source, and what a hot path calls across the boundary
   inlines (`docs/design/srd-crate-boundaries.md` §4).
+- **`veks-transport`: every byte that crosses a network, outside
+  vectordata.** The client pools, per-origin TLS trust, the offline
+  gate, retry (`RetryPolicy`), range reads and whole-file transfers,
+  upload requests, and the cache files remote bytes land in
+  (`VerifiedFile`, merkle-checked; `ChunkedFile`, chunk-recorded) are
+  a crate of their own. It depends on veks-apicore alone and reads no
+  environment variable or settings file. Its configuration
+  (`TransportConfig`), read credentials (`Credentials`) and request
+  signing (`RequestSigner`) are values and traits in veks-apicore, and
+  vectordata builds the one transport from its settings
+  (`vectordata::transport::shared()`). `RemoteSource` is a
+  `ByteSource`, so a program that depends on veks-io and
+  veks-transport reads a remote `.fvecs` through `XvecReader` with no
+  vectordata. vectordata still places every cache file, and the cache
+  layout is unchanged (`docs/design/srd-crate-boundaries.md` §6).
+- **The format layer is veks-io, and only veks-io.** veks-core's
+  streaming readers and writers (xvec, npy, parquet, slab), the sinks
+  and the sharding sink, the positional writer, element conversion,
+  `portable_io` (now `veks_io::file`) and the pipeline's atomic writer
+  (`veks_io::atomic`) moved into it. No other crate reads a dimension
+  header or matches an extension itself, and a workspace test keeps
+  it that way.
+  - `veks_io::xvec::record` encodes, decodes, walks and `pread`s single
+    records in a caller's buffer.
+  - `XvecWriter::append` continues an existing file.
+  - `reader::probe_source` describes a partial, sparse or truncated
+    file instead of refusing it.
+  - `XvecWriter::write_raw` and `writer::encode_records` write packed
+    batches.
+  - The streaming xvec reader reads a directory or a `__NNNN` series
+    as one stream, and the streaming writer releases written pages
+    every 64 MiB.
+- **One `VecFormat`.** veks-io's enum has the variable-length formats
+  (`Fvvec` … `U64vvec`), `is_uniform_xvec`, `is_vvec`,
+  `detect_from_path`, `detect_from_directory`, `record_bytes` and
+  `expected_file_size`. veks-core's enum and its streaming traits,
+  with the string round trip between the two models, are gone.
 - **veks-io's readers take any byte source.** `XvecReader<T, S>`,
   `IndexedVvecReader<T, S>`, `ScalarReader<T, S>` and `StreamReclaim`
   are generic over a `ByteSource`, defaulting to `MappedFile`, a local
@@ -151,8 +188,75 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
 - `CatalogEntry::apply_overlay` returns what it found contradicted
   instead of warning; vectordata warns as before.
 - `vectordata::io::IoError::Http(reqwest::Error)` is
-  `IoError::Transport(Box<dyn Error + Send + Sync>)`: the error type
-  is veks-io's, which has no HTTP client.
+  `IoError::Transport(TransportError)`, the same value `Error::Transport`
+  carries (`From` is implemented). The reader error is veks-apicore's,
+  which has no HTTP client. `TransportErrorKind` gains `Unreachable`
+  (no answer: refused, timed out or an untrusted certificate, so a
+  local copy stands in) and `Offline`, so an exhaustive `match` needs
+  the two arms.
+- **A symlink at a write target is an error**, from every veks-io
+  writer and from `veks_io::atomic`'s `AtomicWriter` and `safe_*`
+  helpers (veks-pipeline's `atomic_write` is a re-export of it). The
+  error names the link and what it points to. veks-core's writer
+  removed the link silently, the pipeline's guard removed it with a
+  warning, and veks-io's writers wrote through it to the file it
+  named. A link someone made on
+  purpose is not a writer's to remove. `veks prepare import`
+  removes the Identity links it made itself where a new plan
+  materializes the artifact, and it says so.
+- **HDF5 is not supported.** The stub reader and `VecFormat::Hdf5` are
+  removed. `veks prepare import` of an `.h5`/`.hdf5` source (or
+  `file.h5#dataset`) stops before planning and says to convert it to
+  fvecs first.
+- **`TypedReader` and the rest of its API are removed** (deprecated
+  since 4.0.0): `TypedReader`, `TypedElement`, `TypedAccessError`,
+  `dispatch_typed!` and `open_facet_typed` (the function and the
+  `TestDataView` method). `vectordata::typed_access` keeps the element
+  model and `ElementTypeExt`.
+
+  | Removed | Use |
+  |---|---|
+  | `open_facet_typed::<T>(&*view, name)`, `view.open_facet_typed::<T>(name)` | `view.facet_as::<T>(name)` |
+  | `TypedReader::<T>::open(path)`, `open_auto(path_or_url, ty)` | `io::open_vec_as::<T>(path_or_url)` |
+  | `get_value(i)` | `get(i)?[0]`, or `as_slice()?[i]` on a resident column |
+  | `get_record(i)` | `get(i)?` |
+  | `get_native(i)`, `get_native_slice(i)` | `as_slice()?[i]`, `get_slice(i)` |
+  | `is_native()`, `native_type()` | `conversion() == Native`, `native_element_type()` |
+  | `dispatch_typed!` | `view.open_facet_native(name)` or `io::open_vec_native(path)` (an `AnyVectorReader` to match on), or `dispatch_element!` |
+  | `TypedAccessError` | `IoError::ElementMismatch`, `IoError::ValueOverflow` |
+  | `T: TypedElement` | `T: Element` |
+- **Format modules moved to veks-io**, with no shim in veks-core:
+
+  | Was | Now |
+  |---|---|
+  | `veks_core::formats::VecFormat` | `veks_io::VecFormat` |
+  | `veks_core::formats::reader::{VecSource, SourceMeta}`, `formats::writer::VecSink` | `veks_io::{VecSource, SourceMeta, VecSink}` (veks-apicore's) |
+  | `veks_core::formats::writer::{open_sink, open_sharded_sink, SinkConfig}`, `formats::SLAB_RECORD_FRAMING` | `veks_io::sink::*` |
+  | `veks_core::formats::writer::sharded` | `veks_io::sharded` |
+  | `veks_core::formats::writer::mmap_xvec::{MmapXvecWriter, SharedMmapWriter}` | `veks_io::xvec::positional::{PositionalXvecWriter, SharedPositionalWriter}` |
+  | `veks_core::formats::reader::{xvec, npy, parquet, slab}`, `formats::writer::{xvec, slab}` | `veks_io::xvec::{reader, writer}`, `veks_io::npy`, `veks_io::parquet`, `veks_io::slab::{reader, writer}` (features `npy`, `parquet`, `slab`) |
+  | `veks_core::formats::convert`, `veks_io::scalar::convert` | `veks_io::convert` |
+  | `veks_core::formats::portable_io` | `veks_io::file` |
+  | `veks_pipeline::pipeline::atomic_write` | `veks_io::atomic` (re-exported at the old path) |
+
+  These paths keep working as re-exports:
+  - `vectordata::metadata_schema` (now veks-apicore's).
+  - `vectordata::merkle` (veks-transport's).
+  - `vectordata::DownloadProgress` and `vectordata::io::*`.
+  - `vectordata::dataset::shards::{discover_shards, observe_series}`
+    (`veks_io::series`).
+  `vectordata::transport` is now public and re-exports
+  veks-transport's client API.
+- **`SourceMeta` has an `element_type` field**
+  (`Option<ElementType>`), and `VecSource::element_type()` defaults to
+  `None`. A struct literal needs the field. The xvec, scalar, npy and
+  parquet readers fill it in.
+- `VecFormat::from_extension("fvvecs")` is `Some(Fvvec)`, not `None`.
+  `is_xvec()` is true for the vvec formats too, so use
+  `is_uniform_xvec()` for one dimension throughout. `open_format` and
+  `create_format` refuse a vvec format.
+- `MetadataSchema::to_json_bytes` and `PredicateSchema::to_json_bytes`
+  return `Result<Vec<u8>, String>`.
 - veks-io: `MmapReader<T>` and `ScalarMmapReader<T>` are deprecated
   aliases of `XvecReader<T>` and `ScalarReader<T>`, and `MmapError` of
   `IoError`. `open(&Path)` is `open_path(&Path)`; `get(i)` returns
@@ -183,6 +287,37 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
   could not find it by name or path. A path is now saved absolute and
   named after its directory (`stage: /data/stage`), and `remove` finds
   it by either spelling. A URL is saved as written.
+- **`fetch_if_modified` refused a self-signed origin the user
+  trusts.** It used the default client, not the one for the URL's
+  origin, so `trust_self_signed` in `settings.yaml` was ignored and
+  the request failed with `UnknownIssuer`. Every request now goes
+  through the client for its origin.
+- **`generate vectors` appended onto a cut file.** A file with a
+  partial last record took new rows after it, and every record from
+  there on was misread. An append now continues only a whole file of
+  the same dimension and type.
+- **Scalar columns of `i8`, `u16` and `u32` were read with the wrong
+  sign** by the predicate-key generator and the SQLite predicate
+  verifier: an `.i8` column read as unsigned, and `.u16` and `.u32` as
+  signed. Each is read at its own type.
+- **A kNN result or segment cache file whose rows are not `k` wide is
+  refused** when read back. `k = 0` is refused.
+- **`datasets filter` sized a bf16 base as 4-byte elements**, and took
+  any extension ending in `vec` for an xvec file.
+- **veks-io's byte-level xvec writer wrapped a dimension over
+  `i32::MAX`** into its header. It is refused at open.
+- **The parquet vector reader read only `f32` list columns** and
+  reported 4-byte elements whatever the column held. A
+  `FixedSizeList` column was found and then decoded as a `List`, so
+  every row was missing. Every numeric list column now reads at its
+  own type.
+- **Write errors the pipeline ignored are returned.** Writers that
+  panicked on an I/O error or discarded it now return it as the step's
+  error.
+- **The explorer's catalog read ignored offline mode.**
+- **A request to a server that has gone away is unreachable**, not a
+  transient error to retry: for example, a pooled connection that gets
+  no answer.
 
 ## 4.0.2 — 2026-10-20
 

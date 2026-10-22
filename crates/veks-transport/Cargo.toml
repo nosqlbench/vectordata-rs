@@ -23,6 +23,8 @@ categories = ["network-programming", "filesystem", "science"]
 veks-apicore = { path = "../veks-apicore", version = "=4.0.2" }
 byteorder = "1.5"
 filetime = "0.2"
+# HMAC-SHA256, the keyed hash of AWS Signature Version 4 (`sigv4`).
+hmac = "0.12"
 httpdate = "1"
 # flock(2) around a merkle state checkpoint, so two processes filling
 # one cache copy merge their bits instead of losing them.

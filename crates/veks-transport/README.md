@@ -10,8 +10,12 @@ vectordata-rs workspace moves over a network goes through this crate.
   and read credentials.
 - **Requests** — `Transport::send(Request) -> Response`, with the
   request's own authorisation (a bearer, a `RequestSigner`, anonymous)
-  or the read credentials by default; `fetch_text` and
-  `fetch_if_modified` for small files.
+  or the read credentials by default; the body read whole or streamed
+  (`Response` is `io::Read`); `fetch_text` and `fetch_if_modified` for
+  small files.
+- **Signing** — `sigv4::SigV4Signer`, AWS Signature Version 4 as a
+  `RequestSigner`, for S3 and S3-compatible stores; checked against
+  AWS's published examples.
 - **Range reads and whole files** — `HttpTransport` (with S3
   wrong-region correction), `fetch_chunks_parallel`, `RetryPolicy`.
 - **Uploads** — `upload`: streaming and conditional `PUT`, and the
@@ -40,7 +44,7 @@ veks-apicore's `ByteSource`.
 |---|---|---|---|
 | `TransportConfig`, `TlsTrust` | veks-apicore | vectordata (from settings and environment), any program | `Transport::new` |
 | `Credentials` | veks-apicore | vectordata (its credential store), any program; `NoCredentials` | requests without their own authorisation |
-| `RequestSigner` | veks-apicore | any program | `Transport::send` |
+| `RequestSigner` | veks-apicore | `SigV4Signer` here, any program | `Transport::send` |
 | `Request`, `TransportError` | veks-apicore | — (values) | `Transport::send` |
 | `ByteSource` | veks-apicore | `RemoteSource`, `RangeSource` | veks-io's readers, vectordata's storage |
 

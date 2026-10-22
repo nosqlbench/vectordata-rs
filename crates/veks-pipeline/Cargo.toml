@@ -99,6 +99,12 @@ veks-completion-derive = { path = "../veks-completion-derive", version = "=4.0.2
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+# A local HTTP and self-signed HTTPS server for the downloaders' transport
+# tests (tests/downloads_through_the_transport.rs): rcgen makes the
+# certificate, axum-server serves it — vectordata's and vecd's TLS stack.
+axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 [[bench]]
 name = "simd_distance"

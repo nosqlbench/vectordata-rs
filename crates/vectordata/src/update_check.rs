@@ -31,8 +31,17 @@
 //! `…/releases/tag/<tag>`, so reading the `Location` header of the
 //! un-followed response yields the latest release tag. The client
 //! sends a descriptive `User-Agent` per GitHub's terms.
+//!
+//! The probe goes through a transport of its own, configured from the
+//! process's (`probe_config`): the same TLS trust and offline gate, no
+//! redirects, a five-second ceiling and one client. It is anonymous —
+//! vectordata's read credentials are for dataset servers, not GitHub
+//! (`docs/design/srd-crate-boundaries.md` TR-10).
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::transport::{Request, Timeouts, Transport, TransportConfig};
 
 /// Repository whose Releases page is probed, and the link printed
 /// in the notice. Single authority: taken from the crate manifest's
@@ -141,22 +150,40 @@ fn notice_line(latest: &str, current: &str) -> String {
     format!("vectordata {latest} is available (current {current}) — {REPO_URL}/releases")
 }
 
+/// The probe's whole-request ceiling, connecting included.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The probe's transport configuration, from the process's `base`
+/// (pure): its offline mode and TLS trust, with redirects off — the
+/// answer *is* the redirect — a [`PROBE_TIMEOUT`] ceiling on connecting
+/// and on the whole request, a descriptive user agent, and one client,
+/// since the probe makes one request.
+fn probe_config(base: &TransportConfig) -> TransportConfig {
+    TransportConfig {
+        user_agent: concat!("vectordata/", env!("CARGO_PKG_VERSION"), " (+", env!("CARGO_PKG_REPOSITORY"), ")")
+            .to_string(),
+        timeouts: Timeouts { request: PROBE_TIMEOUT, connect: PROBE_TIMEOUT },
+        redirects: 0,
+        parallel_streams: 1,
+        download_concurrency: 1,
+        ..base.clone()
+    }
+}
+
+/// The latest release tag from `releases_latest_url`, through
+/// `transport`: an anonymous, un-followed GET whose redirect `Location`
+/// names the tag. Every failure mode collapses to `None`.
+fn latest_tag(transport: &Transport, releases_latest_url: &str) -> Option<String> {
+    let resp = transport.send(Request::get(releases_latest_url).anonymous()).ok()?;
+    if !resp.is_redirection() { return None; }
+    Some(tag_from_location(resp.header("location")?).to_string())
+}
+
 /// Probe the Releases page once: un-followed GET of
 /// `releases/latest`, latest tag read from the redirect `Location`.
-/// Short timeout; every failure mode collapses to `None`.
 fn fetch_latest_tag() -> Option<String> {
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(5))
-        .user_agent(concat!(
-            "vectordata/", env!("CARGO_PKG_VERSION"),
-            " (+", env!("CARGO_PKG_REPOSITORY"), ")"))
-        .build()
-        .ok()?;
-    let resp = client.get(format!("{REPO_URL}/releases/latest")).send().ok()?;
-    if !resp.status().is_redirection() { return None; }
-    let location = resp.headers().get(reqwest::header::LOCATION)?.to_str().ok()?;
-    Some(tag_from_location(location).to_string())
+    let transport = Transport::new(probe_config(crate::transport::shared().config()));
+    latest_tag(&transport, &format!("{REPO_URL}/releases/latest"))
 }
 
 /// Startup hook, called once from `main` after argument parsing
@@ -300,6 +327,56 @@ mod tests {
             "https://github.com/nosqlbench/vectordata-rs/releases/tag/v1.5.3"),
             "v1.5.3");
         assert_eq!(tag_from_location("v1.5.3"), "v1.5.3");
+    }
+
+    /// **The probe follows no redirect and keeps its 5 s ceiling**, and
+    /// otherwise carries the process's configuration (TR-10).
+    #[test]
+    fn the_probe_follows_no_redirect_within_five_seconds() {
+        let base = TransportConfig {
+            offline: true,
+            tls: crate::transport::TlsTrust { trusted_ca_certs: vec!["/ca.pem".into()], trust_self_signed: vec![] },
+            ..TransportConfig::default()
+        };
+        let c = probe_config(&base);
+        assert_eq!(c.redirects, 0);
+        assert_eq!(c.timeouts, Timeouts { request: PROBE_TIMEOUT, connect: PROBE_TIMEOUT });
+        assert_eq!(PROBE_TIMEOUT, Duration::from_secs(5));
+        assert!(c.offline && c.tls == base.tls, "the process's offline mode and trust carry over");
+        assert!(c.user_agent.starts_with("vectordata/") && c.user_agent.contains(REPO_URL), "{}", c.user_agent);
+    }
+
+    /// The tag is read from the redirect itself: a server answering
+    /// `302 Location: …/tag/v9.8.7` whose target would answer otherwise.
+    #[test]
+    fn the_tag_is_read_from_the_unfollowed_redirect() {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let target = format!("{base}/releases/tag/v9.8.7");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut line = String::new();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let _ = reader.read_line(&mut line);
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).is_err() || h.trim().is_empty() { break; }
+                }
+                let reply = if line.contains("/releases/latest") {
+                    format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else {
+                    // A followed redirect lands here, which names no tag.
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+                };
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        let transport = Transport::new(probe_config(&TransportConfig::default()));
+        assert_eq!(latest_tag(&transport, &format!("{base}/releases/latest")).as_deref(), Some("v9.8.7"));
+        let offline = Transport::new(probe_config(&TransportConfig { offline: true, ..TransportConfig::default() }));
+        assert_eq!(latest_tag(&offline, &format!("{base}/releases/latest")), None);
     }
 
     #[test]

@@ -36,7 +36,7 @@ use std::sync::{Arc, OnceLock};
 pub use veks_transport::{
     Authorization, Body, CachePlacement, Credentials, HttpTransport, Method, NoCredentials, RangeSource, RemoteSource,
     Request, RequestSigner, Response, RetryPolicy, Timeouts, TlsTrust, Transport, TransportConfig, TransportError,
-    TransportErrorKind, is_remote_url, upload,
+    TransportErrorKind, is_remote_url, sigv4, upload,
 };
 
 /// The environment values the transport's configuration is built
