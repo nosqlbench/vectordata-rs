@@ -10,7 +10,6 @@
 //! 3. Fetch `catalog.json` from each location (HTTP or local file).
 //! 4. Display the aggregated dataset entries.
 
-use super::build_sources;
 use super::filter;
 use super::filter::{DatasetFilter, ProfileView};
 #[cfg(test)]
@@ -134,6 +133,18 @@ pub struct ListArgs {
 /// ```
 #[cfg(feature = "cli")]
 pub fn run_args(args: ListArgs, program: &crate::catalog::CatalogSources) -> i32 {
+    run_args_listing(args, program, &mut |_, _| {})
+}
+
+/// [`run_args`], telling `listed` which entries the listing printed:
+/// what [`shell::Host::after_list`](crate::shell::Host::after_list)
+/// hears. See [`run_via_catalog_listing`] for when it is called.
+#[cfg(feature = "cli")]
+pub(crate) fn run_args_listing(
+    args: ListArgs,
+    program: &crate::catalog::CatalogSources,
+    listed: &mut dyn FnMut(&crate::catalog::Catalog, &[&CatalogEntry]),
+) -> i32 {
     let name_filter = args.dataset.or(args.matching_name);
     let name = name_filter.map(|p| filter::normalize_match_pattern(&p, "--dataset"));
     let desc = args.matching_desc.map(|p| filter::normalize_match_pattern(&p, "--matching-desc"));
@@ -141,24 +152,39 @@ pub fn run_args(args: ListArgs, program: &crate::catalog::CatalogSources) -> i32
         .matching_profile
         .map(|p| filter::normalize_match_pattern(&p, "--matching-profile"));
 
+    // A malformed size is reported and the command fails with status 1,
+    // before any catalog is read.
+    let sizes = (|| {
+        Ok::<_, ()>((
+            parse_size_opt(args.min_count.as_deref(), "--with-min-count")?,
+            parse_size_opt(args.max_count.as_deref(), "--with-max-count")?,
+            parse_size_opt(args.count.as_deref(), "--with-count")?,
+            parse_bytes_opt(args.min_data.as_deref(), "--with-min-data")?,
+            parse_bytes_opt(args.max_data.as_deref(), "--with-max-data")?,
+            parse_data_opt(args.data.as_deref(), "--with-data")?,
+        ))
+    })();
+    let Ok((min_count, max_count, count, min_data, max_data, data)) = sizes else {
+        return 1;
+    };
     let f = DatasetFilter {
         name,
         facet: args.facet,
         metric: args.metric,
         desc,
-        min_count: parse_size_opt(args.min_count.as_deref(), "--with-min-count"),
-        max_count: parse_size_opt(args.max_count.as_deref(), "--with-max-count"),
-        count: parse_size_opt(args.count.as_deref(), "--with-count"),
+        min_count,
+        max_count,
+        count,
         min_dim: args.min_dim,
         max_dim: args.max_dim,
         dim: args.dim,
         vtype: args.vtype,
-        min_data: parse_bytes_opt(args.min_data.as_deref(), "--with-min-data"),
-        max_data: parse_bytes_opt(args.max_data.as_deref(), "--with-max-data"),
-        data: parse_data_opt(args.data.as_deref(), "--with-data"),
+        min_data,
+        max_data,
+        data,
     };
     let view = ProfileView::new(profile_pat);
-    run(
+    run_listing(
         program,
         &args.configdir,
         &args.catalog,
@@ -169,40 +195,38 @@ pub fn run_args(args: ListArgs, program: &crate::catalog::CatalogSources) -> i32
         &f,
         &view,
         args.select.as_deref(),
+        listed,
     )
 }
 
+/// A size flag's value, `Err` (reported on stderr) when it is malformed.
 #[cfg(feature = "cli")]
-fn parse_size_opt(raw: Option<&str>, label: &str) -> Option<u64> {
+fn parse_size_opt(raw: Option<&str>, label: &str) -> Result<Option<u64>, ()> {
     raw.map(|s| {
-        filter::parse_size(s).unwrap_or_else(|e| {
-            eprintln!("error: {label}: {e}");
-            std::process::exit(1);
-        })
+        filter::parse_size(s).map_err(|e| eprintln!("error: {label}: {e}"))
     })
+    .transpose()
 }
 
+/// A byte-count flag's value, `Err` (reported on stderr) when it is
+/// malformed.
 #[cfg(feature = "cli")]
-fn parse_bytes_opt(raw: Option<&str>, label: &str) -> Option<u64> {
+fn parse_bytes_opt(raw: Option<&str>, label: &str) -> Result<Option<u64>, ()> {
     raw.map(|s| {
-        filter::parse_bytes(s).unwrap_or_else(|e| {
-            eprintln!("error: {label}: {e}");
-            std::process::exit(1);
-        })
+        filter::parse_bytes(s).map_err(|e| eprintln!("error: {label}: {e}"))
     })
+    .transpose()
 }
 
 /// Like [`parse_bytes_opt`] but keeping the spelled unit's
 /// granularity — the exact `--with-data` filter matches within half
 /// a unit (see [`DatasetFilter::data`]).
 #[cfg(feature = "cli")]
-fn parse_data_opt(raw: Option<&str>, label: &str) -> Option<(u64, u64)> {
+fn parse_data_opt(raw: Option<&str>, label: &str) -> Result<Option<(u64, u64)>, ()> {
     raw.map(|s| {
-        filter::parse_bytes_with_unit(s).unwrap_or_else(|e| {
-            eprintln!("error: {label}: {e}");
-            std::process::exit(1);
-        })
+        filter::parse_bytes_with_unit(s).map_err(|e| eprintln!("error: {label}: {e}"))
     })
+    .transpose()
 }
 
 /// Summary used for structured (json/yaml) output.
@@ -250,7 +274,41 @@ pub fn run(
     profile_view: &ProfileView,
     select: Option<&str>,
 ) -> i32 {
-    let sources = build_sources(program, configdir, extra_catalogs, at);
+    run_listing(
+        program,
+        configdir,
+        extra_catalogs,
+        at,
+        format,
+        verbose,
+        group_by,
+        filter,
+        profile_view,
+        select,
+        &mut |_, _| {},
+    )
+}
+
+/// [`run`], telling `listed` which entries the listing printed (see
+/// [`run_via_catalog_listing`]).
+#[allow(clippy::too_many_arguments)]
+fn run_listing(
+    program: &crate::catalog::CatalogSources,
+    configdir: &str,
+    extra_catalogs: &[String],
+    at: &[String],
+    format: &str,
+    verbose: bool,
+    group_by: Option<&str>,
+    filter: &DatasetFilter,
+    profile_view: &ProfileView,
+    select: Option<&str>,
+    listed: &mut dyn FnMut(&crate::catalog::Catalog, &[&CatalogEntry]),
+) -> i32 {
+    let sources = match super::sources_for_run(program, configdir, extra_catalogs, at) {
+        Ok(sources) => sources,
+        Err(code) => return code,
+    };
 
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
@@ -275,7 +333,7 @@ pub fn run(
         eprintln!("error: no datasets found in any configured catalog");
         return 1;
     }
-    run_via_catalog(&catalog, format, verbose, group_by, filter, profile_view, select)
+    run_via_catalog_listing(&catalog, format, verbose, group_by, filter, profile_view, select, listed)
 }
 
 /// [`run`] over a catalog the caller already assembled: apply `filter`
@@ -299,6 +357,25 @@ pub fn run_via_catalog(
     profile_view: &ProfileView,
     select: Option<&str>,
 ) -> i32 {
+    run_via_catalog_listing(catalog, format, verbose, group_by, filter, profile_view, select, &mut |_, _| {})
+}
+
+/// [`run_via_catalog`], telling `listed` which entries it printed, after
+/// printing them: called once for a listing that succeeds, with every
+/// entry the listing shows (none, for an empty informational result),
+/// and never for a run that fails or for `select`, whose output is one
+/// `dataset:profile` line rather than a listing.
+#[allow(clippy::too_many_arguments)]
+fn run_via_catalog_listing(
+    catalog: &crate::catalog::Catalog,
+    format: &str,
+    verbose: bool,
+    group_by: Option<&str>,
+    filter: &DatasetFilter,
+    profile_view: &ProfileView,
+    select: Option<&str>,
+    listed: &mut dyn FnMut(&crate::catalog::Catalog, &[&CatalogEntry]),
+) -> i32 {
     if catalog.is_empty() {
         eprintln!("error: no datasets found in any configured catalog");
         // `--select` asks for a specific entry we couldn't produce.
@@ -306,6 +383,7 @@ pub fn run_via_catalog(
         if select.is_some() {
             return 1;
         }
+        listed(catalog, &[]);
         return 0;
     }
 
@@ -333,6 +411,7 @@ pub fn run_via_catalog(
         if select.is_some() || !filter.is_empty() {
             return 1;
         }
+        listed(catalog, &[]);
         return 0;
     }
 
@@ -344,8 +423,21 @@ pub fn run_via_catalog(
         "json" => output_json(&filtered, verbose, profile_view),
         "yaml" => output_yaml(&filtered, verbose, profile_view),
         "csv"  => output_csv(&filtered, verbose, profile_view),
-        _      => output_text(&filtered, verbose, group_by, profile_view),
+        _      => {
+            if let Err(e) = output_text(&filtered, verbose, group_by, profile_view) {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        }
     }
+    // What the listing showed: an entry none of whose profiles the
+    // profile filter admits is left out of every format.
+    let shown: Vec<&CatalogEntry> = filtered
+        .iter()
+        .copied()
+        .filter(|e| !(profile_view.is_active() && profile_view.matching_profiles(e).is_empty()))
+        .collect();
+    listed(catalog, &shown);
     0
 }
 
@@ -468,10 +560,12 @@ fn terminal_width() -> usize {
 /// beta-100             [default]
 /// gamma-img-search     [default, 10m, 50m, 100m, 200m, 400m]        Cosine
 /// ```
-fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>, pv: &ProfileView) {
+///
+/// `Err` names a `group_by` key that is none of `source`, `profile` and
+/// `metric`, before anything is printed.
+fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>, pv: &ProfileView) -> Result<(), String> {
     if let Some(key) = group_by {
-        output_text_grouped(entries, verbose, key, pv);
-        return;
+        return output_text_grouped(entries, verbose, key, pv);
     }
 
     let width = terminal_width();
@@ -565,6 +659,7 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
             print_profile_parameters(entry);
         }
     }
+    Ok(())
 }
 
 /// What distinguishes each parameterized profile of an entry (P-12).
@@ -617,8 +712,9 @@ fn render_attribute(value: &serde_yaml::Value) -> String {
     }
 }
 
-/// Text output grouped by a key: `source`, `profile`, or `metric`.
-fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: &ProfileView) {
+/// Text output grouped by a key: `source`, `profile`, or `metric`;
+/// `Err` for any other key, before anything is printed.
+fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: &ProfileView) -> Result<(), String> {
     use std::collections::BTreeMap;
 
     let width = terminal_width();
@@ -646,8 +742,7 @@ fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: 
                 continue;
             }
             other => {
-                eprintln!("error: unknown --group-by key '{}'. Use: source, profile, metric", other);
-                std::process::exit(1);
+                return Err(format!("unknown --group-by key '{other}'. Use: source, profile, metric"));
             }
         };
 
@@ -692,6 +787,7 @@ fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: 
         }
         println!();
     }
+    Ok(())
 }
 
 /// CSV output.
@@ -805,6 +901,7 @@ fn escape_csv(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::build_sources;
     use crate::catalog::sources::CatalogSources;
 
     fn make_sources_from_dir(dir: &std::path::Path) -> CatalogSources {

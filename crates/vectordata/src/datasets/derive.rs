@@ -41,7 +41,6 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use super::build_sources;
 use crate::catalog::resolver::Catalog;
 use crate::dataset::config::DatasetConfig as RichDatasetConfig;
 use crate::dataset::DatasetConfigIo;
@@ -1883,7 +1882,7 @@ fn resolve_spec(
             .unwrap_or("derived").to_string();
         return Some((Resolved::Local(head.to_string()), name));
     }
-    let sources = build_sources(program, configdir, extra_catalogs, at);
+    let sources = super::sources_for_run(program, configdir, extra_catalogs, at).ok()?;
     if sources.is_empty() {
         eprintln!("'{head}' is not a local path, not a URL, and no catalog is configured.");
         eprintln!("Add a catalog with: vectordata config catalog add <URL-or-path>");

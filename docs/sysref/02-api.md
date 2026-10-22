@@ -252,7 +252,13 @@ let catalog = Catalog::of(&sources);
   catalogs (`datasets list`, `describe`, `ping`, `precache`, `derive`,
   `explore`): after the configured ones and before `--catalog`'s, and
   replaced with the rest by `--at`. `bin_main_as(invoked, argv)` is the
-  same with none. `datasets::build_sources(program, configdir, catalog,
+  same with none. `shell::run(invoked, argv, &host)` and
+  `shell::run_with_catalogs(invoked, argv, sources)` return the exit
+  status instead of ending the process; a `shell::Host` carries the
+  program's catalogs, its hooks after `datasets describe` and `datasets
+  list` and before `datasets precache` expands its specs, and
+  `owns_completion()` for a program whose command line this is, which
+  then completes under its own executable name. `datasets::build_sources(program, configdir, catalog,
   at)` is the one assembly; `CatalogSources::extend` appends one set to
   another. The program set is the program's own catalogs only; the
   configured ones are added there.

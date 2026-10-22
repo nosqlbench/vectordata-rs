@@ -127,6 +127,22 @@ documentation's **Common tasks** table is the same index with examples.
   [`shell::bin_main_with_catalogs`](crate::shell::bin_main_with_catalogs)
   — they follow the configured catalogs in every command, and `--at`
   replaces them for a run.
+- Run the `vectordata` command line inside a program that carries on
+  after it: [`shell::run`](crate::shell::run) with a
+  [`shell::Host`](crate::shell::Host) (or
+  [`shell::run_with_catalogs`](crate::shell::run_with_catalogs)) returns
+  the exit status (0, 1 failed, 2 usage) instead of ending the process.
+  The host's own output goes in
+  [`Host::after_describe`](crate::shell::Host::after_describe) and
+  [`Host::after_list`](crate::shell::Host::after_list), its own precache
+  specs (`group:<name>`) in
+  [`Host::before_precache`](crate::shell::Host::before_precache), and
+  [`Host::owns_completion`](crate::shell::Host::owns_completion) binds
+  completion to the host's executable name. Do not parse the argv and
+  call the command modules yourself.
+- Precache several specs as one run (one plan, one progress display, one
+  report): `vectordata datasets precache a:default b:10m`, or
+  [`datasets::precache::run_specs`](crate::datasets::precache::run_specs).
 - Build the catalogs a `datasets` command runs against:
   [`datasets::build_sources`](crate::datasets::build_sources) (the
   program's catalogs, then the `--configdir` / `--catalog` / `--at`

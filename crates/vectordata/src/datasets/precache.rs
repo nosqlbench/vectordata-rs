@@ -27,7 +27,6 @@
 
 use std::path::{Path, PathBuf};
 
-use super::build_sources;
 use crate::catalog::resolver::Catalog;
 use crate::dataset::selector::{DatasetSpec, SelectorError};
 use crate::fetch::meter::fmt_bytes;
@@ -226,7 +225,10 @@ pub fn run_specs(specs: &[String], req: PrecacheRequest) -> i32 {
     } else if let Some(catalog) = req.catalog.clone() {
         catalog
     } else {
-        let sources = build_sources(&req.program_catalogs, &req.configdir, &req.extra_catalogs, &req.at);
+        let sources = match super::sources_for_run(&req.program_catalogs, &req.configdir, &req.extra_catalogs, &req.at) {
+            Ok(sources) => sources,
+            Err(code) => return code,
+        };
         if sources.is_empty() {
             let head = &parsed.iter().find(|(head, _)| names_a_dataset(head)).expect("checked above").0;
             eprintln!("'{head}' is not a local path, not a URL, and no catalog is configured.");

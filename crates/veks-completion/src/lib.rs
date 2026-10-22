@@ -2754,7 +2754,23 @@ fn print_partial_parse(pp: &PartialParse) {
 /// length), and it prints one completion candidate per line resolved against
 /// `tree`. Returns `true` when it handled the request, in which case the caller
 /// should exit; returns `false` (printing nothing) for a normal invocation.
+///
+/// The line and cursor are read from the process's own arguments;
+/// [`handle_complete_args`] takes them from the caller.
 pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    handle_complete_args(app_name, tree, &args)
+}
+
+/// [`handle_complete_env`] over `args`, the arguments after the program
+/// name, in place of the process's own: `args[0]` is the command line
+/// and `args[1]` the cursor offset, as the registration script passes
+/// them, and no arguments asks for the script. For a program that runs
+/// a command line it was handed rather than its own process arguments
+/// (a host dispatching to an embedded CLI that owns completion under
+/// the host's name). The request is still recognized by the
+/// `_<APP>_COMPLETE` environment variable.
+pub fn handle_complete_args(app_name: &str, tree: &CommandTree, args: &[String]) -> bool {
     // ONLY the app-namespaced `_<APP>_COMPLETE` diverts execution. We do NOT
     // honor a bare global `COMPLETE` env var: it's set by clap_complete-era
     // shims and, if it leaks into the environment, would turn every normal
@@ -2766,20 +2782,18 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
         return false;
     }
 
-    let argv: Vec<String> = std::env::args().collect();
-
     // Activation handshake vs. completion request. A completion callback always
-    // passes the command line as `argv[1]` (the `$COMP_LINE`/`$COMP_POINT` shim
+    // passes the command line as `args[0]` (the `$COMP_LINE`/`$COMP_POINT` shim
     // in `print_bash_script`). A *bare* `_<APP>_COMPLETE=bash <app>` carries no
     // line and means "give me the registration script" — emit the shim rather
     // than completing the empty line (which would dump the subcommand list).
-    if argv.len() <= 1 {
+    if args.is_empty() {
         print_bash_script(app_name);
         return true;
     }
 
-    let line = argv.get(1).cloned().unwrap_or_default();
-    let point: usize = argv.get(2)
+    let line = args[0].clone();
+    let point: usize = args.get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(line.len());
 

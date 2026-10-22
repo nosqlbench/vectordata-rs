@@ -50,7 +50,10 @@ pub fn run_args(args: PingArgs, program: &crate::catalog::CatalogSources, config
     // shortcuts (`--at 2`) included, by the one assembly every
     // command uses.
     let at = args.at;
-    let sources = super::build_sources(program, configdir, catalog, &at);
+    let sources = match super::sources_for_run(program, configdir, catalog, &at) {
+        Ok(sources) => sources,
+        Err(code) => return code,
+    };
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
         eprintln!();

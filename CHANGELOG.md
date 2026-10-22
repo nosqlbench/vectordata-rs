@@ -159,6 +159,21 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
   answers for a host not built on veks-completion. `completions` under
   an embedding name says how, instead of printing a script bound to the
   `vectordata` executable.
+- **A program can run the `vectordata` command line as its own.**
+  `shell::run(invoked, argv, &host)` and `shell::run_with_catalogs(invoked,
+  argv, catalogs)` parse and dispatch as `bin_main_with_catalogs` does,
+  and return the exit status (0, 1 for a failed command, 2 for a usage
+  error) instead of ending the process, so a program wrapping the argv
+  carries on after the command. A `shell::Host` carries the program's
+  catalogs and its own output: `after_describe` and `after_list` run
+  after `datasets describe` and `datasets list` print, with what they
+  described or listed, and `before_precache` expands a spec of the
+  program's own (`group:<name>`) into the specs it stands for.
+  `Host::owns_completion()` is for a program whose command line this is:
+  `completions` prints scripts bound to the program's name and the
+  completion protocol is answered for it. veks-completion's
+  `handle_complete_args` answers that protocol over arguments a caller
+  passes in.
 - **`datasets precache a b:10m c:profile=*` takes several specs** and
   fetches them as one run: every spec resolved before anything moves,
   then one plan, one progress display and one report, each facet named

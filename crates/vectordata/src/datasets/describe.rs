@@ -37,6 +37,21 @@ pub struct DescribeArgs {
 /// Drive `describe` from parsed [`DescribeArgs`].
 #[cfg(feature = "cli")]
 pub fn run_args(args: DescribeArgs, program: &crate::catalog::CatalogSources, configdir: &str, catalog: &[String]) -> i32 {
+    run_args_described(args, program, configdir, catalog, &mut |_, _, _| {})
+}
+
+/// [`run_args`], telling `described` what it described once the
+/// description is printed: what
+/// [`shell::Host::after_describe`](crate::shell::Host::after_describe)
+/// hears. See [`run_via_catalog_described`].
+#[cfg(feature = "cli")]
+pub(crate) fn run_args_described(
+    args: DescribeArgs,
+    program: &crate::catalog::CatalogSources,
+    configdir: &str,
+    catalog: &[String],
+    described: &mut dyn FnMut(&Catalog, &CatalogEntry, &str),
+) -> i32 {
     // `--at` pins describe to a single catalog source; numbered
     // shortcuts (`--at 2`) resolve against the configured list.
     // `--at` pins the command to the catalogs it names, numbered
@@ -58,10 +73,13 @@ pub fn run_args(args: DescribeArgs, program: &crate::catalog::CatalogSources, co
     // Catalogs are read only for a head that names a dataset in one: a
     // path or URL opens directly, as precache opens it.
     if opens_directly(&head) {
-        return run_via_catalog(&Catalog::default(), &head, selector.as_deref());
+        return run_via_catalog_described(&Catalog::default(), &head, selector.as_deref(), described);
     }
     let at = args.at;
-    let sources = super::build_sources(program, configdir, catalog, &at);
+    let sources = match super::sources_for_run(program, configdir, catalog, &at) {
+        Ok(sources) => sources,
+        Err(code) => return code,
+    };
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
         eprintln!();
@@ -73,7 +91,7 @@ pub fn run_args(args: DescribeArgs, program: &crate::catalog::CatalogSources, co
         Ok(cat) => cat,
         Err(code) => return code,
     };
-    run_via_catalog(&cat, &head, selector.as_deref())
+    run_via_catalog_described(&cat, &head, selector.as_deref(), described)
 }
 
 /// A head [`open_selection`](crate::catalog::Catalog::open_selection)
@@ -94,6 +112,21 @@ fn opens_directly(head: &str) -> bool {
 /// rendered (PS-9): `None` is `default`, and a selector matching more
 /// or fewer than one profile is an error naming what it matched.
 pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&str>) -> i32 {
+    run_via_catalog_described(catalog, dataset_name, selector, &mut |_, _, _| {})
+}
+
+/// [`run_via_catalog`], calling `described(catalog, entry, profile)`
+/// after the description is printed, only when it succeeded: `catalog`
+/// is the one the name was looked up in (empty for a path or URL, which
+/// opens directly), `entry` the dataset described, as listed or as its
+/// `dataset.yaml` reads, and `profile` the one profile the selector
+/// resolved to.
+pub(crate) fn run_via_catalog_described(
+    catalog: &Catalog,
+    dataset_name: &str,
+    selector: Option<&str>,
+    described: &mut dyn FnMut(&Catalog, &CatalogEntry, &str),
+) -> i32 {
     // `lookup`, not `find_exact`: a name two catalogs hold is ambiguous,
     // and saying so is the opposite of saying it is nowhere.
     let opened;
@@ -126,8 +159,12 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, selector: Option<&
             return 1;
         }
     };
-    render(entry, &profile_name, inferred_note.as_deref());
-    0
+    if render(entry, &profile_name, inferred_note.as_deref()) {
+        described(catalog, entry, &profile_name);
+        0
+    } else {
+        1
+    }
 }
 
 /// What the dataset's own declaration says against an overlay's value
@@ -196,7 +233,9 @@ fn varying_attributes(
     keys
 }
 
-fn render(entry: &CatalogEntry, profile_name: &str, inferred: Option<&str>) {
+/// Print the description; `false` when the profile is not the entry's,
+/// after the dataset-level part and the reason.
+fn render(entry: &CatalogEntry, profile_name: &str, inferred: Option<&str>) -> bool {
     println!("Dataset: {}", entry.name());
     println!("Profile: {profile_name}");
     println!("Path:    {}", entry.location());
@@ -262,7 +301,7 @@ fn render(entry: &CatalogEntry, profile_name: &str, inferred: Option<&str>) {
         // Soft-fail render — the dataset-level info above is still
         // useful to the user even when the profile is the typo.
         // Exit code is handled by the caller; we just stop here.
-        std::process::exit(1);
+        return false;
     };
 
     println!();
@@ -370,6 +409,7 @@ fn render(entry: &CatalogEntry, profile_name: &str, inferred: Option<&str>) {
             println!("    source.window [{}..{})", iv.min_incl, iv.max_excl);
         }
     }
+    true
 }
 
 /// The files a series view names, in ordinal order, as the shard

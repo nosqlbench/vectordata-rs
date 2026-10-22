@@ -247,8 +247,17 @@ expression; a spec with no selector is refused naming the spellings.
 vectordata datasets precache my-dataset:default
 vectordata datasets precache my-dataset:profile=*
 vectordata datasets precache "tessera:size=10m,predicates=uniform*" --plan
+vectordata datasets precache my-dataset:default other-dataset:10m
 veks datasets precache --dataset my-dataset:default --at https://example.com/datasets/
 ```
+
+`vectordata datasets precache` takes one or more specs. Several are
+fetched as one run: every spec is resolved before anything is fetched,
+then one plan, one progress display and one report cover them all, each
+facet named `<dataset>:<profile>/<facet>`, and a profile two specs both
+select is fetched once. `--profile` applies to every spec, and
+`--facet`/`--window`/`--plan` need the specs to select one profile
+between them. The library form is `datasets::precache::run_specs`.
 
 ### Cache inspection
 

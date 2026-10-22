@@ -105,20 +105,45 @@ impl RunSources {
 /// dispatches into this module. An `--at` value may also name a
 /// configured or program catalog ([`at_sources`]), so any ordered list
 /// of catalogs is a list of `--at` values.
+///
+/// Exits the process with status 1 on an `--at`/`--catalog` value it
+/// cannot resolve (a number naming no configured catalog, a name two
+/// catalogs share), as [`catalog_args`] does. The commands themselves
+/// assemble the same catalogs and return that status instead, so a
+/// program running them in-process ([`shell::run`](crate::shell::run))
+/// keeps running.
 pub fn build_sources(program: &CatalogSources, configdir: &str, extra_catalogs: &[String], at: &[String]) -> RunSources {
-    let at = catalog_args(at);
-    let extra_catalogs = catalog_args(extra_catalogs);
+    sources_for_run(program, configdir, extra_catalogs, at).unwrap_or_else(|code| std::process::exit(code))
+}
+
+/// [`build_sources`], returning the exit status instead of exiting when
+/// an `--at`/`--catalog` value cannot be resolved; the reason is printed
+/// to stderr. What every `datasets` command assembles its catalogs with.
+pub(crate) fn sources_for_run(
+    program: &CatalogSources,
+    configdir: &str,
+    extra_catalogs: &[String],
+    at: &[String],
+) -> Result<RunSources, i32> {
+    let resolve = |values: &[String]| {
+        sources::resolve_catalog_values(values).map_err(|e| {
+            eprintln!("Error: {e}");
+            1
+        })
+    };
+    let at = resolve(at)?;
+    let extra_catalogs = resolve(extra_catalogs)?;
     let candidates = CatalogSources::new().configure(configdir).extend(program.clone());
     if !at.is_empty() {
         // `--at` names which catalogs to read; what the user and the
         // program know of datasets (their overlays) still applies, as
         // `at_sources` carries them.
-        let sources = at_sources(&at, &candidates).unwrap_or_else(|e| {
+        let sources = at_sources(&at, &candidates).map_err(|e| {
             eprintln!("Error: {e}");
-            std::process::exit(1);
-        });
+            1
+        })?;
         let named = sources.iter().map(|(s, _)| s.name().to_string()).collect();
-        return RunSources { sources, named };
+        return Ok(RunSources { sources, named });
     }
     let (configured, named) = (candidates, extra_catalogs);
     let before: Vec<String> = configured.iter().map(|(s, _)| s.name().to_string()).collect();
@@ -128,7 +153,7 @@ pub fn build_sources(program: &CatalogSources, configdir: &str, extra_catalogs: 
         .map(|(s, _)| s.name().to_string())
         .filter(|name| !before.contains(name))
         .collect();
-    RunSources { sources, named }
+    Ok(RunSources { sources, named })
 }
 
 /// The catalogs a run's `--at` values name, in their order, in place of
