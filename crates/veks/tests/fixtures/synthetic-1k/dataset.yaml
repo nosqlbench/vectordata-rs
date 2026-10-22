@@ -139,16 +139,32 @@ upstream:
 
     - id: generate-predicates
       description: Generate simple integer equality predicates
-      run: generate predicates
+      run: generate simple-predicates
       after: [generate-metadata]
       output: profiles/base/predicates.u8
       count: 100
       seed: 42
-      mode: simple-int-eq
       fields: 1
       range-min: 0
       range-max: 12
       format: u8
+
+    # ── Oracle partitions ────────────────────────────────────────
+
+    - id: partition-profiles
+      description: Create per-label oracle partition profiles
+      run: compute partition-profiles
+      after: [verify-knn, generate-metadata, generate-predicates]
+      base: profiles/base/base_vectors.fvec
+      query: profiles/base/query_vectors.fvec
+      metadata: profiles/base/metadata_content.u8
+      predicates: profiles/base/predicates.u8
+      neighbors: 100
+      metric: L2
+      allowed-partitions: 12
+      # Each of the 12 labels holds ~80 of the 1K base vectors, fewer
+      # than k=100: keep them, so the fixture has partition profiles.
+      on-undersized: include
 
     # ── Predicate evaluation ─────────────────────────────────────
 
@@ -176,7 +192,9 @@ upstream:
       predicates: profiles/base/predicates.u8
       results: metadata_indices.ivvec
       fields: 1
-      output: "${cache}/verify_predicates_sqlite.json"
+      # One report per profile: a `${cache}` path is not prefixed with
+      # the profile's directory, so a shared name collides.
+      output: "${cache}/verify_predicates_sqlite_${profile_name}.json"
 
     # ── Pre-filter KNN (F facet, ACORN G_K) ──────────────────────
 
@@ -215,7 +233,7 @@ upstream:
       run: compute postfiltered-knn
       per_profile: true
       phase: 2
-      after: [compute-knn, compute-evaluate-predicates]
+      after: [compute-knn, evaluate-predicates]
       ground-truth: neighbor_indices.ivec
       ground-truth-distances: neighbor_distances.fvec
       metadata-indices: metadata_indices.ivvec
@@ -279,51 +297,3 @@ profiles:
     prefiltered_neighbor_distances: profiles/default/prefiltered_neighbor_distances.fvec
     postfiltered_neighbor_indices: profiles/default/postfiltered_neighbor_indices.ivec
     postfiltered_neighbor_distances: profiles/default/postfiltered_neighbor_distances.fvec
-  label_00:
-    base_count: 80
-    base_vectors: profiles/label_00/base_vectors.fvec
-    query_vectors: profiles/label_00/query_vectors.fvec
-  label_01:
-    base_count: 77
-    base_vectors: profiles/label_01/base_vectors.fvec
-    query_vectors: profiles/label_01/query_vectors.fvec
-  label_02:
-    base_count: 80
-    base_vectors: profiles/label_02/base_vectors.fvec
-    query_vectors: profiles/label_02/query_vectors.fvec
-  label_03:
-    base_count: 94
-    base_vectors: profiles/label_03/base_vectors.fvec
-    query_vectors: profiles/label_03/query_vectors.fvec
-  label_04:
-    base_count: 87
-    base_vectors: profiles/label_04/base_vectors.fvec
-    query_vectors: profiles/label_04/query_vectors.fvec
-  label_05:
-    base_count: 73
-    base_vectors: profiles/label_05/base_vectors.fvec
-    query_vectors: profiles/label_05/query_vectors.fvec
-  label_06:
-    base_count: 92
-    base_vectors: profiles/label_06/base_vectors.fvec
-    query_vectors: profiles/label_06/query_vectors.fvec
-  label_07:
-    base_count: 84
-    base_vectors: profiles/label_07/base_vectors.fvec
-    query_vectors: profiles/label_07/query_vectors.fvec
-  label_08:
-    base_count: 77
-    base_vectors: profiles/label_08/base_vectors.fvec
-    query_vectors: profiles/label_08/query_vectors.fvec
-  label_09:
-    base_count: 81
-    base_vectors: profiles/label_09/base_vectors.fvec
-    query_vectors: profiles/label_09/query_vectors.fvec
-  label_10:
-    base_count: 85
-    base_vectors: profiles/label_10/base_vectors.fvec
-    query_vectors: profiles/label_10/query_vectors.fvec
-  label_11:
-    base_count: 90
-    base_vectors: profiles/label_11/base_vectors.fvec
-    query_vectors: profiles/label_11/query_vectors.fvec

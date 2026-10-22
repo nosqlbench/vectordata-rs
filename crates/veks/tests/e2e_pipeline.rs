@@ -1818,15 +1818,21 @@ fn e2e_partition_profiles_full_pipeline() {
 
 /// E2E test: partition profile configuration is correct in the synthetic-1k fixture.
 ///
-/// The synthetic-1k fixture has partition profiles (label_00 through label_11)
-/// already built by a previous pipeline run. This test verifies the config
-/// model: profiles exist with correct views, base_count, and natural ordering.
+/// The synthetic-1k fixture declares partition profiles (label_00 through
+/// label_11); the test runs its pipeline in a temp directory, so it reads
+/// what this build produces and never a copy a previous run left in the
+/// source tree. It verifies the config model: profiles exist with correct
+/// views, base_count, and natural ordering, and every partition's base
+/// file is on disk.
 #[test]
 fn e2e_partition_profile_config() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/synthetic-1k");
+    let tmp = make_tempdir();
+    let fixture = tmp.path().to_path_buf();
     let dataset_yaml = fixture.join("dataset.yaml");
-    assert!(dataset_yaml.exists(), "synthetic-1k fixture must exist");
+    std::fs::copy(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synthetic-1k/dataset.yaml"), &dataset_yaml)
+        .expect("copy the synthetic-1k descriptor");
+    let (ok, log) = run_pipeline(&dataset_yaml);
+    assert!(ok, "the synthetic-1k pipeline runs:\n{log}");
 
     let config = vectordata::dataset::DatasetConfig::load(&dataset_yaml).unwrap();
 
