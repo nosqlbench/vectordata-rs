@@ -257,14 +257,13 @@ impl TestDataGroup {
     /// `dataset.yaml` → `knn_entries.yaml`.
     pub fn load_from_url(url_str: &str) -> Result<Self> {
         let url = Url::parse(url_str)?;
-        let client = crate::transport::shared_client_for(url_str);
 
         // Explicit catalog file: dispatch by content shape, no
         // sibling probing. Facet paths resolve against the URL's
         // parent directory.
         if is_yaml_name(url.path()) {
             let base_url = url.join(".")?;
-            let content = fetch_descriptor(&client, &url, &base_url)?.required(&url)?;
+            let content = fetch_descriptor(&url, &base_url)?.required(&url)?;
             let handle = DatasetHandle::of_content(Location::Url(base_url), &Location::Url(url.clone()), &content)?;
             return Ok(Self::from_handle(handle));
         }
@@ -281,7 +280,7 @@ impl TestDataGroup {
         // `knn_entries.yaml` one: go on to that before giving up.
         let dataset_url = base_url.join("dataset.yaml")?;
         let mut unavailable = None;
-        match fetch_descriptor(&client, &dataset_url, &base_url)? {
+        match fetch_descriptor(&dataset_url, &base_url)? {
             Descriptor::Text(content) => {
                 return Ok(Self::from_handle(DatasetHandle::of_dataset_yaml(home, &Location::Url(dataset_url), &content)?));
             }
@@ -290,7 +289,7 @@ impl TestDataGroup {
         }
 
         let knn_url = base_url.join("knn_entries.yaml")?;
-        let content = match (fetch_descriptor(&client, &knn_url, &base_url)?, unavailable) {
+        let content = match (fetch_descriptor(&knn_url, &base_url)?, unavailable) {
             (Descriptor::Text(text), _) => text,
             // dataset.yaml went unasked: that is the reason, whatever
             // came of knn_entries.yaml.
@@ -650,7 +649,6 @@ impl TestDataGroup {
 /// that is neither the file nor "no such file", or a kept copy that
 /// cannot be read.
 fn fetch_descriptor(
-    client: &reqwest::blocking::Client,
     url: &Url,
     base_url: &Url,
 ) -> Result<Descriptor> {
@@ -668,11 +666,10 @@ fn fetch_descriptor(
     }
     // An `s3://` URL is fetched over its HTTPS endpoint; auth and the
     // kept copy stay keyed by the URL as the dataset names it.
-    let wire = crate::transport::normalize_remote_url(url.as_str());
-    let resp = crate::transport::apply_read_auth(client.get(wire.as_ref()), Some(url)).send();
+    let resp = crate::transport::shared().send(crate::transport::Request::get(url.as_str()));
     match resp {
-        Ok(r) if r.status().is_success() => {
-            let text = r.text().map_err(crate::transport::transport_error)?;
+        Ok(r) if r.is_success() => {
+            let text = r.text()?;
             if let Some(path) = kept_descriptor_path(url, base_url) {
                 // Best effort: a cache directory that cannot be written
                 // only costs the offline fallback.
@@ -681,16 +678,16 @@ fn fetch_descriptor(
             }
             Ok(Descriptor::Text(text))
         }
-        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => Ok(Descriptor::Absent),
-        Ok(r) => Err(Error::Other(format!("{url}: {}", r.status()))),
-        Err(e) if e.is_connect() || e.is_timeout() => match &kept {
+        Ok(r) if r.status() == 404 => Ok(Descriptor::Absent),
+        Ok(r) => Err(Error::Other(format!("{url}: {}", r.status_line()))),
+        Err(e) if e.is_unreachable() => match &kept {
             Some(path) => {
-                log::warn!("{url} is unreachable ({e}); using the copy kept at {}", path.display());
+                log::warn!("{url} is unreachable ({}); using the copy kept at {}", e.message, path.display());
                 read_kept(path)
             }
-            None => Ok(Descriptor::Unavailable(Error::Transport(crate::transport::transport_error(e)))),
+            None => Ok(Descriptor::Unavailable(Error::Transport(e))),
         },
-        Err(e) => Err(Error::Transport(crate::transport::transport_error(e))),
+        Err(e) => Err(Error::Transport(e)),
     }
 }
 
@@ -730,8 +727,7 @@ pub(crate) fn fetch_dataset_yaml(url_str: &str) -> Result<String> {
         url = url.join("dataset.yaml")?;
     }
     let base_url = url.join(".")?;
-    let client = crate::transport::shared_client_for(url.as_str());
-    fetch_descriptor(&client, &url, &base_url)?.required(&url)
+    fetch_descriptor(&url, &base_url)?.required(&url)
 }
 
 /// Where a descriptor fetched from `url` is kept: under the dataset's

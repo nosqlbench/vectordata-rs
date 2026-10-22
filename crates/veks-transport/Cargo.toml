@@ -1,0 +1,49 @@
+[package]
+name = "veks-transport"
+version = "4.0.2"
+edition = "2024"
+description = "Remote access and streaming storage for vector datasets: a pooled blocking HTTP client with TLS trust, offline gate, retry and read credentials, range reads and whole-file transfers, uploads, and merkle-verified and chunk-recorded cache files, each a veks-apicore ByteSource"
+license = "Apache-2.0"
+homepage = "https://github.com/nosqlbench/vectordata-rs"
+repository = "https://github.com/nosqlbench/vectordata-rs"
+readme = "README.md"
+keywords = ["vector", "http", "merkle", "cache", "dataset"]
+categories = ["network-programming", "filesystem", "science"]
+
+# The transport layer (docs/design/srd-crate-boundaries.md §6): every
+# byte that crosses a network, and the cache files remote bytes land
+# in. It knows no dataset, catalog or profile, computes no cache path
+# (TR-7) and reads no environment variable or settings file (TR-3); it
+# does not depend on veks-io (TR-8) — the two meet only through
+# veks-apicore's ByteSource.
+[dependencies]
+# The contracts and values the transport implements and consumes:
+# ByteSource, DownloadProgress, TransportConfig, Credentials,
+# RequestSigner, Request, TransportError.
+veks-apicore = { path = "../veks-apicore", version = "=4.0.2" }
+byteorder = "1.5"
+filetime = "0.2"
+httpdate = "1"
+# flock(2) around a merkle state checkpoint, so two processes filling
+# one cache copy merge their bits instead of losing them.
+libc = "0.2"
+log = "0.4"
+memmap2 = "0.9"
+# `default-features = false` drops `default-tls` (OpenSSL via native-
+# tls) so a `*-unknown-linux-musl` static build doesn't need OpenSSL
+# headers / libs on the build host. `rustls` is pure-Rust TLS that
+# links cleanly into a static binary.
+reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "rustls"] }
+sha2 = "0.10"
+url = "2.5"
+
+[dev-dependencies]
+hex = "0.4"
+tempfile = "3"
+# Test-only: shows a program depending on veks-io and veks-transport
+# alone reading a remote file through veks-io's readers over this
+# crate's ByteSource (TR-8). Not a dependency of the library.
+veks-io = { path = "../veks-io" }
+
+[lints]
+workspace = true

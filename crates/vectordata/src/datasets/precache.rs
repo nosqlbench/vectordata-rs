@@ -316,7 +316,7 @@ fn drive_prebuffer(view: &dyn TestDataView, fetch: &FetchRequest, meter: &mut dy
         plan.facets().len(),
         fmt_bytes(plan.bytes_to_fetch()),
         crate::cache::download_concurrency(),
-        crate::transport::http_runtimes()
+        crate::transport::shared().parallel_streams()
     );
     execute(plan, meter)
 }

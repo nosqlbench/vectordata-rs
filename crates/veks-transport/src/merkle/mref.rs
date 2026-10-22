@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Library API. Read-only merkle reference tree loaded from `.mref` files.
+//! Read-only merkle reference tree loaded from `.mref` files.
 
 use std::fs;
 use std::io::{self, Cursor, Read};
@@ -176,11 +176,15 @@ impl MerkleRef {
     /// Serialize to bytes in the standard `.mref` format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.hashes.len() * HASH_SIZE + FOOTER_SIZE_V2);
-        self.write(&mut buf).expect("write to Vec cannot fail");
+        for hash in &self.hashes {
+            buf.extend_from_slice(hash);
+        }
+        buf.extend_from_slice(&self.shape.footer_bytes(0));
         buf
     }
 
     /// Tree geometry.
+    #[inline]
     pub fn shape(&self) -> &MerkleShape {
         &self.shape
     }

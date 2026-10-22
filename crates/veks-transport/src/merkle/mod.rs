@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Library API. Merkle tree integrity verification for chunked data.
+//! Merkle tree integrity verification for chunked data.
 //!
 //! This module implements wire-compatible merkle tree structures matching the
 //! Java companion project (`nbdatatools`). The binary formats for `.mref`
@@ -23,7 +23,7 @@ pub use mstate::MerkleState;
 
 pub use veks_apicore::{ContentId, ContentIdKind};
 
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{self, Cursor, Read, Write};
 
 /// Footer size in bytes — fixed at 41 for wire compatibility.
@@ -194,17 +194,24 @@ impl MerkleShape {
 
     /// Write the 45-byte v2 footer with an explicit bitset size.
     pub fn write_footer_with_bitset<W: Write>(&self, w: &mut W, bitset_size: u32) -> io::Result<()> {
-        w.write_u64::<BigEndian>(self.chunk_size)?;
-        w.write_u64::<BigEndian>(self.total_content_size)?;
-        w.write_u32::<BigEndian>(self.total_chunks)?;
-        w.write_u32::<BigEndian>(self.leaf_count)?;
-        w.write_u32::<BigEndian>(self.cap_leaf)?;
-        w.write_u32::<BigEndian>(self.node_count)?;
-        w.write_u32::<BigEndian>(self.offset)?;
-        w.write_u32::<BigEndian>(self.internal_node_count)?;
-        w.write_u32::<BigEndian>(bitset_size)?;
-        w.write_u8(FOOTER_SIZE_V2 as u8)?;
-        Ok(())
+        w.write_all(&self.footer_bytes(bitset_size))
+    }
+
+    /// The 45-byte v2 footer with an explicit bitset size, as bytes:
+    /// big-endian fields, then the length marker.
+    pub fn footer_bytes(&self, bitset_size: u32) -> [u8; FOOTER_SIZE_V2] {
+        let mut out = [0u8; FOOTER_SIZE_V2];
+        out[0..8].copy_from_slice(&self.chunk_size.to_be_bytes());
+        out[8..16].copy_from_slice(&self.total_content_size.to_be_bytes());
+        out[16..20].copy_from_slice(&self.total_chunks.to_be_bytes());
+        out[20..24].copy_from_slice(&self.leaf_count.to_be_bytes());
+        out[24..28].copy_from_slice(&self.cap_leaf.to_be_bytes());
+        out[28..32].copy_from_slice(&self.node_count.to_be_bytes());
+        out[32..36].copy_from_slice(&self.offset.to_be_bytes());
+        out[36..40].copy_from_slice(&self.internal_node_count.to_be_bytes());
+        out[40..44].copy_from_slice(&bitset_size.to_be_bytes());
+        out[44] = FOOTER_SIZE_V2 as u8;
+        out
     }
 }
 

@@ -1,24 +1,26 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Internal. HTTP byte-range transport using reqwest with connection pooling.
+//! [`HttpTransport`]: one remote file's byte ranges, over a [`Transport`]'s pool.
 
 use std::io;
 use std::sync::OnceLock;
 
-use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, RANGE};
 use url::Url;
 
-use super::ChunkedTransport;
+use crate::Transport;
+use crate::chunked::ChunkedTransport;
 
-/// HTTP transport that fetches byte ranges from a URL.
+/// The byte ranges of one remote file.
 ///
-/// Uses a shared `reqwest::blocking::Client` for connection pooling.
-/// Content length and range support are detected lazily on first use.
-#[derive(Debug)]
+/// Every request goes through its [`Transport`]'s pool, picked per call
+/// by the URL's origin, with the read credentials and the offline gate.
+/// Content length and range support are detected lazily on first use,
+/// by one `HEAD`.
+#[derive(Debug, Clone)]
 pub struct HttpTransport {
-    client: Client,
+    transport: Transport,
     url: Url,
     /// URL after any first-probe redirect correction (e.g. S3
     /// wrong-region rewrite). When set, takes precedence over
@@ -30,27 +32,12 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
-    /// Create a new HTTP transport for the given URL. Reuses the
-    /// process-wide shared `reqwest::blocking::Client` rather than
-    /// constructing a fresh one — `Client::new()` triggers a full
-    /// native-cert load that dominates per-request CPU when called
-    /// repeatedly.
-    pub fn new(url: Url) -> Self {
+    /// The file at `url`, read through `transport`'s pool. Nothing is
+    /// asked until the first read. `url` is the wire form (an `s3://`
+    /// URL is [normalized](Transport::normalize_url) first).
+    pub fn new(transport: &Transport, url: Url) -> Self {
         HttpTransport {
-            // url-aware: a self-signed endpoint listed in `trust_self_signed`
-            // gets the non-verifying client; everyone else the verifying one.
-            client: super::shared_client_for(url.as_str()),
-            url,
-            effective_url: OnceLock::new(),
-            content_length: OnceLock::new(),
-            supports_range: OnceLock::new(),
-        }
-    }
-
-    /// Create with a shared client (for connection pooling across transports).
-    pub fn with_client(client: Client, url: Url) -> Self {
-        HttpTransport {
-            client,
+            transport: transport.clone(),
             url,
             effective_url: OnceLock::new(),
             content_length: OnceLock::new(),
@@ -62,6 +49,27 @@ impl HttpTransport {
     /// messages to point operators at the source that needs a
     /// `.mref` published.
     pub fn url(&self) -> &Url { &self.url }
+
+    /// The transport the requests go through.
+    pub fn transport(&self) -> &Transport {
+        &self.transport
+    }
+
+    /// The file's size in bytes, from the first probe.
+    pub fn content_length(&self) -> io::Result<u64> {
+        self.ensure_probed()?;
+        self.content_length
+            .get()
+            .copied()
+            .ok_or_else(|| io::Error::other(format!("{}: the probe recorded no length", self.url)))
+    }
+
+    /// Whether the server serves byte ranges (`Accept-Ranges: bytes`).
+    /// `false` when the probe fails.
+    pub fn supports_range(&self) -> bool {
+        let _ = self.ensure_probed();
+        self.supports_range.get().copied().unwrap_or(false)
+    }
 
     /// Returns the URL that should actually be hit. This is the
     /// initial URL unless the first probe corrected it (e.g. an
@@ -80,9 +88,10 @@ impl HttpTransport {
     /// probe retried once. All subsequent `fetch_range` calls
     /// pick up the corrected URL.
     fn probe(&self) -> io::Result<(u64, bool)> {
-        super::ensure_online(self.url.as_str())?;
+        self.transport.ensure_online(self.url.as_str())?;
         let target = self.effective_url().clone();
-        let resp = super::apply_read_auth(self.client.head(target.clone()), Some(&target))
+        let client = self.transport.client_for(target.as_str())?;
+        let resp = self.transport.apply_read_auth(client.head(target.clone()), target.as_str())
             .send()
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
 
@@ -99,7 +108,7 @@ impl HttpTransport {
                 && let Some(corrected) = rewrite_s3_url_region(self.effective_url(), &region)
             {
                 let _ = self.effective_url.set(corrected.clone());
-                let retry = super::apply_read_auth(self.client.head(corrected.clone()), Some(&corrected))
+                let retry = self.transport.apply_read_auth(client.head(corrected.clone()), corrected.as_str())
                     .send()
                     .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?
                     .error_for_status()
@@ -149,8 +158,8 @@ impl HttpTransport {
     pub(crate) fn fetch_full_to(&self, out: &mut dyn io::Write) -> io::Result<u64> {
         self.ensure_probed()?;
         let target = self.effective_url().clone();
-        let client = super::shared_client_for(target.as_str());
-        let mut resp = super::apply_read_auth(client.get(target.clone()), Some(&target))
+        let client = self.transport.client_for(target.as_str())?;
+        let mut resp = self.transport.apply_read_auth(client.get(target.clone()), target.as_str())
             .send()
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?
             .error_for_status()
@@ -201,15 +210,17 @@ pub(crate) fn rewrite_s3_url_region(url: &Url, correct_region: &str) -> Option<U
     Some(corrected)
 }
 
-impl ChunkedTransport for HttpTransport {
-    fn fetch_range(&self, start: u64, len: u64) -> io::Result<Vec<u8>> {
+impl HttpTransport {
+    /// Bytes `[start, start+len)` of the file: one ranged `GET`. A
+    /// response of any other length is an error.
+    pub fn fetch_range(&self, start: u64, len: u64) -> io::Result<Vec<u8>> {
         // Ensure the probe has run — it may have discovered a
         // wrong-region S3 redirect and corrected `effective_url`.
         // Without this, the very first range request goes to the
         // original (wrong) URL and S3 returns a 301 XML body that
         // confuses the byte-count assertion downstream.
         self.ensure_probed()?;
-        super::ensure_online(self.url.as_str())?;
+        self.transport.ensure_online(self.url.as_str())?;
         // Pick a client off the round-robin pool **per call**, not
         // per transport. A single shared `Client` puts every worker's
         // HTTP completion + TLS decryption on the same internal
@@ -219,8 +230,8 @@ impl ChunkedTransport for HttpTransport {
         // so chunks actually arrive in parallel.
         let end = start + len - 1;
         let target = self.effective_url().clone();
-        let client = super::shared_client_for(target.as_str());
-        let resp = super::apply_read_auth(client.get(target.clone()), Some(&target))
+        let client = self.transport.client_for(target.as_str())?;
+        let resp = self.transport.apply_read_auth(client.get(target.clone()), target.as_str())
             .header(RANGE, format!("bytes={}-{}", start, end))
             .send()
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?
@@ -246,15 +257,19 @@ impl ChunkedTransport for HttpTransport {
 
         Ok(bytes.to_vec())
     }
+}
+
+impl ChunkedTransport for HttpTransport {
+    fn fetch_range(&self, start: u64, len: u64) -> io::Result<Vec<u8>> {
+        HttpTransport::fetch_range(self, start, len)
+    }
 
     fn content_length(&self) -> io::Result<u64> {
-        self.ensure_probed()?;
-        Ok(*self.content_length.get().unwrap())
+        HttpTransport::content_length(self)
     }
 
     fn supports_range(&self) -> bool {
-        let _ = self.ensure_probed();
-        self.supports_range.get().copied().unwrap_or(false)
+        HttpTransport::supports_range(self)
     }
 }
 
@@ -298,7 +313,7 @@ mod tests {
 #[cfg(test)]
 mod retry_classification {
     use super::*;
-    use crate::transport::RetryPolicy;
+    use crate::RetryPolicy;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -349,7 +364,7 @@ mod retry_classification {
     fn a_client_error_is_asked_once() {
         for status in [401, 403, 404] {
             let (url, gets) = scripted_server(vec![status; 4]);
-            let transport = HttpTransport::with_client(Client::new(), url);
+            let transport = HttpTransport::new(&Transport::new(veks_apicore::transport::TransportConfig::default()), url);
             let err = fast_policy().execute(|| transport.fetch_range(0, 4)).unwrap_err();
             assert!(err.to_string().contains(&status.to_string()), "{status}: {err}");
             assert_eq!(gets.load(Ordering::SeqCst), 1, "{status} was retried");
@@ -360,7 +375,7 @@ mod retry_classification {
     fn a_server_error_or_throttle_is_retried_until_it_passes() {
         for status in [503, 429, 408] {
             let (url, gets) = scripted_server(vec![status, status, 206]);
-            let transport = HttpTransport::with_client(Client::new(), url);
+            let transport = HttpTransport::new(&Transport::new(veks_apicore::transport::TransportConfig::default()), url);
             let bytes = fast_policy().execute(|| transport.fetch_range(0, 4)).unwrap();
             assert_eq!(bytes, b"abcd");
             assert_eq!(gets.load(Ordering::SeqCst), 3, "{status}: two failures, then the range");

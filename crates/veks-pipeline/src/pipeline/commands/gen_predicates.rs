@@ -523,7 +523,11 @@ impl GenPredicatesOp {
         if let Err(e) = writer.start_namespace(vectordata::metadata_schema::SCHEMA_NAMESPACE) {
             return error_result(format!("schema namespace: {}", e), start);
         }
-        if let Err(e) = writer.add_record(&schema.to_json_bytes()) {
+        let schema_bytes = match schema.to_json_bytes() {
+            Ok(v) => v,
+            Err(e) => return error_result(e, start),
+        };
+        if let Err(e) = writer.add_record(&schema_bytes) {
             return error_result(format!("schema write: {}", e), start);
         }
         // Embed the survey report used to generate the

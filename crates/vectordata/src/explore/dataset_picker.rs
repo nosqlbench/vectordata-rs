@@ -719,15 +719,13 @@ fn fetch_yaml_text(location: &str) -> Result<String, String> {
     // same as every data read.
     if crate::transport::is_remote_url(location) {
         let location = crate::transport::normalize_remote_url(location);
-        let location = location.as_ref();
-        let client = crate::transport::shared_client_for(location);
-        let parsed = url::Url::parse(location).ok();
-        return crate::transport::apply_read_auth(client.get(location), parsed.as_ref()).send()
-            .map_err(|e| format!("HTTP fetch: {e}"))?
+        return crate::transport::shared()
+            .send(crate::transport::Request::get(location.as_ref()))
+            .map_err(|e| format!("HTTP fetch: {}", e.message))?
             .error_for_status()
-            .map_err(|e| format!("HTTP status: {e}"))?
+            .map_err(|e| format!("HTTP status: {}", e.message))?
             .text()
-            .map_err(|e| format!("HTTP decode: {e}"));
+            .map_err(|e| format!("HTTP decode: {}", e.message));
     }
     let fs_path: &str = if let Some(rest) = location.strip_prefix("file://") {
         // file:///abs → /abs; file://host/abs → /abs.
@@ -1105,9 +1103,9 @@ fn walk_sidecars(
                 // The chunk store's sidecar, in either of its formats,
                 // read by the store's own reader. The chunk size is the
                 // store's fixed one; the size is the cache file's.
-                let chunk_size = crate::chunked_http::DEFAULT_CHUNK_SIZE;
+                let chunk_size = veks_transport::DEFAULT_CHUNK_SIZE;
                 std::fs::metadata(&cache_file_path).ok().map(|m| m.len()).and_then(|total_size| {
-                    crate::chunked_http::read_sidecar(&path, total_size).map(|sidecar| FacetCacheView {
+                    veks_transport::read_sidecar(&path, total_size).map(|sidecar| FacetCacheView {
                         chunk_size,
                         total_chunks: sidecar.valid.len() as u32,
                         total_size,
@@ -1707,21 +1705,21 @@ fn spawn_size_probes(
 /// ranged GET of the dim header for bytes-per-record, sized by
 /// veks-io's record math as ping and the cache survey are.
 fn probe_facet(job: &SizeProbeJob) -> (Option<u64>, Option<u64>) {
-    use crate::transport::ChunkedTransport;
     let normalized = crate::transport::normalize_remote_url(&job.url);
     let Some(parsed) = url::Url::parse(normalized.as_ref()).ok() else {
         return (None, None);
     };
-    let transport = crate::transport::HttpTransport::new(parsed);
+    let transport = crate::transport::http(parsed);
     let Ok(total) = transport.content_length() else { return (None, None) };
     let mut bpr = None;
-    if job.uniform && transport.supports_range()
+    if job.uniform
+        && transport.supports_range()
         && let Ok(hdr) = transport.fetch_range(0, 4)
-            && hdr.len() == 4 {
-                if let Some(dim) = veks_io::xvec::record::record_dim(&hdr).filter(|&d| d <= 1_000_000) {
-                    bpr = veks_io::reader::xvec_record_bytes(dim as i32, job.elem).ok().map(|b| b as u64);
-                }
-            }
+        && hdr.len() == 4
+        && let Some(dim) = veks_io::xvec::record::record_dim(&hdr).filter(|&d| d <= 1_000_000)
+    {
+        bpr = veks_io::reader::xvec_record_bytes(dim as i32, job.elem).ok().map(|b| b as u64);
+    }
     ((total > 0).then_some(total), bpr)
 }
 

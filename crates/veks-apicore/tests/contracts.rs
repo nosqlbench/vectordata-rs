@@ -100,6 +100,7 @@ const COLD_MODULES: &[(&str, &str)] = &[
     ("model.rs", "descriptor model, at load"),
     ("overlay.rs", "attribute provenance, at load"),
     ("records.rs", "record facets: a page per record, through dyn containers by design"),
+    ("transport.rs", "a transport's configuration, built once; a request value, built once per request"),
     ("verify.rs", "verification reports"),
     ("view.rs", "dataset views, at open; reads go to the readers they hand out"),
     ("dataset", "descriptor model, at load"),
@@ -205,7 +206,7 @@ fn names(text: &str, word: &str) -> bool {
 }
 
 /// The crates that implement the API.
-const IMPLEMENTATIONS: &[&str] = &["vectordata", "veks-io"];
+const IMPLEMENTATIONS: &[&str] = &["vectordata", "veks-io", "veks-transport"];
 
 /// Public traits of an implementation crate that another crate uses,
 /// and why each is not a contract of the API.

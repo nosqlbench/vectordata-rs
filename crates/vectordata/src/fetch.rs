@@ -62,15 +62,17 @@ pub use meter::{LogMeter, ProgressStep, TextMeter};
 /// this is for the small files a program reads beside them.
 pub fn fetch_text(url: &str) -> std::io::Result<String> {
     crate::transport::ensure_online(url)?;
-    crate::transport::fetch_text(url)
+    crate::transport::shared().fetch_text(url)
 }
 
 /// Keep `local_path` a copy of the small remote file at `url`: fetched
 /// when there is no copy or the server's `Last-Modified` is newer than
 /// it, left alone otherwise. `Ok(true)` when it was fetched. The copy's
 /// mtime is the server's `Last-Modified`, so the next call compares
-/// like with like. Same auth and client as [`fetch_text`].
+/// like with like. Same auth and client as [`fetch_text`]: the client for
+/// the URL's origin, so a self-signed origin trusted in `settings.yaml`
+/// (`trust_self_signed`) is reachable here too.
 pub fn fetch_if_modified(url: &str, local_path: &std::path::Path) -> std::io::Result<bool> {
     crate::transport::ensure_online(url)?;
-    crate::transport::fetch_if_modified(url, local_path)
+    crate::transport::shared().fetch_if_modified(url, local_path)
 }

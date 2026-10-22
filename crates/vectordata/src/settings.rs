@@ -700,14 +700,11 @@ pub fn protect_settings_from(settings: &Path) -> bool {
 /// trust_self_signed:
 ///   - https://127.0.0.1:18443
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TlsTrust {
-    /// PEM files added to the client's trusted roots (verification stays on).
-    pub trusted_ca_certs: Vec<PathBuf>,
-    /// Origins (`scheme://host[:port]`) whose server cert is accepted without
-    /// verification — insecure; empty by default.
-    pub trust_self_signed: Vec<String>,
-}
+///
+/// The value is the transport's ([`veks_apicore::transport::TlsTrust`]):
+/// vectordata reads it from the settings file and hands it to the
+/// transport in its configuration ([`crate::transport::config_from`]).
+pub use veks_apicore::transport::TlsTrust;
 
 /// Read the [`TlsTrust`] policy from the user's `settings.yaml` (empty when the
 /// file is absent or declares neither key).

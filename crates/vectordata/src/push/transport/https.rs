@@ -26,8 +26,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-use reqwest::blocking::RequestBuilder;
-use reqwest::StatusCode;
+use crate::transport::{Request, Response, upload};
 
 use super::{join_rel, PushError, PushTransport, RemoteObject};
 
@@ -83,19 +82,19 @@ impl HttpsTransport {
     /// Resolve an absolute server path (e.g. an upload `Location`) against
     /// the endpoint's origin — `http://host:port` + the absolute path.
     fn origin_join(&self, abs_path: &str) -> Result<String, PushError> {
-        let base = reqwest::Url::parse(&self.base)
+        let base = url::Url::parse(&self.base)
             .map_err(|e| PushError::Other(format!("invalid endpoint URL '{}': {e}", self.base)))?;
         base.join(abs_path)
             .map(|u| u.to_string())
             .map_err(|e| PushError::Other(format!("joining '{abs_path}' onto '{}': {e}", self.base)))
     }
 
-    /// Apply bearer auth if a token is configured.
-    fn auth(&self, rb: RequestBuilder) -> RequestBuilder {
-        match &self.token {
-            Some(t) => rb.bearer_auth(t),
-            None => rb,
-        }
+    /// Send `req` through the shared transport with the push token when
+    /// one is configured, anonymously otherwise — never the read
+    /// credentials. A push is an explicit server command, which offline
+    /// mode does not refuse.
+    fn send(&self, req: Request) -> Result<Response, PushError> {
+        crate::transport::shared().send(req.bearer_or_anonymous(self.token.as_deref()).explicit()).map_err(net)
     }
 
     /// Is this endpoint a `vecd` server? Probed once (anonymously-capable
@@ -105,9 +104,8 @@ impl HttpsTransport {
     fn is_vecd(&self) -> bool {
         *self.vecd.get_or_init(|| {
             let Ok(url) = self.origin_join("/-/whoami") else { return false };
-            let client = crate::transport::shared_client_for(&self.base);
-            match self.auth(client.get(&url)).send() {
-                Ok(resp) if resp.status().is_success() => {
+            match self.send(Request::get(url)) {
+                Ok(resp) if resp.is_success() => {
                     resp.text().map(|b| b.contains("\"endpoint\":\"vecd\"")).unwrap_or(false)
                 }
                 _ => false,
@@ -118,45 +116,30 @@ impl HttpsTransport {
 
 impl PushTransport for HttpsTransport {
     fn head(&self, rel: &str) -> Result<Option<RemoteObject>, PushError> {
-        let client = crate::transport::shared_client_for(&self.base);
-        let resp = self.auth(client.head(self.url(rel))).send().map_err(other)?;
+        let resp = self.send(Request::head(self.url(rel)))?;
         match resp.status() {
-            s if s.is_success() => {
-                let size = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let etag = resp
-                    .headers()
-                    .get(reqwest::header::ETAG)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.trim_matches('"').to_string());
+            _ if resp.is_success() => {
+                let size = resp.content_length().unwrap_or(0);
+                let etag = resp.header("etag").map(|s| s.trim_matches('"').to_string());
                 Ok(Some(RemoteObject { size, etag }))
             }
-            StatusCode::NOT_FOUND => Ok(None),
-            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(rel, s)),
-            s => Err(PushError::Other(format!("HEAD {} -> HTTP {s}", self.url(rel)))),
+            404 => Ok(None),
+            401 | 403 => Err(auth(rel, &resp.status_line())),
+            _ => Err(PushError::Other(format!("HEAD {} -> HTTP {}", self.url(rel), resp.status_line()))),
         }
     }
 
     fn get(&self, rel: &str) -> Result<Option<Vec<u8>>, PushError> {
-        let client = crate::transport::shared_client_for(&self.base);
-        let resp = self.auth(client.get(self.url(rel))).send().map_err(other)?;
+        let resp = self.send(Request::get(self.url(rel)))?;
         match resp.status() {
-            s if s.is_success() => {
+            _ if resp.is_success() => {
                 // Capture the advertised length before consuming the body,
                 // then verify we received all of it. A truncated response
                 // (connection reset mid-body) must error here — silently
                 // returning a short body would let a partial pushlog parse
                 // as a valid shorter log and misclassify provenance.
-                let advertised = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok());
-                let body = resp.bytes().map_err(other)?;
+                let advertised = resp.content_length();
+                let body = resp.bytes().map_err(net)?;
                 if let Some(len) = advertised
                     && body.len() as u64 != len
                 {
@@ -166,11 +149,11 @@ impl PushTransport for HttpsTransport {
                         body.len(),
                     )));
                 }
-                Ok(Some(body.to_vec()))
+                Ok(Some(body))
             }
-            StatusCode::NOT_FOUND => Ok(None),
-            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(rel, s)),
-            s => Err(PushError::Other(format!("GET {} -> HTTP {s}", self.url(rel)))),
+            404 => Ok(None),
+            401 | 403 => Err(auth(rel, &resp.status_line())),
+            _ => Err(PushError::Other(format!("GET {} -> HTTP {}", self.url(rel), resp.status_line()))),
         }
     }
 
@@ -181,33 +164,22 @@ impl PushTransport for HttpsTransport {
         if self.is_vecd() {
             return self.resumable_put_file(rel, src);
         }
-        let file = std::fs::File::open(src).map_err(other)?;
-        let client = crate::transport::shared_client_for(&self.base);
-        let resp = self
-            .auth(client.put(self.url(rel)))
-            .body(reqwest::blocking::Body::from(file))
-            .send()
-            .map_err(other)?;
+        // Opened here first, so a missing source is reported as before.
+        std::fs::File::open(src).map_err(other)?;
+        let resp = self.send(upload::put_file(&self.url(rel), src))?;
         self.check_put(rel, resp)
     }
 
     fn put_bytes(&self, rel: &str, data: &[u8], if_match: Option<&str>) -> Result<(), PushError> {
-        let client = crate::transport::shared_client_for(&self.base);
-        let mut rb = self.auth(client.put(self.url(rel))).body(data.to_vec());
-        match if_match {
-            Some("") => rb = rb.header(reqwest::header::IF_NONE_MATCH, "*"),
-            Some(etag) => rb = rb.header(reqwest::header::IF_MATCH, format!("\"{etag}\"")),
-            None => {}
-        }
-        let resp = rb.send().map_err(other)?;
+        let precondition = upload::Precondition::from_if_match(if_match);
+        let resp = self.send(upload::put_bytes(&self.url(rel), data.to_vec(), &precondition))?;
         self.check_put(rel, resp)
     }
 
     fn preflight(&self) -> Result<(), PushError> {
-        let client = crate::transport::shared_client_for(&self.base);
-        let resp = self.auth(client.head(&self.base)).send().map_err(other)?;
+        let resp = self.send(Request::head(self.base.as_str()))?;
         match resp.status() {
-            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth("", s)),
+            401 | 403 => Err(auth("", &resp.status_line())),
             _ => Ok(()), // 404 at the root is fine — nothing published yet
         }
     }
@@ -220,25 +192,24 @@ impl PushTransport for HttpsTransport {
         // has no such verb (404, or a non-JSON 200): there we fail loudly
         // rather than risk deleting against an endpoint we can't enumerate.
         let url = format!("{}?list", self.url(prefix));
-        let client = crate::transport::shared_client_for(&self.base);
-        let resp = self.auth(client.get(&url)).send().map_err(other)?;
+        let resp = self.send(Request::get(url))?;
         match resp.status() {
-            s if s.is_success() => {
-                let body = resp.bytes().map_err(other)?;
+            _ if resp.is_success() => {
+                let body = resp.bytes().map_err(net)?;
                 parse_list_keys(&body).ok_or_else(unsupported_list)
             }
-            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(prefix, s)),
+            401 | 403 => Err(auth(prefix, &resp.status_line())),
             _ => Err(unsupported_list()),
         }
     }
 
     fn delete(&self, rel: &str) -> Result<(), PushError> {
-        let client = crate::transport::shared_client_for(&self.base);
-        let resp = self.auth(client.delete(self.url(rel))).send().map_err(other)?;
+        let resp = self.send(Request::delete(self.url(rel)))?;
         match resp.status() {
-            s if s.is_success() || s == StatusCode::NOT_FOUND => Ok(()),
-            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(rel, s)),
-            s => Err(PushError::Other(format!("DELETE {} -> HTTP {s}", self.url(rel)))),
+            404 => Ok(()),
+            _ if resp.is_success() => Ok(()),
+            401 | 403 => Err(auth(rel, &resp.status_line())),
+            _ => Err(PushError::Other(format!("DELETE {} -> HTTP {}", self.url(rel), resp.status_line()))),
         }
     }
 
@@ -268,25 +239,18 @@ impl HttpsTransport {
     /// `POST <rel>` with `Upload-Length` → the absolute upload URL parsed
     /// from `Location`.
     fn create_upload(&self, rel: &str, total: u64) -> Result<String, PushError> {
-        let client = crate::transport::shared_client_for(&self.base);
-        let resp = self
-            .auth(client.post(self.url(rel)))
-            .header("Upload-Length", total.to_string())
-            .send()
-            .map_err(other)?;
+        let resp = self.send(upload::create_upload(&self.url(rel), total))?;
         match resp.status() {
-            StatusCode::CREATED | StatusCode::OK => {
+            201 | 200 => {
                 let loc = resp
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
+                    .header("location")
                     .ok_or_else(|| {
                         PushError::Other(format!("creating upload for '{rel}' returned no Location"))
                     })?;
                 self.origin_join(loc)
             }
-            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(rel, s)),
-            s => Err(PushError::Other(format!("POST {} -> HTTP {s}", self.url(rel)))),
+            401 | 403 => Err(auth(rel, &resp.status_line())),
+            _ => Err(PushError::Other(format!("POST {} -> HTTP {}", self.url(rel), resp.status_line()))),
         }
     }
 
@@ -434,48 +398,37 @@ impl HttpsTransport {
     /// complete headers are advisory (the client tracks per-chunk acks
     /// itself), so they are not consumed here.
     fn put_chunk(&self, upload_url: &str, offset: u64, body: Vec<u8>) -> Result<(), PushError> {
-        let client = crate::transport::shared_client_for(&self.base);
-        let resp = self
-            .auth(client.patch(upload_url))
-            .header("Upload-Offset", offset.to_string())
-            .body(body)
-            .send()
-            .map_err(other)?;
+        let resp = self.send(upload::upload_chunk(upload_url, offset, body))?;
         match resp.status() {
-            s if s.is_success() => Ok(()),
-            StatusCode::PRECONDITION_FAILED => Err(PushError::PreconditionFailed),
-            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(upload_url, s)),
-            s => Err(PushError::Other(format!("PATCH {upload_url} @ {offset} -> HTTP {s}"))),
+            _ if resp.is_success() => Ok(()),
+            412 => Err(PushError::PreconditionFailed),
+            401 | 403 => Err(auth(upload_url, &resp.status_line())),
+            _ => Err(PushError::Other(format!("PATCH {upload_url} @ {offset} -> HTTP {}", resp.status_line()))),
         }
     }
 
     /// `DELETE <upload-url>` — abandon an upload (best-effort cleanup).
     fn delete_upload(&self, upload_url: &str) -> Result<(), PushError> {
-        let client = crate::transport::shared_client_for(&self.base);
-        self.auth(client.delete(upload_url)).send().map_err(other)?;
+        self.send(upload::abandon_upload(upload_url))?;
         Ok(())
     }
 }
 
 impl HttpsTransport {
-    fn check_put(&self, rel: &str, resp: reqwest::blocking::Response) -> Result<(), PushError> {
+    fn check_put(&self, rel: &str, resp: Response) -> Result<(), PushError> {
         match resp.status() {
-            s if s.is_success() => Ok(()),
-            StatusCode::PRECONDITION_FAILED => Err(PushError::PreconditionFailed),
-            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(rel, s)),
-            StatusCode::METHOD_NOT_ALLOWED => Err(PushError::Other(format!(
+            _ if resp.is_success() => Ok(()),
+            412 => Err(PushError::PreconditionFailed),
+            401 | 403 => Err(auth(rel, &resp.status_line())),
+            405 => Err(PushError::Other(format!(
                 "{} does not accept object PUT (HTTP 405); not a writable object store?",
                 self.url(rel)
             ))),
             // Quota exceeded — surface vecd's `X-Vecd-Quota` (the limit in
             // bytes) and any hint body instead of a bare "HTTP 507", so the
             // user knows it's a quota wall and what to do about it.
-            StatusCode::INSUFFICIENT_STORAGE => {
-                let quota = resp
-                    .headers()
-                    .get("x-vecd-quota")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
+            507 => {
+                let quota = resp.header("x-vecd-quota").map(str::to_string);
                 let body = resp.text().unwrap_or_default();
                 let hint = body.trim();
                 let limit = match quota {
@@ -491,15 +444,17 @@ impl HttpsTransport {
             // A redirect on a PUT (classically an S3 wrong-region 301/307)
             // can't be followed with a streaming body — surface it clearly
             // instead of as an opaque failure.
-            s if s.is_redirection() => Err(PushError::Other(format!(
-                "PUT {} was redirected (HTTP {s}); point at the correct regional endpoint, \
+            _ if resp.is_redirection() => Err(PushError::Other(format!(
+                "PUT {} was redirected (HTTP {}); point at the correct regional endpoint, \
                  or use an s3:// binding so credentials and region are resolved for you",
-                self.url(rel)
+                self.url(rel),
+                resp.status_line()
             ))),
             // Include the server's explanatory body when present (e.g. vecd's
             // "no active storage backend serves '<ns>/…'") so a 404/400 isn't
             // an opaque status code.
-            s => {
+            _ => {
+                let s = resp.status_line();
                 let body = resp.text().unwrap_or_default();
                 let body = body.trim();
                 if body.is_empty() {
@@ -514,6 +469,11 @@ impl HttpsTransport {
 
 fn other<E: std::fmt::Display>(e: E) -> PushError {
     PushError::Other(e.to_string())
+}
+
+/// A request that got no answer, as the client described it.
+fn net(e: crate::TransportError) -> PushError {
+    PushError::Other(e.message)
 }
 
 /// The fixed chunk plan for an object of `total` bytes: `(offset, len)` pairs
@@ -590,7 +550,7 @@ fn paint_progress(rel: &str, plan: &[(u64, u64)], acked: &[AtomicBool]) {
         .map(|(_, &(o, l))| (o, o + l))
         .collect();
     let done: u64 = ranges.iter().map(|(s, e)| e - s).sum();
-    let pct = if total > 0 { done * 100 / total } else { 100 };
+    let pct = (done * 100).checked_div(total).unwrap_or(100);
     eprint!("\r  {rel}  {}  {pct:>3}%", braille_progress(total, &ranges));
     let _ = std::io::stderr().flush();
 }
@@ -625,7 +585,7 @@ fn parse_list_keys(body: &[u8]) -> Option<Vec<String>> {
     Some(arr.iter().filter_map(|e| e.get("key").and_then(|k| k.as_str()).map(String::from)).collect())
 }
 
-fn auth(rel: &str, status: StatusCode) -> PushError {
+fn auth(rel: &str, status: &str) -> PushError {
     let where_ = if rel.is_empty() { "endpoint".to_string() } else { format!("'{rel}'") };
     PushError::Auth(format!(
         "{where_} rejected (HTTP {status}); authenticate with `vectordata login <endpoint>` \

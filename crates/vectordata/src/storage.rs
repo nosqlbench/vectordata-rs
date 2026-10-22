@@ -25,10 +25,10 @@ use std::sync::{Arc, OnceLock};
 use memmap2::Mmap;
 use url::Url;
 
-use crate::cache::CachedChannel;
+use veks_transport::{ChunkedFile, VerifiedFile};
+
 use crate::cache::layout;
 use crate::merkle::MerkleRef;
-use crate::transport::HttpTransport;
 
 /// Byte-oriented storage over an opaque transport.
 ///
@@ -60,40 +60,26 @@ pub(crate) enum Storage {
         path: std::path::PathBuf,
     },
 
-    /// Remote URL with no published `.mref`. Reads route through a
-    /// [`ChunkStore`] that lazily downloads 8 MiB chunks on demand
-    /// — first read covering an unmapped chunk fetches it, writes
-    /// it into a sparse cache file, and records validity in a
-    /// sidecar bitmap. Calling [`precache`] forces every chunk to
-    /// fill. When all chunks are valid the cache file is mmap-
-    /// promoted so subsequent reads take the zero-copy path.
+    /// Remote URL with no published `.mref`: veks-transport's
+    /// [`ChunkedFile`], which lazily downloads 8 MiB chunks on demand —
+    /// the first read covering a missing chunk fetches it, writes it
+    /// into a sparse cache file, and records it in the `.chunks`
+    /// sidecar. [`precache`](Self::precache) fills every chunk. When
+    /// all chunks are valid the cache file is mapped, so later reads
+    /// take the zero-copy path.
     ///
     /// No merkle verification — server bytes are trusted byte-
     /// for-byte (the intentional difference from
-    /// [`Storage::Cached`], which requires a published `.mref`).
-    Http {
-        /// Chunked lazy-fill backend. Shared across every
-        /// `Storage::Http` instance against the same URL via the
-        /// process-wide registry, so concurrent readers benefit
-        /// from a single bitmap and a single in-flight dedup map.
-        chunks: Arc<crate::chunked_http::ChunkStore>,
-        /// Promoted-mmap view of `chunks.cache_path()`. Set by
-        /// `precache`/`prebuffer_with_progress` once every chunk
-        /// is filled, or at open time when an already-complete
-        /// cache file (with bitmap) is detected.
-        mmap: OnceLock<Mmap>,
-    },
+    /// [`Storage::Cached`], which requires a published `.mref`). One
+    /// instance per URL (the process-wide registry), so concurrent
+    /// readers share one bitmap and one in-flight dedup map.
+    Http(ChunkedFile),
 
-    /// Remote URL with a published `.mref`. Reads route through
-    /// `CachedChannel`, which downloads + merkle-verifies chunks on
-    /// demand and writes them to the local cache directory. When every
-    /// chunk is verified, the storage flips to mmap so subsequent
-    /// reads are zero-copy.
-    Cached {
-        channel: CachedChannel,
-        /// Set exactly once when the cache is fully verified.
-        mmap: OnceLock<Mmap>,
-    },
+    /// Remote URL with a published `.mref`: veks-transport's
+    /// [`VerifiedFile`], which downloads and merkle-verifies chunks on
+    /// demand into the cache file. When every chunk is verified, it is
+    /// mapped, so later reads are zero-copy.
+    Cached(VerifiedFile),
 
     /// A multi-file series presented as one byte space (SH-38).
     ///
@@ -131,7 +117,7 @@ fn local_root(path: &Path, len: u64, progress: &mut dyn FnMut(u64, u64)) -> io::
         return Ok(*root);
     }
     progress(0, len);
-    let tree = crate::merkle::MerkleRef::from_path_with_progress(path, crate::chunked_http::DEFAULT_CHUNK_SIZE, |done| progress(done, len))?;
+    let tree = crate::merkle::MerkleRef::from_path_with_progress(path, veks_transport::DEFAULT_CHUNK_SIZE, |done| progress(done, len))?;
     let root = *tree.root_hash();
     ROOTS.lock().unwrap_or_else(|e| e.into_inner()).push((key, root));
     Ok(root)
@@ -227,6 +213,14 @@ pub(crate) struct LayoutChoice {
     /// that's how a moved catalog is migrated by user-visible
     /// `origin.json` edit instead of an opaque cache surgery.
     pub origin_source: String,
+}
+
+impl LayoutChoice {
+    /// Where the file's cache copy and sidecars live, by the cache
+    /// layout's naming ([`layout::placement`]).
+    pub(crate) fn placement(&self) -> veks_transport::CachePlacement {
+        layout::placement(&self.dataset_dir, &self.file_relpath)
+    }
 }
 
 /// Derive a [`LayoutChoice`] from a URL for URL-only opens (no
@@ -580,8 +574,8 @@ impl Storage {
     /// state, else a chunk-store copy whose bitmap is full. `Ok(None)`
     /// when there is no complete copy, and the caller goes online.
     fn open_url_complete(url: &Url, layout: &LayoutChoice) -> io::Result<Option<Self>> {
-        let cache_path = layout.dataset_dir.join(&layout.file_relpath);
-        if !cache_path.is_file() {
+        let placement = layout.placement();
+        if !placement.data.is_file() {
             return Ok(None);
         }
         layout::verify_or_record_origin(&layout.dataset_dir, &layout.origin_source)
@@ -589,37 +583,11 @@ impl Storage {
         // Offline, a partial copy opens too and serves what it holds;
         // a read of a missing chunk then says offline mode is on.
         let allow_partial = crate::settings::offline();
-        let client = crate::transport::shared_client_for(url.as_str());
-        if let Some(channel) = CachedChannel::open_complete(
-            Arc::new(HttpTransport::with_client(client, url.clone())),
-            &layout.dataset_dir,
-            &layout.file_relpath,
-            allow_partial,
-        ) {
-            let channel = channel.with_source_url(url.as_str());
-            let mmap = OnceLock::new();
-            if channel.is_complete()
-                && let Ok(file) = std::fs::File::open(channel.cache_path())
-                && let Ok(m) = unsafe { Mmap::map(&file) }
-            {
-                let _ = mmap.set(m);
-            }
-            return Ok(Some(Storage::Cached { channel, mmap }));
+        if let Some(file) = VerifiedFile::open_complete(crate::transport::http(url.clone()), &placement, allow_partial) {
+            return Ok(Some(Storage::Cached(file)));
         }
-        if let Some(total_size) = crate::chunked_http::complete_size_on_disk(&cache_path, allow_partial) {
-            let chunks = Arc::new(crate::chunked_http::ChunkStore::open(
-                HttpTransport::new(url.clone()),
-                total_size,
-                cache_path,
-            )?);
-            let mmap = OnceLock::new();
-            if chunks.is_complete()
-                && let Ok(file) = std::fs::File::open(chunks.cache_path())
-                && let Ok(m) = unsafe { Mmap::map(&file) }
-            {
-                let _ = mmap.set(m);
-            }
-            return Ok(Some(Storage::Http { chunks, mmap }));
+        if let Some(file) = ChunkedFile::open_complete(crate::transport::http(url.clone()), &placement, allow_partial)? {
+            return Ok(Some(Storage::Http(file)));
         }
         Ok(None)
     }
@@ -648,28 +616,26 @@ impl Storage {
                 }
                 Ok(outcome)
             }
-            Storage::Cached { channel, .. } => {
-                let Some(url) = channel.source_url().map(str::to_string) else {
+            Storage::Cached(file) => {
+                let Some(url) = file.channel().source_url().map(str::to_string) else {
                     return Ok(Revalidation::Current);
                 };
                 let mref_url = format!("{url}.mref");
-                let client = crate::transport::shared_client_for(&url);
-                let parsed = Url::parse(&mref_url).ok();
-                let resp = match crate::transport::apply_read_auth(client.get(&mref_url), parsed.as_ref()).send() {
+                let resp = match crate::transport::shared().send(crate::transport::Request::get(mref_url.as_str())) {
                     Ok(r) => r,
-                    Err(e) if e.is_connect() || e.is_timeout() => return Ok(Revalidation::Unreachable),
+                    Err(e) if e.is_unreachable() => return Ok(Revalidation::Unreachable),
                     Err(e) => return Err(io::Error::other(format!("revalidate {url}: {e}"))),
                 };
-                if !resp.status().is_success() {
+                if !resp.is_success() {
                     return Err(io::Error::other(format!(
                         "revalidate {url}: the server no longer publishes its .mref ({})",
-                        resp.status()
+                        resp.status_line()
                     )));
                 }
                 let bytes = resp.bytes().map_err(|e| io::Error::other(format!("revalidate {url}: {e}")))?;
                 let upstream = MerkleRef::from_bytes(&bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("mref parse: {e}")))?;
-                if upstream.root_hash() != channel.reference().root_hash() {
+                if upstream.root_hash() != file.channel().reference().root_hash() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -681,18 +647,17 @@ impl Storage {
                 }
                 Ok(Revalidation::Current)
             }
-            Storage::Http { chunks, .. } => {
-                use crate::transport::ChunkedTransport;
-                let transport = HttpTransport::new(chunks.url().clone());
+            Storage::Http(file) => {
+                let transport = crate::transport::http(file.url().clone());
                 match transport.content_length() {
-                    Ok(len) if len == chunks.total_size() => Ok(Revalidation::Current),
+                    Ok(len) if len == file.total_size() => Ok(Revalidation::Current),
                     Ok(len) => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
                             "cache for {} is stale: the remote file is {len} bytes, the cached copy \
                              {}. Remove its dataset with `vectordata cache prune` and fetch again.",
-                            chunks.url(),
-                            chunks.total_size()
+                            file.url(),
+                            file.total_size()
                         ),
                     )),
                     Err(_) => Ok(Revalidation::Unreachable),
@@ -705,89 +670,27 @@ impl Storage {
     /// published `.mref`. Crate-internal; callers go through
     /// `open_url_uncached` so the fallback path runs uniformly.
     pub(crate) fn open_url_cached(url: Url, layout: &LayoutChoice) -> io::Result<Self> {
-        crate::transport::ensure_online(url.as_str())?;
-        let client = crate::transport::shared_client_for(url.as_str());
-        let mref_url_str = format!("{}.mref", url.as_str());
-        let mref_url = Url::parse(&mref_url_str).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid mref URL: {e}"),
-            )
-        })?;
-        // Same read-side auth as every data fetch — without it, a
-        // token-protected server 401s the `.mref` probe and every
-        // open silently falls back to the unverified chunked-HTTP
-        // path even though a merkle reference is published.
-        let resp = crate::transport::apply_read_auth(client.get(mref_url.clone()), Some(&mref_url))
-            .send()
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::ConnectionRefused, format!("mref fetch: {e}"))
-            })?
-            .error_for_status()
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::NotFound, format!("no .mref for {url}: {e}"))
-            })?;
-        let mref_bytes = resp
-            .bytes()
-            .map_err(|e| io::Error::other(format!("mref read: {e}")))?;
-        let reference = MerkleRef::from_bytes(&mref_bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("mref parse: {e}")))?;
-
+        let reference = veks_transport::fetch_reference(crate::transport::shared(), &url)?;
         layout::verify_or_record_origin(&layout.dataset_dir, &layout.origin_source)
             .map_err(io::Error::from)?;
-        let url_for_revalidation = url.clone();
-        let transport = HttpTransport::with_client(client, url);
-        let channel = CachedChannel::open(
-            Arc::new(transport),
-            reference,
-            &layout.dataset_dir,
-            &layout.file_relpath,
-        )?
-        .with_source_url(url_for_revalidation.as_str());
-
-        let mmap = OnceLock::new();
-        if channel.is_complete()
-            && let Ok(file) = std::fs::File::open(channel.cache_path())
-            && let Ok(m) = unsafe { Mmap::map(&file) }
-        {
-            let _ = mmap.set(m);
-        }
-
-        Ok(Storage::Cached { channel, mmap })
+        Ok(Storage::Cached(VerifiedFile::open(crate::transport::http(url), reference, &layout.placement())?))
     }
 
     /// Open a remote URL via direct HTTP RANGE. Crate-internal; the
     /// fallback path of `open_url_uncached` (used when no `.mref` is
-    /// published). Per-read fetches go over HTTP until the caller
-    /// runs [`precache`], which downloads the whole file into
-    /// `<dataset_dir>/<file_relpath>` (per the natural layout) and
-    /// promotes to mmap.
+    /// published). Per-read fetches fill chunks of the cache copy at
+    /// `<dataset_dir>/<file_relpath>` (per the natural layout) until
+    /// the caller runs [`precache`](Self::precache), which fills the
+    /// rest and maps the file.
     ///
-    /// At open time, if the cache file already exists with the
-    /// expected size (from a prior precache), this constructor
-    /// mmap-promotes immediately so the new `Storage::Http` starts
-    /// in the zero-copy state.
+    /// At open time, if the cache copy is already complete (from a
+    /// prior precache), the new `Storage::Http` starts mapped.
     pub(crate) fn open_url_http(url: Url, layout: &LayoutChoice) -> io::Result<Self> {
         layout::verify_or_record_origin(&layout.dataset_dir, &layout.origin_source)
             .map_err(io::Error::from)?;
-        let cache_path = layout.dataset_dir.join(&layout.file_relpath);
-
-        let transport = HttpTransport::new(url);
-        let total_size = ChunkedTransportExt::content_length_for(&transport)?;
-
-        let chunks = Arc::new(crate::chunked_http::ChunkStore::open(
-            transport, total_size, cache_path,
-        )?);
-
-        let mmap = OnceLock::new();
-        if chunks.is_complete()
-            && let Ok(file) = std::fs::File::open(chunks.cache_path())
-            && let Ok(m) = unsafe { Mmap::map(&file) }
-        {
-            let _ = mmap.set(m);
-        }
-
-        Ok(Storage::Http { chunks, mmap })
+        let transport = crate::transport::http(url);
+        let total_size = transport.content_length()?;
+        Ok(Storage::Http(ChunkedFile::open(transport, total_size, &layout.placement())?))
     }
 
     /// Read `len` bytes at `offset`. Always succeeds for an in-bounds
@@ -809,63 +712,8 @@ impl Storage {
                 }
                 Ok(m[offset as usize..end as usize].to_vec())
             }
-            Storage::Http { chunks, mmap } => {
-                // Mmap fast path — promoted at open time if a
-                // prior precache populated every chunk, or after
-                // the chunked reader fills the last chunk below.
-                try_promote_http(chunks, mmap);
-                if let Some(m) = mmap.get() {
-                    let end = (offset + len) as usize;
-                    if end > m.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            format!(
-                                "read past end of HTTP cache mmap: offset={offset} len={len} size={}",
-                                m.len()
-                            ),
-                        ));
-                    }
-                    return Ok(m[offset as usize..end].to_vec());
-                }
-                // Lazy chunked read — fetches only the chunks
-                // covering the requested range, caches them to
-                // disk. If this read happened to complete the
-                // file, promote to mmap so the next read takes
-                // the zero-copy path.
-                let bytes = chunks.read(offset, len)?;
-                if mmap.get().is_none()
-                    && chunks.is_complete()
-                    && let Ok(file) = std::fs::File::open(chunks.cache_path())
-                    && let Ok(m) = unsafe { Mmap::map(&file) }
-                {
-                    let _ = mmap.set(m);
-                }
-                Ok(bytes)
-            }
-            Storage::Cached { channel, mmap } => {
-                if let Some(m) = mmap.get() {
-                    let end = (offset + len) as usize;
-                    if end > m.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            format!(
-                                "read past end of cache mmap: offset={offset} len={len} size={}",
-                                m.len()
-                            ),
-                        ));
-                    }
-                    return Ok(m[offset as usize..end].to_vec());
-                }
-                let bytes = channel.read(offset, len)?;
-                if mmap.get().is_none()
-                    && channel.is_complete()
-                    && let Ok(file) = std::fs::File::open(channel.cache_path())
-                    && let Ok(m) = unsafe { Mmap::map(&file) }
-                {
-                    let _ = mmap.set(m);
-                }
-                Ok(bytes)
-            }
+            Storage::Http(f) => f.read_bytes(offset, len),
+            Storage::Cached(f) => f.read_bytes(offset, len),
             Storage::Series { parts, starts, total } => {
                 let end = offset.checked_add(len).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "read range overflow")
@@ -915,14 +763,8 @@ impl Storage {
     pub(crate) fn mmap_base(&self) -> Option<*const u8> {
         match self {
             Storage::Mmap { mmap: m, .. } => Some(m.as_ptr()),
-            Storage::Cached { channel, mmap } => {
-                try_promote_cached(channel, mmap);
-                mmap.get().map(|m| m.as_ptr())
-            }
-            Storage::Http { chunks, mmap } => {
-                try_promote_http(chunks, mmap);
-                mmap.get().map(|m| m.as_ptr())
-            }
+            Storage::Cached(f) => f.mmap_base(),
+            Storage::Http(f) => f.mmap_base(),
             // A series has no single mapping, and saying it has one is
             // the mistake that would make a zero-copy read walk off
             // the end of the first shard into unrelated memory.
@@ -941,14 +783,8 @@ impl Storage {
         let (start, end) = (offset as usize, (offset + len) as usize);
         match self {
             Storage::Mmap { mmap: m, .. } => m.get(start..end),
-            Storage::Cached { channel, mmap } => {
-                try_promote_cached(channel, mmap);
-                mmap.get().and_then(|m| m.get(start..end))
-            }
-            Storage::Http { chunks, mmap } => {
-                try_promote_http(chunks, mmap);
-                mmap.get().and_then(|m| m.get(start..end))
-            }
+            Storage::Cached(f) => f.mmap_slice(offset, len),
+            Storage::Http(f) => f.mmap_slice(offset, len),
             // Borrowable only when the range lies inside one shard.
             // A range crossing a seam has no contiguous backing, and
             // the caller falls back to `read_bytes` as it does for any
@@ -969,8 +805,8 @@ impl Storage {
     pub(crate) fn total_size(&self) -> u64 {
         match self {
             Storage::Mmap { mmap: m, .. } => m.len() as u64,
-            Storage::Http { chunks, .. } => chunks.total_size(),
-            Storage::Cached { channel, .. } => channel.content_size(),
+            Storage::Http(f) => f.total_size(),
+            Storage::Cached(f) => f.total_size(),
             Storage::Series { total, .. } => *total,
         }
     }
@@ -987,14 +823,8 @@ impl Storage {
             // half of whose shards are here is not readable.
             Storage::Series { parts, .. } => parts.iter().all(|p| p.is_complete()),
             Storage::Mmap { .. } => true,
-            Storage::Http { chunks, mmap } => {
-                try_promote_http(chunks, mmap);
-                mmap.get().is_some()
-            }
-            Storage::Cached { channel, mmap } => {
-                try_promote_cached(channel, mmap);
-                mmap.get().is_some() || channel.is_complete()
-            }
+            Storage::Http(f) => f.is_complete(),
+            Storage::Cached(f) => f.is_complete(),
         }
     }
 
@@ -1007,10 +837,10 @@ impl Storage {
     pub(crate) fn content_id(&self, progress: &mut dyn FnMut(u64, u64)) -> io::Result<Option<crate::merkle::ContentId>> {
         use crate::merkle::{ContentId, ContentIdKind};
         Ok(match self {
-            Storage::Cached { channel, .. } => {
-                Some(ContentId { root: *channel.reference().root_hash(), kind: ContentIdKind::Published })
+            Storage::Cached(f) => {
+                Some(ContentId { root: *f.channel().reference().root_hash(), kind: ContentIdKind::Published })
             }
-            Storage::Http { chunks, .. } => chunks.content_root(progress)?.map(|root| ContentId { root, kind: ContentIdKind::Recorded }),
+            Storage::Http(f) => f.store().content_root(progress)?.map(|root| ContentId { root, kind: ContentIdKind::Recorded }),
             Storage::Mmap { path, mmap } => Some(ContentId { root: local_root(path, mmap.len() as u64, progress)?, kind: ContentIdKind::Computed }),
             Storage::Series { .. } => None,
         })
@@ -1023,8 +853,8 @@ impl Storage {
     pub(crate) fn known_content_id(&self) -> Option<crate::merkle::ContentId> {
         use crate::merkle::{ContentId, ContentIdKind};
         match self {
-            Storage::Cached { channel, .. } => Some(ContentId { root: *channel.reference().root_hash(), kind: ContentIdKind::Published }),
-            Storage::Http { chunks, .. } => chunks.recorded_root().map(|root| ContentId { root, kind: ContentIdKind::Recorded }),
+            Storage::Cached(f) => Some(ContentId { root: *f.channel().reference().root_hash(), kind: ContentIdKind::Published }),
+            Storage::Http(f) => f.store().recorded_root().map(|root| ContentId { root, kind: ContentIdKind::Recorded }),
             Storage::Mmap { .. } | Storage::Series { .. } => None,
         }
     }
@@ -1034,8 +864,8 @@ impl Storage {
     /// for a local file, which has nothing to check against.
     pub(crate) fn verify_cached(&self, progress: &mut dyn FnMut(u64, u64)) -> io::Result<Option<Vec<u32>>> {
         Ok(match self {
-            Storage::Cached { channel, .. } => Some(channel.verify_cached(progress)?),
-            Storage::Http { chunks, .. } => Some(chunks.verify_recorded(progress)?),
+            Storage::Cached(f) => Some(f.channel().verify_cached(progress)?),
+            Storage::Http(f) => Some(f.store().verify_recorded(progress)?),
             Storage::Mmap { .. } => None,
             Storage::Series { parts, .. } => {
                 let mut bad = Vec::new();
@@ -1056,7 +886,7 @@ impl Storage {
     pub(crate) fn is_remote(&self) -> bool {
         match self {
             Storage::Mmap { .. } => false,
-            Storage::Http { .. } | Storage::Cached { .. } => true,
+            Storage::Http(_) | Storage::Cached(_) => true,
             Storage::Series { parts, .. } => parts.iter().any(|p| p.is_remote()),
         }
     }
@@ -1066,14 +896,8 @@ impl Storage {
         match self {
             Storage::Series { parts, .. } => parts.iter().all(|p| p.is_local()),
             Storage::Mmap { .. } => true,
-            Storage::Cached { channel, mmap } => {
-                try_promote_cached(channel, mmap);
-                mmap.get().is_some()
-            }
-            Storage::Http { chunks, mmap } => {
-                try_promote_http(chunks, mmap);
-                mmap.get().is_some()
-            }
+            Storage::Cached(f) => f.is_local(),
+            Storage::Http(f) => f.is_local(),
         }
     }
 
@@ -1117,7 +941,7 @@ impl Storage {
         mut cb: F,
     ) -> io::Result<()>
     where
-        F: FnMut(&crate::transport::DownloadProgress),
+        F: FnMut(&crate::DownloadProgress),
     {
         self.prebuffer_range_with_progress_dyn(byte_start, byte_end, &mut cb)
     }
@@ -1133,7 +957,7 @@ impl Storage {
         &self,
         byte_start: u64,
         byte_end: u64,
-        cb: &mut dyn FnMut(&crate::transport::DownloadProgress),
+        cb: &mut dyn FnMut(&crate::DownloadProgress),
     ) -> io::Result<()> {
         match self {
             // Each shard buffers the slice of the range that falls in
@@ -1156,15 +980,11 @@ impl Storage {
             // Local mmap is already fully resident — fire one
             // completion event so callers' meters land at 100%.
             Storage::Mmap { mmap: m, .. } => {
-                cb(&crate::transport::DownloadProgress::new(m.len() as u64, 0));
+                cb(&crate::DownloadProgress::new(m.len() as u64, 0));
                 Ok(())
             }
-            Storage::Http { chunks, mmap: _ } => {
-                chunks.prebuffer_range_with_progress(byte_start, byte_end, cb)
-            }
-            Storage::Cached { channel, mmap: _ } => {
-                channel.prebuffer_range_with_progress(byte_start, byte_end, cb)
-            }
+            Storage::Http(f) => f.prebuffer_range_with_progress(byte_start, byte_end, cb),
+            Storage::Cached(f) => f.prebuffer_range_with_progress(byte_start, byte_end, cb),
         }
     }
 
@@ -1176,7 +996,7 @@ impl Storage {
     /// returned.
     pub(crate) fn prebuffer_with_progress<F>(&self, mut cb: F) -> io::Result<()>
     where
-        F: FnMut(&crate::transport::DownloadProgress),
+        F: FnMut(&crate::DownloadProgress),
     {
         self.prebuffer_with_progress_dyn(&mut cb)
     }
@@ -1186,7 +1006,7 @@ impl Storage {
     /// recursive form takes a trait object.
     fn prebuffer_with_progress_dyn(
         &self,
-        cb: &mut dyn FnMut(&crate::transport::DownloadProgress),
+        cb: &mut dyn FnMut(&crate::DownloadProgress),
     ) -> io::Result<()> {
         match self {
             Storage::Series { parts, .. } => {
@@ -1196,50 +1016,8 @@ impl Storage {
                 Ok(())
             }
             Storage::Mmap { .. } => Ok(()),
-            Storage::Http { chunks, mmap } => {
-                if mmap.get().is_some() {
-                    return Ok(());
-                }
-                chunks.prebuffer_with_progress(cb)?;
-                if !chunks.is_complete() {
-                    return Err(io::Error::other(format!(
-                        "HTTP precache did not complete: {}/{} chunks downloaded",
-                        chunks.valid_count(),
-                        chunks.total_chunks(),
-                    )));
-                }
-                if mmap.get().is_none() {
-                    let file = std::fs::File::open(chunks.cache_path())?;
-                    let m = unsafe { Mmap::map(&file) }?;
-                    let _ = mmap.set(m);
-                }
-                Ok(())
-            }
-            Storage::Cached { channel, mmap } => {
-                channel.prebuffer_with_progress(cb)?;
-                // Strict-completion check: precache downloaded every
-                // missing chunk; if any chunk is still unverified
-                // (verification mismatch, race with a concurrent
-                // writer, anything), surface the failure now.
-                if !channel.is_complete() {
-                    let valid = channel.valid_count();
-                    let total = channel.total_chunks();
-                    return Err(io::Error::other(format!(
-                        "precache did not complete: {valid}/{total} chunks verified"
-                    )));
-                }
-                // Promotion is part of the contract: after Ok(())
-                // every read on *this* Storage takes the zero-copy
-                // path. Other Storage instances pointed at the same
-                // cache file pick up the promotion lazily on their
-                // next mmap_slice/mmap_base call.
-                if mmap.get().is_none() {
-                    let file = std::fs::File::open(channel.cache_path())?;
-                    let m = unsafe { Mmap::map(&file) }?;
-                    let _ = mmap.set(m);
-                }
-                Ok(())
-            }
+            Storage::Http(f) => f.prebuffer_with_progress(cb),
+            Storage::Cached(f) => f.prebuffer_with_progress(cb),
         }
     }
 
@@ -1264,19 +1042,13 @@ impl Storage {
     /// Internal helper: borrow the promoted mmap, lazy-promoting
     /// the Cached and Http variants if their underlying file is
     /// ready.
-    fn promoted_mmap(&self) -> Option<&Mmap> {
+    fn promoted_mmap(&self) -> Option<&[u8]> {
         match self {
             // No single mapping to promote; see `mmap_base`.
             Storage::Series { .. } => None,
-            Storage::Mmap { mmap: m, .. } => Some(m),
-            Storage::Cached { channel, mmap } => {
-                try_promote_cached(channel, mmap);
-                mmap.get()
-            }
-            Storage::Http { chunks, mmap } => {
-                try_promote_http(chunks, mmap);
-                mmap.get()
-            }
+            Storage::Mmap { mmap: m, .. } => Some(&m[..]),
+            Storage::Cached(f) => f.mapped(),
+            Storage::Http(f) => f.mapped(),
         }
     }
 
@@ -1370,7 +1142,7 @@ impl Storage {
     #[allow(dead_code)]
     pub(crate) fn cache_path(&self) -> Option<&Path> {
         match self {
-            Storage::Cached { channel, .. } => Some(channel.cache_path()),
+            Storage::Cached(f) => Some(f.channel().cache_path()),
             _ => None,
         }
     }
@@ -1386,10 +1158,8 @@ impl Storage {
     pub(crate) fn local_path(&self) -> Option<std::path::PathBuf> {
         match self {
             Storage::Mmap { path, .. } => Some(path.clone()),
-            Storage::Cached { channel, .. } => Some(channel.cache_path().to_path_buf()),
-            Storage::Http { chunks, .. } if chunks.cache_path().is_file() => {
-                Some(chunks.cache_path().to_path_buf())
-            }
+            Storage::Cached(f) => Some(f.local_path()),
+            Storage::Http(f) => f.local_path(),
             _ => None,
         }
     }
@@ -1413,8 +1183,8 @@ impl Storage {
         let (first, last) =
             chunk_span(byte_start, byte_end, chunk_size, total_chunks, content_size)?;
         let resident_in = |a: u32, b: u32| match self {
-            Storage::Http { chunks, .. } => Some(chunks.valid_count_in_range(a, b)),
-            Storage::Cached { channel, .. } => Some(channel.valid_count_in_range(a, b)),
+            Storage::Http(f) => Some(f.store().valid_count_in_range(a, b)),
+            Storage::Cached(f) => Some(f.channel().valid_count_in_range(a, b)),
             Storage::Mmap { .. } => None,
             // Chunk fill is a property of one transport. A series
             // spans several, each with its own chunk map, so there is
@@ -1442,19 +1212,19 @@ impl Storage {
             Storage::Mmap { .. } => None,
             // See `range_fill`: one chunk map per shard, not per facet.
             Storage::Series { .. } => None,
-            Storage::Http { chunks, .. } => Some((
-                chunks.valid_count(),
-                chunks.total_chunks(),
-                chunks.chunk_size(),
-                chunks.total_size(),
-                chunks.is_complete(),
+            Storage::Http(f) => Some((
+                f.store().valid_count(),
+                f.store().total_chunks(),
+                f.store().chunk_size(),
+                f.store().total_size(),
+                f.store().is_complete(),
             )),
-            Storage::Cached { channel, .. } => Some((
-                channel.valid_count(),
-                channel.total_chunks(),
-                channel.chunk_size(),
-                channel.content_size(),
-                channel.is_complete(),
+            Storage::Cached(f) => Some((
+                f.channel().valid_count(),
+                f.channel().total_chunks(),
+                f.channel().chunk_size(),
+                f.channel().content_size(),
+                f.channel().is_complete(),
             )),
         }
     }
@@ -1472,94 +1242,20 @@ impl std::fmt::Debug for Storage {
                 .debug_struct("Storage::Mmap")
                 .field("size", &m.len())
                 .finish(),
-            Storage::Http { chunks, mmap } => f
+            Storage::Http(file) => f
                 .debug_struct("Storage::Http")
-                .field("size", &chunks.total_size())
-                .field("chunks_valid", &chunks.valid_count())
-                .field("chunks_total", &chunks.total_chunks())
-                .field("promoted", &mmap.get().is_some())
+                .field("size", &file.store().total_size())
+                .field("chunks_valid", &file.store().valid_count())
+                .field("chunks_total", &file.store().total_chunks())
+                .field("promoted", &file.is_mapped())
                 .finish(),
-            Storage::Cached { channel, mmap } => f
+            Storage::Cached(file) => f
                 .debug_struct("Storage::Cached")
-                .field("size", &channel.content_size())
-                .field("complete", &channel.is_complete())
-                .field("promoted", &mmap.get().is_some())
+                .field("size", &file.channel().content_size())
+                .field("complete", &file.channel().is_complete())
+                .field("promoted", &file.is_mapped())
                 .finish(),
         }
-    }
-}
-
-/// Lazy promotion: if the local cache file is fully verified but
-/// this `Storage::Cached`'s `OnceLock<Mmap>` is empty, open + mmap
-/// the cache file now. Idempotent under races: `OnceLock::set`
-/// keeps only one of the concurrent attempts.
-///
-/// Two completeness signals are checked: the in-memory state on the
-/// `CachedChannel` (cheap, an atomic bitmap count), and — only as a
-/// fallback when in-memory says incomplete — the on-disk `.mrkl`
-/// state via [`CachedChannel::completed_by_sibling`]. The latter
-/// handles the case where a *sibling* `Storage` instance has
-/// populated the cache without notifying this channel's in-memory
-/// state. Without this fallback, an early reader opened before
-/// `precache` would never see the promotion triggered by another
-/// instance.
-///
-/// Cheap when already promoted (atomic load on `OnceLock::get`).
-/// Until then each call costs the in-memory count plus one `stat`
-/// of the `.mrkl`; the on-disk bitset is re-read only when that file
-/// changes. This sits under every record read of a partially cached
-/// shard (`mmap_slice` is tried before `read_bytes`), so it must
-/// never load the state file per call: on a 410 GB shard that file
-/// is 32 MB, and doing so held an explorer to about 50 vectors a
-/// second. `cache::tests::reads_on_a_partial_cache_do_not_reload_the_state_file`
-/// guards this.
-fn try_promote_cached(channel: &CachedChannel, mmap: &OnceLock<Mmap>) {
-    if mmap.get().is_some() {
-        return;
-    }
-    if !(channel.is_complete() || channel.completed_by_sibling()) {
-        return;
-    }
-    if let Ok(file) = std::fs::File::open(channel.cache_path())
-        && let Ok(m) = unsafe { Mmap::map(&file) }
-    {
-        let _ = mmap.set(m);
-    }
-}
-
-/// Same as [`try_promote_cached`] but for the merkle-less Http
-/// variant: if the underlying [`ChunkStore`] reports every chunk
-/// is valid, mmap the cache file. Used both at open time and
-/// lazily on the read paths so that an Http storage opened
-/// *before* a `precache` on a sibling instance picks up the
-/// promotion the first time it's read.
-///
-/// Note: we no longer rely on a bare file-size check —
-/// `chunks.is_complete()` consults the persisted chunk bitmap,
-/// which is the only safe signal when partial-fill cache files
-/// may exist on disk (a sparse file with holes still reports
-/// `total_size` from the filesystem).
-fn try_promote_http(chunks: &crate::chunked_http::ChunkStore, mmap: &OnceLock<Mmap>) {
-    if mmap.get().is_some() {
-        return;
-    }
-    if !chunks.is_complete() {
-        return;
-    }
-    if let Ok(file) = std::fs::File::open(chunks.cache_path())
-        && let Ok(m) = unsafe { Mmap::map(&file) }
-    {
-        let _ = mmap.set(m);
-    }
-}
-
-/// Helper to call `ChunkedTransport::content_length` without exposing
-/// the trait through the public surface.
-struct ChunkedTransportExt;
-impl ChunkedTransportExt {
-    fn content_length_for(t: &HttpTransport) -> io::Result<u64> {
-        use crate::transport::ChunkedTransport;
-        t.content_length()
     }
 }
 

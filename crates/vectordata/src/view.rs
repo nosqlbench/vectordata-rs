@@ -1019,7 +1019,7 @@ impl FacetStorage {
     /// in flight.
     pub fn prebuffer_with_progress<F>(&self, mut cb: F) -> std::io::Result<()>
     where
-        F: FnMut(&crate::transport::DownloadProgress),
+        F: FnMut(&crate::DownloadProgress),
     {
         self.prebuffer_parts(&mut |_, p| cb(p))
     }
@@ -1035,7 +1035,7 @@ impl FacetStorage {
     /// one.
     pub(crate) fn prebuffer_parts(
         &self,
-        cb: &mut dyn FnMut(usize, &crate::transport::DownloadProgress),
+        cb: &mut dyn FnMut(usize, &crate::DownloadProgress),
     ) -> std::io::Result<()> {
         let Some(s) = &self.series else {
             return self.storage.prebuffer_with_progress(|p| cb(0, p));
@@ -1081,7 +1081,7 @@ impl FacetStorage {
         mut cb: F,
     ) -> std::io::Result<()>
     where
-        F: FnMut(&crate::transport::DownloadProgress),
+        F: FnMut(&crate::DownloadProgress),
     {
         let Some(s) = &self.series else {
             return self
@@ -1117,7 +1117,7 @@ impl FacetStorage {
         cb: F,
     ) -> std::io::Result<()>
     where
-        F: FnMut(&crate::transport::DownloadProgress),
+        F: FnMut(&crate::DownloadProgress),
     {
         let storage = match &self.series {
             None => self.storage.clone(),

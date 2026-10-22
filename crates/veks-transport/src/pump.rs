@@ -6,8 +6,8 @@
 //! checkpoint tick.
 //!
 //! Both chunk-download paths — the merkle-verified
-//! [`crate::cache::CachedChannel`] and the no-`.mref`
-//! [`crate::chunked_http::ChunkStore`] — drive their fetches through the
+//! [`crate::CachedChannel`] and the no-`.mref`
+//! [`crate::ChunkStore`] — drive their fetches through the
 //! exact same orchestration: reverse the work list into a LIFO
 //! `Mutex<Vec<_>>` queue, spawn `download_concurrency()` workers that
 //! pop-fetch-report, flip an `AtomicBool` on the first failure so no new
@@ -81,7 +81,7 @@ where
             let work = &work;
             let tx = tx.clone();
             scope.spawn(move || loop {
-                let item = match queue.lock().unwrap().pop() {
+                let item = match queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop() {
                     Some(i) => i,
                     None => break,
                 };

@@ -70,8 +70,9 @@ impl VecSink for SlabWriter {
                 .map_err(|e| {
                     format!("Failed to seal content namespace in {}: {e}", self.path.display())
                 })?;
+            let bytes = schema.to_json_bytes().map_err(|e| format!("{}: {e}", self.path.display()))?;
             self.writer
-                .add_record(&schema.to_json_bytes())
+                .add_record(&bytes)
                 .map_err(|e| {
                     format!("Failed to write schema record in {}: {e}", self.path.display())
                 })?;

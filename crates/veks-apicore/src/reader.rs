@@ -57,7 +57,7 @@ pub enum IoError {
     Io(#[from] io::Error),
     /// An error from the transport a remote source fetches through.
     #[error("transport error: {0}")]
-    Transport(Box<dyn std::error::Error + Send + Sync>),
+    Transport(#[from] crate::error::TransportError),
     /// The bytes are not a file of the expected layout.
     #[error("Invalid format: {0}")]
     InvalidFormat(String),

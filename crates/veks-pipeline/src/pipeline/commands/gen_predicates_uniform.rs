@@ -811,8 +811,12 @@ pub(super) fn run(
         Ok(v) => v,
         Err(e) => return error_result(format!("serialise survey report: {e}"), start),
     };
+    let schema_bytes = match schema.to_json_bytes() {
+        Ok(v) => v,
+        Err(e) => return error_result(e, start),
+    };
     let sections: [(&str, Vec<Vec<u8>>); 4] = [
-        (SCHEMA_NAMESPACE, vec![schema.to_json_bytes()]),
+        (SCHEMA_NAMESPACE, vec![schema_bytes]),
         (SURVEY_NAMESPACE, vec![survey_bytes]),
         (FAMILIES_NAMESPACE, families),
         (GENERATION_NAMESPACE, generation),

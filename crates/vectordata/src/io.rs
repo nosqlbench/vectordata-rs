@@ -131,16 +131,7 @@ impl ByteSource for StorageSource {
     /// auth every data fetch carries; `None` offline, for a local file,
     /// and for anything but a success.
     fn fetch_sibling(&self, data_source: &str, name: &str) -> Option<Vec<u8>> {
-        if crate::settings::offline() || !crate::transport::is_remote_url(data_source) {
-            return None;
-        }
-        let url = url::Url::parse(data_source).ok()?.join(name).ok()?;
-        let client = crate::transport::shared_client_for(url.as_str());
-        let resp = crate::transport::apply_read_auth(client.get(url.clone()), Some(&url)).send().ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        resp.bytes().ok().map(|b| b.to_vec())
+        veks_transport::fetch_sibling(crate::transport::shared(), data_source, name)
     }
 
     fn advise_sequential(&self) {

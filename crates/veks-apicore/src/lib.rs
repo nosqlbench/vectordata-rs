@@ -19,7 +19,7 @@
 //!
 //! | Contract | What it is | Implemented by | Consumed by |
 //! |---|---|---|---|
-//! | [`ByteSource`] | where a reader's bytes come from | veks-io (`MappedFile`), vectordata (its storage) | veks-io's readers |
+//! | [`ByteSource`] | where a reader's bytes come from | veks-io (`MappedFile`), veks-transport (remote and cached files), vectordata (its storage) | veks-io's readers |
 //! | [`VectorReader`], [`VvecReader`] | a file's records by ordinal at one element type | veks-io's readers; vectordata's windowed and sharded views | every reader of a dataset |
 //! | [`VecSource`], [`VecSink`], [`VarlenSource`], [`VarlenSink`] | a file read or written front to back | veks-io, per format | veks-core, veks-pipeline, veks |
 //! | [`ProgressSink`], [`DownloadProgress`] | how far long work has got | vectordata's meters, veks' UI, closures | every long phase |
@@ -28,13 +28,17 @@
 //! | [`FetchProgress`](fetch::FetchProgress) | a fetch's events | vectordata's meters, closures | [`TestDataView::fetch`] |
 //! | [`CatalogSource`](catalog::CatalogSource) | a supply of catalog entries | vectordata (located, built) | vectordata's catalog resolution |
 //! | [`RecordContainer`](records::RecordContainer), [`RecordCodec`](records::RecordCodec) | opaque records by ordinal, and their decoding | vectordata (slabs, codecs) | record facet readers |
+//! | [`Credentials`] | read-side bearer tokens by URL | vectordata (its credential store), outside programs | veks-transport |
+//! | [`RequestSigner`] | a request signed just before it is sent | veks-transport (SigV4), outside programs | veks-transport |
+//! | [`TransportConfig`], [`TlsTrust`], [`Request`](transport::Request) | a transport's configuration and the requests it sends, as values | vectordata (from its settings and environment), outside programs | veks-transport |
 //!
 //! The vocabulary those contracts name is here too: the dataset
 //! descriptor model ([`dataset`], [`model`]), locations ([`Location`]),
 //! slab schema sidecars ([`metadata_schema`]), fetch plans and reports
 //! ([`fetch`]), verification reports
-//! ([`verify`]), attribute provenance ([`overlay`]), and the errors
-//! ([`Error`], [`IoError`]). The element model is `veks-datatypes`',
+//! ([`verify`]), attribute provenance ([`overlay`]), the transport's
+//! configuration and requests ([`transport`]), and the errors
+//! ([`Error`], [`IoError`], [`TransportError`]). The element model is `veks-datatypes`',
 //! re-exported here.
 //!
 //! ## Cost
@@ -64,6 +68,7 @@ pub mod reader;
 pub mod records;
 pub mod source;
 pub mod stream;
+pub mod transport;
 pub mod verify;
 pub mod view;
 
@@ -79,6 +84,7 @@ pub use progress::{DownloadProgress, NoProgress, ProgressSink};
 pub use reader::{AnyElement, AnyVectorReader, AnyVvecReader, ConvertingReader, DIM_UNDEFINED, IoError, VectorReader, VvecReader};
 pub use source::{ByteSource, SourcePart};
 pub use stream::{SourceMeta, VarlenRecord, VarlenSink, VarlenSource, VecSink, VecSource};
+pub use transport::{Credentials, NoCredentials, RequestSigner, TlsTrust, TransportConfig};
 pub use view::{
     CacheStats, FacetDescriptor, MappedRange, PrefetchHandle, PrefetchPlan, PrefetchReport, QuantizedBase, RangeFill,
     ShardRange, TestDataView, TestDataViewExt, WholeFacetFallback,

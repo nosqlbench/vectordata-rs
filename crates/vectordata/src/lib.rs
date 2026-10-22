@@ -231,10 +231,10 @@
 // Module docs, each opening with whether the module is library API,
 // CLI support or internal, live in the module files themselves.
 
-/// Internal. Merkle-verified download cache for remote datasets;
-/// reached through readers and [`fetch`], never directly.
+/// Internal. Where the cache's files land and what is under its root;
+/// the cache files themselves are `veks-transport`'s, reached through
+/// readers and [`fetch`], never directly.
 pub(crate) mod cache;
-pub(crate) mod chunked_http;
 /// Internal. Byte-level storage shared by every reader. Users never see
 /// `storage::Storage` — they get reader handles whose transport is
 /// chosen for them.
@@ -263,10 +263,10 @@ pub mod dataset;
 pub mod formats;
 pub mod records;
 pub mod binding;
-pub mod merkle;
-/// Internal. HTTP transport layer, reached only through readers and the
-/// cache.
-pub(crate) mod transport;
+/// Library API. Merkle tree integrity verification for chunked data:
+/// `veks-transport`'s, re-exported at its path here.
+pub use veks_transport::merkle;
+pub mod transport;
 pub use veks_apicore::model;
 pub mod io;
 pub mod access;
@@ -294,9 +294,10 @@ pub mod _agents {}
 /// under the cache root, for the `vectordata cache` and `veks` tooling.
 ///
 /// Exposes a *minimal* surface for tasks that inspect or scrub the
-/// on-disk cache root — the live cache state itself is owned by
-/// internal types (`storage::Storage`, `cache::CachedChannel`)
-/// that are deliberately not reachable from outside this crate. If you
+/// on-disk cache root — the live cache state itself is owned by a
+/// facet's storage (internal) and the cache files under it
+/// (`veks_transport::VerifiedFile`, `veks_transport::ChunkedFile`),
+/// which this crate places by its layout. If you
 /// find yourself reaching for more than this module exposes, the right
 /// move is to add another targeted re-export, not to widen visibility
 /// on the core types.

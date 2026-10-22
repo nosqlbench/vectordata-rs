@@ -221,6 +221,19 @@ pub fn resolve_read_token(url: &Url) -> Option<String> {
     resolve_read_token_with(None, url, &guard)
 }
 
+/// The read credentials the transport asks: [`resolve_read_token`] for
+/// each request's URL — `$VECTORDATA_TOKEN`, else the credential
+/// recorded at `vectordata login` for it (the process's cached store,
+/// refreshed by [`reload_credentials`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StoredCredentials;
+
+impl veks_apicore::transport::Credentials for StoredCredentials {
+    fn read_token(&self, url: &str) -> Option<String> {
+        resolve_read_token(&Url::parse(url).ok()?)
+    }
+}
+
 /// The stored credential governing `url` (longest-prefix match), loaded
 /// fresh from disk — for the explorer's auth indicator and detail. None
 /// means no credential is recorded for that URL.

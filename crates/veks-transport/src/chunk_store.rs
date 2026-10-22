@@ -1,16 +1,16 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Internal. On-demand chunked partial-read for `Storage::Http` — the
-//! `.mref`-less counterpart to [`crate::cache::CachedChannel`].
+//! On-demand chunked partial reads of a remote file with no published
+//! `.mref`: [`ChunkStore`], the counterpart of [`crate::CachedChannel`].
 //!
-//! Why this exists: a remote `Storage::Http` open against a
+//! Why this exists: a remote open of a file with no `.mref` against a
 //! large file used to have only two read modes —
 //! (a) per-call HTTP RANGE on every `read_bytes`, which is fine
 //!     for tiny lookups but pathological for any consumer that
 //!     reads thousands of small records (e.g. the explore TUI
 //!     sampling 50k vectors → 50k round trips → 0 vec/s);
-//! (b) a full [`crate::storage::Storage::precache`] that
+//! (b) a whole-file precache that
 //!     downloads the entire file before any read can proceed —
 //!     prohibitive for multi-GB datasets the caller may only
 //!     want to sample a slice of.
@@ -24,15 +24,14 @@
 //! sidecar bitmap. Subsequent process runs reload the bitmap
 //! and only re-fetch chunks that weren't already filled.
 //!
-//! When every chunk has been filled, the parent `Storage::Http`
+//! When every chunk has been filled, the owning [`crate::ChunkedFile`]
 //! promotes the cache file to mmap, so subsequent reads take
-//! the zero-copy path — same final state as
-//! [`crate::storage::Storage::precache`] without forcing the
-//! whole download up front.
+//! the zero-copy path — same final state as a whole-file
+//! precache without forcing the whole download up front.
 //!
 //! **No published tree to verify against.** The server's bytes are
 //! trusted byte for byte, integrity being the transport's TLS: the
-//! intentional difference from `Storage::Cached`, which needs a
+//! intentional difference from [`crate::VerifiedFile`], which needs a
 //! published `.mref`. What this store does instead is *record* a tree:
 //! each chunk is hashed as it lands, and the `.chunks` sidecar holds
 //! the leaves and the validity bits in the `.mrkl` format. Once every
@@ -52,23 +51,33 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::transport::{ChunkedTransport, DownloadProgress, HttpTransport};
+use std::sync::{MutexGuard, PoisonError};
+
+use veks_apicore::DownloadProgress;
+
+use crate::{CachePlacement, HttpTransport};
+
+/// `m`, locked: a lock a panicking thread held is still the state it
+/// left, which every reader here re-checks.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Default chunk size for partial-read fills. Mirrors the
 /// `MerkleRef` default that `CachedChannel` uses elsewhere so
 /// the two paths produce similar over-the-wire footprints —
 /// 8 MiB is the sweet spot between per-request overhead and
 /// over-fetch amplification on small reads.
-pub(crate) const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
-/// Chunked partial-read store backing [`crate::storage::Storage::Http`].
+/// Chunked partial-read store backing [`crate::ChunkedFile`].
 ///
-/// Concurrency model mirrors [`crate::cache::CachedChannel`]:
+/// Concurrency model mirrors [`crate::CachedChannel`]:
 /// `chunk_state` is the canonical bitmap of valid chunks
 /// (lock-free reads, mutex-guarded writes), `in_flight` is the
 /// per-chunk condvar table that lets concurrent readers wait
 /// on an existing fetch instead of issuing duplicate requests.
-pub(crate) struct ChunkStore {
+pub struct ChunkStore {
     transport: HttpTransport,
     total_size: u64,
     chunk_size: u64,
@@ -78,7 +87,7 @@ pub(crate) struct ChunkStore {
     /// positional (`pread` on Unix) so the hot read path doesn't
     /// re-open the file per call; chunk writes go through the same
     /// handle followed by an explicit `sync_data`.
-    cache_file: crate::cache::CacheFile,
+    cache_file: crate::verified::CacheFile,
     /// Sidecar bitmap path (`<cache_path>.chunks`). Persists
     /// validity across process runs.
     chunks_path: PathBuf,
@@ -99,9 +108,9 @@ pub(crate) struct ChunkStore {
     /// lock so concurrent finishers can't race on the rename.
     in_flight: Arc<Mutex<HashMap<u32, Arc<Condvar>>>>,
     /// Transient-failure retry policy for chunk fetches, matching the
-    /// `.mref` [`crate::cache::CachedChannel`] path. A flaky connection on
+    /// `.mref` [`crate::CachedChannel`] path. A flaky connection on
     /// one chunk of a concurrent prebuffer must not fail the whole download.
-    retry_policy: crate::transport::RetryPolicy,
+    retry_policy: crate::RetryPolicy,
     /// Serializes the whole-file FullTransfer download used when the
     /// server doesn't support byte ranges: the first chunk request
     /// streams the entire body; concurrent requesters block here and
@@ -128,18 +137,18 @@ impl ChunkStore {
     /// with no sidecar is treated as all-missing (its bytes are
     /// an unproven sparse placeholder, not a completed download),
     /// so reads never silently return zeroed regions.
-    pub(crate) fn open(
-        transport: HttpTransport,
-        total_size: u64,
-        cache_path: PathBuf,
-    ) -> io::Result<Self> {
+    ///
+    /// The cache copy is `placement.data` and the chunk map
+    /// `placement.chunk_map`, as the caller placed them.
+    pub fn open(transport: HttpTransport, total_size: u64, placement: &CachePlacement) -> io::Result<Self> {
+        let cache_path = placement.data.clone();
         let chunk_size = DEFAULT_CHUNK_SIZE;
         let total_chunks: u32 = total_size
             .div_ceil(chunk_size)
             .max(1)
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many chunks"))?;
-        let chunks_path = chunks_sidecar_path(&cache_path);
+        let chunks_path = placement.chunk_map.clone();
 
         if let Some(parent) = cache_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -169,7 +178,7 @@ impl ChunkStore {
         if reset_bitmap {
             f.set_len(total_size)?;
         }
-        let cache_file = crate::cache::CacheFile::new(f);
+        let cache_file = crate::verified::CacheFile::new(f);
 
         // Load the bitmap. The `.chunks` sidecar is the *sole*
         // source of truth for which chunks are valid — a data
@@ -224,42 +233,50 @@ impl ChunkStore {
             chunks_path,
             chunk_state: Arc::new(chunk_state),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
-            retry_policy: crate::transport::RetryPolicy::default(),
+            retry_policy: crate::RetryPolicy::default(),
             full_transfer: Mutex::new(()),
             bits,
             leaves: Mutex::new(leaves),
         })
     }
 
-    pub(crate) fn cache_path(&self) -> &Path {
+    /// The cache copy's path.
+    pub fn cache_path(&self) -> &Path {
         &self.cache_path
     }
+
     /// The URL this store fetches from.
-    pub(crate) fn url(&self) -> &url::Url {
+    pub fn url(&self) -> &url::Url {
         self.transport.url()
     }
 
-    pub(crate) fn total_size(&self) -> u64 {
+    /// The file's size in bytes.
+    #[inline]
+    pub fn total_size(&self) -> u64 {
         self.total_size
     }
-    pub(crate) fn total_chunks(&self) -> u32 {
+
+    /// How many chunks the file is fetched in.
+    pub fn total_chunks(&self) -> u32 {
         self.total_chunks
     }
-    pub(crate) fn chunk_size(&self) -> u64 {
+
+    /// Bytes per chunk (the last may be shorter).
+    pub fn chunk_size(&self) -> u64 {
         self.chunk_size
     }
 
     /// Whether every chunk has been downloaded. Lock-free —
     /// `Acquire` ordering ensures we observe the data-file
     /// writes that preceded any "valid" store.
-    pub(crate) fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) -> bool {
         self.chunk_state
             .iter()
             .all(|b| b.load(Ordering::Acquire) != 0)
     }
 
     /// Number of chunks currently marked valid.
-    pub(crate) fn valid_count(&self) -> u32 {
+    pub fn valid_count(&self) -> u32 {
         self.chunk_state
             .iter()
             .filter(|b| b.load(Ordering::Acquire) != 0)
@@ -271,7 +288,7 @@ impl ChunkStore {
     /// The range form is what a prefetch plan needs: whole-file fill
     /// says nothing about whether the particular window about to be
     /// read is the resident part or the missing one.
-    pub(crate) fn valid_count_in_range(&self, first: u32, last: u32) -> u32 {
+    pub fn valid_count_in_range(&self, first: u32, last: u32) -> u32 {
         if first > last || first as usize >= self.chunk_state.len() {
             return 0;
         }
@@ -288,9 +305,9 @@ impl ChunkStore {
     /// recorded. The state may race with concurrent fetch completions;
     /// whichever snapshot lands is a valid prefix of the eventual
     /// state, and the next finish overwrites it with a fresher one.
-    fn snapshot_sidecar(&self) -> Vec<u8> {
+    fn snapshot_sidecar(&self) -> io::Result<Vec<u8>> {
         let shape = crate::merkle::MerkleShape::for_content(self.chunk_size, self.total_size);
-        let leaves = self.leaves.lock().unwrap().clone();
+        let leaves = lock(&self.leaves).clone();
         let valid: Vec<bool> = self.chunk_state.iter().map(|b| b.load(Ordering::Acquire) != 0).collect();
         let complete = valid.iter().all(|&v| v) && leaves.iter().all(|l| *l != UNRECORDED);
         let tree = if complete && leaves.len() == shape.total_chunks as usize {
@@ -311,15 +328,15 @@ impl ChunkStore {
             }
         }
         let mut out = Vec::new();
-        state.write(&mut out).expect("write to a Vec cannot fail");
-        out
+        state.write(&mut out)?;
+        Ok(out)
     }
 
     /// Hash chunk `i` from the cache file and record it.
     fn record_from_cache(&self, i: u32) -> io::Result<()> {
         let mut buf = vec![0u8; self.chunk_len(i) as usize];
         self.cache_file.read_exact_at(&mut buf, self.chunk_start(i))?;
-        self.leaves.lock().unwrap()[i as usize] = crate::merkle::sha256(&buf);
+        lock(&self.leaves)[i as usize] = crate::merkle::sha256(&buf);
         Ok(())
     }
 
@@ -330,12 +347,12 @@ impl ChunkStore {
     /// one — are hashed from the cache file first, reporting `(done,
     /// total)` bytes to `progress`, and the sidecar is rewritten so
     /// this is paid once. `None` while any chunk is missing.
-    pub(crate) fn content_root(&self, progress: &mut dyn FnMut(u64, u64)) -> io::Result<Option<[u8; 32]>> {
+    pub fn content_root(&self, progress: &mut dyn FnMut(u64, u64)) -> io::Result<Option<[u8; 32]>> {
         if !self.is_complete() {
             return Ok(None);
         }
         let missing: Vec<u32> = {
-            let leaves = self.leaves.lock().unwrap();
+            let leaves = lock(&self.leaves);
             (0..self.total_chunks).filter(|&i| leaves[i as usize] == UNRECORDED).collect()
         };
         if !missing.is_empty() {
@@ -347,23 +364,23 @@ impl ChunkStore {
                 done += self.chunk_len(i);
                 progress(done, total);
             }
-            let snapshot = self.snapshot_sidecar();
-            let _guard = self.in_flight.lock().unwrap();
+            let snapshot = self.snapshot_sidecar()?;
+            let _guard = lock(&self.in_flight);
             save_sidecar(&self.chunks_path, &snapshot)?;
         }
         let shape = crate::merkle::MerkleShape::for_content(self.chunk_size, self.total_size);
-        let leaves = self.leaves.lock().unwrap().clone();
+        let leaves = lock(&self.leaves).clone();
         Ok(Some(*crate::merkle::MerkleRef::from_leaves(shape, &leaves).root_hash()))
     }
 
     /// The recorded root, when every chunk is here and recorded: what
     /// [`content_root`](Self::content_root) answers without reading
     /// the file. `None` otherwise.
-    pub(crate) fn recorded_root(&self) -> Option<[u8; 32]> {
+    pub fn recorded_root(&self) -> Option<[u8; 32]> {
         if !self.is_complete() {
             return None;
         }
-        let leaves = self.leaves.lock().unwrap().clone();
+        let leaves = lock(&self.leaves).clone();
         if leaves.contains(&UNRECORDED) {
             return None;
         }
@@ -375,8 +392,8 @@ impl ChunkStore {
     /// return the chunks whose bytes no longer hash to what was
     /// recorded when they landed: local corruption of the cache file.
     /// Reports `(done, total)` bytes to `progress`.
-    pub(crate) fn verify_recorded(&self, progress: &mut dyn FnMut(u64, u64)) -> io::Result<Vec<u32>> {
-        let leaves = self.leaves.lock().unwrap().clone();
+    pub fn verify_recorded(&self, progress: &mut dyn FnMut(u64, u64)) -> io::Result<Vec<u32>> {
+        let leaves = lock(&self.leaves).clone();
         let check: Vec<u32> = (0..self.total_chunks)
             .filter(|&i| self.chunk_state[i as usize].load(Ordering::Acquire) != 0 && leaves[i as usize] != UNRECORDED)
             .collect();
@@ -399,7 +416,7 @@ impl ChunkStore {
     /// Read bytes from `[offset, offset+len)`, fetching any
     /// chunks needed to satisfy the range. Returns the assembled
     /// bytes from the local cache file.
-    pub(crate) fn read(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    pub fn read(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }
@@ -427,18 +444,18 @@ impl ChunkStore {
     /// each chunk completes so callers can render in-flight
     /// progress. Idempotent — chunks already valid are skipped.
     ///
-    /// Worker pool sized via [`crate::cache::download_concurrency`]
+    /// Worker pool sized by the transport's download concurrency
     /// so both the mref-backed `CachedChannel` and this no-mref
     /// path scale identically under one env knob. Workers pull
     /// chunk indices from a shared `Mutex<Vec<u32>>` queue and
-    /// route each fetch through [`Self::fetch_chunk_with_dedup`],
+    /// route each fetch through a dedup-aware fetch,
     /// so concurrent partial-read traffic against the same store
     /// continues to dedup correctly with the prebuffer loop —
     /// the prebuffer queue only contains chunks currently not
     /// `Acquire`-valid, but if a concurrent partial-read worker
     /// fetches one of those chunks first, the queue's worker
     /// observes it as valid and skips re-fetching.
-    pub(crate) fn prebuffer_with_progress<F>(&self, cb: F) -> io::Result<()>
+    pub fn prebuffer_with_progress<F>(&self, cb: F) -> io::Result<()>
     where
         F: FnMut(&DownloadProgress),
     {
@@ -451,7 +468,7 @@ impl ChunkStore {
     /// large base file only needs the chunks covering its window's
     /// byte range, not the whole file. `byte_end` is clamped to the
     /// total file size; an empty range is a no-op.
-    pub(crate) fn prebuffer_range_with_progress<F>(
+    pub fn prebuffer_range_with_progress<F>(
         &self,
         byte_start: u64,
         byte_end: u64,
@@ -518,9 +535,9 @@ impl ChunkStore {
         // to the sparse cache file, marks the chunk valid, and persists the
         // `.chunks` sidecar itself) plus progress accounting — no merkle
         // verification, by design, since no `.mref` was published.
-        let result = crate::transport::pump::drain_parallel(
+        let result = crate::pump::drain_parallel(
             pending,
-            crate::cache::download_concurrency(),
+            self.transport.transport().download_concurrency(),
             PROGRESS_TICK,
             |&idx: &u32| -> io::Result<()> {
                 let len = self.chunk_len(idx);
@@ -559,7 +576,7 @@ impl ChunkStore {
     /// code suffered is impossible by construction.
     fn ensure_chunks_valid(&self, first: u32, last: u32) -> io::Result<()> {
         let (to_fetch, to_wait): (Vec<u32>, Vec<(u32, Arc<Condvar>)>) = {
-            let mut in_flight = self.in_flight.lock().unwrap();
+            let mut in_flight = lock(&self.in_flight);
             let mut fetch = Vec::new();
             let mut wait = Vec::new();
             for i in first..=last {
@@ -578,7 +595,7 @@ impl ChunkStore {
         };
 
         for (chunk_idx, cv) in &to_wait {
-            let mut in_flight = self.in_flight.lock().unwrap();
+            let mut in_flight = lock(&self.in_flight);
             loop {
                 if self.chunk_state[*chunk_idx as usize].load(Ordering::Acquire) != 0 {
                     break;
@@ -588,7 +605,7 @@ impl ChunkStore {
                 }
                 in_flight = cv
                     .wait_timeout(in_flight, std::time::Duration::from_millis(50))
-                    .unwrap()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .0;
             }
         }
@@ -598,7 +615,7 @@ impl ChunkStore {
             // Always remove the in_flight entry and notify
             // waiters, even on error — otherwise stuck waiters
             // would block forever on a chunk we abandoned.
-            let cv = self.in_flight.lock().unwrap().remove(&i);
+            let cv = lock(&self.in_flight).remove(&i);
             if let Some(cv) = cv {
                 cv.notify_all();
             }
@@ -618,7 +635,7 @@ impl ChunkStore {
             return Ok(());
         }
         let waiter = {
-            let mut in_flight = self.in_flight.lock().unwrap();
+            let mut in_flight = lock(&self.in_flight);
             if let Some(cv) = in_flight.get(&i) {
                 Some(cv.clone())
             } else {
@@ -630,7 +647,7 @@ impl ChunkStore {
         match waiter {
             // Another thread is fetching — wait for it.
             Some(cv) => {
-                let mut in_flight = self.in_flight.lock().unwrap();
+                let mut in_flight = lock(&self.in_flight);
                 loop {
                     if self.chunk_state[i as usize].load(Ordering::Acquire) != 0 {
                         break;
@@ -640,7 +657,7 @@ impl ChunkStore {
                     }
                     in_flight = cv
                         .wait_timeout(in_flight, std::time::Duration::from_millis(50))
-                        .unwrap()
+                        .unwrap_or_else(PoisonError::into_inner)
                         .0;
                 }
                 Ok(())
@@ -648,7 +665,7 @@ impl ChunkStore {
             // We own the fetch — do it.
             None => {
                 let r = self.fetch_and_write_chunk(i);
-                let cv = self.in_flight.lock().unwrap().remove(&i);
+                let cv = lock(&self.in_flight).remove(&i);
                 if let Some(cv) = cv {
                     cv.notify_all();
                 }
@@ -665,7 +682,7 @@ impl ChunkStore {
     /// correct bytes, suboptimal transfer; the advertisement is the
     /// only offline-safe signal we have.
     fn fetch_full_transfer(&self) -> io::Result<()> {
-        let _guard = self.full_transfer.lock().unwrap();
+        let _guard = lock(&self.full_transfer);
         if self.is_complete() {
             return Ok(());
         }
@@ -703,9 +720,9 @@ impl ChunkStore {
         for slot in self.chunk_state.iter() {
             slot.store(1, Ordering::Release);
         }
-        let snapshot = self.snapshot_sidecar();
+        let snapshot = self.snapshot_sidecar()?;
         {
-            let _guard = self.in_flight.lock().unwrap();
+            let _guard = lock(&self.in_flight);
             let _ = save_sidecar(&self.chunks_path, &snapshot);
         }
         Ok(())
@@ -726,11 +743,8 @@ impl ChunkStore {
         // Per-chunk callers converge here naturally: the first one
         // streams, the rest block on the full-transfer lock and then
         // find their chunk already valid.
-        {
-            use crate::transport::ChunkedTransport;
-            if !self.transport.supports_range() {
-                return self.fetch_full_transfer();
-            }
+        if !self.transport.supports_range() {
+            return self.fetch_full_transfer();
         }
         let start = self.chunk_start(i);
         let len = self.chunk_len(i);
@@ -769,7 +783,7 @@ impl ChunkStore {
         // leaves are independent, so the order chunks land in does not
         // matter.
         let leaf = crate::merkle::sha256(&bytes);
-        self.leaves.lock().unwrap()[i as usize] = leaf;
+        lock(&self.leaves)[i as usize] = leaf;
         if let Some(slot) = self.chunk_state.get(i as usize) {
             slot.store(1, Ordering::Release);
         }
@@ -780,7 +794,7 @@ impl ChunkStore {
         // because the bit was set above; readers only need
         // memory visibility, not on-disk visibility.
         {
-            let _guard = self.in_flight.lock().unwrap();
+            let _guard = lock(&self.in_flight);
             let _ = self.persist_chunk(i, leaf);
         }
         Ok(())
@@ -798,8 +812,8 @@ impl ChunkStore {
         let shape = self.bits.shape().clone();
         let fresh = || self.snapshot_sidecar();
         persist_leaf(&self.chunks_path, &shape, &self.bits, i, &leaf, fresh)?;
-        if self.is_complete() && self.leaves.lock().unwrap().iter().all(|l| *l != UNRECORDED) {
-            save_sidecar(&self.chunks_path, &self.snapshot_sidecar())?;
+        if self.is_complete() && lock(&self.leaves).iter().all(|l| *l != UNRECORDED) {
+            save_sidecar(&self.chunks_path, &self.snapshot_sidecar()?)?;
         }
         Ok(())
     }
@@ -816,7 +830,7 @@ fn persist_leaf(
     bits: &crate::merkle::MerkleState,
     i: u32,
     leaf: &[u8; 32],
-    whole: impl FnOnce() -> Vec<u8>,
+    whole: impl FnOnce() -> io::Result<Vec<u8>>,
 ) -> io::Result<()> {
     use std::io::{Seek, SeekFrom};
     // The layout by length, as `MerkleState::checkpoint` judges it: a
@@ -824,7 +838,7 @@ fn persist_leaf(
     let hash_bytes = shape.node_count as u64 * crate::merkle::HASH_SIZE as u64;
     let layout = hash_bytes + bits.bitset_byte_size() as u64 + crate::merkle::FOOTER_SIZE_V2 as u64;
     if std::fs::metadata(path).map(|m| m.len()).ok() != Some(layout) {
-        return save_sidecar(path, &whole());
+        return save_sidecar(path, &whole()?);
     }
     let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
     file.seek(SeekFrom::Start(shape.leaf_node_index(i) as u64 * crate::merkle::HASH_SIZE as u64))?;
@@ -833,11 +847,11 @@ fn persist_leaf(
     bits.checkpoint(path)
 }
 
-/// `io::Write` adapter over [`crate::cache::CacheFile`]'s positional
+/// `io::Write` adapter over the cache file's positional
 /// writes, for streaming a sequential body into the sparse cache file
 /// without touching a shared cursor.
 struct PositionalWriter<'a> {
-    file: &'a crate::cache::CacheFile,
+    file: &'a crate::verified::CacheFile,
     pos: u64,
 }
 
@@ -852,23 +866,25 @@ impl std::io::Write for PositionalWriter<'_> {
     }
 }
 
-/// The size of the file at `cache_path` when its `.chunks` bitmap
+/// The size of the cache copy at `placement` when its chunk map
 /// records every chunk as fetched — a complete download that can be
-/// opened without asking the server for its length. `None` when the
-/// file, its bitmap, or any chunk of it is missing.
-pub(crate) fn complete_size_on_disk(cache_path: &Path, allow_partial: bool) -> Option<u64> {
-    let size = std::fs::metadata(cache_path).ok()?.len();
+/// opened without asking the server for its length (any size, with
+/// `allow_partial`). `None` when the file, its map, or (without
+/// `allow_partial`) any chunk of it is missing.
+pub fn complete_size_on_disk(placement: &CachePlacement, allow_partial: bool) -> Option<u64> {
+    let size = std::fs::metadata(&placement.data).ok()?.len();
     if size == 0 {
         return None;
     }
-    let sidecar = read_sidecar(&chunks_sidecar_path(cache_path), size)?;
+    let sidecar = read_sidecar(&placement.chunk_map, size)?;
     (allow_partial || sidecar.valid.iter().all(|&v| v)).then_some(size)
 }
 
 /// A `.chunks` sidecar as read: which chunks are here, and — in the
 /// current format — the leaf recorded for each (all zeros for one not
 /// recorded).
-pub(crate) struct ChunksSidecar {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunksSidecar {
     /// One flag per chunk.
     pub valid: Vec<bool>,
     /// The recorded leaves; `None` for a sidecar of the earlier,
@@ -881,7 +897,7 @@ pub(crate) struct ChunksSidecar {
 /// its footer's length marker, 45), or the earlier one byte per chunk
 /// (whose bytes are 0 or 1). `None` when it is missing, or does not
 /// describe a file of this size.
-pub(crate) fn read_sidecar(path: &Path, total_size: u64) -> Option<ChunksSidecar> {
+pub fn read_sidecar(path: &Path, total_size: u64) -> Option<ChunksSidecar> {
     let bytes = std::fs::read(path).ok()?;
     let chunks = total_size.div_ceil(DEFAULT_CHUNK_SIZE).max(1) as usize;
     if bytes.len() >= crate::merkle::FOOTER_SIZE_V2 && bytes.last() == Some(&(crate::merkle::FOOTER_SIZE_V2 as u8)) {
@@ -899,12 +915,6 @@ pub(crate) fn read_sidecar(path: &Path, total_size: u64) -> Option<ChunksSidecar
     }
     let bitmap = load_bitmap(path, chunks).ok()?;
     Some(ChunksSidecar { valid: bitmap.iter().map(|&b| b != 0).collect(), leaves: None })
-}
-
-fn chunks_sidecar_path(cache_path: &Path) -> PathBuf {
-    let mut p = cache_path.as_os_str().to_owned();
-    p.push(".chunks");
-    PathBuf::from(p)
 }
 
 fn load_bitmap(path: &Path, expected_chunks: usize) -> io::Result<Vec<u8>> {
@@ -946,7 +956,33 @@ fn save_sidecar(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunked::ChunkedTransport;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// The chunk map's path for a cache copy at `data`, as the layout
+    /// names it.
+    fn chunks_sidecar_path(data: &Path) -> PathBuf {
+        let mut p = data.as_os_str().to_owned();
+        p.push(".chunks");
+        PathBuf::from(p)
+    }
+
+    /// The placement of a cache copy at `data`.
+    fn placed(data: &Path) -> CachePlacement {
+        let mut mrkl = data.as_os_str().to_owned();
+        mrkl.push(".mrkl");
+        CachePlacement {
+            root: data.parent().unwrap().to_path_buf(),
+            data: data.to_path_buf(),
+            merkle_state: PathBuf::from(mrkl),
+            chunk_map: chunks_sidecar_path(data),
+        }
+    }
+
+    /// A transport with the default configuration.
+    fn http(url: &str) -> HttpTransport {
+        HttpTransport::new(&crate::Transport::new(Default::default()), url::Url::parse(url).unwrap())
+    }
 
     /// In-memory transport that counts fetch_range calls so the
     /// dedup-and-cache behaviour can be observed. Uses the
@@ -986,8 +1022,8 @@ mod tests {
         // 8 MiB, 4 MiB.
         let total: u64 = 20 * 1024 * 1024;
         std::fs::write(&path, vec![0u8; total as usize]).unwrap();
-        let transport = HttpTransport::new(url::Url::parse("http://example.com/x").unwrap());
-        let store = ChunkStore::open(transport, total, path).unwrap();
+        let transport = http("http://example.com/x");
+        let store = ChunkStore::open(transport, total, &placed(&path)).unwrap();
         assert_eq!(store.total_chunks(), 3);
         assert_eq!(store.chunk_len(0), 8 * 1024 * 1024);
         assert_eq!(store.chunk_len(1), 8 * 1024 * 1024);
@@ -1013,8 +1049,8 @@ mod tests {
         // allocation) with no sidecar alongside it.
         std::fs::write(&path, vec![0u8; total as usize]).unwrap();
         assert!(!chunks_sidecar_path(&path).exists());
-        let transport = HttpTransport::new(url::Url::parse("http://example.com/x").unwrap());
-        let store = ChunkStore::open(transport, total, path).unwrap();
+        let transport = http("http://example.com/x");
+        let store = ChunkStore::open(transport, total, &placed(&path)).unwrap();
         assert!(
             !store.is_complete(),
             "full-size file without a sidecar must not be trusted as complete"
@@ -1039,10 +1075,10 @@ mod tests {
         std::fs::write(&path, vec![0u8; total as usize]).unwrap();
         let chunks_path = chunks_sidecar_path(&path);
         save_sidecar(&chunks_path, &[1u8, 0, 1]).unwrap();
-        let transport = HttpTransport::new(url::Url::parse("http://example.com/x").unwrap());
-        let store = ChunkStore::open(transport, total, path.clone()).unwrap();
+        let transport = http("http://example.com/x");
+        let store = ChunkStore::open(transport, total, &placed(&path)).unwrap();
         assert_eq!(store.valid_count(), 2);
-        save_sidecar(&chunks_path, &store.snapshot_sidecar()).unwrap();
+        save_sidecar(&chunks_path, &store.snapshot_sidecar().unwrap()).unwrap();
         let reread = read_sidecar(&chunks_path, total).unwrap();
         assert_eq!(reread.valid, [true, false, true]);
         assert_eq!(reread.leaves, Some(vec![UNRECORDED; 3]), "no chunk was hashed by reading it");
@@ -1061,8 +1097,8 @@ mod tests {
         let content: Vec<u8> = (0..(DEFAULT_CHUNK_SIZE as usize + 4096)).map(|i| (i % 251) as u8).collect();
         std::fs::write(&path, &content).unwrap();
         save_sidecar(&chunks_sidecar_path(&path), &[1u8, 1]).unwrap();
-        let transport = HttpTransport::new(url::Url::parse("http://127.0.0.1:9/never-asked").unwrap());
-        let store = ChunkStore::open(transport, content.len() as u64, path.clone()).unwrap();
+        let transport = http("http://127.0.0.1:9/never-asked");
+        let store = ChunkStore::open(transport, content.len() as u64, &placed(&path)).unwrap();
         let mut heard = Vec::new();
         let root = store.content_root(&mut |d, t| heard.push((d, t))).unwrap().unwrap();
         assert_eq!(root, *crate::merkle::MerkleRef::from_content(&content, DEFAULT_CHUNK_SIZE).root_hash());
@@ -1076,8 +1112,8 @@ mod tests {
         assert_eq!(again, 0);
         // A partial file has none.
         save_sidecar(&chunks_sidecar_path(&path), &[1u8, 0]).unwrap();
-        let transport = HttpTransport::new(url::Url::parse("http://127.0.0.1:9/never-asked").unwrap());
-        let partial = ChunkStore::open(transport, content.len() as u64, path).unwrap();
+        let transport = http("http://127.0.0.1:9/never-asked");
+        let partial = ChunkStore::open(transport, content.len() as u64, &placed(&path)).unwrap();
         assert_eq!(partial.content_root(&mut |_, _| {}).unwrap(), None);
     }
 
@@ -1102,7 +1138,7 @@ mod tests {
         let whole = |bits: &crate::merkle::MerkleState| {
             let mut v = Vec::new();
             bits.write(&mut v).unwrap();
-            v
+            Ok(v)
         };
         bits.mark_valid(0);
         persist_leaf(&path, &shape, &bits, 0, &[7u8; 32], || whole(&bits)).unwrap();

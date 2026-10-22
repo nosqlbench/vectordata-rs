@@ -6406,6 +6406,7 @@ version = "4.0.2"
 dependencies = [
  "anyhow",
  "axum",
+ "axum-server",
  "byteorder",
  "criterion",
  "crossterm",
@@ -6423,6 +6424,7 @@ dependencies = [
  "rand_xoshiro",
  "ratatui",
  "rayon",
+ "rcgen",
  "regex",
  "reqwest 0.13.5",
  "serde",
@@ -6447,6 +6449,7 @@ dependencies = [
  "veks-datatypes",
  "veks-io",
  "veks-simd",
+ "veks-transport",
 ]
 
 [[package]]
@@ -6677,6 +6680,25 @@ version = "4.0.2"
 dependencies = [
  "rand 0.9.5",
  "rand_xoshiro",
+]
+
+[[package]]
+name = "veks-transport"
+version = "4.0.2"
+dependencies = [
+ "byteorder",
+ "filetime",
+ "hex",
+ "httpdate",
+ "libc",
+ "log",
+ "memmap2",
+ "reqwest 0.13.5",
+ "sha2",
+ "tempfile",
+ "url",
+ "veks-apicore",
+ "veks-io",
 ]
 
 [[package]]

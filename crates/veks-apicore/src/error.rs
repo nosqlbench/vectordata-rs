@@ -10,14 +10,31 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-/// Whether retrying a failed request could succeed.
+/// Why a request failed, as far as what a caller does next: retry it,
+/// fall back to a local copy, or give up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportErrorKind {
-    /// It cannot: a 4xx status other than 408, 425 and 429, a malformed URL,
-    /// a refused certificate.
+    /// Retrying cannot succeed: a 4xx status other than 408, 425 and
+    /// 429, a malformed URL, a refused redirect.
     Permanent,
-    /// It might: a timeout, a reset, a 5xx, 408, 425 or 429.
+    /// Retrying might succeed: a reset, a body cut short, a 5xx, 408,
+    /// 425 or 429.
     Transient,
+    /// The server could not be reached at all — the connection was
+    /// refused or timed out, or its certificate was not trusted — so a
+    /// local copy, if there is one, is what there is. Retrying might
+    /// succeed.
+    Unreachable,
+    /// Offline mode is on and the request was not made. Decided
+    /// locally, so retrying cannot change it.
+    Offline,
+}
+
+impl TransportErrorKind {
+    /// Whether no retry of the request can succeed.
+    pub fn is_permanent(self) -> bool {
+        matches!(self, TransportErrorKind::Permanent | TransportErrorKind::Offline)
+    }
 }
 
 /// A request that failed, carrying what a caller decides on: the URL,
@@ -38,6 +55,11 @@ pub struct TransportError {
 
 impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.kind == TransportErrorKind::Offline {
+            // The refusal says what happened and what to do; it was not
+            // an HTTP request.
+            return f.write_str(&self.message);
+        }
         f.write_str("HTTP request failed: ")?;
         if let Some(status) = self.status {
             write!(f, "HTTP {status}: ")?;
@@ -53,6 +75,24 @@ impl std::fmt::Display for TransportError {
 }
 
 impl std::error::Error for TransportError {}
+
+impl TransportError {
+    /// Whether no retry of the request can succeed.
+    pub fn is_permanent(&self) -> bool {
+        self.kind.is_permanent()
+    }
+
+    /// Whether the server could not be reached, so a local copy stands
+    /// in for it.
+    pub fn is_unreachable(&self) -> bool {
+        self.kind == TransportErrorKind::Unreachable
+    }
+
+    /// Whether offline mode refused the request.
+    pub fn is_offline(&self) -> bool {
+        self.kind == TransportErrorKind::Offline
+    }
+}
 
 /// Raised when the configured cache directory cannot hold a planned
 /// download. Carries the three numbers a user needs to act on it.

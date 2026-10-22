@@ -343,8 +343,7 @@ fn the_fetch_surface_is_the_budgeted_one() {
 /// cache file; everything else here is a descriptor, a control-plane
 /// call, or a probe that reads no data.
 const NETWORK_ENTRY_POINTS: &[(&str, &str)] = &[
-    ("transport/mod.rs", "the HTTP client pool and transport layer itself"),
-    ("transport/http.rs", "the HTTP transport the caches fetch through"),
+    ("transport.rs", "the process's transport (veks-transport's client pool) and its range-transport constructor"),
     ("storage.rs", "opening remote storage: the .mref probe and revalidation; bytes land in a cache file"),
     ("io.rs", "the offset-index sidecar, kept beside the cache file once fetched"),
     ("group.rs", "dataset descriptors, kept in the dataset's cache directory and used offline"),
@@ -364,11 +363,20 @@ const NETWORK_ENTRY_POINTS: &[(&str, &str)] = &[
 /// is the moment to route it through storage instead.
 #[test]
 fn remote_bytes_are_read_only_through_the_cache() {
+    // What opens a request through veks-transport — a request built,
+    // an upload primitive, a range transport, a published reference or
+    // sibling, a transport of its own — or a client of its own.
     let patterns = [
-        "shared_client_for(",
-        "shared_client()",
+        "transport::Request::",
+        " Request::",
+        "(Request::",
+        "upload::",
         "HttpTransport::new(",
-        "HttpTransport::with_client(",
+        "transport::http(",
+        "fetch_reference(",
+        "fetch_sibling(",
+        "Transport::new(",
+        "Transport::with_credentials(",
         "reqwest::blocking::Client::builder",
         "reqwest::blocking::get",
     ];

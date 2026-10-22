@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Internal. Retry policy with exponential backoff and jitter.
+//! Retry policy with exponential backoff and jitter.
 
 use std::io;
 use std::thread;
@@ -39,8 +39,7 @@ impl RetryPolicy {
     /// Returns the first successful result, or the last error after all
     /// retries are exhausted. An error no retry can change — an
     /// offline-mode refusal, or an HTTP client error such as 404 or
-    /// 401 ([`is_permanent`](super::is_permanent)) — is returned at
-    /// once.
+    /// 401 — is returned at once.
     pub fn execute<T, F>(&self, mut op: F) -> io::Result<T>
     where
         F: FnMut() -> io::Result<T>,
@@ -50,7 +49,7 @@ impl RetryPolicy {
         for attempt in 0..=self.max_retries {
             match op() {
                 Ok(data) => return Ok(data),
-                Err(e) if super::is_permanent(&e) => return Err(e),
+                Err(e) if crate::client::is_permanent(&e) => return Err(e),
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < self.max_retries {
@@ -146,9 +145,11 @@ mod tests {
     #[test]
     fn an_offline_refusal_is_not_retried() {
         let policy = RetryPolicy { max_retries: 5, base_delay_ms: 1, max_delay_ms: 1, jitter_fraction: 0.0 };
-        let refusal = || {
-            io::Error::new(io::ErrorKind::NotConnected, super::super::OfflineRefusal { url: "https://h/f".into() })
-        };
+        let offline = crate::Transport::new(veks_apicore::transport::TransportConfig {
+            offline: true,
+            ..Default::default()
+        });
+        let refusal = || offline.ensure_online("https://h/f").unwrap_err();
         for wrap in [false, true] {
             let attempts = AtomicU32::new(0);
             let result: io::Result<()> = policy.execute(|| {

@@ -22,6 +22,11 @@ veks-io = { path = "../veks-io", version = "=4.0.2" }
 # The API vectordata implements: the dataset, catalog, reader and source
 # contracts and the descriptor model (srd-crate-boundaries.md §4).
 veks-apicore = { path = "../veks-apicore", version = "=4.0.2" }
+# Remote access and streaming storage: the HTTP client, range reads,
+# uploads, and the merkle-verified and chunked cache files
+# (srd-crate-boundaries.md §6). vectordata decides where each cache
+# file lives; the transport writes what it is told.
+veks-transport = { path = "../veks-transport", version = "=4.0.2" }
 veks-anode = { path = "../veks-anode", version = "=4.0.2" }
 slabtastic = { path = "../slabtastic", version = "=4.0.2" }
 regex = "1"
@@ -100,6 +105,10 @@ path = "src/bin/vectordata.rs"
 
 [dev-dependencies]
 axum = "0.8"
+# A self-signed HTTPS origin for the per-origin trust tests (rcgen makes
+# the certificate, axum-server serves it), matching vecd's TLS stack.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 # The reader bench compares vectordata's readers with veks-io's on the
 # same files (srd-loose-files-overlays-integrity.md, IO-4).
 criterion = { version = "0.5", features = ["html_reports"] }

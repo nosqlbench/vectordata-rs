@@ -96,6 +96,7 @@ members = [
     "crates/veks-io",
     "crates/veks-datatypes",
     "crates/veks-apicore",
+    "crates/veks-transport",
     "crates/tools",
     "crates/veks-studies",
 ]
@@ -132,6 +133,7 @@ default-members = [
     "crates/veks-io",
     "crates/veks-datatypes",
     "crates/veks-apicore",
+    "crates/veks-transport",
     "crates/tools",
 ]
 resolver = "3"

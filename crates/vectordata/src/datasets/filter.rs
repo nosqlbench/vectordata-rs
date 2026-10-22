@@ -505,10 +505,9 @@ fn probe_facet_dim_header(path: &str) -> Option<u32> {
         .filter(|f| f.is_xvec())
         .and_then(veks_io::VecFormat::element_type)?;
     let dim = if crate::transport::is_remote_url(path) {
-        use crate::transport::ChunkedTransport;
         let normalized = crate::transport::normalize_remote_url(path);
         let parsed = url::Url::parse(normalized.as_ref()).ok()?;
-        let transport = crate::transport::HttpTransport::new(parsed);
+        let transport = crate::transport::http(parsed);
         if !transport.supports_range() {
             return None;
         }
@@ -717,10 +716,9 @@ fn vtype_element(vtype: &str) -> Option<crate::typed_access::ElementType> {
 /// the completion warm-up calls this directly for bytes-only facets.
 pub(crate) fn facet_len(path: &str) -> Option<u64> {
     if crate::transport::is_remote_url(path) {
-        use crate::transport::ChunkedTransport;
         let normalized = crate::transport::normalize_remote_url(path);
         let parsed = url::Url::parse(normalized.as_ref()).ok()?;
-        let transport = crate::transport::HttpTransport::new(parsed);
+        let transport = crate::transport::http(parsed);
         let len = transport.content_length().ok()?;
         (len > 0).then_some(len)
     } else {

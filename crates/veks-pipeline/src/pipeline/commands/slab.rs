@@ -2230,7 +2230,7 @@ mod tests {
             42,
             2,
         );
-        w.add_record(&schema.to_json_bytes()).unwrap();
+        w.add_record(&schema.to_json_bytes().unwrap()).unwrap();
         w.finish().unwrap();
 
         // Capture the UI output.

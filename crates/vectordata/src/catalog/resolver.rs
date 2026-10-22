@@ -565,9 +565,9 @@ fn dir_name_of_path(path: &str) -> String {
     }
 }
 
-/// Fetch content from a remote URL using the process-wide shared
-/// `reqwest::blocking::Client` so cert loading and DNS/connection
-/// pool state amortise across every catalog access. Accepts the URL
+/// Fetch content from a remote URL through the process's shared
+/// transport, so cert loading and DNS/connection pool state amortise
+/// across every catalog access. Accepts the URL
 /// forms `is_remote_url` recognises — `http(s)://` pass through, and
 /// `s3://bucket/key` is rewritten via `normalize_remote_url` to the
 /// virtual-hosted HTTPS endpoint before the wire.
@@ -616,31 +616,23 @@ enum Fetch {
 }
 
 fn fetch_http_online(url: &str) -> Result<String, Fetch> {
-    let client = crate::transport::shared_client_for(url);
-    let normalized = crate::transport::normalize_remote_url(url);
-
-    let mut rb = client.get(normalized.as_ref());
-    // Authenticate the catalog fetch with the SAME resolution as data reads
-    // (`apply_read_auth`/`resolve_read_token`): `$VECTORDATA_TOKEN`, else the
-    // login-stored credential keyed by origin. So a catalog and the datasets it
-    // points at authenticate identically — private vecd namespaces are
-    // fetchable, not just public-read ones.
-    if let Ok(parsed) = url::Url::parse(url)
-        && let Some(token) = crate::credentials::resolve_read_token(&parsed) {
-            rb = rb.bearer_auth(token);
-        }
-    let response = rb.send().map_err(|e| {
-        let msg = format!("HTTP request to {url} failed: {e}");
-        if e.is_connect() || e.is_timeout() { Fetch::Unreachable(msg) } else { Fetch::Failed(msg) }
+    // Authenticated with the SAME resolution as data reads — the
+    // transport's read credentials (`$VECTORDATA_TOKEN`, else the
+    // login-stored credential for the URL) — so a catalog and the
+    // datasets it points at authenticate identically: private vecd
+    // namespaces are fetchable, not just public-read ones. An `s3://`
+    // URL is fetched over its HTTPS endpoint.
+    let response = crate::transport::shared().send(crate::transport::Request::get(url)).map_err(|e| {
+        let msg = format!("HTTP request to {url} failed: {}", e.message);
+        if e.is_unreachable() { Fetch::Unreachable(msg) } else { Fetch::Failed(msg) }
     })?;
 
-    let status = response.status();
-    if !status.is_success() {
-        return Err(Fetch::Failed(format!("HTTP {} from {}", status.as_u16(), url)));
+    if !response.is_success() {
+        return Err(Fetch::Failed(format!("HTTP {} from {}", response.status(), url)));
     }
 
     response.text()
-        .map_err(|e| Fetch::Failed(format!("failed to read response from {}: {}", url, e)))
+        .map_err(|e| Fetch::Failed(format!("failed to read response from {}: {}", url, e.message)))
 }
 
 /// Why a source gave no catalog at all, from where it is.

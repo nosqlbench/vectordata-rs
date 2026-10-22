@@ -10,7 +10,26 @@
 use serde::Deserialize;
 
 use crate::credentials::origin_of_str;
-use crate::transport::shared_client_for;
+use crate::transport::{Request, Response};
+
+/// Send a control-plane request through the shared transport. An
+/// explicit server command — offline mode does not refuse it — and
+/// authorised only as the caller says: its own token, or anonymous,
+/// never the read credentials.
+fn send(req: Request, token: Option<&str>) -> Result<Response, crate::TransportError> {
+    crate::transport::shared().send(req.bearer_or_anonymous(token).explicit())
+}
+
+/// `req` with `body` as its JSON body.
+fn with_json(req: Request, body: &serde_json::Value) -> Request {
+    req.header("Content-Type", "application/json").bytes(body.to_string().into_bytes())
+}
+
+/// A response body parsed as JSON.
+fn json<T: serde::de::DeserializeOwned>(resp: Response) -> Result<T, String> {
+    let bytes = resp.bytes().map_err(|e| e.message)?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
 
 /// A minted token as returned by `/auth/token` or `/tokens`.
 #[derive(Debug, Clone, Deserialize)]
@@ -50,11 +69,8 @@ pub fn login_password(
     if let Some(e) = expires {
         body["expires"] = serde_json::json!(e);
     }
-    let resp = shared_client_for(&base)
-        .post(format!("{base}/auth/token"))
-        .json(&body)
-        .send()
-        .map_err(|e| format!("contacting {base}: {e}"))?;
+    let resp = send(with_json(Request::post(format!("{base}/auth/token")), &body), None)
+        .map_err(|e| format!("contacting {base}: {}", e.message))?;
     parse_token(resp, "login")
 }
 
@@ -62,20 +78,15 @@ pub fn login_password(
 /// reflects anonymous (`PUBLIC`) access.
 pub fn whoami(url: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
     let base = api_base(url)?;
-    let rb = shared_client_for(&base).get(format!("{base}/-/whoami"));
-    let rb = match token {
-        Some(t) => rb.bearer_auth(t),
-        None => rb,
-    };
-    let resp = rb.send().map_err(|e| format!("contacting {base}: {e}"))?;
-    let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
+    let resp = send(Request::get(format!("{base}/-/whoami")), token)
+        .map_err(|e| format!("contacting {base}: {}", e.message))?;
+    if resp.status() == 404 {
         return Err("not-a-vecd".to_string());
     }
-    if !status.is_success() {
-        return Err(format!("{base}/-/whoami → HTTP {status}"));
+    if !resp.is_success() {
+        return Err(format!("{base}/-/whoami → HTTP {}", resp.status_line()));
     }
-    resp.json().map_err(|e| format!("parsing whoami response: {e}"))
+    json(resp).map_err(|e| format!("parsing whoami response: {e}"))
 }
 
 /// Namespace paths the caller could push to at `url`, best-effort.
@@ -88,18 +99,12 @@ pub fn whoami(url: &str, token: Option<&str>) -> Result<serde_json::Value, Strin
 pub fn candidate_namespaces(url: &str, token: Option<&str>) -> Vec<String> {
     let Ok(base) = api_base(url) else { return Vec::new() };
     let get = |path: &str| -> Option<serde_json::Value> {
-        let rb = shared_client_for(&base)
-            .get(format!("{base}{path}"))
-            .timeout(std::time::Duration::from_secs(4));
-        let rb = match token {
-            Some(t) => rb.bearer_auth(t),
-            None => rb,
-        };
-        let resp = rb.send().ok()?;
-        if !resp.status().is_success() {
+        let req = Request::get(format!("{base}{path}")).timeout(std::time::Duration::from_secs(4));
+        let resp = send(req, token).ok()?;
+        if !resp.is_success() {
             return None;
         }
-        resp.json().ok()
+        json(resp).ok()
     };
 
     // A privileged caller's `/-/namespaces` is the authoritative, backend-aware
@@ -166,12 +171,8 @@ pub fn issue_token(
     if let Some(e) = expires {
         body["expires"] = serde_json::json!(e);
     }
-    let resp = shared_client_for(&base)
-        .post(format!("{base}/tokens"))
-        .bearer_auth(session_token)
-        .json(&body)
-        .send()
-        .map_err(|e| format!("contacting {base}: {e}"))?;
+    let resp = send(with_json(Request::post(format!("{base}/tokens")), &body), Some(session_token))
+        .map_err(|e| format!("contacting {base}: {}", e.message))?;
     parse_token(resp, "token issue")
 }
 
@@ -179,29 +180,25 @@ pub fn issue_token(
 /// admin, any token).
 pub fn revoke_token(url: &str, session_token: &str, id: i64) -> Result<(), String> {
     let base = api_base(url)?;
-    let resp = shared_client_for(&base)
-        .delete(format!("{base}/tokens/{id}"))
-        .bearer_auth(session_token)
-        .send()
-        .map_err(|e| format!("contacting {base}: {e}"))?;
-    if resp.status().is_success() {
+    let resp = send(Request::delete(format!("{base}/tokens/{id}")), Some(session_token))
+        .map_err(|e| format!("contacting {base}: {}", e.message))?;
+    if resp.is_success() {
         Ok(())
     } else {
-        Err(format!("revoking token {id} → HTTP {}", resp.status()))
+        Err(format!("revoking token {id} → HTTP {}", resp.status_line()))
     }
 }
 
 /// `GET /-/versions/<ns>` — a namespace's version history (JSON).
 pub fn versions(url: &str, ns: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
     let base = api_base(url)?;
-    authed_get(&format!("{base}/-/versions/{ns}"), token)?.json().map_err(|e| format!("parsing versions: {e}"))
+    json(authed_get(&format!("{base}/-/versions/{ns}"), token)?).map_err(|e| format!("parsing versions: {e}"))
 }
 
 /// `GET /<ns>/@<selector>/-/manifest` — a version's manifest (JSON).
 pub fn manifest(url: &str, ns: &str, selector: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
     let base = api_base(url)?;
-    authed_get(&format!("{base}/{ns}/@{selector}/-/manifest"), token)?
-        .json()
+    json(authed_get(&format!("{base}/{ns}/@{selector}/-/manifest"), token)?)
         .map_err(|e| format!("parsing manifest: {e}"))
 }
 
@@ -215,34 +212,29 @@ pub fn get_object(
 ) -> Result<Vec<u8>, String> {
     let base = api_base(url)?;
     let resp = authed_get(&format!("{base}/{ns}/@{selector}/{key}"), token)?;
-    Ok(resp.bytes().map_err(|e| format!("reading object body: {e}"))?.to_vec())
+    resp.bytes().map_err(|e| format!("reading object body: {}", e.message))
 }
 
 /// Authenticated GET that errors on non-2xx.
-fn authed_get(url: &str, token: Option<&str>) -> Result<reqwest::blocking::Response, String> {
-    let rb = shared_client_for(url).get(url);
-    let rb = match token {
-        Some(t) => rb.bearer_auth(t),
-        None => rb,
-    };
-    let resp = rb.send().map_err(|e| format!("GET {url}: {e}"))?;
-    if resp.status().is_success() {
+fn authed_get(url: &str, token: Option<&str>) -> Result<Response, String> {
+    let resp = send(Request::get(url), token).map_err(|e| format!("GET {url}: {}", e.message))?;
+    if resp.is_success() {
         Ok(resp)
     } else {
-        Err(format!("GET {url} → HTTP {}", resp.status()))
+        Err(format!("GET {url} → HTTP {}", resp.status_line()))
     }
 }
 
-fn parse_token(resp: reqwest::blocking::Response, what: &str) -> Result<TokenResp, String> {
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
+fn parse_token(resp: Response, what: &str) -> Result<TokenResp, String> {
+    if resp.status() == 401 {
         return Err("authentication failed (check credentials)".to_string());
     }
-    if !status.is_success() {
+    if !resp.is_success() {
+        let status = resp.status_line();
         let body = resp.text().unwrap_or_default();
         return Err(format!("{what} failed (HTTP {status}): {}", body.trim()));
     }
-    resp.json::<TokenResp>().map_err(|e| format!("parsing {what} response: {e}"))
+    json::<TokenResp>(resp).map_err(|e| format!("parsing {what} response: {e}"))
 }
 
 #[cfg(test)]

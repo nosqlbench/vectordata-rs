@@ -902,7 +902,7 @@ mod tests {
         // Schema sidecar.
         w.start_namespace(SCHEMA_NAMESPACE).unwrap();
         let schema = MetadataSchema::new("test-fixture", vec![]);
-        w.add_record(&schema.to_json_bytes()).unwrap();
+        w.add_record(&schema.to_json_bytes().unwrap()).unwrap();
         w.finish().unwrap();
     }
 

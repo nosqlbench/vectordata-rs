@@ -133,8 +133,8 @@ impl MetadataSchema {
 
     /// Serialize to compact JSON bytes suitable for storage as a
     /// single slab record.
-    pub fn to_json_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("MetadataSchema must serialize")
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|e| format!("serialize the metadata schema: {e}"))
     }
 
     /// Parse a descriptor from JSON bytes.
@@ -223,8 +223,8 @@ impl PredicateSchema {
 
     /// Serialize to compact JSON bytes suitable for storage as a
     /// single slab record.
-    pub fn to_json_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("PredicateSchema must serialize")
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|e| format!("serialize the predicate schema: {e}"))
     }
 
     /// Parse a descriptor from JSON bytes.
@@ -255,7 +255,7 @@ mod tests {
                 },
             ],
         );
-        let bytes = s.to_json_bytes();
+        let bytes = s.to_json_bytes().unwrap();
         let parsed = MetadataSchema::from_json_bytes(&bytes).unwrap();
         assert_eq!(parsed, s);
     }
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn record_count_roundtrip() {
         let s = MetadataSchema::new("parquet:/tmp/x", vec![]).with_record_count(42);
-        let bytes = s.to_json_bytes();
+        let bytes = s.to_json_bytes().unwrap();
         let parsed = MetadataSchema::from_json_bytes(&bytes).unwrap();
         assert_eq!(parsed.record_count, Some(42));
     }
@@ -292,7 +292,7 @@ mod tests {
             42,
             500,
         );
-        let bytes = p.to_json_bytes();
+        let bytes = p.to_json_bytes().unwrap();
         let parsed = PredicateSchema::from_json_bytes(&bytes).unwrap();
         assert_eq!(parsed, p);
         assert_eq!(parsed.kind, SCHEMA_KIND_PREDICATE);
@@ -307,8 +307,8 @@ mod tests {
     fn metadata_and_predicate_discriminate_by_kind() {
         let m = MetadataSchema::new("parquet:/x", vec![]);
         let p = PredicateSchema::new("age = ?", "0.1", 1, 1);
-        let m_json = m.to_json_bytes();
-        let p_json = p.to_json_bytes();
+        let m_json = m.to_json_bytes().unwrap();
+        let p_json = p.to_json_bytes().unwrap();
         assert!(std::str::from_utf8(&m_json).unwrap().contains("\"kind\":\"metadata\""));
         assert!(std::str::from_utf8(&p_json).unwrap().contains("\"kind\":\"predicate\""));
     }

@@ -147,6 +147,35 @@ pub(crate) fn dataset_cache_dir(cache_root: &Path, dataset: &str) -> PathBuf {
     cache_root.join(dataset)
 }
 
+/// Suffix of the merkle state beside a cache copy verified against a
+/// published reference: `<file>.mrkl`.
+pub(crate) const MERKLE_STATE_SUFFIX: &str = ".mrkl";
+
+/// Suffix of the chunk map beside a cache copy fetched without a
+/// reference: `<file>.chunks`.
+pub(crate) const CHUNK_MAP_SUFFIX: &str = ".chunks";
+
+/// Where the cache copy of `file_relpath` in the dataset directory
+/// `dataset_dir` lives, with its sidecars: the file at
+/// `<dataset_dir>/<file_relpath>` (nested as the relpath is), its merkle
+/// state `<file>.mrkl` and its chunk map `<file>.chunks` beside it.
+/// The one place these names are decided; the transport writes what
+/// this says (`docs/design/srd-crate-boundaries.md` TR-7).
+pub(crate) fn placement(dataset_dir: &Path, file_relpath: &str) -> veks_transport::CachePlacement {
+    let data = dataset_dir.join(file_relpath);
+    let beside = |suffix: &str| {
+        let mut p = data.as_os_str().to_owned();
+        p.push(suffix);
+        PathBuf::from(p)
+    };
+    veks_transport::CachePlacement {
+        root: dataset_dir.to_path_buf(),
+        merkle_state: beside(MERKLE_STATE_SUFFIX),
+        chunk_map: beside(CHUNK_MAP_SUFFIX),
+        data,
+    }
+}
+
 /// Compute the cache file path for a specific facet within a dataset.
 /// `facet_relpath` is whatever the view declares (`base.fvecs`,
 /// `profiles/1m/base.fvecs`, etc.) — passed through verbatim so the

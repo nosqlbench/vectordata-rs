@@ -1755,8 +1755,12 @@ pub(super) fn run(
         seed,
         drawn.len() as u64,
     );
+    let schema_bytes = match schema.to_json_bytes() {
+        Ok(v) => v,
+        Err(e) => return error_result(e, start),
+    };
     let sections: [(&str, Vec<Vec<u8>>); 4] = [
-        (SCHEMA_NAMESPACE, vec![schema.to_json_bytes()]),
+        (SCHEMA_NAMESPACE, vec![schema_bytes]),
         (
             SURVEY_NAMESPACE,
             vec![match serde_json::to_vec(&survey) {
