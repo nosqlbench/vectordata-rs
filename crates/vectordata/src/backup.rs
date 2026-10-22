@@ -74,7 +74,7 @@ pub fn run_backup(
     std::fs::create_dir_all(&blobs).map_err(|e| e.to_string())?;
 
     // Enumerate readable namespaces from the caller's own access view.
-    let view = endpoint::whoami(url, token)?;
+    let view = endpoint::access_view(url, token)?;
     let readable: Vec<String> = view
         .get("namespaces")
         .and_then(|v| v.as_array())

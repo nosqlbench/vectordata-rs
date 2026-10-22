@@ -12,8 +12,8 @@
 //! [`candidate_namespaces`] (behind completion and the post-login offer)
 //! — before any request is made. The explicit server commands it does
 //! not affect are `login` ([`login_password`]), `token issue` and
-//! `revoke` ([`issue_token`], [`revoke_token`]) and `backup`'s reads
-//! ([`versions`], [`manifest`], [`get_object`])
+//! `revoke` ([`issue_token`], [`revoke_token`]) and `backup`'s requests
+//! ([`access_view`], [`versions`], [`manifest`], [`get_object`])
 //! (`docs/design/srd-crate-boundaries.md` TR-12).
 
 use serde::Deserialize;
@@ -93,6 +93,21 @@ pub fn login_password(
 /// reflects anonymous (`PUBLIC`) access. Refused in offline mode, with
 /// the offline error's message.
 pub fn whoami(url: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
+    whoami_by(send, url, token)
+}
+
+/// [`whoami`] as an explicit server command's first step — `backup`
+/// enumerating what it may read — which offline mode does not refuse.
+pub fn access_view(url: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
+    whoami_by(send_command, url, token)
+}
+
+/// `GET /-/whoami` through `send`.
+fn whoami_by(
+    send: fn(Request, Option<&str>) -> Result<Response, crate::TransportError>,
+    url: &str,
+    token: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let base = api_base(url)?;
     let resp = send(Request::get(format!("{base}/-/whoami")), token)
         .map_err(|e| format!("contacting {base}: {}", e.message))?;

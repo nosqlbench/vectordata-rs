@@ -4,7 +4,8 @@
 //! **Offline mode stops the endpoint introspection calls before the
 //! network** (`docs/design/srd-crate-boundaries.md` TR-12): `whoami`
 //! (behind `ping`) and `candidate_namespaces` (behind completion) make no
-//! request, while the explicit server commands — here `login` — are not
+//! request, while the explicit server commands — here `login` and
+//! `backup`, whose access view is a `whoami` of its own — are not
 //! affected.
 //!
 //! Offline mode is the process's transport configuration, read once from
@@ -78,11 +79,12 @@ fn offline_mode_refuses_endpoint_introspection_before_any_request() {
         String::from_utf8_lossy(&out.stderr)
     );
     let seen = seen.lock().unwrap().clone();
-    assert!(
-        seen.iter().all(|line| line.contains("/auth/token")),
-        "offline mode let introspection reach the server: {seen:?}"
+    let paths: Vec<&str> = seen.iter().filter_map(|line| line.split_whitespace().nth(1)).collect();
+    assert_eq!(
+        paths,
+        ["/auth/token", "/-/whoami"],
+        "offline: only login and backup's access view reach the server, in that order: {seen:?}"
     );
-    assert!(seen.iter().any(|line| line.contains("/auth/token")), "login is an explicit command: {seen:?}");
 }
 
 /// The child half of the test above; does nothing unless launched by it.
@@ -95,4 +97,8 @@ fn endpoint_calls_in_a_child() {
     // `login` reaches the server, which refuses the password.
     let login = vectordata::endpoint::login_password(&url, "u", "p", None, None).expect_err("the server says 401");
     assert!(login.contains("authentication failed"), "{login}");
+    // `backup` reaches the server too: its access view lists no namespace.
+    let dest = tempfile::tempdir().unwrap();
+    let stats = vectordata::backup::run_backup(&url, &dest.path().display().to_string(), false, None);
+    assert!(stats.is_ok(), "backup is an explicit command: {:?}", stats.err());
 }
