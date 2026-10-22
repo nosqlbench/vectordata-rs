@@ -515,10 +515,12 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         std::process::exit(1);
     });
 
-    let workspace = dataset_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+    // Absolute, symlinks kept as named: every option is resolved against
+    // the workspace, and a command that resolves a resolved option again
+    // must find it unchanged, which a relative workspace does not give
+    // (`ds/dataset.yaml` made `ds/ds/…`).
+    let parent = dataset_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let workspace = std::path::absolute(parent).unwrap_or_else(|_| parent.to_path_buf());
 
     // Sweep legacy singular-extension siblings (e.g. `base_vectors.fvec`
     // alongside `base_vectors.fvecs`) before any step runs. Self-heals

@@ -1887,6 +1887,36 @@ fn e2e_partition_profile_config() {
 }
 
 
+/// **A dataset named by a relative path runs as one named absolutely.**
+/// The workspace was the descriptor's parent as given, so a relative
+/// `dataset.yaml` path left every option resolved against a relative
+/// workspace, and a command that resolved it again doubled it
+/// (`ds/ds/profiles/base/base_vectors.fvec`).
+#[test]
+fn e2e_a_relative_dataset_path_runs() {
+    let tmp = make_tempdir();
+    let ds = tmp.path().join("ds");
+    std::fs::create_dir(&ds).unwrap();
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synthetic-1k/dataset.yaml"),
+        ds.join("dataset.yaml"),
+    )
+    .unwrap();
+    catalog_mirror::mark_publishable(&ds);
+    let output = Command::new(veks_bin())
+        .current_dir(tmp.path())
+        .args(["run", "--output", "batch", "--threads", "2", "ds/dataset.yaml"])
+        .output()
+        .expect("failed to execute veks");
+    assert!(
+        output.status.success(),
+        "a relative dataset path fails:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(ds.join("profiles/default/neighbor_indices.ivec").exists());
+}
+
 /// A step that ran makes every step declaring it as an upstream stale,
 /// across the run's phases, and `--rerun` is how a fresh step is made
 /// to run again: the shuffle re-runs, the extracts and the KNN follow,
