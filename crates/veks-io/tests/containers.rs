@@ -75,7 +75,7 @@ fn an_npy_f16_file_states_its_type() {
     // The npy v1 layout: magic, version, header length, a header dict
     // padded so the data starts 64-byte aligned, then the data.
     let mut header = "{'descr': '<f2', 'fortran_order': False, 'shape': (2, 3), }".to_string();
-    while (10 + header.len() + 1) % 64 != 0 {
+    while !(10 + header.len() + 1).is_multiple_of(64) {
         header.push(' ');
     }
     header.push('\n');

@@ -708,7 +708,7 @@ fn read_int_records(path: &Path, fields: usize) -> Result<Vec<Vec<i32>>, String>
                 .map(|(i, record)| {
                     let (_, payload) = record
                         .map_err(|e| format!("read {} record {}: {}", path.display(), i, e))?;
-                    Ok(payload.chunks_exact(4)
+                    Ok(payload.as_chunks::<4>().0.iter()
                         .take(fields)
                         .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                         .collect())

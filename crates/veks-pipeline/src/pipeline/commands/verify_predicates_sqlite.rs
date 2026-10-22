@@ -409,7 +409,7 @@ fn for_each_int_record(
             for (i, record) in veks_io::xvec::record::records(mapped.bytes(), 4).enumerate() {
                 let (_, payload) = record.map_err(|e| format!("record {}: {}", i, e))?;
                 row.clear();
-                row.extend(payload.chunks_exact(4).take(fields)
+                row.extend(payload.as_chunks::<4>().0.iter().take(fields)
                     .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64));
                 each(i as i64, &row)?;
             }

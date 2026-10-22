@@ -154,7 +154,7 @@ impl VecReader {
                 let payload = veks_io::xvec::record::record_payload(&record, 2)
                     .map_err(|e| format!("pread vector {}: {}", index, e))?;
                 let mut out = Vec::with_capacity(dim);
-                out.extend(payload.chunks_exact(2)
+                out.extend(payload.as_chunks::<2>().0.iter()
                     .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()));
                 Ok(out)
             }
@@ -195,7 +195,7 @@ impl VecReader {
         };
         match self {
             VecReader::F32 { .. } => {
-                for (ca, cb) in ba.chunks_exact(4).zip(bb.chunks_exact(4)) {
+                for (ca, cb) in ba.as_chunks::<4>().0.iter().zip(bb.as_chunks::<4>().0.iter()) {
                     let fa = f32::from_le_bytes([ca[0], ca[1], ca[2], ca[3]]);
                     let fb = f32::from_le_bytes([cb[0], cb[1], cb[2], cb[3]]);
                     match fa.partial_cmp(&fb) {
@@ -211,7 +211,7 @@ impl VecReader {
                 std::cmp::Ordering::Equal
             }
             VecReader::F16 { .. } => {
-                for (ca, cb) in ba.chunks_exact(2).zip(bb.chunks_exact(2)) {
+                for (ca, cb) in ba.as_chunks::<2>().0.iter().zip(bb.as_chunks::<2>().0.iter()) {
                     let fa = half::f16::from_bits(u16::from_le_bytes([ca[0], ca[1]])).to_f32();
                     let fb = half::f16::from_bits(u16::from_le_bytes([cb[0], cb[1]])).to_f32();
                     match fa.partial_cmp(&fb) {
@@ -331,12 +331,12 @@ impl VecReader {
             .map_err(|e| format!("vector {} of the batch: {}", local_idx, e))?;
         match self {
             VecReader::F32 { .. } => {
-                for (o, b) in out.iter_mut().zip(src.chunks_exact(4)) {
+                for (o, b) in out.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
                     *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 }
             }
             VecReader::F16 { .. } => {
-                for (o, b) in out.iter_mut().zip(src.chunks_exact(2)) {
+                for (o, b) in out.iter_mut().zip(src.as_chunks::<2>().0.iter()) {
                     *o = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
                 }
             }
