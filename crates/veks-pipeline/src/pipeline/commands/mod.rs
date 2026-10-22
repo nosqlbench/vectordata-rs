@@ -7,7 +7,7 @@
 //! implementation behind the `CommandOp` trait, extracting options from the
 //! pipeline `Options` map and delegating to the underlying logic.
 
-// Removed: barrier, cleanup_cleanfvec
+// Removed: barrier, cleanup_cleanfvec, import (ImportFacetOp, never registered)
 pub mod catalog_generate;
 pub mod tag_profiles;
 pub mod catalog_stats;
@@ -97,7 +97,6 @@ pub mod gen_sketch;
 pub mod gen_dataset_log_jsonl;
 pub mod gen_variables_json;
 pub mod gen_vectors;
-mod import;
 pub mod info_compute;
 pub mod info_file;
 pub mod inspect_predicate;
