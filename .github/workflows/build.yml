@@ -28,6 +28,12 @@
 #     generates SHA256SUMS, attaches everything to a GitHub Release.
 #     Tags containing `-` (e.g. `v1.0.0-rc1`) get auto-marked as
 #     prereleases.
+#
+#   api-paths — on pull requests and pushes to `main`, fails when a
+#     public API path stopped resolving since the newest `v*` tag
+#     without an entry in `crates/tools/api-removals.txt` (AC-5 /
+#     CB-3 of docs/design/srd-crate-boundaries.md). Its own job, so
+#     the build matrix does not wait on it.
 
 name: build
 
@@ -352,6 +358,59 @@ jobs:
           path: target/${{ matrix.target }}/release/vecd${{ matrix.exe_suffix }}
           if-no-files-found: error
           retention-days: 14
+
+  # ───────────────────────────────────────────────────────────
+  # Public API paths — the release guard for AC-5 / CB-3 of
+  # docs/design/srd-crate-boundaries.md. `cargo semver-checks`
+  # reports every item that moved since the newest `v*` tag
+  # reachable from HEAD; a probe crate then `use`s each one, and a
+  # path that no longer resolves (or became private) fails the job
+  # unless `crates/tools/api-removals.txt` lists it for that tag.
+  # Each crate's semver verdict is printed in the log, not enforced.
+  # Separate from `build` so the platform matrix is not slowed.
+  # ───────────────────────────────────────────────────────────
+  api-paths:
+    name: Public API paths
+    # Pull requests and pushes to `main` only: not tag pushes or
+    # manual release dispatches, which rebuild an already-cut release.
+    if: >-
+      github.event_name == 'pull_request'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full history and tags: the baseline is the newest `v*`
+          # tag reachable from HEAD, and semver-checks builds it from
+          # its git revision.
+          fetch-depth: 0
+
+      # ─── Same pinned toolchain as the build matrix (see there).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustc --version
+
+      # ─── Pinned: each cargo-semver-checks release reads a fixed
+      # range of rustdoc JSON formats, so its version moves with the
+      # toolchain pin in rust-toolchain.toml, deliberately.
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@0.51.0
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: api-paths
+
+      - name: Check public API paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p tools --bin api-paths
 
   # ───────────────────────────────────────────────────────────
   # GitHub Release — only on `v*` tag refs. Downloads each

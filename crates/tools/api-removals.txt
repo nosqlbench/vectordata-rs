@@ -1,0 +1,79 @@
+# Copyright (c) Jonathan Shook
+# SPDX-License-Identifier: Apache-2.0
+#
+# Intended removals of public API paths, read by the release guard
+# `cargo run -p tools --bin api-paths` (AC-5 / CB-3 of
+# docs/design/srd-crate-boundaries.md).
+#
+# Line format:  <baseline-tag> <path>  # reason
+#
+# A line applies only when its tag is the baseline being checked, so an
+# entry never excuses a later, accidental removal of the same path. Any
+# path that stops resolving (unresolved or private) since the baseline
+# and is not listed here fails the guard.
+
+# 4.1.0 against v4.0.2. Reasons from CHANGELOG.md.
+
+v4.0.2 vectordata::TypedAccessError                             # TypedReader removed (deprecated since 4.0.0)
+v4.0.2 vectordata::TypedReader                                  # TypedReader removed (deprecated since 4.0.0)
+v4.0.2 vectordata::dispatch_typed                               # TypedReader removed (deprecated since 4.0.0)
+v4.0.2 vectordata::open_facet_typed                             # TypedReader removed (deprecated since 4.0.0)
+v4.0.2 vectordata::typed_access::TypedAccessError               # TypedReader removed (deprecated since 4.0.0)
+v4.0.2 vectordata::typed_access::TypedElement                   # TypedReader removed (deprecated since 4.0.0)
+v4.0.2 vectordata::typed_access::TypedReader                    # TypedReader removed (deprecated since 4.0.0)
+v4.0.2 vectordata::view::open_facet_typed                       # TypedReader removed (deprecated since 4.0.0)
+
+v4.0.2 veks_core::formats::SLAB_RECORD_FRAMING                  # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::VecFormat                            # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::convert                              # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::convert::convert_elements            # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::convert::convert_elements_into       # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::element_type_of_width                # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::portable_io                          # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::portable_io::SpanFile                # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::portable_io::pread                   # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::portable_io::pread_exact             # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::portable_io::pwrite_all              # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::SourceMeta                   # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::VecSource                    # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::npy                          # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::npy::NpyArrayData            # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::npy::NpyDirReader            # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::npy::NpyDtype                # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::npy::NpyFileManifest         # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::npy::NpyScanResult           # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::npy::load_npy                # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::npy::scan_npy_headers        # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::npy::scan_npy_manifest       # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::parquet                      # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::parquet::ParquetDirReader    # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::parquet::ParquetProbeMeta    # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::slab                         # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::slab::SlabReader             # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::xvec                         # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::reader::xvec::open_xvec              # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer                               # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::SinkConfig                   # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::VecSink                      # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::mmap_xvec                    # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::mmap_xvec::MmapXvecWriter    # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::mmap_xvec::SharedMmapWriter  # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::open_sharded_sink            # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::open_sink                    # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::sharded                      # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::sharded::ShardedOutcome      # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::sharded::ShardedSink         # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::slab                         # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::slab::SlabWriter             # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::xvec                         # veks-core format modules moved to veks-io, no shim
+v4.0.2 veks_core::formats::writer::xvec::XvecWriter             # veks-core format modules moved to veks-io, no shim
+
+v4.0.2 veks_core::formats::reader::hdf5                         # HDF5 stub reader removed; HDF5 is not supported
+v4.0.2 veks_core::formats::reader::hdf5::list_datasets          # HDF5 stub reader removed; HDF5 is not supported
+v4.0.2 veks_core::formats::reader::hdf5::open                   # HDF5 stub reader removed; HDF5 is not supported
+v4.0.2 veks_core::formats::reader::hdf5::parse_hdf5_path        # HDF5 stub reader removed; HDF5 is not supported
+v4.0.2 veks_core::formats::reader::hdf5::probe                  # HDF5 stub reader removed; HDF5 is not supported
+
+v4.0.2 veks_io::scalar::convert                                 # veks_io::scalar::convert moved to veks_io::convert
+v4.0.2 veks_io::scalar::convert::ConvertError                   # veks_io::scalar::convert moved to veks_io::convert
+v4.0.2 veks_io::scalar::convert::convert_scalars                # veks_io::scalar::convert moved to veks_io::convert

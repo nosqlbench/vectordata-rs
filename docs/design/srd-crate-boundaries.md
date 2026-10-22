@@ -566,6 +566,21 @@ as re-exports; `vectordata::transport` becomes a public re-export of
 the crate's client API for programs that already depend on
 vectordata.
 
+**AC-5 and CB-3 have a release guard.** The hand-written path list
+above missed a removal: 4.1.0 lost
+`vectordata::catalog::source::{CatalogSource, CatalogOrigin}` when the
+types moved to veks-apicore and the module kept only a private `use`
+(restored in e862359). `cargo run -p tools --bin api-paths
+[--baseline <tag>]` checks every path instead. `cargo semver-checks`
+lists each item of a publishable crate that moved since the baseline
+(default: the newest `v*` tag reachable from HEAD); a probe crate under
+`target/api-paths` `use`s each one, and a path that no longer resolves
+or became private fails the run unless `crates/tools/api-removals.txt`
+lists it for that baseline with its reason. Each crate's semver verdict
+is printed beside it. It runs before `cargo ws version` and as the
+`api-paths` job of `.github/workflows/build.yml` on pull requests and
+pushes to `main`.
+
 ## 8. Non-goals
 
 - Async. Every client stays blocking; vecd's server stays axum.
@@ -1651,3 +1666,7 @@ Decisions made while closing out steps 7–9, each implemented.
   recovered, the slab reader's page lookup returns an error, and the
   unchecked `get_slice`'s documented panic carries a reasoned allow.
 - **`backup` is explicit** under offline mode (§12.8).
+- **AC-5 / CB-3 release guard** (`tools` bin `api-paths`, §7): run
+  against 4.1.0 with baseline v4.0.2 it fails on exactly the two
+  `vectordata::catalog::source` paths; 60 intended removals are
+  allowlisted.

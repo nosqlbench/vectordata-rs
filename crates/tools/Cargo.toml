@@ -6,5 +6,12 @@ description = "Project tooling — diagram generators, code analysis, etc."
 license = "Apache-2.0"
 publish = false
 
+# The release guard for public API paths (AC-5 / CB-3 of
+# docs/design/srd-crate-boundaries.md). Named explicitly for its
+# hyphenated binary name; the generators keep their inferred names.
+[[bin]]
+name = "api-paths"
+path = "src/bin/api_paths.rs"
+
 [lints]
 workspace = true

@@ -154,6 +154,12 @@ resolver = "3"
 #     tag per push stays under the limit, so the `v*` push reliably
 #     triggers `.github/workflows/build.yml`. (That workflow also keeps a
 #     `workflow_dispatch` fallback for re-publishing any tag by hand.)
+#
+# Before `cargo ws version`, run `cargo run -p tools --bin api-paths`.
+# It fails when a public path users know (AC-5 / CB-3 of
+# docs/design/srd-crate-boundaries.md) stopped resolving since the last
+# `v*` tag without an entry in crates/tools/api-removals.txt, and prints
+# each crate's semver verdict so the version bump can be chosen to match.
 [workspace.metadata.workspaces]
 allow_branch = "main"
 no_individual_tags = true
