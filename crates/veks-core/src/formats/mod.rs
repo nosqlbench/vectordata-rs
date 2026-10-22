@@ -51,18 +51,6 @@ pub fn preferred_vec_format(facet: StandardFacet, element: ElementType) -> VecFo
     }
 }
 
-/// The element type a container source (npy, parquet, hdf5) holds,
-/// which its probe states only as a width: containers hold floats, and
-/// one byte is a code.
-pub fn element_type_of_width(bytes: usize) -> ElementType {
-    match bytes {
-        1 => ElementType::U8,
-        2 => ElementType::F16,
-        8 => ElementType::F64,
-        _ => ElementType::F32,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,10 +71,6 @@ mod tests {
         assert_eq!(preferred_vec_format(F::MetadataContent, ElementType::U8), VecFormat::Slab);
         assert_eq!(preferred_vec_format(F::QuantScale, ElementType::U8), VecFormat::ScalarF32);
         assert_eq!(preferred_vec_format(F::QuantSum, ElementType::U8), VecFormat::ScalarI32);
-        assert_eq!(element_type_of_width(1), ElementType::U8);
-        assert_eq!(element_type_of_width(2), ElementType::F16);
-        assert_eq!(element_type_of_width(4), ElementType::F32);
-        assert_eq!(element_type_of_width(8), ElementType::F64);
     }
 
     /// **The facet spec veks-core answers from is vectordata's**: the

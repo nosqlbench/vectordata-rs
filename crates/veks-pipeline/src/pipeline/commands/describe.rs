@@ -222,7 +222,9 @@ element type does this dataset use?"
             format.name(),
             meta.dimension,
             meta.element_size,
-            element_type_label(meta.element_size),
+            // Every reader states its element type but a slab that
+            // declares none, whose records are bytes.
+            meta.element_type.map_or("undeclared", veks_io::ElementType::name),
             records_str,
         );
         if let Some(a) = &dir_agg {
@@ -371,16 +373,6 @@ fn error_result(message: String, start: Instant) -> CommandResult {
         message,
         produced: vec![],
         elapsed: start.elapsed(),
-    }
-}
-
-fn element_type_label(elem_size: usize) -> &'static str {
-    match elem_size {
-        1 => "u8/i8",
-        2 => "f16/i16",
-        4 => "f32/i32",
-        8 => "f64/i64",
-        _ => "unknown",
     }
 }
 

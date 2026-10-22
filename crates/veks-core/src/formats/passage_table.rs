@@ -20,7 +20,7 @@
 //! produce byte-identical files.
 //!
 //! This is a *table* codec, deliberately separate from the vector-sink API
-//! ([`writer::open_sink`](super::writer::open_sink) /
+//! ([`sink::open_sink`](veks_io::sink::open_sink) /
 //! [`VecFormat::is_writable`](super::VecFormat::is_writable)), which models
 //! fixed-dimension vector records rather than heterogeneous rows.
 

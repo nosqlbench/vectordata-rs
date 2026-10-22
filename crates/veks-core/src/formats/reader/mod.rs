@@ -15,12 +15,15 @@ use crate::formats::StandardFacet;
 /// Probe a source to extract metadata without starting a full reader.
 ///
 /// For npy directories, this only reads file headers (a few hundred bytes
-/// each). For other formats, it opens and immediately queries the reader
-/// since those are already lightweight.
+/// each). A slab is probed without building its page index
+/// ([`SlabReader::probe`](veks_io::slab::reader::SlabReader::probe)), at
+/// the element type its schema sidecar declares, or as bytes when it
+/// declares none. For other formats, it opens and immediately queries the
+/// reader since those are already lightweight.
 pub fn probe_source(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
     match format {
         VecFormat::Npy => veks_io::npy::NpyDirReader::probe(path),
-        VecFormat::Slab => probe_slab(path),
+        VecFormat::Slab => veks_io::slab::reader::SlabReader::probe(path),
         _ => {
             // Other formats are lightweight to open — just open and extract
             let source = open_source(path, format, 0, None)?;
@@ -32,31 +35,6 @@ pub fn probe_source(path: &Path, format: VecFormat) -> Result<SourceMeta, String
             })
         }
     }
-}
-
-/// Probe a slab file for metadata without building the full page index.
-///
-/// Uses [`slabtastic::SlabReader::probe`] which reads only the pages-page
-/// and at most two data page footers — orders of magnitude faster than
-/// [`open`] for large files.
-fn probe_slab(path: &Path) -> Result<SourceMeta, String> {
-    let stats = slabtastic::SlabReader::probe(path)
-        .map_err(|e| format!("Failed to probe slab {}: {}", path.display(), e))?;
-
-    if stats.page_count == 0 {
-        return Err("Empty slab file".to_string());
-    }
-
-    // A slab's records are opaque: read as vectors they are taken
-    // 4 bytes wide, and the element type is not claimed.
-    let dimension = (stats.first_record_size / 4) as u32;
-
-    Ok(SourceMeta {
-        dimension,
-        element_size: 4,
-        record_count: Some(stats.total_records),
-        element_type: None,
-    })
 }
 
 /// Open a source reader for the given path and format.

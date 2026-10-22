@@ -262,7 +262,7 @@ mod tests {
     fn config(dim: u32) -> SinkConfig {
         SinkConfig {
             dimension: dim,
-            source_format: VecFormat::Fvec,
+            element_type: VecFormat::Fvec.element_type(),
             slab_page_size: None,
             slab_namespace: 0,
             schema_sidecar: None,

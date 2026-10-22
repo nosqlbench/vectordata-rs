@@ -262,19 +262,25 @@ Convert with explicit source format override:
 
         // The element conversion, decided by the pair of types rather
         // than by their widths: a `.bf16vecs` is not a `.mvecs` because
-        // both are two bytes wide, and an `f32` is not an `i32`. A
-        // container source (npy, parquet, slab) states its type by
-        // width, as it always has; a container target takes the source
-        // bytes as they are.
-        let src_ty = source_format
-            .element_type()
-            .or(source.element_type())
-            .unwrap_or_else(|| veks_core::formats::element_type_of_width(src_element_size));
-        let plan = match to_format.element_type() {
-            Some(dst_ty) if dst_ty != src_ty => match ElementPlan::for_pair(src_ty, dst_ty) {
+        // both are two bytes wide, and an `f32` is not an `i32`. Every
+        // source states its type (npy and parquet from their schema, a
+        // slab from its sidecar) except a slab that declares none, whose
+        // records are bytes and so land only in another slab; a
+        // container target takes the source bytes as they are.
+        let src_ty = source_format.element_type().or(source.element_type());
+        let plan = match (to_format.element_type(), src_ty) {
+            (Some(dst_ty), Some(src_ty)) if dst_ty != src_ty => match ElementPlan::for_pair(src_ty, dst_ty) {
                 Some(plan) => Some(plan),
                 None => return error_result(refusal_message(src_ty, dst_ty), start),
             },
+            (Some(dst_ty), None) => return error_result(
+                format!(
+                    "{} declares no element type, so its records are bytes; converting them to {dst_ty} \
+                     would be a guess — rewrite the source with its element type declared",
+                    source_path.display(),
+                ),
+                start,
+            ),
             _ => None,
         };
         let needs_conversion = plan.is_some();
@@ -653,8 +659,8 @@ Convert with explicit source format override:
         // build a sidecar that the slab sink will emit into a `:schema`
         // namespace. The probe is cheap (reads the first file's footer
         // only) and lets non-veks readers introspect the slab without
-        // parsing any MNode records. Vector facets and non-slab targets
-        // get `None` and behave exactly as before.
+        // parsing any MNode records. Vector records instead carry their
+        // element type, which a slab sink declares in its sidecar.
         let schema_sidecar = build_schema_sidecar(
             &source_path, source_format, to_format, facet, record_count,
         );
@@ -662,7 +668,7 @@ Convert with explicit source format override:
         // Open sink
         let sink_config = SinkConfig {
             dimension,
-            source_format: if needs_conversion { to_format } else { source_format },
+            element_type: if needs_conversion { to_format.element_type() } else { src_ty },
             slab_page_size,
             slab_namespace,
             schema_sidecar,

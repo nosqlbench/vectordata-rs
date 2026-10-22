@@ -3,11 +3,12 @@
 
 //! Opening a writer for any writable format, from a [`SinkConfig`]:
 //! one file, or a series of shards capped in size
-//! ([`ShardedSink`](crate::crate::sharded::ShardedSink)) when the config says
+//! ([`ShardedSink`](crate::sharded::ShardedSink)) when the config says
 //! so.
 
 use std::path::Path;
 
+use crate::element::ElementType;
 use crate::format::VecFormat;
 use crate::traits::VecSink;
 
@@ -19,10 +20,16 @@ pub const SLAB_RECORD_FRAMING: u64 = 4;
 pub struct SinkConfig {
     /// Vector dimension (elements per record) of the output.
     pub dimension: u32,
-    /// Format of the source data. For slab output it sets the element width of
-    /// each record (xvec and scalar sources keep theirs; npy and parquet land as
-    /// `f32`).
-    pub source_format: VecFormat,
+    /// Element type of the records written, when they are vectors.
+    ///
+    /// A slab records it in its schema sidecar (a
+    /// [`VectorSchema`](veks_apicore::metadata_schema::VectorSchema)),
+    /// so its reader reports it, and sizes its records from it. `None`
+    /// writes opaque records — metadata, or a slab whose type is
+    /// undeclared — sized as bytes, which is how such a slab's reader
+    /// counts its dimension. Formats that fix their element type (xvec,
+    /// scalar) ignore it.
+    pub element_type: Option<ElementType>,
     /// Preferred slab page size override. `None` uses the slabtastic default.
     pub slab_page_size: Option<u32>,
     /// Slab namespace index the records are written into. Ignored by non-slab
@@ -30,7 +37,9 @@ pub struct SinkConfig {
     pub slab_namespace: u8,
     /// Optional schema descriptor to emit alongside the content
     /// records as a `:schema` namespace sidecar. Honored only by slab
-    /// sinks; other formats ignore it.
+    /// sinks; other formats ignore it. It describes metadata records,
+    /// so a slab sink refuses it together with an
+    /// [`element_type`](Self::element_type).
     pub schema_sidecar: Option<veks_apicore::metadata_schema::MetadataSchema>,
     /// Cap on one output file. A facet that would exceed it is
     /// written as a multi-file series instead (SH-35).
@@ -46,8 +55,9 @@ impl SinkConfig {
     ///
     /// The question [`VecFormat::record_bytes`] cannot answer alone
     /// for a slab: the payload is `dimension` elements of the
-    /// **source** format's width, because that is what gets written
-    /// into it, and a slab has no element width of its own.
+    /// [`element_type`](Self::element_type) written into it (bytes
+    /// when there is none), because a slab has no element width of
+    /// its own.
     pub fn record_bytes(&self, format: VecFormat) -> Option<u64> {
         if format == VecFormat::Slab {
             Some(self.slab_record_payload() as u64 + SLAB_RECORD_FRAMING)
@@ -58,12 +68,7 @@ impl SinkConfig {
 
     /// The payload length of one record written into a slab.
     fn slab_record_payload(&self) -> usize {
-        let element_size = if self.source_format.is_xvec() || self.source_format.is_scalar() {
-            self.source_format.element_size()
-        } else {
-            4 // npy/parquet sources land as f32
-        };
-        self.dimension as usize * element_size
+        self.dimension as usize * self.element_type.map_or(1, ElementType::byte_width)
     }
 
     /// The shard stride this config implies, if the output should be
@@ -150,6 +155,7 @@ fn open_one_file(
             config.slab_page_size,
             config.slab_namespace,
             config.schema_sidecar.clone(),
+            config.element_type,
         ),
         _ if format.is_uniform_xvec() => crate::xvec::writer::open(path, config.dimension),
         _ if format.is_scalar() => crate::scalar::writer::open(path, format),
@@ -164,7 +170,7 @@ mod sizing_tests {
     fn cfg(dim: u32, source: VecFormat, cap: Option<u64>) -> SinkConfig {
         SinkConfig {
             dimension: dim,
-            source_format: source,
+            element_type: source.element_type(),
             slab_page_size: None,
             slab_namespace: 0,
             schema_sidecar: None,
@@ -194,21 +200,25 @@ mod sizing_tests {
         assert_eq!(cfg(384, VecFormat::Fvec, None).record_bytes(VecFormat::Fvec), Some(1540));
     }
 
-    /// **A slab's record size comes from its source, not from `Slab`.**
-    /// A slab has no element width of its own, so the same target
-    /// format sizes differently depending on what is written into it.
+    /// **A slab's record size comes from what is written into it, not
+    /// from `Slab`.** A slab has no element width of its own, so the
+    /// same target format sizes differently by element type.
     #[test]
     fn a_slab_record_is_sized_from_what_is_written_into_it() {
-        // f32 source: 4 bytes an element, plus the offset entry.
+        // f32 records: 4 bytes an element, plus the offset entry.
         assert_eq!(
             cfg(100, VecFormat::Fvec, None).record_bytes(VecFormat::Slab),
             Some(404)
         );
-        // f16 source: half that payload, same framing.
+        // f16 records: half that payload, same framing.
         assert_eq!(
             cfg(100, VecFormat::Mvec, None).record_bytes(VecFormat::Slab),
             Some(204)
         );
+        // Opaque records (no element type, as from an undeclared slab,
+        // whose reader counts its dimension in bytes): a byte each.
+        let opaque = SinkConfig { element_type: None, ..cfg(100, VecFormat::Fvec, None) };
+        assert_eq!(opaque.record_bytes(VecFormat::Slab), Some(104));
         // And `VecFormat` alone declines, rather than guessing f32.
         assert_eq!(VecFormat::Slab.record_bytes(100), None);
     }

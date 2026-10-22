@@ -9,7 +9,7 @@
 //! object that lets non-veks consumers introspect a slab's
 //! structure without parsing a single content record.
 //!
-//! Two descriptor flavors share the namespace:
+//! Three descriptor flavors share the namespace:
 //!
 //! - **[`MetadataSchema`]** (`kind: "metadata"`) — emitted by
 //!   `convert` for metadata slabs (MNode content). Lists field
@@ -18,10 +18,15 @@
 //!   `generate predicates` for predicate slabs (PNode content).
 //!   Records the template in PNode `Display` vernacular plus the
 //!   generation parameters that produced the records.
+//! - **[`VectorSchema`]** (`kind: "vector"`) — emitted by veks-io's
+//!   slab writer for a slab of vectors. States the element type of
+//!   every record, which nothing else in a slab says.
 //!
 //! Consumers read the namespace and dispatch on the top-level
 //! `kind` field. Older slabs without `kind` are assumed to be
-//! `"metadata"` for backwards compatibility.
+//! `"metadata"` for backwards compatibility. A slab with no
+//! `vector` descriptor declares no element type: its records are
+//! bytes.
 //!
 //! The descriptors are intentionally small and stable. Bump
 //! their `VERSION` constant on any incompatible shape change.
@@ -29,6 +34,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use veks_datatypes::ElementType;
 
 /// Slab namespace name used for schema sidecars. Co-located with the
 /// content namespace (the default, `""`) inside the same `.slab`
@@ -65,7 +71,34 @@ pub const SCHEMA_KIND_METADATA: &str = "metadata";
 /// `kind` discriminator value for predicate-slab schemas.
 pub const SCHEMA_KIND_PREDICATE: &str = "predicate";
 
+/// `kind` discriminator value for vector-slab schemas.
+pub const SCHEMA_KIND_VECTOR: &str = "vector";
+
 fn default_metadata_kind() -> String { SCHEMA_KIND_METADATA.into() }
+
+/// The `kind` of the descriptor in a `:schema` sidecar record: the
+/// top-level `kind` field, or [`SCHEMA_KIND_METADATA`] for a
+/// descriptor written before the discriminator existed. An error when
+/// the record is not a JSON object.
+///
+/// ```
+/// use veks_apicore::metadata_schema::{sidecar_kind, VectorSchema};
+/// use veks_datatypes::ElementType;
+/// let vector = VectorSchema::new(ElementType::U8).to_json_bytes().unwrap();
+/// assert_eq!(sidecar_kind(&vector).unwrap(), "vector");
+/// assert_eq!(sidecar_kind(br#"{"version":1,"fields":[]}"#).unwrap(), "metadata");
+/// assert!(sidecar_kind(b"not json").is_err());
+/// ```
+pub fn sidecar_kind(buf: &[u8]) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(buf).map_err(|e| format!("parse slab schema: {e}"))?;
+    let object = value.as_object().ok_or("parse slab schema: not a JSON object")?;
+    Ok(object
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or(SCHEMA_KIND_METADATA)
+        .to_string())
+}
 
 /// A single field in the imported metadata schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +267,81 @@ impl PredicateSchema {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// VectorSchema — descriptor for vector slabs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Schema descriptor for a slab of vectors.
+///
+/// Written into the slab's `:schema` namespace as a single JSON
+/// record by the slab writer, so a reader can report the records'
+/// real element type and width. A slab without one — every slab
+/// written before this descriptor existed, and every metadata or
+/// predicate slab — declares no element type, and its records read
+/// as bytes.
+///
+/// ```
+/// use veks_apicore::metadata_schema::{VectorSchema, SCHEMA_KIND_VECTOR};
+/// use veks_datatypes::ElementType;
+///
+/// let schema = VectorSchema::new(ElementType::BF16);
+/// let bytes = schema.to_json_bytes().unwrap();
+/// assert_eq!(std::str::from_utf8(&bytes).unwrap(), r#"{"version":1,"kind":"vector","element_type":"bf16"}"#);
+/// let parsed = VectorSchema::from_json_bytes(&bytes).unwrap();
+/// assert_eq!((parsed.kind.as_str(), parsed.element_type), (SCHEMA_KIND_VECTOR, ElementType::BF16));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorSchema {
+    /// Descriptor format version. See [`VectorSchema::VERSION`].
+    pub version: u32,
+    /// Top-level discriminator — always `"vector"`.
+    pub kind: String,
+    /// The element type of every record, spelled by
+    /// [`ElementType::name`] (`"u8"`, `"f32"`, `"bf16"`).
+    #[serde(with = "element_type_name")]
+    pub element_type: ElementType,
+}
+
+impl VectorSchema {
+    /// Current descriptor format version. Bumped on any
+    /// incompatible shape change.
+    pub const VERSION: u32 = 1;
+
+    /// A descriptor declaring `element_type`.
+    pub fn new(element_type: ElementType) -> Self {
+        Self { version: Self::VERSION, kind: SCHEMA_KIND_VECTOR.into(), element_type }
+    }
+
+    /// Serialize to compact JSON bytes suitable for storage as a
+    /// single slab record.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|e| format!("serialize the vector schema: {e}"))
+    }
+
+    /// Parse a descriptor from JSON bytes. An element type that is
+    /// not one of [`ElementType::ALL`] is an error, not a guess.
+    pub fn from_json_bytes(buf: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(buf)
+            .map_err(|e| format!("parse vector schema: {e}"))
+    }
+}
+
+/// [`ElementType`] as its [`name`](ElementType::name) in JSON.
+mod element_type_name {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use veks_datatypes::ElementType;
+
+    pub fn serialize<S: Serializer>(ty: &ElementType, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(ty.name())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<ElementType, D::Error> {
+        let name = String::deserialize(d)?;
+        ElementType::from_name(&name)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown element type '{name}'")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +419,26 @@ mod tests {
         let p_json = p.to_json_bytes().unwrap();
         assert!(std::str::from_utf8(&m_json).unwrap().contains("\"kind\":\"metadata\""));
         assert!(std::str::from_utf8(&p_json).unwrap().contains("\"kind\":\"predicate\""));
+    }
+
+    /// Every element type round-trips through a vector descriptor
+    /// by its name.
+    #[test]
+    fn vector_schema_round_trips_every_element_type() {
+        for &ty in ElementType::ALL {
+            let v = VectorSchema::new(ty);
+            let bytes = v.to_json_bytes().unwrap();
+            assert!(std::str::from_utf8(&bytes).unwrap().contains(&format!("\"element_type\":\"{}\"", ty.name())), "{ty}");
+            assert_eq!(VectorSchema::from_json_bytes(&bytes).unwrap(), v, "{ty}");
+        }
+    }
+
+    /// A vector descriptor naming no known element type, or naming
+    /// none, does not parse: the declaration is there and unreadable,
+    /// and reading it as some type would be a guess.
+    #[test]
+    fn vector_schema_rejects_an_unknown_or_missing_element_type() {
+        assert!(VectorSchema::from_json_bytes(br#"{"version":1,"kind":"vector","element_type":"f128"}"#).is_err());
+        assert!(VectorSchema::from_json_bytes(br#"{"version":1,"kind":"vector"}"#).is_err());
     }
 }

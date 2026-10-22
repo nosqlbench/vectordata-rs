@@ -1445,13 +1445,13 @@ fn bottom_border(inner: usize) -> String {
 
 /// Render the `:schema`-namespace sidecar (if any) above the
 /// page-by-page diagram. Dispatches on the top-level `kind`
-/// field of the parsed JSON to pick between `MetadataSchema`
-/// and `PredicateSchema` renderers — older schemas without
-/// `kind` are interpreted as metadata for back-compat.
+/// field of the parsed JSON to pick between the `MetadataSchema`,
+/// `PredicateSchema` and `VectorSchema` renderers — older schemas
+/// without `kind` are interpreted as metadata for back-compat.
 fn render_schema_sidecar(input_path: &std::path::Path, ctx: &StreamContext) {
     use vectordata::metadata_schema::{
         MetadataSchema, PredicateSchema, SCHEMA_KIND_METADATA, SCHEMA_KIND_PREDICATE,
-        SCHEMA_NAMESPACE,
+        SCHEMA_KIND_VECTOR, SCHEMA_NAMESPACE, VectorSchema, sidecar_kind,
     };
     // Open the schema namespace. Absent → silently skip (the
     // slab is a content-only blob with no sidecar; that's a
@@ -1467,15 +1467,24 @@ fn render_schema_sidecar(input_path: &std::path::Path, ctx: &StreamContext) {
         Ok(b) => b,
         Err(_) => return,
     };
-    // Peek at the JSON's top-level `kind` to route. Both
-    // descriptors carry it; pre-discriminator records default
+    // Peek at the JSON's top-level `kind` to route. Every
+    // descriptor carries it; pre-discriminator records default
     // to "metadata".
-    let kind = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_string))
-        .unwrap_or_else(|| SCHEMA_KIND_METADATA.into());
+    let kind = sidecar_kind(&bytes).unwrap_or_else(|_| SCHEMA_KIND_METADATA.into());
 
     match kind.as_str() {
+        SCHEMA_KIND_VECTOR => match VectorSchema::from_json_bytes(&bytes) {
+            Ok(s) => {
+                let rows = vec![
+                    "kind: vector".to_string(),
+                    format!("element_type: {}", s.element_type),
+                    format!("version:      {}", s.version),
+                ];
+                render_explain_box(ctx, ":schema namespace", &rows);
+                ctx.ui.log("");
+            }
+            Err(e) => ctx.ui.log(&format!("  :schema parse error (kind=vector): {e}")),
+        },
         SCHEMA_KIND_PREDICATE => match PredicateSchema::from_json_bytes(&bytes) {
             Ok(s) => {
                 let rows = vec![
@@ -2254,5 +2263,41 @@ mod tests {
         // the full form should appear on its own line.
         assert!(out.contains("(age >= ? AND name MATCHES ?)"),
             "explain output must include the full template:\n{out}");
+    }
+
+    /// `slab explain` surfaces a vector slab's sidecar as the
+    /// element type it declares, not as a metadata schema it fails
+    /// to parse.
+    #[test]
+    fn slab_explain_surfaces_vector_schema_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+
+        let path = ws.join("codes.slab");
+        let config = veks_io::sink::SinkConfig {
+            dimension: 4,
+            element_type: Some(veks_io::ElementType::I8),
+            slab_page_size: None,
+            slab_namespace: 0,
+            schema_sidecar: None,
+            max_shard_bytes: None,
+        };
+        let mut w = veks_io::sink::open_sink(&path, veks_io::VecFormat::Slab, &config).unwrap();
+        w.write_record(0, &[1, 2, 3, 4]);
+        w.finish().unwrap();
+
+        let sink = std::sync::Arc::new(veks_core::ui::TestSink::new());
+        ctx.ui = veks_core::ui::UiHandle::new(sink.clone());
+
+        let mut opts = Options::new();
+        opts.set("source", path.to_string_lossy().to_string());
+        let r = SlabExplainOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let out = sink.log_messages().join("\n");
+        assert!(out.contains("kind: vector"), "explain output must surface kind=vector, got:\n{out}");
+        assert!(out.contains("element_type: i8"), "explain output must surface the element type, got:\n{out}");
+        assert!(!out.contains("parse error"), "a vector sidecar must not be parsed as metadata:\n{out}");
     }
 }

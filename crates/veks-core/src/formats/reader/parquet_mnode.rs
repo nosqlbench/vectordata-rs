@@ -4,8 +4,8 @@
 //! Parquet metadata reader — reads scalar parquet columns and emits MNode wire
 //! format bytes via [`CompiledMnodeWriter`].
 //!
-//! Unlike [`ParquetDirReader`](super::parquet::ParquetDirReader), which requires
-//! a list-of-float vector column, this reader handles parquet files with
+//! Unlike [`ParquetDirReader`](veks_io::parquet::ParquetDirReader), which requires
+//! a list column of numeric vectors, this reader handles parquet files with
 //! arbitrary scalar columns (strings, ints, timestamps, etc.) and converts each
 //! row to an unframed MNode payload.
 //!

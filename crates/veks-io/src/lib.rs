@@ -366,6 +366,10 @@ pub fn probe_format(path: &Path, format: VecFormat) -> Result<SourceMeta, String
     if format.is_scalar() {
         return scalar::reader::probe(path, format);
     }
+    #[cfg(feature = "slab")]
+    if format == VecFormat::Slab {
+        return slab::reader::SlabReader::probe(path);
+    }
     Err(format!("{} probing not yet implemented in veks-io", format))
 }
 

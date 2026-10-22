@@ -6,21 +6,24 @@
 use std::path::{Path, PathBuf};
 
 use slabtastic::{SlabWriter as SlabtasticWriter, WriterConfig};
-use veks_apicore::metadata_schema::{MetadataSchema, SCHEMA_NAMESPACE};
+use veks_apicore::metadata_schema::{MetadataSchema, SCHEMA_NAMESPACE, VectorSchema};
 
+use crate::element::ElementType;
 use crate::traits::VecSink;
 
 /// Writes a slab file using the `slabtastic` crate.
 ///
 /// Delegates page management, alignment, and pages-page indexing
 /// to the crate's `SlabWriter`. When constructed with a schema
-/// sidecar, [`finish`](Self::finish) seals the content (default)
-/// namespace and emits a single JSON record into the `:schema`
-/// namespace before finalizing the file.
+/// sidecar or an element type, [`finish`](Self::finish) seals the
+/// content (default) namespace and emits a single JSON record into
+/// the `:schema` namespace before finalizing the file: the
+/// [`MetadataSchema`] given, or a [`VectorSchema`] declaring the
+/// element type, which the slab reader then reports.
 pub struct SlabWriter {
     writer: SlabtasticWriter,
     path: PathBuf,
-    schema_sidecar: Option<MetadataSchema>,
+    sidecar: Option<Vec<u8>>,
 }
 
 impl SlabWriter {
@@ -29,16 +32,34 @@ impl SlabWriter {
     /// When `preferred_page_size` is `None`, the slabtastic library default
     /// is used (currently 4 MiB).
     ///
-    /// `schema_sidecar` is written as a single JSON record into the
-    /// [`SCHEMA_NAMESPACE`] (`"schema"`) namespace at finish time. Pass
-    /// `None` for content-only slabs.
+    /// `schema_sidecar` (metadata records) or `element_type` (vector
+    /// records) is written as a single JSON record into the
+    /// [`SCHEMA_NAMESPACE`] (`"schema"`) namespace at finish time; the
+    /// two describe different records, so passing both is an error.
+    /// Pass neither for a content-only slab, whose reader then reports
+    /// its records as bytes of an undeclared type.
     pub fn open(
         path: &Path,
         _record_byte_len: usize,
         preferred_page_size: Option<u32>,
         _namespace_index: u8,
         schema_sidecar: Option<MetadataSchema>,
+        element_type: Option<ElementType>,
     ) -> Result<Box<dyn VecSink>, String> {
+        let sidecar = match (schema_sidecar, element_type) {
+            (Some(_), Some(ty)) => {
+                return Err(format!(
+                    "{}: a metadata schema sidecar describes metadata records, not {ty} vectors",
+                    path.display()
+                ));
+            }
+            (Some(schema), None) => Some(schema.to_json_bytes()),
+            (None, Some(ty)) => Some(VectorSchema::new(ty).to_json_bytes()),
+            (None, None) => None,
+        }
+        .transpose()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+
         let config = match preferred_page_size {
             Some(size) => WriterConfig::new(512, size, u32::MAX, false)
                 .map_err(|e| format!("Invalid writer config: {}", e))?,
@@ -51,7 +72,7 @@ impl SlabWriter {
         Ok(Box::new(SlabWriter {
             writer,
             path: path.to_path_buf(),
-            schema_sidecar,
+            sidecar,
         }))
     }
 }
@@ -64,13 +85,12 @@ impl VecSink for SlabWriter {
     }
 
     fn finish(mut self: Box<Self>) -> Result<(), String> {
-        if let Some(schema) = self.schema_sidecar.take() {
+        if let Some(bytes) = self.sidecar.take() {
             self.writer
                 .start_namespace(SCHEMA_NAMESPACE)
                 .map_err(|e| {
                     format!("Failed to seal content namespace in {}: {e}", self.path.display())
                 })?;
-            let bytes = schema.to_json_bytes().map_err(|e| format!("{}: {e}", self.path.display()))?;
             self.writer
                 .add_record(&bytes)
                 .map_err(|e| {
@@ -105,7 +125,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         {
-            let mut writer = SlabWriter::open(&path, 16, None, 1, None).unwrap();
+            let mut writer = SlabWriter::open(&path, 16, None, 1, None, Some(ElementType::F32)).unwrap();
             for (ordinal, data) in &records {
                 writer.write_record(*ordinal, data);
             }
@@ -115,6 +135,7 @@ mod tests {
         // Read back
         let mut reader = SlabReader::open(&path).unwrap();
         assert_eq!(reader.dimension(), 4);
+        assert_eq!(reader.element_type(), Some(ElementType::F32));
         assert_eq!(reader.record_count(), Some(10));
 
         for (i, (_ordinal, expected_data)) in records.iter().enumerate() {
@@ -156,7 +177,7 @@ mod tests {
         let path = tmp.path().to_path_buf();
         {
             let mut writer =
-                SlabWriter::open(&path, 16, None, 1, Some(schema.clone())).unwrap();
+                SlabWriter::open(&path, 16, None, 1, Some(schema.clone()), None).unwrap();
             writer.write_record(0, b"content-0");
             writer.write_record(1, b"content-1");
             writer.write_record(2, b"content-2");
@@ -179,6 +200,18 @@ mod tests {
         assert!(schema_reader.get(1).is_err(), "schema namespace has exactly one record");
     }
 
+    /// A metadata sidecar and an element type describe different
+    /// records; the writer refuses the pair rather than drop one.
+    #[test]
+    fn test_slab_refuses_a_metadata_sidecar_with_an_element_type() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let schema = MetadataSchema::new("parquet:/test/source", vec![]);
+        let err = SlabWriter::open(tmp.path(), 4, None, 1, Some(schema), Some(ElementType::F32))
+            .err()
+            .unwrap();
+        assert!(err.contains("not f32 vectors"), "{err}");
+    }
+
     #[test]
     fn test_slab_many_records() {
         let records: Vec<Vec<u8>> = (0..100)
@@ -188,7 +221,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         {
-            let mut writer = SlabWriter::open(&path, 16, Some(512), 1, None).unwrap();
+            let mut writer = SlabWriter::open(&path, 16, Some(512), 1, None, Some(ElementType::U8)).unwrap();
             for (i, data) in records.iter().enumerate() {
                 writer.write_record(i as i64, data);
             }
@@ -197,6 +230,7 @@ mod tests {
 
         let mut reader = SlabReader::open(&path).unwrap();
         assert_eq!(reader.record_count(), Some(100));
+        assert_eq!((reader.dimension(), reader.element_type()), (16, Some(ElementType::U8)));
 
         for i in 0..100 {
             let data = reader.next_record().unwrap();
