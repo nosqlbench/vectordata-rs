@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use veks_io::VecFormat;
 use veks_core::formats::reader;
-use veks_core::formats::writer::{self, SinkConfig};
+use veks_io::sink::{self as writer, SinkConfig};
 use veks_core::formats::StandardFacet as Facet;
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,

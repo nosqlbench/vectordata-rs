@@ -2889,12 +2889,61 @@ pub fn run(mut args: ImportArgs) {
 // Identity symlinks for canonical profile layout
 // ---------------------------------------------------------------------------
 
+/// Remove the Identity links a previous import made where this plan now
+/// materializes the artifact: a link at a path a step will write.
+///
+/// The import made those links, so it is the one that knows they are
+/// its own and that the new plan replaces them; writers refuse a
+/// symlink target rather than guess (srd-crate-boundaries.md FL-3).
+/// Only symlinks are removed, never a file, and each removal is said.
+fn unlink_superseded_identity_links(output_dir: &std::path::Path, slots: &PipelineSlots) -> Vec<std::path::PathBuf> {
+    let mut outputs: Vec<&Artifact> = vec![&slots.all_vectors, &slots.prepare, &slots.base_vectors];
+    outputs.extend(slots.query_vectors.iter());
+    outputs.extend(slots.knn.iter());
+    outputs.extend(slots.filtered_knn.iter());
+    if let Some(m) = &slots.metadata {
+        outputs.extend([&m.metadata_all, &m.metadata_content, &m.predicates, &m.predicate_indices]);
+    }
+    let mut paths: Vec<std::path::PathBuf> = outputs
+        .into_iter()
+        .filter_map(|a| match a {
+            Artifact::Materialized { output, .. } if !output.is_empty() && !output.contains('$') => {
+                Some(output_dir.join(output))
+            }
+            _ => None,
+        })
+        .collect();
+    // Ground truth's distances are written beside its indices, by the same step.
+    if let Some(Artifact::Materialized { output, .. }) = &slots.knn
+        && let Some(dir) = output_dir.join(output).parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        paths.extend(entries.flatten().map(|e| e.path()).filter(|p| {
+            p.file_stem().and_then(|s| s.to_str()) == Some("neighbor_distances")
+        }));
+    }
+    let mut removed = Vec::new();
+    for path in paths {
+        if path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    println!("  Unlinked {}: this plan produces it", crate::check::rel_display(&path));
+                    removed.push(path);
+                }
+                Err(e) => eprintln!("  Warning: failed to unlink {}: {e}", path.display()),
+            }
+        }
+    }
+    removed
+}
+
 /// Create symlinks in `profiles/base/` for source files that are used as-is
 /// (Identity artifacts). Only creates symlinks for Identity artifacts —
 /// Materialized artifacts will be created by pipeline steps and must NOT
 /// have symlinks that point to source data (writes through symlinks
 /// would destroy the original data).
 fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slots: &PipelineSlots) {
+    unlink_superseded_identity_links(output_dir, slots);
     // In classic mode, symlinks go directly in the dataset root
     let base_dir = if args.classic {
         output_dir.to_path_buf()
@@ -3585,6 +3634,42 @@ fn count_identity(slots: &PipelineSlots) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// **A new plan unlinks the import's own superseded Identity link**:
+    /// where this plan materializes the base, the link a previous import
+    /// made there is removed before any step writes; a regular file at
+    /// another output, and the linked source, are left alone.
+    #[test]
+    fn a_materialized_artifact_unlinks_the_previous_identity_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.fvecs");
+        std::fs::write(&source, b"source").unwrap();
+        let base_dir = dir.path().join("profiles/base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::os::unix::fs::symlink(&source, base_dir.join("base_vectors.fvecs")).unwrap();
+        std::fs::write(base_dir.join("query_vectors.fvecs"), b"made").unwrap();
+        let id = || super::Artifact::Identity { path: String::new() };
+        let made = |p: &str| super::Artifact::Materialized { step_id: "s".into(), output: p.into() };
+        let slots = super::PipelineSlots {
+            all_vectors: id(),
+            prepare: id(),
+            vector_count: id(),
+            self_search: false,
+            combined_bq: false,
+            shuffle: None,
+            query_vectors: Some(made("profiles/base/query_vectors.fvecs")),
+            base_vectors: made("profiles/base/base_vectors.fvecs"),
+            base_count: None,
+            metadata: None,
+            knn: None,
+            filtered_knn: None,
+        };
+        let removed = super::unlink_superseded_identity_links(dir.path(), &slots);
+        assert_eq!(removed, vec![base_dir.join("base_vectors.fvecs")]);
+        assert!(!base_dir.join("base_vectors.fvecs").exists(), "the link is gone");
+        assert_eq!(std::fs::read(base_dir.join("query_vectors.fvecs")).unwrap(), b"made", "a file is never removed");
+        assert_eq!(std::fs::read(&source).unwrap(), b"source");
+    }
+
     /// **An HDF5 source is named as one**, file or `file.h5#dataset`,
     /// so the import refuses it plainly instead of failing on a format
     /// it cannot detect (srd-crate-boundaries.md Q8).

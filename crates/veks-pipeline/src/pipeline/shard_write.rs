@@ -5,7 +5,7 @@
 //!
 //! The second of this crate's two output seams. Record-oriented
 //! commands go through
-//! [`open_sink`](veks_core::formats::writer::open_sink), which shards
+//! [`open_sink`](veks_io::sink::open_sink), which shards
 //! by decorating a sink; the commands here write `[dim][elements]`
 //! straight into a buffered file, and this is what caps *those*.
 //!

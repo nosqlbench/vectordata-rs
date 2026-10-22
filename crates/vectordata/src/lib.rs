@@ -270,7 +270,7 @@ pub(crate) mod transport;
 pub use veks_apicore::model;
 pub mod io;
 pub mod access;
-pub mod metadata_schema;
+pub use veks_apicore::metadata_schema;
 pub mod typed_access;
 pub mod view;
 pub mod verify;

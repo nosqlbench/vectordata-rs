@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Library API. Schema descriptors for slab files (the `:schema` namespace).
+//! Schema descriptors for slab files (the `:schema` namespace).
 //!
 //! Every typed slab produced by the toolchain carries a single-
 //! record sidecar in a dedicated `schema` namespace describing
@@ -167,7 +167,7 @@ fn now_epoch_secs() -> u64 {
 /// originating `PNode::Display` vernacular string (with `?`
 /// placeholders where comparand values were drawn from a survey)
 /// so any tool that can parse the Display grammar — see
-/// [`veks_anode::pnode::from_display`] — can recover the
+/// `veks_anode::pnode::from_display` — can recover the
 /// structural shape of every record without scanning the content
 /// namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

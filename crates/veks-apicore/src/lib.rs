@@ -31,7 +31,8 @@
 //!
 //! The vocabulary those contracts name is here too: the dataset
 //! descriptor model ([`dataset`], [`model`]), locations ([`Location`]),
-//! fetch plans and reports ([`fetch`]), verification reports
+//! slab schema sidecars ([`metadata_schema`]), fetch plans and reports
+//! ([`fetch`]), verification reports
 //! ([`verify`]), attribute provenance ([`overlay`]), and the errors
 //! ([`Error`], [`IoError`]). The element model is `veks-datatypes`',
 //! re-exported here.
@@ -55,6 +56,7 @@ pub mod dataset;
 pub mod error;
 pub mod fetch;
 pub mod location;
+pub mod metadata_schema;
 pub mod model;
 pub mod overlay;
 pub mod progress;

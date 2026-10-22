@@ -1,15 +1,19 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vector data writers for various formats.
-
-pub mod mmap_xvec;
-pub mod sharded;
-pub mod slab;
+//! Opening a writer for any writable format, from a [`SinkConfig`]:
+//! one file, or a series of shards capped in size
+//! ([`ShardedSink`](crate::crate::sharded::ShardedSink)) when the config says
+//! so.
 
 use std::path::Path;
 
-use veks_io::{VecFormat, VecSink};
+use crate::format::VecFormat;
+use crate::traits::VecSink;
+
+/// Bytes a slab spends per record beyond its payload: one entry in
+/// the page's offset array.
+pub const SLAB_RECORD_FRAMING: u64 = 4;
 
 /// Configuration for opening a sink writer
 pub struct SinkConfig {
@@ -27,7 +31,7 @@ pub struct SinkConfig {
     /// Optional schema descriptor to emit alongside the content
     /// records as a `:schema` namespace sidecar. Honored only by slab
     /// sinks; other formats ignore it.
-    pub schema_sidecar: Option<vectordata::metadata_schema::MetadataSchema>,
+    pub schema_sidecar: Option<veks_apicore::metadata_schema::MetadataSchema>,
     /// Cap on one output file. A facet that would exceed it is
     /// written as a multi-file series instead (SH-35).
     ///
@@ -46,7 +50,7 @@ impl SinkConfig {
     /// into it, and a slab has no element width of its own.
     pub fn record_bytes(&self, format: VecFormat) -> Option<u64> {
         if format == VecFormat::Slab {
-            Some(self.slab_record_payload() as u64 + super::SLAB_RECORD_FRAMING)
+            Some(self.slab_record_payload() as u64 + SLAB_RECORD_FRAMING)
         } else {
             format.record_bytes(self.dimension)
         }
@@ -69,10 +73,10 @@ impl SinkConfig {
     /// not a fixed quantity, or when the cap is roomy enough that a
     /// stride would be meaningless — in every case the caller writes
     /// one file, which is what it did before.
-    pub fn shard_plan(&self, format: VecFormat) -> Option<vectordata::dataset::ShardPlan> {
+    pub fn shard_plan(&self, format: VecFormat) -> Option<veks_apicore::dataset::ShardPlan> {
         let max = self.max_shard_bytes?;
         let record = self.record_bytes(format)?;
-        vectordata::dataset::shard_sizing::plan_fixed(max, record)
+        veks_apicore::dataset::shard_sizing::plan_fixed(max, record)
     }
 }
 
@@ -107,7 +111,7 @@ pub fn open_sharded_sink(
     format: VecFormat,
     config: &SinkConfig,
     stride: u64,
-) -> Result<Box<sharded::ShardedSink>, String> {
+) -> Result<Box<crate::sharded::ShardedSink>, String> {
     Ok(Box::new(sharded_sink(path, format, config, stride)?))
 }
 
@@ -116,7 +120,7 @@ fn sharded_sink(
     format: VecFormat,
     config: &SinkConfig,
     stride: u64,
-) -> Result<sharded::ShardedSink, String> {
+) -> Result<crate::sharded::ShardedSink, String> {
     // The per-shard config is this one with the cap removed: a shard
     // is an ordinary file, and leaving the cap on would make each
     // shard try to shard itself.
@@ -125,7 +129,7 @@ fn sharded_sink(
         schema_sidecar: config.schema_sidecar.clone(),
         ..*config
     };
-    sharded::ShardedSink::open(
+    crate::sharded::ShardedSink::open(
         path,
         stride,
         Box::new(move |p: &Path| open_one_file(p, format, &per_shard)),
@@ -139,15 +143,16 @@ fn open_one_file(
     config: &SinkConfig,
 ) -> Result<Box<dyn VecSink>, String> {
     match format {
-        VecFormat::Slab => slab::SlabWriter::open(
+        #[cfg(feature = "slab")]
+        VecFormat::Slab => crate::slab::writer::SlabWriter::open(
             path,
             config.slab_record_payload(),
             config.slab_page_size,
             config.slab_namespace,
             config.schema_sidecar.clone(),
         ),
-        _ if format.is_xvec() => veks_io::xvec::writer::open(path, config.dimension),
-        _ if format.is_scalar() => veks_io::scalar::writer::open(path, format),
+        _ if format.is_uniform_xvec() => crate::xvec::writer::open(path, config.dimension),
+        _ if format.is_scalar() => crate::scalar::writer::open(path, format),
         _ => Err(format!("{} is not a supported output format", format)),
     }
 }

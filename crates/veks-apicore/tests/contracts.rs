@@ -96,6 +96,7 @@ const COLD_MODULES: &[(&str, &str)] = &[
     ("error.rs", "built only on the error path (PR-6)"),
     ("fetch.rs", "fetch planning and per-range execution"),
     ("location.rs", "parsing a location at open"),
+    ("metadata_schema.rs", "a slab's schema sidecar, read or written once"),
     ("model.rs", "descriptor model, at load"),
     ("overlay.rs", "attribute provenance, at load"),
     ("records.rs", "record facets: a page per record, through dyn containers by design"),

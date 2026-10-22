@@ -7,7 +7,7 @@ use std::path::Path;
 
 use slabtastic::{OpenProgress, SlabBatchIter, SlabReader as SlabtasticReader};
 
-use super::VecSource;
+use crate::traits::VecSource;
 
 /// Reads a `.slab` file containing vector data using the `slabtastic` crate.
 ///

@@ -6,7 +6,7 @@
 pub mod npy;
 pub mod parquet;
 pub mod parquet_mnode;
-pub mod slab;
+
 
 use std::path::Path;
 
@@ -72,7 +72,7 @@ pub fn open_source(path: &Path, format: VecFormat, threads: usize, max_count: Op
     match format {
         VecFormat::Npy => npy::NpyDirReader::open(path, threads, max_count),
         VecFormat::Parquet => parquet::ParquetDirReader::open(path, threads),
-        VecFormat::Slab => slab::SlabReader::open(path),
+        VecFormat::Slab => veks_io::slab::reader::SlabReader::open(path),
         _ => Err(format!("{} format not supported for reading", format)),
     }
 }

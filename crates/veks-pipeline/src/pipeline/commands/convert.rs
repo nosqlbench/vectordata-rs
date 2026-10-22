@@ -17,7 +17,7 @@ use veks_datatypes::{Element, ElementConversion, ElementKind, FloatFormat};
 use crate::pipeline::element_type::ElementType;
 use veks_core::formats::parquet_vector_compiler;
 use veks_core::formats::reader;
-use veks_core::formats::writer::{self, SinkConfig};
+use veks_io::sink::{self as writer, SinkConfig};
 use crate::pipeline::command::{
     ArtifactManifest, ArtifactState, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole,
     Options, ResourceDesc, Status, StreamContext, render_options_table,
@@ -446,7 +446,7 @@ Convert with explicit source format override:
             // Pre-allocate output file
             log::debug!("pre-allocating {} ...", format_size(total_bytes));
             let alloc_start = Instant::now();
-            let mmap_writer = match veks_core::formats::writer::mmap_xvec::MmapXvecWriter::create(
+            let mmap_writer = match veks_io::xvec::positional::PositionalXvecWriter::create(
                 &output_path, dimension, dst_element_size, total,
             ) {
                 Ok(w) => w,
@@ -454,7 +454,7 @@ Convert with explicit source format override:
             };
             log::debug!("pre-allocation done ({:.1}s)",
                 alloc_start.elapsed().as_secs_f64());
-            let shared_writer = veks_core::formats::writer::mmap_xvec::SharedMmapWriter::new(mmap_writer);
+            let shared_writer = veks_io::xvec::positional::SharedPositionalWriter::new(mmap_writer);
 
             let pb = ctx.ui.bar(total, "converting records");
             let pb_id = pb.id();

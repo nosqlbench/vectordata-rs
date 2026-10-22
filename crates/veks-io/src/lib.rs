@@ -110,6 +110,7 @@
 // deprecated item's own example may, and it says so with an allow.
 #![doc(test(attr(deny(deprecated))))]
 
+pub mod atomic;
 pub mod convert;
 pub mod element;
 pub mod file;
@@ -117,6 +118,10 @@ pub mod format;
 pub mod reader;
 pub mod scalar;
 pub mod series;
+pub mod sharded;
+pub mod sink;
+#[cfg(feature = "slab")]
+pub mod slab;
 pub mod source;
 pub mod traits;
 pub mod writer;

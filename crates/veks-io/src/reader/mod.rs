@@ -24,6 +24,7 @@
 use veks_datatypes::{Container, Element, ElementConversion, ElementType};
 
 mod any;
+mod probe;
 mod scalar;
 mod vvec;
 mod xvec;
@@ -35,6 +36,7 @@ pub use veks_apicore::reader::{
 pub(crate) use veks_apicore::reader::decode_vec;
 pub use any::{open_vec, open_vec_as, open_vec_as_with, open_vec_native, open_vec_native_with, open_vec_with};
 pub use any::{open_vvec, open_vvec_untyped, open_vvec_untyped_with, open_vvec_with};
+pub use probe::{XvecProbe, load_series_offsets, probe_source};
 pub use scalar::ScalarReader;
 pub use vvec::{IndexedVvecReader, load_offsets, remove_vvec_index};
 pub(crate) use vvec::write_offset_index;

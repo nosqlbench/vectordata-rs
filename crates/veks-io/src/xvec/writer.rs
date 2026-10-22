@@ -31,19 +31,10 @@ const WRITE_BUF_SIZE: usize = 16 << 20; // 16 MiB
 /// Bytes written between writeback cycles.
 const WRITEBACK_INTERVAL: u64 = 64 << 20; // 64 MiB
 
-/// Refuse to write `path` when it is a symlink: writing through it
-/// would overwrite whatever it links to (often a dataset's source
-/// data), and removing it would discard a link someone made on
-/// purpose. Which is meant is the caller's to decide, before writing.
+/// [`guard_against_symlink_write`](crate::atomic::guard_against_symlink_write)
+/// as the writers' `String` error.
 pub(crate) fn refuse_symlink(path: &Path) -> Result<(), String> {
-    if path.is_symlink() {
-        let to = std::fs::read_link(path).map(|t| t.display().to_string()).unwrap_or_else(|_| "?".into());
-        return Err(format!(
-            "{} is a symlink (to {to}); writers do not write through or remove a link: remove it or write elsewhere",
-            path.display()
-        ));
-    }
-    Ok(())
+    crate::atomic::guard_against_symlink_write(path).map_err(|e| e.to_string())
 }
 
 /// Open an xvec file for sequential writing.

@@ -147,6 +147,47 @@ impl<T: Element> XvecWriter<T> {
         rows.chunks_exact(self.dim).try_for_each(|row| self.write(row))
     }
 
+    /// Write records already in this file's layout — each `[dim: i32]`
+    /// then `dim` elements of `T`, little-endian — in one write: a batch
+    /// a caller packed itself ([`encode_records`]) or copied from another
+    /// file of the same layout. Every header must be this file's
+    /// dimension, and the bytes a whole number of records.
+    ///
+    /// ```
+    /// use veks_io::writer::{XvecWriter, encode_records};
+    /// use veks_io::{VectorReader, XvecReader};
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// let path = dir.path().join("gt.ivecs");
+    /// let mut packed = Vec::new();
+    /// encode_records(&[1i32, 2, 3, 4, 5, 6], 3, &mut packed).unwrap();
+    ///
+    /// let mut w = XvecWriter::<i32>::create(&path, 3).unwrap();
+    /// w.write_raw(&packed).unwrap();
+    /// assert!(w.write_raw(&packed[..10]).is_err(), "not a whole record");
+    /// assert_eq!(w.finish().unwrap(), 2);
+    /// assert_eq!(XvecReader::<i32>::open_path(&path).unwrap().get(1).unwrap(), vec![4, 5, 6]);
+    /// ```
+    pub fn write_raw(&mut self, records: &[u8]) -> Result<(), IoError> {
+        let record_bytes = 4 + self.dim * T::SIZE;
+        if !records.len().is_multiple_of(record_bytes) {
+            return Err(IoError::InvalidFormat(format!(
+                "{} bytes is not a whole number of {record_bytes}-byte records ({})",
+                records.len(),
+                self.path.display()
+            )));
+        }
+        if let Some((k, _)) = records.chunks_exact(record_bytes).enumerate().find(|(_, r)| r[..4] != self.header) {
+            return Err(IoError::InvalidFormat(format!(
+                "record {k} of the batch does not carry dimension {} ({})",
+                self.dim,
+                self.path.display()
+            )));
+        }
+        self.out.write_all(records)?;
+        self.records += (records.len() / record_bytes) as u64;
+        Ok(())
+    }
+
     /// Rows written so far.
     pub fn records(&self) -> u64 {
         self.records
@@ -157,6 +198,30 @@ impl<T: Element> XvecWriter<T> {
         self.out.flush()?;
         Ok(self.records)
     }
+}
+
+/// Append `rows` — `dim`-element rows packed end to end — to `out` as
+/// xvec records (`[dim: i32]` then the elements, little-endian), for
+/// one bulk write ([`XvecWriter::write_raw`], or a positional write of a
+/// batch).
+pub fn encode_records<T: Element>(rows: &[T], dim: usize, out: &mut Vec<u8>) -> Result<(), IoError> {
+    let header = i32::try_from(dim)
+        .ok()
+        .filter(|&d| d > 0)
+        .ok_or_else(|| IoError::InvalidFormat(format!("dimension {dim} is not 1 to {}", i32::MAX)))?
+        .to_le_bytes();
+    if !rows.len().is_multiple_of(dim) {
+        return Err(IoError::InvalidFormat(format!(
+            "{} elements is not a whole number of {dim}-element rows",
+            rows.len()
+        )));
+    }
+    out.reserve(rows.len() / dim * (4 + dim * T::SIZE));
+    for row in rows.chunks_exact(dim) {
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&le_bytes(row));
+    }
+    Ok(())
 }
 
 /// Values of `T` packed with no header into a column (`.u8`, `.i32`,

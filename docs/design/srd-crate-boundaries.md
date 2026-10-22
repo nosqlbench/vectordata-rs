@@ -389,7 +389,14 @@ writer, naming the link and what it points to: writing through it
 would overwrite what it links to (often source data), and removing it
 would discard a link someone made on purpose. veks-core's writer
 removed one silently (from a bulk commit, 26c0ea2, with no stated
-rule); that is not carried over. Decided 2026-10-22.
+rule); that is not carried over. The pipeline's
+`guard_against_symlink_write`, which did the same in twelve files, is
+veks-io's now (`veks_io::atomic`, with `AtomicWriter` and the `safe_*`
+helpers) and errors too; the atomic writer refuses a symlink final
+path, since its rename would replace the link. The process that made a
+link removes it itself, explicitly, when it replaces it: the import
+unlinks its own Identity link where a new plan materializes that
+artifact, before any step writes, and says so. Decided 2026-10-22.
 
 **FL-4 — The gaps G1–G5 become veks-io calls.**
 - G1: `probe_source(&impl ByteSource)` reads the header and stride

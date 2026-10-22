@@ -19,7 +19,7 @@ use memmap2::MmapMut;
 ///
 /// Multiple threads can call `write_record_at` simultaneously for
 /// different ordinals — each write targets a non-overlapping byte range.
-pub struct MmapXvecWriter {
+pub struct PositionalXvecWriter {
     mmap: MmapMut,
     /// Bytes per record: 4 (dim header) + dim * element_size.
     record_stride: usize,
@@ -34,15 +34,15 @@ pub struct MmapXvecWriter {
 /// Wraps the writer in an `Arc` so multiple threads can hold references.
 /// Safety: writes to disjoint byte ranges are safe with `MmapMut` because
 /// each thread writes to a unique ordinal range.
-pub struct SharedMmapWriter {
-    inner: Arc<MmapXvecWriter>,
+pub struct SharedPositionalWriter {
+    inner: Arc<PositionalXvecWriter>,
 }
 
 // MmapMut is Send but not Sync. We guarantee disjoint access by ordinal,
 // so sharing across threads is safe.
-unsafe impl Sync for SharedMmapWriter {}
+unsafe impl Sync for SharedPositionalWriter {}
 
-impl MmapXvecWriter {
+impl PositionalXvecWriter {
     /// Create a new mmap writer.
     ///
     /// Pre-allocates the file to `total_records * record_stride` bytes
@@ -110,7 +110,7 @@ impl MmapXvecWriter {
             let _ = mmap.advise(memmap2::Advice::WillNeed);
         }
 
-        Ok(MmapXvecWriter {
+        Ok(PositionalXvecWriter {
             mmap,
             record_stride,
             dimension,
@@ -191,10 +191,10 @@ impl MmapXvecWriter {
     }
 }
 
-impl SharedMmapWriter {
-    /// Create a shared writer from an `MmapXvecWriter`.
-    pub fn new(writer: MmapXvecWriter) -> Self {
-        SharedMmapWriter { inner: Arc::new(writer) }
+impl SharedPositionalWriter {
+    /// Create a shared writer from an `PositionalXvecWriter`.
+    pub fn new(writer: PositionalXvecWriter) -> Self {
+        SharedPositionalWriter { inner: Arc::new(writer) }
     }
 
     /// Write a record at the given ordinal. Thread-safe for disjoint ordinals.
@@ -218,7 +218,7 @@ impl SharedMmapWriter {
 
     /// Clone the shared handle for another thread.
     pub fn clone_handle(&self) -> Self {
-        SharedMmapWriter { inner: Arc::clone(&self.inner) }
+        SharedPositionalWriter { inner: Arc::clone(&self.inner) }
     }
 
     /// Total number of records the underlying writer was sized for.
@@ -270,7 +270,7 @@ mod tests {
         let elem_size = 4; // f32
         let total = 5u64;
 
-        let writer = MmapXvecWriter::create(&path, dim, elem_size, total).unwrap();
+        let writer = PositionalXvecWriter::create(&path, dim, elem_size, total).unwrap();
 
         for i in 0..total {
             let val = (i + 1) as f32;
@@ -301,8 +301,8 @@ mod tests {
         let elem_size = 4;
         let total = 1000u64;
 
-        let writer = MmapXvecWriter::create(&path, dim, elem_size, total).unwrap();
-        let shared = SharedMmapWriter::new(writer);
+        let writer = PositionalXvecWriter::create(&path, dim, elem_size, total).unwrap();
+        let shared = SharedPositionalWriter::new(writer);
 
         // Spawn threads that each write a disjoint range
         let num_threads = 8;
@@ -353,8 +353,8 @@ mod tests {
         let total = 2000u64;
         let num_threads = 16usize;
 
-        let writer = MmapXvecWriter::create(&path, dim, elem_size, total).unwrap();
-        let shared = SharedMmapWriter::new(writer);
+        let writer = PositionalXvecWriter::create(&path, dim, elem_size, total).unwrap();
+        let shared = SharedPositionalWriter::new(writer);
 
         let mut handles = Vec::new();
         for t in 0..num_threads {
@@ -396,8 +396,8 @@ mod tests {
         let elem_size = 4;
         let total = 100u64;
 
-        let writer = MmapXvecWriter::create(&path, dim, elem_size, total).unwrap();
-        let shared = SharedMmapWriter::new(writer);
+        let writer = PositionalXvecWriter::create(&path, dim, elem_size, total).unwrap();
+        let shared = SharedPositionalWriter::new(writer);
 
         let mut handles = Vec::new();
         for t in 0..4 {
@@ -445,7 +445,7 @@ mod tests {
         let total = 500u64;
         let expected_size = total * (4 + dim as u64 * elem_size as u64);
 
-        let writer = MmapXvecWriter::create(&path, dim, elem_size, total).unwrap();
+        let writer = PositionalXvecWriter::create(&path, dim, elem_size, total).unwrap();
         writer.finish().unwrap();
 
         let actual_size = std::fs::metadata(&path).unwrap().len();
@@ -461,7 +461,7 @@ mod tests {
         let elem_size = 4;
         let total = 100u64;
 
-        let writer = MmapXvecWriter::create(&path, dim, elem_size, total).unwrap();
+        let writer = PositionalXvecWriter::create(&path, dim, elem_size, total).unwrap();
         let stride = writer.record_stride();
 
         for i in 0..total {

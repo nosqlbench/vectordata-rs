@@ -5,7 +5,7 @@
 //! (SRD element-access §13.10): zero, one, the type's extremes, and
 //! for a float a negative, a subnormal, both infinities and a NaN.
 
-use vectordata::typed_access::{Element, bf16, f16};
+use veks_io::{Element, bf16, f16};
 
 /// The values a test feeds through a reader, writer or command at `Self`.
 pub trait Samples: Element {

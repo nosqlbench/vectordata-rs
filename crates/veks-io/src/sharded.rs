@@ -26,15 +26,15 @@
 
 use std::path::{Path, PathBuf};
 
-use vectordata::dataset::{shard_name, shard_source_spec};
+use veks_apicore::dataset::shards::{shard_name, shard_source_spec};
 
-use super::VecSink;
+use crate::traits::VecSink;
 
 /// Opens the sink for one shard file.
 ///
 /// Taken as a closure rather than a format, so this decorator works
 /// for anything writable — including sinks a caller configures itself
-/// — without a second dispatch table beside [`super::open_sink`].
+/// — without a second dispatch table beside [`crate::sink::open_sink`].
 pub type ShardOpener = Box<dyn Fn(&Path) -> Result<Box<dyn VecSink>, String> + Send>;
 
 /// What a completed sharded write produced.
@@ -256,8 +256,8 @@ impl VecSink for ShardedSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use veks_io::VecFormat;
-    use crate::formats::writer::{SinkConfig, open_sink};
+    use crate::VecFormat;
+    use crate::sink::{SinkConfig, open_sink};
 
     fn config(dim: u32) -> SinkConfig {
         SinkConfig {
@@ -461,6 +461,7 @@ mod tests {
     /// A slab series shards the same way an xvec one does — the point
     /// of decorating the sink rather than teaching each format.
     #[test]
+    #[cfg(feature = "slab")]
     fn a_slab_facet_shards_through_the_same_decorator() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("metadata_content.slab");

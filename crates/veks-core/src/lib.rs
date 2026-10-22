@@ -9,11 +9,11 @@
 //! it. It holds what both the CLI and the pipeline need but neither
 //! should own:
 //!
-//! - [`formats`] — [`formats::reader`] and [`formats::writer`] for xvec,
-//!   npy, parquet and slab sources and sinks, the facet → format choice
-//!   ([`formats::preferred_vec_format`]), and the parquet compilers that
-//!   turn columnar metadata into MNode records. The format model itself
-//!   (`VecFormat`, the streaming traits, element conversion) is veks-io's.
+//! - [`formats`] — [`formats::reader`] for npy and parquet sources, the
+//!   facet → format choice ([`formats::preferred_vec_format`]), and the
+//!   parquet compilers that turn columnar metadata into MNode records.
+//!   The format layer itself (`VecFormat`, the streaming traits, the
+//!   readers, writers and sinks, element conversion) is veks-io's.
 //! - [`ui`] — the progress and logging abstraction every long-running
 //!   command reports through: a [`ui::UiHandle`] fronting a pluggable
 //!   [`ui::UiSink`] (ratatui, plain text, headless, or a capturing test
@@ -47,5 +47,3 @@ pub mod paths;
 pub mod term;
 pub mod ui;
 
-#[cfg(test)]
-pub(crate) mod test_support;

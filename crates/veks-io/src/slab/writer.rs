@@ -6,9 +6,9 @@
 use std::path::{Path, PathBuf};
 
 use slabtastic::{SlabWriter as SlabtasticWriter, WriterConfig};
-use vectordata::metadata_schema::{MetadataSchema, SCHEMA_NAMESPACE};
+use veks_apicore::metadata_schema::{MetadataSchema, SCHEMA_NAMESPACE};
 
-use super::VecSink;
+use crate::traits::VecSink;
 
 /// Writes a slab file using the `slabtastic` crate.
 ///
@@ -85,7 +85,7 @@ impl VecSink for SlabWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::reader::slab::SlabReader;
+    use crate::slab::reader::SlabReader;
 
     #[test]
     fn test_slab_write_read_roundtrip() {
@@ -130,7 +130,7 @@ mod tests {
     /// content namespace untouched.
     #[test]
     fn test_slab_writes_schema_sidecar() {
-        use vectordata::metadata_schema::{
+        use veks_apicore::metadata_schema::{
             MetadataSchema, SchemaField, SCHEMA_NAMESPACE,
         };
 
