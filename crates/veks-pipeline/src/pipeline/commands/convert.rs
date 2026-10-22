@@ -268,6 +268,7 @@ Convert with explicit source format override:
         // bytes as they are.
         let src_ty = source_format
             .element_type()
+            .or(source.element_type())
             .unwrap_or_else(|| veks_core::formats::element_type_of_width(src_element_size));
         let plan = match to_format.element_type() {
             Some(dst_ty) if dst_ty != src_ty => match ElementPlan::for_pair(src_ty, dst_ty) {
@@ -415,7 +416,7 @@ Convert with explicit source format override:
 
             // Scan npy manifest for per-file offsets
             ctx.ui.log("  scanning npy headers...");
-            let (mut manifest, _dim, _total) = match veks_core::formats::reader::npy::scan_npy_manifest(&source_path) {
+            let (mut manifest, _dim, _total) = match veks_io::npy::scan_npy_manifest(&source_path) {
                 Ok(m) => m,
                 Err(e) => return error_result(format!("failed to scan npy manifest: {}", e), start),
             };
@@ -476,7 +477,7 @@ Convert with explicit source format override:
             /// 768-dim f16 ≈ 12 MiB per chunk.
             const CHUNK_ROWS: usize = 8192;
 
-            let dtype = match veks_core::formats::reader::npy::scan_npy_headers(&source_path, None) {
+            let dtype = match veks_io::npy::scan_npy_headers(&source_path, None) {
                 Ok(s) => s.dtype,
                 Err(e) => return error_result(e, start),
             };
@@ -498,7 +499,7 @@ Convert with explicit source format override:
             struct LoadedFile {
                 offset: u64,
                 rows: u64,
-                array: veks_core::formats::reader::npy::NpyArrayData,
+                array: veks_io::npy::NpyArrayData,
             }
 
             /// A chunk of rows within a loaded file. Multiple chunks reference
@@ -534,7 +535,7 @@ Convert with explicit source format override:
                                 Some(e) => e,
                                 None => break,
                             };
-                            match veks_core::formats::reader::npy::load_npy(&entry.path, dt) {
+                            match veks_io::npy::load_npy(&entry.path, dt) {
                                 Ok(array) => {
                                     let file = std::sync::Arc::new(LoadedFile {
                                         offset: entry.offset,

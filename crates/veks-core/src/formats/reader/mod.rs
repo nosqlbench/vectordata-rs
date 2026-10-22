@@ -1,12 +1,11 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vector data readers for various formats.
+//! Opening any source by format, and by facet: metadata parquet goes to
+//! the MNode reader here ([`parquet_mnode`]), every other format to
+//! veks-io's readers.
 
-pub mod npy;
-pub mod parquet;
 pub mod parquet_mnode;
-
 
 use std::path::Path;
 
@@ -20,7 +19,7 @@ use crate::formats::StandardFacet;
 /// since those are already lightweight.
 pub fn probe_source(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
     match format {
-        VecFormat::Npy => npy::NpyDirReader::probe(path),
+        VecFormat::Npy => veks_io::npy::NpyDirReader::probe(path),
         VecFormat::Slab => probe_slab(path),
         _ => {
             // Other formats are lightweight to open — just open and extract
@@ -29,6 +28,7 @@ pub fn probe_source(path: &Path, format: VecFormat) -> Result<SourceMeta, String
                 dimension: source.dimension(),
                 element_size: source.element_size(),
                 record_count: source.record_count(),
+                element_type: source.element_type(),
             })
         }
     }
@@ -47,13 +47,15 @@ fn probe_slab(path: &Path) -> Result<SourceMeta, String> {
         return Err("Empty slab file".to_string());
     }
 
-    // Assume f32 elements (4 bytes each) as default
+    // A slab's records are opaque: read as vectors they are taken
+    // 4 bytes wide, and the element type is not claimed.
     let dimension = (stats.first_record_size / 4) as u32;
 
     Ok(SourceMeta {
         dimension,
         element_size: 4,
         record_count: Some(stats.total_records),
+        element_type: None,
     })
 }
 
@@ -70,8 +72,8 @@ pub fn open_source(path: &Path, format: VecFormat, threads: usize, max_count: Op
         return veks_io::scalar::reader::open(path, format);
     }
     match format {
-        VecFormat::Npy => npy::NpyDirReader::open(path, threads, max_count),
-        VecFormat::Parquet => parquet::ParquetDirReader::open(path, threads),
+        VecFormat::Npy => veks_io::npy::NpyDirReader::open(path, threads, max_count),
+        VecFormat::Parquet => veks_io::parquet::ParquetDirReader::open(path, threads),
         VecFormat::Slab => veks_io::slab::reader::SlabReader::open(path),
         _ => Err(format!("{} format not supported for reading", format)),
     }

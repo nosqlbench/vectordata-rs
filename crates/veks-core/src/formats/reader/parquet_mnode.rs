@@ -136,6 +136,7 @@ impl ParquetMnodeReader {
             dimension: 0,
             element_size: 1,
             record_count: Some(total_rows),
+            element_type: None,
         })
     }
 

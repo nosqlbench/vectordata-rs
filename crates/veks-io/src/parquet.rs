@@ -1,8 +1,10 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parquet vector reader — reads directories of `.parquet` files containing
-//! list-of-float vector columns and emits raw LE vector bytes.
+//! Parquet vector reader (the `parquet` feature) — reads a `.parquet`
+//! file or a directory of them whose first list column (`List`,
+//! `LargeList` or `FixedSizeList`) holds numbers, and emits each row as
+//! raw little-endian bytes at that column's element type.
 //!
 //! A configurable pool of background workers loads parquet files in parallel
 //! while an adaptive prefetch gate controls how far ahead they may read.
@@ -10,8 +12,8 @@
 //! that row ordering is deterministic regardless of which worker finishes
 //! first.
 //!
-//! On little-endian platforms, vector rows are extracted via zero-copy from
-//! the Arrow `Float32Array` backing buffer, avoiding per-element conversion.
+//! On little-endian platforms, a row is one copy out of the Arrow value
+//! buffer, avoiding per-element conversion, whatever its element type.
 
 use std::collections::HashMap;
 use std::fs;
@@ -20,11 +22,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 
-use arrow::array::{Array, Float32Array, ListArray};
+use arrow::array::{Array, ListArray};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use super::{SourceMeta, VecSource};
+use crate::traits::{SourceMeta, VecSource};
+use veks_datatypes::ElementType;
 
 /// Maximum number of loaded files held in memory at once.
 ///
@@ -108,6 +111,8 @@ pub struct ParquetDirReader {
     current_row: usize,
     /// Index of the vector column in the parquet schema
     vector_col_idx: usize,
+    /// The element type the vector column's list holds
+    element: ElementType,
     /// Vector dimension (number of elements per record)
     dimension: u32,
     /// Total record count across all files
@@ -153,6 +158,8 @@ impl ParquetDirReader {
 
         // Check for vector column
         let vector_col = find_vector_column(&schema);
+        let element = vector_col.map(|(_, e)| e);
+        let vector_col = vector_col.map(|(i, _)| i);
 
         // Get vector dimension if present (requires reading first batch)
         let (vector_meta, first_file_rows) = if let Some(col_idx) = vector_col {
@@ -171,7 +178,8 @@ impl ParquetDirReader {
 
             let meta = dim.map(|d| SourceMeta {
                 dimension: d,
-                element_size: 4,
+                element_size: element.map_or(4, ElementType::byte_width),
+                element_type: element,
                 record_count: None, // filled in below with total
             });
             (meta, rows)
@@ -231,9 +239,9 @@ impl ParquetDirReader {
 
         let schema = builder.schema().clone();
 
-        // Find the first list-of-float column
-        let vector_col_idx = find_vector_column(&schema).ok_or_else(|| {
-            "No list-of-float column found in parquet schema".to_string()
+        // The first list column of a numeric element type
+        let (vector_col_idx, element) = find_vector_column(&schema).ok_or_else(|| {
+            "No list-of-numbers column found in parquet schema".to_string()
         })?;
 
         // Read first file's batches to determine dimension
@@ -351,6 +359,7 @@ impl ParquetDirReader {
             current_batch_idx: 0,
             current_row: 0,
             vector_col_idx,
+            element,
             dimension,
             record_count: Some(total_rows),
             _workers: workers,
@@ -460,7 +469,11 @@ impl VecSource for ParquetDirReader {
     }
 
     fn element_size(&self) -> usize {
-        4 // parquet vector columns are f32
+        self.element.byte_width()
+    }
+
+    fn element_type(&self) -> Option<ElementType> {
+        Some(self.element)
     }
 
     fn record_count(&self) -> Option<u64> {
@@ -474,11 +487,8 @@ impl VecSource for ParquetDirReader {
                 let batch = &self.current_batches[self.current_batch_idx];
                 if self.current_row < batch.num_rows() {
                     let col = batch.column(self.vector_col_idx);
-                    let list_array = col.as_any().downcast_ref::<ListArray>()?;
-                    let values = list_array.value(self.current_row);
-                    let float_array = values.as_any().downcast_ref::<Float32Array>()?;
-
-                    let bytes = extract_f32_row_bytes(float_array);
+                    let values = list_row(col.as_ref(), self.current_row)?;
+                    let bytes = row_bytes(values.as_ref(), self.element.byte_width());
 
                     self.current_row += 1;
                     return Some(bytes);
@@ -497,30 +507,30 @@ impl VecSource for ParquetDirReader {
     }
 }
 
-/// Extract raw LE bytes from a `Float32Array` row.
-///
-/// On little-endian platforms, the Arrow backing buffer is already contiguous
-/// LE bytes — we cast directly to `&[u8]` and copy once. On big-endian
-/// platforms, falls back to per-element `to_le_bytes()`.
-fn extract_f32_row_bytes(float_array: &Float32Array) -> Vec<u8> {
+/// Row `row` of a list column — `List`, `LargeList` or `FixedSizeList` —
+/// as the array of its elements.
+fn list_row(col: &dyn Array, row: usize) -> Option<arrow::array::ArrayRef> {
+    use arrow::array::{FixedSizeListArray, LargeListArray};
+    if let Some(l) = col.as_any().downcast_ref::<ListArray>() {
+        return Some(l.value(row));
+    }
+    if let Some(l) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+        return Some(l.value(row));
+    }
+    col.as_any().downcast_ref::<LargeListArray>().map(|l| l.value(row))
+}
+
+/// A primitive array's elements as little-endian bytes, `width` each:
+/// one copy out of Arrow's value buffer, whatever the element type.
+fn row_bytes(values: &dyn Array, width: usize) -> Vec<u8> {
+    let data = values.to_data();
+    let start = data.offset() * width;
+    let bytes = &data.buffers()[0].as_slice()[start..start + data.len() * width];
     if cfg!(target_endian = "little") {
-        // Float32Array::values() returns a ScalarBuffer<f32> whose inner
-        // Buffer is contiguous LE f32 values. Cast to &[u8] and copy once.
-        let values = float_array.values();
-        let byte_len = values.len() * 4;
-        let byte_ptr = values.as_ptr() as *const u8;
-        // SAFETY: ScalarBuffer<f32> is a contiguous allocation of f32 values.
-        // On LE platforms, the in-memory layout matches the wire format.
-        // We only read `values.len() * 4` bytes, which is within the
-        // allocation.
-        let byte_slice = unsafe { std::slice::from_raw_parts(byte_ptr, byte_len) };
-        byte_slice.to_vec()
+        bytes.to_vec()
     } else {
-        float_array
-            .values()
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect()
+        // Arrow's buffers are native-endian: reverse each element.
+        bytes.chunks_exact(width).flat_map(|e| e.iter().rev().copied()).collect()
     }
 }
 
@@ -575,18 +585,28 @@ fn format_schema(schema: &Arc<arrow::datatypes::Schema>) -> String {
 }
 
 /// Find the first column in the schema that is a list of floats
-fn find_vector_column(schema: &Arc<arrow::datatypes::Schema>) -> Option<usize> {
+fn find_vector_column(schema: &Arc<arrow::datatypes::Schema>) -> Option<(usize, ElementType)> {
     use arrow::datatypes::DataType;
     for (i, field) in schema.fields().iter().enumerate() {
-        if let DataType::List(inner) = field.data_type()
-            && matches!(inner.data_type(), DataType::Float32) {
-                return Some(i);
-            }
-        // Also check FixedSizeList
-        if let DataType::FixedSizeList(inner, _) = field.data_type()
-            && matches!(inner.data_type(), DataType::Float32) {
-                return Some(i);
-            }
+        let inner = match field.data_type() {
+            DataType::List(inner) | DataType::LargeList(inner) | DataType::FixedSizeList(inner, _) => inner,
+            _ => continue,
+        };
+        let element = match inner.data_type() {
+            DataType::Int8 => ElementType::I8,
+            DataType::UInt8 => ElementType::U8,
+            DataType::Int16 => ElementType::I16,
+            DataType::UInt16 => ElementType::U16,
+            DataType::Int32 => ElementType::I32,
+            DataType::UInt32 => ElementType::U32,
+            DataType::Int64 => ElementType::I64,
+            DataType::UInt64 => ElementType::U64,
+            DataType::Float16 => ElementType::F16,
+            DataType::Float32 => ElementType::F32,
+            DataType::Float64 => ElementType::F64,
+            _ => continue,
+        };
+        return Some((i, element));
     }
     None
 }
@@ -604,13 +624,10 @@ fn get_vector_dimension(
         return Ok(*size as u32);
     }
 
-    // For List, check the first row
-    let list_array = col
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or("Column is not a ListArray")?;
-    if list_array.is_empty() {
+    // For a variable list, the first row says
+    if col.is_empty() {
         return Err("Empty batch, cannot determine dimension".to_string());
     }
-    Ok(list_array.value(0).len() as u32)
+    let first = list_row(col.as_ref(), 0).ok_or("Column is not a list column")?;
+    Ok(first.len() as u32)
 }

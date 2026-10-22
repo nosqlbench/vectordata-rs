@@ -23,7 +23,8 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use ndarray::Array2;
 use ndarray_npy::ReadNpyExt;
 
-use super::VecSource;
+use crate::traits::{SourceMeta, VecSource};
+use veks_datatypes::ElementType;
 
 /// Detected element type from the npy descriptor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,10 +48,15 @@ impl NpyDtype {
     }
 
     fn element_size(self) -> usize {
+        self.element_type().byte_width()
+    }
+
+    /// The element type the descriptor names.
+    pub fn element_type(self) -> ElementType {
         match self {
-            Self::F16 => 2,
-            Self::F32 => 4,
-            Self::F64 => 8,
+            Self::F16 => ElementType::F16,
+            Self::F32 => ElementType::F32,
+            Self::F64 => ElementType::F64,
         }
     }
 }
@@ -354,7 +360,7 @@ impl NpyDirReader {
     ///
     /// Only reads file headers — no data is loaded, no background threads
     /// are spawned. Used for fail-fast validation in the import probe phase.
-    pub fn probe(path: &Path) -> Result<super::SourceMeta, String> {
+    pub fn probe(path: &Path) -> Result<SourceMeta, String> {
         let scan = scan_npy_headers(path, None)?;
         log::info!(
             "    {} npy file(s), dtype {:?}, {} bytes/element, dimension {}",
@@ -363,10 +369,11 @@ impl NpyDirReader {
             scan.dtype.element_size(),
             scan.dimension
         );
-        Ok(super::SourceMeta {
+        Ok(SourceMeta {
             dimension: scan.dimension,
             element_size: scan.dtype.element_size(),
             record_count: Some(scan.total_rows),
+            element_type: Some(scan.dtype.element_type()),
         })
     }
 
@@ -583,6 +590,10 @@ impl VecSource for NpyDirReader {
 
     fn element_size(&self) -> usize {
         self.dtype.element_size()
+    }
+
+    fn element_type(&self) -> Option<ElementType> {
+        Some(self.dtype.element_type())
     }
 
     fn record_count(&self) -> Option<u64> {

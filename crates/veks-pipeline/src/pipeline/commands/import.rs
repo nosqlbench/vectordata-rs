@@ -175,6 +175,7 @@ work with.
         };
         let element = source_format
             .element_type()
+            .or(probe.element_type)
             .unwrap_or_else(|| veks_core::formats::element_type_of_width(probe.element_size));
         let target_format = veks_core::formats::preferred_vec_format(facet, element);
 
@@ -243,6 +244,7 @@ work with.
         let element_size = source.element_size();
         let element = source_format
             .element_type()
+            .or(source.element_type())
             .unwrap_or_else(|| veks_core::formats::element_type_of_width(element_size));
         let target_format = veks_core::formats::preferred_vec_format(facet, element);
 

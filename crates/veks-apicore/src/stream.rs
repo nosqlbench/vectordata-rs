@@ -16,6 +16,12 @@ pub struct SourceMeta {
     pub element_size: usize,
     /// Total number of records, if known without a full scan.
     pub record_count: Option<u64>,
+    /// The element type, when the format states it (every xvec and
+    /// scalar format, npy, a parquet vector column). `None` for one
+    /// that cannot know, such as a slab of opaque records: then only
+    /// [`element_size`](Self::element_size) is known, and a width does
+    /// not tell an `f32` from an `i32`.
+    pub element_type: Option<veks_datatypes::ElementType>,
 }
 
 /// Streaming reader for vector data.
@@ -74,6 +80,12 @@ pub trait VecSource: Send {
 
     /// Bytes per element in the source data.
     fn element_size(&self) -> usize;
+
+    /// The element type, when the format states it; `None` when only
+    /// the width is known (see [`SourceMeta::element_type`]).
+    fn element_type(&self) -> Option<veks_datatypes::ElementType> {
+        None
+    }
 
     /// Total record count, if known without a full scan.
     fn record_count(&self) -> Option<u64>;

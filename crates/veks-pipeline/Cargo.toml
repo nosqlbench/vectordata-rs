@@ -92,7 +92,7 @@ veks-datatypes = { path = "../veks-datatypes", version = "=4.0.2" }
 veks-core = { path = "../veks-core", version = "=4.0.2" }
 # The format layer: VecFormat, the streaming readers and writers,
 # element conversion and positional file I/O.
-veks-io = { path = "../veks-io", version = "=4.0.2", features = ["slab"] }
+veks-io = { path = "../veks-io", version = "=4.0.2", features = ["npy", "parquet", "slab"] }
 veks-completion = { path = "../veks-completion", version = "=4.0.2" }
 veks-completion-derive = { path = "../veks-completion-derive", version = "=4.0.2" }
 

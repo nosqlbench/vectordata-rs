@@ -102,7 +102,8 @@ pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String
     }
     let (dim, record_bytes) = dim.ok_or_else(|| format!("no {format} files at {}", path.display()))?;
     let total_records = parts.iter().map(|p| p.records).sum();
-    Ok(Box::new(XvecReader { parts, part: 0, dim, record_bytes, total_records, read_in_part: 0, released: 0 }))
+    let element = format.element_type();
+    Ok(Box::new(XvecReader { parts, part: 0, dim, record_bytes, element, total_records, read_in_part: 0, released: 0 }))
 }
 
 /// The files `path` names for `format`: the file itself; the files of
@@ -170,6 +171,7 @@ pub fn probe(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
         dimension: dim.ok_or_else(|| format!("no {format} files at {}", path.display()))?,
         element_size: elem_size,
         record_count: Some(count),
+        element_type: format.element_type(),
     })
 }
 
@@ -185,6 +187,7 @@ struct XvecReader {
     part: usize,
     dim: u32,
     record_bytes: usize,
+    element: Option<veks_datatypes::ElementType>,
     total_records: u64,
     /// Records read from the current part.
     read_in_part: u64,
@@ -222,6 +225,7 @@ impl XvecReader {
 impl VecSource for XvecReader {
     fn dimension(&self) -> u32 { self.dim }
     fn element_size(&self) -> usize { (self.record_bytes - 4) / self.dim as usize }
+    fn element_type(&self) -> Option<veks_datatypes::ElementType> { self.element }
     fn record_count(&self) -> Option<u64> { Some(self.total_records) }
 
     fn next_record(&mut self) -> Option<Vec<u8>> {

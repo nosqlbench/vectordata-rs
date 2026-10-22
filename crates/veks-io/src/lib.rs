@@ -115,6 +115,10 @@ pub mod convert;
 pub mod element;
 pub mod file;
 pub mod format;
+#[cfg(feature = "npy")]
+pub mod npy;
+#[cfg(feature = "parquet")]
+pub mod parquet;
 pub mod reader;
 pub mod scalar;
 pub mod series;
@@ -193,11 +197,11 @@ pub fn open_format(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>,
     }
     match format {
         #[cfg(feature = "npy")]
-        VecFormat::Npy => Err("npy reading not yet implemented in veks-io".into()),
+        VecFormat::Npy => npy::NpyDirReader::open(path, 0, None),
         #[cfg(feature = "parquet")]
-        VecFormat::Parquet => Err("parquet reading not yet implemented in veks-io".into()),
+        VecFormat::Parquet => parquet::ParquetDirReader::open(path, 0),
         #[cfg(feature = "slab")]
-        VecFormat::Slab => Err("slab reading not yet implemented in veks-io".into()),
+        VecFormat::Slab => slab::reader::SlabReader::open(path),
         _ => Err(format!("{} format is not supported", format)),
     }
 }

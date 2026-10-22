@@ -30,6 +30,7 @@ pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String
     Ok(Box::new(ScalarReader {
         reader: BufReader::with_capacity(4 * 1024 * 1024, file),
         element_size: elem_size,
+        element: format.element_type(),
         total: count,
         read: 0,
     }))
@@ -54,12 +55,14 @@ pub fn probe(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
         dimension: 1,
         element_size: elem_size,
         record_count: Some((file_len / elem_size) as u64),
+        element_type: format.element_type(),
     })
 }
 
 struct ScalarReader {
     reader: BufReader<std::fs::File>,
     element_size: usize,
+    element: Option<veks_datatypes::ElementType>,
     total: usize,
     read: usize,
 }
@@ -67,6 +70,7 @@ struct ScalarReader {
 impl VecSource for ScalarReader {
     fn dimension(&self) -> u32 { 1 }
     fn element_size(&self) -> usize { self.element_size }
+    fn element_type(&self) -> Option<veks_datatypes::ElementType> { self.element }
     fn record_count(&self) -> Option<u64> { Some(self.total as u64) }
 
     fn next_record(&mut self) -> Option<Vec<u8>> {
