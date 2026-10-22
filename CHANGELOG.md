@@ -159,6 +159,12 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
   answers for a host not built on veks-completion. `completions` under
   an embedding name says how, instead of printing a script bound to the
   `vectordata` executable.
+- **`datasets precache a b:10m c:profile=*` takes several specs** and
+  fetches them as one run: every spec resolved before anything moves,
+  then one plan, one progress display and one report, each facet named
+  `<dataset>:<profile>/<facet>`. `datasets::precache::run_specs` is the
+  library form; `PrecacheRequest` is unchanged. Before, every spec
+  after the first was silently ignored and the command exited 0.
 - **`VecSource::read_record_into(&mut Vec<u8>)`** streams a file into
   one buffer instead of a new `Vec` per record. The streaming readers
   read from a mapping and release the pages behind the cursor.

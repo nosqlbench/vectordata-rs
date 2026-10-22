@@ -393,17 +393,19 @@ enum DatasetsCmd {
     /// in a single-provenance `pushlog.jsonl`. The transport is chosen
     /// from the URL scheme (`s3://`, `https://`, `file://`).
     Push(crate::push::PushArgs),
-    /// Download and cache every facet of a dataset profile into the
-    /// configured cache directory. Renders a live per-facet +
-    /// aggregate progress meter on stderr.
+    /// Download and cache every facet of the profiles one or more specs
+    /// select into the configured cache directory, as one run. Renders a
+    /// live per-facet + aggregate progress meter on stderr.
     Precache {
-        /// `<head>[:<selector>]` (PS-1): the head is a catalog name, a path
-        /// to a `dataset.yaml` or its containing directory, or an
-        /// `http(s)://…` URL; the selector names the profiles to fetch —
-        /// a name, `profile=*` for every profile, or an expression such as
-        /// `size=10m,predicates=uniform*`. A spec with no selector and no
-        /// `--profile` is refused naming the spellings.
-        spec: String,
+        /// One or more `<head>[:<selector>]` specs (PS-1): the head is a
+        /// catalog name, a path to a `dataset.yaml` or its containing
+        /// directory, or an `http(s)://…` URL; the selector names the
+        /// profiles to fetch — a name, `profile=*` for every profile, or an
+        /// expression such as `size=10m,predicates=uniform*`. A spec with
+        /// no selector and no `--profile` is refused naming the spellings.
+        /// Several specs are fetched as one plan, with one progress
+        /// display and one report.
+        specs: Vec<String>,
         /// Configuration directory containing `catalogs.yaml`.
         #[arg(long, default_value_t = crate::catalog::sources::config_dir())]
         configdir: String,
@@ -838,7 +840,7 @@ pub fn bin_main_with_catalogs(invoked: &str, argv: Vec<String>, program: crate::
                     },
                 ),
                 DatasetsCmd::Precache {
-                    spec,
+                    specs,
                     configdir,
                     catalog,
                     at,
@@ -848,8 +850,9 @@ pub fn bin_main_with_catalogs(invoked: &str, argv: Vec<String>, program: crate::
                     plan,
                     profile,
                     allow_whole_facet,
-                } => crate::datasets::precache::run(crate::datasets::precache::PrecacheRequest {
-                    dataset_spec: spec,
+                } => crate::datasets::precache::run_specs(&specs, crate::datasets::precache::PrecacheRequest {
+                    // run_specs reads the specs, not this.
+                    dataset_spec: String::new(),
                     configdir,
                     extra_catalogs: catalog,
                     at,

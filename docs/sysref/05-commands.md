@@ -129,6 +129,7 @@ palette.
 | `veks prepare readme [PATH]` | Write the README.md scaffold: the standard sections, the definition's facts filled in, a marker wherever a person must write |
 | `veks generate docs-html` | Render every Markdown document to a self-contained HTML mirror under `docs/html/`, links rewritten relative to each page; a finalize step, the Markdown being the source of truth |
 | `veks prepare cleanup-profiles` | Housekeeping: drop sized profiles no stratum names and profile directories no entry names, without touching the cache |
+| `vectordata datasets precache SPEC...` | Bring the facets of the profiles each `<head>[:<selector>]` spec selects into the cache, as one run: every spec resolved first, then one plan, one progress display and one report; `--profile`, `--facet`, `--window`, `--plan`, `--cache-dir`, `--allow-whole-facet` and the `--configdir`/`--catalog`/`--at` catalogs apply to all of them. Command-line only: no `dataset.yaml` key names a precache |
 | `veks prepare cache-gc` | Housekeeping: remove cache files nothing in the definition can use — not named by a step, not recorded by a defined step, not claimed by an engine's cache, not a twin of those |
 
 ### Bulkdl configuration

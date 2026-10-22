@@ -108,7 +108,8 @@ impl PrecacheRequest {
     }
 }
 
-/// Entry point.
+/// Entry point: precache `req.dataset_spec`, one spec. [`run_specs`] is
+/// the same run over several.
 ///
 /// `dataset_spec` is `<head>[:<selector>]` (PS-1), where the head is:
 /// - a catalog name (e.g. `glove-100:default`, `tessera:size=10m`)
@@ -131,6 +132,36 @@ impl PrecacheRequest {
 /// window or selector, an unknown facet, a window that would become a
 /// whole-facet download).
 pub fn run(req: PrecacheRequest) -> i32 {
+    let spec = req.dataset_spec.clone();
+    run_specs(std::slice::from_ref(&spec), req)
+}
+
+/// Precache several specs as one run: `vectordata datasets precache a
+/// b:10m c:profile=*`.
+///
+/// Each of `specs` is a spec as [`run`] takes one, and `req` carries
+/// everything else; its `dataset_spec` is not read. `--profile`
+/// (`req.profile`) outranks every spec's selector. Every spec is parsed,
+/// and every dataset looked up, before anything is fetched, so a typo
+/// in the third spec fails the run before the first spec's bytes move.
+///
+/// The profiles every spec selects are fetched as **one plan**: one
+/// cost line, one progress display and one closing report, with each
+/// facet named `<dataset>:<profile>/<facet>`. A profile two specs both
+/// select is fetched once. One spec runs exactly as [`run`] does.
+/// `--facet`, `--window` and `--plan` (`req.facets`, `req.window`,
+/// `req.plan_only`) need the specs to select one profile between them,
+/// as they need one spec to.
+///
+/// Returns a process exit code as [`run`] does; 2 for no specs at all.
+///
+/// ```no_run
+/// use vectordata::datasets::precache::{PrecacheRequest, run_specs};
+/// let specs = ["glove-100:default".to_string(), "sift-128:default".to_string()];
+/// let code = run_specs(&specs, PrecacheRequest::all("", "/home/me/.config/vectordata"));
+/// assert_eq!(code, 0);
+/// ```
+pub fn run_specs(specs: &[String], req: PrecacheRequest) -> i32 {
     // A window has to parse before anything is opened or downloaded.
     // Discovering it is malformed after the catalog round-trip wastes
     // the user's time for no reason.
@@ -144,6 +175,10 @@ pub fn run(req: PrecacheRequest) -> i32 {
         },
         None => None,
     };
+    if specs.is_empty() {
+        eprintln!("error: no dataset given: name one or more `<head>[:<selector>]` specs");
+        return 2;
+    }
 
     if let Some(dir) = req.cache_dir.as_deref()
         && let Err(e) = crate::settings::set_cache_dir(dir)
@@ -162,30 +197,38 @@ pub fn run(req: PrecacheRequest) -> i32 {
         }
     };
 
-    let (head, spec_selector) = match classify_spec(&req.dataset_spec) {
-        Ok(split) => split,
-        Err(e) => {
-            eprintln!("error: {e}");
+    // Every spec is read before any is opened: a refused spec stops the
+    // run with nothing looked up.
+    let mut parsed: Vec<(String, String)> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let (head, spec_selector) = match classify_spec(spec) {
+            Ok(split) => split,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        };
+        // An explicit --profile outranks whatever the spec implied; it is
+        // a selector too (PS-14).
+        let Some(selector) = req.profile.clone().or(spec_selector) else {
+            eprintln!("error: {}", bare_spec_refusal(&head));
             return 2;
-        }
-    };
-    // An explicit --profile outranks whatever the spec implied; it is
-    // a selector too (PS-14).
-    let Some(selector) = req.profile.clone().or(spec_selector) else {
-        eprintln!("error: {}", bare_spec_refusal(&head));
-        return 2;
-    };
+        };
+        parsed.push((head, selector));
+    }
 
-    // Catalogs are loaded only for a head that names a dataset: a path
-    // or URL opens directly, and fetching remote catalogs to then not
-    // use them would be wasted round trips.
-    let catalog = if crate::transport::is_remote_url(&head) || Path::new(&head).exists() {
+    // Catalogs are loaded only when a head names a dataset: a path or
+    // URL opens directly, and fetching remote catalogs to then not use
+    // them would be wasted round trips. One catalog serves every spec.
+    let names_a_dataset = |head: &str| !(crate::transport::is_remote_url(head) || Path::new(head).exists());
+    let catalog = if !parsed.iter().any(|(head, _)| names_a_dataset(head)) {
         Catalog::default()
     } else if let Some(catalog) = req.catalog.clone() {
         catalog
     } else {
         let sources = build_sources(&req.program_catalogs, &req.configdir, &req.extra_catalogs, &req.at);
         if sources.is_empty() {
+            let head = &parsed.iter().find(|(head, _)| names_a_dataset(head)).expect("checked above").0;
             eprintln!("'{head}' is not a local path, not a URL, and no catalog is configured.");
             eprintln!("Add a catalog with:");
             eprintln!("  vectordata config catalog add <URL-or-path>");
@@ -197,14 +240,18 @@ pub fn run(req: PrecacheRequest) -> i32 {
             Err(code) => return code,
         }
     };
-    let selection = match catalog.open_selection(&head, Some(&selector)) {
-        Ok(s) => s,
-        Err(e) => {
-            super::report_lookup_failure(&catalog, &e);
-            return 1;
+    let opens_directly = Catalog::default();
+    let mut selections = Vec::with_capacity(parsed.len());
+    for (head, selector) in &parsed {
+        let lookup = if names_a_dataset(head) { &catalog } else { &opens_directly };
+        match lookup.open_selection(head, Some(selector)) {
+            Ok(s) => selections.push(s),
+            Err(e) => {
+                super::report_lookup_failure(lookup, &e);
+                return 1;
+            }
         }
-    };
-    let descriptor = selection.dataset().to_string();
+    }
 
     if let Some(c) = &configured {
         eprintln!("  Cache root: {}", c.display());
@@ -218,6 +265,21 @@ pub fn run(req: PrecacheRequest) -> i32 {
     };
     let mut meter = crate::fetch::meter::stderr_meter("Precache");
 
+    if let ([selection], [(_, selector)]) = (selections.as_slice(), parsed.as_slice()) {
+        return drive_selection(selection, selector, &req, &fetch, &mut *meter);
+    }
+    drive_specs(&selections, &req, &fetch, &mut *meter)
+}
+
+/// Precache what one spec selected: the single-spec run.
+fn drive_selection(
+    selection: &crate::catalog::DatasetSelection,
+    selector: &str,
+    req: &PrecacheRequest,
+    fetch: &FetchRequest,
+    meter: &mut dyn FetchProgress,
+) -> i32 {
+    let descriptor = selection.dataset();
     let names = selection.profiles();
     if let [profile_name] = names {
         let view = match selection.view() {
@@ -229,10 +291,10 @@ pub fn run(req: PrecacheRequest) -> i32 {
         };
         let label = format!("{descriptor}:{profile_name}");
         if req.is_selective() {
-            return drive_selective(&*view, &label, &fetch, req.plan_only, &mut *meter);
+            return drive_selective(&*view, &label, fetch, req.plan_only, meter);
         }
         eprintln!("Prebuffering {label}");
-        return drive_prebuffer(&*view, &fetch, &mut *meter);
+        return drive_prebuffer(&*view, fetch, meter);
     }
     if req.is_selective() {
         // A facet or window selection needs one profile to resolve
@@ -253,7 +315,88 @@ pub fn run(req: PrecacheRequest) -> i32 {
         names.len(),
         names.join(", ")
     );
-    drive_prebuffer_all(&selection, &fetch, &mut *meter)
+    drive_prebuffer_all(selection, fetch, meter)
+}
+
+/// Precache what several specs selected, as one plan.
+fn drive_specs(
+    selections: &[crate::catalog::DatasetSelection],
+    req: &PrecacheRequest,
+    fetch: &FetchRequest,
+    meter: &mut dyn FetchProgress,
+) -> i32 {
+    // Each selected profile once, in the order the specs name them.
+    let mut seen = std::collections::HashSet::new();
+    let targets: Vec<(&crate::catalog::DatasetSelection, &str, String)> = selections
+        .iter()
+        .flat_map(|s| s.profiles().iter().map(move |p| (s, p.as_str(), format!("{}:{p}", s.dataset()))))
+        .filter(|(_, _, label)| seen.insert(label.clone()))
+        .collect();
+    let labels: Vec<&str> = targets.iter().map(|(_, _, label)| label.as_str()).collect();
+
+    if req.is_selective() {
+        let [(selection, profile, label)] = targets.as_slice() else {
+            // As for one spec: a facet or window needs one profile to
+            // resolve against.
+            eprintln!(
+                "error: --facet/--window/--plan need a single profile, but the {} specs select {}: {}",
+                selections.len(),
+                labels.len(),
+                labels.join(", ")
+            );
+            eprintln!("Name one profile, or choose one with `--profile <name>`.");
+            return 2;
+        };
+        let Some(view) = selection.group().profile(profile) else {
+            eprintln!("error: {label}: profile not found");
+            return 1;
+        };
+        return drive_selective(&*view, label, fetch, req.plan_only, meter);
+    }
+
+    let datasets = {
+        let mut names: Vec<&str> = selections.iter().map(|s| s.dataset()).collect();
+        names.sort_unstable();
+        names.dedup();
+        names.len()
+    };
+    eprintln!(
+        "Prebuffering {} profiles of {datasets} dataset(s) ({})",
+        labels.len(),
+        labels.join(", ")
+    );
+    let mut facets = Vec::new();
+    for (selection, profile, label) in &targets {
+        let Some(view) = selection.group().profile(profile) else {
+            eprintln!("Precache: {label}: profile not found");
+            return 1;
+        };
+        if let Err(e) = crate::fetch::plan_view(&*view, Some(label), fetch, meter, &mut facets) {
+            eprintln!("Precache: {e}");
+            return 1;
+        }
+    }
+    let plan = crate::fetch::plan_from(
+        facets,
+        fetch,
+        crate::fetch::CapacityCheck::new(|bytes| Ok(crate::cache::ensure_cache_capacity(bytes)?)),
+    );
+    if plan.is_empty() {
+        println!("Precache: no facets across the selected profiles.");
+        return 0;
+    }
+    if let Some(code) = refuse(&plan) {
+        return code;
+    }
+    let total = plan.bytes_to_fetch();
+    warn_if_large(total);
+    eprintln!(
+        "Prebuffering {} facet(s) across {} profiles, {} to download.",
+        plan.facets().len(),
+        labels.len(),
+        fmt_bytes(total)
+    );
+    execute(plan, meter)
 }
 
 /// Split a spec into the part that names a dataset and the selector
@@ -444,6 +587,19 @@ fn drive_prebuffer_all(
         return code;
     }
     let total = plan.bytes_to_fetch();
+    warn_if_large(total);
+    eprintln!(
+        "Prebuffering {} facet(s) across {} profiles, {} to download.",
+        plan.facets().len(),
+        selection.profiles().len(),
+        fmt_bytes(total)
+    );
+    execute(plan, meter)
+}
+
+/// The advisory a run across profiles prints when it will download at
+/// least [`PREBUFFER_LARGE_WARNING_BYTES`](crate::PREBUFFER_LARGE_WARNING_BYTES).
+fn warn_if_large(total: u64) {
     if total >= crate::PREBUFFER_LARGE_WARNING_BYTES {
         eprintln!(
             "warning: precache announced {} across the selected profiles \
@@ -456,13 +612,6 @@ fn drive_prebuffer_all(
                    are downloaded."
         );
     }
-    eprintln!(
-        "Prebuffering {} facet(s) across {} profiles, {} to download.",
-        plan.facets().len(),
-        selection.profiles().len(),
-        fmt_bytes(total)
-    );
-    execute(plan, meter)
 }
 
 /// The exit code for a plan the library would refuse, before any
