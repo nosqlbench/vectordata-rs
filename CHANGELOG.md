@@ -335,6 +335,12 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
   over attributes needed its own `serde_yaml` at vectordata's exact
   version. `vectordata::AttributeValue` (and `veks_apicore::AttributeValue`)
   names the type, and `vectordata::serde_yaml` is the crate.
+- **A directory of symlinked files was not inferred.** Loose-file
+  inference skipped every link, so a dataset staged by linking its
+  files into a scratch directory failed with "name the files for their
+  roles:" and an empty list. Links are followed, for files and for
+  `profiles/` directories; a link to nothing is refused, naming it; and
+  a directory with no vector file says so.
 - **A directory of npy or parquet files that held a corrupt file
   ended early, quietly.** The loaders logged the file at info level
   and skipped it, so the stream stopped with fewer records than its

@@ -131,6 +131,8 @@ pub enum InferError {
     /// A `profiles/` directory without one profile to call `default`
     /// (LF-10).
     Profiles(Vec<String>),
+    /// The directory holds no vector file to infer from (LF-3).
+    NoCandidates(String),
 }
 
 impl fmt::Display for InferError {
@@ -155,6 +157,7 @@ impl fmt::Display for InferError {
                 let text: Vec<String> = failures.iter().map(|x| x.to_string()).collect();
                 write!(f, "the files do not belong together (LF-9): {}", text.join("; "))
             }
+            InferError::NoCandidates(dir) => write!(f, "{dir} has no vector files to infer a dataset from (LF-3)"),
             InferError::Profiles(names) => {
                 write!(f, "profiles/ holds {} profiles and none is default: {} (LF-10)", names.len(), names.join(", "))
             }
@@ -198,7 +201,11 @@ pub fn has_loose_files(dir: &Path) -> bool {
         || std::fs::read_dir(dir).is_ok_and(|entries| {
             entries
                 .filter_map(|e| e.ok())
-                .any(|e| e.file_type().is_ok_and(|t| t.is_file()) && e.file_name().to_str().is_some_and(is_candidate))
+                // A link to nothing still counts: inference then names it.
+                .any(|e| {
+                    e.file_name().to_str().is_some_and(is_candidate)
+                        && std::fs::metadata(e.path()).map_or(true, |m| m.is_file())
+                })
         })
 }
 
@@ -257,13 +264,21 @@ impl Candidate {
 /// The candidates of `dir`, a `__NNNN` series folded into one (LF-3,
 /// LF-7).
 fn candidates(dir: &Path) -> Result<Vec<Candidate>, InferError> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .map_err(|e| InferError::Unreadable(format!("{}: {e}", dir.display())))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .filter(|n| is_candidate(n))
-        .collect();
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| InferError::Unreadable(format!("{}: {e}", dir.display())))? {
+        let Ok(entry) = entry else { continue };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+        if !is_candidate(&name) {
+            continue;
+        }
+        // A symlink is followed: a dataset staged by linking its files
+        // reads as the files would. A link to nothing is refused, named.
+        match std::fs::metadata(entry.path()) {
+            Ok(meta) if meta.is_file() => names.push(name),
+            Ok(_) => {}
+            Err(e) => return Err(InferError::Unreadable(format!("{}: {e}", entry.path().display()))),
+        }
+    }
     names.sort();
     let mut singles = Vec::new();
     let mut series: BTreeMap<(String, String), Vec<(u32, String)>> = BTreeMap::new();
@@ -532,7 +547,8 @@ pub fn infer_dir(dir: &Path) -> Result<Inferred, InferError> {
         let mut names: Vec<String> = std::fs::read_dir(&profiles_dir)
             .map_err(|e| InferError::Unreadable(format!("{}: {e}", profiles_dir.display())))?
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            // A symlinked profile directory is a profile.
+            .filter(|e| std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir()))
             .filter_map(|e| e.file_name().to_str().map(str::to_string))
             .collect();
         names.sort();
@@ -583,7 +599,11 @@ pub fn infer_dir(dir: &Path) -> Result<Inferred, InferError> {
         }
         out
     } else {
-        let chosen = classify("default", candidates(dir)?, false, &mut notes)?;
+        let cands = candidates(dir)?;
+        if cands.is_empty() {
+            return Err(InferError::NoCandidates(dir.display().to_string()));
+        }
+        let chosen = classify("default", cands, false, &mut notes)?;
         vec![("default".to_string(), chosen)]
     };
 

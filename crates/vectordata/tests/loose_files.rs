@@ -307,3 +307,79 @@ fn describe_and_init_take_a_directory_of_loose_files() {
     assert!(stdout.contains("neighbor_indices = gt.ivecs (by the role token 'gt' (LF-5))"), "{stdout}");
     assert!(d.join("dataset.yaml").is_file());
 }
+
+/// **A symlinked file is a candidate like a copy (LF-3)**: staging a
+/// dataset by linking its files into a scratch directory is how one is
+/// tried without duplicating it, and it infers and opens as the copies
+/// would.
+#[cfg(unix)]
+#[test]
+fn symlinked_files_are_candidates() {
+    use std::os::unix::fs::symlink;
+    let (_store, store) = dir("store");
+    fvecs(&store.join("e5_base_99443.fvecs"), &unit(10));
+    fvecs(&store.join("e5_query_10000.fvecs"), &unit(3));
+    ivecs(&store.join("e5_gt_100.ivecs"), &truth(3, 4, 10));
+    let (_root, d) = dir("staged");
+    symlink(store.join("e5_base_99443.fvecs"), d.join("mydata_base_100000.fvecs")).unwrap();
+    symlink(store.join("e5_query_10000.fvecs"), d.join("mydata_query_10000.fvecs")).unwrap();
+    symlink(store.join("e5_gt_100.ivecs"), d.join("mydata_gt_100.ivecs")).unwrap();
+    let inferred = infer_dir(&d).unwrap();
+    assert_eq!(
+        sources(&inferred),
+        [
+            (StandardFacet::BaseVectors, "mydata_base_100000.fvecs".into(), Rule::RoleToken("base".into())),
+            (StandardFacet::QueryVectors, "mydata_query_10000.fvecs".into(), Rule::RoleToken("query".into())),
+            (StandardFacet::NeighborIndices, "mydata_gt_100.ivecs".into(), Rule::RoleToken("gt".into())),
+        ]
+    );
+    let view = TestDataGroup::load(d.to_str().unwrap()).unwrap().profile("default").unwrap();
+    assert_eq!(view.base_vectors_as::<f32>().unwrap().count(), 10);
+}
+
+/// **A symlinked profile directory is a profile (LF-10).**
+#[cfg(unix)]
+#[test]
+fn a_symlinked_profile_directory_is_read() {
+    use std::os::unix::fs::symlink;
+    let (_store, store) = dir("store");
+    std::fs::create_dir_all(store.join("base")).unwrap();
+    fvecs(&store.join("base/base_vectors.fvec"), &unit(10));
+    let (_root, d) = dir("veks");
+    std::fs::create_dir_all(d.join("profiles/default")).unwrap();
+    symlink(store.join("base"), d.join("profiles/base")).unwrap();
+    fvecs(&d.join("profiles/default/query_vectors.fvec"), &unit(3));
+    ivecs(&d.join("profiles/default/neighbor_indices.ivec"), &truth(3, 4, 10));
+    let inferred = infer_dir(&d).unwrap();
+    assert!(
+        sources(&inferred).contains(&(StandardFacet::BaseVectors, "profiles/base/base_vectors.fvec".into(), Rule::CanonicalName)),
+        "{:?}",
+        sources(&inferred)
+    );
+}
+
+/// **A link to nothing is refused, naming it**, rather than skipped
+/// into a misleading "no file is …".
+#[cfg(unix)]
+#[test]
+fn a_dangling_link_is_refused_naming_it() {
+    use std::os::unix::fs::symlink;
+    let (_root, d) = dir("broken");
+    fvecs(&d.join("x_base.fvecs"), &unit(10));
+    fvecs(&d.join("x_query.fvecs"), &unit(3));
+    symlink(d.join("gone.ivecs"), d.join("x_gt.ivecs")).unwrap();
+    let err = infer_dir(&d).unwrap_err();
+    assert!(matches!(err, InferError::Unreadable(_)), "{err:?}");
+    assert!(err.to_string().contains("x_gt.ivecs"), "{err}");
+}
+
+/// **A directory with no vector files says so**, not "name the files
+/// for their roles:" with nothing after it.
+#[test]
+fn a_directory_without_vector_files_says_so() {
+    let (_root, d) = dir("empty-ish");
+    std::fs::write(d.join("notes.txt"), "nothing to see").unwrap();
+    let err = infer_dir(&d).unwrap_err().to_string();
+    assert!(!err.trim_end().ends_with(':'), "{err}");
+    assert!(err.contains("no vector files"), "{err}");
+}
