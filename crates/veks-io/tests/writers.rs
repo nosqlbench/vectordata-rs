@@ -115,38 +115,67 @@ fn a_rewritten_vvec_file_is_read_by_its_own_index() {
     assert_eq!(VvecReader::get(&r, 2).unwrap(), vec![6, 5, 4]);
 }
 
-/// A path that writes to `/dev/full`: every write fails, no space left.
+/// The file-size limit the child runs under: every write past it fails
+/// (`EFBIG`), as a write to a full disk does (`ENOSPC`). A limit, not a
+/// symlink to `/dev/full`: the writers replace a symlink at their
+/// target rather than write through it.
 #[cfg(target_os = "linux")]
-fn full_disk(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::os::unix::fs::symlink("/dev/full", &path).unwrap();
-    path
-}
+const FILE_SIZE_LIMIT: u64 = 1 << 20;
 
 /// **A full disk is an error, never a short file**, from the typed
 /// writers and from the byte-level ones. The byte-level writers
 /// discarded every write error, so a batch larger than their buffer —
 /// written past it, straight to the file — failed silently and `finish`
 /// reported success.
+///
+/// Runs [`writes_past_the_file_size_limit_fail`] in a child of this
+/// test binary with `RLIMIT_FSIZE` set and `SIGXFSZ` ignored, so the
+/// limit touches nothing else in this process.
 #[test]
 #[cfg(target_os = "linux")]
 fn a_full_disk_is_an_error_from_every_writer() {
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child.args(["writes_past_the_file_size_limit_fail", "--exact", "--ignored", "--nocapture"]);
+    // SAFETY: runs in the forked child before exec, and calls only
+    // async-signal-safe functions.
+    unsafe {
+        child.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit { rlim_cur: FILE_SIZE_LIMIT, rlim_max: FILE_SIZE_LIMIT };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = child.output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && text.contains("1 passed"), "{text}{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// The body of [`a_full_disk_is_an_error_from_every_writer`], run only
+/// in its file-size-limited child.
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "run by a_full_disk_is_an_error_from_every_writer under a file-size limit"]
+fn writes_past_the_file_size_limit_fail() {
     let dir = tempfile::tempdir().unwrap();
 
-    let mut typed = XvecWriter::<f32>::create(&full_disk(dir.path(), "typed.fvecs"), 1024).unwrap();
+    let mut typed = XvecWriter::<f32>::create(&dir.path().join("typed.fvecs"), 1024).unwrap();
     let row = vec![1.0f32; 1024];
     let wrote: Result<(), IoError> = (0..8192).try_for_each(|_| typed.write(&row));
-    assert!(wrote.is_err() || typed.finish().is_err(), "32 MiB to a full disk reported success");
+    assert!(wrote.is_err() || typed.finish().is_err(), "32 MiB past the limit reported success");
 
-    let mut sink = veks_io::xvec::writer::open(&full_disk(dir.path(), "bytes.fvecs"), 1024).unwrap();
+    let mut sink = veks_io::xvec::writer::open(&dir.path().join("bytes.fvecs"), 1024).unwrap();
     let batch = vec![0u8; 4096 * 5000]; // 20 MiB: more than the 16 MiB buffer
     sink.write_records_fixed_dim(0, &batch, 5000, 4096);
-    let err = sink.finish().expect_err("a batch written past the buffer to a full disk reported success");
-    assert!(err.contains("No space left") || err.contains("space"), "{err}");
+    let err = sink.finish().expect_err("a batch written past the buffer and the limit reported success");
+    assert!(err.contains("too large") || err.contains("space"), "{err}");
 
-    let mut column = veks_io::scalar::writer::open(&full_disk(dir.path(), "col.u8"), veks_io::VecFormat::ScalarU8).unwrap();
+    let mut column = veks_io::scalar::writer::open(&dir.path().join("col.u8"), veks_io::VecFormat::ScalarU8).unwrap();
     for _ in 0..(5 << 20) {
         column.write_record(0, &[7]);
     }
-    assert!(column.finish().is_err(), "5 MiB to a full disk reported success");
+    assert!(column.finish().is_err(), "5 MiB past the limit reported success");
 }

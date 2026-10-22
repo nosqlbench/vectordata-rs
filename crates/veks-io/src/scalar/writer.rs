@@ -21,6 +21,7 @@ pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSink>, String> 
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    crate::xvec::writer::refuse_symlink(path)?;
     let file = std::fs::File::create(path)
         .map_err(|e| format!("create {}: {}", path.display(), e))?;
     Ok(Box::new(ScalarWriter {

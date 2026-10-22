@@ -43,7 +43,9 @@ fn shape(path: &Path, dim: i32, file_size: u64, elem_size: usize) -> Result<(u32
     Ok((dim as u32, record_bytes, file_size / record_bytes as u64))
 }
 
-/// Open an xvec file as a streaming [`VecSource`].
+/// Open an xvec file, a directory of them, or a series (`<stem>__NNNN`)
+/// as one streaming [`VecSource`], each file checked for the same
+/// dimension and a whole number of records.
 ///
 /// # Example
 ///
@@ -75,100 +77,145 @@ fn shape(path: &Path, dim: i32, file_size: u64, elem_size: usize) -> Result<(u32
 /// ```
 pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String> {
     let elem_size = format.element_size();
-    if elem_size == 0 {
-        return Err(format!("{} is not an xvec format", format));
+    if elem_size == 0 || !format.is_uniform_xvec() {
+        return Err(format!("{} is not a uniform xvec format", format));
     }
-    let file = MappedFile::map(path).map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-    let bytes = file.bytes();
-    if bytes.len() < 4 {
-        return Err(format!("read dim: {} bytes is too short for a record header", bytes.len()));
+    let mut parts = Vec::new();
+    let mut dim = None;
+    for file in files_of(path, format)? {
+        let mapped = MappedFile::map(&file).map_err(|e| format!("failed to open {}: {}", file.display(), e))?;
+        let bytes = mapped.bytes();
+        if bytes.len() < 4 {
+            return Err(format!("{}: {} bytes is too short for a record header", file.display(), bytes.len()));
+        }
+        let first = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let (d, record_bytes, records) = shape(&file, first, bytes.len() as u64, elem_size)?;
+        match dim {
+            None => dim = Some((d, record_bytes)),
+            Some((want, _)) if want != d => {
+                return Err(format!("{}: dimension {d} where the files before it hold {want}", file.display()));
+            }
+            Some(_) => {}
+        }
+        mapping::advise_sequential_bytes(bytes);
+        parts.push(Part { file: mapped, records });
     }
-    let dim = i32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
-    let (dim, record_bytes, total_records) = shape(path, dim, bytes.len() as u64, elem_size)?;
-    mapping::advise_sequential_bytes(bytes);
-    Ok(Box::new(XvecReader { file, dim, record_bytes, total_records, records_read: 0, released: 0 }))
+    let (dim, record_bytes) = dim.ok_or_else(|| format!("no {format} files at {}", path.display()))?;
+    let total_records = parts.iter().map(|p| p.records).sum();
+    Ok(Box::new(XvecReader { parts, part: 0, dim, record_bytes, total_records, read_in_part: 0, released: 0 }))
 }
 
-/// Probe an xvec file for metadata without reading all data.
-///
-/// # Example
-///
-/// The element size is the format's (`u16` is 2 bytes); the count is
-/// the file size over the record size, and a file that is not a whole
-/// number of records is refused rather than truncated:
+/// The files `path` names for `format`: the file itself; the files of
+/// that format in a directory, in name order (the order a series'
+/// `__NNNN` names sort in); or, when `path` itself is absent, the
+/// shards of the series it is the unsharded name of.
+fn files_of(path: &Path, format: VecFormat) -> Result<Vec<std::path::PathBuf>, String> {
+    if path.is_dir() {
+        let mut files: Vec<_> = std::fs::read_dir(path)
+            .map_err(|e| format!("read directory {}: {e}", path.display()))?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()).and_then(VecFormat::from_extension) == Some(format))
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            return Err(format!("no {format} files in {}", path.display()));
+        }
+        return Ok(files);
+    }
+    if !path.exists() {
+        let shards = crate::series::discover_shards(path);
+        if !shards.is_empty() {
+            return Ok(shards);
+        }
+    }
+    Ok(vec![path.to_path_buf()])
+}
+
+/// Probe an xvec file, directory or series for its dimension, element
+/// size and record count, reading one header per file.
 ///
 /// ```
 /// use veks_io::{VecFormat, xvec};
-/// # use std::io::Write;
 /// # let dir = tempfile::tempdir().unwrap();
-/// # let path = dir.path().join("counts.u16vecs");
-/// # let mut f = std::fs::File::create(&path).unwrap();
-/// # for row in [[1u16, 2, 3], [4, 5, 6]] {
-/// #     f.write_all(&3i32.to_le_bytes()).unwrap();
-/// #     for v in row { f.write_all(&v.to_le_bytes()).unwrap(); }
-/// # }
-/// # drop(f);
-/// let meta = xvec::reader::probe(&path, VecFormat::U16vec).unwrap();
-/// assert_eq!((meta.dimension, meta.element_size, meta.record_count), (3, 2, Some(2)));
-///
-/// // the same bytes read as a 1-byte type are not a whole number of 7-byte records
-/// let err = xvec::reader::probe(&path, VecFormat::Bvec).unwrap_err();
-/// assert!(err.contains("not a whole number"), "{err}");
+/// for (name, rows) in [("b__0000.fvecs", 3), ("b__0001.fvecs", 2)] {
+///     let mut w = xvec::writer::open(&dir.path().join(name), 4).unwrap();
+///     for _ in 0..rows {
+///         w.write_record(0, &[0u8; 16]);
+///     }
+///     w.finish().unwrap();
+/// }
+/// let meta = xvec::reader::probe(dir.path(), VecFormat::Fvec).unwrap();
+/// assert_eq!((meta.dimension, meta.element_size, meta.record_count), (4, 4, Some(5)));
 /// ```
 pub fn probe(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-    let file_size = file.metadata()
-        .map_err(|e| format!("metadata: {}", e))?
-        .len();
     let elem_size = format.element_size();
     if elem_size == 0 {
         return Err(format!("{} is not an xvec format", format));
     }
-
-    let mut reader = file;
-    let dim = reader.read_i32::<LittleEndian>()
-        .map_err(|e| format!("read dim: {}", e))?;
-    let (dim, _, count) = shape(path, dim, file_size, elem_size)?;
-
+    let mut dim = None;
+    let mut count = 0u64;
+    for file in files_of(path, format)? {
+        let mut f = File::open(&file).map_err(|e| format!("failed to open {}: {}", file.display(), e))?;
+        let file_size = f.metadata().map_err(|e| format!("metadata: {}", e))?.len();
+        let first = f.read_i32::<LittleEndian>().map_err(|e| format!("read dim: {}", e))?;
+        let (d, _, records) = shape(&file, first, file_size, elem_size)?;
+        if dim.is_some_and(|want| want != d) {
+            return Err(format!("{}: dimension {d} where the files before it hold {}", file.display(), dim.unwrap_or(d)));
+        }
+        dim = Some(d);
+        count += records;
+    }
     Ok(SourceMeta {
-        dimension: dim,
+        dimension: dim.ok_or_else(|| format!("no {format} files at {}", path.display()))?,
         element_size: elem_size,
         record_count: Some(count),
     })
 }
 
-struct XvecReader {
+/// One mapped file of the stream.
+struct Part {
     file: MappedFile,
+    records: u64,
+}
+
+struct XvecReader {
+    parts: Vec<Part>,
+    /// The part being read.
+    part: usize,
     dim: u32,
     record_bytes: usize,
     total_records: u64,
-    records_read: u64,
-    /// Bytes behind the cursor already released.
+    /// Records read from the current part.
+    read_in_part: u64,
+    /// Bytes of the current part whose pages have been released.
     released: u64,
 }
 
 impl XvecReader {
-    /// The next record's element bytes, borrowed from the mapping, and
-    /// the cursor moved past it. `None` at the end, and at a record
-    /// whose dimension is not the file's.
     fn next_slice(&mut self) -> Option<&[u8]> {
-        if self.records_read >= self.total_records {
-            return None;
+        while self.part < self.parts.len() && self.read_in_part >= self.parts[self.part].records {
+            // Done with a part: release what is left of it before the next.
+            let bytes = self.parts[self.part].file.bytes();
+            mapping::release_range_bytes(bytes, self.released, bytes.len() as u64);
+            self.part += 1;
+            self.read_in_part = 0;
+            self.released = 0;
         }
-        let at = self.records_read as usize * self.record_bytes;
-        let bytes = self.file.bytes();
-        let dim = i32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+        let part = self.parts.get(self.part)?;
+        let at = self.read_in_part as usize * self.record_bytes;
+        let bytes = part.file.bytes();
+        let dim = i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
         if dim as u32 != self.dim {
             return None; // dimension mismatch
         }
-        self.records_read += 1;
+        self.read_in_part += 1;
         let end = (at + self.record_bytes) as u64;
         if end - self.released >= RELEASE_WINDOW {
             mapping::release_range_bytes(bytes, self.released, end);
             self.released = end;
         }
-        Some(&self.file.bytes()[at + 4..at + self.record_bytes])
+        Some(&self.parts[self.part].file.bytes()[at + 4..at + self.record_bytes])
     }
 }
 

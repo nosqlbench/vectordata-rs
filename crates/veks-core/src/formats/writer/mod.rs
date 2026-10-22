@@ -6,7 +6,6 @@
 pub mod mmap_xvec;
 pub mod sharded;
 pub mod slab;
-pub mod xvec;
 
 use std::path::Path;
 
@@ -147,7 +146,7 @@ fn open_one_file(
             config.slab_namespace,
             config.schema_sidecar.clone(),
         ),
-        _ if format.is_xvec() => xvec::XvecWriter::open(path, config.dimension),
+        _ if format.is_xvec() => veks_io::xvec::writer::open(path, config.dimension),
         _ if format.is_scalar() => veks_io::scalar::writer::open(path, format),
         _ => Err(format!("{} is not a supported output format", format)),
     }

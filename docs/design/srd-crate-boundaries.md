@@ -379,9 +379,17 @@ shards** as one stream, in the series order vectordata reads
 
 **FL-3 — veks-io's streaming writer controls writeback.** It starts
 writeback and releases written pages every 64 MiB, as veks-core's
-does; it replaces a symlink at the target rather than writing through
-it; it keeps reporting the first error from `finish` (veks-core's
-panics). The buffer size is settled by measurement (16 MiB vs 4 MiB).
+does; it keeps reporting the first error from `finish` (veks-core's
+panics). The buffer size is settled by measurement (16 MiB vs 4 MiB):
+`stream_write/sink_write_record` (256 MiB of dim-128 f32) took 183.6 ms
+at 16 MiB and 182.5 ms at 4 MiB, the same within noise, so it stays
+16 MiB.
+**A symlink at a write target is an error**, from every veks-io
+writer, naming the link and what it points to: writing through it
+would overwrite what it links to (often source data), and removing it
+would discard a link someone made on purpose. veks-core's writer
+removed one silently (from a bulk commit, 26c0ea2, with no stated
+rule); that is not carried over. Decided 2026-10-22.
 
 **FL-4 — The gaps G1–G5 become veks-io calls.**
 - G1: `probe_source(&impl ByteSource)` reads the header and stride

@@ -41,6 +41,7 @@ pub fn open_reader(path: &Path, format: VecFormat) -> Result<Box<dyn VarlenSourc
 /// Each record is written with its own dimension header, allowing
 /// different dimensions per record.
 pub fn open_writer(path: &Path) -> Result<Box<dyn VarlenSink>, String> {
+    crate::xvec::writer::refuse_symlink(path)?;
     let file = File::create(path)
         .map_err(|e| format!("create {}: {}", path.display(), e))?;
     let writer = BufWriter::with_capacity(BUF_SIZE, file);

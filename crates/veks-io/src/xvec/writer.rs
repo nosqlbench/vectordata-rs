@@ -2,12 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Sequential xvec writer with buffered I/O.
+//!
+//! The written pages are written back and released as the file grows
+//! (Linux: every 64 MiB, `sync_file_range` then `FADV_DONTNEED`), so a
+//! write of a file larger than memory keeps a bounded page cache and the
+//! kernel never stalls the writer flushing gigabytes at once. A symlink
+//! at the target is an error: what it links to is not the writer's to
+//! overwrite, and the link is not the writer's to remove. The first I/O
+//! error stops the writer and is what
+//! [`finish`](VecSink::finish) returns.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-
-use byteorder::{LittleEndian, WriteBytesExt};
 
 use crate::traits::VecSink;
 
@@ -20,6 +27,24 @@ use crate::traits::VecSink;
 ///   (Linux's `dirty_ratio`) on cold-disk targets like EBS, because the
 ///   producer side serializes on the flush.
 const WRITE_BUF_SIZE: usize = 16 << 20; // 16 MiB
+
+/// Bytes written between writeback cycles.
+const WRITEBACK_INTERVAL: u64 = 64 << 20; // 64 MiB
+
+/// Refuse to write `path` when it is a symlink: writing through it
+/// would overwrite whatever it links to (often a dataset's source
+/// data), and removing it would discard a link someone made on
+/// purpose. Which is meant is the caller's to decide, before writing.
+pub(crate) fn refuse_symlink(path: &Path) -> Result<(), String> {
+    if path.is_symlink() {
+        let to = std::fs::read_link(path).map(|t| t.display().to_string()).unwrap_or_else(|_| "?".into());
+        return Err(format!(
+            "{} is a symlink (to {to}); writers do not write through or remove a link: remove it or write elsewhere",
+            path.display()
+        ));
+    }
+    Ok(())
+}
 
 /// Open an xvec file for sequential writing.
 ///
@@ -50,6 +75,7 @@ const WRITE_BUF_SIZE: usize = 16 << 20; // 16 MiB
 /// assert_eq!(second.iter().map(|&b| i8::from_le_bytes([b])).collect::<Vec<_>>(), [i8::MIN, 0, i8::MAX]);
 /// ```
 pub fn open(path: &Path, dimension: u32) -> Result<Box<dyn VecSink>, String> {
+    refuse_symlink(path)?;
     let file = File::create(path)
         .map_err(|e| format!("create {}: {}", path.display(), e))?;
     let writer = BufWriter::with_capacity(WRITE_BUF_SIZE, file);
@@ -65,6 +91,7 @@ pub fn open(path: &Path, dimension: u32) -> Result<Box<dyn VecSink>, String> {
         // state has zero allocations in the hot loop.
         scratch: Vec::new(),
         error: None,
+        writeback: Writeback::default(),
     }))
 }
 
@@ -75,6 +102,8 @@ struct XvecWriter {
     /// The first write that failed: kept, and returned by `finish`, so a
     /// full disk is an error rather than a short file.
     error: Option<std::io::Error>,
+    /// Page-cache release as the file grows.
+    writeback: Writeback,
 }
 
 impl XvecWriter {
@@ -85,7 +114,81 @@ impl XvecWriter {
             self.error = Some(e);
         }
     }
+
+    /// Count `n` bytes written, and once an interval has passed, flush
+    /// and write back what is on disk so far.
+    fn wrote(&mut self, n: usize) {
+        self.writeback.written += n as u64;
+        if self.writeback.written - self.writeback.started >= WRITEBACK_INTERVAL {
+            let flushed = self.writer.flush();
+            self.keep(flushed);
+            self.writeback.cycle(self.writer.get_ref());
+        }
+    }
 }
+
+/// Page-cache release for a file written front to back: start
+/// writeback on the newly written range, and drop the range written
+/// back the cycle before, which is clean by then.
+#[derive(Debug, Default)]
+struct Writeback {
+    /// Bytes written so far.
+    written: u64,
+    /// Where the last writeback started up to.
+    started: u64,
+    /// Where pages have been released up to.
+    released: u64,
+}
+
+impl Writeback {
+    fn cycle(&mut self, file: &File) {
+        if self.released < self.started {
+            release(file, self.released, self.started);
+            self.released = self.started;
+        }
+        if self.written > self.started {
+            start_writeback(file, self.started, self.written);
+            self.started = self.written;
+        }
+    }
+
+    /// The last cycle: write back the rest, wait for it and release it.
+    fn finish(&mut self, file: &File) {
+        self.cycle(file);
+        if self.released < self.started {
+            release(file, self.released, self.started);
+            self.released = self.started;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_writeback(file: &File, start: u64, end: u64) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: a hint over a range of an open file; it reads no memory.
+    unsafe {
+        libc::sync_file_range(file.as_raw_fd(), start as i64, (end - start) as i64, libc::SYNC_FILE_RANGE_WRITE);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn release(file: &File, start: u64, end: u64) {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: as above. Waiting first makes the pages clean, so
+    // DONTNEED drops them rather than leaving dirty ones behind.
+    unsafe {
+        libc::sync_file_range(fd, start as i64, (end - start) as i64, libc::SYNC_FILE_RANGE_WAIT_BEFORE);
+        libc::posix_fadvise(fd, start as i64, (end - start) as i64, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_writeback(_file: &File, _start: u64, _end: u64) {}
+
+#[cfg(not(target_os = "linux"))]
+fn release(_file: &File, _start: u64, _end: u64) {}
+
 
 impl VecSink for XvecWriter {
     fn write_record(&mut self, _ordinal: i64, data: &[u8]) {
@@ -96,6 +199,7 @@ impl VecSink for XvecWriter {
         self.keep(header);
         let body = self.writer.write_all(data);
         self.keep(body);
+        self.wrote(4 + data.len());
     }
 
     /// Write `count` fixed-dim records from a contiguous packed buffer of
@@ -141,6 +245,7 @@ impl VecSink for XvecWriter {
         if self.error.is_none() {
             let result = self.writer.write_all(&self.scratch);
             self.keep(result);
+            self.wrote(total);
         }
     }
 
@@ -148,13 +253,9 @@ impl VecSink for XvecWriter {
         if let Some(e) = self.error.take() {
             return Err(format!("write: {e}"));
         }
-        self.writer.flush().map_err(|e| format!("flush: {}", e))
+        self.writer.flush().map_err(|e| format!("flush: {}", e))?;
+        self.writeback.finish(self.writer.get_ref());
+        Ok(())
     }
 }
 
-#[allow(dead_code)]
-fn _unused_byteorder(_: u32) -> std::io::Result<()> {
-    // Keep byteorder import live even though the hot path uses LE bytes directly.
-    let mut w = std::io::sink();
-    w.write_i32::<LittleEndian>(0)
-}

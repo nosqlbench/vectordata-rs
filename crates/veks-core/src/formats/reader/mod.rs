@@ -7,7 +7,6 @@ pub mod npy;
 pub mod parquet;
 pub mod parquet_mnode;
 pub mod slab;
-pub mod xvec;
 
 use std::path::Path;
 
@@ -65,7 +64,7 @@ fn probe_slab(path: &Path) -> Result<SourceMeta, String> {
 /// Readers that don't support multi-threading ignore this parameter.
 pub fn open_source(path: &Path, format: VecFormat, threads: usize, max_count: Option<u64>) -> Result<Box<dyn VecSource>, String> {
     if format.is_xvec() {
-        return xvec::open_xvec(path, format);
+        return veks_io::xvec::reader::open(path, format);
     }
     if format.is_scalar() {
         return veks_io::scalar::reader::open(path, format);

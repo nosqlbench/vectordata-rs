@@ -67,6 +67,7 @@ fn create_for<T: Element>(path: &Path, container: Container, reader: &str) -> Re
             }
         )));
     }
+    crate::xvec::writer::refuse_symlink(path).map_err(IoError::InvalidFormat)?;
     Ok(BufWriter::with_capacity(WRITE_BUF_SIZE, File::create(path)?))
 }
 
