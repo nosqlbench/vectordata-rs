@@ -1,6 +1,6 @@
 [package]
 name = "veks-io"
-version = "4.1.0"
+version = "4.1.1"
 edition = "2024"
 description = "Standalone vector data I/O — read and write fvec, ivec, mvec, dvec, bvec, svec, npy, parquet, and slab formats"
 license = "Apache-2.0"
@@ -25,12 +25,12 @@ thiserror = "2.0.18"
 # The element model: which types a file may hold, what its extension
 # says, and what a reader may do when asked for another type. Shared
 # with vectordata so the two agree by construction.
-veks-datatypes = { path = "../veks-datatypes", version = "=4.1.0" }
+veks-datatypes = { path = "../veks-datatypes", version = "=4.1.1" }
 # The contracts veks-io implements: ByteSource, the reader and streaming
 # traits and the reader error (srd-crate-boundaries.md §4).
-veks-apicore = { path = "../veks-apicore", version = "=4.1.0" }
+veks-apicore = { path = "../veks-apicore", version = "=4.1.1" }
 # Float element conversion runs on its byte converters (F16C where present).
-veks-simd = { path = "../veks-simd", version = "=4.1.0" }
+veks-simd = { path = "../veks-simd", version = "=4.1.1" }
 
 # Optional: npy format support
 ndarray = { version = "0.16", optional = true }
@@ -41,7 +41,7 @@ arrow = { version = "54", optional = true }
 parquet = { version = "54", optional = true }
 
 # Optional: slab format support
-slabtastic = { path = "../slabtastic", version = "=4.1.0", optional = true }
+slabtastic = { path = "../slabtastic", version = "=4.1.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

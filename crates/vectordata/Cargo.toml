@@ -1,6 +1,6 @@
 [package]
 name = "vectordata"
-version = "4.1.0"
+version = "4.1.1"
 edition = "2024"
 description = "Rust implementation of vectordata tools for dataset.yaml"
 license = "Apache-2.0"
@@ -15,20 +15,20 @@ indexmap = { version = "2", features = ["serde"] }
 # The element model: element types, the extension table, and the
 # conversion rules every reader applies. Shared with veks-io so the
 # two agree by construction.
-veks-datatypes = { path = "../veks-datatypes", version = "=4.1.0" }
+veks-datatypes = { path = "../veks-datatypes", version = "=4.1.1" }
 # The one implementation of the file formats: vectordata's readers are
 # veks-io's over its own storage (srd-loose-files-overlays-integrity §6.1).
-veks-io = { path = "../veks-io", version = "=4.1.0" }
+veks-io = { path = "../veks-io", version = "=4.1.1" }
 # The API vectordata implements: the dataset, catalog, reader and source
 # contracts and the descriptor model (srd-crate-boundaries.md §4).
-veks-apicore = { path = "../veks-apicore", version = "=4.1.0" }
+veks-apicore = { path = "../veks-apicore", version = "=4.1.1" }
 # Remote access and streaming storage: the HTTP client, range reads,
 # uploads, and the merkle-verified and chunked cache files
 # (srd-crate-boundaries.md §6). vectordata decides where each cache
 # file lives; the transport writes what it is told.
-veks-transport = { path = "../veks-transport", version = "=4.1.0" }
-veks-anode = { path = "../veks-anode", version = "=4.1.0" }
-slabtastic = { path = "../slabtastic", version = "=4.1.0" }
+veks-transport = { path = "../veks-transport", version = "=4.1.1" }
+veks-anode = { path = "../veks-anode", version = "=4.1.1" }
+slabtastic = { path = "../slabtastic", version = "=4.1.1" }
 regex = "1"
 crossterm = "0.28"
 ratatui = { version = "0.29", features = ["all-widgets"] }
@@ -53,14 +53,14 @@ url = "2.5"
 # the default `cli` feature so `cargo install vectordata` produces a
 # working binary with no `--features` ceremony. Library-only consumers
 # can drop the CLI framework with `default-features = false`.
-veks-completion = { path = "../veks-completion", optional = true, version = "=4.1.0" }
-veks-completion-derive = { path = "../veks-completion-derive", optional = true, version = "=4.1.0" }
+veks-completion = { path = "../veks-completion", optional = true, version = "=4.1.1" }
+veks-completion-derive = { path = "../veks-completion-derive", optional = true, version = "=4.1.1" }
 # Used by the `explore` subcommand's TUI for value similarity, seeded
 # sampling, parallel batched analytics, and Ctrl-C abort handling.
 # All kept optional so library-only consumers (cargo install
 # --no-default-features ...) drop them out. The SIMD kernels are pure
 # Rust (`veks-simd`), so `explore` needs no C toolchain.
-veks-simd = { path = "../veks-simd", version = "=4.1.0", optional = true }
+veks-simd = { path = "../veks-simd", version = "=4.1.1", optional = true }
 rand_xoshiro = { version = "0.7", optional = true }
 rand = { version = "0.9", optional = true }
 rayon = { version = "1", optional = true }
