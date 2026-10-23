@@ -17,11 +17,7 @@ use crate::{admin, backup, config, db::Db, server};
 /// The parsed `vecd` command line: global config/data-dir flags plus one
 /// subcommand.
 #[derive(veks_completion_derive::VeksCli)]
-#[command(
-    name = "vecd",
-    about = "vectordata endpoint daemon — an AAA gateway in front of object storage",
-    version
-)]
+#[command(about = "vectordata endpoint daemon — an AAA gateway in front of object storage")]
 pub struct Cli {
     /// Data directory (DB, pidfile, local-backend objects). Defaults to
     /// the config dir's `data/`.

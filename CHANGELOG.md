@@ -25,6 +25,12 @@
 
 ### Changed
 
+- **`#[derive(VeksCli)]` refuses any `#[arg]` or `#[command]` key it
+  does not implement, at compile time.** It ignored them, so a
+  declaration carried over from clap (`hide`, `last`,
+  `allow_hyphen_values`, `trailing_var_arg`, `num_args`, `version`, …)
+  compiled and silently meant something else. The error names the key
+  and lists the supported ones.
 - **`OptionDef::parse_sig` includes the value delimiter**, so the
   option audit reports one option name split differently by two
   commands.
@@ -61,6 +67,9 @@
   the one-line summary.** They show the starting points and the
   activation lines, naming the program run, and the `completions`
   entry in the command list is one line.
+- **`slab explain --pages` was documented as taking several pages
+  after one flag** but took one; it takes a comma-separated list
+  (`--pages 0,3`), and repeating it still adds pages.
 
 ## 4.3.0 — 2026-10-23
 

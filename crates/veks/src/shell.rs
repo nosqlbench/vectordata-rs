@@ -84,7 +84,6 @@ fn long_version() -> &'static str {
 struct HelpArgs {
     /// Command path to look up (e.g., "compute knn" or "compute").
     /// Omit to list all commands.
-    #[arg(trailing_var_arg = true)]
     command_path: Vec<String>,
 
     /// List all commands with summaries, grouped by category

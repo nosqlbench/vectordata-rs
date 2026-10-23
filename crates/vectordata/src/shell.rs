@@ -57,8 +57,6 @@ const LONG_VERSION: &str = concat!(
 
 #[derive(veks_completion_derive::VeksCli)]
 #[command(
-    name = "vectordata",
-    version = LONG_VERSION,
     about = "Inspect catalog-published vector datasets, manage the local cache, and \
              launch the interactive explorer."
 )]

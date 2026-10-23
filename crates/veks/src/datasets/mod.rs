@@ -25,7 +25,6 @@ use std::path::PathBuf;
 
 /// Browse, search, and manage datasets
 #[derive(veks_completion_derive::VeksCli)]
-#[command(disable_help_subcommand = true)]
 pub struct DatasetsArgs {
     #[command(subcommand)]
     /// The `veks datasets` subcommand to run.
@@ -150,7 +149,6 @@ pub enum DatasetsCommand {
         output: Option<PathBuf>,
     },
     /// Configure vectordata settings (cache directory, mounts)
-    #[command(disable_help_subcommand = true)]
     Config {
         #[command(subcommand)]
         /// The `config` subcommand to run.

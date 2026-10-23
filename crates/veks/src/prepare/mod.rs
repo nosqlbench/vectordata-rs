@@ -26,7 +26,6 @@ use std::path::PathBuf;
 
 /// Dataset preparation and pipeline management
 #[derive(veks_completion_derive::VeksCli)]
-#[command(disable_help_subcommand = true)]
 pub struct PrepareArgs {
     #[command(subcommand)]
     /// The `veks prepare` subcommand to run.
@@ -444,7 +443,6 @@ pub enum PrepareCommand {
         force: bool,
     },
     /// Generate and manage dataset catalog index files
-    #[command(disable_help_subcommand = true)]
     Catalog {
         #[command(subcommand)]
         /// The catalog subcommand to run.

@@ -368,6 +368,83 @@ pub enum ParseError {
 /// Implemented by `#[derive(VeksCli)]` types: a command/args struct or a
 /// subcommand enum. Provides the [`CommandSpec`] (drives parse + help +
 /// completion) and the typed extraction from a [`ParsedArgs`].
+///
+/// The derive implements a fixed set of `#[arg(...)]` and `#[command(...)]`
+/// keys (listed in `veks-completion-derive`'s docs), and refuses every
+/// other one at compile time, so a declaration carried over from clap
+/// cannot quietly change meaning:
+///
+/// ```
+/// use veks_completion_derive::VeksCli;
+/// #[derive(VeksCli)]
+/// #[command(about = "Run it.")]
+/// struct Args {
+///     #[arg(long, global = true, alias = "silent")]
+///     quiet: bool,
+///     #[arg(long, value_delimiter = ',')]
+///     pages: Vec<usize>,
+///     #[arg(positional)]
+///     rest: Vec<String>,
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use veks_completion_derive::VeksCli;
+/// #[derive(VeksCli)]
+/// #[command(about = "Run it.")]
+/// struct Args {
+///     #[arg(long, global = true, alias = "silent", hide = true)]
+///     quiet: bool,
+///     #[arg(long, value_delimiter = ',')]
+///     pages: Vec<usize>,
+///     #[arg(positional)]
+///     rest: Vec<String>,
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use veks_completion_derive::VeksCli;
+/// #[derive(VeksCli)]
+/// #[command(about = "Run it.")]
+/// struct Args {
+///     #[arg(long, global = true, alias = "silent")]
+///     quiet: bool,
+///     #[arg(long, value_delimiter = ',')]
+///     pages: Vec<usize>,
+///     #[arg(positional, trailing_var_arg = true)]
+///     rest: Vec<String>,
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use veks_completion_derive::VeksCli;
+/// #[derive(VeksCli)]
+/// #[command(about = "Run it.", version)]
+/// struct Args {
+///     #[arg(long, global = true, alias = "silent")]
+///     quiet: bool,
+///     #[arg(long, value_delimiter = ',')]
+///     pages: Vec<usize>,
+///     #[arg(positional)]
+///     rest: Vec<String>,
+/// }
+/// ```
+///
+/// A value delimiter needs a list to split into:
+///
+/// ```compile_fail
+/// use veks_completion_derive::VeksCli;
+/// #[derive(VeksCli)]
+/// #[command(about = "Run it.")]
+/// struct Args {
+///     #[arg(long, global = true, alias = "silent")]
+///     quiet: bool,
+///     #[arg(long, value_delimiter = ',')]
+///     pages: usize,
+///     #[arg(positional)]
+///     rest: Vec<String>,
+/// }
+/// ```
 pub trait VeksCli: Sized {
     /// The full spec for this type used as a command named `name`.
     fn veks_command_spec(name: &str) -> CommandSpec;

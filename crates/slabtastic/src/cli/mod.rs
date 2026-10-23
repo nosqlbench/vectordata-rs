@@ -53,7 +53,7 @@ use crate::WriterConfig;
 
 /// slab — slabtastic file maintenance tool
 #[derive(veks_completion_derive::VeksCli)]
-#[command(name = "slab", version, about = "Slabtastic file maintenance tool")]
+#[command(about = "Slabtastic file maintenance tool")]
 pub struct Cli {
     /// The subcommand to run.
     #[command(subcommand)]
@@ -260,8 +260,8 @@ pub enum Command {
         /// Path to the slabtastic file.
         #[arg(positional)]
         file: String,
-        /// Show specific page indices (0-based).
-        #[arg(long, num_args = 1..)]
+        /// Show specific page indices (0-based), comma-separated or repeated.
+        #[arg(long, value_delimiter = ',')]
         pages: Option<Vec<usize>>,
         /// Show only pages belonging to a namespace.
         #[arg(long)]

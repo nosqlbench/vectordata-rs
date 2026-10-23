@@ -16,6 +16,17 @@
 //! - `#[command(flatten)]` pulls in another `VeksCli` struct's options (DRY);
 //! - `#[command(subcommand)]` on an enum-typed field wires up subcommands.
 //!
+//! The `#[arg(...)]` keys are `long`, `short`, `default` / `default_value`,
+//! `default_value_t`, `value_name`, `value_parser`, `positional`,
+//! `conflicts_with`, `conflicts_with_all`, `global` (accepted by every
+//! subcommand below, one set of values for the whole line), `alias` /
+//! `aliases` (other long spellings) and `value_delimiter` (split each value,
+//! for a `Vec` field). The `#[command(...)]` keys are `flatten` and
+//! `subcommand` on a field, and `about`, `long_about`, `after_help` /
+//! `after_long_help`, `alias` / `aliases` and `stability` on a type or a
+//! variant. Any other key is a compile error, so a clap declaration that
+//! would change meaning here does not compile silently.
+//!
 //! ## Enums (subcommands)
 //! Each variant becomes a subcommand: unit ⇒ no args, `V(ArgsStruct)` ⇒ delegate,
 //! `V { … }` ⇒ inline fields.
@@ -86,6 +97,16 @@ struct FieldAttrs {
     value_delimiter: Option<char>,
 }
 
+/// The `#[arg(...)]` keys the derive implements, named in the error for
+/// any other.
+const ARG_KEYS: &str = "long, short, default, default_value, default_value_t, value_name, \
+    value_parser, positional, conflicts_with, conflicts_with_all, global, alias, aliases, \
+    value_delimiter";
+
+/// The `#[command(...)]` keys a type or an enum variant may carry.
+const COMMAND_KEYS: &[&str] =
+    &["about", "long_about", "after_help", "after_long_help", "alias", "aliases", "stability"];
+
 /// The string literals of `= "x"` or `= ["x", "y"]`.
 fn str_or_strs(meta: &syn::meta::ParseNestedMeta) -> syn::Result<Vec<String>> {
     match meta.value()?.parse::<Expr>()? {
@@ -109,6 +130,30 @@ fn bool_value(meta: &syn::meta::ParseNestedMeta) -> syn::Result<bool> {
     } else {
         Ok(true)
     }
+}
+
+/// Refuse any `#[command(...)]` key on a type or variant that the derive
+/// does not implement.
+fn check_command_keys(attrs: &[Attribute]) -> syn::Result<()> {
+    for attr in attrs {
+        if attr.path().is_ident("command") {
+            attr.parse_nested_meta(|meta| {
+                let known = COMMAND_KEYS.iter().any(|k| meta.path.is_ident(k));
+                if !known {
+                    let key = meta.path.get_ident().map(|i| i.to_string()).unwrap_or_default();
+                    return Err(meta.error(format!(
+                        "VeksCli does not implement `#[command({key})]` here; the keys are: {}",
+                        COMMAND_KEYS.join(", ")
+                    )));
+                }
+                if meta.input.peek(syn::Token![=]) {
+                    meta.value()?.parse::<Expr>()?;
+                }
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_docs(attrs: &[Attribute]) -> Option<String> {
@@ -222,9 +267,10 @@ fn parse_field_attrs(field: &Field) -> syn::Result<FieldAttrs> {
                     let c: syn::LitChar = meta.value()?.parse()?;
                     fa.value_delimiter = Some(c.value());
                 } else {
-                    // Unknown arg keys (value_hint, …) are tolerated and
-                    // ignored — consume any `= value` so parsing continues.
-                    let _ = meta.value().and_then(|v| v.parse::<Expr>());
+                    let key = meta.path.get_ident().map(|i| i.to_string()).unwrap_or_default();
+                    return Err(meta.error(format!(
+                        "VeksCli does not implement `#[arg({key})]`; the keys are: {ARG_KEYS}"
+                    )));
                 }
                 Ok(())
             })?;
@@ -235,7 +281,10 @@ fn parse_field_attrs(field: &Field) -> syn::Result<FieldAttrs> {
                 } else if meta.path.is_ident("subcommand") {
                     fa.subcommand = true;
                 } else {
-                    let _ = meta.value().and_then(|v| v.parse::<Expr>());
+                    let key = meta.path.get_ident().map(|i| i.to_string()).unwrap_or_default();
+                    return Err(meta.error(format!(
+                        "VeksCli does not implement `#[command({key})]` on a field; the keys are: flatten, subcommand"
+                    )));
                 }
                 Ok(())
             })?;
@@ -724,6 +773,7 @@ fn parse_expr(inner: &Type, flag: &str) -> TS2 {
 // ---------------------------------------------------------------------------
 
 fn derive_struct(di: &DeriveInput, fields: &Punctuated<Field, Comma>) -> syn::Result<TS2> {
+    check_command_keys(&di.attrs)?;
     let name = &di.ident;
     let about_call = about_after_help_calls(di);
     let (spec_stmts, inits) = process_fields(fields)?;
@@ -751,6 +801,7 @@ fn derive_enum(
     di: &DeriveInput,
     variants: &Punctuated<syn::Variant, Comma>,
 ) -> syn::Result<TS2> {
+    check_command_keys(&di.attrs)?;
     let name = &di.ident;
     let about_call = about_after_help_calls(di);
 
@@ -760,7 +811,8 @@ fn derive_enum(
     for variant in variants {
         let vident = &variant.ident;
         let cmd_name = pascal_to_kebab(vident);
-        let vabout = collect_docs(&variant.attrs);
+        check_command_keys(&variant.attrs)?;
+        let vabout = command_str_attr(&variant.attrs, "about").or_else(|| collect_docs(&variant.attrs));
         let vabout_call = match vabout {
             Some(a) => quote! { .about(#a) },
             None => quote! {},

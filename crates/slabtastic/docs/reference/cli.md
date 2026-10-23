@@ -147,7 +147,7 @@ the header, records, offset array, and footer fields.
 
 | Flag | Description |
 |------|-------------|
-| `--pages <N>...` | Show specific page indices (0-based) |
+| `--pages <N>[,<N>...]` | Show specific page indices (0-based), comma-separated or repeated |
 | `--namespace <NAME>` | Show only pages belonging to a namespace |
 | `--ordinals <SPEC>` | Show pages overlapping an ordinal range |
 
