@@ -1,6 +1,6 @@
 [package]
 name = "veks-datatypes"
-version = "4.3.0"
+version = "4.3.1"
 edition = "2024"
 description = "The element model shared by vectordata and veks: element types, the one extension table, the conversion rules between types, and the distance functions a dataset declares"
 license = "Apache-2.0"
