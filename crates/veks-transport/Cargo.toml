@@ -1,6 +1,6 @@
 [package]
 name = "veks-transport"
-version = "4.2.0"
+version = "4.2.1"
 edition = "2024"
 description = "Remote access and streaming storage for vector datasets: a pooled blocking HTTP client with TLS trust, offline gate, retry and read credentials, range reads and whole-file transfers, uploads, and merkle-verified and chunk-recorded cache files, each a veks-apicore ByteSource"
 license = "Apache-2.0"
@@ -20,7 +20,7 @@ categories = ["network-programming", "filesystem", "science"]
 # The contracts and values the transport implements and consumes:
 # ByteSource, DownloadProgress, TransportConfig, Credentials,
 # RequestSigner, Request, TransportError.
-veks-apicore = { path = "../veks-apicore", version = "=4.2.0" }
+veks-apicore = { path = "../veks-apicore", version = "=4.2.1" }
 byteorder = "1.5"
 filetime = "0.2"
 # HMAC-SHA256, the keyed hash of AWS Signature Version 4 (`sigv4`).
