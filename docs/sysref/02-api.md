@@ -1156,6 +1156,17 @@ is `Error::AmbiguousDataset`, listing them — ambiguity is never
 resolved by order. Name the entry after its directory, or open the
 file as a catalog and pick an entry.
 
+An **`_include: { url: … }`** names another catalog, a URL or a path
+(a relative one under the file's location), whose entries are read
+as this file's, as jvector `DataSetLoaderSimpleMFD` reads them: this
+file's `_defaults` apply to them, their facets resolve against the
+included catalog's directory unless an entry or `_defaults` states a
+`base_url`, and an entry of this file replaces an included one of the
+same key. The included catalog's own `_`-prefixed keys (its
+`_defaults`, a further `_include`) are not read. A remote one is
+fetched as any catalog is, through the kept copy offline; one that
+cannot be had is a warning, and this file's own entries still load.
+
 The reverse holds too: a catalog source that points at a
 `dataset.yaml` lists that one dataset (named by its `name:`, else by
 its directory), with its profiles embedded, rather than a dataset per

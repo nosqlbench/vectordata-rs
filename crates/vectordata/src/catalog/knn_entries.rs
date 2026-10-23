@@ -66,6 +66,17 @@ pub const DATASET_CACHE_DIR_ENV: &str = "DATASET_CACHE_DIR";
 /// entry's `cache_dir`, else `$DATASET_CACHE_DIR`, else the catalog's
 /// own directory when the catalog is local.
 ///
+/// An `_include: { url: … }` entry names another catalog whose entries
+/// are read as this one's, as jvector `DataSetLoaderSimpleMFD` reads
+/// them: this document's `_defaults` apply to them, their facets
+/// resolve against the included catalog's directory unless an entry or
+/// `_defaults` states a `base_url`, and an entry of this document
+/// replaces an included one of the same key. The included catalog's own
+/// `_`-prefixed keys (its `_defaults`, a further `_include`) are not
+/// read. A remote one is fetched as any catalog is, through the kept
+/// copy offline; one that cannot be had is warned about, and this
+/// document's own entries still load.
+///
 /// `catalog_location` should be the directory URL or path that
 /// `knn_entries.yaml` lives in (with or without trailing `/`).
 pub fn parse_knn_entries_yaml(
@@ -73,16 +84,42 @@ pub fn parse_knn_entries_yaml(
     catalog_location: &str,
 ) -> Result<Vec<CatalogEntry>, String> {
     let env_cache_dir = std::env::var(DATASET_CACHE_DIR_ENV).ok().filter(|v| !v.is_empty());
-    parse_knn_entries_yaml_with(content, catalog_location, env_cache_dir.as_deref())
+    let parsed = parse_knn_entries_yaml_with(content, catalog_location, env_cache_dir.as_deref(), &read_included)?;
+    for warning in &parsed.warnings {
+        log::warn!("{warning}");
+    }
+    Ok(parsed.entries)
 }
 
-/// [`parse_knn_entries_yaml`] with `$DATASET_CACHE_DIR`'s value given,
-/// so the lookup is a function of its inputs.
+/// A catalog an `_include` names, read as any catalog file is.
+pub(crate) fn read_included(location: &str) -> Result<String, String> {
+    super::source::read_catalog_file(location).ok_or_else(|| format!("no catalog could be read at {location}"))
+}
+
+/// What [`parse_knn_entries_yaml_with`] read: the entries, and what
+/// went wrong without failing the document (an `_include` that could
+/// not be read).
+pub(crate) struct ParsedKnnEntries {
+    pub(crate) entries: Vec<CatalogEntry>,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// One entry as listed, before its facets resolve: its fields, and the
+/// `base_url` it falls back on when it states none.
+struct Listed {
+    fields: serde_yaml::Mapping,
+    base_url: String,
+}
+
+/// [`parse_knn_entries_yaml`] with `$DATASET_CACHE_DIR`'s value and the
+/// reading of an `_include`d catalog given, so the parse is a function
+/// of its inputs.
 pub(crate) fn parse_knn_entries_yaml_with(
     content: &str,
     catalog_location: &str,
     env_cache_dir: Option<&str>,
-) -> Result<Vec<CatalogEntry>, String> {
+    read_include: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<ParsedKnnEntries, String> {
     // Top-level shape: a map of String -> serde_yaml::Value.
     let top = top_level(content)?;
 
@@ -90,13 +127,28 @@ pub(crate) fn parse_knn_entries_yaml_with(
     // each entry. The two fields we honour mirror jvector
     // `DataSetLoaderSimpleMFD`: `base_url` (where to fetch from)
     // and `cache_dir` (where the local copies live, if any).
-    let (default_base_url, default_cache_dir) =
-        extract_defaults(&top, catalog_location);
+    let (stated_base_url, default_cache_dir) = extract_defaults(&top);
+    let default_base_url = stated_base_url.clone().unwrap_or_else(|| crate::location::dir_form(catalog_location));
     // A local catalog's own directory is where its files are, unless the
     // catalog or the environment names another; jvector's last resort.
     let local_catalog_dir = crate::Location::parse(catalog_location)
         .ok()
         .and_then(|l| l.as_path().map(|p| p.to_string_lossy().into_owned()));
+
+    // Entries by key, an included catalog's first, so this document's
+    // entry of the same key replaces one it includes.
+    let mut warnings = Vec::new();
+    let mut listed: IndexMap<String, Listed> = IndexMap::new();
+    if let Some(url) = include_location(&top, catalog_location) {
+        match read_include(&url).and_then(|text| top_level(&text)) {
+            Ok(included) => {
+                let base_url = stated_base_url.clone().unwrap_or_else(|| crate::location::parent_form(&url));
+                list_entries(&included, &base_url, &mut listed);
+            }
+            Err(e) => warnings.push(format!("knn_entries.yaml: the catalog _include names at {url} was not read: {e}")),
+        }
+    }
+    list_entries(&top, &default_base_url, &mut listed);
 
     // Accumulate by dataset name → (profile name → resolved views).
     // We resolve every facet path eagerly here so the synthesized
@@ -104,33 +156,10 @@ pub(crate) fn parse_knn_entries_yaml_with(
     // exists, and absolute URLs for facets that still need to be
     // fetched. Downstream the view layer's local-source short-
     // circuit handles them uniformly.
-    let mut grouped: IndexMap<String, IndexMap<String, IndexMap<String, String>>> =
-        IndexMap::new();
+    let mut grouped: IndexMap<String, Dataset> = IndexMap::new();
 
-    for (key_v, val_v) in top.iter() {
-        let key = match key_v.as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        // Skip all `_`-prefixed keys (`_defaults`, `_meta`,
-        // `_include`, etc.). They are control-plane metadata, not
-        // dataset entries.
-        if key.starts_with('_') { continue; }
-        let (dataset_name, profile_name) = match parse_dataset_profile_key(key) {
-            Some(t) => t,
-            None => {
-                log::warn!("knn_entries.yaml: skipping malformed key '{key}'");
-                continue;
-            }
-        };
-
-        let raw = match val_v.as_mapping() {
-            Some(m) => m,
-            None => {
-                log::warn!("knn_entries.yaml: entry '{key}' is not a map; skipping");
-                continue;
-            }
-        };
+    for (key, Listed { fields: raw, base_url }) in &listed {
+        let Some((dataset_name, profile_name)) = parse_dataset_profile_key(key) else { continue };
 
         // Per-entry overrides for cache_dir / base_url. Each
         // override replaces (not extends) the corresponding
@@ -141,7 +170,7 @@ pub(crate) fn parse_knn_entries_yaml_with(
             .and_then(|v| v.as_str())
             .map(expand_env_vars)
             .map(|s| crate::location::dir_form(&s))
-            .unwrap_or_else(|| default_base_url.clone());
+            .unwrap_or_else(|| base_url.clone());
         let entry_cache_dir = raw
             .get(serde_yaml::Value::String("cache_dir".to_string()))
             .and_then(|v| v.as_str())
@@ -172,16 +201,17 @@ pub(crate) fn parse_knn_entries_yaml_with(
             view_map.insert(canonical, resolved);
         }
 
-        grouped
-            .entry(dataset_name.to_string())
-            .or_default()
-            .insert(profile_name.to_string(), view_map);
+        let dataset = grouped.entry(dataset_name.to_string()).or_insert_with(|| Dataset {
+            home_base: base_url.clone(),
+            profiles: IndexMap::new(),
+        });
+        dataset.profiles.insert(profile_name.to_string(), view_map);
     }
 
     // Each dataset is an embedded entry: its home is the base and its
     // name, and every facet keeps the path resolved above, as written.
     let mut out: Vec<CatalogEntry> = Vec::with_capacity(grouped.len());
-    for (name, profiles) in grouped {
+    for (name, Dataset { home_base, profiles }) in grouped {
         let description = profiles
             .into_iter()
             .fold(DatasetConfig::builder(name.clone()), |dataset, (profile_name, views)| {
@@ -196,12 +226,62 @@ pub(crate) fn parse_knn_entries_yaml_with(
             .map_err(|e| format!("dataset '{name}': {e}"))?;
         out.push(
             CatalogEntry::builder(name.clone())
-                .home_as_written(format!("{}/{name}/", default_base_url.trim_end_matches('/')))
+                .home_as_written(format!("{}/{name}/", home_base.trim_end_matches('/')))
                 .dataset(description)
                 .build()?,
         );
     }
-    Ok(out)
+    Ok(ParsedKnnEntries { entries: out, warnings })
+}
+
+/// One dataset of a `knn_entries.yaml` document as its entries are
+/// grouped: the base its home is under, and its profiles' resolved
+/// facets.
+struct Dataset {
+    home_base: String,
+    profiles: IndexMap<String, IndexMap<String, String>>,
+}
+
+/// Every dataset entry of `top` (not a `_`-prefixed key, a key that
+/// splits into dataset and profile, a map), into `listed` under its
+/// key with `base_url` to fall back on; a key already there is
+/// replaced where it stands.
+fn list_entries(top: &serde_yaml::Mapping, base_url: &str, listed: &mut IndexMap<String, Listed>) {
+    for (key_v, val_v) in top.iter() {
+        let key = match key_v.as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Skip all `_`-prefixed keys (`_defaults`, `_meta`,
+        // `_include`, etc.). They are control-plane metadata, not
+        // dataset entries.
+        if key.starts_with('_') { continue; }
+        if parse_dataset_profile_key(key).is_none() {
+            log::warn!("knn_entries.yaml: skipping malformed key '{key}'");
+            continue;
+        }
+        let Some(raw) = val_v.as_mapping() else {
+            log::warn!("knn_entries.yaml: entry '{key}' is not a map; skipping");
+            continue;
+        };
+        listed.insert(key.to_string(), Listed { fields: raw.clone(), base_url: base_url.to_string() });
+    }
+}
+
+/// Where `_include.url` points, env vars expanded: a URL, or a path,
+/// a relative one under the catalog's location. `None` when the
+/// document includes nothing.
+fn include_location(top: &serde_yaml::Mapping, catalog_location: &str) -> Option<String> {
+    let url = top
+        .get(serde_yaml::Value::String("_include".to_string()))?
+        .get("url")?
+        .as_str()
+        .map(expand_env_vars)?;
+    if url.contains("://") || std::path::Path::new(&url).is_absolute() {
+        Some(url)
+    } else {
+        Some(crate::location::concat_form(&crate::location::dir_form(catalog_location), &url))
+    }
 }
 
 /// The document's top-level map. A key given twice keeps its last
@@ -260,13 +340,12 @@ pub(crate) fn declared_facet_paths(content: &str) -> Result<Vec<(String, String,
     Ok(out)
 }
 
-/// Extract `(default_base_url, default_cache_dir)` from a parsed
-/// `_defaults` mapping. `base_url` defaults to the catalog
-/// location (with a trailing `/` so `concat_form` composes cleanly).
-/// `cache_dir` has no default — its absence simply means "no
-/// local cache layer; always use the remote URL".
-fn extract_defaults(top: &serde_yaml::Mapping, catalog_location: &str) -> (String, Option<String>) {
-    let mut base_url = crate::location::dir_form(catalog_location);
+/// Extract `(base_url, cache_dir)` from a parsed `_defaults` mapping,
+/// each as stated: `base_url` with a trailing `/` so `concat_form`
+/// composes cleanly. Neither has a default here; the caller decides
+/// what each falls back on.
+fn extract_defaults(top: &serde_yaml::Mapping) -> (Option<String>, Option<String>) {
+    let mut base_url: Option<String> = None;
     let mut cache_dir: Option<String> = None;
     if let Some(defaults) = top
         .get(serde_yaml::Value::String("_defaults".to_string()))
@@ -276,7 +355,7 @@ fn extract_defaults(top: &serde_yaml::Mapping, catalog_location: &str) -> (Strin
             .get(serde_yaml::Value::String("base_url".to_string()))
             .and_then(|v| v.as_str())
         {
-            base_url = crate::location::dir_form(&expand_env_vars(bu));
+            base_url = Some(crate::location::dir_form(&expand_env_vars(bu)));
         }
         if let Some(cd) = defaults
             .get(serde_yaml::Value::String("cache_dir".to_string()))
@@ -395,6 +474,11 @@ pub(crate) fn parse_dataset_profile_key(key: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader for documents that include nothing.
+    fn no_include(location: &str) -> Result<String, String> {
+        Err(format!("nothing is included here ({location})"))
+    }
 
     /// Generic knn_entries-shape sample exercising the user-
     /// supplied pattern (`_defaults.base_url` + colon-keyed
@@ -647,7 +731,7 @@ _defaults:
         }
         let local = |dir: &std::path::Path, file: &str| std::path::absolute(dir.join(file)).unwrap().to_string_lossy().into_owned();
         let source = |yaml: &str, location: &str, env_dir: Option<&str>, facet: &str| {
-            let entries = parse_knn_entries_yaml_with(yaml, location, env_dir).unwrap();
+            let entries = parse_knn_entries_yaml_with(yaml, location, env_dir, &no_include).unwrap().entries;
             entries[0].profiles().profile("default").unwrap().views[facet].source.path.clone()
         };
         let facets = "  base: beside.fvec\n  query: env.fvec\n  gt: named.fvec\n";
@@ -678,13 +762,58 @@ _defaults:
         assert_eq!(source(&remote, "https://host/ds/", None, "base_vectors"), "https://host/ds/beside.fvec");
     }
 
+    /// **`_include` reads another catalog's entries as this one's**, as
+    /// jvector's loader does: this document's `_defaults` apply to them,
+    /// their facets resolve against the included catalog's directory
+    /// unless a `base_url` is stated, and this document's entry of the
+    /// same key replaces the included one.
+    #[test]
+    fn an_include_reads_the_included_entries() {
+        let included = "_defaults:\n  base_url: https://ignored/\nshared:\n  base: remote.fvec\nremote-only:\n  base: r.fvec\nown-base:\n  base_url: https://own/\n  base: o.fvec\n";
+        let read = |location: &str| -> Result<String, String> {
+            assert_eq!(location, "https://host/public/catalog_entries.yaml");
+            Ok(included.to_string())
+        };
+        let base = |entries: &[CatalogEntry], name: &str| {
+            let entry = entries.iter().find(|e| e.name() == name).unwrap_or_else(|| panic!("{name}"));
+            entry.profiles().profile("default").unwrap().views["base_vectors"].source.path.clone()
+        };
+        let doc = "_include:\n  url: https://host/public/catalog_entries.yaml\nshared:\n  base: local.fvec\n";
+        let parsed = parse_knn_entries_yaml_with(doc, "https://local/", None, &read).unwrap();
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        let names: Vec<&str> = parsed.entries.iter().map(|e| e.name()).collect();
+        assert_eq!(names, ["shared", "remote-only", "own-base"]);
+        assert_eq!(base(&parsed.entries, "shared"), "https://local/local.fvec", "the local entry wins");
+        assert_eq!(base(&parsed.entries, "remote-only"), "https://host/public/r.fvec", "the included catalog's directory, not its _defaults");
+        assert_eq!(base(&parsed.entries, "own-base"), "https://own/o.fvec");
+
+        // This document's `_defaults.base_url` outranks the included
+        // catalog's directory, and a relative `_include` is under the
+        // catalog's location.
+        let stated = "_defaults:\n  base_url: https://mirror/\n_include:\n  url: public/catalog_entries.yaml\n";
+        let parsed = parse_knn_entries_yaml_with(stated, "https://host/", None, &read).unwrap();
+        assert_eq!(base(&parsed.entries, "remote-only"), "https://mirror/r.fvec");
+        assert_eq!(base(&parsed.entries, "own-base"), "https://own/o.fvec");
+    }
+
+    /// **An include that cannot be read is a warning**, and the
+    /// document's own entries still load.
+    #[test]
+    fn an_unreadable_include_warns_and_keeps_the_own_entries() {
+        let doc = "_include:\n  url: https://host/gone.yaml\nmine:\n  base: m.fvec\n";
+        let parsed = parse_knn_entries_yaml_with(doc, "https://local/", None, &no_include).unwrap();
+        assert_eq!(parsed.entries.iter().map(|e| e.name()).collect::<Vec<_>>(), ["mine"]);
+        assert_eq!(parsed.warnings.len(), 1);
+        assert!(parsed.warnings[0].contains("https://host/gone.yaml"), "{:?}", parsed.warnings);
+    }
+
     /// **An entry given twice keeps its last copy**, as jvector's loader
     /// and earlier releases read it, rather than failing the whole file:
     /// hand-kept catalogs append a newer copy of an entry below the old.
     #[test]
     fn a_repeated_entry_keeps_its_last_copy() {
         let yaml = "\"d:default\":\n  base: old/b.fvec\n\"d:other\":\n  base: o.fvec\n\"d:default\":\n  base: new/b.fvec\n";
-        let entries = parse_knn_entries_yaml_with(yaml, "https://host/", None).unwrap();
+        let entries = parse_knn_entries_yaml_with(yaml, "https://host/", None, &no_include).unwrap().entries;
         let profiles = entries[0].profiles();
         assert_eq!(profiles.profile("default").unwrap().views["base_vectors"].source.path, "https://host/new/b.fvec");
         assert!(profiles.profile("other").is_some());

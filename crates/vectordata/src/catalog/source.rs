@@ -129,7 +129,7 @@ impl CatalogSource for LocatedCatalog {
 /// A catalog file's text, or `None` when it cannot be had: a local file
 /// that is not there, or a remote one its server does not give (the
 /// next probe is tried).
-fn read_catalog_file(file: &str) -> Option<String> {
+pub(super) fn read_catalog_file(file: &str) -> Option<String> {
     if crate::transport::is_remote_url(file) {
         super::resolver::fetch_http(file).ok()
     } else {
@@ -189,10 +189,13 @@ pub(crate) fn parse_catalog_content(
             }
         }
         serde_json::Value::Object(ref map) => {
+            // An included catalog's entries resolve against its own
+            // directory, so an `_include` states a base too.
             let states_base = map
                 .get("_defaults")
                 .and_then(|d| d.get("base_url"))
-                .is_some_and(|b| b.is_string());
+                .is_some_and(|b| b.is_string())
+                || map.get("_include").and_then(|i| i.get("url")).is_some_and(|u| u.is_string());
             match base {
                 None if !states_base => {
                     diagnostics.push(CatalogDiagnostic::error(format!(
@@ -201,8 +204,16 @@ pub(crate) fn parse_catalog_content(
                     )));
                     Vec::new()
                 }
-                _ => match super::knn_entries::parse_knn_entries_yaml(content, base.unwrap_or_default()) {
-                    Ok(entries) => entries,
+                _ => match super::knn_entries::parse_knn_entries_yaml_with(
+                    content,
+                    base.unwrap_or_default(),
+                    std::env::var(super::knn_entries::DATASET_CACHE_DIR_ENV).ok().filter(|v| !v.is_empty()).as_deref(),
+                    &super::knn_entries::read_included,
+                ) {
+                    Ok(parsed) => {
+                        diagnostics.extend(parsed.warnings.into_iter().map(CatalogDiagnostic::warning));
+                        parsed.entries
+                    }
                     Err(e) => {
                         diagnostics.push(CatalogDiagnostic::error(format!("failed to parse {named}: {e}")));
                         Vec::new()

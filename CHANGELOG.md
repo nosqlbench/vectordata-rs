@@ -17,6 +17,15 @@
 - **`CatalogSources::including_disabled`**: the set with its disabled
   catalogs assembled, for a program that turns catalogs on and off
   itself, as the explorer's picker does.
+- **jvector `_include` is followed.** A `knn_entries.yaml` (or any
+  jvector-shaped catalog) whose `_include: { url: … }` names another
+  catalog lists that catalog's datasets, read as jvector reads them:
+  the including file's `_defaults` apply, facets resolve against the
+  included catalog's directory unless a `base_url` is stated, and the
+  including file's own entry of a name wins. It was skipped, so a thin
+  wrapper such as jvector's public catalog listed nothing. A remote
+  include is kept for offline use like any catalog; one that cannot be
+  read is a warning, not a failure.
 
 ### Breaking
 

@@ -939,3 +939,35 @@ fn a_served_catalog_is_kept_in_the_test_cache() {
         TEST_CACHE_DIR.path().display()
     );
 }
+
+/// **A jvector `_include` is followed** over HTTP: a thin local catalog
+/// naming a served `catalog_entries.yaml` lists its datasets, which
+/// resolve against the served catalog's directory, beside the local
+/// file's own entries.
+#[test]
+fn a_jvector_include_lists_the_served_catalogs_datasets() {
+    let served = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(served.path().join("public")).unwrap();
+    std::fs::write(
+        served.path().join("public/catalog_entries.yaml"),
+        "included-ds:\n  base: inc_base.fvecs\n  query: inc_query.fvecs\n  gt: inc_gt.ivecs\n",
+    )
+    .unwrap();
+    let server = serve(served.path());
+    let local = tempfile::tempdir().unwrap();
+    let catalog_file = local.path().join("public-catalog.yaml");
+    std::fs::write(
+        &catalog_file,
+        format!("_include:\n  url: {}/public/catalog_entries.yaml\nmine:\n  base: m.fvecs\n", server.base_url()),
+    )
+    .unwrap();
+
+    let catalog = Catalog::of(&CatalogSources::new().add_catalogs(&[catalog_file.to_string_lossy().into_owned()]));
+    assert!(catalog.diagnostics().is_empty(), "{:?}", catalog.diagnostics());
+    let mut names: Vec<&str> = catalog.datasets().iter().map(|e| e.name()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["included-ds", "mine"]);
+    let included = catalog.find_exact("included-ds").unwrap();
+    let base = &included.profiles().profile("default").unwrap().views["base_vectors"].source.path;
+    assert_eq!(base, &format!("{}/public/inc_base.fvecs", server.base_url()));
+}
