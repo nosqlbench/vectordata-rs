@@ -835,16 +835,19 @@ _defaults:
             let parsed = parse_knn_entries_yaml_with(yaml, location, env, &no_include).unwrap();
             parsed.entries.iter().find(|e| e.name() == name).unwrap().cache_dir().map(std::path::Path::to_path_buf)
         };
+        // `/data/jv` is absolute on Unix; on Windows it has no drive, so
+        // it is made absolute on the working directory's.
+        let absolute = |p: &str| Some(std::path::absolute(p).unwrap());
         let doc = "_defaults:\n  cache_dir: /data/jv\nplain:\n  base: p.fvec\nown:\n  cache_dir: /fast/own\n  base: o.fvec\n";
-        assert_eq!(cache(doc, "https://host/", None, "plain"), Some("/data/jv".into()));
-        assert_eq!(cache(doc, "https://host/", Some("/env"), "own"), Some("/fast/own".into()));
+        assert_eq!(cache(doc, "https://host/", None, "plain"), absolute("/data/jv"));
+        assert_eq!(cache(doc, "https://host/", Some("/env"), "own"), absolute("/fast/own"));
         let bare = "plain:\n  base: p.fvec\n";
-        assert_eq!(cache(bare, "https://host/", Some("/env"), "plain"), Some("/env".into()));
+        assert_eq!(cache(bare, "https://host/", Some("/env"), "plain"), absolute("/env"));
         assert_eq!(cache(bare, "/local/catalog", None, "plain"), None, "a local catalog's directory names no cache");
         let relative = "_defaults:\n  cache_dir: dataset_cache/public\nplain:\n  base: p.fvec\n";
         assert_eq!(
             cache(relative, "https://host/", None, "plain"),
-            Some(std::path::absolute("dataset_cache/public").unwrap()),
+            absolute("dataset_cache/public"),
             "relative to the working directory, as jvector reads it"
         );
     }
