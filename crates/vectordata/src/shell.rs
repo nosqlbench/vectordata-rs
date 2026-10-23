@@ -64,7 +64,7 @@ const LONG_VERSION: &str = concat!(
     long_about = "vectordata — the user-facing entry point for working with \
                   published vector-search benchmark datasets.\n\n\
                   Common starting points:\n  \
-                  • `vectordata explore`           — interactive dataset picker + visualizer\n  \
+                  • `vectordata datasets explore`  — interactive dataset picker + visualizer (`explore` for short)\n  \
                   • `vectordata datasets list`     — text catalog listing\n  \
                   • `vectordata config get`        — review the active configuration\n  \
                   • `vectordata cache list`        — see what's on disk\n\n\
@@ -89,9 +89,8 @@ enum Cmd {
         #[command(subcommand)]
         command: ConfigCmd,
     },
-    /// Operations on catalog-published datasets. Run bare to see
-    /// the available subcommands; for interactive browsing and
-    /// visualization use `vectordata explore`.
+    /// Operations on catalog-published datasets, the interactive
+    /// explorer among them. Run bare to see the available subcommands.
     Datasets {
         #[command(subcommand)]
         command: Option<DatasetsCmd>,
@@ -100,24 +99,21 @@ enum Cmd {
         // values the dispatch arms read come from each subcommand's
         // own fields.
         #[allow(dead_code)]
-        /// (TUI-mode only) Configuration directory containing catalogs.yaml.
+        /// Configuration directory containing catalogs.yaml.
         #[arg(long, default_value_t = crate::catalog::sources::config_dir(), global = true)]
         configdir: String,
-        /// (TUI-mode only) Additional catalog directories, file paths, or HTTP URLs.
+        /// Additional catalog directories, file paths, or HTTP URLs.
         #[arg(long, global = true)]
         #[allow(dead_code)]
         catalog: Vec<String>,
-        /// (TUI-mode only) Catalogs to use *instead* of the configured ones, in order: each a URL, a path, a configured catalog's number, or the name of a configured or program catalog (repeatable).
+        /// Catalogs to use *instead* of the configured ones, in order: each a URL, a path, a configured catalog's number, or the name of a configured or program catalog (repeatable).
         #[arg(long = "at", global = true)]
         #[allow(dead_code)]
         at: Vec<String>,
     },
-    /// Unified vector space explorer — norms, distances, eigenvalues,
-    /// and PCA projections rendered in a single ratatui TUI. Run without
-    /// flags to pop the catalog picker; pass `--source` or `--dataset`
-    /// to launch directly against a known view.
+    /// Short for `datasets explore`: the interactive explorer.
     #[cfg(feature = "explore")]
-    Explore(crate::explore::ExploreArgs),
+    Explore(ExploreCommand),
     /// Print or activate tab-completion for the current shell.
     ///
     /// With no arguments, auto-detects your shell from `$SHELL` and
@@ -276,6 +272,24 @@ enum CacheCmd {
     },
 }
 
+/// `datasets explore` and its short form `explore`: the explorer's
+/// options and the catalogs it reads.
+#[cfg(feature = "explore")]
+#[derive(veks_completion_derive::VeksCli)]
+struct ExploreCommand {
+    #[command(flatten)]
+    args: crate::explore::ExploreArgs,
+    /// Configuration directory containing `catalogs.yaml`.
+    #[arg(long, default_value_t = crate::catalog::sources::config_dir())]
+    configdir: String,
+    /// Additional catalog directories, file paths, or HTTP URLs.
+    #[arg(long)]
+    catalog: Vec<String>,
+    /// Catalogs to use *instead* of the configured ones, in order: each a URL, a path, a configured catalog's number, or the name of a configured or program catalog (repeatable).
+    #[arg(long = "at")]
+    at: Vec<String>,
+}
+
 #[derive(veks_completion_derive::VeksCli)]
 enum DatasetsCmd {
     /// List datasets from configured or specified catalogs.
@@ -334,6 +348,14 @@ enum DatasetsCmd {
 
     /// Generate a curl download script for a dataset's published files.
     Curlify(crate::datasets::curlify::CurlifyArgs),
+
+    /// Unified vector space explorer — norms, distances, eigenvalues,
+    /// and PCA projections rendered in a single ratatui TUI. Run without
+    /// flags to pop the catalog picker; pass `--source` or `--dataset`
+    /// to launch directly against a known view. `explore` at the top
+    /// level is its short form.
+    #[cfg(feature = "explore")]
+    Explore(ExploreCommand),
 
     /// Materialize a profile of an existing dataset into a new,
     /// self-standing dataset directory.
@@ -1174,16 +1196,14 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
             at: _,
         } => {
             // No subcommand → describe the subcommands, nothing
-            // else. The interactive surface is `vectordata explore`;
-            // launching a TUI from a bare noun command was a
-            // surprise, not a feature.
+            // else; the interactive surface is `datasets explore`.
+            // Launching a TUI from a bare noun command was a surprise,
+            // not a feature.
             let Some(command) = command else {
                 print!(
                     "{}",
                     vcli::render_help_for(&spec, &["datasets".to_string()])
                 );
-                println!();
-                println!("For interactive browsing and visualization, use: vectordata explore");
                 return 0;
             };
             match command {
@@ -1216,6 +1236,8 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
                 ),
                 DatasetsCmd::Init(args) => crate::datasets::init::run(&args),
                 DatasetsCmd::Curlify(args) => crate::datasets::curlify::run_args(args),
+                #[cfg(feature = "explore")]
+                DatasetsCmd::Explore(explore) => cmd_explore(explore, program),
                 DatasetsCmd::Push(args) => crate::push::run(args),
                 DatasetsCmd::Derive {
                     dataset,
@@ -1458,14 +1480,18 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
             }
         }
         #[cfg(feature = "explore")]
-        Cmd::Explore(args) => {
-            // The program's catalogs follow the configured ones, as in
-            // every other command.
-            match crate::datasets::sources_for_run(program, &crate::catalog::sources::config_dir(), &[], &[]) {
-                Ok(run) => crate::explore::run_with_sources(args, run.sources().clone()),
-                Err(code) => code,
-            }
-        }
+        Cmd::Explore(explore) => cmd_explore(explore, program),
+    }
+}
+
+/// `datasets explore`, and `explore` for short: the explorer over the
+/// run's catalogs — the program's after the configured ones, as in
+/// every other command, or `--at`'s instead.
+#[cfg(feature = "explore")]
+fn cmd_explore(explore: ExploreCommand, program: &crate::catalog::CatalogSources) -> i32 {
+    match crate::datasets::sources_for_run(program, &explore.configdir, &explore.catalog, &explore.at) {
+        Ok(run) => crate::explore::run_with_sources(explore.args, run.sources().clone()),
+        Err(code) => code,
     }
 }
 

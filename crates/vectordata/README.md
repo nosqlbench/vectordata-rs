@@ -17,7 +17,7 @@ reference (numpy + FAISS) — see the
 # Register a catalog once (an HTTP URL or a local directory).
 vectordata config catalog add https://example.com/datasets/
 
-vectordata explore                          # browse and visualize interactively
+vectordata explore                          # browse and visualize interactively (datasets explore)
 vectordata datasets list                    # what's available
 vectordata datasets describe my-dataset     # profiles, facets, metric
 vectordata datasets precache my-dataset:default   # fetch and verify into the cache

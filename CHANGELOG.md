@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- **`vectordata datasets explore`** is the explorer, beside the other
+  dataset commands, and takes `--configdir`, `--catalog` and `--at` as
+  they do. `vectordata explore` stays as its short form, with the same
+  options; it read only the configured catalogs before.
+
 ### Fixes
 
 - **A group named alone lists its subcommands.** `vectordata cache`,

@@ -210,6 +210,7 @@ Each of these exists, is tested, and handles cases that are easy to miss.
 | `vectordata datasets derive` | none — a command that writes a new dataset directory |
 | `vectordata datasets init` | [`dataset::infer::infer_dir`](crate::dataset::infer::infer_dir) — writes its `yaml`; `TestDataGroup::load` on the directory reads the same descriptor |
 | `vectordata datasets curlify` | none — a command that writes a download script |
+| `vectordata datasets explore` | none — the interactive TUI, over [`explore::run_with_sources`](crate::explore::run_with_sources) |
 | `vectordata cache list` | [`cache_admin::list_entries`](crate::cache_admin::list_entries) |
 | `vectordata cache prune` | [`cache_admin::prune_by_filter`](crate::cache_admin::prune_by_filter) |
 | `vectordata cache prune-legacy` | [`cache_admin::prune_legacy_layout`](crate::cache_admin::prune_legacy_layout) |
@@ -228,7 +229,7 @@ Each of these exists, is tested, and handles cases that are easy to miss.
 | `vectordata token revoke` | [`endpoint::revoke_token`](crate::endpoint::revoke_token) |
 | `vectordata backup` | [`backup::run_backup`](crate::backup::run_backup) |
 | `vectordata restore` | [`backup::run_restore`](crate::backup::run_restore) |
-| `vectordata explore` | none — the interactive TUI |
+| `vectordata explore` | short for `vectordata datasets explore` |
 | `vectordata completions` | none — shell integration |
 
 `veks datasets …` dispatches to the same implementations.

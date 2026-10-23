@@ -27,7 +27,8 @@ further down.)
 
 ## 1. Find & download datasets — the CLI
 
-The quickest entry point is `vectordata explore`: with no arguments it
+The quickest entry point is `vectordata explore` (short for `vectordata
+datasets explore`): with no arguments it
 pops a **catalog picker**, lets you browse the datasets in your
 configured catalogs, and opens a TUI (norms, distances, eigenvalues, PCA)
 against any of them — fetching data on demand.
