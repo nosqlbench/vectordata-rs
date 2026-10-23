@@ -116,7 +116,7 @@ impl RunSources {
 ///
 /// Exits the process with status 1 on an `--at`/`--catalog` value it
 /// cannot resolve (a number naming no configured catalog, a name two
-/// catalogs share), as [`catalog_args`] does. The commands themselves
+/// catalogs share, a name no catalog has), as [`catalog_args`] does. The commands themselves
 /// assemble the same catalogs and return that status instead, so a
 /// program running them in-process ([`shell::run`](crate::shell::run))
 /// keeps running.
@@ -167,6 +167,10 @@ pub(crate) fn sources_for_run(
             configured = configured.enabling(&value);
             by_name.push(value);
         } else {
+            names_no_catalog(&value, &configured).map_err(|e| {
+                eprintln!("Error: {e}");
+                1
+            })?;
             locations.push(value);
         }
     }
@@ -188,12 +192,34 @@ fn is_location(value: &str) -> bool {
     value.contains("://") || std::path::Path::new(&crate::catalog::sources::expand_tilde(value)).exists()
 }
 
+/// Refuse a `--at`/`--catalog` value that reads as a catalog name (no
+/// path separator, no `.`, no `~`) but names none of `candidates` and is
+/// no URL or existing path. Read as a location, it would fail naming a
+/// file nobody asked for under a made-up catalog index; the user meant a
+/// catalog, so say which ones there are. Disabled catalogs are listed
+/// too, since naming one reads it.
+fn names_no_catalog(value: &str, candidates: &CatalogSources) -> Result<(), String> {
+    let reads_as_name = !is_location(value) && !value.contains(['/', '\\', '.']) && !value.starts_with('~');
+    if !reads_as_name {
+        return Ok(());
+    }
+    let all = candidates.including_disabled();
+    let names: Vec<&str> = all.iter().map(|(s, _)| s.name()).collect();
+    Err(if names.is_empty() {
+        format!("no catalog is named '{value}', and no catalog is configured; give a URL or a path")
+    } else {
+        format!("no catalog is named '{value}'; the catalogs are: {}", names.join(", "))
+    })
+}
+
 /// The catalogs a run's `--at` values name, in their order, in place of
 /// every other: each value is a location when it is a URL or a path
 /// that exists (a path that exists is a path, as in
 /// [`open_spec`](crate::catalog::Catalog::open_spec)); else the catalog
 /// of `candidates` (the configured ones and the program's) of that
-/// name; else a location, as before. A name two candidates share is an
+/// name; else a location, unless it reads as a name (no path separator,
+/// no `.`, no `~`), which is an error listing the catalogs there are. A
+/// name two candidates share is an
 /// error naming both, never settled by order. Numbered shortcuts are
 /// resolved before this ([`catalog_args`]). A catalog the user disabled
 /// is read when named: naming it is the choice to.
@@ -208,7 +234,10 @@ pub fn at_sources(values: &[String], candidates: &CatalogSources) -> Result<Cata
         let named = if is_location(value) { None } else { candidates.named(value)? };
         sources = match named {
             Some(named) => sources.extend(named),
-            None => sources.add_catalogs(std::slice::from_ref(value)),
+            None => {
+                names_no_catalog(value, candidates)?;
+                sources.add_catalogs(std::slice::from_ref(value))
+            }
         };
     }
     Ok(sources)

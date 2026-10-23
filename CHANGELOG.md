@@ -26,6 +26,13 @@
 
 ### Fixes
 
+- **`--at <name>` and `--catalog <name>` naming no catalog** were read
+  as a location, so the run failed naming a file nobody asked for under
+  a made-up catalog index (`no catalog file found at <name>` …
+  `catalog '0', named for this run, could not be loaded`), as when the
+  catalog was removed from `catalogs.yaml` while a program ran. A value
+  that reads as a name (no path separator, no `.`, no `~`) and is no URL
+  or existing path is now refused, listing the catalogs there are.
 - **A resident facet's precache line, again.** After 4.2.1 dropped
   the zero total, the log meter's progress line for a resident facet
   read word for word as its closing line, so one facet was listed twice;

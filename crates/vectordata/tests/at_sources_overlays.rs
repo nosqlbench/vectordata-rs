@@ -103,3 +103,23 @@ fn two_program_overlays_setting_one_key_are_still_refused() {
     let again = Overlay::program("fvec", "datasets:\n  ds:\n    distance_function: COSINE\n").unwrap();
     assert!(program().with_overlay(again).is_err(), "registering an overlay twice is refused");
 }
+
+/// **A name no catalog has is refused, naming the catalogs there are.**
+/// A value that reads as a name (no path separator, no `.`) and names no
+/// catalog was read as a location, and the run failed naming a file
+/// nobody asked for under a made-up catalog index `0`, as when the
+/// catalog is removed from `catalogs.yaml` while a process runs.
+#[test]
+fn at_sources_refuses_a_name_no_catalog_has() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config_with_two_catalogs(tmp.path());
+    let candidates = CatalogSources::new().configure(&config).extend(program());
+
+    let err = at_sources(&["gone-catalog".into()], &candidates).unwrap_err();
+    assert!(err.contains("no catalog is named 'gone-catalog'"), "{err}");
+    assert!(err.contains("c1, c2, fvec"), "lists the catalogs: {err}");
+
+    // A value that reads as a location stays one.
+    let missing = tmp.path().join("missing").to_string_lossy().into_owned();
+    assert!(at_sources(&[missing], &candidates).is_ok());
+}
