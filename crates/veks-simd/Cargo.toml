@@ -1,6 +1,6 @@
 [package]
 name = "veks-simd"
-version = "4.2.1"
+version = "4.2.2"
 edition = "2024"
 description = "Pure-Rust SIMD distance, query-batch and f16 conversion kernels for vectordata and veks, with runtime ISA dispatch"
 license = "Apache-2.0"
@@ -18,7 +18,7 @@ fearless_simd_macros = "0.1"
 half = "2"
 # The distance-function vocabulary and its one spelling table; Metric
 # parses through it.
-veks-datatypes = { path = "../veks-datatypes", version = "=4.2.1" }
+veks-datatypes = { path = "../veks-datatypes", version = "=4.2.2" }
 # Opt-in alternative pairwise backend (C, compiled by `cc`). Off by
 # default; enabled only by builds that ask for `--backend simsimd`.
 simsimd = { version = "6", optional = true }

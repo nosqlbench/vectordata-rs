@@ -1,6 +1,6 @@
 [package]
 name = "veks"
-version = "4.2.1"
+version = "4.2.2"
 edition = "2024"
 description = "A vector bulk data processing tool"
 license = "Apache-2.0"
@@ -21,8 +21,8 @@ path = "src/main.rs"
 [dependencies]
 atty = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
-veks-completion = { path = "../veks-completion", version = "=4.2.1" }
-veks-completion-derive = { path = "../veks-completion-derive", version = "=4.2.1" }
+veks-completion = { path = "../veks-completion", version = "=4.2.2" }
+veks-completion-derive = { path = "../veks-completion-derive", version = "=4.2.2" }
 crossterm = "0.28"
 env_logger = "0.11"
 filetime = "0.2"
@@ -39,13 +39,13 @@ serde_json = "1"
 serde_yaml = "0.9"
 signal-hook = "0.3"
 unicode-width = "0.2"
-slabtastic = { path = "../slabtastic", version = "=4.2.1" }
-vectordata = { path = "../vectordata", version = "=4.2.1" }
-veks-core = { path = "../veks-core", version = "=4.2.1" }
+slabtastic = { path = "../slabtastic", version = "=4.2.2" }
+vectordata = { path = "../vectordata", version = "=4.2.2" }
+veks-core = { path = "../veks-core", version = "=4.2.2" }
 # The format layer: VecFormat, the streaming readers and writers,
 # element conversion and positional file I/O.
-veks-io = { path = "../veks-io", version = "=4.2.1" }
-veks-pipeline = { path = "../veks-pipeline", version = "=4.2.1" }
+veks-io = { path = "../veks-io", version = "=4.2.2" }
+veks-pipeline = { path = "../veks-pipeline", version = "=4.2.2" }
 libc = "0.2.183"
 
 [features]

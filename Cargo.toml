@@ -15,7 +15,7 @@
 # the other with -p.
 [package]
 name = "vectordata-rs"
-version = "4.2.1"
+version = "4.2.2"
 edition = "2024"
 description = "Umbrella binary for the vectordata-rs toolkit: the vectordata CLI plus veks, vecd, and slab in one installable multiplexer"
 license = "Apache-2.0"
@@ -60,10 +60,10 @@ name = "veks"
 path = "src/main.rs"
 
 [dependencies]
-slabtastic = { path = "crates/slabtastic", version = "=4.2.1" }
-vecd = { path = "crates/vecd", version = "=4.2.1" }
-vectordata = { path = "crates/vectordata", version = "=4.2.1", features = ["cli"] }
-veks = { path = "crates/veks", version = "=4.2.1", default-features = false }
+slabtastic = { path = "crates/slabtastic", version = "=4.2.2" }
+vecd = { path = "crates/vecd", version = "=4.2.2" }
+vectordata = { path = "crates/vectordata", version = "=4.2.2", features = ["cli"] }
+veks = { path = "crates/veks", version = "=4.2.2", default-features = false }
 
 # Mirror veks's feature surface so `cargo install --path .` gets the same
 # default personality as `cargo install --path crates/veks`. The defaults
