@@ -37,6 +37,13 @@ fn init_test_cache() {
     );
 }
 
+/// Serve `root` for a test. Every test here that reaches a server goes
+/// through this, so nothing it fetches lands in the user's own cache.
+fn serve(root: &std::path::Path) -> TestServer {
+    init_test_cache();
+    TestServer::start(root).unwrap()
+}
+
 const KNN_ENTRIES_YAML: &str = r#"
 _defaults:
   base_url: file:///tmp/knn-fixture/parent
@@ -211,7 +218,7 @@ _defaults:
   query: profiles/base/query_vectors.fvecs
   gt: profiles/100k/neighbor_indices.ivecs
 "#;
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let base = server.base_url();
     let dataset_url = format!("{base}/example-1b");
     // Substitute the real base_url so the synthesized facet paths
@@ -265,7 +272,7 @@ fn http_test_data_group_load_from_url_falls_back_to_knn_entries() {
 "#,
     )
     .unwrap();
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let dataset_url = format!("{}/alpha", server.base_url());
 
     let group = vectordata::TestDataGroup::load(&dataset_url)
@@ -295,7 +302,7 @@ fn http_404_on_canonical_falls_through_to_knn_entries() {
 "#,
     )
     .unwrap();
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let sources = CatalogSources::new().add_catalogs(&[server.base_url()]);
     let catalog = Catalog::of(&sources);
     let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name()).collect();
@@ -313,7 +320,7 @@ fn http_404_on_canonical_falls_through_to_knn_entries() {
 #[test]
 fn catalog_open_synthesizes_group_for_knn_entries_entry() {
     let tmp = tempfile::tempdir().unwrap();
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let base = server.base_url();
     let yaml = r#"
 _defaults:
@@ -350,7 +357,7 @@ ds-x:
 #[test]
 fn http_catalog_resolver_accepts_simple_mfd_shape() {
     let tmp = tempfile::tempdir().unwrap();
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let base = server.base_url();
     let yaml = format!(
         r#"
@@ -402,7 +409,7 @@ ds-c-1m:
 #[test]
 fn http_catalog_resolver_accepts_arbitrary_yaml_filename() {
     let tmp = tempfile::tempdir().unwrap();
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let base = server.base_url();
 
     let yaml = format!(
@@ -453,7 +460,7 @@ fn http_catalog_resolver_accepts_arbitrary_canonical_yaml() {
         base_vectors: base.fvec
 "#;
     std::fs::write(tmp.path().join("my-private.yaml"), yaml).unwrap();
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let catalog_url = format!("{}/my-private.yaml", server.base_url());
 
     let sources = CatalogSources::new().add_catalogs(&[catalog_url]);
@@ -479,7 +486,7 @@ fn http_test_data_group_load_from_url_with_arbitrary_yaml_filename() {
 "#,
     )
     .unwrap();
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let url = format!("{}/protected-catalog.yaml", server.base_url());
 
     let group = vectordata::TestDataGroup::load(&url)
@@ -727,7 +734,7 @@ fn out_of_home_facets_cache_flat_under_dataset_dir() {
     std::fs::write(shared.join("base_6m.fvecs"), &rec).unwrap();
     std::fs::write(shared.join("query_10k.fvecs"), &rec).unwrap();
 
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let base = server.base_url();
     let yaml = format!(
         r#"
@@ -818,7 +825,7 @@ fn out_of_home_basename_collision_is_a_hard_error() {
     std::fs::write(a.join("vectors.fvecs"), &rec).unwrap();
     std::fs::write(b.join("vectors.fvecs"), &rec).unwrap();
 
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let base = server.base_url();
     let yaml = format!(
         r#"
@@ -868,7 +875,7 @@ fn catalog_source_verification_requires_live_endpoint() {
     gt.extend_from_slice(&0i32.to_le_bytes());
     std::fs::write(live.join("ds/gt.ivecs"), &gt).unwrap();
 
-    let server = TestServer::start(tmp.path()).unwrap();
+    let server = serve(tmp.path());
     let base = server.base_url();
     init_test_cache();
 
@@ -910,4 +917,25 @@ ghost-ds:
     let err = vectordata::config::verify_catalog_source("lab", &format!("{base}/absent/"))
         .expect_err("missing catalog must be refused");
     assert!(err.contains("no datasets"), "unexpected refusal: {err}");
+}
+
+/// **A remote catalog read by these tests is kept in the test cache**,
+/// never in the user's: the catalog tests had left hundreds of
+/// `127.0.0.1_<port>_*.yaml` copies in the real cache's `.catalogs/`.
+#[test]
+fn a_served_catalog_is_kept_in_the_test_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("kept.yaml"), "\"only:default\":\n  base: base.fvec\n").unwrap();
+    let server = serve(tmp.path());
+    let url = format!("{}/kept.yaml", server.base_url());
+    let _ = Catalog::of(&CatalogSources::new().add_catalogs(&[url]));
+    let port = server.base_url().trim_end_matches('/').rsplit(':').next().unwrap().to_string();
+    let kept: Vec<String> = std::fs::read_dir(TEST_CACHE_DIR.path().join(".catalogs"))
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    assert!(
+        kept.iter().any(|n| n.contains(&port) && n.ends_with("kept.yaml")),
+        "the served catalog was not kept in the test cache {}: {kept:?}",
+        TEST_CACHE_DIR.path().display()
+    );
 }
