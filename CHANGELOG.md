@@ -4,6 +4,11 @@
 
 ### Fixes
 
+- **A group named alone lists its subcommands.** `vectordata cache`,
+  `vectordata config`, `vectordata config catalog` and the like failed
+  with `a subcommand is required`; they print their help, as
+  `vectordata datasets` does. Given an option but no subcommand, a
+  group is still a usage error, and lists them too.
 - **The reminder to enable tab-completion names the program run.** A
   program embedding the CLI (`fvec bench vectordata …`) told its user
   to run `eval "$(vectordata completions)"`; it names the program's

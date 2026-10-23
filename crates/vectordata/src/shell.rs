@@ -1141,17 +1141,11 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
 
     let parsed = match vcli::parse(&spec, &argv) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("{invoked}: {e}");
-            return 2;
-        }
+        Err(e) => return parse_failure(invoked, &spec, &argv, &e),
     };
     let cli = match <Cli as VeksCli>::veks_from_parsed(&parsed) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("{invoked}: {e}");
-            return 2;
-        }
+        Err(e) => return parse_failure(invoked, &spec, &argv, &e),
     };
     // After parsing only — completion, --help, --version, and
     // malformed invocations never reach the update check. Prints a
@@ -1473,6 +1467,26 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
             }
         }
     }
+}
+
+/// The exit status for a command line `spec` refused with `e`, after
+/// saying why. A group named alone (`cache`, `config catalog`) asks
+/// what it holds: its help, listing its subcommands, is printed and the
+/// status is 0. A group given options but no subcommand is a usage
+/// error that lists them too; any other refusal is its message alone.
+fn parse_failure(invoked: &str, spec: &veks_completion::CommandSpec, argv: &[String], e: &vcli::ParseError) -> i32 {
+    if !matches!(e, vcli::ParseError::MissingSubcommand { .. }) {
+        eprintln!("{invoked}: {e}");
+        return 2;
+    }
+    let help = vcli::render_help_for(spec, argv);
+    if argv.iter().all(|w| !w.starts_with('-')) {
+        print!("{help}");
+        return 0;
+    }
+    eprintln!("{invoked}: {e}");
+    eprint!("\n{help}");
+    2
 }
 
 /// The specs `datasets precache` runs: each of `specs` through the
