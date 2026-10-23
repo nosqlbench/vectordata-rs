@@ -42,6 +42,9 @@ pub struct TextMeter {
     /// Say nothing for a facet whose plan has nothing to fetch, nor for
     /// a run that has nothing to fetch.
     quiet_when_resident: bool,
+    /// What each facet's plan found already cached, for the line of a
+    /// resident facet: how much the run checked.
+    resident: ResidentSizes,
 }
 
 impl TextMeter {
@@ -58,6 +61,7 @@ impl TextMeter {
             ticker: None,
             live: None,
             quiet_when_resident: false,
+            resident: ResidentSizes::default(),
         }
     }
 
@@ -100,6 +104,7 @@ impl FetchProgress for TextMeter {
                     .begin(format!("[{index}/{count}] {facet}{span}: opening"));
             }
             FetchEvent::PlanEnd { facet, plan } => {
+                self.resident.record(facet, plan.resident_bytes);
                 let outcome = if plan.degrades_to_full_download {
                     format!("{} whole, its window cannot be mapped", fmt_bytes(plan.facet_bytes))
                 } else if plan.is_resident() {
@@ -122,7 +127,7 @@ impl FetchProgress for TextMeter {
             }
             FetchEvent::FacetBegin { index, facet, bytes, resident, .. } => {
                 if let Some(live) = &mut self.live {
-                    live.begin(*index, facet, *bytes, *resident);
+                    live.begin(*index, facet, *bytes, *resident, self.resident.of(facet));
                     let line = live.line(0);
                     self.write(&line);
                 }
@@ -298,9 +303,26 @@ struct Live {
     facet: String,
     facet_total: u64,
     resident: bool,
+    /// For a resident facet, the bytes found cached; zero when unknown.
+    resident_bytes: u64,
     current_bytes: u64,
     last_render: Instant,
     started: Instant,
+}
+
+/// The bytes each facet's plan found already cached, by facet, so the
+/// fetch that follows can say how much a resident facet came to.
+#[derive(Default)]
+struct ResidentSizes(std::collections::HashMap<String, u64>);
+
+impl ResidentSizes {
+    fn record(&mut self, facet: &FacetId, bytes: u64) {
+        self.0.insert(facet.to_string(), bytes);
+    }
+
+    fn of(&self, facet: &FacetId) -> u64 {
+        self.0.get(&facet.to_string()).copied().unwrap_or(0)
+    }
 }
 
 impl Live {
@@ -313,17 +335,19 @@ impl Live {
             facet: String::new(),
             facet_total: 0,
             resident: false,
+            resident_bytes: 0,
             current_bytes: 0,
             last_render: Instant::now(),
             started: Instant::now(),
         }
     }
 
-    fn begin(&mut self, index: usize, facet: &FacetId, bytes: u64, resident: bool) {
+    fn begin(&mut self, index: usize, facet: &FacetId, bytes: u64, resident: bool, resident_bytes: u64) {
         self.index = index;
         self.facet = facet.to_string();
         self.facet_total = bytes;
         self.resident = resident;
+        self.resident_bytes = resident_bytes;
         self.current_bytes = 0;
         self.last_render = Instant::now();
     }
@@ -336,22 +360,40 @@ impl Live {
             None => String::new(),
         };
         format!(
-            "\r  [{}/{}] {}: {} \u{2022} total {}% ({}/{}){}\u{1b}[K",
+            "\r  [{}/{}] {}: {}{}{}\u{1b}[K",
             self.index,
             self.count,
             self.facet,
             self.facet_state(bytes),
-            pct(aggregate, self.total),
-            fmt_bytes(aggregate),
-            fmt_bytes(self.total),
+            self.run_total(aggregate, " \u{2022} "),
             trailing
         )
+    }
+
+    /// The run's progress after `sep`, or nothing for a run that has
+    /// nothing to fetch: `0 B/0 B` measures a quantity it does not have.
+    fn run_total(&self, aggregate: u64, sep: &str) -> String {
+        if self.total == 0 {
+            String::new()
+        } else {
+            format!("{sep}total {}% ({}/{})", pct(aggregate, self.total), fmt_bytes(aggregate), fmt_bytes(self.total))
+        }
+    }
+
+    /// What a resident facet's line says: that it is cached, and how
+    /// much was checked when the plan said.
+    fn resident_state(&self) -> String {
+        if self.resident_bytes > 0 {
+            format!("already resident, {}", fmt_bytes(self.resident_bytes))
+        } else {
+            "already resident".to_string()
+        }
     }
 
     /// The current facet's own progress at `bytes` done.
     fn facet_state(&self, bytes: u64) -> String {
         if self.resident {
-            "already resident".to_string()
+            self.resident_state()
         } else {
             format!("{}% ({}/{})", pct(bytes, self.facet_total), fmt_bytes(bytes), fmt_bytes(self.facet_total))
         }
@@ -383,14 +425,12 @@ impl Live {
             None => String::new(),
         };
         format!(
-            "[{}/{}] {}: {}, total {}% ({}/{}){}",
+            "[{}/{}] {}: {}{}{}",
             self.index,
             self.count,
             self.facet,
             self.facet_state(bytes),
-            pct(aggregate, self.total),
-            fmt_bytes(aggregate),
-            fmt_bytes(self.total),
+            self.run_total(aggregate, ", "),
             trailing
         )
     }
@@ -401,11 +441,7 @@ impl Live {
         // facet's share of it is the plan, whatever the transport
         // reported against chunk boundaries.
         self.finished += self.facet_total;
-        let what = if self.resident {
-            "already resident".to_string()
-        } else {
-            fmt_bytes(bytes)
-        };
+        let what = if self.resident { self.resident_state() } else { fmt_bytes(bytes) };
         format!("\r  [{}/{}] {} \u{2713} {}\u{1b}[K\n", self.index, self.count, self.facet, what)
     }
 
@@ -591,6 +627,7 @@ impl LogMeter {
                     quiet_when_resident: false,
                     planning_said: false,
                     silent_run: false,
+                    resident: ResidentSizes::default(),
                 }),
                 wake: std::sync::Condvar::new(),
             }),
@@ -743,6 +780,8 @@ struct LogState {
     planning_said: bool,
     /// Whether the current run fetches nothing and says so with nothing.
     silent_run: bool,
+    /// What each facet's plan found already cached.
+    resident: ResidentSizes,
 }
 
 impl LogState {
@@ -807,6 +846,7 @@ impl LogState {
                 self.advance();
             }
             FetchEvent::PlanEnd { facet, plan } => {
+                self.resident.record(facet, plan.resident_bytes);
                 let outcome = if plan.degrades_to_full_download {
                     format!("{} whole, its window cannot be mapped", fmt_bytes(plan.facet_bytes))
                 } else if plan.is_resident() {
@@ -840,7 +880,7 @@ impl LogState {
             }
             FetchEvent::FacetBegin { index, facet, bytes, resident, .. } => {
                 let LogPhase::Fetching(live) = &mut self.phase else { return };
-                live.begin(*index, facet, *bytes, *resident);
+                live.begin(*index, facet, *bytes, *resident, self.resident.of(facet));
                 if !*resident {
                     let body = format!("[{index}/{}] {facet}: started, {} to fetch", live.count, fmt_bytes(*bytes));
                     self.emit(log::Level::Info, &body);
@@ -873,11 +913,7 @@ impl LogState {
                 // its planned size.
                 live.finished += live.facet_total;
                 live.current_bytes = 0;
-                let what = if live.resident {
-                    "already resident".to_string()
-                } else {
-                    format!("done, {}", fmt_bytes(*bytes))
-                };
+                let what = if live.resident { live.resident_state() } else { format!("done, {}", fmt_bytes(*bytes)) };
                 let body = format!("[{}/{}] {}: {what}", live.index, live.count, live.facet);
                 let quiet = self.quiet_when_resident && live.resident;
                 if !quiet {
@@ -893,7 +929,8 @@ impl LogState {
                 let LogPhase::Fetching(live) = &self.phase else { return };
                 let (total, facet_total, count, secs) =
                     (live.total, live.facet_total, live.count, live.started.elapsed().as_secs_f64());
-                if self.reported_bytes != Some(total) {
+                // A run with nothing to fetch has no progress to close.
+                if total > 0 && self.reported_bytes != Some(total) {
                     self.report(facet_total, total, self.reported_step);
                 }
                 let done = report.bytes_fetched();
@@ -1272,8 +1309,41 @@ mod tests {
         meter.on_event(&FetchEvent::FacetEnd { facet: &a, bytes: 0 });
         meter.on_event(&FetchEvent::End { report: &report });
         let text = texts(&lines);
-        assert!(text.contains(&"Fetch: [1/1] a: already resident".to_string()), "{text:#?}");
-        assert!(text.contains(&"Fetch: [1/1] a: already resident, total 100% (0 B/0 B)".to_string()), "{text:#?}");
+        // Nothing to fetch: the facet's line once, and no run total, as
+        // `0 B/0 B` measures a quantity the run does not have.
+        assert_eq!(text.iter().filter(|l| l.contains("a: already resident")).count(), 1, "{text:#?}");
+        assert!(!text.iter().any(|l| l.contains("total") && l.contains("0 B/0 B")), "{text:#?}");
+    }
+
+    /// **A resident facet's line says how much it came to**, from its
+    /// plan, so a warm-cache run shows what it checked; the run total is
+    /// left off when there is nothing to fetch.
+    #[test]
+    fn a_resident_facet_shows_its_size_and_no_zero_total() {
+        let a = id("a");
+        let plan = PrefetchPlan { resident_bytes: 4 << 20, ..PrefetchPlan::default() };
+        let report = FetchReport { facets: vec![], elapsed: Duration::ZERO };
+
+        let cap = Capture::default();
+        let mut meter = TextMeter::to_writer("Precache", Box::new(cap.clone()));
+        meter.on_event(&FetchEvent::PlanEnd { facet: &a, plan: &plan });
+        meter.on_event(&FetchEvent::Begin { facets: 1, bytes: 0 });
+        meter.on_event(&FetchEvent::FacetBegin { index: 1, count: 1, facet: &a, bytes: 0, chunks: 0, resident: true });
+        meter.on_event(&FetchEvent::FacetEnd { facet: &a, bytes: 0 });
+        let text = cap.text();
+        assert!(text.contains("[1/1] a: already resident, 4.0 MiB"), "{text}");
+        assert!(text.contains("[1/1] a \u{2713} already resident, 4.0 MiB"), "{text}");
+        assert!(!text.contains("0 B/0 B"), "{text}");
+
+        let (mut meter, lines) = log_meter("Precache");
+        meter.on_event(&FetchEvent::PlanEnd { facet: &a, plan: &plan });
+        meter.on_event(&FetchEvent::Begin { facets: 1, bytes: 0 });
+        meter.on_event(&FetchEvent::FacetBegin { index: 1, count: 1, facet: &a, bytes: 0, chunks: 0, resident: true });
+        meter.on_event(&FetchEvent::FacetEnd { facet: &a, bytes: 0 });
+        meter.on_event(&FetchEvent::End { report: &report });
+        let text = texts(&lines);
+        assert!(text.contains(&"Precache: [1/1] a: already resident, 4.0 MiB".to_string()), "{text:#?}");
+        assert!(!text.iter().any(|l| l.contains("0 B/0 B")), "{text:#?}");
     }
 
     /// **A stall is warned in the progress line's form**, at `Warn`,

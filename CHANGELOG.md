@@ -26,6 +26,12 @@
 
 ### Fixes
 
+- **A precache with nothing to fetch printed `total 100% (0 B/0 B)`**
+  on every facet's line, a total of a quantity the run does not have.
+  The total is left off when nothing is to be fetched, and a resident
+  facet's line says how much was found cached
+  (`[1/3] base_vectors: already resident, 1.8 GiB`), in the terminal
+  and log meters alike.
 - **A disabled catalog is not read.** `disabled_catalogs` was honoured
   by the explorer's picker alone: every `datasets`, `cache` and
   `explore --dataset` command, every `shell::Host` program and every
