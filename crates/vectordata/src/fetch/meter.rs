@@ -104,7 +104,7 @@ impl FetchProgress for TextMeter {
                     .begin(format!("[{index}/{count}] {facet}{span}: opening"));
             }
             FetchEvent::PlanEnd { facet, plan } => {
-                self.resident.record(facet, plan.resident_bytes);
+                self.resident.record(facet, covered_bytes(plan));
                 let outcome = if plan.degrades_to_full_download {
                     format!("{} whole, its window cannot be mapped", fmt_bytes(plan.facet_bytes))
                 } else if plan.is_resident() {
@@ -308,6 +308,15 @@ struct Live {
     current_bytes: u64,
     last_render: Instant,
     started: Instant,
+}
+
+/// The bytes a plan's request covers: the whole facet when it degrades
+/// to a full download, else its byte ranges, else (a plan with no ranges)
+/// the facet's size. For a resident facet that is what the run checked;
+/// `resident_bytes` alone is filled only for a degraded plan.
+fn covered_bytes(plan: &crate::view::PrefetchPlan) -> u64 {
+    let ranges: u64 = plan.byte_ranges.iter().map(|r| r.end.saturating_sub(r.start)).sum();
+    if plan.degrades_to_full_download || ranges == 0 { plan.facet_bytes } else { ranges }
 }
 
 /// The bytes each facet's plan found already cached, by facet, so the
@@ -846,7 +855,7 @@ impl LogState {
                 self.advance();
             }
             FetchEvent::PlanEnd { facet, plan } => {
-                self.resident.record(facet, plan.resident_bytes);
+                self.resident.record(facet, covered_bytes(plan));
                 let outcome = if plan.degrades_to_full_download {
                     format!("{} whole, its window cannot be mapped", fmt_bytes(plan.facet_bytes))
                 } else if plan.is_resident() {
@@ -891,6 +900,9 @@ impl LogState {
                 let LogPhase::Fetching(live) = &mut self.phase else { return };
                 let moved = *bytes > live.current_bytes;
                 live.current_bytes = *bytes;
+                // A resident facet moves nothing; its closing line says
+                // all there is, and a progress line would only repeat it.
+                let resident = live.resident;
                 let (aggregate, total) = (live.finished + bytes, live.total);
                 if moved {
                     self.advance();
@@ -903,7 +915,9 @@ impl LogState {
                     self.last_progress.map(|t| t.elapsed()),
                     self.min_interval,
                 );
-                if let Some(step) = due {
+                if let Some(step) = due
+                    && !resident
+                {
                     self.report(*bytes, aggregate, step);
                 }
             }
@@ -1321,7 +1335,7 @@ mod tests {
     #[test]
     fn a_resident_facet_shows_its_size_and_no_zero_total() {
         let a = id("a");
-        let plan = PrefetchPlan { resident_bytes: 4 << 20, ..PrefetchPlan::default() };
+        let plan = PrefetchPlan { facet_bytes: 4 << 20, ..PrefetchPlan::default() };
         let report = FetchReport { facets: vec![], elapsed: Duration::ZERO };
 
         let cap = Capture::default();
@@ -1344,6 +1358,35 @@ mod tests {
         let text = texts(&lines);
         assert!(text.contains(&"Precache: [1/1] a: already resident, 4.0 MiB".to_string()), "{text:#?}");
         assert!(!text.iter().any(|l| l.contains("0 B/0 B")), "{text:#?}");
+    }
+
+    /// **A whole-file resident facet says its size, once**: a plan of
+    /// the whole facet fills no `resident_bytes` (only a degraded plan
+    /// does), and the size is what its byte ranges cover; the log meter
+    /// reports no progress line for a resident facet, which read just as
+    /// its closing line did.
+    #[test]
+    fn a_whole_file_resident_facet_is_one_line_with_its_size() {
+        let a = id("a");
+        let whole = 3 << 20;
+        let plan = PrefetchPlan {
+            facet_bytes: whole,
+            byte_ranges: vec![crate::view::ShardRange { shard: 0, start: 0, end: whole }],
+            requested_ranges: vec![crate::view::ShardRange { shard: 0, start: 0, end: whole }],
+            ..PrefetchPlan::default()
+        };
+        let report = FetchReport { facets: vec![], elapsed: Duration::ZERO };
+        let (meter, lines) = log_meter("Precache");
+        let mut meter = meter.min_interval(Duration::ZERO);
+        meter.on_event(&FetchEvent::PlanEnd { facet: &a, plan: &plan });
+        meter.on_event(&FetchEvent::Begin { facets: 1, bytes: 0 });
+        meter.on_event(&FetchEvent::FacetBegin { index: 1, count: 1, facet: &a, bytes: 0, chunks: 0, resident: true });
+        progress(&mut meter, &a, 0, 0);
+        meter.on_event(&FetchEvent::FacetEnd { facet: &a, bytes: 0 });
+        meter.on_event(&FetchEvent::End { report: &report });
+        let text = texts(&lines);
+        let facet_lines: Vec<&String> = text.iter().filter(|l| l.contains("[1/1] a:")).collect();
+        assert_eq!(facet_lines, [&"Precache: [1/1] a: already resident, 3.0 MiB".to_string()], "{text:#?}");
     }
 
     /// **A stall is warned in the progress line's form**, at `Warn`,

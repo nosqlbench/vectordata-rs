@@ -26,6 +26,12 @@
 
 ### Fixes
 
+- **A resident facet's precache line, again.** After 4.2.1 dropped
+  the zero total, the log meter's progress line for a resident facet
+  read word for word as its closing line, so one facet was listed twice;
+  and the size was shown only for a degraded plan, never for a whole
+  facet. A resident facet is one line, with the bytes its request
+  covers (`[1/3] base_vectors: already resident, 1.8 GiB`).
 - **A precache with nothing to fetch printed `total 100% (0 B/0 B)`**
   on every facet's line, a total of a quantity the run does not have.
   The total is left off when nothing is to be fetched, and a resident
