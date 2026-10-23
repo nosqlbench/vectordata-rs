@@ -20,6 +20,11 @@
   program embedding the CLI (`fvec bench vectordata …`) told its user
   to run `eval "$(vectordata completions)"`; it names the program's
   executable (`fvec`) and checks that executable's registration.
+- **The explorer's `--dataset` with `--source` named `vectordata
+  explore`** under any program, and ended the process from inside
+  `explore::run_with_sources`. The command line refuses the pair, in
+  the name of the command that was run, and `run_with_sources` given
+  both returns 2.
 
 ## 4.3.0 — 2026-10-23
 

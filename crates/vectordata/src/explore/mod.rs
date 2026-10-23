@@ -163,10 +163,10 @@ pub struct ExploreArgs {
     /// `img-search`, `img-search:default`, or `tessera:size=10m,predicates=uniform-2`.
     /// The explorer shows one profile, so the selector must name exactly one;
     /// none means `default`.
-    #[arg(long, group = "input")]
+    #[arg(long, conflicts_with = "source")]
     pub dataset: Option<String>,
     /// Any data source: local file path or dataset:profile:facet
-    #[arg(long, group = "input")]
+    #[arg(long)]
     pub source: Option<String>,
     /// Profile selector (used with --dataset; outranks a selector carried by the spec)
     #[arg(long)]
@@ -201,31 +201,27 @@ pub struct ExploreArgs {
 /// carries (PS-14): the spec's head is found by its shape (PS-2), so a
 /// URL keeps its scheme and port, and the flag replaces what follows.
 /// A spec with no selector is left alone; the opener reads it as
-/// `default` (PS-10).
+/// `default` (PS-10). `Err` when both are given: the command line
+/// refuses that, and so does a program that sets both.
 fn resolve_input(
     dataset: Option<String>,
     source: Option<String>,
     profile: Option<String>,
-) -> Option<String> {
+) -> Result<Option<String>, &'static str> {
     let base = match (dataset, source) {
         (Some(ds), None) => ds,
         (None, Some(src)) => src,
-        (None, None) => return None,
-        (Some(_), Some(_)) => {
-            eprintln!(
-                "vectordata explore: --dataset and --source are mutually exclusive — pass only one"
-            );
-            std::process::exit(2);
-        }
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => return Err("--dataset and --source are mutually exclusive — pass only one"),
     };
 
-    Some(match profile {
+    Ok(Some(match profile {
         Some(p) => {
             let (head, _) = crate::dataset::selector::DatasetSpec::split_head(&base);
             format!("{head}:{p}")
         }
         None => base,
-    })
+    }))
 }
 
 /// Launch the unified explore TUI over the configured catalogs: the
@@ -288,8 +284,13 @@ pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogS
     // Non-interactive path: explicit source or dataset → straight to
     // the explorer, no picker, no menu.
     if dataset.is_some() || source.is_some() {
-        let src = resolve_input(dataset, source, profile)
-            .expect("guarded above: at least one of --dataset/--source is set here");
+        let src = match resolve_input(dataset, source, profile) {
+            Ok(src) => src.expect("guarded above: at least one of --dataset/--source is set here"),
+            Err(message) => {
+                eprintln!("error: {message}");
+                return 2;
+            }
+        };
         // Catalogs are read only for a source that names a dataset in one.
         let catalog = if shared::names_catalog_dataset(&src) {
             crate::datasets::open_catalog(&sources)

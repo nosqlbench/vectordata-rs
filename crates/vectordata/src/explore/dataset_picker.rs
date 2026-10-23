@@ -4438,7 +4438,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
         for n in names {
             eprintln!("    {n}");
         }
-        eprintln!("  In `vectordata explore`, open the config view (Ctrl-G) and press 'e' to edit & re-validate.");
+        eprintln!("  In the explorer, open the config view (Ctrl-G) and press 'e' to edit & re-validate.");
     }
     result
 }

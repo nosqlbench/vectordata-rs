@@ -265,6 +265,11 @@ fn host_child() {
         }
         "complete-path" => run("fvec bench", words(&["completions", "--shell", "bash"]), &host.owns_completion()),
         "embedded-completions" => run("fvec bench vectordata", words(&["completions", "--shell", "bash"]), &host),
+        "embedded-explore-both" => run(
+            "fvec bench vectordata",
+            words(&["datasets", "explore", "--dataset", "alpha", "--source", "b.fvec", "--configdir", &config]),
+            &host,
+        ),
         other => panic!("no case {other}"),
     };
     std::process::exit(code);
@@ -361,4 +366,16 @@ fn an_embedding_host_keeps_the_graft_help() {
     assert!(stderr.contains("fvec bench vectordata: completion for an embedded vectordata CLI is the host program's to answer:"), "{stderr}");
     assert!(stderr.contains("graft vectordata::shell::completion_node()"), "{stderr}");
     assert!(!text(&out.stdout).contains("complete -o"), "{}", text(&out.stdout));
+}
+
+/// **The explorer's refusal names the command the user ran**: given
+/// both `--dataset` and `--source` under an embedding host, the error is
+/// the host's command line's, not `vectordata explore`'s.
+#[test]
+fn the_explorers_refusal_names_the_embedding_command() {
+    let (out, _tmp) = child("embedded-explore-both", &[]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("fvec bench vectordata: '--dataset' cannot be combined with '--source'"), "{stderr}");
+    assert!(!stderr.contains("vectordata explore"), "{stderr}");
 }
