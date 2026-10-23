@@ -82,7 +82,7 @@ enum Cmd {
     /// Inspect, list, or curate the on-disk cache.
     Cache {
         #[command(subcommand)]
-        command: CacheCmd,
+        command: Option<CacheCmd>,
     },
     /// Inspect or modify vectordata's settings.yaml.
     Config {
@@ -1179,15 +1179,23 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
     let program = &host.catalogs;
     match cli.command {
         Cmd::Cache { command } => match command {
-            CacheCmd::List { cache_dir, verbose } => cmd_cache_list(cache_dir, verbose),
-            CacheCmd::PruneLegacy { dry_run, cache_dir } => {
+            // No subcommand → where the cache is and how much it
+            // holds, then the subcommands.
+            None => {
+                print!("{}", cache_summary());
+                println!();
+                print!("{}", vcli::render_help_for(&spec, &["cache".to_string()]));
+                0
+            }
+            Some(CacheCmd::List { cache_dir, verbose }) => cmd_cache_list(cache_dir, verbose),
+            Some(CacheCmd::PruneLegacy { dry_run, cache_dir }) => {
                 cmd_cache_prune_legacy(cache_dir, dry_run)
             }
-            CacheCmd::Prune {
+            Some(CacheCmd::Prune {
                 dataset,
                 dry_run,
                 cache_dir,
-            } => cmd_cache_prune(cache_dir, dataset, dry_run),
+            }) => cmd_cache_prune(cache_dir, dataset, dry_run),
         },
         Cmd::Datasets {
             command,
@@ -1760,9 +1768,29 @@ fn cmd_cache_prune_legacy(cache_dir: Option<PathBuf>, dry_run: bool) -> i32 {
 
 // ─── Formatting ──────────────────────────────────────────────────────
 
+/// The two lines that open `cache list` and a bare `cache`: where the
+/// cache is and how much of the disk it takes.
+fn cache_header(root: &std::path::Path, total: &str) -> String {
+    format!("Cache directory: {}\nTotal on disk:   {total}\n", root.display())
+}
+
+/// What a bare `cache` opens with: [`cache_header`] for the configured
+/// cache, or why there is none.
+fn cache_summary() -> String {
+    match crate::settings::cache_dir() {
+        Ok(root) => {
+            let total = match list_entries(&root) {
+                Ok(l) => fmt_size(l.total_bytes()),
+                Err(e) => format!("unknown ({e})"),
+            };
+            cache_header(&root, &total)
+        }
+        Err(e) => format!("Cache directory: none ({e})\n"),
+    }
+}
+
 fn print_listing(root: &std::path::Path, l: &CacheListing, verbose: bool) {
-    println!("Cache directory: {}", root.display());
-    println!("Total on disk:   {}", fmt_size(l.total_bytes()));
+    print!("{}", cache_header(root, &fmt_size(l.total_bytes())));
     println!();
 
     if !l.datasets.is_empty() {

@@ -12,6 +12,9 @@
   explorer for a program that embeds the command line, naming the
   commands its hints suggest under `invoked`; `run_with_sources` is it
   under `vectordata`.
+- **A bare `vectordata cache` says where the cache is and how much it
+  holds**: it opens with the `Cache directory:` and `Total on disk:`
+  lines `cache list` opens with, above its subcommands.
 
 ### Fixes
 

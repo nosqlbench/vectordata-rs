@@ -52,6 +52,30 @@ fn a_bare_group_lists_its_subcommands() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
 }
 
+/// **A bare `cache` says where the cache is and how much it holds**,
+/// with the lines `cache list` opens with, above its subcommands.
+#[test]
+fn a_bare_cache_opens_with_its_directory_and_size() {
+    let tmp = make_tmp();
+    let cache = tmp.path().join("the-cache");
+    std::fs::create_dir_all(cache.join("ds")).unwrap();
+    std::fs::write(cache.join("ds/base.fvec"), vec![7u8; 1 << 20]).unwrap();
+    std::fs::write(tmp.path().join("settings.yaml"), format!("cache_dir: {}\n", cache.display())).unwrap();
+
+    let (listed, _) = text(&vectordata(tmp.path(), &["cache", "list"]));
+    let header: Vec<&str> = listed.lines().take(2).collect();
+    assert!(header[0] == format!("Cache directory: {}", cache.display()), "{listed}");
+    assert!(header[1].starts_with("Total on disk:") && !header[1].ends_with(" 0 B"), "{listed}");
+
+    let out = vectordata(tmp.path(), &["cache"]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[..2], header[..], "{stdout}");
+    let usage = lines.iter().position(|l| l.starts_with("Usage:")).unwrap_or_else(|| panic!("{stdout}"));
+    assert!(usage > 2 && stdout.contains("prune-legacy"), "{stdout}");
+}
+
 /// **The explorer is `datasets explore`, and `explore` is its short
 /// form**: both are listed and read the run's catalogs the same way —
 /// an `--at` name no catalog has is refused by either.
