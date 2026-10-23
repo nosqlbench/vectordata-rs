@@ -15,6 +15,19 @@
 - **A bare `vectordata cache` says where the cache is and how much it
   holds**: it opens with the `Cache directory:` and `Total on disk:`
   lines `cache list` opens with, above its subcommands.
+- **`#[derive(VeksCli)]` implements `#[arg(global)]`, `#[arg(alias)]` /
+  `aliases` and `#[arg(value_delimiter)]`.** A global option is
+  accepted by every subcommand below the command that declares it,
+  with one set of values for the whole line, and help and completion
+  offer it there. `CommandSpec` gains `propagate_globals`,
+  `OptionSpec` gains `global`, and `OptionDef` gains `aliases` and
+  `value_delimiter`.
+
+### Changed
+
+- **`OptionDef::parse_sig` includes the value delimiter**, so the
+  option audit reports one option name split differently by two
+  commands.
 
 ### Fixes
 
@@ -36,6 +49,14 @@
   no catalogs (`config catalog add`), with no terminal for the picker
   (`datasets list`), and for a source with no vectors (`datasets
   precache`). They name the command that was run.
+- **`vectordata datasets --at X list` ignored `X`**, as it did a
+  `--configdir` or `--catalog` given before the subcommand; they are
+  the subcommand's, as when given after it.
+- **`vecd <command> --data-dir …` was refused**: `vecd`'s
+  `--data-dir`, `--conf` and the config-location flags are accepted
+  after the subcommand as well as before it.
+- **`veks prepare bootstrap --overwrite` was refused**, though it was
+  declared as another spelling of `--force`; it is accepted.
 
 ## 4.3.0 — 2026-10-23
 

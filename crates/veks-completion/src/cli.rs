@@ -36,6 +36,10 @@ pub struct OptionSpec {
     /// shape or the consistency audit, so it may legitimately differ between
     /// commands that share the same `def`.
     pub value_completion: Option<crate::ValueProvider>,
+    /// Whether the option is global: accepted by every subcommand below the
+    /// command that declares it, with one set of values for the whole line
+    /// (see [`CommandSpec::propagate_globals`]).
+    pub global: bool,
 }
 
 impl std::fmt::Debug for OptionSpec {
@@ -45,6 +49,7 @@ impl std::fmt::Debug for OptionSpec {
             .field("required", &self.required)
             .field("default", &self.default)
             .field("value_completion", &self.value_completion.as_ref().map(|_| "<provider>"))
+            .field("global", &self.global)
             .finish()
     }
 }
@@ -53,7 +58,12 @@ impl OptionSpec {
     /// Wrap a shared option shape as an optional option with no default and
     /// no value completer.
     pub fn new(def: OptionDef) -> Self {
-        OptionSpec { def, required: false, default: None, value_completion: None }
+        OptionSpec { def, required: false, default: None, value_completion: None, global: false }
+    }
+    /// Set whether the option is global (see [`OptionSpec::global`]).
+    pub fn global(mut self, yes: bool) -> Self {
+        self.global = yes;
+        self
     }
     /// Set whether [`parse`] fails with [`ParseError::MissingRequiredOption`]
     /// when this option is absent and has no default.
@@ -184,10 +194,42 @@ impl CommandSpec {
         self
     }
 
-    /// Find an option by long token (with or without leading dashes) or short.
+    /// Copy every [global](OptionSpec::global) option into each command
+    /// below the one declaring it, unless that command declares an option
+    /// of the same name itself, so parsing, help and completion all see it
+    /// there. `#[derive(VeksCli)]` applies this to the specs it builds; a
+    /// spec built by hand calls it once, on its root, when it is complete.
+    pub fn propagate_globals(mut self) -> Self {
+        self.inherit_globals(&[]);
+        self
+    }
+
+    fn inherit_globals(&mut self, inherited: &[OptionSpec]) {
+        let mut globals: Vec<OptionSpec> = Vec::new();
+        for g in inherited {
+            if self.find_long(&g.def.name).is_none() {
+                self.options.push(g.clone());
+            }
+            globals.push(g.clone());
+        }
+        for o in &self.options {
+            if o.global && !globals.iter().any(|g| g.def.name == o.def.name) {
+                globals.push(o.clone());
+            }
+        }
+        for sub in &mut self.subcommands {
+            sub.inherit_globals(&globals);
+        }
+    }
+
+    /// Find an option by long token or one of its aliases (with or without
+    /// leading dashes).
     fn find_long(&self, token: &str) -> Option<&OptionSpec> {
         let want = token.trim_start_matches('-');
-        self.options.iter().find(|o| o.def.name.trim_start_matches('-') == want)
+        self.options.iter().find(|o| {
+            o.def.name.trim_start_matches('-') == want
+                || o.def.aliases.iter().any(|a| a.trim_start_matches('-') == want)
+        })
     }
     fn find_short(&self, c: char) -> Option<&OptionSpec> {
         self.options.iter().find(|o| o.def.short == Some(c))
@@ -358,9 +400,30 @@ impl std::error::Error for ParseError {}
 /// Grammar handled: `--long`, `--long=value`, `--long value`, `-s`, `-s value`,
 /// `-s=value`, `--` (end-of-options), positionals, and nested subcommands.
 /// Boolean options take no value; value options consume the next word (or the
-/// `=`-suffix). Repeatable options accumulate. Defaults fill absent value
-/// options; required options/positionals are checked after parsing.
+/// `=`-suffix). Repeatable options accumulate, and an option with a value
+/// delimiter splits each value at it. A [global](OptionSpec::global) option
+/// given at any level of the line is present at every level that declares
+/// it. Defaults fill absent value options; required options/positionals are
+/// checked after parsing.
 pub fn parse(spec: &CommandSpec, argv: &[String]) -> Result<ParsedArgs, ParseError> {
+    let mut out = parse_level(spec, argv)?;
+    share_globals(spec, &mut out);
+    finalize_tree(spec, &mut out)?;
+    Ok(out)
+}
+
+/// Record a value given for `opt`, split at its delimiter when it has one.
+fn push_value(out: &mut ParsedArgs, opt: &OptionSpec, canon: String, value: String) {
+    let values = out.values.entry(canon).or_default();
+    match opt.def.value_delimiter {
+        Some(d) => values.extend(value.split(d).map(str::to_string)),
+        None => values.push(value),
+    }
+}
+
+/// One level of `argv` against `spec`, and the subcommand levels below it,
+/// as given: no defaults, no checks.
+fn parse_level(spec: &CommandSpec, argv: &[String]) -> Result<ParsedArgs, ParseError> {
     let mut out = ParsedArgs::default();
     let mut i = 0;
     let mut options_ended = false;
@@ -406,7 +469,7 @@ pub fn parse(spec: &CommandSpec, argv: &[String]) -> Result<ParsedArgs, ParseErr
                             .ok_or_else(|| ParseError::MissingValue { command: spec.name.clone(), flag: arg.clone() })?
                     }
                 };
-                out.values.entry(canon).or_default().push(value);
+                push_value(&mut out, opt, canon, value);
             }
             i += 1;
             continue;
@@ -435,7 +498,7 @@ pub fn parse(spec: &CommandSpec, argv: &[String]) -> Result<ParsedArgs, ParseErr
                         .cloned()
                         .ok_or_else(|| ParseError::MissingValue { command: spec.name.clone(), flag: arg.clone() })?
                 };
-                out.values.entry(canon).or_default().push(value);
+                push_value(&mut out, opt, canon, value);
             }
             i += 1;
             continue;
@@ -449,10 +512,9 @@ pub fn parse(spec: &CommandSpec, argv: &[String]) -> Result<ParsedArgs, ParseErr
                 command: spec.name.clone(),
                 name: arg.clone(),
             })?;
-            let sub_parsed = parse(sub, &argv[i + 1..])?;
+            let sub_parsed = parse_level(sub, &argv[i + 1..])?;
             out.subcommand = Some((sub.name.clone(), Box::new(sub_parsed)));
             // A subcommand consumes the remainder.
-            finalize(spec, &mut out)?;
             return Ok(out);
         }
 
@@ -460,8 +522,75 @@ pub fn parse(spec: &CommandSpec, argv: &[String]) -> Result<ParsedArgs, ParseErr
         i += 1;
     }
 
-    finalize(spec, &mut out)?;
     Ok(out)
+}
+
+/// The specs and parsed levels of one line, root first.
+fn levels<'a>(spec: &'a CommandSpec, out: &'a ParsedArgs) -> Vec<(&'a CommandSpec, &'a ParsedArgs)> {
+    let mut chain = vec![(spec, out)];
+    while let Some((s, p)) = chain.last().copied() {
+        match p.subcommand.as_ref().and_then(|(name, sub)| Some((s.find_subcommand(name)?, sub.as_ref()))) {
+            Some(next) => chain.push(next),
+            None => break,
+        }
+    }
+    chain
+}
+
+/// Give every level that declares a global option the values the line gave
+/// it at any level, in the order given.
+fn share_globals(spec: &CommandSpec, out: &mut ParsedArgs) {
+    let chain = levels(spec, out);
+    let mut globals: Vec<String> = Vec::new();
+    for (s, _) in &chain {
+        for o in s.options.iter().filter(|o| o.global) {
+            let canon = o.def.name.trim_start_matches('-').to_string();
+            if !globals.contains(&canon) {
+                globals.push(canon);
+            }
+        }
+    }
+    let mut flagged: HashSet<String> = HashSet::new();
+    let mut given: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (_, p) in &chain {
+        for g in &globals {
+            if p.flags.contains(g) {
+                flagged.insert(g.clone());
+            }
+            if let Some(v) = p.values.get(g) {
+                given.entry(g.clone()).or_default().extend(v.iter().cloned());
+            }
+        }
+    }
+    let declared: Vec<Vec<String>> = chain
+        .iter()
+        .map(|(s, _)| {
+            globals.iter().filter(|g| s.options.iter().any(|o| o.def.name.trim_start_matches('-') == g.as_str())).cloned().collect()
+        })
+        .collect();
+    let mut level = Some(out);
+    for names in declared {
+        let Some(p) = level else { break };
+        for g in names {
+            if flagged.contains(&g) {
+                p.flags.insert(g.clone());
+            }
+            if let Some(v) = given.get(&g) {
+                p.values.insert(g, v.clone());
+            }
+        }
+        level = p.subcommand.as_mut().map(|(_, sub)| sub.as_mut());
+    }
+}
+
+/// [`finalize`] each level of a parsed line, deepest first.
+fn finalize_tree(spec: &CommandSpec, out: &mut ParsedArgs) -> Result<(), ParseError> {
+    if let Some((name, sub)) = out.subcommand.as_mut()
+        && let Some(sub_spec) = spec.find_subcommand(name)
+    {
+        finalize_tree(sub_spec, sub)?;
+    }
+    finalize(spec, out)
 }
 
 /// Apply defaults, then validate required options/positionals and subcommand
@@ -1305,6 +1434,107 @@ mod derive_tests {
         let (sub, sp) = p.subcommand().unwrap();
         assert_eq!(sub, "go");
         assert!(sp.has_flag("--verbose"));
+    }
+
+    /// A group with global options above a leaf that declares nothing and
+    /// a leaf that redeclares `--at` as its own.
+    #[derive(VeksCli, Debug, PartialEq)]
+    struct Daemon {
+        #[arg(long, global = true)]
+        data_dir: Option<String>,
+        #[arg(long = "at", global = true)]
+        at: Vec<String>,
+        #[arg(long, global = true)]
+        quiet: bool,
+        #[command(subcommand)]
+        command: DaemonCmd,
+    }
+
+    #[derive(VeksCli, Debug, PartialEq)]
+    enum DaemonCmd {
+        /// Run it.
+        Serve {
+            #[arg(long)]
+            port: Option<u16>,
+        },
+        /// List what the catalogs hold.
+        List {
+            #[arg(long = "at")]
+            at: Vec<String>,
+        },
+    }
+
+    /// **A global option is accepted below the command declaring it**,
+    /// and its values are the same at every level that declares it,
+    /// wherever on the line they were given and in the order given.
+    #[test]
+    fn a_global_option_is_one_option_for_the_whole_line() {
+        let spec = Daemon::veks_command_spec("vecd");
+        let parse = |words: &[&str]| Daemon::veks_from_parsed(&crate::cli::parse(&spec, &argv(words)).unwrap()).unwrap();
+
+        let after = parse(&["serve", "--data-dir", "/d", "--quiet"]);
+        let before = parse(&["--data-dir", "/d", "--quiet", "serve"]);
+        assert_eq!(after, before);
+        assert_eq!(after.data_dir.as_deref(), Some("/d"));
+        assert!(after.quiet);
+
+        // A subcommand's own `--at` reads the value given before it,
+        // and the group's reads the one given after it.
+        let both = parse(&["--at", "a", "list", "--at", "b"]);
+        assert_eq!(both.at, ["a", "b"]);
+        assert_eq!(both.command, DaemonCmd::List { at: vec!["a".into(), "b".into()] });
+
+        // A non-global option stays at its own level.
+        assert!(crate::cli::parse(&spec, &argv(&["--port", "1", "serve"])).is_err());
+    }
+
+    /// **Help and completion offer a global option below the command
+    /// declaring it.**
+    #[test]
+    fn help_and_completion_offer_a_global_option_below_it() {
+        let spec = Daemon::veks_command_spec("vecd");
+        let help = crate::cli::render_help_for(&spec, &argv(&["serve", "--help"]));
+        assert!(help.contains("--data-dir") && help.contains("--port"), "{help}");
+        let tree = crate::cli::build_completion_tree(&spec, &std::collections::BTreeMap::new());
+        let cands = crate::complete(&tree, &["vecd", "serve", "--d"]);
+        assert!(cands.iter().any(|c| c.starts_with("--data-dir")), "{cands:?}");
+    }
+
+    /// **An option alias is another spelling of the option**, read
+    /// under its own name, and not offered by help.
+    #[test]
+    fn an_option_alias_is_another_spelling() {
+        #[derive(VeksCli, Debug, PartialEq)]
+        struct Bootstrap {
+            /// Overwrite what is there.
+            #[arg(long, alias = "overwrite")]
+            force: bool,
+            #[arg(long, aliases = ["src", "from"])]
+            source: Option<String>,
+        }
+        let spec = Bootstrap::veks_command_spec("bootstrap");
+        let parse = |words: &[&str]| Bootstrap::veks_from_parsed(&crate::cli::parse(&spec, &argv(words)).unwrap()).unwrap();
+        assert_eq!(parse(&["--overwrite", "--from", "x"]), Bootstrap { force: true, source: Some("x".into()) });
+        assert_eq!(parse(&["--force", "--src=y"]), Bootstrap { force: true, source: Some("y".into()) });
+        let help = crate::cli::render_help(&spec);
+        assert!(!help.contains("overwrite"), "{help}");
+    }
+
+    /// **A value delimiter splits each value**, and repeating the
+    /// option still adds to the list.
+    #[test]
+    fn a_value_delimiter_splits_each_value() {
+        #[derive(VeksCli, Debug, PartialEq)]
+        struct Explain {
+            #[arg(long, value_delimiter = ',')]
+            pages: Option<Vec<usize>>,
+            #[arg(long, value_delimiter = ':')]
+            path: Vec<String>,
+        }
+        let spec = Explain::veks_command_spec("explain");
+        let parse = |words: &[&str]| Explain::veks_from_parsed(&crate::cli::parse(&spec, &argv(words)).unwrap()).unwrap();
+        assert_eq!(parse(&["--pages", "0,2", "--pages=5", "--path", "a:b"]), Explain { pages: Some(vec![0, 2, 5]), path: vec!["a".into(), "b".into()] });
+        assert_eq!(parse(&[]), Explain { pages: None, path: vec![] });
     }
 
     #[test]

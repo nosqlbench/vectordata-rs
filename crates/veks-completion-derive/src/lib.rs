@@ -77,6 +77,38 @@ struct FieldAttrs {
     /// to the siblings' long tokens. Declaring one side is enough —
     /// the completion bridge and parser symmetrize.
     conflicts_with: Vec<String>,
+    /// `#[arg(global = true)]`: the option is accepted by every subcommand
+    /// below, with one set of values for the whole line.
+    global: bool,
+    /// Other long spellings from `#[arg(alias = "x")]` / `aliases = [..]`.
+    aliases: Vec<String>,
+    /// `#[arg(value_delimiter = ',')]`: each value is split at it.
+    value_delimiter: Option<char>,
+}
+
+/// The string literals of `= "x"` or `= ["x", "y"]`.
+fn str_or_strs(meta: &syn::meta::ParseNestedMeta) -> syn::Result<Vec<String>> {
+    match meta.value()?.parse::<Expr>()? {
+        Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) => Ok(vec![s.value()]),
+        Expr::Array(arr) => arr
+            .elems
+            .into_iter()
+            .map(|e| match e {
+                Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) => Ok(s.value()),
+                other => Err(syn::Error::new_spanned(other, "expected a string literal")),
+            })
+            .collect(),
+        other => Err(syn::Error::new_spanned(other, "expected a string literal or an array of them")),
+    }
+}
+
+/// `key` alone is `true`; `key = true|false` is that value.
+fn bool_value(meta: &syn::meta::ParseNestedMeta) -> syn::Result<bool> {
+    if meta.input.peek(syn::Token![=]) {
+        Ok(meta.value()?.parse::<syn::LitBool>()?.value)
+    } else {
+        Ok(true)
+    }
 }
 
 fn collect_docs(attrs: &[Attribute]) -> Option<String> {
@@ -108,14 +140,9 @@ fn collect_aliases(attrs: &[Attribute]) -> Vec<String> {
                             out.push(s.value());
                         }
                 } else if meta.path.is_ident("aliases") {
-                    if let Ok(v) = meta.value()
-                        && let Ok(arr) = v.parse::<syn::ExprArray>() {
-                            for elem in arr.elems {
-                                if let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = elem {
-                                    out.push(s.value());
-                                }
-                            }
-                        }
+                    if let Ok(v) = str_or_strs(&meta) {
+                        out.extend(v);
+                    }
                 } else {
                     let _ = meta.value().and_then(|v| v.parse::<Expr>());
                 }
@@ -187,10 +214,16 @@ fn parse_field_attrs(field: &Field) -> syn::Result<FieldAttrs> {
                             }
                         }
                     }
+                } else if meta.path.is_ident("global") {
+                    fa.global = bool_value(&meta)?;
+                } else if meta.path.is_ident("alias") || meta.path.is_ident("aliases") {
+                    fa.aliases.extend(str_or_strs(&meta)?);
+                } else if meta.path.is_ident("value_delimiter") {
+                    let c: syn::LitChar = meta.value()?.parse()?;
+                    fa.value_delimiter = Some(c.value());
                 } else {
-                    // Unknown arg keys (value_hint, alias, …) are
-                    // tolerated and ignored — consume any `= value` so parsing
-                    // continues.
+                    // Unknown arg keys (value_hint, …) are tolerated and
+                    // ignored — consume any `= value` so parsing continues.
                     let _ = meta.value().and_then(|v| v.parse::<Expr>());
                 }
                 Ok(())
@@ -207,6 +240,17 @@ fn parse_field_attrs(field: &Field) -> syn::Result<FieldAttrs> {
                 Ok(())
             })?;
         }
+    }
+    let ident = field.ident.as_ref().unwrap();
+    let is_option = type_is_bool(&field.ty) || fa.has_long || fa.short.is_some();
+    if (fa.global || !fa.aliases.is_empty()) && (!is_option || fa.positional) {
+        return Err(syn::Error::new_spanned(ident, "`global` and `alias` apply to options (`#[arg(long)]`), not positionals"));
+    }
+    if fa.value_delimiter.is_some()
+        && generic_inner(&field.ty, "Vec").is_none()
+        && generic_inner(&field.ty, "Option").and_then(|i| generic_inner(i, "Vec")).is_none()
+    {
+        return Err(syn::Error::new_spanned(ident, "`value_delimiter` needs a `Vec<T>` or `Option<Vec<T>>` field"));
     }
     Ok(fa)
 }
@@ -445,6 +489,15 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
             let resolved: Vec<String> = fa.conflicts_with.iter().map(resolve_conflict).collect();
             quote! { .conflicts_with(&[#(#resolved),*]) }
         };
+        // Option aliases and the value delimiter ride on the shared shape;
+        // `global` on this command's attachment of it.
+        let aliases: Vec<String> = fa.aliases.iter().map(|a| format!("--{}", a.trim_start_matches('-'))).collect();
+        let delimiter_call = match fa.value_delimiter {
+            Some(c) => quote! { .value_delimiter(#c) },
+            None => quote! {},
+        };
+        let conflicts_call = quote! { #conflicts_call #(.alias(#aliases))* #delimiter_call };
+        let global = fa.global;
 
         // ---- boolean flag ----
         if type_is_bool(ty) {
@@ -454,7 +507,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
             spec_stmts.push(quote! {
                 __spec = __spec.option(::veks_completion::OptionSpec::new(
                     ::veks_completion::OptionDef::flag(#dashed) #short_call #help_call #conflicts_call
-                ));
+                ).global(#global));
             });
             inits.push(quote! { #ident: __p.has_flag(#dashed) });
             continue;
@@ -485,7 +538,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                 spec_stmts.push(quote! {
                     __spec = __spec.option(::veks_completion::OptionSpec::new(
                         ::veks_completion::OptionDef::value(#dashed).multiple(true) #short_call #value_name_call #help_call #conflicts_call
-                    ) #value_completion_call);
+                    ).global(#global) #value_completion_call);
                 });
                 inits.push(quote! {
                     #ident: {
@@ -502,7 +555,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                 spec_stmts.push(quote! {
                     __spec = __spec.option(::veks_completion::OptionSpec::new(
                         ::veks_completion::OptionDef::value(#dashed).multiple(true) #short_call #value_name_call #help_call #conflicts_call
-                    ) #value_completion_call);
+                    ).global(#global) #value_completion_call);
                 });
                 inits.push(quote! {
                     #ident: {
@@ -520,7 +573,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                 spec_stmts.push(quote! {
                     __spec = __spec.option(::veks_completion::OptionSpec::new(
                         ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call #conflicts_call
-                    ) #value_completion_call);
+                    ).global(#global) #value_completion_call);
                 });
                 inits.push(quote! {
                     #ident: match __p.value(#dashed) {
@@ -535,7 +588,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                 spec_stmts.push(quote! {
                     __spec = __spec.option(::veks_completion::OptionSpec::new(
                         ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call #conflicts_call
-                    ) #value_completion_call);
+                    ).global(#global) #value_completion_call);
                 });
                 inits.push(quote! {
                     #ident: match __p.value(#dashed) {
@@ -551,7 +604,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                         spec_stmts.push(quote! {
                             __spec = __spec.option(::veks_completion::OptionSpec::new(
                                 ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call #conflicts_call
-                            ).default(#def) #value_completion_call);
+                            ).global(#global).default(#def) #value_completion_call);
                         });
                         inits.push(quote! {
                             #ident: { let __s = __p.value(#dashed).unwrap_or(#def); #parse }
@@ -561,7 +614,7 @@ fn process_fields(fields: &Punctuated<Field, Comma>) -> syn::Result<(Vec<TS2>, V
                         spec_stmts.push(quote! {
                             __spec = __spec.option(::veks_completion::OptionSpec::new(
                                 ::veks_completion::OptionDef::value(#dashed) #short_call #value_name_call #help_call #conflicts_call
-                            ).required(true) #value_completion_call);
+                            ).global(#global).required(true) #value_completion_call);
                         });
                         inits.push(quote! {
                             #ident: {
@@ -670,7 +723,7 @@ fn derive_struct(di: &DeriveInput, fields: &Punctuated<Field, Comma>) -> syn::Re
         impl ::veks_completion::VeksCli for #name {
             fn veks_command_spec(__name: &str) -> ::veks_completion::CommandSpec {
                 let __spec = ::veks_completion::CommandSpec::new(__name) #about_call;
-                Self::veks_augment_spec(__spec)
+                Self::veks_augment_spec(__spec).propagate_globals()
             }
             fn veks_augment_spec(mut __spec: ::veks_completion::CommandSpec) -> ::veks_completion::CommandSpec {
                 #(#spec_stmts)*
@@ -764,7 +817,7 @@ fn derive_enum(
         impl ::veks_completion::VeksCli for #name {
             fn veks_command_spec(__name: &str) -> ::veks_completion::CommandSpec {
                 let __spec = ::veks_completion::CommandSpec::new(__name) #about_call;
-                Self::veks_augment_spec(__spec)
+                Self::veks_augment_spec(__spec).propagate_globals()
             }
             fn veks_augment_spec(mut __spec: ::veks_completion::CommandSpec) -> ::veks_completion::CommandSpec {
                 __spec.subcommand_required = true;

@@ -60,6 +60,15 @@ pub struct OptionDef {
     /// once its counterpart is on the line, and the pair is rejected
     /// at parse time.
     pub conflicts_with: Vec<String>,
+    /// Other long tokens (with dashes) the parser also accepts for this
+    /// option, e.g. `"--overwrite"` for `"--force"`. They are not offered
+    /// in completion or listed in help; values are stored under
+    /// [`name`](Self::name).
+    pub aliases: Vec<String>,
+    /// When set, each value given is split at this character into several
+    /// values (`--pages 1,2,3` is three), for a [`multiple`](Self::multiple)
+    /// option. Part of the parse shape.
+    pub value_delimiter: Option<char>,
 }
 
 impl OptionDef {
@@ -73,6 +82,8 @@ impl OptionDef {
             value_name: None,
             help: None,
             conflicts_with: Vec::new(),
+            aliases: Vec::new(),
+            value_delimiter: None,
         }
     }
 
@@ -86,6 +97,8 @@ impl OptionDef {
             value_name: None,
             help: None,
             conflicts_with: Vec::new(),
+            aliases: Vec::new(),
+            value_delimiter: None,
         }
     }
 
@@ -98,6 +111,17 @@ impl OptionDef {
                 self.conflicts_with.push((*o).to_string());
             }
         }
+        self
+    }
+
+    /// Accept another long token for this option, e.g. `"--overwrite"`.
+    pub fn alias(mut self, a: impl Into<String>) -> Self {
+        self.aliases.push(a.into());
+        self
+    }
+    /// Split each value given at `c` into several values.
+    pub fn value_delimiter(mut self, c: char) -> Self {
+        self.value_delimiter = Some(c);
         self
     }
 
@@ -123,12 +147,12 @@ impl OptionDef {
     }
 
     /// The parse-distinguishing signature: the properties that actually change
-    /// *how the option is parsed* — value-taking, repeatable, and the short
-    /// spelling. Display-only fields (`value_name`, `help`) are excluded, so a
-    /// flag that merely documents itself differently across commands is not a
-    /// parse inconsistency.
-    pub fn parse_sig(&self) -> (bool, bool, Option<char>) {
-        (self.takes_value, self.multiple, self.short)
+    /// *how the option is parsed* — value-taking, repeatable, the short
+    /// spelling, and the value delimiter. Display-only fields (`value_name`,
+    /// `help`) are excluded, so a flag that merely documents itself
+    /// differently across commands is not a parse inconsistency.
+    pub fn parse_sig(&self) -> (bool, bool, Option<char>, Option<char>) {
+        (self.takes_value, self.multiple, self.short, self.value_delimiter)
     }
 }
 
@@ -151,10 +175,10 @@ impl std::fmt::Display for ParseMismatch {
             self.name
         )?;
         for (path, def) in &self.occurrences {
-            let (takes_value, multiple, short) = def.parse_sig();
+            let (takes_value, multiple, short, delimiter) = def.parse_sig();
             writeln!(
                 f,
-                "  {:<28} takes_value={takes_value} multiple={multiple} short={short:?}",
+                "  {:<28} takes_value={takes_value} multiple={multiple} short={short:?} delimiter={delimiter:?}",
                 if path.is_empty() { "<root>" } else { path }
             )?;
         }
@@ -296,7 +320,7 @@ impl OptionRegistry {
         }
         let mut mismatches = Vec::new();
         for (name, mut occs) in by_name {
-            let mut sigs: std::collections::HashSet<(bool, bool, Option<char>)> =
+            let mut sigs: std::collections::HashSet<(bool, bool, Option<char>, Option<char>)> =
                 occs.iter().map(|(_, d)| d.parse_sig()).collect();
             // Fold in the registered canonical definition so an observed flag
             // that disagrees with the shared definition is flagged too.

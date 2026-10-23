@@ -279,6 +279,9 @@ fn host_child() {
             words(&["datasets", "explore", "--dataset", "alpha", "--source", "b.fvec", "--configdir", &config]),
             &host,
         ),
+        "embedded-at-before-list" => {
+            run("fvec bench vectordata", words(&["datasets", "--at", "nowhere", "list", "--configdir", &config]), &host)
+        }
         other => panic!("no case {other}"),
     };
     std::process::exit(code);
@@ -404,4 +407,15 @@ fn the_explorers_hints_name_the_embedding_command() {
         assert!(stderr.contains(hint), "{case}: {stderr}");
         assert!(!stderr.contains("`vectordata ") && !stderr.contains("Try: vectordata"), "{case}: {stderr}");
     }
+}
+
+/// **A catalog option given before a `datasets` subcommand is the
+/// subcommand's**: `datasets --at X list` reads X, as `datasets list
+/// --at X` does, rather than dropping it.
+#[test]
+fn a_catalog_option_before_the_subcommand_is_read() {
+    let (out, _tmp) = child("embedded-at-before-list", &[]);
+    let stderr = text(&out.stderr);
+    assert!(!out.status.success(), "{}{stderr}", text(&out.stdout));
+    assert!(stderr.contains("no catalog is named 'nowhere'"), "{stderr}");
 }
