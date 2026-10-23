@@ -1,22 +1,9 @@
 # Changelog
 
-## Unreleased
+## 4.3.0 — 2026-10-23
 
 ### Added
 
-- **`config catalog disable <name>` and `config catalog enable <name>`**
-  (`vectordata` and `veks datasets`) set the `disabled_catalogs` key of
-  `settings.yaml` without the explorer, editing that one line and
-  keeping every comment. A name no catalog has is refused naming the
-  ones there are; disabling a disabled catalog says so and succeeds.
-  The names complete. `config catalog list` marks a disabled catalog
-  `(disabled)` under the number `--at` takes, which does not change.
-- **`--catalog <name>`** names a configured or program catalog, as
-  `--at <name>` does, and reads it beside the others; a URL or an
-  existing path is a location, as before.
-- **`CatalogSources::including_disabled`**: the set with its disabled
-  catalogs assembled, for a program that turns catalogs on and off
-  itself, as the explorer's picker does.
 - **jvector `_include` is followed.** A `knn_entries.yaml` (or any
   jvector-shaped catalog) whose `_include: { url: … }` names another
   catalog lists that catalog's datasets, read as jvector reads them:
@@ -51,9 +38,6 @@
 
 - veks: `DatasetsCommand::CacheStatus` gains `cache_dir`, so a pattern
   or construction of it outside veks names the field or uses `..`.
-- veks: `ConfigCatalogSubcommand` gains `Disable` and `Enable`, mirroring
-  `vectordata config catalog`, and is `#[non_exhaustive]` from now on,
-  so a match on it outside veks needs a wildcard arm.
 
 ### Fixes
 
@@ -64,12 +48,44 @@
   catalog was removed from `catalogs.yaml` while a program ran. A value
   that reads as a name (no path separator, no `.`, no `~`) and is no URL
   or existing path is now refused, listing the catalogs there are.
+
+## 4.2.2 — 2026-10-23
+
+### Fixes
+
 - **A resident facet's precache line, again.** After 4.2.1 dropped
   the zero total, the log meter's progress line for a resident facet
   read word for word as its closing line, so one facet was listed twice;
   and the size was shown only for a degraded plan, never for a whole
   facet. A resident facet is one line, with the bytes its request
   covers (`[1/3] base_vectors: already resident, 1.8 GiB`).
+
+## 4.2.1 — 2026-10-23
+
+### Added
+
+- **`config catalog disable <name>` and `config catalog enable <name>`**
+  (`vectordata` and `veks datasets`) set the `disabled_catalogs` key of
+  `settings.yaml` without the explorer, editing that one line and
+  keeping every comment. A name no catalog has is refused naming the
+  ones there are; disabling a disabled catalog says so and succeeds.
+  The names complete. `config catalog list` marks a disabled catalog
+  `(disabled)` under the number `--at` takes, which does not change.
+- **`--catalog <name>`** names a configured or program catalog, as
+  `--at <name>` does, and reads it beside the others; a URL or an
+  existing path is a location, as before.
+- **`CatalogSources::including_disabled`**: the set with its disabled
+  catalogs assembled, for a program that turns catalogs on and off
+  itself, as the explorer's picker does.
+
+### Breaking
+
+- veks: `ConfigCatalogSubcommand` gains `Disable` and `Enable`, mirroring
+  `vectordata config catalog`, and is `#[non_exhaustive]` from now on,
+  so a match on it outside veks needs a wildcard arm.
+
+### Fixes
+
 - **A precache with nothing to fetch printed `total 100% (0 B/0 B)`**
   on every facet's line, a total of a quantity the run does not have.
   The total is left off when nothing is to be fetched, and a resident
@@ -88,7 +104,74 @@
   The setting is read from the `settings.yaml` beside the
   `catalogs.yaml` (`<dir>/settings.yaml` for `--configdir <dir>`).
 
-## Unreleased
+## 4.2.0 — 2026-10-22
+
+### Highlights
+
+- **A program can run the `vectordata` command line as its own.**
+  `shell::run(invoked, argv, &host)` and `shell::run_with_catalogs(invoked,
+  argv, catalogs)` parse and dispatch as `bin_main_with_catalogs` does,
+  and return the exit status (0, 1 for a failed command, 2 for a usage
+  error) instead of ending the process, so a program wrapping the argv
+  carries on after the command. A `shell::Host` carries the program's
+  catalogs and its own output: `after_describe` and `after_list` run
+  after `datasets describe` and `datasets list` print, with what they
+  described or listed, and `before_precache` expands a spec of the
+  program's own (`group:<name>`) into the specs it stands for.
+  `Host::owns_completion()` is for a program whose command line this is:
+  `completions` prints scripts bound to the program's name and the
+  completion protocol is answered for it. veks-completion's
+  `handle_complete_args` answers that protocol over arguments a caller
+  passes in.
+- **`datasets precache a b:10m c:profile=*` takes several specs** and
+  fetches them as one run: every spec resolved before anything moves,
+  then one plan, one progress display and one report, each facet named
+  `<dataset>:<profile>/<facet>`. `datasets::precache::run_specs` is the
+  library form; `PrecacheRequest` is unchanged. Before, every spec
+  after the first was silently ignored and the command exited 0.
+
+### Fixes
+
+- **A directory of symlinked files was not inferred.** Loose-file
+  inference skipped every link, so a dataset staged by linking its
+  files into a scratch directory failed with "name the files for their
+  roles:" and an empty list. Links are followed, for files and for
+  `profiles/` directories; a link to nothing is refused, naming it; and
+  a directory with no vector file says so.
+- **`config catalog add .` saved the resolved directory, not the one
+  the user was in.** A directory reached through a link (every temp
+  directory on macOS, through `/var` → `/private/var`) was saved by its
+  resolved path, so `remove` by the path the user saw could not find
+  it. The shell's `$PWD` is used when it names the same directory.
+- **Windows paths in catalogs.** A catalog file named by a Windows path
+  gave its datasets an empty home, and `config catalog add` named a
+  catalog after the whole path (`c-data-stage`); a `\` now separates a
+  local path's parts there, as `/` does.
+
+## 4.1.1 — 2026-10-22
+
+### Fixes
+
+- **`vectordata::catalog::source::{CatalogSource, CatalogOrigin}`
+  resolve again.** 4.1.0 moved the two to veks-apicore and re-exported
+  them at `vectordata::catalog`, but not at `catalog::source`, where
+  4.0.2 defined them, so code naming them there stopped compiling.
+- **`datasets::at_sources` with two or more catalog names registered
+  a program overlay once per name.** Each named catalog came with the
+  candidates' overlays, so every name after the first added the
+  program's overlay again, and that was refused as two overlays setting
+  one key: an error diagnostic per name, which `Catalog::of` reported.
+  The overlays are now carried once for the whole set, and a location
+  in the list reads them as a name does. `CatalogSources::named`
+  returns the catalog alone.
+- **The attribute value type had no name in vectordata.** Attributes,
+  profile tags and overlay values are `serde_yaml` values, but neither
+  the type nor the crate was re-exported, so a program writing a helper
+  over attributes needed its own `serde_yaml` at vectordata's exact
+  version. `vectordata::AttributeValue` (and `veks_apicore::AttributeValue`)
+  names the type, and `vectordata::serde_yaml` is the crate.
+
+## 4.1.0 — 2026-10-22
 
 One implementation of every file format. veks-io's readers are now
 the readers: vectordata's `XvecReader`, `IndexedVvecReader` and
@@ -247,27 +330,6 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
   answers for a host not built on veks-completion. `completions` under
   an embedding name says how, instead of printing a script bound to the
   `vectordata` executable.
-- **A program can run the `vectordata` command line as its own.**
-  `shell::run(invoked, argv, &host)` and `shell::run_with_catalogs(invoked,
-  argv, catalogs)` parse and dispatch as `bin_main_with_catalogs` does,
-  and return the exit status (0, 1 for a failed command, 2 for a usage
-  error) instead of ending the process, so a program wrapping the argv
-  carries on after the command. A `shell::Host` carries the program's
-  catalogs and its own output: `after_describe` and `after_list` run
-  after `datasets describe` and `datasets list` print, with what they
-  described or listed, and `before_precache` expands a spec of the
-  program's own (`group:<name>`) into the specs it stands for.
-  `Host::owns_completion()` is for a program whose command line this is:
-  `completions` prints scripts bound to the program's name and the
-  completion protocol is answered for it. veks-completion's
-  `handle_complete_args` answers that protocol over arguments a caller
-  passes in.
-- **`datasets precache a b:10m c:profile=*` takes several specs** and
-  fetches them as one run: every spec resolved before anything moves,
-  then one plan, one progress display and one report, each facet named
-  `<dataset>:<profile>/<facet>`. `datasets::precache::run_specs` is the
-  library form; `PrecacheRequest` is unchanged. Before, every spec
-  after the first was silently ignored and the command exited 0.
 - **`VecSource::read_record_into(&mut Vec<u8>)`** streams a file into
   one buffer instead of a new `Vec` per record. The streaming readers
   read from a mapping and release the pages behind the cursor.
@@ -426,39 +488,6 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
 
 ### Fixes
 
-- **`vectordata::catalog::source::{CatalogSource, CatalogOrigin}`
-  resolve again.** 4.1.0 moved the two to veks-apicore and re-exported
-  them at `vectordata::catalog`, but not at `catalog::source`, where
-  4.0.2 defined them, so code naming them there stopped compiling.
-- **`datasets::at_sources` with two or more catalog names registered
-  a program overlay once per name.** Each named catalog came with the
-  candidates' overlays, so every name after the first added the
-  program's overlay again, and that was refused as two overlays setting
-  one key: an error diagnostic per name, which `Catalog::of` reported.
-  The overlays are now carried once for the whole set, and a location
-  in the list reads them as a name does. `CatalogSources::named`
-  returns the catalog alone.
-- **The attribute value type had no name in vectordata.** Attributes,
-  profile tags and overlay values are `serde_yaml` values, but neither
-  the type nor the crate was re-exported, so a program writing a helper
-  over attributes needed its own `serde_yaml` at vectordata's exact
-  version. `vectordata::AttributeValue` (and `veks_apicore::AttributeValue`)
-  names the type, and `vectordata::serde_yaml` is the crate.
-- **A directory of symlinked files was not inferred.** Loose-file
-  inference skipped every link, so a dataset staged by linking its
-  files into a scratch directory failed with "name the files for their
-  roles:" and an empty list. Links are followed, for files and for
-  `profiles/` directories; a link to nothing is refused, naming it; and
-  a directory with no vector file says so.
-- **`config catalog add .` saved the resolved directory, not the one
-  the user was in.** A directory reached through a link (every temp
-  directory on macOS, through `/var` → `/private/var`) was saved by its
-  resolved path, so `remove` by the path the user saw could not find
-  it. The shell's `$PWD` is used when it names the same directory.
-- **Windows paths in catalogs.** A catalog file named by a Windows path
-  gave its datasets an empty home, and `config catalog add` named a
-  catalog after the whole path (`c-data-stage`); a `\` now separates a
-  local path's parts there, as `/` does.
 - **A directory of npy or parquet files that held a corrupt file
   ended early, quietly.** The loaders logged the file at info level
   and skipped it, so the stream stopped with fewer records than its
@@ -476,7 +505,6 @@ measurements are `docs/design/srd-loose-files-overlays-integrity.md`
   a parquet row that is null, of another length, or in a file of
   another schema. A varlen record of dimension 0, as the varlen writer
   writes it, reads as an empty record where it ended the stream.
-
 - **veks-io's byte-level writers reported a full disk as success.**
   `xvec::writer`, `scalar::writer` and the varlen writer discarded
   every write error, so a batch larger than their buffer, written
