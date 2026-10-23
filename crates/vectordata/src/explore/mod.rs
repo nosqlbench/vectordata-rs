@@ -250,6 +250,10 @@ pub fn run(args: ExploreArgs) -> i32 {
 /// expanded set, filter, scroll, last menu cursor — is preserved across
 /// every action. An edit to `catalogs.yaml` on the catalogs screen
 /// re-reads the configured catalogs and keeps the program's.
+///
+/// A catalog the user disabled is not read by `--dataset`/`--source`.
+/// The picker reads it ([`CatalogSources::including_disabled`](crate::catalog::CatalogSources::including_disabled))
+/// and hides its rows until it is turned back on in the session.
 pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogSources) -> i32 {
     use dataset_picker::{ActionFlow, PickerAction, PickerOutcome};
 
@@ -322,8 +326,11 @@ pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogS
     loop {
         // One catalog per pass, its problems printed before the picker
         // takes the screen; the picker shows them on its status line, and
-        // every action looks datasets up in this same catalog.
-        let catalog = crate::datasets::open_catalog(&sources);
+        // every action looks datasets up in this same catalog. The picker
+        // turns catalogs on and off in the session (`disabled_catalogs`),
+        // so it reads the disabled ones too and hides their rows itself.
+        let picked = sources.including_disabled();
+        let catalog = crate::datasets::open_catalog(&picked);
         let dispatch = |specifier: &str, action: PickerAction, pause: bool| -> ActionFlow {
             match action {
                 PickerAction::Visualize => {
@@ -369,7 +376,7 @@ pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogS
                 }
             }
         };
-        match dataset_picker::run_picker(&sources, &catalog, dispatch, start_in_settings) {
+        match dataset_picker::run_picker(&picked, &catalog, dispatch, start_in_settings) {
             PickerOutcome::Done => return 0,
             PickerOutcome::Failed => return 1,
             PickerOutcome::Reload => {

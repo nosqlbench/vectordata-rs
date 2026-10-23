@@ -13,6 +13,9 @@
 //! 4. Each location becomes a [`LocatedCatalog`], required or optional,
 //!    in a [`CatalogSources`] set, beside any catalog a program adds with
 //!    [`CatalogSources::with`].
+//! 5. The `disabled_catalogs` setting in the `settings.yaml` beside that
+//!    `catalogs.yaml` names catalogs the set holds but does not assemble
+//!    ([`CatalogSources::iter`]); naming one for the run reads it.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,9 +36,23 @@ pub const DEFAULT_CONFIG_DIR: &str = "~/.config/vectordata";
 /// gives nothing is an error; an optional one is not. Registered and
 /// located catalogs are alike in every other way: a dataset name in two
 /// of them is ambiguous, whichever kinds they are.
+///
+/// A catalog the user disabled (`disabled_catalogs` in the
+/// `settings.yaml` of a configured directory, as `config catalog
+/// disable` writes it) stays in the set but is not assembled: it is not
+/// in [`iter`](Self::iter), so no [`Catalog`](super::Catalog) of the set
+/// reads it. The setting names catalogs, so it disables a program's
+/// catalog of that name as well as a configured one. A catalog named
+/// for the run is read all the same: [`named`](Self::named) finds a
+/// disabled catalog, and a location added with
+/// [`add_catalogs`](Self::add_catalogs) or
+/// [`add_named_catalog`](Self::add_named_catalog) is never disabled.
 #[derive(Clone, Default)]
 pub struct CatalogSources {
     sources: Vec<Slot>,
+    /// The names the `disabled_catalogs` setting of each configured
+    /// directory lists: catalogs by these names are not assembled.
+    disabled: std::collections::BTreeSet<String>,
     /// Each `configure*` call, so [`reload_configured`](Self::reload_configured)
     /// can read its `catalogs.yaml` again.
     configured: Vec<Configured>,
@@ -54,6 +71,10 @@ struct Slot {
     requirement: Requirement,
     /// The `configure*` call it came from, by index into `configured`.
     from_config: Option<usize>,
+    /// A location given directly ([`CatalogSources::add_catalogs`],
+    /// [`CatalogSources::add_named_catalog`]): named for the run, so
+    /// never disabled.
+    given: bool,
 }
 
 /// One `configure*` call: which directory's `catalogs.yaml`, how its
@@ -77,6 +98,7 @@ impl std::fmt::Debug for CatalogSources {
                     .map(|(s, r)| (s.name().to_string(), s.origin().to_string(), r))
                     .collect::<Vec<_>>(),
             )
+            .field("disabled", &self.disabled)
             .field("diagnostics", &self.diagnostics())
             .finish()
     }
@@ -129,7 +151,9 @@ impl CatalogSources {
     }
 
     /// Read a `configure*` call's `catalogs.yaml` and add its catalogs,
-    /// and its `overlays.yaml` as the user's overlay.
+    /// its `overlays.yaml` as the user's overlay, and the
+    /// `disabled_catalogs` of its `settings.yaml` as catalogs not to
+    /// assemble.
     fn add_configured(&mut self, mut configured: Configured) {
         match crate::overlay::Overlay::load_user(Path::new(&configured.dir)) {
             Some(Ok(overlay)) => {
@@ -149,7 +173,32 @@ impl CatalogSources {
                 Err(e) => configured.diagnostics.push(super::CatalogDiagnostic::warning(e)),
             }
         }
+        if let Ok(settings) = std::fs::read_to_string(Path::new(&configured.dir).join(crate::settings::SETTINGS_FILE)) {
+            self.disabled.extend(crate::settings::disabled_catalogs_in(&settings));
+        }
         self.configured.push(configured);
+    }
+
+    /// The same set with every catalog assembled, the disabled ones
+    /// included: what a browser that turns catalogs on and off in the
+    /// session reads, so a catalog turned back on has its datasets at
+    /// hand. Every other reader uses the set as it is.
+    pub fn including_disabled(&self) -> Self {
+        CatalogSources { disabled: std::collections::BTreeSet::new(), ..self.clone() }
+    }
+
+    /// The same set with the catalogs named `name` assembled though the
+    /// user disabled them: what `--catalog <name>` reads.
+    pub(crate) fn enabling(mut self, name: &str) -> Self {
+        self.disabled.remove(name);
+        self
+    }
+
+    /// Whether `slot` is assembled: a location given directly always
+    /// is; any other catalog unless `disabled` names it. Pure over the
+    /// names given.
+    fn assembled(slot: &Slot, disabled: &std::collections::BTreeSet<String>) -> bool {
+        slot.given || !disabled.contains(slot.source.name())
     }
 
     /// The same set with every `catalogs.yaml` it was configured from read
@@ -159,6 +208,7 @@ impl CatalogSources {
     pub fn reload_configured(&self) -> Self {
         let mut overlays = self.overlays.clone();
         overlays.set_user(None);
+        // The disabled names are read again with each configuration.
         let mut out = CatalogSources { diagnostics: self.diagnostics.clone(), overlays, ..CatalogSources::default() };
         let mut reread = vec![false; self.configured.len()];
         for slot in &self.sources {
@@ -218,14 +268,14 @@ impl CatalogSources {
     /// or the program's own [`CatalogSource`]. It takes its place in
     /// order after the catalogs already added.
     pub fn with(mut self, source: impl CatalogSource + 'static) -> Self {
-        self.sources.push(Slot { source: Arc::new(source), requirement: Requirement::Required, from_config: None });
+        self.sources.push(Slot { source: Arc::new(source), requirement: Requirement::Required, from_config: None, given: false });
         self
     }
 
     /// A catalog the program supplies, optional: one that gives no
     /// catalog at all is not an error.
     pub fn with_optional(mut self, source: impl CatalogSource + 'static) -> Self {
-        self.sources.push(Slot { source: Arc::new(source), requirement: Requirement::Optional, from_config: None });
+        self.sources.push(Slot { source: Arc::new(source), requirement: Requirement::Optional, from_config: None, given: false });
         self
     }
 
@@ -233,7 +283,7 @@ impl CatalogSources {
     /// as required as it was there. `other`'s configured catalogs stay
     /// configured, so [`reload_configured`](Self::reload_configured)
     /// re-reads them where they now stand, and its diagnostics come
-    /// along.
+    /// along. A name either set disables is disabled in the whole.
     ///
     /// ```
     /// use vectordata::catalog::{CatalogBuilder, CatalogSources};
@@ -245,6 +295,7 @@ impl CatalogSources {
     pub fn extend(mut self, other: CatalogSources) -> Self {
         let offset = self.configured.len();
         self.configured.extend(other.configured);
+        self.disabled.extend(other.disabled);
         self.sources.extend(other.sources.into_iter().map(|slot| Slot {
             from_config: slot.from_config.map(|k| k + offset),
             ..slot
@@ -266,7 +317,9 @@ impl CatalogSources {
     /// The one catalog of this set named `name`, as a set of its own and
     /// required: what `--at <name>` reads. `Ok(None)` when no catalog
     /// has the name; an error naming each when several do, since a
-    /// choice between catalogs is never made by order.
+    /// choice between catalogs is never made by order. A disabled
+    /// catalog is found too, and is assembled in the set returned:
+    /// naming it is a choice to read it.
     ///
     /// The set holds the catalog alone, with no overlays: the overlays
     /// belong to the set they were registered on, and
@@ -291,9 +344,14 @@ impl CatalogSources {
         }
     }
 
-    /// The catalogs, in order, each with whether it must load.
+    /// The catalogs assembled, in order, each with whether it must
+    /// load: every catalog of the set but those the user disabled
+    /// ([`including_disabled`](Self::including_disabled) has them all).
     pub fn iter(&self) -> impl Iterator<Item = (&dyn CatalogSource, Requirement)> + '_ {
-        self.sources.iter().map(|slot| (slot.source.as_ref(), slot.requirement))
+        self.sources
+            .iter()
+            .filter(|slot| Self::assembled(slot, &self.disabled))
+            .map(|slot| (slot.source.as_ref(), slot.requirement))
     }
 
     fn extend_located(&mut self, located: Vec<LocatedCatalog>, requirement: Requirement, from_config: Option<usize>) {
@@ -301,6 +359,7 @@ impl CatalogSources {
             source: Arc::new(l) as Arc<dyn CatalogSource>,
             requirement,
             from_config,
+            given: from_config.is_none(),
         }));
     }
 
@@ -358,7 +417,7 @@ impl CatalogSources {
     /// (ad-hoc CLI locations): the next free stringified index,
     /// matching the promotion rule for legacy list files.
     fn synthesize_name(&self) -> String {
-        let taken: std::collections::HashSet<&str> = self.iter().map(|(s, _)| s.name()).collect();
+        let taken: std::collections::HashSet<&str> = self.sources.iter().map(|slot| slot.source.name()).collect();
         let mut n = self.sources.len();
         loop {
             let candidate = n.to_string();
@@ -374,9 +433,10 @@ impl CatalogSources {
         self.add_paths(paths, Requirement::Optional)
     }
 
-    /// Returns true if no catalog sources are configured.
+    /// Returns true if no catalog is assembled: none is configured or
+    /// given, or every one is disabled.
     pub fn is_empty(&self) -> bool {
-        self.sources.is_empty()
+        self.iter().next().is_none()
     }
 }
 
@@ -929,6 +989,51 @@ mod tests {
         std::fs::write(tmp.path().join("catalog.json"), "[]").unwrap();
         let sources = CatalogSources::new().add_named_catalog("lab", &tmp.path().to_string_lossy());
         assert_eq!(listed(&sources, Requirement::Required)[0].0, "lab");
+    }
+
+    /// **A catalog `disabled_catalogs` names is held but not
+    /// assembled.** The setting is read from the `settings.yaml` beside
+    /// the `catalogs.yaml`; it disables a program catalog of a listed
+    /// name too, never a location given directly; `named` finds a
+    /// disabled catalog, assembled; `including_disabled` has them all,
+    /// and a reload reads the setting again.
+    #[test]
+    fn a_disabled_catalog_is_held_but_not_assembled() {
+        use super::CatalogSources;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("catalogs.yaml"), "c1: /nowhere/c1\nc2: /nowhere/c2\n").unwrap();
+        std::fs::write(dir.join("settings.yaml"), "# mine\ndisabled_catalogs: c2, bench\n").unwrap();
+        let config = dir.to_string_lossy().into_owned();
+        let names = |s: &CatalogSources| s.iter().map(|(c, _)| c.name().to_string()).collect::<Vec<_>>();
+        let program = CatalogSources::new()
+            .with(crate::catalog::CatalogBuilder::named("bench").build())
+            .with(crate::catalog::CatalogBuilder::named("mine").build());
+
+        let set = CatalogSources::new().configure(&config).extend(program.clone());
+        assert_eq!(names(&set), ["c1", "mine"]);
+        assert_eq!(names(&set.including_disabled()), ["c1", "c2", "bench", "mine"]);
+        assert_eq!(names(&set.named("c2").unwrap().unwrap()), ["c2"], "named, it is read");
+        assert_eq!(names(&set.named("bench").unwrap().unwrap()), ["bench"]);
+        assert!(!set.is_empty());
+
+        // Order does not matter: the program's catalogs first.
+        assert_eq!(names(&program.clone().extend(CatalogSources::new().configure(&config))), ["mine", "c1"]);
+
+        // A location given directly is never disabled, whatever its name.
+        let given = CatalogSources::new().configure(&config).add_named_catalog("c2", "/nowhere/else");
+        assert_eq!(names(&given), ["c1", "c2"]);
+        assert_eq!(given.iter().nth(1).unwrap().0.origin().to_string(), "/nowhere/else");
+
+        // `--catalog c2` enables it where it stands.
+        assert_eq!(names(&set.clone().enabling("c2")), ["c1", "c2", "mine"]);
+
+        std::fs::write(dir.join("settings.yaml"), "disabled_catalogs: c1, c2\n").unwrap();
+        let reloaded = set.reload_configured();
+        assert_eq!(names(&reloaded), ["bench", "mine"], "the setting is read again");
+        let all_off = CatalogSources::new().configure(&config);
+        assert!(all_off.is_empty(), "every catalog disabled: nothing assembled");
+        assert_eq!(names(&all_off.including_disabled()), ["c1", "c2"]);
     }
 
     #[test]

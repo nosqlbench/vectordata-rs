@@ -537,8 +537,21 @@ enum CatalogCmd {
         #[arg(long)]
         at: Option<usize>,
     },
-    /// List configured catalog sources.
+    /// List configured catalog sources, numbered as `--at <n>` takes
+    /// them; a disabled one is marked `(disabled)`.
     List,
+    /// Stop assembling a catalog with the others (the `disabled_catalogs`
+    /// setting): no command reads it unless named with `--at <name>` or
+    /// `--catalog <name>`. Its number in `config catalog list` stays.
+    Disable {
+        /// The catalog's name (see `config catalog list`).
+        name: String,
+    },
+    /// Assemble a disabled catalog with the others again.
+    Enable {
+        /// The catalog's name (see `config catalog list`).
+        name: String,
+    },
 }
 
 #[derive(veks_completion_derive::VeksCli)]
@@ -658,6 +671,38 @@ fn complete_config_get(partial: &str, _ctx: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Tab-completion for `config catalog disable <name>`: the configured
+/// catalogs not disabled.
+fn complete_catalog_disable(partial: &str, _ctx: &[&str]) -> Vec<String> {
+    catalog_toggle_candidates(&configured_catalog_names(), &crate::settings::disabled_catalogs(), true, partial)
+}
+
+/// Tab-completion for `config catalog enable <name>`: the catalogs
+/// disabled.
+fn complete_catalog_enable(partial: &str, _ctx: &[&str]) -> Vec<String> {
+    catalog_toggle_candidates(&configured_catalog_names(), &crate::settings::disabled_catalogs(), false, partial)
+}
+
+/// The names `catalogs.yaml` gives, in order.
+fn configured_catalog_names() -> Vec<String> {
+    crate::catalog::sources::named_catalog_entries(&crate::catalog::sources::config_dir())
+        .into_iter()
+        .map(|e| e.name)
+        .collect()
+}
+
+/// Pure core of the `disable`/`enable` completions: for `disable`, the
+/// `configured` names `disabled` does not list; for `enable`, those it
+/// lists. Each starting with `partial`.
+fn catalog_toggle_candidates(configured: &[String], disabled: &[String], disable: bool, partial: &str) -> Vec<String> {
+    let pool: Vec<String> = if disable {
+        configured.iter().filter(|n| !disabled.contains(n)).cloned().collect()
+    } else {
+        disabled.to_vec()
+    };
+    pool.into_iter().filter(|n| n.starts_with(partial)).collect()
+}
+
 /// Every dynamic value resolver this binary registers with the
 /// completion tree: the shared dataset-domain map (`--dataset`,
 /// `--profile`, `--at`, and the `datasets ping`/`describe`/`precache`
@@ -678,6 +723,14 @@ fn completion_resolvers() -> std::collections::BTreeMap<String, veks_completion:
     resolvers.insert(
         "config get".to_string(),
         veks_completion::fn_provider(complete_config_get),
+    );
+    resolvers.insert(
+        "config catalog disable".to_string(),
+        veks_completion::fn_provider(complete_catalog_disable),
+    );
+    resolvers.insert(
+        "config catalog enable".to_string(),
+        veks_completion::fn_provider(complete_catalog_enable),
     );
     resolvers
 }
@@ -1287,6 +1340,8 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
                     }
                 },
                 CatalogCmd::List => crate::config::list_catalogs(),
+                CatalogCmd::Disable { name } => crate::config::set_catalog_disabled(&name, true, program),
+                CatalogCmd::Enable { name } => crate::config::set_catalog_disabled(&name, false, program),
             },
             ConfigCmd::Overlay { command } => {
                 let dir = crate::catalog::sources::config_dir();
@@ -1813,6 +1868,22 @@ mod tests {
         out
     }
 
+    /// Every command path the binary accepts, at any depth (`config
+    /// catalog disable` as well as `config catalog`): a row may name a
+    /// command below the table's granularity, but only one that exists.
+    fn all_command_paths() -> Vec<String> {
+        fn walk(prefix: &str, spec: &veks_completion::CommandSpec, out: &mut Vec<String>) {
+            for sub in &spec.subcommands {
+                let path = if prefix.is_empty() { sub.name.clone() } else { format!("{prefix} {}", sub.name) };
+                out.push(path.clone());
+                walk(&path, sub, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk("", &<Cli as VeksCli>::veks_command_spec("vectordata"), &mut out);
+        out
+    }
+
     /// **An embedding binary's invocation is what help names.** The
     /// spec `bin_main_as` builds carries the path the user typed, so the
     /// usage line at every depth reads as a command they can rerun.
@@ -1833,6 +1904,7 @@ mod tests {
     /// the call behind a command it has watched work, which is the
     /// miss the SRD opens with. A command added without a row fails
     /// here, and a row naming a command that no longer exists does too.
+    /// Rows are required to depth two and allowed deeper.
     /// (The links in each row are checked by rustdoc: the file renders
     /// as `crate::_agents`.)
     #[test]
@@ -1847,7 +1919,8 @@ mod tests {
         let commands = command_paths();
         let missing: Vec<&String> = commands.iter().filter(|c| !rows.contains(&c.as_str())).collect();
         assert!(missing.is_empty(), "commands with no CLI ↔ library row in AGENTS.md: {missing:?}");
-        let stale: Vec<&&str> = rows.iter().filter(|r| !commands.iter().any(|c| c == **r)).collect();
+        let all = all_command_paths();
+        let stale: Vec<&&str> = rows.iter().filter(|r| !all.iter().any(|c| c == **r)).collect();
         assert!(stale.is_empty(), "AGENTS.md rows for commands that do not exist: {stale:?}");
     }
 
@@ -1882,6 +1955,8 @@ mod tests {
                 "--with-min-data".to_string(),
                 "--with-min-dim".to_string(),
                 "--with-vtype".to_string(),
+                "config catalog disable".to_string(),
+                "config catalog enable".to_string(),
                 "config get".to_string(),
                 "config set".to_string(),
                 "datasets describe".to_string(),
@@ -1889,5 +1964,23 @@ mod tests {
                 "datasets precache".to_string(),
             ]
         );
+    }
+
+    /// **`config catalog disable`/`enable` are in the completion tree,
+    /// and complete the names each can take**: disable the catalogs not
+    /// disabled, enable the disabled ones.
+    #[test]
+    fn catalog_disable_and_enable_complete() {
+        let verbs = complete(&["config", "catalog", ""]);
+        for verb in ["add", "remove", "list", "disable", "enable"] {
+            assert!(verbs.iter().any(|v| v.trim_end() == verb), "{verb}: {verbs:?}");
+        }
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let configured = names(&["c1", "c2", "c3"]);
+        let disabled = names(&["c2"]);
+        assert_eq!(catalog_toggle_candidates(&configured, &disabled, true, ""), ["c1", "c3"]);
+        assert_eq!(catalog_toggle_candidates(&configured, &disabled, true, "c3"), ["c3"]);
+        assert_eq!(catalog_toggle_candidates(&configured, &disabled, false, ""), ["c2"]);
+        assert!(catalog_toggle_candidates(&configured, &disabled, false, "c1").is_empty());
     }
 }

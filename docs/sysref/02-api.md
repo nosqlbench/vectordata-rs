@@ -166,7 +166,14 @@ Manage catalogs via the CLI:
 veks datasets config catalog add https://example.com/datasets/
 veks datasets config catalog list
 veks datasets config catalog remove --index 2
+veks datasets config catalog disable staging   # kept, not read unless named (--at staging)
+veks datasets config catalog enable staging
 ```
+
+A disabled catalog (`disabled_catalogs` in `settings.yaml`, see
+[§3.1](03-catalogs.md#disabling-a-catalog)) is held by
+`CatalogSources` but left out of `iter()`, so `Catalog::of` does not
+read it; `named()` and `including_disabled()` still reach it.
 
 ### Discovering datasets
 

@@ -384,7 +384,11 @@ pub enum ConfigSubcommand {
 }
 
 /// Catalog-source management under `veks datasets config catalog`.
+///
+/// Non-exhaustive: it mirrors `vectordata config catalog`, which gains
+/// subcommands, so a match outside this crate needs a wildcard arm.
 #[derive(veks_completion_derive::VeksCli)]
+#[non_exhaustive]
 pub enum ConfigCatalogSubcommand {
     /// Add a catalog source (URL or path).
     Add {
@@ -400,8 +404,21 @@ pub enum ConfigCatalogSubcommand {
         #[arg(long)]
         index: Option<usize>,
     },
-    /// List configured catalog sources.
+    /// List configured catalog sources, numbered as `--at <n>` takes
+    /// them; a disabled one is marked `(disabled)`.
     List,
+    /// Stop assembling a catalog with the others (the `disabled_catalogs`
+    /// setting): no command reads it unless named with `--at <name>` or
+    /// `--catalog <name>`. Its number in `config catalog list` stays.
+    Disable {
+        /// The catalog's name (see `config catalog list`).
+        name: String,
+    },
+    /// Assemble a disabled catalog with the others again.
+    Enable {
+        /// The catalog's name (see `config catalog list`).
+        name: String,
+    },
 }
 
 /// Dispatch to the appropriate datasets subcommand.
@@ -761,6 +778,12 @@ fn run_config_command(command: ConfigSubcommand) {
                 }
             },
             ConfigCatalogSubcommand::List => vectordata::config::list_catalogs(),
+            ConfigCatalogSubcommand::Disable { name } => {
+                vectordata::config::set_catalog_disabled(&name, true, &vectordata::catalog::CatalogSources::new())
+            }
+            ConfigCatalogSubcommand::Enable { name } => {
+                vectordata::config::set_catalog_disabled(&name, false, &vectordata::catalog::CatalogSources::new())
+            }
         },
     };
     if code != 0 {

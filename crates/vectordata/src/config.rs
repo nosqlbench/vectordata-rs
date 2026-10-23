@@ -22,6 +22,8 @@
 //! - [`add_catalog`], [`remove_catalog`], [`list_catalogs`] —
 //!   manage `catalogs.yaml`, the list of catalog sources used by
 //!   [`crate::catalog::resolver::Catalog::of`].
+//! - [`set_catalog_disabled`] — `config catalog disable`/`enable`:
+//!   edit the `disabled_catalogs` setting, the catalogs not assembled.
 
 use std::path::{Path, PathBuf};
 
@@ -80,9 +82,10 @@ pub fn show() -> i32 {
     if cats_configured {
         // Defer to `list-catalogs` for the actual enumeration — keeps
         // a single source of truth for catalog output.
-        let entries = raw_catalog_entries(&config_dir);
+        let entries = crate::catalog::sources::named_catalog_entries(&config_dir);
+        let disabled = settings::disabled_catalogs();
         for (i, e) in entries.iter().enumerate() {
-            println!("  {:>3}. {}", i + 1, e);
+            println!("  {:>3}. {}{}", i + 1, e.location, disabled_mark(&e.name, &disabled));
         }
     } else {
         println!("  (no catalogs configured)");
@@ -1017,11 +1020,100 @@ pub fn remove_catalog(spec: RemoveCatalogSpec<'_>) -> i32 {
     }
 }
 
-/// List the configured catalog sources with their symbolic names.
+/// The `  (disabled)` a catalog listing puts after a catalog the
+/// `disabled_catalogs` setting names, or nothing.
+fn disabled_mark(name: &str, disabled: &[String]) -> &'static str {
+    if disabled.iter().any(|d| d == name) { "  (disabled)" } else { "" }
+}
+
+/// Whether [`set_catalog_disabled`] changed the setting.
+#[derive(Debug, PartialEq, Eq)]
+enum Toggle {
+    /// The new `disabled_catalogs` set, to write.
+    Changed(std::collections::HashSet<String>),
+    /// It already was as asked; nothing to write.
+    Already,
+}
+
+/// Pure core of `config catalog disable`/`enable`: `disabled` with
+/// `name` added (`disable`) or taken out. `known` is every catalog
+/// name the setting can name; a name outside it is refused naming
+/// them, except that `enable` takes out a name the setting lists
+/// though no catalog has it any more.
+fn toggle_disabled(known: &[String], disabled: &[String], name: &str, disable: bool) -> Result<Toggle, String> {
+    let listed = disabled.iter().any(|d| d == name);
+    if !known.iter().any(|k| k == name) && !(listed && !disable) {
+        return Err(format!(
+            "no catalog named '{name}'; the catalogs are: {}",
+            if known.is_empty() { "(none)".to_string() } else { known.join(", ") }
+        ));
+    }
+    if listed == disable {
+        return Ok(Toggle::Already);
+    }
+    let mut set: std::collections::HashSet<String> = disabled.iter().cloned().collect();
+    if disable {
+        set.insert(name.to_string());
+    } else {
+        set.remove(name);
+    }
+    Ok(Toggle::Changed(set))
+}
+
+/// Disable (`disable == true`) or enable the catalog `name`:
+/// `config catalog disable <name>` / `enable <name>`. A disabled
+/// catalog is not assembled by any command or host program; one named
+/// for the run (`--at <name>`, `--catalog <name>`) is read all the
+/// same. Edits the `disabled_catalogs` line of `settings.yaml` and
+/// keeps every other byte, as `config set` does; like `config set`
+/// (and unlike a `cache_dir` overwrite) it is not held back by
+/// `protect_settings`.
+///
+/// The names it takes are those of `catalogs.yaml` (the nested names a
+/// directory entry contributes included) and of `program`'s catalogs; an
+/// unknown name is refused naming them (status 1). Asking for what
+/// already holds says so and succeeds.
+pub fn set_catalog_disabled(name: &str, disable: bool, program: &CatalogSources) -> i32 {
+    let config_dir = crate::catalog::sources::config_dir();
+    let mut known: Vec<String> = Vec::new();
+    let assembled = CatalogSources::new().configure_optional(&config_dir).extend(program.clone()).including_disabled();
+    let written = crate::catalog::sources::named_catalog_entries(&config_dir);
+    for n in written.into_iter().map(|e| e.name).chain(assembled.iter().map(|(s, _)| s.name().to_string())) {
+        if !known.contains(&n) {
+            known.push(n);
+        }
+    }
+    let (done, already) = if disable { ("Disabled", "already disabled") } else { ("Enabled", "not disabled") };
+    match toggle_disabled(&known, &settings::disabled_catalogs(), name, disable) {
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+        Ok(Toggle::Already) => {
+            println!("Catalog '{name}' is {already}; settings.yaml unchanged.");
+            0
+        }
+        Ok(Toggle::Changed(set)) => match settings::write_disabled_catalogs(&set) {
+            Ok(path) => {
+                println!("{done} catalog '{name}'.\nSaved to {}", path.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        },
+    }
+}
+
+/// List the configured catalog sources with their symbolic names, in
+/// `catalogs.yaml` order: the numbers `--at <n>` takes. A catalog the
+/// `disabled_catalogs` setting names is listed, marked `(disabled)`.
 pub fn list_catalogs() -> i32 {
     let path = catalogs_path();
     let config_dir = crate::catalog::sources::config_dir();
     let entries = crate::catalog::sources::named_catalog_entries(&config_dir);
+    let disabled = settings::disabled_catalogs();
     if entries.is_empty() {
         println!("No catalog sources configured.");
         println!();
@@ -1031,7 +1123,7 @@ pub fn list_catalogs() -> i32 {
         println!("Configured catalog sources ({}):", entries.len());
         let name_w = entries.iter().map(|e| e.name.len()).max().unwrap_or(8);
         for (i, e) in entries.iter().enumerate() {
-            println!("  {:>3}. {:<name_w$}  {}", i + 1, e.name, e.location);
+            println!("  {:>3}. {:<name_w$}  {}{}", i + 1, e.name, e.location, disabled_mark(&e.name, &disabled));
         }
         println!();
         println!("Catalogs file: {}", path.display());
@@ -1075,6 +1167,27 @@ fn dir_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`disable`/`enable` change the set only when asked for a
+    /// change, and refuse a name no catalog has**, naming the ones
+    /// there are; `enable` still takes out a stale name the setting
+    /// lists.
+    #[test]
+    fn toggle_disabled_rules() {
+        let v = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let set = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<std::collections::HashSet<_>>();
+        let known = v(&["c1", "c2"]);
+        assert_eq!(toggle_disabled(&known, &[], "c2", true), Ok(Toggle::Changed(set(&["c2"]))));
+        assert_eq!(toggle_disabled(&known, &v(&["c2"]), "c2", true), Ok(Toggle::Already));
+        assert_eq!(toggle_disabled(&known, &v(&["c2"]), "c1", true), Ok(Toggle::Changed(set(&["c1", "c2"]))));
+        assert_eq!(toggle_disabled(&known, &v(&["c1", "c2"]), "c2", false), Ok(Toggle::Changed(set(&["c1"]))));
+        assert_eq!(toggle_disabled(&known, &[], "c2", false), Ok(Toggle::Already));
+        let err = toggle_disabled(&known, &[], "c3", true).unwrap_err();
+        assert!(err.contains("'c3'") && err.contains("c1, c2"), "{err}");
+        assert!(toggle_disabled(&known, &[], "c3", false).is_err());
+        assert_eq!(toggle_disabled(&known, &v(&["c3"]), "c3", false), Ok(Toggle::Changed(set(&[]))), "a stale name");
+        assert!(toggle_disabled(&[], &[], "c1", true).unwrap_err().contains("(none)"));
+    }
 
     /// **Every `catalogs.yaml` edit replaces the file whole**: a reader
     /// that already has it open keeps reading the old file, never a

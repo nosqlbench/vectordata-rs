@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Added
+
+- **`config catalog disable <name>` and `config catalog enable <name>`**
+  (`vectordata` and `veks datasets`) set the `disabled_catalogs` key of
+  `settings.yaml` without the explorer, editing that one line and
+  keeping every comment. A name no catalog has is refused naming the
+  ones there are; disabling a disabled catalog says so and succeeds.
+  The names complete. `config catalog list` marks a disabled catalog
+  `(disabled)` under the number `--at` takes, which does not change.
+- **`--catalog <name>`** names a configured or program catalog, as
+  `--at <name>` does, and reads it beside the others; a URL or an
+  existing path is a location, as before.
+- **`CatalogSources::including_disabled`**: the set with its disabled
+  catalogs assembled, for a program that turns catalogs on and off
+  itself, as the explorer's picker does.
+
+### Breaking
+
+- veks: `ConfigCatalogSubcommand` gains `Disable` and `Enable`, mirroring
+  `vectordata config catalog`, and is `#[non_exhaustive]` from now on,
+  so a match on it outside veks needs a wildcard arm.
+
+### Fixes
+
+- **A disabled catalog is not read.** `disabled_catalogs` was honoured
+  by the explorer's picker alone: every `datasets`, `cache` and
+  `explore --dataset` command, every `shell::Host` program and every
+  `CatalogSources::configure*` set read a disabled catalog like any
+  other, listing its datasets, failing on its errors, and making a
+  dataset it shares with an enabled catalog ambiguous. A catalog the
+  setting names is now held but not assembled
+  (`CatalogSources::iter` leaves it out), a program's catalog of that
+  name included; `--at <name>` and `--catalog <name>` still read it.
+  The setting is read from the `settings.yaml` beside the
+  `catalogs.yaml` (`<dir>/settings.yaml` for `--configdir <dir>`).
+
+## Unreleased
+
 One implementation of every file format. veks-io's readers are now
 the readers: vectordata's `XvecReader`, `IndexedVvecReader` and
 `ScalarReader` are veks-io's, over vectordata's storage, and its own

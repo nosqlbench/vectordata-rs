@@ -94,6 +94,14 @@ impl RunSources {
 /// and any `--catalog` locations follow those. Catalogs given by `--at`
 /// or `--catalog` are [named for the run](RunSources::open).
 ///
+/// A catalog the user disabled (`disabled_catalogs`, see
+/// [`CatalogSources`]) is not among them, configured or the
+/// program's, unless it is named for the run: `--at <name>` reads it in
+/// place of the others, and `--catalog <name>` reads it where it stands
+/// among them, beside the enabled ones. A `--catalog` value that is not
+/// a URL or an existing path, and is the name of a configured or program
+/// catalog, names that catalog; any other is a location.
+///
 /// `program` is the program's own catalogs only, not the configured
 /// ones, which are added here: a set built with `configure_default()`
 /// lists each configured catalog twice, and every name in one becomes
@@ -145,15 +153,39 @@ pub(crate) fn sources_for_run(
         let named = sources.iter().map(|(s, _)| s.name().to_string()).collect();
         return Ok(RunSources { sources, named });
     }
-    let (configured, named) = (candidates, extra_catalogs);
+    // A `--catalog` value naming a catalog of the set reads it where it
+    // stands, disabled or not; any other is a location added after them.
+    let mut configured = candidates;
+    let mut by_name = Vec::new();
+    let mut locations = Vec::new();
+    for value in extra_catalogs {
+        let names_one = !is_location(&value) && configured.named(&value).map_err(|e| {
+            eprintln!("Error: {e}");
+            1
+        })?.is_some();
+        if names_one {
+            configured = configured.enabling(&value);
+            by_name.push(value);
+        } else {
+            locations.push(value);
+        }
+    }
     let before: Vec<String> = configured.iter().map(|(s, _)| s.name().to_string()).collect();
-    let sources = configured.add_catalogs(&named);
+    let sources = configured.add_catalogs(&locations);
     let named = sources
         .iter()
         .map(|(s, _)| s.name().to_string())
         .filter(|name| !before.contains(name))
+        .chain(by_name)
         .collect();
     Ok(RunSources { sources, named })
+}
+
+/// Whether a `--at`/`--catalog` value is a location rather than a
+/// catalog name: a URL, or a path that exists (a path that exists is a
+/// path, as in [`open_spec`](crate::catalog::Catalog::open_spec)).
+fn is_location(value: &str) -> bool {
+    value.contains("://") || std::path::Path::new(&crate::catalog::sources::expand_tilde(value)).exists()
 }
 
 /// The catalogs a run's `--at` values name, in their order, in place of
@@ -163,7 +195,8 @@ pub(crate) fn sources_for_run(
 /// of `candidates` (the configured ones and the program's) of that
 /// name; else a location, as before. A name two candidates share is an
 /// error naming both, never settled by order. Numbered shortcuts are
-/// resolved before this ([`catalog_args`]).
+/// resolved before this ([`catalog_args`]). A catalog the user disabled
+/// is read when named: naming it is the choice to.
 ///
 /// The set carries `candidates`' overlays, each once: `--at` names
 /// which catalogs to read, not what the user and the program know of
@@ -172,9 +205,7 @@ pub(crate) fn sources_for_run(
 pub fn at_sources(values: &[String], candidates: &CatalogSources) -> Result<CatalogSources, String> {
     let mut sources = CatalogSources::new().with_overlays_from(candidates);
     for value in values {
-        let is_location = value.contains("://")
-            || std::path::Path::new(&crate::catalog::sources::expand_tilde(value)).exists();
-        let named = if is_location { None } else { candidates.named(value)? };
+        let named = if is_location(value) { None } else { candidates.named(value)? };
         sources = match named {
             Some(named) => sources.extend(named),
             None => sources.add_catalogs(std::slice::from_ref(value)),

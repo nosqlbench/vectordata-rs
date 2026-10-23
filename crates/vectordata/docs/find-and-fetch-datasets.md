@@ -133,7 +133,14 @@ vectordata config catalog add https://example.com/datasets/ --name benches  # HT
 vectordata config catalog add s3://my-bucket/datasets/                       # public S3 bucket
 vectordata config catalog add /shared/datasets                              # or a local directory
 vectordata config catalog list                                             # what's registered (with #)
+vectordata config catalog disable benches                                  # keep it, but don't read it
+vectordata config catalog enable benches                                   # read it again
 ```
+
+A disabled catalog (the `disabled_catalogs` setting) is left out of every
+listing and lookup unless you name it for the run (`--at benches`,
+`--catalog benches`); `config catalog list` still shows it, marked
+`(disabled)`, under the same number.
 
 Give a catalog a `--name` and you can refer to it by that name — or by its
 1-based index from `config catalog list` — anywhere an endpoint is expected

@@ -62,6 +62,53 @@ given: `config catalog add .` in `/data/stage` saves `stage:
 well as the one it was saved as. Entries saved relative by an earlier
 release are left as written.
 
+### Disabling a catalog
+
+```bash
+vectordata config catalog disable c2
+vectordata config catalog enable c2
+```
+
+A disabled catalog stays in `catalogs.yaml` but is not read with the
+others: no command (`datasets`, `cache`, `explore --dataset`) and no
+program running the command line (`shell::run_with_catalogs`,
+`shell::Host`) or reading `CatalogSources::configure*` assembles it, so
+its datasets are not listed, do not open by name, and do not make a
+name they share with an enabled catalog ambiguous. The setting is the
+`disabled_catalogs` key of the `settings.yaml` beside that
+`catalogs.yaml` (`$VECTORDATA_HOME`, else `~/.config/vectordata`; with
+`--configdir <dir>`, `<dir>/settings.yaml`):
+
+```yaml
+disabled_catalogs: c2, c3
+```
+
+- **Naming it reads it.** `--at c2` reads `c2` in place of the others;
+  `--catalog c2` reads it with the enabled ones, where it stands. A
+  `--catalog` value that is the name of a configured or program catalog
+  names that catalog; a URL or an existing path is a location.
+- **Numbers do not shift.** `--at <n>` and `config catalog list`
+  count every entry `catalogs.yaml` writes, disabled ones included.
+  `config catalog list` marks a disabled catalog `(disabled)`.
+- **It names catalogs, not entries.** A program's own catalog
+  (`CatalogSources::with`) of a listed name is disabled too; one it
+  does not list is not affected. A location given directly
+  (`CatalogSources::add_catalogs`, `--catalog <path>`) is never
+  disabled.
+- **The explorer's picker** reads every catalog, disabled ones
+  included, and hides a disabled catalog's rows; its catalogs screen
+  (Ctrl-G) turns one on and off and writes the same key.
+  `CatalogSources::including_disabled` is that set for a program.
+
+`disable` and `enable` edit that one line of `settings.yaml` and keep
+every other byte, comments included. They take a name `catalogs.yaml`
+gives (or a nested `catalogs.yaml` it points at, or the host program's
+catalogs); any other is refused naming the catalogs there are.
+Disabling a disabled catalog, or enabling an enabled one, says so and
+succeeds. Like `config set`, they are not held back by
+`protect_settings`, which guards only `cache_dir` against an
+overwrite.
+
 ### Programmatic access
 
 ```rust
@@ -228,6 +275,13 @@ Or manually in `~/.config/vectordata/settings.yaml`:
 cache_dir: /mnt/fast-storage/vd-cache
 protect_settings: true
 ```
+
+Other `settings.yaml` keys: `offline` (`config set offline`),
+`update_check` (`config set update_check`), `palette` and `curve`
+(`config set palette|curve`), `disabled_catalogs` (`config catalog
+disable|enable`, §3.1), and the TLS-trust lists `trusted_ca_certs` and
+`trust_self_signed` (which `config catalog add --trust-self-signed`
+adds to).
 
 Resolution order: `--cache-dir` flag (per-command override) >
 `cache_dir:` from `settings.yaml`. If neither is set, every API

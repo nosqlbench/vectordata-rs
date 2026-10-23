@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 use crate::mounts;
 
 const CONFIG_DIR: &str = ".config/vectordata";
-const SETTINGS_FILE: &str = "settings.yaml";
+pub(crate) const SETTINGS_FILE: &str = "settings.yaml";
 
 /// The cache directory this process was given — by [`set_cache_dir`]
 /// or the test hook [`override_cache_dir_for_process`]. When set,
@@ -487,15 +487,30 @@ pub fn write_csv_setting(key: &str, names: &std::collections::HashSet<String>) -
     write_setting(key, &sorted.join(", "))
 }
 
-/// Catalog names disabled by the user — the persisted form of the
-/// picker's settings-screen toggles.
+/// Settings key naming the catalogs the user disabled.
+pub const DISABLED_CATALOGS_KEY: &str = "disabled_catalogs";
+
+/// Catalog names disabled by the user: `disabled_catalogs: c1, c2`,
+/// as `config catalog disable`/`enable` and the picker's catalog
+/// toggles write it. No command or host program assembles a disabled
+/// catalog with the configured ones
+/// ([`CatalogSources`](crate::catalog::CatalogSources) reads this from
+/// the `settings.yaml` beside each `catalogs.yaml` it is configured
+/// from); one named for the run (`--at <name>`, `--catalog <name>`) is
+/// read all the same.
 pub fn disabled_catalogs() -> Vec<String> {
-    csv_setting("disabled_catalogs")
+    csv_setting(DISABLED_CATALOGS_KEY)
+}
+
+/// The `disabled_catalogs` of `settings.yaml` content. Pure — the
+/// parser [`disabled_catalogs`] and catalog assembly share.
+pub(crate) fn disabled_catalogs_in(content: &str) -> Vec<String> {
+    setting_value_from(content, DISABLED_CATALOGS_KEY).map(|v| parse_csv_setting(&v)).unwrap_or_default()
 }
 
 /// Persist the disabled-catalog set.
 pub fn write_disabled_catalogs(names: &std::collections::HashSet<String>) -> Result<PathBuf, String> {
-    write_csv_setting("disabled_catalogs", names)
+    write_csv_setting(DISABLED_CATALOGS_KEY, names)
 }
 
 /// Catalog names that were saved but failed verification (parse/ping) —
