@@ -1,6 +1,6 @@
 [package]
 name = "tools"
-version = "4.3.1"
+version = "4.3.2"
 edition = "2024"
 description = "Project tooling — diagram generators, code analysis, etc."
 license = "Apache-2.0"
