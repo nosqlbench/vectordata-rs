@@ -1,6 +1,6 @@
 [package]
 name = "veks-pipeline"
-version = "4.2.2"
+version = "4.3.0"
 edition = "2024"
 description = "Pipeline execution engine for veks"
 license = "Apache-2.0"
@@ -79,20 +79,20 @@ hmac = "0.12"
 hex = "0.4"
 quick-xml = "0.36"
 signal-hook = "0.3"
-slabtastic = { path = "../slabtastic", version = "=4.2.2" }
-veks-simd = { path = "../veks-simd", version = "=4.2.2" }
+slabtastic = { path = "../slabtastic", version = "=4.3.0" }
+veks-simd = { path = "../veks-simd", version = "=4.3.0" }
 # Pure-Rust sgemm (the engine under faer) for the matrix-multiply KNN
 # scans; `x86-v4` turns on its AVX-512 kernels.
 gemm = { version = "0.19", default-features = false, features = ["std", "rayon", "x86-v4"] }
 tempfile = "3"
-vectordata = { path = "../vectordata", version = "=4.2.2" }
-veks-datatypes = { path = "../veks-datatypes", version = "=4.2.2" }
-veks-core = { path = "../veks-core", version = "=4.2.2" }
+vectordata = { path = "../vectordata", version = "=4.3.0" }
+veks-datatypes = { path = "../veks-datatypes", version = "=4.3.0" }
+veks-core = { path = "../veks-core", version = "=4.3.0" }
 # The format layer: VecFormat, the streaming readers and writers,
 # element conversion and positional file I/O.
-veks-io = { path = "../veks-io", version = "=4.2.2", features = ["npy", "parquet", "slab"] }
-veks-completion = { path = "../veks-completion", version = "=4.2.2" }
-veks-completion-derive = { path = "../veks-completion-derive", version = "=4.2.2" }
+veks-io = { path = "../veks-io", version = "=4.3.0", features = ["npy", "parquet", "slab"] }
+veks-completion = { path = "../veks-completion", version = "=4.3.0" }
+veks-completion-derive = { path = "../veks-completion-derive", version = "=4.3.0" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

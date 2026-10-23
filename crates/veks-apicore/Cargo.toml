@@ -1,6 +1,6 @@
 [package]
 name = "veks-apicore"
-version = "4.2.2"
+version = "4.3.0"
 edition = "2024"
 description = "The vectordata API: the dataset, catalog, reader, source, streaming and progress contracts, and every descriptor, value and error type they name. Implemented by vectordata, veks-io and veks-transport"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ categories = ["data-structures", "encoding"]
 # dependency belongs here only when that vocabulary needs it.
 [dependencies]
 # The element model: element types, extensions, conversions, distances.
-veks-datatypes = { path = "../veks-datatypes", version = "=4.2.2" }
+veks-datatypes = { path = "../veks-datatypes", version = "=4.3.0" }
 indexmap = { version = "2", features = ["serde"] }
 log = "0.4"
 regex = "1"
