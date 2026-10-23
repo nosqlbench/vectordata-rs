@@ -105,6 +105,10 @@ pub struct CatalogEntry {
     description: EntryDescription,
     catalog_file: Option<String>,
     catalog_name: Option<String>,
+    /// The cache directory the catalog names for this dataset, in place
+    /// of the configured one. Never written to a catalog file: a
+    /// listing says where the dataset is, not where it is kept.
+    cache_dir: Option<std::path::PathBuf>,
     /// What overlays state for this dataset, merged over its own
     /// attributes. Never written to a catalog file: a listing says what
     /// the catalog says.
@@ -188,6 +192,7 @@ pub struct EntryBuilder {
     name: String,
     home: Option<String>,
     description: Option<EntryDescription>,
+    cache_dir: Option<std::path::PathBuf>,
 }
 
 impl CatalogEntry {
@@ -221,7 +226,7 @@ impl CatalogEntry {
     /// # Ok::<(), vectordata::Error>(())
     /// ```
     pub fn builder(name: impl Into<String>) -> EntryBuilder {
-        EntryBuilder { name: name.into(), home: None, description: None }
+        EntryBuilder { name: name.into(), home: None, description: None, cache_dir: None }
     }
 
     /// The entry a catalog file lists: `path` (as written, or resolved
@@ -412,6 +417,15 @@ impl CatalogEntry {
         self.catalog_name.as_deref()
     }
 
+    /// The cache directory the catalog names for this dataset (a
+    /// jvector catalog's `cache_dir`), used in place of the configured
+    /// cache: its copies are kept under `<cache_dir>/<name>/`, laid out
+    /// and managed as in any cache. `None` when the catalog names none,
+    /// and the configured cache is used.
+    pub fn cache_dir(&self) -> Option<&std::path::Path> {
+        self.cache_dir.as_deref()
+    }
+
     /// Record which catalog document the entry was read from. Set by
     /// the loader that reads the document.
     pub fn set_catalog_file(&mut self, file: impl Into<String>) {
@@ -534,6 +548,13 @@ impl EntryBuilder {
         self
     }
 
+    /// The cache directory the dataset is kept in, in place of the
+    /// configured cache: see [`CatalogEntry::cache_dir`].
+    pub fn cache_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.cache_dir = Some(dir.into());
+        self
+    }
+
     /// The entry. Refused without a description, or for an embedded one
     /// without a home.
     pub fn build(self) -> Result<CatalogEntry, String> {
@@ -548,7 +569,15 @@ impl EntryBuilder {
                 return Err(format!("catalog entry '{name}': an embedded dataset needs a home"));
             }
         };
-        Ok(CatalogEntry { name, home, description, catalog_file: None, catalog_name: None, overlay: None })
+        Ok(CatalogEntry {
+            name,
+            home,
+            description,
+            catalog_file: None,
+            catalog_name: None,
+            cache_dir: self.cache_dir,
+            overlay: None,
+        })
     }
 }
 

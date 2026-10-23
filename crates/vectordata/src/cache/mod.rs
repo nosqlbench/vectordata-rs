@@ -27,7 +27,7 @@ pub(crate) fn download_concurrency() -> usize {
 
 pub use veks_apicore::error::InsufficientCacheSpace;
 
-/// Fail fast when the configured cache directory cannot hold `needed`
+/// Fail fast when the cache directory `dir` cannot hold `needed`
 /// additional bytes. Returns `Ok(())` — i.e. lets the download
 /// proceed — in every case where the check can't be made meaningfully:
 ///   - `needed == 0` (nothing remote to fetch),
@@ -37,11 +37,14 @@ pub use veks_apicore::error::InsufficientCacheSpace;
 ///   - free space can't be queried (non-Unix target, or `statvfs`
 ///     failed). The invariant only *rejects* on a known shortfall;
 ///     it never blocks on an unverifiable one.
-pub(crate) fn ensure_cache_capacity(needed: u64) -> Result<(), InsufficientCacheSpace> {
+///
+/// `dir` is the cache a dataset's catalog names, if any: the directory
+/// checked is the dataset's cache ([`crate::settings::dataset_cache_location`]).
+pub(crate) fn ensure_cache_capacity_in(dir: Option<&Path>, needed: u64) -> Result<(), InsufficientCacheSpace> {
     if needed == 0 {
         return Ok(());
     }
-    let Ok(dir) = crate::settings::cache_dir() else {
+    let Ok(dir) = crate::settings::dataset_cache_location(dir) else {
         return Ok(());
     };
     let available = available_space(&dir);
@@ -158,7 +161,7 @@ mod tests {
     /// touches the filesystem-space probe.
     #[test]
     fn ensure_capacity_is_a_noop_for_zero_bytes() {
-        assert!(ensure_cache_capacity(0).is_ok());
+        assert!(ensure_cache_capacity_in(None, 0).is_ok());
     }
 
     /// `available_space` reports a positive figure for a real

@@ -66,6 +66,12 @@ pub const DATASET_CACHE_DIR_ENV: &str = "DATASET_CACHE_DIR";
 /// entry's `cache_dir`, else `$DATASET_CACHE_DIR`, else the catalog's
 /// own directory when the catalog is local.
 ///
+/// A cache directory the catalog or the environment names (the entry's
+/// `cache_dir`, else `_defaults.cache_dir`, else `$DATASET_CACHE_DIR`)
+/// is also the dataset's cache: [`CatalogEntry::cache_dir`]. What is
+/// fetched lands there, laid out and managed as in any vectordata
+/// cache, in place of the configured one.
+///
 /// An `_include: { url: … }` entry names another catalog whose entries
 /// are read as this one's, as jvector `DataSetLoaderSimpleMFD` reads
 /// them: this document's `_defaults` apply to them, their facets
@@ -171,13 +177,15 @@ pub(crate) fn parse_knn_entries_yaml_with(
             .map(expand_env_vars)
             .map(|s| crate::location::dir_form(&s))
             .unwrap_or_else(|| base_url.clone());
-        let entry_cache_dir = raw
+        // The cache directory a user named for this dataset: the
+        // entry's, the catalog's, or the environment's.
+        let stated_cache_dir = raw
             .get(serde_yaml::Value::String("cache_dir".to_string()))
             .and_then(|v| v.as_str())
             .map(expand_env_vars)
             .or_else(|| default_cache_dir.clone())
-            .or_else(|| env_cache_dir.map(str::to_string))
-            .or_else(|| local_catalog_dir.clone());
+            .or_else(|| env_cache_dir.map(str::to_string));
+        let entry_cache_dir = stated_cache_dir.clone().or_else(|| local_catalog_dir.clone());
 
         let mut view_map: IndexMap<String, String> = IndexMap::new();
         for (fk, fv) in raw {
@@ -201,8 +209,15 @@ pub(crate) fn parse_knn_entries_yaml_with(
             view_map.insert(canonical, resolved);
         }
 
+        // A relative cache directory is the process's working
+        // directory's, as jvector's `Paths.get` reads it.
+        let cache_dir = stated_cache_dir.map(|d| {
+            let d = std::path::PathBuf::from(d);
+            std::path::absolute(&d).unwrap_or(d)
+        });
         let dataset = grouped.entry(dataset_name.to_string()).or_insert_with(|| Dataset {
             home_base: base_url.clone(),
+            cache_dir,
             profiles: IndexMap::new(),
         });
         dataset.profiles.insert(profile_name.to_string(), view_map);
@@ -211,7 +226,7 @@ pub(crate) fn parse_knn_entries_yaml_with(
     // Each dataset is an embedded entry: its home is the base and its
     // name, and every facet keeps the path resolved above, as written.
     let mut out: Vec<CatalogEntry> = Vec::with_capacity(grouped.len());
-    for (name, Dataset { home_base, profiles }) in grouped {
+    for (name, Dataset { home_base, cache_dir, profiles }) in grouped {
         let description = profiles
             .into_iter()
             .fold(DatasetConfig::builder(name.clone()), |dataset, (profile_name, views)| {
@@ -224,21 +239,24 @@ pub(crate) fn parse_knn_entries_yaml_with(
             })
             .build()
             .map_err(|e| format!("dataset '{name}': {e}"))?;
-        out.push(
-            CatalogEntry::builder(name.clone())
-                .home_as_written(format!("{}/{name}/", home_base.trim_end_matches('/')))
-                .dataset(description)
-                .build()?,
-        );
+        let builder = CatalogEntry::builder(name.clone())
+            .home_as_written(format!("{}/{name}/", home_base.trim_end_matches('/')))
+            .dataset(description);
+        let builder = match cache_dir {
+            Some(dir) => builder.cache_dir(dir),
+            None => builder,
+        };
+        out.push(builder.build()?);
     }
     Ok(ParsedKnnEntries { entries: out, warnings })
 }
 
 /// One dataset of a `knn_entries.yaml` document as its entries are
-/// grouped: the base its home is under, and its profiles' resolved
-/// facets.
+/// grouped: the base its home is under, the cache directory named for
+/// it (its first entry's), and its profiles' resolved facets.
 struct Dataset {
     home_base: String,
+    cache_dir: Option<std::path::PathBuf>,
     profiles: IndexMap<String, IndexMap<String, String>>,
 }
 
@@ -805,6 +823,30 @@ _defaults:
         assert_eq!(parsed.entries.iter().map(|e| e.name()).collect::<Vec<_>>(), ["mine"]);
         assert_eq!(parsed.warnings.len(), 1);
         assert!(parsed.warnings[0].contains("https://host/gone.yaml"), "{:?}", parsed.warnings);
+    }
+
+    /// **A cache directory the catalog or the environment names is the
+    /// dataset's cache**: the entry's, else `_defaults`', else
+    /// `$DATASET_CACHE_DIR`, made absolute. The catalog's own directory,
+    /// where local copies are looked for last, names no cache.
+    #[test]
+    fn a_named_cache_dir_is_the_entrys_cache() {
+        let cache = |yaml: &str, location: &str, env: Option<&str>, name: &str| {
+            let parsed = parse_knn_entries_yaml_with(yaml, location, env, &no_include).unwrap();
+            parsed.entries.iter().find(|e| e.name() == name).unwrap().cache_dir().map(std::path::Path::to_path_buf)
+        };
+        let doc = "_defaults:\n  cache_dir: /data/jv\nplain:\n  base: p.fvec\nown:\n  cache_dir: /fast/own\n  base: o.fvec\n";
+        assert_eq!(cache(doc, "https://host/", None, "plain"), Some("/data/jv".into()));
+        assert_eq!(cache(doc, "https://host/", Some("/env"), "own"), Some("/fast/own".into()));
+        let bare = "plain:\n  base: p.fvec\n";
+        assert_eq!(cache(bare, "https://host/", Some("/env"), "plain"), Some("/env".into()));
+        assert_eq!(cache(bare, "/local/catalog", None, "plain"), None, "a local catalog's directory names no cache");
+        let relative = "_defaults:\n  cache_dir: dataset_cache/public\nplain:\n  base: p.fvec\n";
+        assert_eq!(
+            cache(relative, "https://host/", None, "plain"),
+            Some(std::path::absolute("dataset_cache/public").unwrap()),
+            "relative to the working directory, as jvector reads it"
+        );
     }
 
     /// **An entry given twice keeps its last copy**, as jvector's loader

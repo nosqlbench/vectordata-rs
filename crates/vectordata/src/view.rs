@@ -440,12 +440,15 @@ pub struct PrebufferProgress {
 /// belong at handle creation. Only the `Storage::open` is lazy.
 #[derive(Debug, Clone)]
 pub(crate) enum ShardOpen {
-    /// Catalog-anchored: cached under `<root>/<dataset>/<relpath>`.
+    /// Catalog-anchored: cached under `<root>/<dataset>/<relpath>`,
+    /// `root` the catalog's named cache directory or, without one, the
+    /// configured cache.
     Layered {
         resolved: String,
         dataset: String,
         relpath: String,
         home: String,
+        cache_dir: Option<std::path::PathBuf>,
     },
     /// Plain open by resolved path or URL.
     Plain { resolved: String },
@@ -459,7 +462,8 @@ impl ShardOpen {
                 dataset,
                 relpath,
                 home,
-            } => crate::storage::Storage::open_layered(resolved, dataset, relpath, home),
+                cache_dir,
+            } => crate::storage::Storage::open_layered(resolved, dataset, relpath, home, cache_dir.as_deref()),
             Self::Plain { resolved } => crate::storage::Storage::open(resolved),
         }
     }
@@ -1931,6 +1935,9 @@ pub struct GenericTestDataView {
     /// Verified on subsequent opens; editable by the user when the
     /// catalog moves but the bytes are the same.
     catalog_source: Option<String>,
+    /// The cache root the dataset's catalog names for it, in place of
+    /// the configured cache.
+    cache_dir: Option<std::path::PathBuf>,
     /// What overlays claim about this dataset's counts, checked as the
     /// facets they concern open (OV-5).
     overlay_claims: Option<Arc<crate::overlay::Claims>>,
@@ -1948,6 +1955,7 @@ impl GenericTestDataView {
             attributes: HashMap::new(),
             dataset_name: None,
             catalog_source: None,
+            cache_dir: None,
             overlay_claims: None,
             attribute_sources: Arc::default(),
         }
@@ -1965,9 +1973,17 @@ impl GenericTestDataView {
             attributes,
             dataset_name: None,
             catalog_source: None,
+            cache_dir: None,
             overlay_claims: None,
             attribute_sources: Arc::default(),
         }
+    }
+
+    /// Keep the dataset's cached copies under `dir`, the cache its
+    /// catalog names, in place of the configured cache.
+    pub(crate) fn with_cache_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.cache_dir = dir;
+        self
     }
 
     /// Check what overlays claim about the dataset's counts against
@@ -2566,6 +2582,10 @@ impl TestDataView for GenericTestDataView {
         self.dataset_name.clone()
     }
 
+    fn cache_dir(&self) -> Option<std::path::PathBuf> {
+        self.cache_dir.clone()
+    }
+
     fn distance_function(&self) -> Option<String> {
         self.attributes
             .get("distance_function")
@@ -2599,7 +2619,8 @@ impl TestDataView for GenericTestDataView {
     }
 
     fn cache_capacity(&self) -> crate::fetch::CapacityCheck {
-        crate::fetch::CapacityCheck::new(|bytes| Ok(crate::cache::ensure_cache_capacity(bytes)?))
+        let dir = self.cache_dir.clone();
+        crate::fetch::CapacityCheck::new(move |bytes| Ok(crate::cache::ensure_cache_capacity_in(dir.as_deref(), bytes)?))
     }
 
     fn normalization(&self) -> Result<crate::verify::Normalization> {
@@ -2662,7 +2683,7 @@ impl GenericTestDataView {
                 let home_norm = crate::location::dir_form(home);
                 let file_relpath = facet_cache_relpath(&resolved, &home_norm);
                 self.reject_relpath_collisions(name, &resolved, &file_relpath, &home_norm)?;
-                crate::storage::Storage::open_layered(&resolved, ds_name, &file_relpath, home)
+                crate::storage::Storage::open_layered(&resolved, ds_name, &file_relpath, home, self.cache_dir.as_deref())
             }
             _ => crate::storage::Storage::open(&resolved),
         }
@@ -2687,6 +2708,7 @@ impl GenericTestDataView {
                     dataset: ds_name.clone(),
                     relpath,
                     home: home.clone(),
+                    cache_dir: self.cache_dir.clone(),
                 }
             }
             _ => ShardOpen::Plain { resolved },

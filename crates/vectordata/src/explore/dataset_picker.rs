@@ -325,7 +325,7 @@ fn build_rows(
             .or_else(|| infer_metric_from_entry(entry))
             .unwrap_or_default();
 
-        let ds_cache = cache_dir.join(entry.name());
+        let ds_cache = crate::settings::dataset_cache_dir_or(entry.cache_dir(), &cache_dir).join(entry.name());
 
         let catalog_name = entry.catalog_name().unwrap_or("?").to_string();
         for profile_name in entry.profile_names() {
@@ -880,6 +880,22 @@ fn strip_window_suffix(source_path: &str) -> &str {
 ///   ├── query.fvec
 ///   └── query.fvec.chunks
 /// ```
+/// [`survey_cache_state`] over every cache `entries` are kept in: the
+/// general one, and each one a catalog names for its datasets. The
+/// survey is keyed by cache-file path, so the caches merge.
+fn survey_entry_caches(entries: &[CatalogEntry], cache_dir: &std::path::Path)
+    -> std::collections::HashMap<std::path::PathBuf, FacetCacheView>
+{
+    let mut roots = vec![cache_dir.to_path_buf()];
+    for entry in entries {
+        let root = crate::settings::dataset_cache_dir_or(entry.cache_dir(), cache_dir);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots.iter().flat_map(|root| survey_cache_state(root)).collect()
+}
+
 fn survey_cache_state(cache_dir: &std::path::Path)
     -> std::collections::HashMap<std::path::PathBuf, FacetCacheView>
 {
@@ -1172,6 +1188,8 @@ pub(super) fn purge_cache_for_entry(
     entry: &CatalogEntry,
     cache_dir: &std::path::Path,
 ) -> (Vec<std::path::PathBuf>, u64, Vec<String>) {
+    // The dataset's own cache, when its catalog names one.
+    let cache_dir = &crate::settings::dataset_cache_dir_or(entry.cache_dir(), cache_dir);
     let mut removed = Vec::new();
     let mut freed: u64 = 0;
     let mut skipped = Vec::new();
@@ -1246,6 +1264,7 @@ pub(super) fn purge_cache_for_profiles(
         let (removed, freed, skipped) = purge_cache_for_entry(entry, cache_dir);
         return ProfilePurge { removed, freed, skipped, kept: Vec::new() };
     }
+    let cache_dir = &crate::settings::dataset_cache_dir_or(entry.cache_dir(), cache_dir);
     let mut out = ProfilePurge { removed: Vec::new(), freed: 0, skipped: Vec::new(), kept: Vec::new() };
     let name_dir = cache_dir.join(entry.name());
     if !name_dir.is_dir() {
@@ -1585,7 +1604,7 @@ fn collect_local_knowledge(
     knowledge: &mut std::collections::HashMap<String, FacetKnowledge>,
 ) {
     for entry in entries {
-        let ds_workspace = cache_dir.join(entry.name());
+        let ds_workspace = crate::settings::dataset_cache_dir_or(entry.cache_dir(), cache_dir).join(entry.name());
         let home = crate::location::dir_form(entry.dataset_home_url());
         for pname in entry.profile_names() {
             let Some(profile) = entry.profiles().profile(pname) else { continue };
@@ -2427,7 +2446,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     }
 
     let cache_dir = crate::explore::cache_dir_or_exit();
-    let mut cache_survey = survey_cache_state(&cache_dir);
+    let mut cache_survey = survey_entry_caches(entries, &cache_dir);
     let mut all_rows = build_rows(entries, &cache_survey);
     // Session-long facet knowledge (url → bytes/bpr): seeded from
     // local sources now, completed by background remote probes once
@@ -4079,7 +4098,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                 // the batch made; fresh local facts
                                 // (finished downloads) refresh the
                                 // knowledge map before cells refill.
-                                cache_survey = survey_cache_state(&cache_dir);
+                                cache_survey = survey_entry_caches(entries, &cache_dir);
                                 all_rows = build_rows(entries, &cache_survey);
                                 collect_local_knowledge(
                                     entries, &cache_dir, &cache_survey, &mut facet_knowledge);
@@ -4160,7 +4179,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
                                 // just acted on stays under the
                                 // highlight even if the new sort order
                                 // moved it.
-                                cache_survey = survey_cache_state(&cache_dir);
+                                cache_survey = survey_entry_caches(entries, &cache_dir);
                                 all_rows = build_rows(entries, &cache_survey);
                                 collect_local_knowledge(
                                     entries, &cache_dir, &cache_survey, &mut facet_knowledge);
@@ -4495,6 +4514,64 @@ mod tests {
         assert_eq!(removed, vec![ds.clone()], "dataset dir must be purged");
         assert!(skipped.is_empty(), "no skip notes expected: {skipped:?}");
         assert!(!ds.exists());
+    }
+
+    /// An entry kept in the cache its catalog names (a jvector
+    /// `cache_dir`), with a base under `https://h/cat/ds-j/`.
+    fn entry_in_named_cache(named: &std::path::Path) -> crate::dataset::CatalogEntry {
+        let description = crate::dataset::DatasetConfig::builder("ds-j")
+            .profile("default", |p| p.facet(crate::dataset::StandardFacet::BaseVectors, "https://h/cat/ds-j/base.fvecs"))
+            .build()
+            .unwrap();
+        crate::dataset::CatalogEntry::builder("ds-j")
+            .home_as_written("https://h/cat/ds-j/")
+            .dataset(description)
+            .cache_dir(named)
+            .build()
+            .unwrap()
+    }
+
+    /// A dataset directory at `root/ds-j` bound to the entry's home,
+    /// holding a complete one-chunk chunk-store copy of its base.
+    fn cached_ds_j(root: &std::path::Path) -> std::path::PathBuf {
+        let ds = root.join("ds-j");
+        std::fs::create_dir_all(&ds).unwrap();
+        std::fs::write(ds.join("origin.json"), r#"{"source":"https://h/cat/ds-j/","fetched_at":"x"}"#).unwrap();
+        std::fs::write(ds.join("base.fvecs"), b"data").unwrap();
+        std::fs::write(ds.join("base.fvecs.chunks"), [1u8]).unwrap();
+        ds
+    }
+
+    /// **A purge acts on the dataset's own cache**: an entry whose
+    /// catalog names a cache is purged there, and the general cache's
+    /// same-named directory is left alone. (No process-wide cache is
+    /// set in this test binary; one would outrank the catalog's.)
+    #[test]
+    fn purge_acts_on_the_cache_the_catalog_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (general, named) = (tmp.path().join("general"), tmp.path().join("named"));
+        let in_named = cached_ds_j(&named);
+        let in_general = cached_ds_j(&general);
+
+        let (removed, _freed, skipped) = super::purge_cache_for_entry(&entry_in_named_cache(&named), &general);
+        assert_eq!(removed, vec![in_named.clone()], "{skipped:?}");
+        assert!(!in_named.exists());
+        assert!(in_general.exists(), "the general cache's directory was removed");
+    }
+
+    /// **The picker's survey covers every cache its entries are kept
+    /// in**: a facet cached only in the catalog's cache is found.
+    #[test]
+    fn the_survey_covers_the_caches_catalogs_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (general, named) = (tmp.path().join("general"), tmp.path().join("named"));
+        std::fs::create_dir_all(&general).unwrap();
+        let ds = cached_ds_j(&named);
+        let entries = vec![entry_in_named_cache(&named)];
+
+        assert!(super::survey_cache_state(&general).is_empty());
+        let survey = super::survey_entry_caches(&entries, &general);
+        assert!(survey.contains_key(&ds.join("base.fvecs")), "{:?}", survey.keys().collect::<Vec<_>>());
     }
 
     /// A same-named directory bound to a DIFFERENT catalog's home

@@ -363,7 +363,9 @@ impl TestDataGroup {
                 .collect(),
         );
         Some(match &self.name {
-            Some(dataset) => view.with_catalog_identity(dataset.clone(), self.origin.clone()),
+            Some(dataset) => view
+                .with_catalog_identity(dataset.clone(), self.origin.clone())
+                .with_cache_dir(self.entry.cache_dir().map(std::path::Path::to_path_buf)),
             None => view,
         })
     }
@@ -571,10 +573,11 @@ impl TestDataGroup {
             })?;
             crate::fetch::plan_view(&*view, Some(name), request, progress, &mut facets)?;
         }
+        let dir = self.entry.cache_dir().map(std::path::Path::to_path_buf);
         Ok(crate::fetch::plan_from(
             facets,
             request,
-            crate::fetch::CapacityCheck::new(|bytes| Ok(crate::cache::ensure_cache_capacity(bytes)?)),
+            crate::fetch::CapacityCheck::new(move |bytes| Ok(crate::cache::ensure_cache_capacity_in(dir.as_deref(), bytes)?)),
         ))
     }
 

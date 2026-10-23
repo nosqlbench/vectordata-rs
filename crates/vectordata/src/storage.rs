@@ -325,7 +325,9 @@ impl Storage {
     /// when the catalog moves but the bytes are the same).
     ///
     /// `fetch_url` is the actual byte source. `dataset_name` +
-    /// `file_relpath` are the natural cache coordinates. The
+    /// `file_relpath` are the natural cache coordinates, in the
+    /// dataset's cache ([`crate::settings::dataset_cache_dir`]):
+    /// `cache_root` is the one its catalog names, if any. The
     /// pre-flight origin check (against `catalog_source`) runs
     /// *before* the registry lookup so a mismatch fails fast even
     /// if the URL is already in the process-wide cache.
@@ -334,6 +336,7 @@ impl Storage {
         dataset_name: &str,
         file_relpath: &str,
         catalog_source: &str,
+        cache_root: Option<&std::path::Path>,
     ) -> io::Result<Arc<Self>> {
         // Local sources route to `open_path_uncached` (plain mmap) —
         // there is no cache directory to lay out for them. Skip the
@@ -346,10 +349,10 @@ impl Storage {
         // the real cache root even though the actual bytes were
         // mmap'd locally.
         if !crate::transport::is_remote_url(fetch_url) {
-            let _ = (dataset_name, file_relpath, catalog_source);
+            let _ = (dataset_name, file_relpath, catalog_source, cache_root);
             return Self::open(fetch_url);
         }
-        let cache_root = crate::settings::data_cache_dir()
+        let cache_root = crate::settings::dataset_cache_dir(cache_root)
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
         let dataset_dir = layout::dataset_cache_dir(&cache_root, dataset_name);
         // Pre-flight: surface OriginMismatch before anything else.

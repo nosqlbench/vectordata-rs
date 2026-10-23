@@ -51,10 +51,10 @@ pub fn measure_normalization<V: TestDataView + ?Sized>(view: &V) -> crate::Resul
 }
 
 /// The file `view`'s measurements are recorded in: the dataset's
-/// directory of the cache.
+/// directory of the cache it is kept in.
 fn measured_path<V: TestDataView + ?Sized>(view: &V) -> Option<std::path::PathBuf> {
     let name = view.cache_name()?;
-    crate::settings::cache_dir().ok().map(|c| c.join(name).join(MEASURED_FILE))
+    crate::settings::dataset_cache_location(view.cache_dir().as_deref()).ok().map(|c| c.join(name).join(MEASURED_FILE))
 }
 
 /// The file name measurements are recorded in, in a dataset's cache

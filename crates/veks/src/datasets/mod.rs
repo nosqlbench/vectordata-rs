@@ -174,6 +174,11 @@ pub enum DatasetsCommand {
         #[arg(long)]
         tree: bool,
 
+        /// Override cache directory location (default: the dataset's
+        /// cache — the one its catalog names, else the configured one)
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+
         /// Configuration directory containing catalogs.yaml
         #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
         configdir: String,
@@ -549,25 +554,17 @@ pub fn run(args: DatasetsArgs) {
             all,
             verbose,
             tree,
+            cache_dir,
             configdir,
             catalog: raw_catalog,
             at,
         } => {
             let catalog: Vec<String> = vectordata::datasets::catalog_args(&raw_catalog);
+            let program = vectordata::catalog::CatalogSources::new();
             if all {
-                cache::run_cache_status_all(verbose, &vectordata::catalog::CatalogSources::new(), &configdir, &catalog, &at);
+                cache::run_cache_status_all_in(cache_dir.as_deref(), verbose, tree, &program, &configdir, &catalog, &at);
             } else if let Some(ds) = dataset {
-                cache::run_cache_status(&ds, verbose, &vectordata::catalog::CatalogSources::new(), &configdir, &catalog, &at);
-                if tree {
-                    let cache_dir =
-                        crate::pipeline::commands::config::configured_cache_dir_or_exit();
-                    let ds_cache = cache_dir.join(&ds);
-                    if ds_cache.is_dir() {
-                        println!();
-                        println!("  File tree:");
-                        cache::print_cache_tree(&ds_cache);
-                    }
-                }
+                cache::run_cache_status_in(&ds, cache_dir.as_deref(), verbose, tree, &program, &configdir, &catalog, &at);
             } else {
                 eprintln!("Specify --dataset <name> or --all");
                 std::process::exit(1);

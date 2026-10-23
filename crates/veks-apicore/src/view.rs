@@ -277,6 +277,13 @@ pub trait TestDataView: Send + Sync {
         None
     }
 
+    /// The cache root the dataset is kept under when its catalog names
+    /// one (a jvector catalog's `cache_dir`), in place of the configured
+    /// cache. `None` when the configured cache is used.
+    fn cache_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// The `quantization` attribute, when the profile or the dataset
     /// declares one: how the codes in `base_vectors` relate to the
     /// vectors they stand for. The profile's wins over the dataset's.

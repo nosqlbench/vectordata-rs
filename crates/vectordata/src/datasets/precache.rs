@@ -368,20 +368,34 @@ fn drive_specs(
         labels.join(", ")
     );
     let mut facets = Vec::new();
+    // The caches the run fetches into: the configured one, and any a
+    // dataset's catalog names in its place.
+    let mut roots: Vec<Option<std::path::PathBuf>> = Vec::new();
     for (selection, profile, label) in &targets {
         let Some(view) = selection.group().profile(profile) else {
             eprintln!("Precache: {label}: profile not found");
             return 1;
         };
+        let root = view.cache_dir();
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
         if let Err(e) = crate::fetch::plan_view(&*view, Some(label), fetch, meter, &mut facets) {
             eprintln!("Precache: {e}");
             return 1;
         }
     }
+    // Each cache is held to the whole run's bytes: never less than it
+    // takes in.
     let plan = crate::fetch::plan_from(
         facets,
         fetch,
-        crate::fetch::CapacityCheck::new(|bytes| Ok(crate::cache::ensure_cache_capacity(bytes)?)),
+        crate::fetch::CapacityCheck::new(move |bytes| {
+            for root in &roots {
+                crate::cache::ensure_cache_capacity_in(root.as_deref(), bytes)?;
+            }
+            Ok(())
+        }),
     );
     if plan.is_empty() {
         println!("Precache: no facets across the selected profiles.");

@@ -105,6 +105,44 @@ pub(crate) fn data_cache_dir() -> Result<PathBuf, SettingsError> {
     Ok(dir)
 }
 
+/// The cache a dataset's files are kept in, the one every command that
+/// reads, lists or drops a dataset's copies uses: the cache this process
+/// was given ([`set_cache_dir`], a command's `--cache-dir`) when it has
+/// one; else `catalog_dir`, the cache the dataset's catalog names (a
+/// jvector catalog's `cache_dir`); else the configured one, recorded as
+/// [`data_cache_dir`] records it.
+pub(crate) fn dataset_cache_dir(catalog_dir: Option<&Path>) -> Result<PathBuf, SettingsError> {
+    match pick_dataset_cache_dir(CACHE_DIR_OVERRIDE.get().map(PathBuf::as_path), catalog_dir) {
+        Some(dir) => Ok(dir),
+        None => data_cache_dir(),
+    }
+}
+
+/// [`dataset_cache_dir`] without recording that the configured cache
+/// holds data: for looking at a dataset's cache (its size, its free
+/// space, what is in it) rather than opening a file in it.
+pub(crate) fn dataset_cache_location(catalog_dir: Option<&Path>) -> Result<PathBuf, SettingsError> {
+    match pick_dataset_cache_dir(CACHE_DIR_OVERRIDE.get().map(PathBuf::as_path), catalog_dir) {
+        Some(dir) => Ok(dir),
+        None => cache_dir(),
+    }
+}
+
+/// The dataset's cache, as [`dataset_cache_location`] picks it, with
+/// `general` (the cache a command acts on when it names no dataset) in
+/// place of the configured one: `general` when the process has a cache
+/// of its own or the catalog names none, else the catalog's.
+pub(crate) fn dataset_cache_dir_or(catalog_dir: Option<&Path>, general: &Path) -> PathBuf {
+    pick_dataset_cache_dir(CACHE_DIR_OVERRIDE.get().map(|_| general), catalog_dir)
+        .unwrap_or_else(|| general.to_path_buf())
+}
+
+/// Pure precedence behind [`dataset_cache_dir`]: the process's cache,
+/// then the catalog's; `None` leaves the configured one.
+fn pick_dataset_cache_dir(process: Option<&Path>, catalog: Option<&Path>) -> Option<PathBuf> {
+    process.or(catalog).map(Path::to_path_buf)
+}
+
 /// Why [`set_cache_dir`] refused: this process already uses another
 /// cache directory for dataset files.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1112,6 +1150,17 @@ protect_settings: true
         ).unwrap();
         assert_eq!(cache_dir_from(&yaml).unwrap(),
             PathBuf::from("/mnt/datamir/vectordata-cache"));
+    }
+
+    /// **A dataset's cache**: the process's when it has one (a
+    /// command's `--cache-dir`), else the one its catalog names, else
+    /// the configured one.
+    #[test]
+    fn a_datasets_cache_is_the_processs_then_its_catalogs() {
+        let (process, catalog) = (Path::new("/process"), Path::new("/catalog"));
+        assert_eq!(pick_dataset_cache_dir(Some(process), Some(catalog)).as_deref(), Some(process));
+        assert_eq!(pick_dataset_cache_dir(None, Some(catalog)).as_deref(), Some(catalog));
+        assert_eq!(pick_dataset_cache_dir(None, None), None);
     }
 
     #[test]

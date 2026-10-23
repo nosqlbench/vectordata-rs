@@ -146,6 +146,17 @@ adapter over a library call:
 The full table, one row per command, is in the crate's `AGENTS.md`, and
 a test fails when a command has no row there.
 
+**Which cache a command uses.** Every command that reads, fetches,
+lists or drops cached data acts on the cache active for it, and each
+takes `--cache-dir` to name that cache for the run, over the configured
+or default one; `settings.yaml` is left unchanged. For a dataset the
+cache is, in order: the run's (`--cache-dir`, or `settings::set_cache_dir`
+in a program), the one the dataset's catalog names (a jvector catalog's
+`cache_dir`, §2.9), the configured one. A command that names no dataset
+(`cache list`, `cache prune`, `veks datasets drop-cache`) acts on the
+run's cache, else the configured one; `veks datasets cache-status
+--all` and the explorer's picker also cover each cache a catalog names.
+
 ## 2.2 Catalog-Based Dataset Discovery
 
 ### Catalog configuration
@@ -1156,16 +1167,27 @@ is `Error::AmbiguousDataset`, listing them — ambiguity is never
 resolved by order. Name the entry after its directory, or open the
 file as a catalog and pick an entry.
 
-An **`_include: { url: … }`** names another catalog, a URL or a path
-(a relative one under the file's location), whose entries are read
-as this file's, as jvector `DataSetLoaderSimpleMFD` reads them: this
-file's `_defaults` apply to them, their facets resolve against the
-included catalog's directory unless an entry or `_defaults` states a
-`base_url`, and an entry of this file replaces an included one of the
-same key. The included catalog's own `_`-prefixed keys (its
-`_defaults`, a further `_include`) are not read. A remote one is
-fetched as any catalog is, through the kept copy offline; one that
-cannot be had is a warning, and this file's own entries still load.
+Two jvector keys carry further:
+
+- **`_include: { url: … }`** names another catalog, a URL or a path
+  (a relative one under the file's location), whose entries are read
+  as this file's, as jvector `DataSetLoaderSimpleMFD` reads them: this
+  file's `_defaults` apply to them, their facets resolve against the
+  included catalog's directory unless an entry or `_defaults` states a
+  `base_url`, and an entry of this file replaces an included one of the
+  same key. The included catalog's own `_`-prefixed keys (its
+  `_defaults`, a further `_include`) are not read. A remote one is
+  fetched as any catalog is, through the kept copy offline; one that
+  cannot be had is a warning, and this file's own entries still load.
+- **`cache_dir`** (the entry's, else `_defaults.cache_dir`, else
+  `$DATASET_CACHE_DIR`) is where a local copy is looked for first, as
+  jvector looks, and it is also the dataset's cache: what is fetched
+  lands under `<cache_dir>/<dataset>/`, laid out and managed as in any
+  cache, in place of the configured one (`CatalogEntry::cache_dir`); a
+  run's `--cache-dir` (or `settings::set_cache_dir`) still outranks it. A
+  relative `cache_dir` is under the working directory, as jvector reads
+  it. A local catalog's own directory, where copies are looked for
+  last, names no cache.
 
 The reverse holds too: a catalog source that points at a
 `dataset.yaml` lists that one dataset (named by its `name:`, else by

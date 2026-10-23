@@ -26,9 +26,31 @@
   wrapper such as jvector's public catalog listed nothing. A remote
   include is kept for offline use like any catalog; one that cannot be
   read is a warning, not a failure.
+- **A jvector catalog's `cache_dir` is the dataset's cache.** The
+  entry's `cache_dir`, `_defaults.cache_dir` or `$DATASET_CACHE_DIR`
+  was only where an existing copy was looked for; a fetch went to the
+  configured cache. What is fetched now lands under
+  `<cache_dir>/<dataset>/`, managed as any cache is (sidecars,
+  `origin.json`, `measured.yaml`, the free-space check), in place of the
+  configured cache; a run's `--cache-dir` or `settings::set_cache_dir`
+  still outranks it. `CatalogEntry::cache_dir` and
+  `EntryBuilder::cache_dir` carry it, and `TestDataView::cache_dir`
+  (defaulted to `None`) says which cache a view's dataset is in.
+- **The cache commands act on the cache active for them.**
+  `veks datasets cache-status` takes `--cache-dir`; without it, a
+  dataset's status is read from its own cache (the one its catalog
+  names, else the configured one), `--tree` shows that cache's tree,
+  and `--all` covers each cache a catalog names as well as the
+  configured one. The explorer's picker finds, locates and purges a
+  dataset in its own cache too. `vectordata::datasets::cache::
+  run_cache_status_in` and `run_cache_status_all_in` take the cache
+  and `tree`; `run_cache_status` and `run_cache_status_all` are
+  deprecated wrappers over them.
 
 ### Breaking
 
+- veks: `DatasetsCommand::CacheStatus` gains `cache_dir`, so a pattern
+  or construction of it outside veks names the field or uses `..`.
 - veks: `ConfigCatalogSubcommand` gains `Disable` and `Enable`, mirroring
   `vectordata config catalog`, and is `#[non_exhaustive]` from now on,
   so a match on it outside veks needs a wildcard arm.

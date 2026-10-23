@@ -351,7 +351,7 @@ pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogS
                     }
                 }
                 PickerAction::Locate => {
-                    run_locate(specifier, pause);
+                    run_locate(specifier, &catalog, pause);
                     ActionFlow::Stay
                 }
                 PickerAction::Download => {
@@ -393,8 +393,11 @@ pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogS
 /// shell-friendly — a `#`-commented header per dataset and either
 /// the bare path or a commented not-cached note, so real paths
 /// filter out with `grep -v '^#'`.
-fn run_locate(specifier: &str, pause: bool) {
-    for line in locate_lines(specifier, &cache_dir_or_exit()) {
+fn run_locate(specifier: &str, catalog: &crate::catalog::Catalog, pause: bool) {
+    // The dataset's cache: the one its catalog names, if any.
+    let general = cache_dir_or_exit();
+    let named = catalog.lookup(&specifier_head(specifier)).ok().and_then(|e| e.cache_dir());
+    for line in locate_lines(specifier, &crate::settings::dataset_cache_dir_or(named, &general)) {
         println!("{line}");
     }
     if pause {

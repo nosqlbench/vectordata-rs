@@ -94,7 +94,9 @@ pub fn run(cache_dir: Option<&Path>, verbose: bool) {
     println!("{} dataset(s) cached", datasets.len());
 }
 
-/// Show cache status for all cached datasets.
+/// Show cache status for all cached datasets in the configured cache
+/// and the caches catalogs name.
+#[deprecated(note = "use run_cache_status_all_in, which takes the cache to read and --tree")]
 pub fn run_cache_status_all(
     verbose: bool,
     program: &crate::catalog::CatalogSources,
@@ -102,17 +104,46 @@ pub fn run_cache_status_all(
     extra_catalogs: &[String],
     at: &[String],
 ) {
-    let cache_dir = configured_cache_dir_or_exit();
-    println!("Cache directory: {}", rel_display(&cache_dir));
-    println!();
+    run_cache_status_all_in(None, verbose, false, program, configdir, extra_catalogs, at)
+}
 
-    if !cache_dir.is_dir() {
-        println!("  No cache directory found.");
-        return;
+/// Show cache status for all cached datasets: every dataset directory
+/// in `cache_dir` when one is given; else in the configured cache and in
+/// each cache a catalog names for its datasets (a jvector catalog's
+/// `cache_dir`). With `tree`, each one's file tree follows.
+pub fn run_cache_status_all_in(
+    cache_dir: Option<&Path>,
+    verbose: bool,
+    tree: bool,
+    program: &crate::catalog::CatalogSources,
+    configdir: &str,
+    extra_catalogs: &[String],
+    at: &[String],
+) {
+    let catalog = super::build_sources(program, configdir, extra_catalogs, at)
+        .open()
+        .unwrap_or_else(|code| std::process::exit(code));
+    let general = cache_dir.map(Path::to_path_buf).unwrap_or_else(configured_cache_dir_or_exit);
+    let mut roots = vec![general.clone()];
+    if cache_dir.is_none() {
+        for entry in catalog.datasets() {
+            let root = crate::settings::dataset_cache_dir_or(entry.cache_dir(), &general);
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
     }
 
     let mut found = false;
-    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+    for root in &roots {
+        println!("Cache directory: {}", rel_display(root));
+        println!();
+        if !root.is_dir() {
+            println!("  No cache directory found.");
+            println!();
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(root) else { continue };
         let mut dirs: Vec<_> = entries.flatten()
             .filter(|e| e.path().is_dir())
             .collect();
@@ -135,7 +166,7 @@ pub fn run_cache_status_all(
             if has_origin || has_mrkl {
                 if found { println!(); }
                 found = true;
-                run_cache_status(&name, verbose, program, configdir, extra_catalogs, at);
+                print_cache_status(&name, &ds_path, lookup_for_status(&catalog, &name), verbose, tree);
             }
         }
     }
@@ -156,7 +187,22 @@ fn has_mrkl_files(dir: &std::path::Path) -> bool {
     false
 }
 
-/// Show detailed cache status for a specific dataset across all profiles.
+/// The entry a status names, for its profile summary. A name two
+/// catalogs hold gets the cache status without it, and is told why.
+fn lookup_for_status<'c>(catalog: &'c crate::catalog::Catalog, name: &str) -> Option<&'c crate::dataset::CatalogEntry> {
+    match catalog.lookup(name) {
+        Ok(entry) => Some(entry),
+        Err(e @ crate::Error::AmbiguousDataset { .. }) => {
+            eprintln!("note: no profile summary: {e}");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// Show detailed cache status for a specific dataset across all
+/// profiles, in the dataset's cache.
+#[deprecated(note = "use run_cache_status_in, which takes the cache to read and --tree")]
 pub fn run_cache_status(
     dataset_name: &str,
     verbose: bool,
@@ -165,28 +211,68 @@ pub fn run_cache_status(
     extra_catalogs: &[String],
     at: &[String],
 ) {
-    use crate::merkle::MerkleState;
+    run_cache_status_in(dataset_name, None, verbose, false, program, configdir, extra_catalogs, at)
+}
 
-    let cache_dir = configured_cache_dir_or_exit();
-    let ds_cache = cache_dir.join(dataset_name);
-
+/// Show detailed cache status for a specific dataset across all
+/// profiles, in `cache_dir` when one is given, else in the dataset's
+/// cache: the one its catalog names, else the configured one. With
+/// `tree`, the dataset directory's file tree follows.
+pub fn run_cache_status_in(
+    dataset_name: &str,
+    cache_dir: Option<&Path>,
+    verbose: bool,
+    tree: bool,
+    program: &crate::catalog::CatalogSources,
+    configdir: &str,
+    extra_catalogs: &[String],
+    at: &[String],
+) {
     // Load catalog to get profile info
     let catalog = super::build_sources(program, configdir, extra_catalogs, at)
         .open()
         .unwrap_or_else(|code| std::process::exit(code));
-    // The profile summary needs the one entry; a name two catalogs hold
-    // gets the cache status without it, and is told why.
-    let entry = match catalog.lookup(dataset_name) {
-        Ok(entry) => Some(entry),
-        Err(e @ crate::Error::AmbiguousDataset { .. }) => {
-            eprintln!("note: no profile summary: {e}");
-            None
-        }
-        Err(_) => None,
+    let entry = lookup_for_status(&catalog, dataset_name);
+    let root = match cache_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => match crate::settings::dataset_cache_location(entry.and_then(|e| e.cache_dir())) {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        },
     };
+    print_cache_status(dataset_name, &root.join(dataset_name), entry, verbose, tree);
+}
+
+/// The status of the dataset directory `ds_cache`, with `entry`'s
+/// profile summary when there is one.
+fn print_cache_status(
+    dataset_name: &str,
+    ds_cache: &Path,
+    entry: Option<&crate::dataset::CatalogEntry>,
+    verbose: bool,
+    tree: bool,
+) {
+    print_cache_status_body(dataset_name, ds_cache, entry, verbose);
+    if tree && ds_cache.is_dir() {
+        println!();
+        println!("  File tree:");
+        print_cache_tree(ds_cache);
+    }
+}
+
+fn print_cache_status_body(
+    dataset_name: &str,
+    ds_cache: &Path,
+    entry: Option<&crate::dataset::CatalogEntry>,
+    verbose: bool,
+) {
+    use crate::merkle::MerkleState;
 
     println!("Cache status: {}", dataset_name);
-    println!("  Cache dir: {}", rel_display(&ds_cache));
+    println!("  Cache dir: {}", rel_display(ds_cache));
     println!();
 
     if !ds_cache.is_dir() {
@@ -201,14 +287,14 @@ pub fn run_cache_status(
     let mut total_content_bytes: u64 = 0;
     let mut facet_rows: Vec<(String, u32, u32, u64, u64, bool, String)> = Vec::new();
 
-    scan_mrkl_status(&ds_cache, &ds_cache, &mut facet_rows);
+    scan_mrkl_status(ds_cache, ds_cache, &mut facet_rows);
 
     if facet_rows.is_empty() {
         // No .mrkl files — show raw file listing
         println!("  No merkle state — files downloaded without verification:");
         println!();
-        print_file_tree(&ds_cache, &ds_cache, 2);
-        let (file_count, dir_size) = scan_directory_recursive(&ds_cache);
+        print_file_tree(ds_cache, ds_cache, 2);
+        let (file_count, dir_size) = scan_directory_recursive(ds_cache);
         println!();
         println!("  {} file(s), {} total", file_count, format_size(dir_size));
         return;
@@ -290,7 +376,7 @@ pub fn run_cache_status(
                                 .map(|iv| (iv.min_incl, iv.max_excl))
                                 .or_else(|| source_suffix_window(source))
                         };
-                        let (v, t) = facet_chunk_coverage(state, window, clean, &ds_cache);
+                        let (v, t) = facet_chunk_coverage(state, window, clean, ds_cache);
                         pv += v;
                         pt += t;
                     }
