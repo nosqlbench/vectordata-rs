@@ -60,17 +60,7 @@ const LONG_VERSION: &str = concat!(
     name = "vectordata",
     version = LONG_VERSION,
     about = "Inspect catalog-published vector datasets, manage the local cache, and \
-             launch the interactive explorer.",
-    long_about = "vectordata — the user-facing entry point for working with \
-                  published vector-search benchmark datasets.\n\n\
-                  Common starting points:\n  \
-                  • `vectordata datasets explore`  — interactive dataset picker + visualizer (`explore` for short)\n  \
-                  • `vectordata datasets list`     — text catalog listing\n  \
-                  • `vectordata config get`        — review the active configuration\n  \
-                  • `vectordata cache list`        — see what's on disk\n\n\
-                  First-time users typically start by configuring a catalog source \
-                  (`vectordata config catalog add <url-or-path>`) and a cache directory \
-                  (`vectordata config set cache <dir>`)."
+             launch the interactive explorer."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -114,31 +104,9 @@ enum Cmd {
     /// Short for `datasets explore`: the interactive explorer.
     #[cfg(feature = "explore")]
     Explore(ExploreCommand),
+    // Its `--help` is `completions_long_about`, which names the
+    // program run.
     /// Print or activate tab-completion for the current shell.
-    ///
-    /// With no arguments, auto-detects your shell from `$SHELL` and
-    /// emits a sourceable wrapper that activates completions for the
-    /// current session:
-    ///
-    ///   eval "$(vectordata completions)"
-    ///
-    /// With `--shell <name>`, emits the raw completion script for that
-    /// shell (bash / zsh / fish / elvish / powershell).
-    #[command(
-        long_about = "Print or activate tab-completion for the current shell.\n\
-        \n\
-        To activate for the current session:\n    \
-        eval \"$(vectordata completions)\"\n\
-        \n\
-        To persist (bash):\n    \
-        echo 'eval \"$(vectordata completions)\"' >> ~/.bashrc\n\
-        \n\
-        To persist (zsh):\n    \
-        echo 'eval \"$(vectordata completions)\"' >> ~/.zshrc\n\
-        \n\
-        To emit a raw script for a specific shell:\n    \
-        vectordata completions --shell bash > /etc/bash_completion.d/vectordata\n"
-    )]
     Completions {
         /// Emit the raw completion script for this shell instead of
         /// the auto-detected wrapper.
@@ -1031,6 +999,62 @@ impl Host {
 /// `vectordata`, or the host that embeds this CLI (`fvec` for `fvec
 /// bench vectordata`), whose shell completion it is. `None` when
 /// `invoked` is empty.
+/// The command line as `invoked` reaches it, with the long help of the
+/// root and of `completions` naming `invoked`, so a host embedding it
+/// shows its own commands.
+fn cli_spec(invoked: &str) -> veks_completion::CommandSpec {
+    let mut spec = Cli::veks_command_spec(invoked).long_about(top_long_about(invoked));
+    if let Some(c) = spec.subcommands.iter_mut().find(|c| c.name == "completions") {
+        c.long_about = Some(completions_long_about(invoked));
+    }
+    spec
+}
+
+/// What `<invoked> --help` opens with: the starting points, as typed.
+fn top_long_about(invoked: &str) -> String {
+    let starts = [
+        ("datasets explore", "interactive dataset picker + visualizer (`explore` for short)"),
+        ("datasets list", "text catalog listing"),
+        ("config get", "review the active configuration"),
+        ("cache list", "see what's on disk"),
+    ];
+    let width = starts.iter().map(|(c, _)| invoked.len() + 1 + c.len()).max().unwrap_or(0);
+    let mut s = String::from(
+        "The user-facing entry point for working with published vector-search benchmark datasets.\n\n\
+         Common starting points:\n",
+    );
+    for (cmd, what) in starts {
+        let typed = format!("{invoked} {cmd}");
+        s.push_str(&format!("  • `{typed}`{:pad$}  — {what}\n", "", pad = width - typed.len()));
+    }
+    s.push_str(&format!(
+        "\nFirst-time users typically start by configuring a catalog source \
+         (`{invoked} config catalog add <url-or-path>`) and a cache directory \
+         (`{invoked} config set cache <dir>`)."
+    ));
+    s
+}
+
+/// What `<invoked> completions --help` shows: how to activate and keep
+/// tab-completion for the program run.
+fn completions_long_about(invoked: &str) -> String {
+    let program = completion_hint_name(invoked).unwrap_or(invoked);
+    format!(
+        "Print or activate tab-completion for the current shell.\n\n\
+         With no arguments, detects your shell from `$SHELL` and prints a wrapper to \
+         source. With `--shell <name>`, prints that shell's raw completion script \
+         (bash / zsh / fish / elvish / powershell).\n\n\
+         To activate for the current session:\n    \
+         eval \"$({invoked} completions)\"\n\n\
+         To persist (bash):\n    \
+         echo 'eval \"$({invoked} completions)\"' >> ~/.bashrc\n\n\
+         To persist (zsh):\n    \
+         echo 'eval \"$({invoked} completions)\"' >> ~/.zshrc\n\n\
+         To emit a raw script for a specific shell:\n    \
+         {invoked} completions --shell bash > /etc/bash_completion.d/{program}\n"
+    )
+}
+
 fn completion_hint_name(invoked: &str) -> Option<&str> {
     invoked.split_whitespace().next()
 }
@@ -1122,7 +1146,7 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
     // Two specs, one tree: the completion machinery keys on the name
     // the shell completes — the `vectordata` executable's, or an owning
     // host's; everything a user reads names `invoked`.
-    let spec = Cli::veks_command_spec(invoked);
+    let spec = cli_spec(invoked);
     let completing = host.completion_name(invoked);
 
     // Dynamic-completion entry: when invoked with `_<NAME>_COMPLETE=bash`
@@ -1133,7 +1157,7 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
     // (the line and the cursor); the `vectordata` executable's is read from
     // the process's arguments, as it always was.
     if let Some(name) = completing {
-        let exe_spec = Cli::veks_command_spec(name);
+        let exe_spec = cli_spec(name);
         let tree = vcli::build_completion_tree(&exe_spec, &completion_resolvers());
         let answered = if host.owns_completion {
             veks_completion::handle_complete_args(name, &tree, &argv)

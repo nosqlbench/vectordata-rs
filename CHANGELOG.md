@@ -16,12 +16,12 @@
   holds**: it opens with the `Cache directory:` and `Total on disk:`
   lines `cache list` opens with, above its subcommands.
 - **`#[derive(VeksCli)]` implements `#[arg(global)]`, `#[arg(alias)]` /
-  `aliases` and `#[arg(value_delimiter)]`.** A global option is
-  accepted by every subcommand below the command that declares it,
-  with one set of values for the whole line, and help and completion
-  offer it there. `CommandSpec` gains `propagate_globals`,
-  `OptionSpec` gains `global`, and `OptionDef` gains `aliases` and
-  `value_delimiter`.
+  `aliases`, `#[arg(value_delimiter)]` and `#[command(long_about)]`.** A
+  global option is accepted by every subcommand below the command that
+  declares it, with one set of values for the whole line, and help and
+  completion offer it there. `CommandSpec` gains `long_about` and
+  `propagate_globals`, `OptionSpec` gains `global`, and `OptionDef`
+  gains `aliases` and `value_delimiter`.
 
 ### Changed
 
@@ -57,6 +57,10 @@
   after the subcommand as well as before it.
 - **`veks prepare bootstrap --overwrite` was refused**, though it was
   declared as another spelling of `--force`; it is accepted.
+- **`vectordata --help` and `vectordata completions --help` showed only
+  the one-line summary.** They show the starting points and the
+  activation lines, naming the program run, and the `completions`
+  entry in the command list is one line.
 
 ## 4.3.0 — 2026-10-23
 

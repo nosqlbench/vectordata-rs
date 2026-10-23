@@ -352,12 +352,21 @@ fn about_after_help_calls(di: &DeriveInput) -> TS2 {
         Some(a) => quote! { .about(#a) },
         None => quote! {},
     };
+    let long_about = long_about_call(&di.attrs);
     let after = match type_after_help(di) {
         Some(h) => quote! { .after_help(#h) },
         None => quote! {},
     };
     let stability = stability_call(&di.attrs);
-    quote! { #about #after #stability }
+    quote! { #about #long_about #after #stability }
+}
+
+/// The `.long_about(…)` builder call from `#[command(long_about = "…")]`.
+fn long_about_call(attrs: &[Attribute]) -> TS2 {
+    match command_str_attr(attrs, "long_about") {
+        Some(l) => quote! { .long_about(#l) },
+        None => quote! {},
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -763,7 +772,8 @@ fn derive_enum(
         let aliases = collect_aliases(&variant.attrs);
         let alias_calls = quote! { #(.alias(#aliases))* };
         let stability = stability_call(&variant.attrs);
-        let vabout_call = quote! { #vabout_call #vafter_call #alias_calls #stability };
+        let vlong_about = long_about_call(&variant.attrs);
+        let vabout_call = quote! { #vabout_call #vlong_about #vafter_call #alias_calls #stability };
 
         match &variant.fields {
             Fields::Unit => {

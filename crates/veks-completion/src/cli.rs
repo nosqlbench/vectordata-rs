@@ -133,6 +133,11 @@ pub struct CommandSpec {
     pub name: String,
     /// One-line summary shown in `--help` and subcommand listings.
     pub about: Option<String>,
+    /// The longer description `--help` shows in place of
+    /// [`about`](Self::about): a line that starts with whitespace is shown
+    /// as written, and any other is wrapped to the help width. Subcommand
+    /// listings still show `about`.
+    pub long_about: Option<String>,
     /// Alternate names that also select this command.
     pub aliases: Vec<String>,
     /// Options accepted at this command level, in declaration order.
@@ -161,6 +166,11 @@ impl CommandSpec {
     /// Set the one-line summary.
     pub fn about(mut self, a: impl Into<String>) -> Self {
         self.about = Some(a.into());
+        self
+    }
+    /// Set the longer description `--help` shows in place of the summary.
+    pub fn long_about(mut self, a: impl Into<String>) -> Self {
+        self.long_about = Some(a.into());
         self
     }
     /// Add an alternate name this command also answers to (e.g. `ls` for `list`).
@@ -742,7 +752,20 @@ pub fn render_help(spec: &CommandSpec) -> String {
 pub fn render_help_at(spec: &CommandSpec, path: &str) -> String {
     let mut s = String::new();
 
-    if let Some(about) = &spec.about {
+    if let Some(long) = &spec.long_about {
+        for line in long.trim_end().lines() {
+            if line.starts_with(char::is_whitespace) {
+                s.push_str(line);
+                s.push('\n');
+            } else {
+                for wrapped in wrap_text(line, HELP_WIDTH) {
+                    s.push_str(&wrapped);
+                    s.push('\n');
+                }
+            }
+        }
+        s.push('\n');
+    } else if let Some(about) = &spec.about {
         for line in wrap_text(about, HELP_WIDTH) {
             s.push_str(&line);
             s.push('\n');
@@ -1535,6 +1558,34 @@ mod derive_tests {
         let parse = |words: &[&str]| Explain::veks_from_parsed(&crate::cli::parse(&spec, &argv(words)).unwrap()).unwrap();
         assert_eq!(parse(&["--pages", "0,2", "--pages=5", "--path", "a:b"]), Explain { pages: Some(vec![0, 2, 5]), path: vec!["a".into(), "b".into()] });
         assert_eq!(parse(&[]), Explain { pages: None, path: vec![] });
+    }
+
+    /// **`long_about` is what `--help` shows, as written**; listings of
+    /// the subcommands keep the one-line summary.
+    #[test]
+    fn help_shows_the_long_about_as_written() {
+        #[derive(VeksCli)]
+        #[command(about = "Short.", long_about = "Long first line.\n  • an indented   point\n\nA paragraph long enough that it has to be wrapped to fit the width that help is rendered at.")]
+        #[allow(dead_code)]
+        struct Top {
+            #[command(subcommand)]
+            command: TopCmd,
+        }
+        #[derive(VeksCli)]
+        #[allow(dead_code)]
+        enum TopCmd {
+            /// Sub summary.
+            #[command(long_about = "Sub, at length.")]
+            Sub,
+        }
+        let spec = Top::veks_command_spec("top");
+        let top = crate::cli::render_help(&spec);
+        assert!(top.starts_with("Long first line.\n  • an indented   point\n\nA paragraph long enough"), "{top}");
+        assert!(top.lines().all(|l| l.chars().count() <= 100), "{top}");
+        assert!(top.lines().filter(|l| l.starts_with("A paragraph") || l.starts_with("rendered")).count() <= 2, "{top}");
+        assert!(top.contains("Sub summary."), "{top}");
+        let sub = crate::cli::render_help_for(&spec, &argv(&["sub", "--help"]));
+        assert!(sub.starts_with("Sub, at length."), "{sub}");
     }
 
     #[test]

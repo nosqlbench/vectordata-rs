@@ -279,6 +279,8 @@ fn host_child() {
             words(&["datasets", "explore", "--dataset", "alpha", "--source", "b.fvec", "--configdir", &config]),
             &host,
         ),
+        "embedded-help" => run("fvec bench vectordata", words(&["--help"]), &host),
+        "embedded-completions-help" => run("fvec bench vectordata", words(&["completions", "--help"]), &host),
         "embedded-at-before-list" => {
             run("fvec bench vectordata", words(&["datasets", "--at", "nowhere", "list", "--configdir", &config]), &host)
         }
@@ -407,6 +409,25 @@ fn the_explorers_hints_name_the_embedding_command() {
         assert!(stderr.contains(hint), "{case}: {stderr}");
         assert!(!stderr.contains("`vectordata ") && !stderr.contains("Try: vectordata"), "{case}: {stderr}");
     }
+}
+
+/// **The long help names the command the user ran**: the starting
+/// points `--help` lists and the activation lines `completions --help`
+/// shows are the embedding host's commands.
+#[test]
+fn the_long_help_names_the_embedding_command() {
+    let (out, _tmp) = child("embedded-help", &[]);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("`fvec bench vectordata datasets explore`"), "{stdout}");
+    assert!(!stdout.contains("`vectordata "), "{stdout}");
+
+    let (out, _tmp) = child("embedded-completions-help", &[]);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("eval \"$(fvec bench vectordata completions)\""), "{stdout}");
+    assert!(stdout.contains("> /etc/bash_completion.d/fvec\n"), "{stdout}");
+    assert!(!stdout.contains("$(vectordata "), "{stdout}");
 }
 
 /// **A catalog option given before a `datasets` subcommand is the
