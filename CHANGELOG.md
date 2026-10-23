@@ -8,6 +8,10 @@
   dataset commands, and takes `--configdir`, `--catalog` and `--at` as
   they do. `vectordata explore` stays as its short form, with the same
   options; it read only the configured catalogs before.
+- **`explore::run_with_sources_as(invoked, args, sources)`**: the
+  explorer for a program that embeds the command line, naming the
+  commands its hints suggest under `invoked`; `run_with_sources` is it
+  under `vectordata`.
 
 ### Fixes
 
@@ -25,6 +29,10 @@
   `explore::run_with_sources`. The command line refuses the pair, in
   the name of the command that was run, and `run_with_sources` given
   both returns 2.
+- **The explorer's hints named `vectordata` under any program**: with
+  no catalogs (`config catalog add`), with no terminal for the picker
+  (`datasets list`), and for a source with no vectors (`datasets
+  precache`). They name the command that was run.
 
 ## 4.3.0 — 2026-10-23
 

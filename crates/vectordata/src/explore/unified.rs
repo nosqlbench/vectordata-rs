@@ -339,8 +339,11 @@ pub(super) enum ExploreExit {
     Back,
 }
 
+/// `invoked` is the command the user typed to reach the explorer, as
+/// [`run_with_sources_as`](super::run_with_sources_as) takes it; the
+/// hint for a source with no vectors names its precache under it.
 pub(super) fn run_interactive_explore(
-    source: &str, catalog: &crate::catalog::Catalog, sample_size: usize, seed: u64, sample_mode: SampleMode,
+    invoked: &str, source: &str, catalog: &crate::catalog::Catalog, sample_size: usize, seed: u64, sample_mode: SampleMode,
     start_palette: super::palette::Palette, start_curve: super::palette::Curve,
 ) -> ExploreExit {
     eprintln!("Opening {}...", source);
@@ -351,7 +354,7 @@ pub(super) fn run_interactive_explore(
     if total == 0 || dim == 0 {
         eprintln!("error: no vector data found in '{}' (count={}, dim={})", source, total, dim);
         eprintln!("  This may mean the profile doesn't have base_vectors, or the data isn't cached yet.");
-        eprintln!("  Try: vectordata datasets precache {}:{}",
+        eprintln!("  Try: {invoked} datasets precache {}:{}",
             source.split(':').next().unwrap_or(source),
             source.split(':').nth(1).unwrap_or("default"));
         // Brief pause so user can read the message before TUI takes over

@@ -250,7 +250,20 @@ pub fn run(args: ExploreArgs) -> i32 {
 /// A catalog the user disabled is not read by `--dataset`/`--source`.
 /// The picker reads it ([`CatalogSources::including_disabled`](crate::catalog::CatalogSources::including_disabled))
 /// and hides its rows until it is turned back on in the session.
-pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogSources) -> i32 {
+///
+/// The commands its hints suggest are named under `vectordata`;
+/// [`run_with_sources_as`] names them under a program's own command.
+pub fn run_with_sources(args: ExploreArgs, sources: crate::catalog::CatalogSources) -> i32 {
+    run_with_sources_as("vectordata", args, sources)
+}
+
+/// [`run_with_sources`] for a program that embeds the command line:
+/// `invoked` is what the user typed to reach it — `"vectordata"`, or
+/// e.g. `"fvec bench vectordata"`, as for
+/// [`shell::bin_main_as`](crate::shell::bin_main_as) — and the commands
+/// the explorer's hints suggest are named under it
+/// (`fvec bench vectordata datasets precache …`).
+pub fn run_with_sources_as(invoked: &str, args: ExploreArgs, mut sources: crate::catalog::CatalogSources) -> i32 {
     use dataset_picker::{ActionFlow, PickerAction, PickerOutcome};
 
     let original_hook = std::panic::take_hook();
@@ -298,6 +311,7 @@ pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogS
             crate::catalog::Catalog::default()
         };
         return match unified::run_interactive_explore(
+            invoked,
             &src,
             &catalog,
             sample,
@@ -339,6 +353,7 @@ pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogS
                     // viewer owns the terminal until the user exits it.
                     let _ = pause;
                     match unified::run_interactive_explore(
+                        invoked,
                         specifier,
                         &catalog,
                         sample,
@@ -377,7 +392,7 @@ pub fn run_with_sources(args: ExploreArgs, mut sources: crate::catalog::CatalogS
                 }
             }
         };
-        match dataset_picker::run_picker(&picked, &catalog, dispatch, start_in_settings) {
+        match dataset_picker::run_picker(invoked, &picked, &catalog, dispatch, start_in_settings) {
             PickerOutcome::Done => return 0,
             PickerOutcome::Failed => return 1,
             PickerOutcome::Reload => {

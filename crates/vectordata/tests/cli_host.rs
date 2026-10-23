@@ -265,6 +265,15 @@ fn host_child() {
         }
         "complete-path" => run("fvec bench", words(&["completions", "--shell", "bash"]), &host.owns_completion()),
         "embedded-completions" => run("fvec bench vectordata", words(&["completions", "--shell", "bash"]), &host),
+        "embedded-explore-no-catalogs" => {
+            run("fvec bench vectordata", words(&["datasets", "explore", "--configdir", &config]), &Host::new())
+        }
+        "embedded-explore-no-terminal" => run("fvec bench vectordata", words(&["datasets", "explore", "--configdir", &config]), &host),
+        "embedded-explore-no-vectors" => {
+            let empty = dir.join("empty.fvec");
+            std::fs::write(&empty, b"").unwrap();
+            run("fvec bench vectordata", words(&["explore", "--source", empty.to_str().unwrap(), "--configdir", &config]), &host)
+        }
         "embedded-explore-both" => run(
             "fvec bench vectordata",
             words(&["datasets", "explore", "--dataset", "alpha", "--source", "b.fvec", "--configdir", &config]),
@@ -378,4 +387,21 @@ fn the_explorers_refusal_names_the_embedding_command() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("fvec bench vectordata: '--dataset' cannot be combined with '--source'"), "{stderr}");
     assert!(!stderr.contains("vectordata explore"), "{stderr}");
+}
+
+/// **The explorer's hints name the command the user ran**: with no
+/// catalogs, with no terminal for the picker, and for a source with no
+/// vectors, the command each suggests is the embedding host's.
+#[test]
+fn the_explorers_hints_name_the_embedding_command() {
+    for (case, hint) in [
+        ("embedded-explore-no-catalogs", "`fvec bench vectordata config catalog add <URL-or-path>`"),
+        ("embedded-explore-no-terminal", "`fvec bench vectordata datasets list`"),
+        ("embedded-explore-no-vectors", "Try: fvec bench vectordata datasets precache"),
+    ] {
+        let (out, _tmp) = child(case, &[]);
+        let stderr = text(&out.stderr);
+        assert!(stderr.contains(hint), "{case}: {stderr}");
+        assert!(!stderr.contains("`vectordata ") && !stderr.contains("Try: vectordata"), "{case}: {stderr}");
+    }
 }

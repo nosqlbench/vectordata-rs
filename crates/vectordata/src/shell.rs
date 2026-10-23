@@ -1237,7 +1237,7 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
                 DatasetsCmd::Init(args) => crate::datasets::init::run(&args),
                 DatasetsCmd::Curlify(args) => crate::datasets::curlify::run_args(args),
                 #[cfg(feature = "explore")]
-                DatasetsCmd::Explore(explore) => cmd_explore(explore, program),
+                DatasetsCmd::Explore(explore) => cmd_explore(invoked, explore, program),
                 DatasetsCmd::Push(args) => crate::push::run(args),
                 DatasetsCmd::Derive {
                     dataset,
@@ -1480,7 +1480,7 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
             }
         }
         #[cfg(feature = "explore")]
-        Cmd::Explore(explore) => cmd_explore(explore, program),
+        Cmd::Explore(explore) => cmd_explore(invoked, explore, program),
     }
 }
 
@@ -1488,9 +1488,9 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
 /// run's catalogs — the program's after the configured ones, as in
 /// every other command, or `--at`'s instead.
 #[cfg(feature = "explore")]
-fn cmd_explore(explore: ExploreCommand, program: &crate::catalog::CatalogSources) -> i32 {
+fn cmd_explore(invoked: &str, explore: ExploreCommand, program: &crate::catalog::CatalogSources) -> i32 {
     match crate::datasets::sources_for_run(program, &explore.configdir, &explore.catalog, &explore.at) {
-        Ok(run) => crate::explore::run_with_sources(explore.args, run.sources().clone()),
+        Ok(run) => crate::explore::run_with_sources_as(invoked, explore.args, run.sources().clone()),
         Err(code) => code,
     }
 }

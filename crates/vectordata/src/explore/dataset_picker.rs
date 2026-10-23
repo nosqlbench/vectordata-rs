@@ -2418,7 +2418,11 @@ fn read_only_note(origin: Option<&crate::catalog::CatalogOrigin>, config_file: &
 /// restores its own chrome immediately after. Picker state (cursor,
 /// expanded set, filter, scroll, menu cursor) is preserved across
 /// dispatches because the function never exits between them.
+///
+/// `invoked` is the command the user typed to reach the explorer; the
+/// commands the picker's hints suggest are named under it.
 pub fn run_picker<F>(
+    invoked: &str,
     sources: &CatalogSources,
     catalog: &crate::catalog::Catalog,
     mut dispatch: F,
@@ -2436,7 +2440,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
         eprintln!();
-        eprintln!("Add one with `vectordata config catalog add <URL-or-path>`.");
+        eprintln!("Add one with `{invoked} config catalog add <URL-or-path>`.");
         return PickerOutcome::Failed;
     }
     let entries = catalog.datasets();
@@ -2467,7 +2471,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
         eprintln!("       (stdout is not a TTY — were you redirecting output?)");
         eprintln!();
         eprintln!("Pass `--dataset <name>` or `--source <path>` to explore non-interactively,");
-        eprintln!("or run `vectordata datasets list` for a text-friendly catalog view.");
+        eprintln!("or run `{invoked} datasets list` for a text-friendly catalog view.");
         return PickerOutcome::Failed;
     }
 
