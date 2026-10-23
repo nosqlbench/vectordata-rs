@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **The reminder to enable tab-completion names the program run.** A
+  program embedding the CLI (`fvec bench vectordata …`) told its user
+  to run `eval "$(vectordata completions)"`; it names the program's
+  executable (`fvec`) and checks that executable's registration.
+
 ## 4.3.0 — 2026-10-23
 
 ### Added

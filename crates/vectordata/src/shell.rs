@@ -1004,6 +1004,15 @@ impl Host {
     }
 }
 
+/// The executable a reminder to enable tab-completion names, for a run
+/// invoked as `invoked`: its first word, the program the user typed —
+/// `vectordata`, or the host that embeds this CLI (`fvec` for `fvec
+/// bench vectordata`), whose shell completion it is. `None` when
+/// `invoked` is empty.
+fn completion_hint_name(invoked: &str) -> Option<&str> {
+    invoked.split_whitespace().next()
+}
+
 /// Run the command line `argv` (everything after the program name) for
 /// `host`, and return its exit status instead of ending the process: 0
 /// for success, 1 when the command fails, 2 for a usage error (a
@@ -1115,6 +1124,8 @@ fn dispatch(invoked: &str, argv: Vec<String>, host: &Host) -> i32 {
         if veks_completion::handle_diagnostic_args(name, &tree) {
             return 0;
         }
+    }
+    if let Some(name) = completion_hint_name(invoked) {
         veks_completion::hint_completions_unregistered(name);
     }
 
@@ -1850,6 +1861,16 @@ fn fmt_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The completion reminder names the command the user ran**: an
+    /// embedded CLI's is its host's, not `vectordata`'s.
+    #[test]
+    fn the_completion_hint_names_the_program_run() {
+        assert_eq!(completion_hint_name("vectordata"), Some("vectordata"));
+        assert_eq!(completion_hint_name("fvec-bench"), Some("fvec-bench"));
+        assert_eq!(completion_hint_name("fvec bench vectordata"), Some("fvec"));
+        assert_eq!(completion_hint_name(""), None);
+    }
 
     /// Every command path the binary accepts, to depth two (`datasets
     /// precache`, `cache prune`, `token issue`) — the granularity the
