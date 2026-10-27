@@ -84,6 +84,7 @@ impl FoundDataset {
 
 /// What the generator is doing, for a progress display.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum GenerateEvent<'a> {
     /// Searching for datasets under this directory.
     Scanning(&'a Path),
@@ -113,6 +114,16 @@ pub enum GenerateEvent<'a> {
     /// can be stated in jvector's format any more, and the file is the
     /// generator's to keep true ([`knn_listing`]).
     RemovedKnnEntries(&'a Path),
+    /// A dataset's variable-length file has no current offset index, and
+    /// one is being written ([`crate::vvec_index`]).
+    Indexing(&'a Path),
+    /// A variable-length file's offset index was written.
+    Indexed {
+        /// The variable-length file.
+        file: &'a Path,
+        /// Its `IDXFOR__` sidecar.
+        index: &'a Path,
+    },
     /// A directory's catalog files were written.
     Wrote {
         /// The directory.
@@ -187,6 +198,11 @@ impl CatalogTree {
     /// is not marked `.do_not_catalog`, deepest first, so a parent's
     /// catalog is always newer than its children's. Returns the files
     /// written.
+    ///
+    /// Each dataset catalogued here has its variable-length files'
+    /// offset indexes brought current first ([`crate::vvec_index`]), so a
+    /// directory served as it stands opens remotely without downloading
+    /// those files whole. A file that cannot be indexed fails the write.
     pub fn write(
         &self,
         dirs: &BTreeSet<PathBuf>,
@@ -210,6 +226,7 @@ impl CatalogTree {
                 continue;
             }
             for dataset in self.datasets.iter().filter(|d| d.dir() == dir.as_path()) {
+                index_vvec_files(dataset.dir(), progress)?;
                 for (profile, p) in &dataset.config.profiles.profiles {
                     if let Some(Err(reason)) = knn_listing(p) {
                         progress(GenerateEvent::KnnOmitted { dataset: &dataset.config.name, profile, reason: &reason });
@@ -325,6 +342,20 @@ fn slash_path(relative: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Bring the offset index of every variable-length file under the
+/// dataset directory `dir` current, reporting each one written.
+fn index_vvec_files(dir: &Path, progress: &mut dyn FnMut(GenerateEvent)) -> Result<(), String> {
+    for file in crate::vvec_index::indexed_files_under(dir) {
+        if !crate::vvec_index::prepare(&file, true, &mut |_| {})?.index_written {
+            continue;
+        }
+        progress(GenerateEvent::Indexing(&file));
+        let done = crate::vvec_index::prepare(&file, false, &mut |_| {})?;
+        progress(GenerateEvent::Indexed { file: &file, index: &done.index });
+    }
+    Ok(())
 }
 
 fn write_file(path: &Path, content: &str) -> Result<PathBuf, String> {
@@ -464,6 +495,39 @@ mod tests {
         assert!(!tmp.path().join("private").join("inner").join("catalog.json").exists());
         let top = std::fs::read_to_string(tmp.path().join("catalog.json")).unwrap();
         assert!(!top.contains("inner"), "{top}");
+    }
+
+    /// **A catalogued dataset's variable-length files get their offset
+    /// indexes**, reported as they are written, so the directory served
+    /// as it stands opens remotely without downloading them whole. The
+    /// uniform `.ivec` ground truth gets none; an empty vvec fails the
+    /// write.
+    #[test]
+    fn catalogued_vvec_files_get_offset_indexes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ds");
+        dataset(&dir, "ds");
+        std::fs::create_dir_all(dir.join("profiles/default")).unwrap();
+        let data = dir.join("profiles/default/metadata_results.ivvec");
+        std::fs::write(&data, [1i32, 7].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        std::fs::write(dir.join("gt.ivec"), [1i32, 7].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+
+        let tree = CatalogTree::scan(tmp.path(), &mut |_| {});
+        let mut heard = Vec::new();
+        tree.write(&tree.catalog_dirs(), "catalog", &mut |e| {
+            if let GenerateEvent::Indexed { index, .. } = e {
+                heard.push(index.to_path_buf());
+            }
+        })
+        .unwrap();
+        let index = dir.join("profiles/default/IDXFOR__metadata_results.ivvec.i32");
+        assert_eq!(heard, vec![index.clone()]);
+        assert_eq!(std::fs::read(&index).unwrap(), 0i32.to_le_bytes());
+        assert!(!dir.join("IDXFOR__gt.ivec.i32").exists());
+
+        std::fs::write(dir.join("empty.ivvec"), b"").unwrap();
+        let refused = tree.write(&tree.catalog_dirs(), "catalog", &mut |_| {}).unwrap_err();
+        assert!(refused.contains("empty.ivvec") && refused.contains("is empty"), "{refused}");
     }
 
     /// **`knn_entries.yaml` lists only the profiles it can state

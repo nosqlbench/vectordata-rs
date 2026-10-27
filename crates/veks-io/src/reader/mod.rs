@@ -38,7 +38,9 @@ pub use any::{open_vec, open_vec_as, open_vec_as_with, open_vec_native, open_vec
 pub use any::{open_vvec, open_vvec_untyped, open_vvec_untyped_with, open_vvec_with};
 pub use probe::{XvecProbe, load_series_offsets, probe_source};
 pub use scalar::ScalarReader;
-pub use vvec::{IndexedVvecReader, load_offsets, remove_vvec_index};
+pub use vvec::{
+    IndexedVvecReader, VvecIndex, index_vvec_file, load_offsets, remove_vvec_index, vvec_index_is_current, vvec_index_path,
+};
 pub(crate) use vvec::write_offset_index;
 pub use xvec::{StreamReclaim, XvecReader};
 

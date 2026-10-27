@@ -172,6 +172,9 @@ fn log_event(ui: &veks_core::ui::UiHandle, event: GenerateEvent) {
                 .collect();
             ui.log(&format!("  wrote {entries} entries to {} ({})", dir.display(), names.join(" + ")))
         }
+        GenerateEvent::Indexing(file) => ui.log(&format!("  indexing {}...", file.display())),
+        GenerateEvent::Indexed { index, .. } => ui.log(&format!("  wrote {}", index.display())),
+        other => ui.log(&format!("  {other:?}")),
     }
 }
 

@@ -1536,7 +1536,15 @@ fn materialize_facet<F: FnMut(u64)>(
                     format!("facet '{facet_name}': unknown element width for '.{ext}'"),
                 ));
             }
-            done(materialize_vvec(src, dest, elem, window, on_bytes_written))
+            // The copy ships with its offset index, as a published
+            // variable-length file does, so a remote reader of the
+            // derived dataset opens it by ordinal.
+            let indexed = materialize_vvec(src, dest, elem, window, on_bytes_written).and_then(|()| {
+                crate::vvec_index::prepare(dest, false, &mut |_| {})
+                    .map(|_| ())
+                    .map_err(io::Error::other)
+            });
+            done(indexed)
         }
         FacetKind::Scalar(elem) => {
             done(materialize_scalar(src, dest, elem, window, on_bytes_written))
@@ -2226,6 +2234,32 @@ mod sharded_output {
             None
         );
         assert_eq!(fixed_record_size(&spans_of(&src), FacetKind::Slab).unwrap(), None);
+    }
+
+    /// **A derived variable-length file ships with its offset index**,
+    /// whole or windowed, giving the records of the copy, not of its
+    /// source.
+    #[test]
+    fn a_derived_vvec_gets_its_offset_index() {
+        let d = tmpdir();
+        let src = d.path().join("in.ivvec");
+        let mut bytes = Vec::new();
+        for r in [&[1i32, 2][..], &[], &[3], &[4, 5, 6]] {
+            bytes.extend((r.len() as i32).to_le_bytes());
+            r.iter().for_each(|x| bytes.extend(x.to_le_bytes()));
+        }
+        fs::write(&src, bytes).unwrap();
+        let starts = |p: &Path| -> Vec<i32> {
+            fs::read(p).unwrap().chunks(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect()
+        };
+        let cases = [("whole", DSWindow::default(), vec![0, 12, 16, 24]), ("window", crate::dataset::source::parse_window("1..3").unwrap(), vec![0, 4])];
+        for (tag, window, expected) in cases {
+            let out = d.path().join(tag);
+            fs::create_dir_all(&out).unwrap();
+            let dest = out.join("metadata_results.ivvec");
+            materialize_facet("metadata_results", &spans_of(&src), &dest, FacetKind::VariableVvec, &window, Sharding::Whole, |_| {}).unwrap();
+            assert_eq!(starts(&out.join("IDXFOR__metadata_results.ivvec.i32")), expected, "{tag}");
+        }
     }
 
     /// **The shards concatenate back to the source.** Splitting is a

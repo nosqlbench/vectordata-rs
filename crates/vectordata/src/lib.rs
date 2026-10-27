@@ -37,6 +37,7 @@
 //! | Read ground truth | [`TestDataViewExt::neighbor_indices_as`], [`TestDataViewExt::neighbor_distances_as`] | [`TestDataViewExt::neighbor_indices_as`] |
 //! | Read a metadata or scalar facet | [`TestDataViewExt::facet_as`] | below |
 //! | Read a record (slab) facet | [`TestDataView::open_facet_records`] | — |
+//! | Ship the offset index of each variable-length file you publish | [`vvec_index::prepare`]; `push` and `CatalogTree::write` call it | [`vvec_index::prepare`] |
 //! | List profiles and facets | [`TestDataGroup::profile_names`], [`TestDataView::facet_manifest`] | below |
 //! | Find datasets by pattern | [`Catalog::match_glob`](catalog::Catalog::match_glob), [`Catalog::datasets`](catalog::Catalog::datasets) | — |
 //! | Build a dataset description in code | [`DatasetConfig::builder`](dataset::DatasetConfig::builder) → [`save`](dataset::DatasetConfig::save) | `examples/register_catalog.rs` |
@@ -252,6 +253,7 @@ pub mod update_check;
 pub mod shell;
 pub mod datasets;
 pub mod push;
+pub mod vvec_index;
 pub mod credentials;
 pub mod endpoint;
 pub mod backup;

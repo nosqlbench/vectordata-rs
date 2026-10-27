@@ -111,6 +111,9 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
             let names: Vec<String> = files.iter().map(|f| rel(f)).collect();
             eprintln!("Wrote {entries} entries to {}", names.join(", "));
         }
+        GenerateEvent::Indexing(file) => eprintln!("  Indexing {}...", rel(file)),
+        GenerateEvent::Indexed { index, .. } => eprintln!("  Wrote {}", rel(index)),
+        other => eprintln!("  {other:?}"),
     };
     let tree = CatalogTree::scan(&scan_root, &mut progress);
     eprintln!("Found {} publishable dataset(s)", tree.datasets().len());

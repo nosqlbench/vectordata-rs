@@ -1131,3 +1131,97 @@ fn hashing_progress_reaches_the_callers_sink() {
     assert_eq!(hashing.len(), 1, "one finished line per hashed directory: {lines:?}");
     assert!(hashing[0].contains("1.0 GiB / 1.0 GiB"), "{}", hashing[0]);
 }
+
+/// A variable-length file of `records`, as `i32` elements.
+fn write_ivvec(path: &Path, records: &[&[i32]]) {
+    let mut bytes = Vec::new();
+    for r in records {
+        bytes.extend_from_slice(&(r.len() as i32).to_le_bytes());
+        for x in *r {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// **A pushed variable-length file ships with its offset index**: a
+/// push writes the `IDXFOR__` sidecar a file has none of, publishes and
+/// checksums it, merkles it when the file is merkled, and leaves it
+/// alone on the next push. The uniform `.ivec` gets no index.
+#[test]
+fn a_pushed_vvec_ships_with_its_offset_index() {
+    let src = unique("vvec-src");
+    let remote = unique("vvec-remote");
+    make_dataset(&src);
+    let data = src.join("profiles/1m/metadata_results.ivvec");
+    write_ivvec(&data, &[&[3, 1], &[], &[2]]);
+    let tree = crate::merkle::MerkleRef::from_content(&std::fs::read(&data).unwrap(), 1 << 20);
+    std::fs::write(src.join("profiles/1m/metadata_results.ivvec.mref"), tree.to_bytes()).unwrap();
+
+    let (sink, lines) = ProgressSink::capture();
+    let mut o = opts(&src, &remote);
+    o.progress = sink;
+    execute(&o).expect("push should succeed");
+
+    let index = "profiles/1m/IDXFOR__metadata_results.ivvec.i32";
+    let shipped = std::fs::read(remote.join(index)).expect("index published");
+    let starts: Vec<i32> = shipped.chunks(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(starts, vec![0, 12, 16]);
+    assert!(remote.join(format!("{index}.mref")).is_file(), "a merkled file's index is merkled");
+    let sums = std::fs::read_to_string(remote.join("profiles/1m/SHA256SUMS")).unwrap();
+    assert!(sums.contains("IDXFOR__metadata_results.ivvec.i32"), "{sums}");
+    assert!(!remote.join("profiles/1m/IDXFOR__neighbor.ivec.i32").exists());
+    let said = lines.lock().unwrap().join("\n");
+    assert!(said.contains(&format!("index: wrote {index}")), "{said}");
+
+    let again = execute(&opts(&src, &remote)).expect("repush");
+    assert_eq!((again.added, again.overwritten), (0, 0), "an unchanged index is not pushed again");
+}
+
+/// **A dry run writes no index**: it says which it would write, and
+/// leaves the source as it found it.
+#[test]
+fn a_dry_run_names_the_index_it_would_write() {
+    let src = unique("vvec-dry-src");
+    let remote = unique("vvec-dry-remote");
+    make_dataset(&src);
+    write_ivvec(&src.join("m.ivvec"), &[&[1]]);
+    let (sink, lines) = ProgressSink::capture();
+    let mut o = opts(&src, &remote);
+    o.dry_run = true;
+    o.progress = sink;
+    execute(&o).expect("dry run");
+    assert!(!src.join("IDXFOR__m.ivvec.i32").exists());
+    let said = lines.lock().unwrap().join("\n");
+    assert!(said.contains("index: would write IDXFOR__m.ivvec.i32"), "{said}");
+}
+
+/// **A producer-selected set gets its indexes too**: `veks publish`
+/// names the files, and the index of a variable-length one is added.
+#[test]
+fn an_injected_set_ships_its_vvec_indexes() {
+    let root = unique("vvec-inj-src");
+    let remote = unique("vvec-inj-remote");
+    std::fs::create_dir_all(root.join("ds")).unwrap();
+    write_ivvec(&root.join("ds/m.ivvec"), &[&[1, 2]]);
+    let mut o = opts(&root, &remote);
+    o.files = Some(vec!["ds/m.ivvec".to_string()]);
+    execute(&o).expect("hierarchy push ok");
+    assert!(remote.join("ds/IDXFOR__m.ivvec.i32").is_file());
+}
+
+/// **An empty variable-length file is refused**, not published with an
+/// empty index: a facet with no records is what a failed producer
+/// leaves.
+#[test]
+fn an_empty_vvec_is_refused() {
+    let src = unique("vvec-empty-src");
+    let remote = unique("vvec-empty-remote");
+    make_dataset(&src);
+    std::fs::write(src.join("m.ivvec"), b"").unwrap();
+    match execute(&opts(&src, &remote)) {
+        Err(Failure::Usage(m)) => assert!(m.contains("m.ivvec") && m.contains("is empty"), "{m}"),
+        other => panic!("{:?}", other.map(|o| o.version)),
+    }
+    assert!(!remote.join("m.ivvec").exists());
+}

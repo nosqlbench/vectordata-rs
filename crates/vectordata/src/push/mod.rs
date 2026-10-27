@@ -356,6 +356,7 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
         Some(files) => plan::Scan::from_files(files.clone()),
         None => plan::scan(root).map_err(Failure::Usage)?,
     };
+    let scan = with_vvec_indexes(root, scan, opts.dry_run, &report)?;
     // The exact files published from each directory — the basis for that
     // directory's SHA256SUMS, so the checksum file describes precisely
     // what ships (a filtered subset when a producer selected it).
@@ -1222,6 +1223,45 @@ fn dir_join(root: &Path, dir_rel: &str) -> PathBuf {
 }
 
 /// Split a forward-slashed relative file path into (dir, filename).
+/// `scan` with the offset index of every variable-length file in it
+/// brought current and added, and the index's merkle reference where the
+/// file has one ([`crate::vvec_index`]), so a remote open reads the
+/// file's records without downloading it whole. A dry run writes
+/// nothing: it says what it would write, and publishes what is there.
+fn with_vvec_indexes(root: &Path, scan: plan::Scan, dry_run: bool, report: &Reporter) -> Result<plan::Scan, Failure> {
+    let mut files = scan.files.clone();
+    for rel in &scan.files {
+        let (dir_rel, name) = split_rel(rel);
+        if !crate::vvec_index::is_indexed_file(name) {
+            continue;
+        }
+        let data = root.join(rel);
+        let needed = crate::vvec_index::prepare(&data, true, &mut |_| {}).map_err(Failure::Usage)?;
+        let done = if dry_run || !(needed.index_written || needed.mref_written) {
+            needed
+        } else {
+            let total = std::fs::metadata(&data).map(|m| m.len()).unwrap_or(0);
+            let mut show = |at: u64| report.live_line(&format!("  index: {rel} {}/{}", fmt_bytes(at), fmt_bytes(total)), false);
+            let done = crate::vvec_index::prepare(&data, false, &mut show).map_err(Failure::Usage)?;
+            report.live_line(&format!("  index: {rel} {}", fmt_bytes(total)), true);
+            done
+        };
+        for (sidecar, written) in [(Some(&done.index), done.index_written), (done.mref.as_ref(), done.mref_written)] {
+            let Some(sidecar) = sidecar else { continue };
+            let file = sidecar.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let sidecar_rel = if dir_rel.is_empty() { file.to_string() } else { format!("{dir_rel}/{file}") };
+            if written {
+                let verb = if dry_run { "would write" } else { "wrote" };
+                report.note(&format!("index: {verb} {sidecar_rel}"));
+            }
+            if sidecar.is_file() && !files.contains(&sidecar_rel) {
+                files.push(sidecar_rel);
+            }
+        }
+    }
+    Ok(if files.len() == scan.files.len() { scan } else { plan::Scan::from_files(files) })
+}
+
 fn split_rel(rel: &str) -> (&str, &str) {
     match rel.rfind('/') {
         Some(i) => (&rel[..i], &rel[i + 1..]),

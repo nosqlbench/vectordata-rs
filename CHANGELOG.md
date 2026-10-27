@@ -22,6 +22,17 @@
   completion offer it there. `CommandSpec` gains `long_about` and
   `propagate_globals`, `OptionSpec` gains `global`, and `OptionDef`
   gains `aliases` and `value_delimiter`.
+- **Every published variable-length file ships with its offset index.**
+  `vectordata push` and `veks publish` write the `IDXFOR__` sidecar of
+  any `*vvec(s)` file in the publish set that has none, or a stale one,
+  and publish and checksum it; where the file has a `.mref`, the index
+  gets one too. A dry run names the indexes it would write.
+  `CatalogTree::write` (`catalog generate`) and `vectordata datasets
+  derive` write them as well.
+- **`vectordata::vvec_index`** (`prepare`, `is_indexed_file`,
+  `indexed_files_under`) and **`veks_io::reader::index_vvec_file`**
+  (with `vvec_index_path` and `vvec_index_is_current`): the code every
+  path above writes an index through.
 
 ### Changed
 
@@ -31,6 +42,12 @@
   `allow_hyphen_values`, `trailing_var_arg`, `num_args`, `version`, …)
   compiled and silently meant something else. The error names the key
   and lists the supported ones.
+- **`catalog::generate::GenerateEvent` is `#[non_exhaustive]`** and
+  gains `Indexing` and `Indexed`, reported as a dataset's offset indexes
+  are written.
+- **An empty variable-length file is refused by every publishing
+  path**, naming it: a facet with no records is what a failed producer
+  leaves, not data to publish.
 - **`OptionDef::parse_sig` includes the value delimiter**, so the
   option audit reports one option name split differently by two
   commands.

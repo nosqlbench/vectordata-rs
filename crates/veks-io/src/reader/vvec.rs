@@ -393,6 +393,110 @@ pub(crate) fn write_offset_index(data_path: &Path, offsets: &[u64], file_size: u
     write_index(&index_path_for(data_path, file_size), offsets, file_size)
 }
 
+/// What [`index_vvec_file`] found beside a variable-length file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VvecIndex {
+    /// The `IDXFOR__<name>.<i32|i64>` sidecar.
+    pub path: PathBuf,
+    /// Whether it was written now; `false` when a current one was there.
+    pub written: bool,
+}
+
+/// The `IDXFOR__` sidecar the local variable-length file `data_path`
+/// has, or would have: `IDXFOR__<name>.i32` beside it, or `.i64` past
+/// 2 GiB.
+pub fn vvec_index_path(data_path: &Path) -> Result<PathBuf, IoError> {
+    Ok(index_path_for(data_path, std::fs::metadata(data_path)?.len()))
+}
+
+/// Whether the local variable-length file `data_path` has a current
+/// `IDXFOR__` index beside it: what [`index_vvec_file`] would leave as
+/// it is.
+pub fn vvec_index_is_current(data_path: &Path) -> Result<bool, IoError> {
+    index_is_current(&vvec_index_path(data_path)?, data_path)
+}
+
+/// Make sure the local variable-length file `data_path` has a current
+/// `IDXFOR__` offset index beside it, writing one when it has none or
+/// the one there is older than the file. Idempotent: a current index is
+/// left as it is.
+///
+/// The sidecar is what lets a remote reader open the file by ordinal
+/// without downloading it whole, so a publisher writes it for every
+/// variable-length file it ships. Unlike an open, which only tries to
+/// keep the index it builds, a failure to write one here is an error.
+/// `progress` hears the bytes walked so far, for a large file.
+///
+/// ```
+/// use veks_io::reader::{index_vvec_file, vvec_index_path};
+/// # use std::io::Write;
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let data = dir.path().join("matches.i32vvec");
+/// # let mut f = std::fs::File::create(&data).unwrap();
+/// # for v in [vec![1i32, 2], vec![], vec![3]] { f.write_all(&(v.len() as i32).to_le_bytes()).unwrap(); for x in v { f.write_all(&x.to_le_bytes()).unwrap(); } }
+/// # drop(f);
+/// let first = index_vvec_file(&data, &mut |_| {}).unwrap();
+/// assert!(first.written && first.path == vvec_index_path(&data).unwrap());
+/// assert!(!index_vvec_file(&data, &mut |_| {}).unwrap().written); // current: left as it is
+/// ```
+pub fn index_vvec_file(data_path: &Path, progress: &mut dyn FnMut(u64)) -> Result<VvecIndex, IoError> {
+    let name = data_path.to_string_lossy();
+    let ext = ext_of(&name);
+    if !is_vvec_ext(ext) {
+        return Err(IoError::InvalidFormat(format!("'{name}' is not a variable-length file")));
+    }
+    let elem_size = veks_datatypes::ElementType::parse_extension(ext)
+        .map(|(t, _)| t.byte_width())
+        .ok_or_else(|| IoError::InvalidFormat(format!("no element type for '.{ext}'")))?;
+    let source = MappedFile::open_path(data_path)?;
+    let total_size = source.total_size();
+    // A variable-length facet has a record per row, even one with no
+    // elements, so no bytes at all means no rows: what a producer that
+    // failed leaves, not data to publish.
+    if total_size == 0 {
+        return Err(IoError::InvalidFormat(format!("'{name}' is empty: a variable-length file holds at least one record")));
+    }
+    let path = index_path_for(data_path, total_size);
+    if index_is_current(&path, data_path)? {
+        return Ok(VvecIndex { path, written: false });
+    }
+    let read = |offset: u64| -> Result<i32, IoError> {
+        match source.mmap_slice(offset, 4) {
+            Some(h) => Ok(LittleEndian::read_i32(h)),
+            None => Ok(LittleEndian::read_i32(&source.read_bytes(offset, 4)?)),
+        }
+    };
+    let mut walked = 0u64;
+    let offsets = walk_offsets(
+        total_size,
+        |offset| {
+            // Every 64 MiB walked, so a large file is heard from.
+            if offset >= walked + (64 << 20) {
+                walked = offset;
+                progress(offset);
+            }
+            read(offset)
+        },
+        elem_size,
+    )?;
+    progress(total_size);
+    write_index(&path, &offsets, total_size)?;
+    Ok(VvecIndex { path, written: true })
+}
+
+/// Whether the sidecar at `index_path` is current for `data_path`: no
+/// older than it, and a whole non-zero number of entries.
+fn index_is_current(index_path: &Path, data_path: &Path) -> Result<bool, IoError> {
+    let Ok(index_meta) = std::fs::metadata(index_path) else {
+        return Ok(false);
+    };
+    let mtime = |m: std::fs::Metadata| m.modified().map_err(|e| IoError::InvalidFormat(format!("mtime: {e}")));
+    let width = if index_path.extension().and_then(|e| e.to_str()) == Some("i64") { 8 } else { 4 };
+    Ok(index_meta.len() > 0
+        && index_meta.len().is_multiple_of(width)
+        && mtime(index_meta)? >= mtime(std::fs::metadata(data_path)?)?)
+}
+
 /// Remove any `IDXFOR__` index beside a data file, before rewriting it,
 /// so a stale index is not read. The next open rebuilds it.
 pub fn remove_vvec_index(data_path: &Path) {
@@ -594,5 +698,67 @@ mod torn_records {
             matches!(opened, Err(IoError::InvalidFormat(ref m)) if m.contains("the record at offset 0 runs to 12, past the end of the file at 8")),
             "{opened:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod indexing {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn write_vvec(path: &Path, records: &[Vec<i32>]) {
+        let mut bytes = Vec::new();
+        for r in records {
+            bytes.extend_from_slice(&(r.len() as i32).to_le_bytes());
+            for x in r {
+                bytes.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn index_entries(path: &Path) -> Vec<u64> {
+        let bytes = std::fs::read(path).unwrap();
+        parse_index_bytes(&bytes, "i32", u64::MAX)
+    }
+
+    /// **Indexing writes the sidecar a reader looks for, once**: a
+    /// current index is left alone, and one older than its file is
+    /// rewritten.
+    #[test]
+    fn indexing_is_idempotent_and_follows_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("r.i32vvec");
+        write_vvec(&data, &[vec![1, 2], vec![], vec![3]]);
+        let first = index_vvec_file(&data, &mut |_| {}).unwrap();
+        assert_eq!(first, VvecIndex { path: dir.path().join("IDXFOR__r.i32vvec.i32"), written: true });
+        assert_eq!(index_entries(&first.path), vec![0, 12, 16]);
+        assert!(!index_vvec_file(&data, &mut |_| {}).unwrap().written);
+
+        write_vvec(&data, &[vec![9]]);
+        let later = SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&data).unwrap().set_modified(later).unwrap();
+        assert!(index_vvec_file(&data, &mut |_| {}).unwrap().written, "a stale index is rewritten");
+        assert_eq!(index_entries(&first.path), vec![0]);
+    }
+
+    /// **Only a whole variable-length file is indexed**: another
+    /// format, an empty file and one that does not end at a record
+    /// boundary are refused rather than indexed.
+    #[test]
+    fn indexing_refuses_what_is_not_a_whole_vvec() {
+        let dir = tempfile::tempdir().unwrap();
+        let fvec = dir.path().join("b.fvec");
+        std::fs::write(&fvec, [1u8, 0, 0, 0, 0, 0, 0x80, 0x3f]).unwrap();
+        assert!(index_vvec_file(&fvec, &mut |_| {}).is_err());
+        let empty = dir.path().join("e.i32vvec");
+        std::fs::write(&empty, b"").unwrap();
+        let refused = index_vvec_file(&empty, &mut |_| {});
+        assert!(matches!(refused, Err(IoError::InvalidFormat(ref m)) if m.contains("is empty")), "{refused:?}");
+        assert!(!dir.path().join("IDXFOR__e.i32vvec.i32").exists());
+        let torn = dir.path().join("t.i32vvec");
+        std::fs::write(&torn, [2u8, 0, 0, 0, 1, 0, 0, 0]).unwrap();
+        assert!(index_vvec_file(&torn, &mut |_| {}).is_err());
+        assert!(!dir.path().join("IDXFOR__t.i32vvec.i32").exists());
     }
 }
