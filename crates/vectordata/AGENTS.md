@@ -176,6 +176,10 @@ Each of these exists, is tested, and handles cases that are easy to miss.
   format, including sharded facets and variable-length files.
 - **Facet name aliases.** `FetchRequest::facets` accepts the standard
   aliases (`base`, `gt`, `metadata_indices`, …).
+- **Fetch-then-reopen for an unindexed variable-length facet.** Do not
+  catch `OffsetIndexUnavailable`, fetch and open again yourself:
+  `TestDataViewExt::vvec_facet_fetching_as` does it, with progress and
+  the warning that tells the user the dataset lacks its index.
 - **Vector file readers.** Do not open the cache's or the dataset's
   files with your own `.fvec`/`.ivec` reader. The facet readers already
   mmap them, and they also know the shard boundaries, record windows,
@@ -253,10 +257,14 @@ Each of these exists, is tested, and handles cases that are easy to miss.
 - **Opening a reader does not fetch the facet.** Reads fetch the chunks
   they touch, one at a time. For a scan, `fetch` first and read locally.
 - **A remote variable-length facet with no published offset index
-  cannot be opened until fetched.** The open is refused with
+  cannot be opened lazily.** The open is refused with
   [`IoError::OffsetIndexUnavailable`](crate::IoError::OffsetIndexUnavailable)
-  instead of downloading the whole file. `fetch` it (no window), or
-  publish its `IDXFOR__` sidecar.
+  instead of downloading the whole file. To accept the download, open
+  it with `vvec_facet_fetching_as` / `metadata_results_fetching_as`,
+  which fetch it whole with progress and log a warning naming the index
+  its publisher should add. A publisher ships the `IDXFOR__` sidecar:
+  `vectordata push`, `veks publish`, `catalog generate` and the
+  `generate vvec-index` step write it.
 - **A server without HTTP range support serves only whole files.** The
   first read downloads everything; `fetch` first to see it with
   progress.

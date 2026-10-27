@@ -37,6 +37,7 @@
 //! | Read ground truth | [`TestDataViewExt::neighbor_indices_as`], [`TestDataViewExt::neighbor_distances_as`] | [`TestDataViewExt::neighbor_indices_as`] |
 //! | Read a metadata or scalar facet | [`TestDataViewExt::facet_as`] | below |
 //! | Read a record (slab) facet | [`TestDataView::open_facet_records`] | — |
+//! | Read a variable-length facet (`metadata_results`) | [`TestDataViewExt::vvec_facet_as`]; when its source publishes no offset index, [`TestDataViewExt::vvec_facet_fetching_as`] | [`TestDataViewExt::metadata_results_as`] |
 //! | Ship the offset index of each variable-length file you publish | [`vvec_index::prepare`]; `push`, `CatalogTree::write` and the `generate vvec-index` step call it | [`vvec_index::prepare`] |
 //! | List profiles and facets | [`TestDataGroup::profile_names`], [`TestDataView::facet_manifest`] | below |
 //! | Find datasets by pattern | [`Catalog::match_glob`](catalog::Catalog::match_glob), [`Catalog::datasets`](catalog::Catalog::datasets) | — |
@@ -180,10 +181,13 @@
 //!   ([`TestDataView::fetch`]) — in parallel, with progress — and read
 //!   locally after.
 //! - **A remote variable-length facet with no published offset index
-//!   cannot be opened until fetched.** Its record boundaries are only
-//!   knowable from every byte, so the open is refused with
+//!   cannot be opened lazily.** Its record boundaries are only knowable
+//!   from every byte, so the open is refused with
 //!   [`IoError::OffsetIndexUnavailable`] rather than downloading the
-//!   file behind your back. Fetch it, or publish its `IDXFOR__` sidecar.
+//!   file behind your back. Accept the download with
+//!   [`TestDataViewExt::vvec_facet_fetching_as`], which warns that the
+//!   dataset lacks the index, or publish its `IDXFOR__` sidecar
+//!   ([`vvec_index`]).
 //! - **A server without HTTP range support serves only whole files.**
 //!   The first read of such a file downloads all of it; fetch first to
 //!   see that happen with progress.

@@ -819,6 +819,20 @@ pub trait TestDataView: Send + Sync {
     ) -> crate::verify::VerifyReport;
 }
 
+/// The warning a whole-file fetch of the unindexed variable-length file
+/// at `url`, `bytes` long, logs: what happened, and what its publisher
+/// should add so that it does not happen again.
+fn unindexed_vvec_warning(url: &str, bytes: u64) -> String {
+    let file = url.rsplit('/').next().unwrap_or(url);
+    let width = if bytes <= i32::MAX as u64 { "i32" } else { "i64" };
+    format!(
+        "{url} is a variable-length file published without an offset index, so all {bytes} bytes of it were \
+         downloaded to open it. The dataset should be optimized upstream: ask its publisher to add the index \
+         IDXFOR__{file}.{width} beside it (`vectordata push` and `veks publish` write it, as does a pipeline's \
+         `generate vvec-index` step), so it opens without a download."
+    )
+}
+
 /// The typed facet readers: every [`TestDataView`] method that serves
 /// a vector facet, with the element type a parameter.
 ///
@@ -1065,6 +1079,63 @@ pub trait TestDataViewExt: TestDataView {
     /// ```
     fn metadata_results_as<T: Element>(&self) -> Result<Arc<dyn VvecReader<T>>> {
         Ok(self.open_vvec_facet_native("metadata_results")?.into_typed::<T>()?)
+    }
+
+    /// The variable-length facet `name` as `T`, which must be the type
+    /// the file holds, as [`metadata_results_as`](Self::metadata_results_as)
+    /// is for `metadata_results`.
+    ///
+    /// A remote file whose source publishes no `IDXFOR__` offset index is
+    /// refused ([`IoError::OffsetIndexUnavailable`]): only a download of
+    /// every byte would find its records. To accept that download, open
+    /// it with [`vvec_facet_fetching_as`](Self::vvec_facet_fetching_as).
+    fn vvec_facet_as<T: Element>(&self, name: &str) -> Result<Arc<dyn VvecReader<T>>> {
+        Ok(self.open_vvec_facet_native(name)?.into_typed::<T>()?)
+    }
+
+    /// [`vvec_facet_as`](Self::vvec_facet_as), fetching the facet whole
+    /// first when its source publishes no offset index: the one case a
+    /// lazy open refuses. `progress` hears the fetch, as
+    /// [`fetch`](TestDataView::fetch)'s does; an indexed or already
+    /// fetched facet opens as `vvec_facet_as` opens it, and nothing is
+    /// fetched.
+    ///
+    /// A whole-file download to open a variable-length file is a gap in
+    /// the published dataset, so it is logged as a warning naming the
+    /// file and the index its publisher should add: `vectordata push`
+    /// and `veks publish` write it, as does a pipeline's
+    /// `generate vvec-index` step.
+    ///
+    /// ```no_run
+    /// use vectordata::{TestDataViewExt, fetch::TextMeter};
+    /// # fn demo(view: &dyn vectordata::TestDataView) -> vectordata::Result<()> {
+    /// let results = view.vvec_facet_fetching_as::<i32>("metadata_results", &mut TextMeter::stderr("Fetch"))?;
+    /// # let _ = results;
+    /// # Ok(()) }
+    /// ```
+    fn vvec_facet_fetching_as<T: Element>(
+        &self,
+        name: &str,
+        progress: &mut dyn crate::fetch::FetchProgress,
+    ) -> Result<Arc<dyn VvecReader<T>>> {
+        match self.open_vvec_facet_native(name) {
+            Err(Error::VectorIo(IoError::OffsetIndexUnavailable { url, bytes })) => {
+                log::warn!("{}", unindexed_vvec_warning(&url, bytes));
+                self.fetch(&crate::fetch::FetchRequest::facets([name]).allow_whole_facet(), progress)?;
+                self.vvec_facet_as(name)
+            }
+            opened => Ok(opened?.into_typed::<T>()?),
+        }
+    }
+
+    /// [`metadata_results_as`](Self::metadata_results_as), fetching the
+    /// facet whole first when its source publishes no offset index. See
+    /// [`vvec_facet_fetching_as`](Self::vvec_facet_fetching_as).
+    fn metadata_results_fetching_as<T: Element>(
+        &self,
+        progress: &mut dyn crate::fetch::FetchProgress,
+    ) -> Result<Arc<dyn VvecReader<T>>> {
+        self.vvec_facet_fetching_as("metadata_results", progress)
     }
 
     /// A quantized base as one thing: the codes at their own type `C`,

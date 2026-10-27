@@ -22,6 +22,14 @@
   completion offer it there. `CommandSpec` gains `long_about` and
   `propagate_globals`, `OptionSpec` gains `global`, and `OptionDef`
   gains `aliases` and `value_delimiter`.
+- **`TestDataViewExt::vvec_facet_fetching_as` and
+  `metadata_results_fetching_as` open a remote variable-length facet
+  published without its offset index**, by fetching it whole first, with
+  progress, then opening it. The download is logged as a warning naming
+  the file and the `IDXFOR__` index its publisher should add. An indexed
+  or already fetched facet opens without a fetch. `vvec_facet_as` opens
+  any variable-length facet by name; the lazy opens still refuse an
+  unindexed one.
 - **Every published variable-length file ships with its offset index.**
   `vectordata push` and `veks publish` write the `IDXFOR__` sidecar of
   any `*vvec(s)` file in the publish set that has none, or a stale one,

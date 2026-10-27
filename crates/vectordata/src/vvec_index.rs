@@ -16,7 +16,9 @@
 //!
 //! A file is indexed when its extension names the variable-length
 //! container (`.i32vvec`, `.fvvecs`, …). The bare `.ivec` is not: it is
-//! also the uniform ground-truth format.
+//! also the uniform ground-truth format, and a variable-length file
+//! still spelled that way opens through
+//! [`TestDataViewExt::vvec_facet_fetching_as`](crate::TestDataViewExt::vvec_facet_fetching_as).
 
 use std::path::{Path, PathBuf};
 

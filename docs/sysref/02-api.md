@@ -1208,12 +1208,24 @@ data/IDXFOR__metadata_indices.ivvecs.i64  # offset index (≥ 2 GB data)
 ```
 
 The index is a flat-packed array of byte offsets (one per record).
-It is created automatically:
+Every variable-length file a dataset publishes ships with one. It is
+written:
 
-- On first local open by `IndexedVvecReader::open` /
-  `IndexedVvecReader::open_path`.
-- By the `generate vvec-index` pipeline step before publishing.
-- By `evaluate-predicates` immediately after writing vvec output.
+- by `VvecWriter::finish`, so by every pipeline step that writes vvec
+  output;
+- by the `generate vvec-index` pipeline step, for every variable-length
+  file under its source — imported, derived or produced outside veks;
+- by `vectordata push` and `veks publish`, `CatalogTree::write`
+  (`catalog generate`) and `vectordata datasets derive`, for any file
+  that has none ([`vectordata::vvec_index`]);
+- on first local open by `IndexedVvecReader::open` /
+  `IndexedVvecReader::open_path`, as a cache of the walk.
+
+The publishing paths are idempotent: a current index is left alone.
+Where the file has a `.mref`, its index gets one too, at the same chunk
+size. An empty variable-length file, or one that does not end at a
+record boundary, is refused rather than indexed. The bare `.ivec` is
+never indexed by them, as it is also the uniform ground-truth format.
 
 For remote access, the reader looks for the sidecar in this order: a
 copy kept beside the cache file by an earlier open; the sidecar the
@@ -1221,8 +1233,12 @@ server publishes beside the file (fetched with the same auth as the
 data, and kept beside the cache file); and a walk of the cache copy
 when every byte of it is here. A remote file with none of those is
 refused with `IoError::OffsetIndexUnavailable`, rather than downloaded
-whole behind the open: fetch the facet first. The rebuilt index is
-never written to the remote source.
+whole behind the open. To accept the download, open it with
+`TestDataViewExt::vvec_facet_fetching_as` (or
+`metadata_results_fetching_as`): it fetches the facet whole, with
+progress, opens it, and logs a warning naming the file and the index
+its publisher should add. The rebuilt index is never written to the
+remote source.
 
 ---
 

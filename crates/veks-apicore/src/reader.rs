@@ -74,13 +74,15 @@ pub enum IoError {
     ///
     /// Opening a reader never does that implicitly: a whole-file
     /// download behind a constructor is the trap this refusal replaces.
-    /// Fetch the file first, and the reader then rebuilds the index
-    /// from the local copy; or publish the `IDXFOR__` sidecar beside it.
+    /// Open it with `TestDataViewExt::vvec_facet_fetching_as`, which
+    /// fetches it and then opens it, or fetch it first, and the reader
+    /// then rebuilds the index from the local copy; or publish the
+    /// `IDXFOR__` sidecar beside it.
     #[error(
         "no published offset index for {url}; finding its record boundaries means \
-         downloading the whole file ({bytes} bytes). Fetch it first \
-         (TestDataView::fetch, or `vectordata datasets precache`) or publish its \
-         IDXFOR__ sidecar"
+         downloading the whole file ({bytes} bytes). Open it with \
+         TestDataViewExt::vvec_facet_fetching_as, fetch it first (TestDataView::fetch, \
+         or `vectordata datasets precache`), or publish its IDXFOR__ sidecar"
     )]
     OffsetIndexUnavailable {
         /// The file.
