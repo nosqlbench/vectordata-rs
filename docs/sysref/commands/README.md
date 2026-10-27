@@ -40,7 +40,7 @@ Every command with a working example run against the
 | [generate vectors](./generate-vectors.md) | Random vector generation |
 | [generate metadata](./generate-metadata.md) | Random integer metadata labels |
 | [generate predicates](./generate-predicates.md) | Predicates: random equality, survey-driven, or stratified families over the survey census |
-| [generate vvec-index](./generate-vvec-index.md) | Build offset indices for vvec files |
+| [generate vvec-index](./generate-vvec-index.md) | Write the offset index of every variable-length file |
 | [generate passages](./generate-passages.md) | Chunk an s2orc-format text corpus into passages.parquet (+ parent manifest) |
 | [generate embed](./generate-embed.md) | Embed a parquet text column into npy vectors (candle, Qwen3-Embedding; `embed`/`embed-cuda` features) |
 

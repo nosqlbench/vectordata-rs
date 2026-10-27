@@ -29,6 +29,10 @@
   gets one too. A dry run names the indexes it would write.
   `CatalogTree::write` (`catalog generate`) and `vectordata datasets
   derive` write them as well.
+- **The `generate vvec-index` pipeline step** writes the offset index of
+  every variable-length file under its source, idempotently, and is
+  emitted by `veks prepare bootstrap` ahead of `catalog generate` and
+  `merkle create`.
 - **`vectordata::vvec_index`** (`prepare`, `is_indexed_file`,
   `indexed_files_under`) and **`veks_io::reader::index_vvec_file`**
   (with `vvec_index_path` and `vvec_index_is_current`): the code every

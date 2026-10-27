@@ -1630,6 +1630,7 @@ fn e2e_finalize_steps_run_after_compute() {
         "generate-dataset-log-jsonl",
         "generate-docs",
         "generate-docs-html",
+        "generate-vvec-index",
         "generate-merkle",
         "generate-catalog",
     ];

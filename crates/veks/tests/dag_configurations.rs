@@ -975,6 +975,7 @@ fn dag_finalize_field_emitted_correctly() {
         "generate-dataset-log-jsonl",
         "generate-docs",
         "generate-docs-html",
+        "generate-vvec-index",
         "generate-merkle",
         "generate-catalog",
     ];
@@ -1062,6 +1063,13 @@ fn dag_finalize_partitioning() {
     let last = &finalize_dag.steps[finalize_dag.steps.len() - 1];
     assert_eq!(last.id, "generate-merkle",
         "last finalize step should be generate-merkle, got {}", last.id);
+
+    // The offset indexes are written before the catalog and merkle
+    // steps, so merkle covers them with the rest of the dataset.
+    let at = |id: &str| finalize_dag.steps.iter().position(|s| s.id == id)
+        .unwrap_or_else(|| panic!("no finalize step {id}"));
+    assert!(at("generate-vvec-index") < at("generate-catalog"));
+    assert!(at("generate-vvec-index") < at("generate-merkle"));
 }
 
 /// Verify that when per-profile steps are expanded (as in Phase 2/3),
@@ -1109,9 +1117,9 @@ fn dag_finalize_excluded_from_reexpansion() {
         "compute steps ({}) should outnumber finalize steps ({})",
         compute_steps.len(), finalize_steps.len());
 
-    // Finalize steps should still be exactly 7 (not multiplied by profile count)
-    assert_eq!(finalize_steps.len(), 7,
-        "should have exactly 7 finalize steps after re-expansion, got {}",
+    // Finalize steps should still be exactly 8 (not multiplied by profile count)
+    assert_eq!(finalize_steps.len(), 8,
+        "should have exactly 8 finalize steps after re-expansion, got {}",
         finalize_steps.len());
 
     // No finalize step should have per_profile set
@@ -1132,7 +1140,7 @@ fn dag_finalize_excluded_from_reexpansion() {
     // Finalize DAG should build with partial refs (dangling compute refs ignored)
     let finalize_dag = veks_pipeline::pipeline::dag::build_dag_partial(&finalize_steps)
         .expect("finalize DAG should build after profile expansion");
-    assert_eq!(finalize_dag.steps.len(), 7);
+    assert_eq!(finalize_dag.steps.len(), 8);
 }
 
 /// Verify that when dataset.yaml has finalize steps, the full DAG
@@ -1166,10 +1174,10 @@ fn dag_finalize_step_count_consistency() {
         "compute ({}) + finalize ({}) should equal total ({})",
         compute_count, finalize_count, all_steps.len());
 
-    // Should have exactly 7 finalize steps
-    // (dataset-json, variables-json, dataset-log-jsonl, generate-docs, generate-docs-html, merkle, catalog)
-    assert_eq!(finalize_count, 7,
-        "expected 7 finalize steps, got {}", finalize_count);
+    // Should have exactly 8 finalize steps
+    // (dataset-json, variables-json, dataset-log-jsonl, generate-docs, generate-docs-html, vvec-index, merkle, catalog)
+    assert_eq!(finalize_count, 8,
+        "expected 8 finalize steps, got {}", finalize_count);
 
     // The full DAG should also build successfully (for emit-yaml, script)
     let full_dag = veks_pipeline::pipeline::dag::build_dag(&all_steps)

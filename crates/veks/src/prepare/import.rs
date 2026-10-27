@@ -2374,6 +2374,21 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         ],
     });
 
+    // ── Offset indexes ──────────────────────────────────────────────
+    // Every variable-length file ships with its IDXFOR__ index, so a
+    // remote reader opens it by ordinal. Before merkle, so the indexes
+    // are merkled with the rest of the dataset.
+    steps.push(Step {
+        id: "generate-vvec-index".into(),
+        run: "generate vvec-index".into(),
+        description: Some("Write the offset index of every variable-length file".into()),
+        after: vec![],
+        per_profile: false,
+        phase: 0,
+        finalize: true,
+        options: vec![("source".into(), ".".into())],
+    });
+
     // ── Catalog generation ──────────────────────────────────────────
     // Produces catalog.json, catalog.yaml, and knn_entries.yaml.
     // Runs before merkle so knn_entries.yaml gets .mref coverage.
@@ -2381,7 +2396,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         id: "generate-catalog".into(),
         run: "catalog generate".into(),
         description: Some("Generate catalog index for the dataset directory".into()),
-        after: vec!["generate-docs".into(), "generate-docs-html".into()],
+        after: vec!["generate-docs".into(), "generate-docs-html".into(), "generate-vvec-index".into()],
         per_profile: false,
         phase: 0,
         finalize: true,
@@ -3871,8 +3886,9 @@ mod tests {
         // count-duplicates, generate-shuffle, extract-queries, extract-base,
         // count-base, compute-knn, verify-knn, generate-dataset-json,
         // generate-variables-json, generate-dataset-log-jsonl, generate-docs,
-        // generate-docs-html, generate-catalog, generate-merkle.
-        assert_eq!(steps.len(), 21, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
+        // generate-docs-html, generate-vvec-index, generate-catalog,
+        // generate-merkle.
+        assert_eq!(steps.len(), 22, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
         assert!(step_ids.contains(&"count-duplicates"), "should have count-duplicates");
         assert!(step_ids.contains(&"count-source-base"), "should have count-source-base");

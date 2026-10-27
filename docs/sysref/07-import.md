@@ -159,14 +159,14 @@ The wizard generates a DAG of steps based on the resolved artifacts:
 ### Minimal pipeline (B only)
 
 ```
-count-vectors → generate-vvec-index → generate-merkle → generate-catalog
+count-vectors → generate-vvec-index → generate-catalog → generate-merkle
 ```
 
 ### Self-search (B, no Q)
 
 ```
 count-vectors → generate-shuffle → extract-queries → extract-base
-→ compute-knn → verify-knn → ... → generate-merkle → generate-catalog
+→ compute-knn → verify-knn → ... → generate-catalog → generate-merkle
 ```
 
 ### Full predicated (B+Q+GT, synthesize metadata)
@@ -178,7 +178,7 @@ count-vectors → scan-zeros → scan-duplicates
              → compute-filtered-knn → verify-filtered-knn
              → generate-dataset-json → generate-variables-json
              → generate-dataset-log-jsonl → generate-vvec-index
-             → generate-merkle → generate-catalog
+             → generate-catalog → generate-merkle
 ```
 
 ### Key decisions

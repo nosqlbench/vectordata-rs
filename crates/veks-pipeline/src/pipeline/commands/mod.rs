@@ -9,6 +9,7 @@
 
 // Removed: barrier, cleanup_cleanfvec, import (ImportFacetOp, never registered)
 pub mod catalog_generate;
+pub mod vvec_index;
 pub mod tag_profiles;
 pub mod catalog_stats;
 pub mod require;
@@ -228,6 +229,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate dataset-log-jsonl", gen_dataset_log_jsonl::factory);
     registry.register("generate variables-json", gen_variables_json::factory);
     registry.register("generate vectors", gen_vectors::factory);
+    registry.register("generate vvec-index", vvec_index::factory);
 
     // ── merkle ───────────────────────────────────────────────────────
     registry.register("merkle create", merkle::create_factory);

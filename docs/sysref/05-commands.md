@@ -52,7 +52,7 @@ each run against the synthetic-1k test fixture.
 | `generate vectors` | Random vector generation (gaussian, uniform) |
 | `generate metadata` | Random integer metadata labels |
 | `generate predicates` | Predicates: random equality (simple-int-eq), survey-driven, or `stratified` — four families covering every selectivity decade from the survey census |
-| `generate vvec-index` | Build IDXFOR__ offset indices for vvec files |
+| `generate vvec-index` | Write the `IDXFOR__` offset index of every variable-length file |
 | `generate shuffle` | Random permutation of vector ordinals |
 | `generate dataset-json` | Produce dataset.json from dataset.yaml |
 | `generate variables-json` | Produce variables.json from variables.yaml |

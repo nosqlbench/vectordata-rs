@@ -1917,6 +1917,7 @@ fn import_full_pipeline_all_features() {
         "generate-dataset-log-jsonl",
         "generate-docs",
         "generate-docs-html",
+        "generate-vvec-index",
         "generate-merkle",
         "generate-catalog",
     ];
@@ -1985,10 +1986,10 @@ fn import_full_pipeline_everything_disabled() {
     // extract-base, count-base, compute-knn, verify-knn,
     // generate-dataset-json, generate-variables-json,
     // generate-dataset-log-jsonl, generate-docs, generate-docs-html,
-    // generate-catalog, generate-merkle = 21
+    // generate-vvec-index, generate-catalog, generate-merkle = 22
     // (scan-zeros + scan-duplicates are now mandatory — see above.)
-    assert_eq!(ids.len(), 21,
-        "minimal self-search pipeline should have 21 steps (incl. mandatory scan-zeros + scan-duplicates), got {}: {:?}",
+    assert_eq!(ids.len(), 22,
+        "minimal self-search pipeline should have 22 steps (incl. mandatory scan-zeros + scan-duplicates), got {}: {:?}",
         ids.len(), ids);
 }
 
@@ -2068,7 +2069,7 @@ fn project_artifacts_every_registered_command_no_panic() {
         // generate
         "generate dataset", "generate derive", "generate from-model",
         "generate predicates", "generate shuffle",
-        "generate sketch", "generate vectors",
+        "generate sketch", "generate vectors", "generate vvec-index",
         // merkle
         "merkle create", "merkle diff", "merkle path", "merkle spoilbits",
         "merkle spoilchunks", "merkle summary", "merkle treeview", "merkle verify",

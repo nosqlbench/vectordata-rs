@@ -10,9 +10,9 @@
 //! whole, which an open refuses to do behind the caller
 //! ([`IoError::OffsetIndexUnavailable`](crate::io::IoError::OffsetIndexUnavailable)).
 //! So every publishing path — `vectordata push`, `veks publish`,
-//! [`CatalogTree::write`](crate::catalog::generate::CatalogTree::write)
-//! and `vectordata datasets derive` — brings the index current here,
-//! before it ships.
+//! [`CatalogTree::write`](crate::catalog::generate::CatalogTree::write),
+//! `vectordata datasets derive` and the `generate vvec-index` pipeline
+//! step — brings the index current here, before it ships.
 //!
 //! A file is indexed when its extension names the variable-length
 //! container (`.i32vvec`, `.fvvecs`, …). The bare `.ivec` is not: it is
