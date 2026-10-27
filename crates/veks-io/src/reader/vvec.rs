@@ -263,6 +263,12 @@ fn walk_offsets(
         }
         offset += 4 + dim as u64 * elem_size as u64;
     }
+    if offset > file_size {
+        let start = offsets.last().copied().unwrap_or(0);
+        return Err(IoError::InvalidFormat(format!(
+            "the record at offset {start} runs to {offset}, past the end of the file at {file_size}"
+        )));
+    }
     if offset != file_size {
         return Err(IoError::InvalidFormat(format!(
             "file does not end at a record boundary: {} bytes remaining at offset {offset}",
@@ -568,5 +574,25 @@ mod index_atomicity {
 
     fn offsets_len_bytes() -> usize {
         4096 * 4
+    }
+}
+
+#[cfg(test)]
+mod torn_records {
+    use super::*;
+
+    /// **A file whose last record runs past its end is refused**, naming
+    /// the record, rather than underflowing the bytes left: a panic in a
+    /// debug build and a wrapped count in a release one.
+    #[test]
+    fn a_record_past_the_end_is_refused_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let torn = dir.path().join("t.i32vvec");
+        std::fs::write(&torn, [2u8, 0, 0, 0, 1, 0, 0, 0]).unwrap();
+        let opened = IndexedVvecReader::<i32>::open_path(&torn);
+        assert!(
+            matches!(opened, Err(IoError::InvalidFormat(ref m)) if m.contains("the record at offset 0 runs to 12, past the end of the file at 8")),
+            "{opened:?}"
+        );
     }
 }

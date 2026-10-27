@@ -37,6 +37,9 @@
 
 ### Fixes
 
+- **Opening a variable-length file whose last record runs past its end
+  panicked** in a debug build, and gave a wrapped byte count in a
+  release one. It is refused, naming the record and the file's end.
 - **A group named alone lists its subcommands.** `vectordata cache`,
   `vectordata config`, `vectordata config catalog` and the like failed
   with `a subcommand is required`; they print their help, as
