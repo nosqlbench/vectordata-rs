@@ -2268,6 +2268,13 @@ fn recover_identity_symlinks(workspace: &Path, config: &DatasetConfig) {
             continue;
         }
         for (_facet, view) in profile.views() {
+            // A series names a pattern, not a file, and a windowed source
+            // names a range of one; neither is a missing file to recover.
+            // Linking the pattern name to a `_`-prefixed source once made
+            // a 2 TB upstream file look like a new object to publish.
+            if view.is_series() || view.path().contains('[') {
+                continue;
+            }
             let view_path = workspace.join(view.path());
             if view_path.exists() || view_path.symlink_metadata().is_ok() {
                 continue; // file or symlink exists
@@ -2710,6 +2717,26 @@ variables:
         assert!(content.contains("*.log"));
         assert!(content.contains("build/"));
         assert!(content.contains("!dataset.yaml"));
+    }
+
+    /// **Identity-symlink recovery leaves a sharded series alone**: the
+    /// pattern name is not a missing file, so no link to a `_`-prefixed
+    /// source is made for it, while a plain missing view still recovers.
+    #[test]
+    fn symlink_recovery_skips_a_series() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        std::fs::write(ws.join("_base_all.fvecs"), b"base").unwrap();
+        std::fs::write(ws.join("_query_all.fvecs"), b"query").unwrap();
+        std::fs::write(
+            ws.join("dataset.yaml"),
+            "format_version: 2\nname: t\nprofiles:\n  default:\n    base_vectors:\n      source: profiles/base/base_vectors__NNNN.fvecs\n      shard_stride: 100\n      shard_count: 5\n      record_count: 495\n    query_vectors: profiles/base/query_vectors.fvecs\n",
+        )
+        .unwrap();
+        let config = DatasetConfig::load(&ws.join("dataset.yaml")).unwrap();
+        recover_identity_symlinks(ws, &config);
+        assert!(ws.join("profiles/base/base_vectors__NNNN.fvecs").symlink_metadata().is_err(), "a series pattern is never linked");
+        assert!(ws.join("profiles/base/query_vectors.fvecs").symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false), "a plain missing view is recovered");
     }
 
     #[test]
