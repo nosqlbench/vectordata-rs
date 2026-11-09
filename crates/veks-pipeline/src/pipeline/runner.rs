@@ -180,10 +180,10 @@ pub fn run_steps(
         )
         .map_err(|e| format!("step '{}': {}", step.id, e))?;
 
-        let resolved_map: HashMap<String, String> = resolved_opts
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Recorded and hashed workspace-relative, so how the workspace is
+        // named never changes what a step is; the command itself gets the
+        // resolved options below.
+        let resolved_map: HashMap<String, String> = super::progress::recorded_options(resolved_opts.iter(), &ctx.workspace);
 
         // 2. Resolve command from registry (needed for build_version in fingerprint)
         let factory = registry.get(&step.def.run).ok_or_else(|| {
@@ -795,10 +795,7 @@ pub fn run_steps(
                         completed_at: Utc::now(),
                         elapsed_secs: elapsed.as_secs_f64(),
                         outputs: vec![],
-                        resolved_options: resolved_opts
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
+                        resolved_options: super::progress::recorded_options(resolved_opts.iter(), &ctx.workspace),
                         error: Some(msg.clone()),
                         resource_summary: None,
                         provenance: Some(provenance.clone()),
@@ -1051,10 +1048,7 @@ fn step_record_from_result(
         completed_at: Utc::now(),
         elapsed_secs: result.elapsed.as_secs_f64(),
         outputs,
-        resolved_options: resolved_opts
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<HashMap<_, _>>(),
+        resolved_options: super::progress::recorded_options(resolved_opts.iter(), workspace),
         error,
         resource_summary,
         provenance,

@@ -259,6 +259,40 @@ pub struct OutputRecord {
     pub mtime: Option<String>,
 }
 
+/// A step's resolved options as the progress log records and compares
+/// them: wherever a value names the workspace by its absolute path — a
+/// bare path, a path behind a prefix such as `count:`, a windowed path
+/// — that prefix is written away, so the same step resolved from a
+/// bare, a relative or an absolute workspace reads as the same
+/// options. Making the workspace absolute (so a resolved option
+/// resolved again stays put) turned `${cache}` from `.cache/x` into
+/// `/abs/.cache/x` and read every existing dataset as rebuilt from
+/// scratch; this is the comparison that cannot be fooled that way.
+pub fn recorded_options<'a>(
+    opts: impl IntoIterator<Item = (&'a String, &'a String)>,
+    workspace: &Path,
+) -> HashMap<String, String> {
+    let ws = if workspace.as_os_str().is_empty() { Path::new(".") } else { workspace };
+    let ws_abs = std::path::absolute(ws).unwrap_or_else(|_| ws.to_path_buf());
+    let ws_str = ws_abs.to_string_lossy().replace('\\', "/");
+    let ws_str = ws_str.trim_end_matches('/').to_string();
+    opts.into_iter()
+        .map(|(k, v)| {
+            let mut out = v.replace('\\', "/");
+            if !ws_str.is_empty() && ws_str != "/" {
+                out = out.replace(&format!("{ws_str}/"), "");
+                if out == ws_str {
+                    out = ".".to_string();
+                }
+            }
+            if let Some(stripped) = out.strip_prefix("./") {
+                out = stripped.to_string();
+            }
+            (k.clone(), out)
+        })
+        .collect()
+}
+
 impl ProgressLog {
     /// Create an empty progress log (in-memory only, no file backing).
     pub fn new() -> Self {
@@ -734,10 +768,21 @@ impl ProgressLog {
             return Some("previous run was a bound-check skip, re-validating".to_string());
         }
 
+        // Options are compared in workspace-relative form: how the run
+        // named its workspace — bare, relative, absolute — must never
+        // make a step stale, and records from before options were
+        // recorded relative still compare.
         if let Some(current) = current_options
-            && !record.resolved_options.is_empty() && &record.resolved_options != current {
+            && !record.resolved_options.is_empty()
+        {
+            let (recorded, now) = match workspace {
+                Some(ws) => (recorded_options(record.resolved_options.iter(), ws), recorded_options(current.iter(), ws)),
+                None => (record.resolved_options.clone(), current.clone()),
+            };
+            if recorded != now {
                 return Some("options changed".to_string());
             }
+        }
 
         for output in &record.outputs {
             let path = resolve_path(&output.path, workspace);
@@ -1762,6 +1807,42 @@ mod tests {
         assert!(msg.unwrap().contains("schema version changed"));
         assert!(log.steps.is_empty(), "steps should be cleared on version mismatch");
         assert_eq!(log.schema_version, PROGRESS_SCHEMA_VERSION);
+    }
+
+    /// **How the workspace is named never makes a step stale**: options
+    /// recorded as `.cache/x` by a run from inside the dataset compare
+    /// equal to `/abs/ws/.cache/x` resolved by a run with an absolute
+    /// workspace, and a value that did change still reads as changed.
+    #[test]
+    fn options_compare_workspace_relative() {
+        let ws = tempfile::tempdir().unwrap();
+        let abs = std::fs::canonicalize(ws.path()).unwrap();
+        let mut log = ProgressLog::new();
+        let mut recorded = HashMap::new();
+        recorded.insert("output".to_string(), ".cache/sorted.ivecs".to_string());
+        recorded.insert("source".to_string(), "_base_all.fvecs".to_string());
+        let mut r = rec(None);
+        r.resolved_options = recorded;
+        r.elapsed_secs = 1.0;
+        log.record_step("prepare-vectors", r);
+        let mut now = HashMap::new();
+        now.insert("output".to_string(), abs.join(".cache/sorted.ivecs").to_string_lossy().to_string());
+        now.insert("source".to_string(), "_base_all.fvecs".to_string());
+        assert!(log.check_step_freshness("prepare-vectors", Some(&now), Some(&abs)).is_none(), "the same option, spelled from an absolute workspace, is not a change");
+        assert!(log.check_step_freshness("prepare-vectors", Some(&now), Some(ws.path())).is_none());
+        now.insert("output".to_string(), abs.join(".cache/other.ivecs").to_string_lossy().to_string());
+        assert_eq!(log.check_step_freshness("prepare-vectors", Some(&now), Some(&abs)).as_deref(), Some("options changed"));
+        let norm = recorded_options(now.iter(), &abs);
+        assert_eq!(norm["output"], ".cache/other.ivecs");
+        assert_eq!(norm["source"], "_base_all.fvecs");
+        let outside = recorded_options([(&"x".to_string(), &"/elsewhere/file".to_string())], &abs);
+        assert_eq!(outside["x"], "/elsewhere/file", "a path outside the workspace is kept as it is");
+        // A path behind a prefix, and a windowed path, read the same way.
+        let counted = format!("count:{}/.cache/dedup.ivecs", abs.display());
+        let windowed = format!("{}/profiles/base/b.fvecs[0..10)", abs.display());
+        let n = recorded_options([(&"value".to_string(), &counted), (&"base".to_string(), &windowed)], &abs);
+        assert_eq!(n["value"], "count:.cache/dedup.ivecs");
+        assert_eq!(n["base"], "profiles/base/b.fvecs[0..10)");
     }
 
     /// **The definition is a finalize step's input, by content.** A

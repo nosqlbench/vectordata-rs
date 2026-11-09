@@ -1431,7 +1431,7 @@ fn explain_staleness(
             }
         };
         let resolved_map: std::collections::HashMap<String, String> =
-            resolved_opts.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            progress::recorded_options(resolved_opts.iter(), &ctx.workspace);
 
         let factory = match registry.get(&step.def.run) {
             Some(f) => f,
